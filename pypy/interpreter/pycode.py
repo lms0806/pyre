@@ -18,7 +18,7 @@ from pypy.interpreter.astcompiler.consts import (
     CO_ITERABLE_COROUTINE, CO_ASYNC_GENERATOR)
 from pypy.tool.stdlib_opcode import opcodedesc, HAVE_ARGUMENT
 from rpython.rlib.rarithmetic import intmask, r_uint
-from rpython.rlib.objectmodel import compute_hash, we_are_translated, not_rpython
+from rpython.rlib.objectmodel import compute_hash, we_are_translated, not_rpython, always_inline
 from rpython.rlib import jit, rstring
 
 
@@ -679,15 +679,18 @@ class W_LineIterator(W_Root):
         ])
         return w_res
 
+@always_inline # to not have to allocate the tuple result
 def _decode_varint(table, i):
     """Decode one CPython-3.11-compatible varint from table at byte position i.
     Returns (value, new_i).  Reads 6 bits per byte, MSB first.  Bit 6 is the
     continuation flag; bit 7 is the start-of-entry marker which is ignored
     here (masked off along with the continuation bit by ``& 63``)."""
-    b = ord(table[i]); i += 1
+    b = ord(table[i])
+    i += 1
     value = b & 63
     while b & 64:
-        b = ord(table[i]); i += 1
+        b = ord(table[i])
+        i += 1
         value = (value << 6) | (b & 63)
     return value, i
 
