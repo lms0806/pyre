@@ -1134,7 +1134,7 @@ class PythonCodeMaker(ast.ASTVisitor):
                     # INTO this block would place the RERAISE inside the byte
                     # range of an enclosing try-body's exception-table entry
                     # (body blocks emitted by _visit_try_except/_visit_try_finally
-                    # have a table entry body.offset.exc.offset, and the
+                    # have a table entry body.offset...exc.offset, and the
                     # duplicated RERAISE would incorrectly fall inside that
                     # range, dispatching to the inner handler instead of the
                     # outer reraise cleanup).  Mirrors the RERAISE-only skip
