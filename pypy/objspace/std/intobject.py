@@ -638,13 +638,7 @@ class W_IntObject(W_AbstractIntObject):
         if _recover_with_smalllong(space):
             return _lshift_ovf2small(space, x, y)
 
-        from pypy.objspace.std.longobject import W_LongObject, W_AbstractLongObject
-        if w_x is None or not isinstance(w_x, W_AbstractLongObject):
-            w_x = W_LongObject.fromint(space, x)
-
-        # crucially, *don't* convert w_y to W_LongObject, it will just be
-        # converted back (huge lshifts always overflow)
-        return w_x._int_lshift(space, y)
+        return space.newlong_from_rbigint(rbigint.lshift_int_int_bigint_result(x, y))
 
     descr_lshift, descr_rlshift = _make_descr_binop(
         _lshift, ovf_func=_ovf2long_lshift)

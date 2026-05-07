@@ -1985,6 +1985,14 @@ class TestHypothesis(object):
         res = rbigint.mul_int_int_bigint_result(a, b)
         assert res.tolong() == a * b
 
+    @example(-sys.maxint-1, 5)
+    @example(-1, 10)
+    @example(1, 1071)
+    @given(ints, strategies.integers(0, 2000))
+    def test_lshift_int_int_rbigint_result(self, a, b):
+        res = rbigint.lshift_int_int_bigint_result(a, b)
+        assert res.tolong() == a << b
+
     @given(strategies.data())
     def test_format_lowest_level_divmod_int_results(self, data):
         b = data.draw(strategies.integers(1, MASK))

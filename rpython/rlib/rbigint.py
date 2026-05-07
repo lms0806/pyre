@@ -1328,6 +1328,48 @@ class rbigint(object):
         return z
     lqshift._always_inline_ = True # It's so fast that it's always beneficial.
 
+    @staticmethod
+    @jit.elidable
+    def lshift_int_int_bigint_result(iself, int_other):
+        if not SUPPORT_INT128 or SHIFT != 63 or not int_in_valid_range(iself):
+            return rbigint.fromint(iself).lshift(int_other)
+        if int_other < 0:
+            raise ValueError("negative shift count")
+
+        if iself == 0:
+            return NULLRBIGINT
+        if int_other == 0:
+            return rbigint.fromint(iself)
+
+        selfsign = intsign(iself)
+
+        wordshift = int_other // SHIFT
+        remshift = int_other - wordshift * SHIFT
+        hishift = SHIFT - remshift
+
+        if iself < 0:
+            ival = -r_uint(iself)
+            carry = ival >> SHIFT
+            assert not carry
+        else:
+            assert iself > 0
+            ival = r_uint(iself)
+
+        if remshift:
+            lowerdigit = ival << remshift
+            upperdigit = ival >> hishift
+            if upperdigit:
+                resdigits = [NULLDIGIT] * (wordshift + 2)
+                resdigits[wordshift] = _store_digit(lowerdigit & MASK)
+                resdigits[wordshift + 1] = _store_digit(upperdigit & MASK)
+                return rbigint(resdigits, selfsign, wordshift + 2)
+        else:
+            lowerdigit = ival
+        # don't need to normalize
+        resdigits = [NULLDIGIT] * (wordshift + 1)
+        resdigits[wordshift] = _store_digit(lowerdigit & MASK)
+        return rbigint(resdigits, selfsign, wordshift + 1)
+
     @jit.elidable
     def rshift(self, int_other, dont_invert=False):
         if int_other < 0:
