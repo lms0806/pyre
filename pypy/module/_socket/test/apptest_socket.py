@@ -92,7 +92,7 @@ def test_socket_close():
     if os.name != 'nt':
         pytest.raises(OSError, os.close, fileno)
 
-@pytest.mark.skipif(sys.platform == 'win32')
+@pytest.mark.skipif(sys.platform == 'win32', reason="no fileno on windows")
 def test_socket_close_exception():
     import _socket, errno
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM, 0)
@@ -100,7 +100,7 @@ def test_socket_close_exception():
     e = pytest.raises(OSError, s.close)
     assert e.value.errno in (errno.EBADF, errno.ENOTSOCK)
 
-@pytest.mark.skipif(sys.platform == 'win32')
+@pytest.mark.skipif(sys.platform == 'win32', reason="no fileno on windows")
 def test_setblocking_invalidfd():
     import _socket
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM, 0)
@@ -307,7 +307,8 @@ def test_dup_error():
     import _socket
     pytest.raises(_socket.error, _socket.dup, 123456)
 
-@pytest.mark.skipif(os.name=='nt', reason="no recvmsg on win32")
+@pytest.mark.skipif(sys.platform == 'win32', reason="no recvmsg on win32")
+@pytest.mark.skipif(sys.platform == 'darwin', reason="no MSG_ERRQUEUE on macos")
 def test_recvmsg_issue2649():
     import _socket as socket
     listener = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
