@@ -695,13 +695,13 @@ class rbigint(object):
     @jit.elidable
     def int_add(self, iother):
         selfsign = self.get_sign()
+        if selfsign == 0:
+            return rbigint.fromint(iother)
+        if iother == 0:
+            return self
         if not int_in_valid_range(iother):
             # Fallback to long.
             return self.add(rbigint.fromint(iother))
-        elif selfsign == 0:
-            return rbigint.fromint(iother)
-        elif iother == 0:
-            return self
 
         othersign = intsign(iother)
         if selfsign == othersign:
@@ -711,6 +711,45 @@ class rbigint(object):
             result._set_sign(-result.get_sign())
         result._set_sign(result.get_sign() * othersign)
         return result
+
+    @staticmethod
+    @jit.elidable
+    def add_int_int_bigint_result(iself, iother):
+        if not SUPPORT_INT128 or SHIFT != 63 or not int_in_valid_range(iself) or not int_in_valid_range(iother):
+            return rbigint.fromint(iself).int_add(iother)
+        return rbigint._add_int_int_helper(iself, iother)
+
+    @staticmethod
+    def _add_int_int_helper(iself, iother):
+        if iself == 0:
+            return rbigint.fromint(iother)
+        if iother == 0:
+            return rbigint.fromint(iself)
+
+        sign1 = intsign(iself)
+        sign2 = intsign(iother)
+        v1 = abs(iself)
+        v2 = abs(iother)
+
+        if sign1 == sign2:
+            sign = sign1
+            ures = UDIGIT_TYPE(v1) + UDIGIT_TYPE(v2)
+        else:
+            if v1 >= v2:
+                sign = sign1
+                ures = UDIGIT_TYPE(v1) - UDIGIT_TYPE(v2)
+            else:
+                sign = sign2
+                ures = UDIGIT_TYPE(v2) - UDIGIT_TYPE(v1)
+
+        if ures == 0:
+            return NULLRBIGINT
+
+        carry = ures >> SHIFT
+        if carry:
+            return rbigint([_store_digit(ures & MASK), _store_digit(carry)], sign, 2)
+        else:
+            return rbigint([_store_digit(ures & MASK)], sign, 1)
 
     @jit.elidable
     def sub(self, other):
@@ -743,6 +782,15 @@ class rbigint(object):
             result = _x_int_add(self, iother)
         result._set_sign(result.get_sign() * selfsign)
         return result
+
+    @staticmethod
+    @jit.elidable
+    def sub_int_int_bigint_result(iself, iother):
+        if not SUPPORT_INT128 or SHIFT != 63 or not int_in_valid_range(iself) or not int_in_valid_range(iother):
+            return rbigint.fromint(iself).int_sub(iother)
+        # -iother is safe here because int_in_valid_range(iother)
+        # checks that it's not minint
+        return rbigint._add_int_int_helper(iself, -iother)
 
     @jit.elidable
     def mul(self, other):

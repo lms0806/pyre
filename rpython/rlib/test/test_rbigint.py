@@ -631,6 +631,18 @@ class Test_rbigint(object):
                 result = f1.int_mul(y)
                 assert result.tolong() == x * y
 
+    def test_add_int_int_rbigint_result(self):
+        for x in signed_int_vals:
+            for y in signed_int_vals:
+                result = rbigint.add_int_int_bigint_result(x, y)
+                assert result.tolong() == x + y
+
+    def test_sub_int_int_rbigint_result(self):
+        for x in signed_int_vals:
+            for y in signed_int_vals:
+                result = rbigint.sub_int_int_bigint_result(x, y)
+                assert result.tolong() == x - y
+
     def test_mul_int_int_rbigint_result(self):
         for x in signed_int_vals:
             for y in signed_int_vals:
@@ -1979,6 +1991,16 @@ class TestHypothesis(object):
         x = a * a
         lx = rbigint.fromlong(x)
         assert lx.isqrt().tolong() == a
+
+    @given(ints, ints)
+    def test_add_int_int_rbigint_result(self, a, b):
+        res = rbigint.add_int_int_bigint_result(a, b)
+        assert res.tolong() == a + b
+
+    @given(ints, ints)
+    def test_sub_int_int_rbigint_result(self, a, b):
+        res = rbigint.sub_int_int_bigint_result(a, b)
+        assert res.tolong() == a - b
 
     @given(ints, ints)
     def test_mul_int_int_rbigint_result(self, a, b):

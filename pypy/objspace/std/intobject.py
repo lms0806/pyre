@@ -333,6 +333,10 @@ def _make_ovf2long(opname, ovf2small=None):
             a = r_longlong(x)
             b = r_longlong(y)
             return W_SmallLongObject(op(a, b))
+        if opname == 'add':
+            return space.newlong_from_rbigint(rbigint.add_int_int_bigint_result(x, y))
+        if opname == 'sub':
+            return space.newlong_from_rbigint(rbigint.sub_int_int_bigint_result(x, y))
         if opname == 'mul':
             return space.newlong_from_rbigint(rbigint.mul_int_int_bigint_result(x, y))
         from pypy.objspace.std.longobject import W_LongObject, W_AbstractLongObject

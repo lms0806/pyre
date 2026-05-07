@@ -82,12 +82,7 @@ class TestW_IntObject:
 
     def test_add_ovf_int_op_shortcut(self, monkeypatch):
         from pypy.objspace.std.longobject import W_LongObject, rbigint
-        @staticmethod
-        def fromint(space, x):
-            assert x == sys.maxint # only the maxint is converted, not the 1!
-            return W_LongObject(rbigint.fromint(x))
-
-        monkeypatch.setattr(W_LongObject, 'fromint', fromint)
+        monkeypatch.setattr(W_LongObject, 'fromint', None)
 
         space = self.space
         x = sys.maxint
@@ -113,6 +108,19 @@ class TestW_IntObject:
         v = f1.descr_sub(space, f2)
         assert space.isinstance_w(v, space.w_long)
         assert space.bigint_w(v).eq(rbigint.fromlong(sys.maxint - -1))
+
+    def test_sub_ovf_int_op_shortcut(self, monkeypatch):
+        from pypy.objspace.std.longobject import W_LongObject, rbigint
+        monkeypatch.setattr(W_LongObject, 'fromint', None)
+
+        space = self.space
+        x = sys.maxint
+        y = -1
+        f1 = iobj.W_IntObject(x)
+        f2 = iobj.W_IntObject(y)
+        v = f1.descr_sub(space, f2)
+        assert space.isinstance_w(v, space.w_long)
+        assert space.bigint_w(v).eq(rbigint.fromlong(x - y))
 
     def test_mul(self):
         space = self.space
@@ -337,7 +345,6 @@ class TestW_IntObject:
         f2 = iobj.W_IntObject(y)
         v = f1.descr_lshift(space, f2)
         assert space.bigint_w(v).eq(rbigint.fromlong(x << y))
-
 
     def test_rshift(self):
         x = 12345678
