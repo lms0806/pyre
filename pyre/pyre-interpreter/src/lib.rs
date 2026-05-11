@@ -26,6 +26,7 @@ pub mod listobject;
 pub mod opcode_ops;
 pub mod pycode;
 pub mod pyopcode;
+pub mod pytraceback;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod sliceobject;
@@ -64,6 +65,7 @@ pub use opcode_ops::*;
 pub use pycode::*;
 pub use pyframe::*;
 pub use pyopcode::*;
+pub use pytraceback::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
 
@@ -95,7 +97,13 @@ pub fn all_foreign_pytypes() -> &'static [(
     static PYTYPES: &[(
         &pyre_object::pyobject::PyType,
         &pyre_object::pyobject::PyType,
-    )] = &[(&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE)];
+    )] = &[
+        (&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE),
+        (
+            &crate::pytraceback::PYTRACEBACK_TYPE,
+            &pyre_object::INSTANCE_TYPE,
+        ),
+    ];
     PYTYPES
 }
 

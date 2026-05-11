@@ -338,6 +338,20 @@ pub fn init_typeobjects() {
             dict_items_type as usize,
         );
 
+        // traceback — `pypy/interpreter/pytraceback.py:17-101
+        // PyTraceback.typedef`.  Read-only-ish: `tb_next` accepts a
+        // chain rewrite, `tb_lineno` / `tb_lasti` are read+write to
+        // mirror PyPy's getsetters.  `acceptable_as_base_class=False`
+        // matches PyPy's `pytraceback.py` which never sets it (TypeDef
+        // defaults).
+        let traceback_type =
+            new_typeobject_with_base("traceback", init_pytraceback_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(traceback_type, false) };
+        reg.insert(
+            &crate::pytraceback::PYTRACEBACK_TYPE as *const PyType as usize,
+            traceback_type as usize,
+        );
+
         // function — PyPy: funcobject.py
         // Functions are descriptors: function.__get__ returns a bound method.
         let function_type = new_typeobject_with_base("function", init_function_type, object_type);
@@ -1563,6 +1577,15 @@ fn init_str_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "isprintable",
+        make_builtin_function_with_arity(
+            "isprintable",
+            crate::type_methods::str_method_isprintable,
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "isupper",
         make_builtin_function_with_arity("isupper", crate::type_methods::str_method_isupper, 1),
     );
@@ -1882,6 +1905,11 @@ fn init_dict_type(ns: &mut DictStorage) {
         ns,
         "pop",
         make_builtin_function("pop", crate::type_methods::dict_method_pop),
+    );
+    dict_storage_store(
+        ns,
+        "popitem",
+        make_builtin_function_with_arity("popitem", crate::type_methods::dict_method_popitem, 1),
     );
     dict_storage_store(
         ns,
@@ -2247,6 +2275,201 @@ fn init_dict_view_set_like_type(ns: &mut DictStorage) {
 /// equality falls through to `object.__eq__`'s identity check.
 fn init_dict_view_values_type(ns: &mut DictStorage) {
     init_dict_view_common_slots(ns);
+}
+
+/// `pypy/interpreter/pytraceback.py:17-101 PyTraceback.typedef` —
+/// the four Python-visible getsets.
+///
+/// ```python
+/// PyTraceback.typedef = TypeDef("traceback",
+///     __new__ = interp2app(PyTraceback.descr_new),
+///     __dir__ = interp2app(PyTraceback.descr__dir__),
+///     __reduce__ = interp2app(PyTraceback.descr__reduce__),
+///     __setstate__ = interp2app(PyTraceback.descr__setstate__),
+///     tb_frame  = GetSetProperty(PyTraceback.descr_get_tb_frame),
+///     tb_lasti  = GetSetProperty(PyTraceback.descr_get_tb_lasti,
+///                                PyTraceback.descr_set_tb_lasti),
+///     tb_lineno = GetSetProperty(PyTraceback.descr_get_tb_lineno,
+///                                PyTraceback.descr_set_tb_lineno),
+///     tb_next   = GetSetProperty(PyTraceback.descr_get_next,
+///                                PyTraceback.descr_set_next),
+/// )
+/// ```
+///
+/// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `__dir__`.  Gaps
+/// with cited convergence paths:
+///   - `tb_frame` returns `None` — needs `PyFrame` to grow a
+///     `PyObject` header (`pyframe.rs:39` currently `repr(C)`
+///     without one).  Snapshot stub (using `w_code` + `lineno` +
+///     recursive `tb_next.tb_frame` for `f_back`) is the bridge.
+///   - `__new__` needs the same `PyFrame` W_Root surface (per
+///     `pytraceback.py:67` `space.interp_w(PyFrame, w_frame)`).
+///   - `__reduce__` / `__setstate__` (`:74-97`) need the
+///     `_pickle_support.traceback_new` builtin module which pyre
+///     hasn't ported.
+fn init_pytraceback_type(ns: &mut DictStorage) {
+    // pytraceback.py:45-49 descr_get_tb_lasti / descr_set_tb_lasti.
+    let lasti_getter = make_builtin_function_with_arity(
+        "tb_lasti",
+        |args| {
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
+            Ok(pyre_object::w_int_new(lasti))
+        },
+        2,
+    );
+    let lasti_setter = make_builtin_function_with_arity(
+        "tb_lasti",
+        |args| {
+            let tb = args[1];
+            let w_value = args[2];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let v = crate::baseobjspace::int_w(w_value)?;
+            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v) };
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "tb_lasti",
+        make_getset_property_named(lasti_getter, lasti_setter, pyre_object::PY_NULL, "tb_lasti"),
+    );
+
+    // pytraceback.py:39-43 descr_get_tb_lineno / descr_set_tb_lineno.
+    let lineno_getter = make_builtin_function_with_arity(
+        "tb_lineno",
+        |args| {
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let n = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
+            Ok(pyre_object::w_int_new(n))
+        },
+        2,
+    );
+    let lineno_setter = make_builtin_function_with_arity(
+        "tb_lineno",
+        |args| {
+            let tb = args[1];
+            let w_value = args[2];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let v = crate::baseobjspace::int_w(w_value)?;
+            unsafe { crate::pytraceback::w_pytraceback_set_lineno(tb, v) };
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "tb_lineno",
+        make_getset_property_named(
+            lineno_getter,
+            lineno_setter,
+            pyre_object::PY_NULL,
+            "tb_lineno",
+        ),
+    );
+
+    // pytraceback.py:51-62 descr_get_next / descr_set_next — setter
+    // walks the proposed chain for self-references (`:57-61
+    // traceback loop detected`).
+    let next_getter = make_builtin_function_with_arity(
+        "tb_next",
+        |args| {
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let nxt = unsafe { crate::pytraceback::w_pytraceback_get_w_next(tb) };
+            if nxt.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(nxt)
+        },
+        2,
+    );
+    let next_setter = make_builtin_function_with_arity(
+        "tb_next",
+        |args| {
+            let tb = args[1];
+            let mut w_new = args[2];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            // pytraceback.py:55 `w_next = space.interp_w(PyTraceback,
+            // w_next, can_be_None=True)` — None / null → PY_NULL chain
+            // terminator; anything else must be a W_PyTraceback.
+            if w_new.is_null() || unsafe { pyre_object::is_none(w_new) } {
+                w_new = pyre_object::PY_NULL;
+            } else if !unsafe { crate::pytraceback::is_pytraceback(w_new) } {
+                return Err(crate::PyError::type_error(
+                    "expected traceback object or None".to_string(),
+                ));
+            }
+            if unsafe { crate::pytraceback::w_pytraceback_set_w_next(tb, w_new) }.is_err() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::ValueError,
+                    "traceback loop detected".to_string(),
+                ));
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "tb_next",
+        make_getset_property_named(next_getter, next_setter, pyre_object::PY_NULL, "tb_next"),
+    );
+
+    // pytraceback.py:34 descr_get_tb_frame — placeholder returning
+    // None until `PyFrame` grows a `PyObject` header.  Convergence
+    // path documented in `pytraceback.rs`.
+    let frame_getter = make_builtin_function_with_arity(
+        "tb_frame",
+        |args| {
+            let _tb = args[1];
+            Ok(pyre_object::w_none())
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "tb_frame",
+        make_getset_property_named(
+            frame_getter,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            "tb_frame",
+        ),
+    );
+    // `pytraceback.py:99-101 descr__dir__` — returns the list of
+    // public traceback attribute names.
+    dict_storage_store(
+        ns,
+        "__dir__",
+        make_builtin_function_with_arity(
+            "__dir__",
+            |_args| {
+                Ok(pyre_object::w_list_new(vec![
+                    pyre_object::w_str_new("tb_frame"),
+                    pyre_object::w_str_new("tb_next"),
+                    pyre_object::w_str_new("tb_lasti"),
+                    pyre_object::w_str_new("tb_lineno"),
+                ]))
+            },
+            1,
+        ),
+    );
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:1605-1623`
@@ -3596,6 +3819,73 @@ fn init_type_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
+
+    // `pypy/objspace/std/typeobject.py:614-624 get_module` /
+    // `:1241-1247 descr_get__module` / `descr_set__module`.
+    // For heaptype (user-defined classes) the value is read from /
+    // written to the class's `__dict__`; for builtin types getter
+    // derives the module from the qualified name (everything before
+    // the rightmost dot, default `"builtins"`).  PyPy's
+    // `getdictvalue` returns the stored value verbatim — including
+    // `None` — so the getter must NOT fall through to the dot-split
+    // when the dict entry exists but happens to be None.
+    let module_getter = make_builtin_function_with_arity(
+        "__module__",
+        |args| {
+            let cls = args[1];
+            // `typeobject.py:614-617 get_module`:
+            //     if self.is_heaptype():
+            //         return self.getdictvalue(space, '__module__')
+            // `lookup_in_type` filters out null entries but
+            // preserves `w_none()`, matching PyPy's "value present
+            // even if it's None" semantic.
+            if let Some(v) = unsafe { crate::baseobjspace::lookup_in_type(cls, "__module__") } {
+                if !v.is_null() {
+                    return Ok(v);
+                }
+            }
+            // Builtin-name dot split fallback (`typeobject.py:619-624`).
+            let name = unsafe { pyre_object::w_type_get_name(cls) };
+            let mod_name = match name.rfind('.') {
+                Some(dot) => name[..dot].to_string(),
+                None => "builtins".to_string(),
+            };
+            Ok(pyre_object::w_str_new(&mod_name))
+        },
+        2,
+    );
+    let module_setter = make_builtin_function_with_arity(
+        "__module__",
+        |args| {
+            // `typeobject.py:1245-1247`:
+            //     def descr_set__module(space, w_type, w_value):
+            //         w_type.setdictvalue(space, '__module__', w_value)
+            // Writes directly into the type's namespace dict so
+            // `A.__module__ = "x"` is reflected in `A.__dict__`.
+            let cls = args[1];
+            let value = args[2];
+            unsafe {
+                if pyre_object::is_type(cls) {
+                    let dict_ptr = pyre_object::w_type_get_dict_ptr(cls) as *mut crate::DictStorage;
+                    if !dict_ptr.is_null() {
+                        crate::dict_storage_store(&mut *dict_ptr, "__module__", value);
+                    }
+                }
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "__module__",
+        make_getset_property_named(
+            module_getter,
+            module_setter,
+            pyre_object::PY_NULL,
+            "__module__",
+        ),
+    );
 
     let dict_getter = make_builtin_function_with_arity(
         "__dict__",
@@ -5095,7 +5385,93 @@ fn init_bytes_type(ns: &mut DictStorage) {
         "__str__",
         make_builtin_function_with_arity("__str__", bytes_method_repr, 1),
     );
+    dict_storage_store(ns, "hex", make_builtin_function("hex", bytes_method_hex));
     // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+/// `pypy/objspace/std/bytesobject.py W_BytesObject.descr_hex` —
+///
+/// ```python
+/// def descr_hex(self, space, w_sep=None, w_bytes_per_sep=1):
+///     ...
+/// ```
+///
+/// Returns a string of hex pairs.  Optional `sep` (single byte/char)
+/// inserts between pairs; `bytes_per_sep` controls the grouping.
+fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // No sep / default grouping — produces "ffff" for [0xff, 0xff].
+    // The sep + bytes_per_sep kwargs are deferred until first observed
+    // need; CPython callers without args hit the hot path.
+    if args.len() <= 1 {
+        let mut out = String::with_capacity(data.len() * 2);
+        for &b in data {
+            out.push_str(&format!("{:02x}", b));
+        }
+        return Ok(pyre_object::w_str_new(&out));
+    }
+    // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
+    // sep validation — must be a length-1 ASCII string or length-1
+    // bytes; otherwise ValueError per PyPy.
+    let sep_obj = args[1];
+    let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
+        let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
+        let mut chars = s.chars();
+        let first = chars.next().ok_or_else(|| {
+            crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.")
+        })?;
+        if chars.next().is_some() {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "sep must be length 1.",
+            ));
+        }
+        if (first as u32) >= 0x80 {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "sep must be ASCII.",
+            ));
+        }
+        first
+    } else if unsafe { pyre_object::is_bytes(sep_obj) } {
+        let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
+        if sep_bytes.len() != 1 {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "sep must be length 1.",
+            ));
+        }
+        sep_bytes[0] as char
+    } else {
+        return Err(crate::PyError::type_error("sep must be str or bytes"));
+    };
+    let sep_str = sep_char.to_string();
+    // `bytearrayobject.py:660-674` — positive `bytes_per_sep` groups
+    // from the right (default), negative groups from the left; zero
+    // falls back to 1.
+    let raw_group: i64 = if args.len() >= 3 {
+        crate::baseobjspace::int_w(args[2])?
+    } else {
+        1
+    };
+    let group = (raw_group.unsigned_abs() as usize).max(1);
+    let group_from_left = raw_group < 0;
+    let mut out = String::with_capacity(data.len() * 2 + data.len());
+    for (i, b) in data.iter().enumerate() {
+        if i > 0 {
+            let boundary = if group_from_left {
+                i % group == 0
+            } else {
+                (data.len() - i) % group == 0
+            };
+            if boundary {
+                out.push_str(&sep_str);
+            }
+        }
+        out.push_str(&format!("{:02x}", b));
+    }
+    Ok(pyre_object::w_str_new(&out))
 }
 
 /// PyPy: bytesobject.py descr_decode
@@ -5793,6 +6169,77 @@ fn init_set_type(ns: &mut DictStorage) {
             for other in &args[1..] {
                 let other_items = crate::builtins::collect_iterable(*other)?;
                 for item in other_items {
+                    unsafe { pyre_object::w_set_add(args[0], item) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    // `pypy/objspace/std/setobject.py:1188 W_BaseSetObject.descr_difference_update`
+    // / `:1217 descr_intersection_update` / `:1244 descr_symmetric_difference_update`
+    // — in-place set ops that mirror the non-update variants but
+    // mutate `self` instead of returning a fresh set.
+    dict_storage_store(
+        ns,
+        "difference_update",
+        make_builtin_function("difference_update", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            for other in &args[1..] {
+                let other_items = crate::builtins::collect_iterable(*other)?;
+                for item in other_items {
+                    unsafe { pyre_object::w_set_discard(args[0], item) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    dict_storage_store(
+        ns,
+        "intersection_update",
+        make_builtin_function("intersection_update", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            // Snapshot self's items, drop any not present in EVERY other.
+            let self_items = unsafe { pyre_object::w_set_items(args[0]) };
+            for item in self_items {
+                let mut keep = true;
+                for other in &args[1..] {
+                    let other_items = crate::builtins::collect_iterable(*other)?;
+                    if !other_items
+                        .iter()
+                        .any(|&o| crate::baseobjspace::eq_w(item, o))
+                    {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    unsafe { pyre_object::w_set_discard(args[0], item) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    dict_storage_store(
+        ns,
+        "symmetric_difference_update",
+        make_builtin_function("symmetric_difference_update", |args| {
+            if args.is_empty() || args.len() < 2 {
+                return Ok(pyre_object::w_none());
+            }
+            let other_items = crate::builtins::collect_iterable(args[1])?;
+            for item in other_items {
+                // toggle: remove if present, add otherwise
+                let self_items = unsafe { pyre_object::w_set_items(args[0]) };
+                if self_items
+                    .iter()
+                    .any(|&existing| crate::baseobjspace::eq_w(item, existing))
+                {
+                    unsafe { pyre_object::w_set_discard(args[0], item) };
+                } else {
                     unsafe { pyre_object::w_set_add(args[0], item) };
                 }
             }

@@ -468,32 +468,60 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     //               self.getorcreatedebug().w_f_trace = trace
     //   except OperationError as e:
     //       operr = e
-    //   ...
+    //   pytraceback.record_application_traceback(
+    //       self.space, operr, self, self.last_instr)
     //   ec.exception_trace(self, operr)
     //
-    // Gated on a live tracefunc so the no-tracer hot path skips both
-    // the f_trace save/restore dance and the `to_exc_object` alloc.
+    // bytecode_trace_after_exception + exception_trace are gated on a
+    // live tracefunc so the no-tracer hot path skips the f_trace
+    // save/restore dance.  record_application_traceback runs
+    // unconditionally per `:147-148`, so the traceback chain grows on
+    // every exception regardless of trace state.
     // bytecode_trace_after_exception's exception is caught by the
     // surrounding `except OperationError` and replaces operr;
     // exception_trace's exception is NOT caught (line 148 stands
     // outside the except), so it short-circuits the unrollstack search
     // — pyre signals that by returning `false` after replacing `err`.
+    // `pyopcode.py:122-149 handle_operation_error(attach_tb=True)` —
+    // the entire `if attach_tb:` block (bytecode_trace_after_exception,
+    // record_application_traceback, exception_trace) is gated on
+    // `attach_tb`.  RERAISE opcode raises `RaiseWithExplicitTraceback`
+    // which routes through the `attach_tb=False` branch, so all three
+    // tracing hooks are skipped per `:91-94`.  Pyre carries the same
+    // intent via `PyError.attach_tb` set by `eval.rs::reraise`.
     let ec = frame.execution_context as *mut crate::PyExecutionContext;
-    if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
-        let saved_trace = frame.get_w_f_trace();
-        if !saved_trace.is_null() {
-            frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+    let exc_obj = err.to_exc_object();
+    if err.exc_object.is_null() {
+        err.exc_object = exc_obj;
+    }
+    if err.attach_tb {
+        if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+            let saved_trace = frame.get_w_f_trace();
+            if !saved_trace.is_null() {
+                frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+            }
+            let after_exc_result =
+                unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
+            if !saved_trace.is_null() {
+                frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+            }
+            if let Err(trace_err) = after_exc_result {
+                // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
+                *err = trace_err;
+            }
         }
-        let after_exc_result =
-            unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
-        if !saved_trace.is_null() {
-            frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+        // `pyopcode.py:147-148 pytraceback.record_application_traceback`
+        // — prepends a `W_PyTraceback` wrapping the current frame onto
+        // the exception's `w_traceback` chain.
+        unsafe {
+            crate::pytraceback::record_application_traceback(
+                exc_obj,
+                frame as *mut PyFrame,
+                frame.last_instr as i64,
+            );
         }
-        if let Err(trace_err) = after_exc_result {
-            // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
-            *err = trace_err;
-        }
-        let exc_obj = err.to_exc_object();
+    }
+    if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(
                 frame as *mut PyFrame,
@@ -934,7 +962,24 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::generatorobject::is_generator(iter)
                 || pyre_object::itertoolsmodule::is_repeat(iter)
                 || pyre_object::itertoolsmodule::is_count(iter)
+                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::enumerateobject::is_enumerate(iter)
             {
+                return Ok(());
+            }
+            // `pypy/objspace/std/dictmultiobject.py W_DictMulti
+            // ViewKeysObject.descr_iter` (and values / items siblings)
+            // — `_iter_*` returns a live `W_BaseDictIterator`.  Pyre
+            // produces a `W_DictViewIterator` carrying the source
+            // dict's `dictversion` counter so mid-iteration mutation
+            // surfaces as `RuntimeError("dictionary changed size during
+            // iteration")` per `:1719-1741 descr_next`.
+            if pyre_object::dictviewobject::is_dict_view(iter) {
+                let kind = pyre_object::dictviewobject::w_dict_view_get_kind(iter);
+                let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(iter);
+                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(w_dict, kind);
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
             // list → seq_iter
@@ -985,16 +1030,20 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
-            // dict → iterate over keys (PyPy: dictobject.py __iter__ → dict_keys)
+            // dict → iterate over keys.  `pypy/objspace/std/dict
+            // multiobject.py W_DictMultiObject.descr_iter` returns
+            // `W_DictMultiIterKeys(self)` — pyre's `W_DictViewIterator`
+            // with kind=Keys plays the same role, capturing the
+            // dict's `dictversion` so mid-iteration mutation raises
+            // `RuntimeError("dictionary changed size during
+            // iteration")`.
             if pyre_object::is_dict(iter) {
-                let d = &*(iter as *const pyre_object::dictobject::W_DictObject);
-                let entries = &*d.entries;
-                let keys: Vec<pyre_object::PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
-                let key_list = pyre_object::w_list_new(keys);
-                let len = entries.len();
-                let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
+                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(
+                    iter,
+                    pyre_object::dictviewobject::DictViewKind::Keys,
+                );
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
             // set / frozenset → iterate via insertion order (PyPy:
@@ -1065,9 +1114,14 @@ impl IterOpcodeHandler for PyFrame {
                     Err(e) => return Err(e),
                 }
             }
-            // itertools iterators — delegate to baseobjspace::next
+            // itertools iterators + W_Enumerate + W_DictViewIterator
+            // — delegate to baseobjspace::next.  The shared cache slot
+            // (USER_ITER_NEXT_CACHE) carries the most recent value
+            // across the iter_continues / iter_next_value pair.
             if pyre_object::itertoolsmodule::is_repeat(iter)
                 || pyre_object::itertoolsmodule::is_count(iter)
+                || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
             {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
@@ -1104,12 +1158,15 @@ impl IterOpcodeHandler for PyFrame {
 
     /// PyPy: space.next(w_iterator) → returns cached value from concrete_iter_continues.
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        // Generator/user-defined/itertools iterator: return cached value
+        // Generator/user-defined/itertools/enumerate/dict-iter:
+        // return cached value populated by concrete_iter_continues.
         if unsafe {
             pyre_object::generatorobject::is_generator(iter)
                 || pyre_object::is_instance(iter)
                 || pyre_object::itertoolsmodule::is_repeat(iter)
                 || pyre_object::itertoolsmodule::is_count(iter)
+                || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {
@@ -1844,17 +1901,21 @@ impl OpcodeStepExecutor for PyFrame {
     fn reraise(&mut self) -> Result<(), Self::Error> {
         // TOS is the exception, TOS1 is prev_exc_info
         let exc = self.peek();
-        unsafe {
+        // `pyopcode.py:1370-1376 RERAISE raise
+        // RaiseWithExplicitTraceback` parity — flip `attach_tb` so
+        // `handle_exception` skips `record_application_traceback`
+        // and the cleanup-RERAISE doesn't double-stamp the traceback.
+        let mut err = unsafe {
             if pyre_object::is_exception(exc) {
-                Err(PyError::from_exc_object(exc))
+                PyError::from_exc_object(exc)
             } else if pyre_object::is_str(exc) {
-                Err(PyError::runtime_error(
-                    pyre_object::w_str_get_value(exc).to_string(),
-                ))
+                PyError::runtime_error(pyre_object::w_str_get_value(exc).to_string())
             } else {
-                Err(PyError::runtime_error("exception re-raised"))
+                PyError::runtime_error("exception re-raised")
             }
-        }
+        };
+        err.attach_tb = false;
+        Err(err)
     }
 
     // ── LoadFromDictOrGlobals ──

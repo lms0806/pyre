@@ -182,9 +182,31 @@ pub fn exc_info_direct() -> PyObjectRef {
         if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
             w_tuple_new(vec![w_none(), w_none(), w_none()])
         } else {
-            let w_class = (*exc).w_class;
-            let exc_type = if w_class.is_null() { w_none() } else { w_class };
-            w_tuple_new(vec![exc_type, exc, w_none()])
+            // `pypy/module/sys/vm.py exc_info_direct` returns
+            // `(type, value, traceback)` where `type` is
+            // `space.exception_getclass(value)` — the specific
+            // subclass W_TypeObject (e.g. `ZeroDivisionError`), not
+            // the generic `Exception` stub set in
+            // `w_exception_new`.  Pyre routes the per-`ExcKind`
+            // lookup through `typedef::r#type` (`typedef.rs:186-197`)
+            // which `exception_getclass` delegates to, so go through
+            // that instead of dereferencing the raw `w_class` slot
+            // (which still points at the constructor-time
+            // `EXCEPTION_TYPE` stub).
+            let exc_type = crate::baseobjspace::exception_getclass(exc);
+            let exc_type = if exc_type.is_null() {
+                w_none()
+            } else {
+                exc_type
+            };
+            // The third tuple slot mirrors
+            // `space.exception_gettraceback(operror)`
+            // (`error.py:140-145`).  Pyre stores the chain on the
+            // typed `w_traceback` slot of `W_ExceptionObject`
+            // (`excobject.rs:303`); surface it directly here.
+            let tb = pyre_object::excobject::w_exception_get_traceback(exc);
+            let w_tb = if tb.is_null() { w_none() } else { tb };
+            w_tuple_new(vec![exc_type, exc, w_tb])
         }
     }
 }
@@ -549,6 +571,7 @@ pub fn init(ns: &mut DictStorage) {
                 kind: crate::PyErrorKind::SystemExit,
                 message: code.to_string(),
                 exc_object: std::ptr::null_mut(),
+                attach_tb: true,
             })
         }),
     );

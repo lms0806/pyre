@@ -74,14 +74,14 @@ impl OperationError {
     /// Mutates `self` to install the normalized `(w_type, w_value)` and
     /// returns the new `w_value`.
     ///
-    /// PRE-EXISTING-ADAPTATION: the W_BaseException fast path
-    /// (error.py:228-232 `w_value.w_traceback = tb`) requires the
-    /// `w_traceback` slot to be present on `W_ExceptionObject`
-    /// (`pyre-object/excobject.rs` carries only `kind` + `message`
-    /// today).  The PyPy W_BaseException expansion epic is the
-    /// prerequisite; until it lands, the fallback `space.setattr(w_value,
-    /// "__traceback__", tb)` path covers both branches semantically —
-    /// PyPy's two arms differ only in optimisation.
+    /// `pypy/interpreter/error.py:225-236 normalize_exception` traceback
+    /// attach: the W_BaseException-typed fast path writes
+    /// `w_value.w_traceback = tb` directly; the generic fallback is
+    /// `space.setattr(w_value, "__traceback__", tb)`.  Pyre's
+    /// W_ExceptionObject grew the typed `w_traceback` slot, so the
+    /// fast path is now reachable — `w_exception_set_traceback` is
+    /// invoked when `w_value` is an exception instance, falling back
+    /// to the generic setattr for anything else.
     pub fn normalize_exception(&mut self, space: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let mut w_type = self.w_type;
         let mut w_value = self.get_w_value(space);
@@ -124,17 +124,16 @@ impl OperationError {
                         w_type = self._exception_getclass(w_value)?;
                     }
                 }
-                // error.py:225-236 traceback attach.
+                // error.py:225-236 traceback attach — fast path writes
+                // `w_value.w_traceback = tb` when `w_value` is a
+                // `W_BaseException`, otherwise falls through to the
+                // generic `space.setattr(w_value, "__traceback__", tb)`.
                 if let Some(tb) = self._application_traceback {
-                    // PRE-EXISTING-ADAPTATION (see method docstring): the
-                    // W_BaseException-typed fast path is unreachable until
-                    // pyre grows the `w_traceback` slot on
-                    // `W_ExceptionObject`.  Until then both arms fall through
-                    // to the generic setattr escape (error.py:235-236), which
-                    // PyPy uses unconditionally for any non-W_BaseException
-                    // value.  No semantic loss — only the slot-write
-                    // optimisation is deferred.
-                    let _ = crate::baseobjspace::setattr(w_value, "__traceback__", tb);
+                    if pyre_object::is_exception(w_value) {
+                        pyre_object::excobject::w_exception_set_traceback(w_value, tb);
+                    } else {
+                        let _ = crate::baseobjspace::setattr(w_value, "__traceback__", tb);
+                    }
                 }
             } else {
                 // error.py:238-245 (inst, None) — `raise inst`
@@ -173,34 +172,95 @@ impl OperationError {
         Ok(w_type)
     }
 
-    /// pypy/interpreter/error.py:418-427 `chain_exceptions`.
+    /// `pypy/interpreter/error.py:422-434 chain_exceptions` parity:
     ///
-    /// PRE-EXISTING-ADAPTATION (Slice 3 of OperationError port,
-    /// blocked): line-by-line port requires
-    ///   - `W_BaseException.descr_setcontext(space, w_context)` to
-    ///     write the `__context__` slot
-    ///   - `_break_context_cycle` helper (error.py:443-)
-    ///   - `W_BaseException` instance-of check
+    /// ```python
+    /// def chain_exceptions(self, space, context):
+    ///     w_value = self.normalize_exception(space)
+    ///     w_context = context.normalize_exception(space)
+    ///     if not space.is_w(w_value, w_context):
+    ///         if not isinstance(w_value, W_BaseException):
+    ///             raise oefmt(space.w_SystemError, "not an instance of Exception: %T", w_value)
+    ///         if w_value.w_context is None:
+    ///             _break_context_cycle(space, w_value, w_context)
+    ///             w_value.descr_setcontext(space, w_context)
+    /// ```
     ///
-    /// Pyre's `W_ExceptionObject` (pyre-object/excobject.rs:59) carries
-    /// only `kind` + `message` — no `w_context` / `w_cause` /
-    /// `w_traceback` slots.  Adding those fields is the
-    /// `W_BaseException` expansion epic (pypy/module/exceptions/
-    /// interp_exceptions.py W_BaseException, ~200 LOC).
-    ///
-    /// Until that epic lands, `chain_exceptions` cannot be ported.
-    /// `record_context` / `chain_exceptions_from_cause` (error.py:406,
-    /// 429) inherit the same blocker.
+    /// Writes flow through the typed `w_context` slot on
+    /// `W_ExceptionObject` (`pyre-object/src/excobject.rs:113-117
+    /// W_BaseException class defaults`).
     pub fn chain_exceptions(
         &mut self,
-        _space: PyObjectRef,
-        _context: &mut OperationError,
+        space: PyObjectRef,
+        context: &mut OperationError,
     ) -> Result<(), PyError> {
-        // Stub: return Ok(()) until the W_BaseException expansion epic
-        // wires up `descr_setcontext` and the per-exception
-        // w_context / w_cause / w_traceback slots.
+        let w_value = self.normalize_exception(space)?;
+        let w_context = context.normalize_exception(space)?;
+        if std::ptr::eq(w_value, w_context) {
+            return Ok(());
+        }
+        if !unsafe { pyre_object::is_exception(w_value) } {
+            return Err(PyError::new(
+                crate::PyErrorKind::SystemError,
+                "not an instance of Exception".to_string(),
+            ));
+        }
+        // `:432-434` — only set __context__ when it isn't already
+        // stamped; mirrors CPython's `_PyErr_ChainExceptions` precedent.
+        let existing = unsafe { pyre_object::excobject::w_exception_get_context(w_value) };
+        if existing.is_null() {
+            _break_context_cycle(w_value, w_context)?;
+            unsafe { pyre_object::excobject::w_exception_set_context(w_value, w_context) };
+        }
         Ok(())
     }
+}
+
+/// `pypy/interpreter/error.py:478-509 _break_context_cycle` parity —
+/// Floyd cycle-detection over the `__context__` chain, breaking the
+/// loop by writing `None` into the offending link before the new
+/// `w_context` is attached.
+fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<(), PyError> {
+    let mut w_rabbit = w_context;
+    let mut w_tortoise = w_context;
+    let mut update_tortoise_toggle = false;
+    loop {
+        if !unsafe { pyre_object::is_exception(w_rabbit) } {
+            return Err(PyError::new(
+                crate::PyErrorKind::SystemError,
+                "not an instance of Exception".to_string(),
+            ));
+        }
+        let w_next = unsafe { pyre_object::excobject::w_exception_get_context(w_rabbit) };
+        if w_next.is_null() || unsafe { pyre_object::is_none(w_next) } {
+            break;
+        }
+        if std::ptr::eq(w_next, w_value) {
+            // `:497-498` — `w_rabbit.descr_setcontext(space, space.w_None)`
+            // (a real None, mirroring PyPy's "internal None" → user-
+            // visible None via the typed slot).
+            unsafe {
+                pyre_object::excobject::w_exception_set_context(w_rabbit, pyre_object::w_none())
+            };
+            break;
+        }
+        w_rabbit = w_next;
+        if std::ptr::eq(w_rabbit, w_tortoise) {
+            // `:502-503` — pre-existing cycle; don't set anything to None.
+            break;
+        }
+        if update_tortoise_toggle {
+            if !unsafe { pyre_object::is_exception(w_tortoise) } {
+                return Err(PyError::new(
+                    crate::PyErrorKind::RuntimeError,
+                    "not an instance of Exception".to_string(),
+                ));
+            }
+            w_tortoise = unsafe { pyre_object::excobject::w_exception_get_context(w_tortoise) };
+        }
+        update_tortoise_toggle = !update_tortoise_toggle;
+    }
+    Ok(())
 }
 
 impl From<OperationError> for PyError {
@@ -214,6 +274,7 @@ impl From<OperationError> for PyError {
             kind: PyErrorKind::RuntimeError,
             message,
             exc_object: value.w_value,
+            attach_tb: true,
         }
     }
 }
@@ -235,6 +296,18 @@ pub struct PyError {
     /// Cached W_ExceptionObject pointer — reused by to_exc_object()
     /// to avoid re-allocating an exception object that already exists.
     pub exc_object: PyObjectRef,
+    /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., attach_tb=True)`
+    /// parity.  RERAISE opcode (`pyopcode.py:1348-1376 RERAISE`)
+    /// surfaces the operror as `RaiseWithExplicitTraceback` which
+    /// PyPy's bytecode dispatcher routes through
+    /// `handle_operation_error(attach_tb=False)` to avoid stamping a
+    /// spurious traceback frame on the cleanup path.  Pyre routes the
+    /// same intent through this field: the `reraise` opcode
+    /// (`eval.rs::reraise`) clears `attach_tb` so the
+    /// re-fired `handle_exception` skips
+    /// `record_application_traceback`.  Default `true` for any
+    /// normally-constructed PyError; reraise flips it off.
+    pub attach_tb: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +367,11 @@ pub enum PyErrorKind {
     /// in pyre; the runtime allocator never returns NULL except on
     /// genuine system OOM.
     MemoryError,
+    /// `pypy/module/exceptions/interp_exceptions.py W_SystemError` —
+    /// PyPy uses this for interpreter-internal invariant violations
+    /// (e.g. `chain_exceptions` rejecting non-BaseException context
+    /// at `error.py:429`).
+    SystemError,
 }
 
 impl PyError {
@@ -302,6 +380,7 @@ impl PyError {
             kind,
             message: message.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -310,6 +389,7 @@ impl PyError {
             kind: PyErrorKind::TypeError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -318,6 +398,7 @@ impl PyError {
             kind: PyErrorKind::AttributeError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -326,6 +407,7 @@ impl PyError {
             kind: PyErrorKind::ValueError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -334,6 +416,7 @@ impl PyError {
             kind: PyErrorKind::ZeroDivisionError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -342,6 +425,7 @@ impl PyError {
             kind: PyErrorKind::OverflowError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -350,6 +434,7 @@ impl PyError {
             kind: PyErrorKind::RuntimeError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -358,6 +443,7 @@ impl PyError {
             kind: PyErrorKind::KeyError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -366,6 +452,7 @@ impl PyError {
             kind: PyErrorKind::OSError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -381,6 +468,7 @@ impl PyError {
             kind,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -391,6 +479,7 @@ impl PyError {
             kind: PyErrorKind::ReferenceError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -399,6 +488,7 @@ impl PyError {
             kind: PyErrorKind::RecursionError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -411,6 +501,7 @@ impl PyError {
             kind: PyErrorKind::MemoryError,
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -419,6 +510,7 @@ impl PyError {
             kind: PyErrorKind::StopIteration,
             message: String::new(),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         }
     }
 
@@ -479,6 +571,7 @@ impl PyError {
             PyErrorKind::DescrMismatch => ExcKind::TypeError,
             PyErrorKind::SystemExit => ExcKind::SystemExit,
             PyErrorKind::MemoryError => ExcKind::MemoryError,
+            PyErrorKind::SystemError => ExcKind::SystemError,
         }
     }
 
@@ -494,6 +587,7 @@ impl PyError {
                 kind: Self::kind_from_exc(kind),
                 message,
                 exc_object: obj,
+                attach_tb: true,
             }
         }
     }
@@ -525,6 +619,7 @@ impl PyError {
             ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
             ExcKind::MemoryError => PyErrorKind::MemoryError,
+            ExcKind::SystemError => PyErrorKind::SystemError,
         }
     }
 
@@ -550,11 +645,206 @@ pub fn write_exception<W: Write>(
     include_traceback: bool,
 ) -> std::io::Result<()> {
     if include_traceback {
+        // `traceback.py:171-194` __cause__ / __context__ chain
+        // printing.  Recurse into the older exception first, emit
+        // the bridging banner, then print the current exception.
+        if !err.exc_object.is_null() {
+            write_chained_context(writer, err.exc_object)?;
+        }
         writeln!(writer, "Traceback (most recent call last):")?;
-        writeln!(writer, "  {}", err.render_exception())
+        write_traceback_chain(writer, err)?;
+        writeln!(writer, "{}", err.render_exception())?;
+        write_exception_notes(writer, err.exc_object)
     } else {
         writeln!(writer, "{}", err.render_exception())
     }
+}
+
+/// `Lib/traceback.py:171-200 TracebackException._format_*` parity —
+/// walk `__cause__` (or `__context__` when `__suppress_context__` is
+/// False) chains and emit each older exception with the appropriate
+/// bridging banner before the current one.
+fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return Ok(());
+    }
+    let cause = unsafe { pyre_object::excobject::w_exception_get_cause(exc) };
+    let context = unsafe { pyre_object::excobject::w_exception_get_context(exc) };
+    let suppress = unsafe { pyre_object::excobject::w_exception_get_suppress_context(exc) };
+
+    // `traceback.py:184-191` — `__cause__` wins over `__context__`;
+    // `__suppress_context__` (set by `raise X from None`) hides
+    // `__context__` only when no explicit cause was attached.
+    let (older, banner) = if !cause.is_null() && !unsafe { pyre_object::is_none(cause) } {
+        (
+            cause,
+            "\nThe above exception was the direct cause of the following exception:\n",
+        )
+    } else if !suppress && !context.is_null() && !unsafe { pyre_object::is_none(context) } {
+        (
+            context,
+            "\nDuring handling of the above exception, another exception occurred:\n",
+        )
+    } else {
+        return Ok(());
+    };
+
+    write_chained_context(writer, older)?;
+    write_single_exception(writer, older)?;
+    writeln!(writer, "{}", banner)?;
+    Ok(())
+}
+
+/// Print one W_ExceptionObject as `Traceback ...\n<frames>\n<header>`.
+/// Used by `write_chained_context` when recursing through chained
+/// __cause__ / __context__ predecessors.
+fn write_single_exception<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
+    writeln!(writer, "Traceback (most recent call last):")?;
+    write_traceback_chain_from_exc(writer, exc)?;
+    let render = render_exc_object(exc);
+    writeln!(writer, "{}", render)?;
+    write_exception_notes(writer, exc)
+}
+
+/// `Lib/traceback.py:_format_final_exc_line` notes block — each entry of
+/// `e.__notes__` is printed on its own line after the exception
+/// header.  Notes are stored in ATTR_TABLE as a list of strings by
+/// `BaseException.add_note` (PEP 678).
+fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return Ok(());
+    }
+    let notes = match crate::baseobjspace::getattr(exc, "__notes__") {
+        Ok(v) if !v.is_null() => v,
+        _ => return Ok(()),
+    };
+    if !unsafe { pyre_object::is_list(notes) } {
+        return Ok(());
+    }
+    let len = unsafe { pyre_object::w_list_len(notes) } as i64;
+    for i in 0..len {
+        let item = unsafe { pyre_object::w_list_getitem(notes, i) }.unwrap_or(pyre_object::PY_NULL);
+        if item.is_null() {
+            continue;
+        }
+        let s = unsafe { crate::display::py_str(item) };
+        for line in s.lines() {
+            writeln!(writer, "{}", line)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compose the `ExcName: msg` header for a W_ExceptionObject —
+/// equivalent to `traceback.format_exception_only`'s last line.
+fn render_exc_object(exc: PyObjectRef) -> String {
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return String::from("<no exception>");
+    }
+    let kind = unsafe { pyre_object::excobject::w_exception_get_kind(exc) };
+    let name = exc_kind_name(kind);
+    // `str(e)` semantically — pyre stores args as a list; the
+    // first arg's str repr is the message.  Empty args produces
+    // bare `ExcName` per `traceback.format_exception_only`.
+    let args = unsafe { pyre_object::excobject::w_exception_get_args(exc) };
+    let msg = unsafe {
+        if args.is_null() || !pyre_object::is_tuple(args) {
+            String::new()
+        } else {
+            let len = pyre_object::w_tuple_len(args);
+            if len == 0 {
+                String::new()
+            } else if len == 1 {
+                let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(pyre_object::PY_NULL);
+                if first.is_null() {
+                    String::new()
+                } else {
+                    crate::display::py_str(first)
+                }
+            } else {
+                // Multi-arg exceptions render as tuple repr — matches
+                // BaseException.__str__ (`interp_exceptions.py:142`).
+                let items: Vec<String> = (0..len as i64)
+                    .filter_map(|i| pyre_object::w_tuple_getitem(args, i))
+                    .map(|w| crate::display::py_repr(w))
+                    .collect();
+                format!("({})", items.join(", "))
+            }
+        }
+    };
+    if msg.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {msg}")
+    }
+}
+
+/// `pypy/interpreter/error.py:125-158 print_app_tb_only` parity —
+/// walk the chained `W_PyTraceback` head→tail (outermost → innermost)
+/// and print each frame as `File "<path>", line N, in <name>` plus the
+/// source line.  Silently no-ops when `err.exc_object` is null, the
+/// traceback slot is empty, or the source file can't be read.
+fn write_traceback_chain<W: Write>(writer: &mut W, err: &PyError) -> std::io::Result<()> {
+    if err.exc_object.is_null() {
+        return Ok(());
+    }
+    write_traceback_chain_from_exc(writer, err.exc_object)
+}
+
+fn write_traceback_chain_from_exc<W: Write>(
+    writer: &mut W,
+    exc: PyObjectRef,
+) -> std::io::Result<()> {
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return Ok(());
+    }
+    let mut tb = unsafe { pyre_object::excobject::w_exception_get_traceback(exc) };
+    while !tb.is_null() {
+        if !unsafe { crate::pytraceback::is_pytraceback(tb) } {
+            break;
+        }
+        let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(tb) };
+        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
+        let (filename, funcname) = if w_code.is_null() {
+            (String::from("<unknown>"), String::from("<unknown>"))
+        } else {
+            // `w_code` is a GC-rooted `W_CodeObject` pointer captured
+            // at `record_application_traceback` time; the inner
+            // `CodeObject` lives as long as `w_code` is reachable.
+            let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+            if code_obj.is_null() {
+                (String::from("<unknown>"), String::from("<unknown>"))
+            } else {
+                let code = unsafe { &*code_obj };
+                (code.source_path.to_string(), code.obj_name.to_string())
+            }
+        };
+        writeln!(
+            writer,
+            "  File \"{}\", line {}, in {}",
+            filename, lineno, funcname
+        )?;
+        if let Some(line) = read_source_line(&filename, lineno) {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            writeln!(writer, "    {}", trimmed.trim_start())?;
+        }
+        tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(tb) };
+    }
+    Ok(())
+}
+
+/// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
+/// `None` for synthetic / unreadable sources — matches PyPy's silent
+/// `linecache.getline` fallback at `error.py:150`.
+fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
+    if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
+        return None;
+    }
+    let content = std::fs::read_to_string(filename).ok()?;
+    content
+        .lines()
+        .nth((lineno - 1) as usize)
+        .map(|s| s.to_string())
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {

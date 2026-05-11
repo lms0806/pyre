@@ -490,6 +490,7 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     {
         entries.remove(idx);
         dict.len -= 1;
+
         true
     } else {
         false
@@ -507,6 +508,7 @@ pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
     {
         entries.remove(idx);
         dict.len -= 1;
+
         hit = true;
     }
     // Storage proxy sync: keep `pick_builtin`'s lazy mirror / `globals()`
@@ -546,6 +548,7 @@ pub unsafe fn w_dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> bool {
     if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
         entries.remove(idx);
         dict.len -= 1;
+
         hit = true;
     }
     // String-key delete must also flow into the storage proxy so

@@ -129,7 +129,7 @@ fn real_main(binary_name: &str) {
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
             importing::set_sys_argv(&["-c".to_string()]);
-            run_source(&cmd, Mode::Exec);
+            run_source(&cmd, Mode::Exec, "<string>");
             if inspect {
                 repl::run_repl(true);
             }
@@ -153,7 +153,7 @@ fn real_main(binary_name: &str) {
             let argv = vec![path.clone()];
             // lexopt consumed script name; remaining values go to sys.argv[1:]
             importing::set_sys_argv(&argv);
-            run_source(&source, Mode::Exec);
+            run_source(&source, Mode::Exec, &path);
             if inspect {
                 repl::run_repl(true);
             }
@@ -167,8 +167,8 @@ fn real_main(binary_name: &str) {
     }
 }
 
-fn run_source(source: &str, mode: Mode) {
-    let code = match compile_source(source, mode) {
+fn run_source(source: &str, mode: Mode, filename: &str) {
+    let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{e}");

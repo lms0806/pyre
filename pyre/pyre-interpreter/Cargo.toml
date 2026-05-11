@@ -27,3 +27,5 @@ num-integer = { workspace = true }
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }
 sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "e79df4a6fb788eb8c0c8ea823621e175396612e5" }
 libc = "0.2"
+siphasher = "1.0"
+caseless = "0.2"

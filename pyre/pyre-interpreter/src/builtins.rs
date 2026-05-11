@@ -1352,6 +1352,112 @@ fn make_exc_type(
         name,
         move |ns| {
             crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+            // `pypy/module/exceptions/interp_exceptions.py:225-235`
+            // `BaseException.with_traceback` — installed on every
+            // builtin exception class so MRO lookup from a subclass
+            // (`MyError.with_traceback`) hits the canonical method
+            // even before user-level `class MyError(BaseException):`
+            // metaclass walks BaseException's namespace.  PyPy adds
+            // this to BaseException only; pyre's `make_exc_type`
+            // wires it into every class because Pyre doesn't run
+            // `BaseException.__init_subclass__` at builtin-bootstrap
+            // time, so without per-class install `subclass.with_traceback`
+            // raises AttributeError.
+            if name == "BaseException" {
+                crate::dict_storage_store(
+                    ns,
+                    "with_traceback",
+                    make_builtin_function_with_arity(
+                        "with_traceback",
+                        |args| {
+                            let w_self = *args.first().ok_or_else(|| {
+                                crate::PyError::type_error(
+                                    "with_traceback() missing 1 required positional argument: 'self'",
+                                )
+                            })?;
+                            let w_tb = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                            if !w_self.is_null() && unsafe { pyre_object::is_exception(w_self) } {
+                                // `interp_exceptions.py:213-219
+                                // descr_settraceback` — only None or
+                                // PyTraceback is accepted.
+                                let value =
+                                    if w_tb.is_null() || unsafe { pyre_object::is_none(w_tb) } {
+                                        pyre_object::PY_NULL
+                                    } else if unsafe { crate::pytraceback::is_pytraceback(w_tb) } {
+                                        w_tb
+                                    } else {
+                                        return Err(crate::PyError::type_error(
+                                            "__traceback__ must be a traceback or None",
+                                        ));
+                                    };
+                                unsafe {
+                                    pyre_object::excobject::w_exception_set_traceback(
+                                        w_self, value,
+                                    );
+                                }
+                            }
+                            Ok(w_self)
+                        },
+                        2,
+                    ),
+                );
+                // `interp_exceptions.py:236-247 BaseException.add_note`
+                // (Python 3.11+ PEP 678).  Appends a string to
+                // `self.__notes__`, allocating the list on first call.
+                // The list lives in ATTR_TABLE rather than a typed
+                // W_ExceptionObject slot — notes are a rare attribute,
+                // and the per-instance side store already handles
+                // `e.__notes__` reads via baseobjspace::getattr.
+                crate::dict_storage_store(
+                    ns,
+                    "add_note",
+                    make_builtin_function_with_arity(
+                        "add_note",
+                        |args| {
+                            let w_self = *args.first().ok_or_else(|| {
+                                crate::PyError::type_error(
+                                    "add_note() missing 1 required positional argument: 'self'",
+                                )
+                            })?;
+                            let w_note = *args.get(1).ok_or_else(|| {
+                                crate::PyError::type_error(
+                                    "add_note() missing 1 required positional argument: 'note'",
+                                )
+                            })?;
+                            // `interp_exceptions.py:238-239` — only
+                            // `str` is accepted.
+                            if w_note.is_null() || !unsafe { pyre_object::is_str(w_note) } {
+                                return Err(crate::PyError::type_error("note must be a string"));
+                            }
+                            // `interp_exceptions.py:240-254` — lazy
+                            // list allocation on first call; if the
+                            // attribute is already set but NOT a list,
+                            // PyPy raises TypeError("Cannot add note:
+                            // __notes__ is not a list") per `:254`.
+                            let existing = crate::baseobjspace::getattr(w_self, "__notes__")
+                                .ok()
+                                .filter(|w| !w.is_null());
+                            let notes = match existing {
+                                Some(v) if unsafe { pyre_object::is_list(v) } => v,
+                                Some(_) => {
+                                    return Err(crate::PyError::type_error(
+                                        "Cannot add note: __notes__ is not a list",
+                                    ));
+                                }
+                                None => {
+                                    let fresh = pyre_object::w_list_new(Vec::new());
+                                    let _ =
+                                        crate::baseobjspace::setattr(w_self, "__notes__", fresh);
+                                    fresh
+                                }
+                            };
+                            unsafe { pyre_object::w_list_append(notes, w_note) };
+                            Ok(pyre_object::w_none())
+                        },
+                        2,
+                    ),
+                );
+            }
         },
         base,
     );
@@ -2847,6 +2953,24 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     names.push(pyre_object::w_str_get_value(k).to_string());
                 }
             }
+        } else {
+            // Fallback: walk the object's type namespace so user-
+            // visible attributes on builtin W_Root types (PyTraceback,
+            // dict view, etc.) surface in dir().  Mirrors PyPy's
+            // `typeobject.py:1247 type_dir` MRO walk.  Excluded for
+            // module/instance/type/dict above because those have
+            // richer paths that combine instance+class entries.
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if pyre_object::is_type(w_type) {
+                    let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
+                    if !ns_ptr.is_null() {
+                        let ns = &*(ns_ptr as *const DictStorage);
+                        for (name, _) in ns.entries() {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
     names.sort();
@@ -2861,10 +2985,46 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(args[0] as i64))
 }
 
-/// `hash(obj)` — PyPy: baseobjspace.py hash → identity for now
+/// `hash(obj)` — PyPy: `descroperation.py:1006 hash`.
+///
+/// CPython / PyPy raise `TypeError: unhashable type: 'X'` when the
+/// object's class lacks a non-None `__hash__` slot.  Built-in
+/// mutable containers (dict, list, set, bytearray) explicitly set
+/// `__hash__ = None` (`dictmultiobject.py:1431`, `listobject.py`,
+/// `setobject.py`).  Pyre's `hash_value` falls through to identity
+/// for un-typed objects, so this wrapper screens the known
+/// unhashables before calling.
 fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "hash() takes exactly one argument");
-    Ok(w_int_new(hash_value(args[0])))
+    let obj = args[0];
+    if obj.is_null() {
+        return Err(crate::PyError::type_error("hash() argument is null"));
+    }
+    unsafe {
+        let kind = if pyre_object::is_dict(obj) {
+            Some("dict")
+        } else if pyre_object::is_list(obj) {
+            Some("list")
+        } else if pyre_object::is_set(obj) {
+            // `frozenset` is hashable per setobject.py:623-642 _hash_frozenset.
+            Some("set")
+        } else if pyre_object::is_bytearray(obj) {
+            Some("bytearray")
+        } else if pyre_object::dictviewobject::is_dict_view(obj) {
+            // `dictmultiobject.py:1619 _is_set_like` views inherit set's
+            // unhashable semantics; values view also isn't hashable.
+            Some("dict view")
+        } else {
+            None
+        };
+        if let Some(name) = kind {
+            return Err(crate::PyError::type_error(&format!(
+                "unhashable type: '{}'",
+                name
+            )));
+        }
+    }
+    Ok(w_int_new(hash_value(obj)))
 }
 
 /// `pypy/objspace/std/intobject.py:36-37` — `HASH_BITS = 61` (64-bit
@@ -3111,6 +3271,43 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
     h
 }
 
+/// `pypy/objspace/std/unicodeobject.py:341-345 W_UnicodeObject.hash_w`
+/// parity:
+///
+/// ```python
+/// def hash_w(self):
+///     x = compute_hash(self._utf8)
+///     x -= (x == -1)
+///     return x
+/// ```
+///
+/// `compute_hash` is `rpython.rlib.objectmodel.compute_hash` —
+/// on 64-bit hosts it delegates to `rpython.rlib.rsiphash.siphash24`
+/// with a 16-byte secret key set via `rsiphash.choose_initial_seed`
+/// (rpython/rlib/rsiphash.py:48).  The seed is read from
+/// `PYTHONHASHSEED`, defaulting to a randomised value at process
+/// start (CPython parity: `Random_Hash_Function_Seed_String`).
+///
+/// Pyre uses a fixed 16-byte key here so test runs are deterministic
+/// (matching `PYTHONHASHSEED=0`).  Switching to a randomised seed
+/// is straight-forward (`OnceLock<[u8; 16]>` seeded from
+/// `getrandom` or the env var) once tests are robust to it.
+fn _hash_str(s: &str) -> i64 {
+    use core::hash::Hasher;
+    // `rpython/rlib/rsiphash.py:60-62 _build_key_from_seed` — when
+    // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
+    // Pyre runs with the deterministic seed for reproducibility,
+    // matching PyPy's `PYTHONHASHSEED=0` byte-for-byte.  Wiring a
+    // user-overridable seed is straight-forward (`OnceLock<[u8; 16]>`
+    // sampled from `getrandom` or the env var) once tests are
+    // robust to it.
+    static SECRET: [u8; 16] = [0u8; 16];
+    let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
+    hasher.write(s.as_bytes());
+    let raw = hasher.finish() as i64;
+    raw - ((raw == -1) as i64)
+}
+
 /// `pypy/objspace/std/setobject.py:623-642 W_FrozensetObject.descr_hash`
 /// line-by-line port:
 ///
@@ -3181,19 +3378,7 @@ pub(crate) fn hash_value(obj: PyObjectRef) -> i64 {
             return _hash_float(pyre_object::w_float_get_value(obj));
         }
         if is_str(obj) {
-            // PRE-EXISTING-ADAPTATION — `unicodeobject.py:341 hash_w`
-            // calls `compute_hash(self._utf8)` (RPython's siphash24
-            // on 64-bit hosts).  Pyre's FNV mix below is
-            // deterministic and content-derived but not bit-identical
-            // to CPython/PyPy.  Convergence target: import siphash24
-            // (e.g. `siphasher` crate) and use the per-process secret
-            // key.
-            let s = w_str_get_value(obj);
-            let mut h: i64 = 0;
-            for b in s.bytes() {
-                h = h.wrapping_mul(1000003).wrapping_add(b as i64);
-            }
-            return h;
+            return _hash_str(w_str_get_value(obj));
         }
         if pyre_object::is_none(obj) {
             return 0;
@@ -3286,11 +3471,19 @@ fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let func = args[0];
-    let iterable = args[1];
-    let items = collect_iterable(iterable)?;
-    let mut results = Vec::with_capacity(items.len());
-    for item in items {
-        let result = crate::call_function(func, &[item]);
+    // `pypy/module/__builtin__/functional.py:336-355 W_Map.descr_new`
+    // accepts any number of iterables; each iteration calls
+    // `func(*tuple_of_one_item_per_iterable)` and stops at the
+    // shortest iterable.  Single-iterable map is the trivial case.
+    let iters: Vec<Vec<PyObjectRef>> = args[1..]
+        .iter()
+        .map(|&it| collect_iterable(it))
+        .collect::<Result<_, _>>()?;
+    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
+    let mut results = Vec::with_capacity(min_len);
+    for i in 0..min_len {
+        let call_args: Vec<PyObjectRef> = iters.iter().map(|v| v[i]).collect();
+        let result = crate::call_function(func, &call_args);
         results.push(result);
     }
     let n = results.len();
@@ -3300,6 +3493,15 @@ fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `zip(*iterables)` — PyPy: functional.py W_Zip
 fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `pypy/module/__builtin__/functional.py:411-414 W_Zip.descr_new`
+    // accepts `strict` as a keyword.  Pyre's flat builtin ABI surfaces
+    // kwargs as a trailing `__pyre_kw__` dict; strip it before the
+    // positional walk and look up `strict` from it.
+    let (args, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
+    let strict = kwarg_get(kwargs, "strict")
+        .map(|v| crate::baseobjspace::is_true(v))
+        .unwrap_or(false);
     if args.is_empty() {
         return Ok(pyre_object::w_seq_iter_new(
             pyre_object::w_list_new(vec![]),
@@ -3340,6 +3542,31 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         iters.push(items);
     }
     let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
+    // `functional.py:411-435 W_Zip.descr_new` — strict mode raises
+    // ValueError when iterables have different lengths.  Detect by
+    // checking max == min; report which argument was longer/shorter
+    // per CPython's `zip()` message format.
+    if strict {
+        let max_len = iters.iter().map(|v| v.len()).max().unwrap_or(0);
+        if max_len != min_len {
+            // CPython's `zip()` reports the first SHORT argument (the
+            // one with `len < max_len`) as "shorter than argument N"
+            // where N is some earlier (longer) argument.  Find the
+            // first short index — that's the one being reported.
+            let short = iters.iter().position(|v| v.len() < max_len).unwrap_or(0);
+            // Pick any longer argument as the reference point; CPython
+            // names the first one (typically argument 1).
+            let long = iters.iter().position(|v| v.len() == max_len).unwrap_or(0);
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!(
+                    "zip() argument {} is shorter than argument {}",
+                    short + 1,
+                    long + 1
+                ),
+            ));
+        }
+    }
     let mut result = Vec::with_capacity(min_len);
     for i in 0..min_len {
         let tuple_items: Vec<_> = iters.iter().map(|v| v[i]).collect();

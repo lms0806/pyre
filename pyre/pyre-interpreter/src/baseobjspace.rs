@@ -4369,7 +4369,6 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 ));
             }
             if name == "__doc__"
-                || name == "__module__"
                 || name == "__flags__"
                 || name == "__code__"
                 || name == "__func__"
@@ -4386,6 +4385,12 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
                 return Ok(w_none());
             }
+            // `__module__` is NOT in the short-circuit list — it falls
+            // through to the normal descriptor protocol so type's
+            // `__module__` GetSetProperty (`typedef.rs init_type_type`)
+            // can resolve via PyPy's `typeobject.py:614-624 get_module`
+            // (heaptype reads class dict, builtin types use the dot-
+            // split of the class name with `"builtins"` fallback).
 
             if let Some(value) = lookup_in_type_where(obj, name) {
                 if let Some(result) = get(value, PY_NULL, obj)? {
@@ -5742,32 +5747,25 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
                 return Ok(w_none());
             }
             "__traceback__" => {
-                // `interp_exceptions.py:203-206 descr_settraceback` —
-                // must be a traceback or None.  Pyre has no real
-                // traceback objects yet (`getattr(exc,
-                // "__traceback__")` returns a stub `W_InstanceObject`
-                // carrying `tb_frame`/`tb_lineno`/`tb_next`), so the
-                // validation rejects the obviously-wrong primitive
-                // types while accepting None or any object that could
-                // plausibly carry traceback attributes.
-                if !unsafe { pyre_object::is_none(value) } {
-                    let primitive = unsafe {
-                        pyre_object::is_int(value)
-                            || pyre_object::is_long(value)
-                            || pyre_object::is_str(value)
-                            || pyre_object::is_float(value)
-                            || pyre_object::is_tuple(value)
-                            || pyre_object::is_list(value)
-                            || pyre_object::is_bool(value)
-                            || pyre_object::is_dict(value)
-                    };
-                    if primitive {
-                        return Err(PyError::type_error(
-                            "__traceback__ must be a traceback or None",
-                        ));
-                    }
+                // `interp_exceptions.py:202-206 descr_settraceback` —
+                // accept None or PyTraceback only.  Now that real
+                // W_PyTraceback exists, narrow the type check to the
+                // exact pair PyPy accepts; reject everything else as
+                // TypeError per PyPy.
+                let accept = unsafe {
+                    pyre_object::is_none(value) || crate::pytraceback::is_pytraceback(value)
+                };
+                if !accept {
+                    return Err(PyError::type_error(
+                        "__traceback__ must be a traceback or None",
+                    ));
                 }
-                unsafe { pyre_object::excobject::w_exception_set_traceback(obj, value) };
+                let stored = if unsafe { pyre_object::is_none(value) } {
+                    pyre_object::PY_NULL
+                } else {
+                    value
+                };
+                unsafe { pyre_object::excobject::w_exception_set_traceback(obj, stored) };
                 return Ok(w_none());
             }
             "__suppress_context__" => {
@@ -7185,19 +7183,25 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
-    // .descr_iter` (and the values / items siblings) materialise an
-    // iterator over the source dict's current entries.  Pyre routes
-    // through `dict_view_snapshot` which produces the kind-appropriate
-    // list (keys / values / (k,v) tuples) and wraps it in a sequence
-    // iterator — same observable behaviour as PyPy's per-kind
-    // _iter_keys / _iter_values / _iter_items.
+    // `pypy/objspace/std/dictmultiobject.py:1701-1741
+    // W_BaseDictIterator` line-by-line port — pyre's `W_DictViewIterator`
+    // captures the source dict + the version counter seen at iter()
+    // time, then on each `next()` step compares against `w_dict.version`
+    // and raises `RuntimeError("dictionary changed size during
+    // iteration")` if the dict was mutated mid-iteration.
     unsafe {
         if pyre_object::dictviewobject::is_dict_view(obj) {
-            let snapshot = crate::type_methods::dict_view_snapshot(obj);
-            let n = snapshot.len();
-            let list = pyre_object::w_list_new(snapshot);
-            return Ok(pyre_object::w_seq_iter_new(list, n));
+            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+            let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
+            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+                w_dict, kind,
+            ));
+        }
+        // `dict_keyiterator` / `dict_valueiterator` / `dict_itemiterator`
+        // — `__iter__` returns self per `dictmultiobject.py:1716-1717
+        // W_BaseDictIterator.iter_w`.
+        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+            return Ok(obj);
         }
     }
     unsafe {
@@ -7385,6 +7389,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 kind: PyErrorKind::StopIteration,
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
+                attach_tb: true,
             });
         }
         // Range iterator
@@ -7406,6 +7411,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 kind: PyErrorKind::StopIteration,
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
+                attach_tb: true,
             });
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
@@ -7441,6 +7447,47 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::itertoolsmodule::w_repeat_dec_count(obj);
             }
             return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
+        }
+        // `pypy/objspace/std/dictmultiobject.py:1719-1741
+        // W_BaseDictIterator.descr_next` line-by-line —
+        //
+        //     def next(self):
+        //         if self.len != self.w_dict.length():
+        //             raise oefmt(space.w_RuntimeError,
+        //                 "dictionary changed size during iteration")
+        //         ...
+        //
+        // Only `len` is compared — re-assigning an existing key
+        // (overwrite) is permitted because `length()` is unchanged.
+        // Pyre also routes the entry read through `w_dict_items()`
+        // so DictStorage-backed dicts (globals(), module dict)
+        // see their authoritative storage instead of the local
+        // mirror.
+        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+            use pyre_object::dictviewobject as dv;
+            let dict = dv::w_dict_view_iterator_get_dict(obj);
+            let startlen = dv::w_dict_view_iterator_get_startlen(obj);
+            let current_len = pyre_object::dictobject::w_dict_len(dict);
+            if startlen != current_len {
+                return Err(PyError::new(
+                    PyErrorKind::RuntimeError,
+                    "dictionary changed size during iteration".to_string(),
+                ));
+            }
+            let index = dv::w_dict_view_iterator_get_index(obj);
+            let items = pyre_object::dictobject::w_dict_items(dict);
+            if index >= items.len() {
+                return Err(PyError::stop_iteration());
+            }
+            let (k, v) = items[index];
+            dv::w_dict_view_iterator_set_index(obj, index + 1);
+            return Ok(match dv::w_dict_view_iterator_get_kind(obj) {
+                pyre_object::dictviewobject::DictViewKind::Keys => k,
+                pyre_object::dictviewobject::DictViewKind::Values => v,
+                pyre_object::dictviewobject::DictViewKind::Items => {
+                    pyre_object::w_tuple_new(vec![k, v])
+                }
+            });
         }
         // `pypy/module/__builtin__/functional.py:280-310 W_Enumerate.descr_next`
         // line-by-line port —
@@ -7733,6 +7780,7 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         kind: PyErrorKind::GeneratorExit,
         message: String::new(),
         exc_object: std::ptr::null_mut(),
+        attach_tb: true,
     };
     match generator_send_ex(gen_obj, w_none(), Some(err)) {
         Ok(_) => {
@@ -7776,6 +7824,7 @@ fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
                     kind: PyError::kind_from_exc(kind),
                     message: msg,
                     exc_object: std::ptr::null_mut(),
+                    attach_tb: true,
                 };
             }
         }

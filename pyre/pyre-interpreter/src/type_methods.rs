@@ -371,27 +371,19 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// ```
 ///
 /// PyPy delegates to `rpython.rlib.runicode.unicode_casefold` which
-/// applies the full Unicode CaseFolding mapping (ß → ss,
-/// ﬁ → fi, dotless-i variants, etc.).  Pyre has no Unicode-data
-/// dependency, so this routes through Rust's `to_lowercase` and
-/// applies a small whitelist of multi-character casefolds for the
-/// most user-visible mismatches; coverage gap acknowledged inline.
-///
-/// **PRE-EXISTING-ADAPTATION** — full Unicode `CaseFolding.txt` (1500+
-/// code points with status-T and status-F mappings) needs to land in
-/// `pyre-object` before this can mirror `runicode.unicode_casefold`
-/// line-by-line.  The whitelist below covers the German ß, the Latin
-/// ligatures (ﬁ/ﬂ/ﬃ/ﬄ/ﬅ/ﬆ), and Turkish dotless-i variants —
-/// the cases that surface in stdlib tests like
-/// `str.casefold() == str.casefold()` round-trips.  Convergence
-/// target: import the CaseFolding table as a generated `static`
-/// lookup keyed by `char`.
+/// applies the full Unicode `CaseFolding.txt` mapping (status C +
+/// status F: ß → ss, ﬁ → fi, İ → i + combining dot,
+/// Lithuanian Į → i̇ǫ, the Greek sigma, etc.).  Pyre routes through
+/// the `caseless` crate's `default_case_fold_str` which is itself
+/// generated from `CaseFolding.txt` status-C+F entries, so the
+/// surface matches `unicode_casefold` for every Unicode code point.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    Ok(w_str_new(&casefold_basic(s)))
+    Ok(w_str_new(&caseless::default_case_fold_str(s)))
 }
 
+#[allow(dead_code)]
 fn casefold_basic(s: &str) -> String {
     // Multi-char expansion casefolds the Unicode `Final_Sigma` /
     // `Lt`/`Lu` cases pyre's interpreter test corpus actually
@@ -1263,6 +1255,45 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_str_new(&format!("{pad}{s}")))
 }
 
+/// `pypy/objspace/std/unicodeobject.py descr_isprintable` —
+///
+/// ```python
+/// def descr_isprintable(self, space):
+///     for ch in self._utf8:
+///         if not unicodedb.isprintable(ord(ch)):
+///             return space.w_False
+///     return space.w_True
+/// ```
+///
+/// Empty string returns True per CPython.  Non-printable categories
+/// per Unicode standard: Cc/Cf/Cs/Co/Cn/Zl/Zp + Zs other than
+/// U+0020.  Rust stdlib's `char::is_control()` only covers Cc; full
+/// parity requires a Unicode category table.  Convergence path:
+/// import `unicode_general_category` (e.g. via the `unicode-general-category`
+/// crate) and check `!matches!(cat, Cc|Cf|Cs|Co|Cn|Zl|Zp)` + `Zs == ' '`.
+/// For now: approximate via `!c.is_control() && c != ' ' || c == ' '`
+/// which catches the common ASCII-only cases.
+pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    if s.is_empty() {
+        return Ok(w_bool_from(true));
+    }
+    Ok(w_bool_from(s.chars().all(|c| {
+        // Cc (control) — Rust stdlib catches this.
+        // Zl / Zp — single chars U+2028 / U+2029 are non-printable.
+        // Zs other than space — narrow no-break U+202F, etc., are
+        // non-printable, but plain space ' ' is.
+        if c.is_control() {
+            return false;
+        }
+        if c == '\u{2028}' || c == '\u{2029}' {
+            return false;
+        }
+        true
+    })))
+}
+
 /// PyPy: unicodeobject.py descr_isspace
 pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
@@ -1564,23 +1595,16 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// Materialise a dict_keys / values / items view's current snapshot
 /// as a list of items.  Mirrors the body of `W_DictMultiViewKeys
-/// Object._iter_*` (`dictmultiobject.py:451-470`) — pyre's
-/// view-iter dispatch (baseobjspace `__iter__` arm) calls this to
-/// produce the iterator backing list, and `repr` / `len` go through
-/// the same `w_dict_items` snapshot for consistency.
+/// Object._iter_*` (`dictmultiobject.py:451-470`) — pyre's `repr` /
+/// `len` / `compare` / set-op paths call this to produce the
+/// kind-appropriate list eagerly.
 ///
-/// **PRE-EXISTING-ADAPTATION** — PyPy's `_iter_*` returns a *live*
-/// `W_BaseDictIterator` (`dictmultiobject.py:1701-1741`) that walks
-/// the dict's underlying storage on demand, so mutations to the
-/// source dict during iteration surface (`RuntimeError: dictionary
-/// changed size during iteration`).  Pyre snapshots the items eagerly
-/// at iter-acquisition time, so a `dict.update()` in the middle of
-/// `for k in d.keys()` is invisible to the iterator instead of
-/// raising.  Convergence target: introduce live `W_DictViewKeys
-/// Iterator` etc. backed by the dict storage's epoch counter, raising
-/// when the source mutates.  Requires the DictStorage iterators to
-/// gain a stable-identity cursor (currently `w_dict_items` clones
-/// entries into a Vec).
+/// `__iter__` no longer routes through this helper: it allocates a
+/// live `W_DictViewIterator` (per `dictmultiobject.py:1701-1741
+/// W_BaseDictIterator`) that walks the source dict's entries
+/// directly and trips on the dictversion counter, raising
+/// `RuntimeError("dictionary changed size during iteration")` when
+/// the source mutates mid-iteration.
 pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
     let kind = unsafe { pyre_object::dictviewobject::w_dict_view_get_kind(view) };
     let dict = unsafe { pyre_object::dictviewobject::w_dict_view_get_dict(view) };
@@ -1814,6 +1838,40 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         Ok(d)
     } else {
         Err(crate::PyError::key_error("dict.pop(): key not found"))
+    }
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:1395 W_DictMultiObject.descr_popitem`:
+///
+/// ```python
+/// def descr_popitem(self, space):
+///     try:
+///         w_key, w_value = self.popitem()
+///     except KeyError:
+///         raise oefmt(space.w_KeyError, "dictionary is empty")
+///     return space.newtuple([w_key, w_value])
+/// ```
+///
+/// In Python 3.7+ `popitem` is LIFO (returns the most recently
+/// inserted pair); pyre's `w_dict_items` preserves insertion order
+/// so popping the last entry matches the spec.
+pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let dict = resolve_dict_backing(args[0]);
+    if dict.is_null() {
+        return Err(crate::PyError::key_error("dictionary is empty"));
+    }
+    unsafe {
+        if pyre_object::w_dict_len(dict) == 0 {
+            return Err(crate::PyError::key_error("dictionary is empty"));
+        }
+        let items = pyre_object::w_dict_items(dict);
+        let (k, v) = items
+            .last()
+            .copied()
+            .ok_or_else(|| crate::PyError::key_error("dictionary is empty"))?;
+        pyre_object::dictobject::w_dict_delitem(dict, k);
+        Ok(pyre_object::w_tuple_new(vec![k, v]))
     }
 }
 

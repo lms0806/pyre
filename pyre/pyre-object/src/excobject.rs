@@ -52,6 +52,10 @@ pub enum ExcKind {
     /// returns NULL.  Subclass of Exception per
     /// pypy/module/exceptions/interp_exceptions.py.
     MemoryError = 24,
+    /// `pypy/module/exceptions/interp_exceptions.py W_SystemError` —
+    /// raised by interpreter-internal invariants (e.g.
+    /// `chain_exceptions` rejecting non-BaseException context).
+    SystemError = 25,
 }
 
 /// Layout: `[ob_header | kind: ExcKind | message: *mut String | args_w: PyObjectRef]`
@@ -406,6 +410,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::UnicodeEncodeError => "UnicodeEncodeError",
         ExcKind::SystemExit => "SystemExit",
         ExcKind::MemoryError => "MemoryError",
+        ExcKind::SystemError => "SystemError",
     }
 }
 

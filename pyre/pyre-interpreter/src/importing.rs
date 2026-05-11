@@ -4664,6 +4664,7 @@ fn load_part(
             kind: crate::PyErrorKind::ImportError,
             message: format!("builtin module '{modulename}' failed to initialize"),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         })?;
         set_sys_module(modulename, m);
         return Ok(Some(m));
@@ -4693,6 +4694,7 @@ fn load_part(
                 kind: crate::PyErrorKind::ImportError,
                 message: format!("builtin module '{modulename}' failed to initialize"),
                 exc_object: std::ptr::null_mut(),
+                attach_tb: true,
             })?;
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
@@ -4794,6 +4796,7 @@ fn relative_import(
         kind: crate::PyErrorKind::ImportError,
         message: "attempted relative import with no known parent package".to_string(),
         exc_object: std::ptr::null_mut(),
+        attach_tb: true,
     })?;
 
     // Strip (level - 1) trailing components from package
@@ -4807,6 +4810,7 @@ fn relative_import(
                 "attempted relative import beyond top-level package (package='{package}', level={level})"
             ),
             exc_object: std::ptr::null_mut(),
+            attach_tb: true,
         });
     }
     for _ in 0..strips {
