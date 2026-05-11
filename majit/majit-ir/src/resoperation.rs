@@ -3933,11 +3933,15 @@ mod tests {
 
     #[test]
     fn test_op_new() {
-        let op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        // IntAdd takes two Int operands (resoperation.py:1693
+        // `opclasses[INT_ADD].arity` = 2).
+        let lhs = OpRef::int_op(0);
+        let rhs = OpRef::int_op(1);
+        let op = Op::new(OpCode::IntAdd, &[lhs, rhs]);
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.args.len(), 2);
-        assert_eq!(op.args[0], OpRef::from_raw(0));
-        assert_eq!(op.args[1], OpRef::from_raw(1));
+        assert_eq!(op.args[0], lhs);
+        assert_eq!(op.args[1], rhs);
         assert!(op.descr.is_none());
         assert!(op.fail_args.is_none());
         assert_eq!(op.result_type(), Type::Int);
@@ -3946,9 +3950,11 @@ mod tests {
 
     #[test]
     fn test_op_getarg() {
-        let op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_raw(20)]);
-        assert_eq!(op.arg(0), OpRef::from_raw(10));
-        assert_eq!(op.arg(1), OpRef::from_raw(20));
+        let lhs = OpRef::int_op(10);
+        let rhs = OpRef::int_op(20);
+        let op = Op::new(OpCode::IntAdd, &[lhs, rhs]);
+        assert_eq!(op.arg(0), lhs);
+        assert_eq!(op.arg(1), rhs);
     }
 
     // ── Descriptor requirements ──

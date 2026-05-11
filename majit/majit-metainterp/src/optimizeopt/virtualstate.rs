@@ -1602,30 +1602,6 @@ impl VirtualState {
             _ => None,
         }
     }
-
-    /// Merge two virtual states. For each entry, take the weaker
-    /// (more general) of the two. Used when multiple paths converge.
-    pub fn merge(&self, other: &VirtualState) -> VirtualState {
-        let merged: Vec<Rc<VirtualStateInfoNode>> = self
-            .state
-            .iter()
-            .zip(other.state.iter())
-            .map(|(a, b)| {
-                if a.is_compatible(b) {
-                    Rc::clone(a)
-                } else {
-                    // Widen to the common type, or fall back to Ref.
-                    // RPython's `not_virtual(cpu, box.type, None)`
-                    // reconstructs the `type` discriminant from the Box
-                    // at merge time; pyre keeps the type on the
-                    // pre-existing `Unknown(Type)` tag.
-                    let tp = a.info_type().or_else(|| b.info_type()).unwrap_or(Type::Ref);
-                    VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(tp))
-                }
-            })
-            .collect();
-        VirtualState::from_shared_rcs(merged)
-    }
 }
 
 impl Clone for VirtualState {

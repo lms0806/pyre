@@ -376,11 +376,12 @@ impl Optimizer {
             VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
             VirtualStateInfo::Unknown(tp) => *tp,
         };
-        let opref = if tp == majit_ir::Type::Void {
-            ctx.alloc_op_position()
-        } else {
-            ctx.alloc_op_position_typed(tp)
-        };
+        // `alloc_op_position_typed(Void)` mints a `VoidOp(_)` variant —
+        // resoperation.py:260 `AbstractResOp.type = 'v'` parity. Past
+        // version routed Void through `alloc_op_position()` which
+        // returned `Untyped(_)`; that left a variant-Eq miss when a
+        // downstream lookup carried the canonical `VoidOp` discriminant.
+        let opref = ctx.alloc_op_position_typed(tp);
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("[jit] import_virtual_state_value {opref:?} <= {info:?}");
         }
@@ -684,10 +685,19 @@ impl Optimizer {
                 // typed `OpRef::input_arg_typed` minted at trace start
                 // (pyre/pyre-jit-trace/src/trace.rs) under variant-aware Eq.
                 let pos = ctx.inputarg_base + iv.inputarg_index as u32;
-                let raw = match ctx.inputarg_type_at(iv.inputarg_index) {
-                    Some(tp) => OpRef::input_arg_typed(pos, tp),
-                    None => OpRef::from_raw(pos),
-                };
+                // resoperation.py:719/727/739 InputArg{Int,Float,Ref} class
+                // hierarchy fixes `box.type` at construction; a missing
+                // entry in `inputarg_types` is an invariant violation, not
+                // an Ref-fallback opportunity.
+                let tp = ctx.inputarg_type_at(iv.inputarg_index).unwrap_or_else(|| {
+                    panic!(
+                        "inputarg_type_at({}) returned None: \
+                             RPython InputArg* class fixes box.type at \
+                             construction (resoperation.py:719/727/739)",
+                        iv.inputarg_index
+                    )
+                });
+                let raw = OpRef::input_arg_typed(pos, tp);
                 let virtual_head = ctx.get_box_replacement(raw);
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
@@ -2034,10 +2044,14 @@ impl Optimizer {
             let typed_inputargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let pos = inputarg_base + i as u32;
-                    match ctx.inputarg_type_at(i) {
-                        Some(tp) => OpRef::input_arg_typed(pos, tp),
-                        None => OpRef::from_raw(pos),
-                    }
+                    let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
+                        panic!(
+                            "inputarg_type_at({i}) returned None: \
+                             RPython InputArg* class fixes box.type at \
+                             construction (resoperation.py:719/727/739)"
+                        )
+                    });
+                    OpRef::input_arg_typed(pos, tp)
                 })
                 .collect();
             let source_set: std::collections::HashSet<OpRef> =
@@ -2059,17 +2073,17 @@ impl Optimizer {
                         // (history.py:220), so a None here would mean the
                         // source slot has no resolvable type — impossible
                         // under upstream invariants.
-                        let fresh = match ctx.opref_type(source) {
-                            Some(tp) => ctx.alloc_op_position_typed(tp),
-                            None => {
-                                debug_assert!(
-                                    false,
-                                    "cross-slot collision: source {:?} has no resolvable box.type (RPython invariant violated)",
-                                    source,
-                                );
-                                ctx.alloc_op_position()
-                            }
-                        };
+                        // history.py:220 RPython Box always carries
+                        // `box.type` — a missing entry is an invariant
+                        // violation, not a Ref-fallback opportunity.
+                        let tp = ctx.opref_type(source).unwrap_or_else(|| {
+                            panic!(
+                                "cross-slot collision: source {:?} has no resolvable box.type \
+                                 (RPython invariant: every Box carries `.type` per history.py:220)",
+                                source,
+                            )
+                        });
+                        let fresh = ctx.alloc_op_position_typed(tp);
                         ctx.replace_op(source, fresh);
                         fresh
                     } else {
@@ -2095,9 +2109,16 @@ impl Optimizer {
                     );
                 }
                 if !self.imported_virtuals.is_empty() {
-                    let upper = ctx.inputarg_base + ctx.num_inputs;
-                    for raw in ctx.inputarg_base..upper {
-                        let raw = OpRef::from_raw(raw);
+                    for i in 0..ctx.num_inputs as usize {
+                        let raw_pos = ctx.inputarg_base + i as u32;
+                        let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
+                            panic!(
+                                "inputarg_type_at({i}) returned None: \
+                                 RPython InputArg* class fixes box.type at \
+                                 construction (resoperation.py:719/727/739)"
+                            )
+                        });
+                        let raw = OpRef::input_arg_typed(raw_pos, tp);
                         eprintln!(
                             "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
                             ctx.get_box_replacement(raw)
@@ -2398,17 +2419,14 @@ impl Optimizer {
                                     // mean an emitted virtual-field producer
                                     // has no resolvable type — impossible
                                     // under upstream invariants.
-                                    let ff = match ctx.opref_type(orig_field) {
-                                        Some(tp) => ctx.alloc_op_position_typed(tp),
-                                        None => {
-                                            debug_assert!(
-                                                false,
-                                                "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
-                                                orig_field,
-                                            );
-                                            ctx.alloc_op_position()
-                                        }
-                                    };
+                                    let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
+                                        panic!(
+                                            "virtual-field alias: orig_field {:?} has no resolvable box.type \
+                                             (RPython invariant: every Box carries `.type` per history.py:220)",
+                                            orig_field,
+                                        )
+                                    });
+                                    let ff = ctx.alloc_op_position_typed(tp);
                                     ctx.replace_op(ff, orig_field);
                                     field.1 = ff;
                                 }
@@ -2579,10 +2597,14 @@ impl Optimizer {
             let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
                 .map(|i| {
                     let pos = ctx.inputarg_base + i as u32;
-                    match ctx.inputarg_type_at(i) {
-                        Some(tp) => OpRef::input_arg_typed(pos, tp),
-                        None => OpRef::from_raw(pos),
-                    }
+                    let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
+                        panic!(
+                            "inputarg_type_at({i}) returned None: \
+                             RPython InputArg* class fixes box.type at \
+                             construction (resoperation.py:719/727/739)"
+                        )
+                    });
+                    OpRef::input_arg_typed(pos, tp)
                 })
                 .collect();
             crate::optimizeopt::unroll::export_state(

@@ -6948,7 +6948,8 @@ mod tests {
                 debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_guard_class_uses_guard_nonnull_class() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef::from_raw(0);
+        // registers_r[i] tracks locals_cells_stack_w[*] — W_Root array, Type::Ref.
+        let obj = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![obj];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -6985,7 +6986,8 @@ mod tests {
         // intrinsic parity, history.py:220) so the inputarg must be Ref for
         // trace_guarded_int_payload to take the fast path rather than short-circuit.
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let int_obj = OpRef::from_raw(0);
+        // value_type is Ref per the comment above; registers_r[0] = inputarg slot 0.
+        let int_obj = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![int_obj];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -7134,7 +7136,7 @@ mod tests {
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.become_active_vable_owner();
 
         sym.init_symbolic(&mut ctx, frame_ptr);
@@ -7459,7 +7461,9 @@ mod tests {
     fn test_load_local_checked_value_respects_symbolic_local_type() {
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test(1);
-            let local = OpRef::from_raw(0);
+            // The slot type matches `symbolic_type` (resoperation.py:719/727/739
+            // InputArg{Int,Float,Ref}); Void has no inputarg variant in RPython.
+            let local = OpRef::input_arg_typed(0, symbolic_type);
             let mut sym = PyreSym::new_uninit(OpRef::NONE);
             sym.registers_r = vec![local];
             sym.symbolic_local_types = vec![symbolic_type];
@@ -7543,8 +7547,8 @@ mod tests {
     #[test]
     fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef::from_raw(0);
-        let rhs = OpRef::from_raw(1);
+        let lhs = OpRef::input_arg_float(0);
+        let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
@@ -7584,8 +7588,8 @@ mod tests {
     #[test]
     fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
         let mut ctx = TraceCtx::for_test(2);
-        let callable = OpRef::from_raw(0);
-        let arg = OpRef::from_raw(1);
+        let callable = OpRef::input_arg_ref(0);
+        let arg = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
@@ -8053,9 +8057,9 @@ mod tests {
             Type::Ref, // stack1
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
-        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
-        sym.frame = OpRef::from_raw(0);
-        sym.execution_context = OpRef::from_raw(1);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.frame = OpRef::input_arg_ref(0);
+        sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
@@ -8255,16 +8259,17 @@ mod tests {
         input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
-        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
-        sym.vable_last_instr = OpRef::from_raw(1);
-        sym.vable_pycode = OpRef::from_raw(2);
-        sym.vable_valuestackdepth = OpRef::from_raw(3);
-        sym.vable_debugdata = OpRef::from_raw(4);
-        sym.vable_lastblock = OpRef::from_raw(5);
-        sym.vable_w_globals = OpRef::from_raw(6);
-        sym.registers_r = vec![OpRef::from_raw(7)];
+        // vable static fields per pyframe.py declared types (state.rs:1428-1439).
+        sym.vable_last_instr = OpRef::input_arg_int(1);
+        sym.vable_pycode = OpRef::input_arg_ref(2);
+        sym.vable_valuestackdepth = OpRef::input_arg_int(3);
+        sym.vable_debugdata = OpRef::input_arg_ref(4);
+        sym.vable_lastblock = OpRef::input_arg_ref(5);
+        sym.vable_w_globals = OpRef::input_arg_ref(6);
+        sym.registers_r = vec![OpRef::input_arg_ref(7)];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;

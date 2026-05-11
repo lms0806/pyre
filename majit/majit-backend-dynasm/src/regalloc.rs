@@ -1173,6 +1173,23 @@ impl RegisterManager {
         }
     }
 
+    /// `box.type == FLOAT` query for a constant `OpRef`.
+    ///
+    /// Typed variants (`OpRef::ConstFloat`) carry the type tag intrinsically,
+    /// matching `ConstFloat.type = FLOAT` (history.py:262). The
+    /// `constant_types` side-table fallback is transitional: it serves
+    /// `OpRef::Untyped(x | CONST_BIT)` constants until Phase 4 (Task #258)
+    /// retires that variant; once retired, the `None` arm becomes dead and
+    /// the side table can be deleted.
+    #[inline]
+    fn is_float_constant(&self, v: OpRef) -> bool {
+        match v.ty() {
+            Some(Type::Float) => true,
+            Some(_) => false,
+            None => self.constant_types.get(&v.raw()).copied() == Some(Type::Float),
+        }
+    }
+
     /// regalloc.py:611
     pub fn loc(
         &mut self,
@@ -1185,8 +1202,7 @@ impl RegisterManager {
     ) -> Loc {
         if v.is_constant() {
             let val = constants.get(&v.raw()).copied().unwrap_or(0);
-            if tp == Type::Float || self.constant_types.get(&v.raw()).copied() == Some(Type::Float)
-            {
+            if tp == Type::Float || self.is_float_constant(v) {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
             return Loc::Immed(ImmedLoc::new(val));
@@ -1205,8 +1221,7 @@ impl RegisterManager {
         // as plain OpRefs (without CONST_BIT) when they originate from
         // short preamble or constant folding.
         if let Some(&val) = constants.get(&v.raw()) {
-            if tp == Type::Float || self.constant_types.get(&v.raw()).copied() == Some(Type::Float)
-            {
+            if tp == Type::Float || self.is_float_constant(v) {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
             return Loc::Immed(ImmedLoc::new(val));
@@ -1505,7 +1520,7 @@ impl RegisterManager {
         debug_assert!(v.is_constant());
         // constants map key is opref.raw() (raw value WITH CONST_BIT), not const_index
         let val = constants.get(&v.raw()).copied().unwrap_or(0);
-        if self.constant_types.get(&v.raw()).copied() == Some(Type::Float) {
+        if self.is_float_constant(v) {
             Loc::Immed(ImmedLoc::new_float(val))
         } else {
             Loc::Immed(ImmedLoc::new(val))

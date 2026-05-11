@@ -255,8 +255,8 @@ pub struct Assembler386<'a> {
     bridge_input_locs: Option<Vec<Loc>>,
 
     // ── State tracking for code generation ──
-    /// Maps OpRef index → jitframe slot index.
-    opref_to_slot: HashMap<u32, usize>,
+    /// Maps OpRef → jitframe slot index.
+    opref_to_slot: HashMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -349,7 +349,7 @@ struct GuardToken {
     fail_args: Vec<OpRef>,
     /// regalloc parity: snapshot of opref_to_slot at guard emission time.
     /// Needed by recovery stubs to read fail_args from correct slots.
-    opref_to_slot_snapshot: HashMap<u32, usize>,
+    opref_to_slot_snapshot: HashMap<OpRef, usize>,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -511,7 +511,7 @@ impl<'a> Assembler386<'a> {
     /// (regardless of CONST_BIT), then fall back to slot mapping.
     fn resolve_opref(&self, opref: OpRef) -> ResolvedArg {
         // Op results take precedence over constants (Cranelift parity).
-        if let Some(&slot) = self.opref_to_slot.get(&opref.raw()) {
+        if let Some(&slot) = self.opref_to_slot.get(&opref) {
             return ResolvedArg::Slot(Self::slot_offset(slot));
         }
         if let Some(&val) = self.constants.get(&opref.raw()) {
@@ -524,7 +524,7 @@ impl<'a> Assembler386<'a> {
     /// Allocate a frame slot for an OpRef and return the slot index.
     /// Reuses existing slot if the OpRef already has one.
     fn allocate_slot(&mut self, opref: OpRef) -> usize {
-        if let Some(&existing) = self.opref_to_slot.get(&opref.raw()) {
+        if let Some(&existing) = self.opref_to_slot.get(&opref) {
             return existing;
         }
         let slot = self.next_slot;
@@ -532,7 +532,7 @@ impl<'a> Assembler386<'a> {
         if self.next_slot + 1 > self.frame_depth {
             self.frame_depth = self.next_slot + 1;
         }
-        self.opref_to_slot.insert(opref.raw(), slot);
+        self.opref_to_slot.insert(opref, slot);
         slot
     }
 
@@ -980,7 +980,7 @@ impl<'a> Assembler386<'a> {
             for (ia, loc) in inputargs.iter().zip(input_locs.iter()) {
                 if let Loc::Frame(floc) = loc {
                     let abs_slot = JITFRAME_FIXED_SIZE + floc.position;
-                    self.opref_to_slot.insert(ia.index, abs_slot);
+                    self.opref_to_slot.insert(ia.opref(), abs_slot);
                     if abs_slot + 1 > max_abs_slot {
                         max_abs_slot = abs_slot + 1;
                     }
@@ -989,7 +989,8 @@ impl<'a> Assembler386<'a> {
             self.next_slot = max_abs_slot;
         } else {
             for (i, ia) in inputargs.iter().enumerate() {
-                self.opref_to_slot.insert(ia.index, JITFRAME_FIXED_SIZE + i);
+                self.opref_to_slot
+                    .insert(ia.opref(), JITFRAME_FIXED_SIZE + i);
             }
             self.next_slot = JITFRAME_FIXED_SIZE + inputargs.len();
         }
@@ -1409,13 +1410,13 @@ impl<'a> Assembler386<'a> {
         // offset without further adjustment.
         for iarg in inputargs {
             self.opref_to_slot
-                .insert(iarg.index, JITFRAME_FIXED_SIZE + iarg.index as usize);
+                .insert(iarg.opref(), JITFRAME_FIXED_SIZE + iarg.index as usize);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
             if let Some(floc) = lifetime.current_frame_loc {
                 self.opref_to_slot
-                    .insert(opref.raw(), JITFRAME_FIXED_SIZE + floc.position);
+                    .insert(opref, JITFRAME_FIXED_SIZE + floc.position);
             }
         }
         // frame_slot_depth is already absolute (see calculation above).
@@ -3116,7 +3117,7 @@ impl<'a> Assembler386<'a> {
                         None
                     } else {
                         self.opref_to_slot
-                            .get(&opref.raw())
+                            .get(opref)
                             .copied()
                             .map(|slot| slot + JITFRAME_FIXED_SIZE)
                     }
@@ -3622,15 +3623,36 @@ impl<'a> Assembler386<'a> {
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.args
                     .iter()
-                    .map(|opref| self.opref_type_at(*opref, op_index).unwrap_or(Type::Int))
+                    .map(|opref| {
+                        self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
+                            panic!(
+                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                                 op_index={:?} (Finish/Jump arg): RPython box.type is fixed at \
+                                 construction (resoperation.py:719/727/739)",
+                                opref, op_index
+                            )
+                        })
+                    })
                     .collect()
             } else if let Some(ref fa) = op.fail_args {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
+                            // resume.py:411-417 parity: TAGCONST/TAGVIRTUAL
+                            // slots are kept as OpRef::NONE in fail_args
+                            // (PyPy filters them out; pyre keeps positional).
+                            // Type at this slot is never read at runtime —
+                            // the value comes from the resume snapshot.
                             Type::Ref
                         } else {
-                            self.opref_type_at(*opref, op_index).unwrap_or(Type::Ref)
+                            self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
+                                panic!(
+                                    "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                                     op_index={:?} (fail_arg): RPython box.type is fixed at \
+                                     construction (resoperation.py:719/727/739)",
+                                    opref, op_index
+                                )
+                            })
                         }
                     })
                     .collect()
@@ -3641,9 +3663,17 @@ impl<'a> Assembler386<'a> {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {
+                        // resume.py:411-417 parity: see comment above.
                         Type::Ref
                     } else {
-                        self.opref_type_at(*opref, op_index).unwrap_or(Type::Ref)
+                        self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
+                            panic!(
+                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                                 op_index={:?} (fail_arg): RPython box.type is fixed at \
+                                 construction (resoperation.py:719/727/739)",
+                                opref, op_index
+                            )
+                        })
                     }
                 })
                 .collect()
@@ -3728,7 +3758,7 @@ impl<'a> Assembler386<'a> {
             } else if arg_ref.is_constant() {
                 let val = self.constants.get(&arg_ref.raw()).copied().unwrap_or(0);
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val as i64 ; push rax);
-            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.raw()) {
+            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref) {
                 let src = Self::slot_offset(old_slot);
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + src]);
             } else {
@@ -3757,7 +3787,7 @@ impl<'a> Assembler386<'a> {
         // Remap: Label's arg[i] → canonical slot i
         for (i, &arg_ref) in op.args.iter().enumerate() {
             if !arg_ref.is_none() {
-                self.opref_to_slot.insert(arg_ref.raw(), i);
+                self.opref_to_slot.insert(arg_ref, i);
             }
         }
         self.next_slot = self.next_slot.max(op.args.len());
@@ -3983,8 +4013,8 @@ impl<'a> Assembler386<'a> {
     /// regalloc.py parity: no code emitted — just alias the slot.
     fn genop_same_as(&mut self, op: &Op) {
         let arg = op.arg(0);
-        if let Some(&slot) = self.opref_to_slot.get(&arg.raw()) {
-            self.opref_to_slot.insert(op.pos.raw(), slot);
+        if let Some(&slot) = self.opref_to_slot.get(&arg) {
+            self.opref_to_slot.insert(op.pos, slot);
         } else {
             self.load_arg_to_rax(arg);
             self.store_rax_to_result(op.pos);

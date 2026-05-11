@@ -476,11 +476,24 @@ impl PotentialShortOp {
                 } else {
                     let index = ShortBoxes::_pick_op_index(&produced, true);
                     let chosen = produced[index].clone();
+                    // shortpreamble.py:326-330 — alias side:
+                    //   opnum = OpHelpers.same_as_for_type(shortop.res.type)
+                    //   new_name = ResOperation(opnum, [shortop.res])
+                    //   lst[i].short_op.res = new_name
+                    // The alias's type matches `compound.res.type`. PyPy
+                    // Box.type is fixed at construction (resoperation.py:
+                    // 719/727/739); pyre's transitional `OpRef::Untyped(_)`
+                    // producers carry no type tag and fall back to a fresh
+                    // `from_raw` alias — eliminated once Task #258 retires
+                    // the Untyped variant.
                     for (i, mut alt) in produced.into_iter().enumerate() {
                         if i == index {
                             continue;
                         }
-                        let alias = OpRef::from_raw(sb.next_synthetic_pos);
+                        let alias = match compound.res.ty() {
+                            Some(tp) => OpRef::op_typed(sb.next_synthetic_pos, tp),
+                            None => OpRef::from_raw(sb.next_synthetic_pos),
+                        };
                         sb.next_synthetic_pos += 1;
                         alt.preamble_op.pos = alias;
                         alt.invented_name = true;
@@ -1818,24 +1831,28 @@ fn build_short_preamble_struct_from_ops(
     // we snapshot the loop's constant pool entries for any OpRef referenced by
     // short preamble ops that isn't defined by the ops themselves.
     let mut constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
-    // RPython parity: if a Const exists in loop_constants, its type must
-    // also exist in loop_constant_types — both maps are populated in
-    // lockstep by the optimizer (constant_pool.rs). Missing type entry
-    // for a known constant is a structural bug.
-    let const_type_for = |raw: u32| -> majit_ir::Type {
-        loop_constant_types.get(&raw).copied().unwrap_or_else(|| {
+    // RPython parity: typed `OpRef::Const{Int,Float,Ptr}` carry the type
+    // tag intrinsically (history.py:220/261/307). Only `OpRef::Untyped`
+    // (legacy `from_raw` producers) needs the lockstep side-table; missing
+    // type entry for a known constant in that case is a structural bug.
+    let const_type_for =
+        |arg: OpRef| -> majit_ir::Type {
+            if let Some(tp) = arg.ty() {
+                return tp;
+            }
+            loop_constant_types.get(&arg.raw()).copied().unwrap_or_else(|| {
             panic!(
                 "loop_constant_types missing entry for raw={} though loop_constants has it: \
                  the two maps must be populated in lockstep",
-                raw
+                arg.raw()
             )
         })
-    };
+        };
     for op in ops {
         for &arg in &op.args {
             if !defined_by_ops.contains(&arg) {
                 if let Some(&val) = loop_constants.get(&arg.raw()) {
-                    constants.insert(arg.raw(), (val, const_type_for(arg.raw())));
+                    constants.insert(arg.raw(), (val, const_type_for(arg)));
                 }
             }
         }
@@ -1843,7 +1860,7 @@ fn build_short_preamble_struct_from_ops(
             for &arg in fa {
                 if !defined_by_ops.contains(&arg) {
                     if let Some(&val) = loop_constants.get(&arg.raw()) {
-                        constants.insert(arg.raw(), (val, const_type_for(arg.raw())));
+                        constants.insert(arg.raw(), (val, const_type_for(arg)));
                     }
                 }
             }
@@ -1853,7 +1870,7 @@ fn build_short_preamble_struct_from_ops(
     for &arg in jump_args {
         if !defined_by_ops.contains(&arg) {
             if let Some(&val) = loop_constants.get(&arg.raw()) {
-                constants.insert(arg.raw(), (val, const_type_for(arg.raw())));
+                constants.insert(arg.raw(), (val, const_type_for(arg)));
             }
         }
     }
