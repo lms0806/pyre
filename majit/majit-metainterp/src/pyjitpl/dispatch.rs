@@ -3773,8 +3773,7 @@ where
                 // 1. clear_exception (pyjitpl.py:2010)
                 self.clear_exception();
                 // 2. vable_and_vrefs_before_residual_call (pyjitpl.py:2017)
-                let active_vable =
-                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 // 3. execute (pyjitpl.py:2039-2042, tp == 'v')
                 call_void_function(concrete_ptr, &concrete_args);
                 // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
@@ -3997,8 +3996,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                let active_vable =
-                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
@@ -4057,8 +4055,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                let active_vable =
-                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
@@ -4117,8 +4114,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                let active_vable =
-                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
