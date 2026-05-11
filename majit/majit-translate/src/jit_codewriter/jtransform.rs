@@ -1264,7 +1264,140 @@ impl<'a> Transformer<'a> {
                     RewriteResult::Keep
                 }
             }
+            crate::hints::VirtualizableHintKind::Promote => {
+                // `rpython/jit/codewriter/jtransform.py:608-614`:
+                //     if hints.get('promote') and op.args[0].concretetype is not lltype.Void:
+                //         assert op.args[0].concretetype != lltype.Ptr(rstr.STR)
+                //         kind = getkind(op.args[0].concretetype)
+                //         op0 = SpaceOperation('-live-', [], None)
+                //         op1 = SpaceOperation('%s_guard_value' % kind, [op.args[0]], None)
+                //         # the special return value None forces op.result
+                //         # to be considered equal to op.args[0]
+                //         return [op0, op1, None]
+                //
+                // Skip void args (`concretetype is not lltype.Void` guard).
+                // The string-pointer special case (`promote_string` /
+                // `str_guard_value`) is a separate hint kind; this arm only
+                // handles plain `int/ref/float_guard_value` shapes.  The
+                // `None` sentinel that aliases the result back to the input
+                // is realized in pyre by `self.aliases.insert(result, base)`
+                // before emitting the replacement ops.
+                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
+            }
+            crate::hints::VirtualizableHintKind::PromoteString => {
+                // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
+                //     S = lltype.Ptr(rstr.STR)
+                //     assert op.args[0].concretetype == S
+                //     self._register_extra_helper(OS_STREQ_NONNULL,
+                //         "str.eq_nonnull", [S, S], lltype.Signed,
+                //         EF_ELIDABLE_CANNOT_RAISE)
+                //     descr, p = callinfocollection.callinfo_for_oopspec(
+                //         OS_STREQ_NONNULL)
+                //     c = Constant(p.adr.ptr, lltype.typeOf(p.adr.ptr))
+                //     op1 = SpaceOperation('str_guard_value',
+                //         [op.args[0], c, descr], op.result)
+                //     return [SpaceOperation('-live-', [], None), op1, None]
+                //
+                // The upstream op shape is 3-input/1-output (`rid>r`):
+                // ref arg + helper fnptr constant + calldescr → result.
+                // Pyre's IR currently lacks the helper/descr extras on
+                // `GuardValue` and `_register_extra_helper` has not been
+                // ported (`OS_STREQ_NONNULL` is registered in
+                // `majit-ir::OopSpecIndex` but `callinfocollection.add`
+                // is never invoked for it), so producing the correct
+                // bytecode is not yet possible.  Emitting a 1-input
+                // `str_guard_value/r` op instead would silently
+                // disagree with the BH wire `str_guard_value/rid>r`
+                // and panic at assembly-time opname lookup.
+                panic!(
+                    "rewrite_op_hint(promote_string=True) for `{target}`: \
+                     the str_guard_value emit chain is not yet wired in \
+                     pyre.  TODO: (1) extend `OpKind::GuardValue` with \
+                     optional `helper_fnptr_const` + `descr` fields per \
+                     jtransform.py:631 op shape; (2) port \
+                     `jtransform.py:2010-2029 _register_extra_helper` so \
+                     `callinfocollection.callinfo_for_oopspec(\
+                     OS_STREQ_NONNULL)` resolves at rewrite time; (3) \
+                     teach `assembler.rs::encode_op` an explicit \
+                     `OpKind::GuardValue` arm that emits the `rid>r` \
+                     argcode."
+                )
+            }
+            crate::hints::VirtualizableHintKind::PromoteUnicode => {
+                // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`
+                // emits the same `str_guard_value` opname as
+                // promote_string (jit.py:647); the
+                // `OS_UNIEQ_NONNULL` oopspec carries the unicode
+                // helper.  Same TODO chain as the PromoteString arm
+                // above — without `_register_extra_helper` /
+                // `callinfo_for_oopspec` we cannot produce the
+                // upstream-shaped 3-input op.
+                panic!(
+                    "rewrite_op_hint(promote_unicode=True) for `{target}`: \
+                     the str_guard_value emit chain is not yet wired in \
+                     pyre.  TODO: same prerequisites as promote_string — \
+                     `OpKind::GuardValue` helper/descr extras, \
+                     `_register_extra_helper(OS_UNIEQ_NONNULL, \
+                     \"unicode.eq_nonnull\", ...)` port, and an explicit \
+                     `assembler.rs::encode_op` arm for the `rid>r` argcode."
+                )
+            }
         }
+    }
+
+    /// Shared body for the `promote=True` arm of
+    /// `rpython/jit/codewriter/jtransform.py:608-614 rewrite_op_hint`.
+    ///
+    /// Returns `RewriteResult::Replace([-live-, <kind>_guard_value(arg)])`
+    /// after seeding `self.aliases.insert(result, arg)` to realize the
+    /// upstream `None` sentinel (`# the special return value None forces
+    /// op.result to be considered equal to op.args[0]`).  The
+    /// `<kind>` char is the upstream `getkind()` of `op.args[0]`
+    /// (`'i'`/`'r'`/`'f'`); void args fall through.
+    ///
+    /// `promote_string` / `promote_unicode` (jit.py:615-648) emit the
+    /// 3-input `str_guard_value/rid>r` op which requires extras the
+    /// IR does not yet carry — those arms panic in the caller above
+    /// rather than route through this helper, which only knows how to
+    /// emit the 1-input `<kind>_guard_value` family.
+    fn rewrite_op_hint_guard_value_family(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        graph_name: &str,
+    ) -> RewriteResult {
+        let Some(arg) = args.first().copied() else {
+            return RewriteResult::Keep;
+        };
+        let base = resolve_alias(arg, &self.aliases);
+        let kind_char = self.value_kind(base);
+        // jtransform.py:608 `op.args[0].concretetype is not lltype.Void`
+        // guard — void args fall through the rewrite (caller may want
+        // to keep the original op).
+        if kind_char == 'v' {
+            return RewriteResult::Keep;
+        }
+        if let Some(result) = op.result {
+            self.aliases.insert(result, base);
+        }
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: {target}(...) → {kind_char}_guard_value"),
+        });
+        RewriteResult::Replace(vec![
+            SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::GuardValue {
+                    value: base,
+                    kind_char,
+                },
+            },
+        ])
     }
 
     /// RPython `rpython/jit/codewriter/jtransform.py:830-906 rewrite_op_getfield`.
@@ -4447,6 +4580,170 @@ mod tests {
         assert!(matches!(
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
+        ));
+    }
+
+    /// `rpython/jit/codewriter/jtransform.py:608-614 rewrite_op_hint`
+    /// `promote=True` branch: emits `[-live-, <kind>_guard_value(x),
+    /// None]` where the `None` sentinel aliases the result back to the
+    /// input arg.  In pyre's `RewriteResult` model the alias is applied
+    /// by `optimize_block` from `self.aliases.insert(result, base)` and
+    /// the two emitted ops show up at the call site as
+    /// `[OpKind::Live, OpKind::GuardValue { kind_char }]`.
+    #[test]
+    fn rewrite_graph_rewrites_hint_promote() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        let promoted = graph.alloc_value();
+        let consumed = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        // `hint_promote(v)` — mirrors `rlib/jit.py:101 promote(x)` after
+        // lowering to the operator-level helper name.
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote"]),
+                args: vec![v],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(promoted);
+        // A downstream op that names the promote result so we can
+        // observe that `optimize_block` aliased it back to `v`.
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: promoted,
+                field: crate::model::FieldDescriptor::new("payload", Some("Box".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(consumed);
+        graph.set_return(graph.startblock, None);
+
+        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        // Expected post-rewrite shape: [Live, GuardValue, FieldRead].
+        assert_eq!(ops.len(), 3, "got {ops:?}");
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { value, kind_char } => {
+                assert_eq!(*value, v, "guard target must remain the input arg");
+                assert_eq!(*kind_char, 'r', "default kind without type-state");
+            }
+            other => panic!("expected GuardValue, got {other:?}"),
+        }
+        // `None` sentinel parity: the downstream FieldRead, which named
+        // the `promoted` result, must have its base resolved back to `v`.
+        match &ops[2].kind {
+            OpKind::FieldRead { base, .. } => {
+                assert_eq!(*base, v, "promote result must alias back to input arg");
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+    }
+
+    /// `rpython/jit/codewriter/jtransform.py:615-631 promote_string`
+    /// emits a 3-input `str_guard_value/rid>r` op (ref arg + helper
+    /// fnptr const + calldescr → result).  Pyre's `GuardValue`
+    /// variant does not yet carry the helper+descr extras and
+    /// `_register_extra_helper` (jit.py:2010-2029) is not ported, so
+    /// the rewrite arm panics with a TODO citation rather than
+    /// silently emitting a malformed 1-input shape.
+    #[test]
+    #[should_panic(expected = "str_guard_value emit chain is not yet wired")]
+    fn rewrite_graph_panics_on_hint_promote_string_until_helper_chain_lands() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_string"]),
+                args: vec![v],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let _ = rewrite_graph(&graph, &GraphTransformConfig::default());
+    }
+
+    /// `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`
+    /// has the same 3-input `str_guard_value/rid>r` op shape as
+    /// promote_string; the unicode helper is wired via
+    /// `OS_UNIEQ_NONNULL` rather than `OS_STREQ_NONNULL`.  Same TODO
+    /// prerequisites — fail-loud until the IR + helper-registration
+    /// chain is complete.
+    #[test]
+    #[should_panic(expected = "str_guard_value emit chain is not yet wired")]
+    fn rewrite_graph_panics_on_hint_promote_unicode_until_helper_chain_lands() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_unicode"]),
+                args: vec![v],
+                result_ty: ValueType::Ref,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let _ = rewrite_graph(&graph, &GraphTransformConfig::default());
+    }
+
+    /// `jtransform.py:608` voidness guard — `if hints.get('promote')
+    /// and op.args[0].concretetype is not lltype.Void`.  Pyre falls
+    /// through (Keep) when `value_kind(arg) == 'v'`.
+    #[test]
+    fn rewrite_graph_keeps_hint_promote_on_void_arg() {
+        let mut graph = FunctionGraph::new("demo");
+        let v = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote"]),
+                args: vec![v],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        // Mark `v` as void-kind via synth_kinds before rewriting.
+        let mut transformer = Transformer::new(&config);
+        transformer
+            .synth_kinds
+            .insert(v, crate::jit_codewriter::type_state::ConcreteType::Void);
+        // Direct call to rewrite_operation — without setting up the
+        // optimize_block plumbing — verifies the Keep result for the
+        // void-kind branch in isolation.
+        let op = graph
+            .block(graph.startblock)
+            .operations
+            .last()
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            transformer.rewrite_operation(&op, "demo"),
+            RewriteResult::Keep
         ));
     }
 

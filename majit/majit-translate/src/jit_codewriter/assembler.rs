@@ -2755,6 +2755,23 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::GuardTrue { .. } => "guard_true".into(),
         OpKind::GuardFalse { .. } => "guard_false".into(),
         OpKind::GuardValue { kind_char, .. } => {
+            // `rpython/jit/codewriter/jtransform.py:611` emits one of
+            // `int_guard_value` / `ref_guard_value` / `float_guard_value`
+            // depending on the `getkind()` of the guarded arg.
+            //
+            // RPython upstream also emits `str_guard_value` for
+            // `promote_string` (jit.py:631) and `promote_unicode`
+            // (jit.py:647), but that op has a 3-input `rid>r` shape
+            // (ref + helper fnptr const + calldescr) that pyre's
+            // `GuardValue` variant does not yet carry; the upstream
+            // chain depends on `_register_extra_helper` (jit.py:
+            // 2010-2029) populating `callinfo_for_oopspec`
+            // (`OS_STREQ_NONNULL` / `OS_UNIEQ_NONNULL`).  Until that
+            // chain lands, the rewrite arms in
+            // `jtransform.rs::rewrite_op_hint` panic when they would
+            // have produced a `kind_char ∈ {'s', 'u'}` `GuardValue`,
+            // so no such variant can reach the assembler.  The match
+            // arm below treats those chars as a bug.
             format!("{}_guard_value", kind_char_to_name(*kind_char))
         }
         // RPython: getfield_vable_i, getfield_vable_r, getfield_vable_f

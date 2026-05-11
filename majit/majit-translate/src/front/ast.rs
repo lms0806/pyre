@@ -593,6 +593,272 @@ fn collect_fields_and_returns(
     }
 }
 
+/// `promote_args` selector for `#[elidable_promote(...)]` synthesis.
+///
+/// Mirrors `rlib/jit.py:189-191` — RPython splits a literal string at
+/// `,` when the value is not the special `"all"` marker:
+///
+/// ```python
+/// if promote_args != 'all':
+///     args = [args[int(i)] for i in promote_args.split(",")]
+/// ```
+#[derive(Debug, Clone)]
+enum PromoteArgsSelector {
+    /// `jit.py:180` default `promote_args='all'` — every non-self
+    /// positional arg flows through `hint(..., promote=True)`.
+    All,
+    /// `jit.py:189-191` index list (`"0,2"` → `[0, 2]`).  Indices are
+    /// 0-based and point into the **positional arg list including
+    /// `self`** when the decorated function is a method (RPython's
+    /// `_get_args(func)` reads the raw co_varnames; pyre mirrors the
+    /// same convention by treating `self` as index 0 when present).
+    Indices(Vec<usize>),
+}
+
+/// `rlib/jit.py:180-191` — parse the literal attribute value attached
+/// to `#[elidable_promote(promote_args = "...")]`.  Bare
+/// `#[elidable_promote]` defaults to `"all"` per the upstream default
+/// argument at jit.py:180.
+fn parse_elidable_promote_args(attr: &syn::Attribute) -> syn::Result<PromoteArgsSelector> {
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return Ok(PromoteArgsSelector::All);
+    }
+    let mut selector = None;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("promote_args") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            selector = Some(if lit.value() == "all" {
+                PromoteArgsSelector::All
+            } else {
+                let mut indices = Vec::new();
+                for piece in lit.value().split(',') {
+                    indices.push(piece.trim().parse::<usize>().map_err(|err| {
+                        syn::Error::new(lit.span(), format!("promote_args: {err}"))
+                    })?);
+                }
+                PromoteArgsSelector::Indices(indices)
+            });
+            Ok(())
+        } else {
+            Err(meta.error("unsupported elidable_promote argument"))
+        }
+    })?;
+    Ok(selector.unwrap_or(PromoteArgsSelector::All))
+}
+
+/// Expand a `syn::ItemFn` into `[orig, wrapper]` when it carries
+/// `#[elidable_promote]` / `#[purefunction_promote]`, else return the
+/// single function unchanged.  Mirrors `rlib/jit.py:184-201`'s "module
+/// import installs two callables" semantics at every entry point that
+/// hands a `syn::ItemFn` to `build_function_graph*` — free functions
+/// (`build_graphs_from_items`), inherent / trait-impl methods
+/// (`parse::extract_inherent_impl_methods`,
+/// `parse::extract_trait_impls`), and trait default methods
+/// (`parse::extract_trait_impls`).  Centralising the expansion here
+/// keeps the decorator behaviour uniform across all four lowering
+/// surfaces.
+pub fn synthesize_or_passthrough(fake_fn: ItemFn) -> Vec<ItemFn> {
+    match extract_elidable_promote_selector(&fake_fn.attrs) {
+        Some(selector) => {
+            let (orig, wrapper) = synthesize_elidable_promote_pair(&fake_fn, &selector);
+            vec![orig, wrapper]
+        }
+        None => vec![fake_fn],
+    }
+}
+
+/// Locate `#[elidable_promote]` (or its deprecated `#[purefunction_promote]`
+/// alias from `rlib/jit.py:203-205`) and return its parsed
+/// `promote_args` selector, or `None` if neither attribute is present.
+///
+/// `rlib/jit.py:189-191` `args[int(i)]` propagates `ValueError` /
+/// `IndexError` to the caller — the decorator does not silently drop
+/// malformed input.  Pyre mirrors that fail-loud behaviour here: a
+/// malformed `promote_args = "..."` literal panics with the
+/// underlying `syn::Error` rather than falling through.
+fn extract_elidable_promote_selector(attrs: &[syn::Attribute]) -> Option<PromoteArgsSelector> {
+    for attr in attrs {
+        if let Some(segment) = attr.path().segments.last() {
+            let name = segment.ident.to_string();
+            if name == "elidable_promote" || name == "purefunction_promote" {
+                return Some(parse_elidable_promote_args(attr).unwrap_or_else(|err| {
+                    panic!("#[{name}(...)]: {err}");
+                }));
+            }
+        }
+    }
+    None
+}
+
+/// Synthesize the wrapper / original function pair from a single
+/// `#[elidable_promote] fn foo(...)` source item.
+///
+/// Line-by-line port of `rlib/jit.py:184-201`:
+///
+/// ```python
+/// def decorator(func):
+///     elidable(func)                                # func._elidable_function_ = True
+///     args = _get_args(func)
+///     code = ["def f(%s):\n" % (argstring,)]
+///     if promote_args != 'all':
+///         args = [args[int(i)] for i in promote_args.split(",")]
+///     for arg in args:
+///         code.append("    %s = hint(%s, promote=True, promote_string=True)\n" % …)
+///     code.append("    return _orig_func_unlikely_name(%s)\n" % …)
+///     d = {"_orig_func_unlikely_name": func, "hint": hint}
+///     exec py.code.Source("\n".join(code)).compile() in d
+///     result = d["f"]
+///     result.__name__ = func.__name__ + "_promote"
+///     return result
+/// ```
+///
+/// Pyre's syn-tree adaptation:
+///
+///   * RPython's `_orig_func_unlikely_name` closure capture becomes a
+///     module-scope sibling `fn _orig_<name>_unlikely_name` carrying
+///     the original body and the `#[elidable]` attribute (so
+///     `collect_jit_hints` registers it via `mark_elidable`).
+///   * RPython's `exec compile` synthesis of `def f(...)` becomes a
+///     `syn::Block` whose stmts are `let <arg> = hint_promote(<arg>);`
+///     for each selected arg, followed by the tail call.
+///   * The user-facing name keeps its identity (matching pyre's
+///     proc-macro naming convention `_orig_<name>_unlikely_name` at
+///     `majit-macros::elidable_promote`); RPython's `__name__ + "_promote"`
+///     rename is the symmetric choice and equivalently produces two
+///     distinct callable identifiers.
+fn synthesize_elidable_promote_pair(
+    func: &ItemFn,
+    selector: &PromoteArgsSelector,
+) -> (ItemFn, ItemFn) {
+    use quote::format_ident;
+    // jit.py:186 args = _get_args(func) — positional names, self included.
+    let arg_names: Vec<syn::Ident> = func
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| match arg {
+            syn::FnArg::Typed(pt) => match &*pt.pat {
+                syn::Pat::Ident(pi) => pi.ident.clone(),
+                _ => panic!(
+                    "#[elidable_promote] on `fn {}`: unsupported binder \
+                     pattern in arg position — RPython `_get_args(func)` \
+                     (jit.py:172-178) reads positional names off \
+                     `co_varnames`, which never include destructured \
+                     binders.  Rewrite the parameter as a plain `name: \
+                     Ty` instead.",
+                    func.sig.ident
+                ),
+            },
+            // `&self` / `&mut self` map to a positional name "self" so
+            // index 0 in `Indices` continues to address the receiver as
+            // RPython does (`_get_args(func)` reads co_varnames raw).
+            syn::FnArg::Receiver(_) => format_ident!("self"),
+        })
+        .collect();
+
+    let orig_ident = format_ident!("_orig_{}_unlikely_name", func.sig.ident);
+
+    // jit.py:184-185 — original keeps the body, gains `_elidable_function_`.
+    let orig_attrs: Vec<syn::Attribute> = func
+        .attrs
+        .iter()
+        .filter(|a| {
+            let name = a
+                .path()
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            name != "elidable_promote" && name != "purefunction_promote"
+        })
+        .cloned()
+        .collect();
+    let elidable_attr: syn::Attribute = syn::parse_quote!(#[elidable]);
+    let mut orig_fn = func.clone();
+    orig_fn.attrs = orig_attrs;
+    orig_fn.attrs.push(elidable_attr);
+    orig_fn.sig.ident = orig_ident.clone();
+
+    // jit.py:189-191 — promote_args=='all' → all indices; else parsed list.
+    // RPython `args[int(i)]` raises `IndexError` on out-of-range
+    // indices; pyre fails loudly here for the same reason.
+    let promote_indices: Vec<usize> = match selector {
+        PromoteArgsSelector::All => (0..arg_names.len()).collect(),
+        PromoteArgsSelector::Indices(ix) => {
+            for &i in ix {
+                if i >= arg_names.len() {
+                    panic!(
+                        "#[elidable_promote(promote_args = ...)] on `fn {}`: \
+                         index {} is out of range for a {}-arg function \
+                         (jit.py:191 `args[int(i)]` would IndexError)",
+                        func.sig.ident,
+                        i,
+                        arg_names.len()
+                    );
+                }
+            }
+            ix.clone()
+        }
+    };
+    let promote_stmts: Vec<syn::Stmt> = promote_indices
+        .iter()
+        .map(|&i| arg_names[i].clone())
+        // jit.py:193 — `self`-promotion in pyre's syn tree would require
+        // a non-trivial rebinding (`let self = ...`), which Rust does not
+        // accept.  Skip self for now — RPython's `hint(self, ...)`
+        // returns the same object identity, and the elidable-original
+        // call below still threads `self` through unchanged.  Re-binding
+        // self via `let _self_promoted = hint_promote(self); ...` is a
+        // follow-up if a benchmark needs receiver promotion.
+        .filter(|id| *id != "self")
+        .map(|id| -> syn::Stmt { syn::parse_quote!(let #id = hint_promote(#id);) })
+        .collect();
+
+    // jit.py:195 — return _orig_func_unlikely_name(args).
+    let call_args = arg_names.iter().map(|id| -> syn::Expr {
+        if id == "self" {
+            syn::parse_quote!(self)
+        } else {
+            syn::parse_quote!(#id)
+        }
+    });
+    let tail_call: syn::Expr = syn::parse_quote!(#orig_ident(#(#call_args),*));
+    let tail_stmt = syn::Stmt::Expr(tail_call, None);
+
+    // jit.py:198-201 — wrapper is the user-facing decorated name with
+    // the promote+forward body; `#[elidable_promote]` is stripped so
+    // `collect_jit_hints` does not register the wrapper itself as
+    // elidable (the binary flag belongs on the original alone, per
+    // jit.py:185 `elidable(func)`).
+    let wrapper_attrs: Vec<syn::Attribute> = func
+        .attrs
+        .iter()
+        .filter(|a| {
+            let name = a
+                .path()
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            name != "elidable_promote" && name != "purefunction_promote"
+        })
+        .cloned()
+        .collect();
+    let mut wrapper_block = syn::Block {
+        brace_token: Default::default(),
+        stmts: Vec::new(),
+    };
+    wrapper_block.stmts.extend(promote_stmts);
+    wrapper_block.stmts.push(tail_stmt);
+
+    let mut wrapper_fn = func.clone();
+    wrapper_fn.attrs = wrapper_attrs;
+    wrapper_fn.block = Box::new(wrapper_block);
+
+    (orig_fn, wrapper_fn)
+}
+
 /// RPython: pass 2 graph building with Item::Mod recursion.
 /// Mirrors collect_types_from_items traversal so that module-internal
 /// functions get proper SemanticFunction entries with qualified names.
@@ -616,21 +882,29 @@ fn build_graphs_from_items(
     for item in items {
         match item {
             Item::Fn(func) => {
-                let mut sf = build_function_graph(
-                    func,
-                    options,
-                    None,
-                    struct_fields,
-                    fn_return_types,
-                    prefix,
-                    known_struct_names,
-                    known_trait_names,
-                )?;
-                // RPython: exact graph identity — module-qualified name.
-                if !prefix.is_empty() {
-                    sf.name = format!("{}::{}", prefix, sf.name);
+                // `rlib/jit.py:184-201 elidable_promote.decorator(func)`
+                // installs two callable objects on module import
+                // (closure-captured original + `exec`-built wrapper).
+                // `synthesize_or_passthrough` mirrors that for both
+                // free fns and impl methods so the lowering layer below
+                // stays wrapper-blind, exactly like RPython's flow-graph
+                // builder.
+                for synth in synthesize_or_passthrough(func.clone()) {
+                    let mut sf = build_function_graph(
+                        &synth,
+                        options,
+                        None,
+                        struct_fields,
+                        fn_return_types,
+                        prefix,
+                        known_struct_names,
+                        known_trait_names,
+                    )?;
+                    if !prefix.is_empty() {
+                        sf.name = format!("{}::{}", prefix, sf.name);
+                    }
+                    functions.push(sf);
                 }
-                functions.push(sf);
             }
             Item::Impl(impl_block) => {
                 // Qualify bare self type with module prefix (RPython: unique type identity).
@@ -644,17 +918,23 @@ fn build_graphs_from_items(
                             sig: method.sig.clone(),
                             block: Box::new(method.block.clone()),
                         };
-                        let sf = build_function_graph(
-                            &fake_fn,
-                            options,
-                            self_ty_root.clone(),
-                            struct_fields,
-                            fn_return_types,
-                            prefix,
-                            known_struct_names,
-                            known_trait_names,
-                        )?;
-                        functions.push(sf);
+                        // jit.py:184-201 — method-level `@elidable_promote`
+                        // gets the same wrapper/orig synthesis as free
+                        // fns; RPython decorators apply uniformly to any
+                        // callable.
+                        for synth in synthesize_or_passthrough(fake_fn) {
+                            let sf = build_function_graph(
+                                &synth,
+                                options,
+                                self_ty_root.clone(),
+                                struct_fields,
+                                fn_return_types,
+                                prefix,
+                                known_struct_names,
+                                known_trait_names,
+                            )?;
+                            functions.push(sf);
+                        }
                     }
                 }
             }
@@ -2179,27 +2459,29 @@ fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>) -> 
             match name.as_str() {
                 // RPython-parity names (rlib/jit.py)
                 "elidable" | "jit_elidable" => hints.push("elidable".into()),
-                "elidable_promote" => hints.push("elidable".into()),
-                // `call.py:292-299 getcalldescr` runs `self._canraise(op)`
-                // *separately* from the binary `_elidable_function_` flag
-                // (`getattr(func, "_elidable_function_", False)` at
-                // `call.py:247`).  RPython hands the funcobj's elidable
-                // boolean to `getcalldescr`, then `_canraise` analyzes the
-                // callee graph to pick between `EF_ELIDABLE_CANNOT_RAISE` /
-                // `EF_ELIDABLE_OR_MEMORYERROR` / `EF_ELIDABLE_CAN_RAISE`.
-                // Pyre mirrors that two-step chain: this hint feeds
-                // `mark_elidable(path)` (the binary flag) and the 3-way
-                // pick is recovered by `_canraise` at
-                // `jit_codewriter/call.rs:2773-2782` + the matching match
-                // at `call.rs:2969-2979`.  Collapsing the two attribute
-                // spellings to a single `"elidable"` hint is therefore
-                // parity-correct, not a lossy adaptation — the
-                // `EF_ELIDABLE_*` distinction is still produced per
-                // callsite by `getcalldescr`.  The proc-macro layer keeps
-                // the spellings distinct via
-                // `majit-macros::helper_policy_tokens_for_fn` (policy
-                // codes 19/20) for its own dispatch wiring, which is
-                // independent of this translate-layer hint stream.
+                // `rlib/jit.py:184-201 elidable_promote` is no longer
+                // collapsed onto the user-facing function's hints here.
+                // `build_graphs_from_items` synthesizes the
+                // (`_orig_<NAME>_unlikely_name`, wrapper) pair before
+                // this collector ever runs, attaches the synthetic
+                // `#[elidable]` attribute to the original, and strips
+                // `#[elidable_promote]` from the wrapper's `attrs`.
+                // The orig is what RPython's `elidable(func)` at
+                // jit.py:185 marks with `_elidable_function_`; the
+                // wrapper (`result` at jit.py:198-201) carries no
+                // binary flag.  `synthesize_elidable_promote_pair`
+                // always succeeds — unrecognised binder patterns (which
+                // Python signatures cannot express anyway) panic with
+                // a citation to `jit.py:172-178 _get_args(func)`, so
+                // there is no silent single-graph fallback.
+                //
+                // `call.py:292-299 getcalldescr` still runs the
+                // `_canraise(op)` analysis on every elidable callsite,
+                // so collapsing `elidable_cannot_raise` /
+                // `elidable_or_memerror` to a single `"elidable"` hint
+                // remains parity-correct — `getcalldescr` recovers the
+                // `EF_ELIDABLE_*` 3-way from the per-op raise analysis
+                // at `jit_codewriter/call.rs:2773-2782`.
                 "elidable_cannot_raise" | "elidable_or_memerror" => {
                     hints.push("elidable".into());
                 }
@@ -9618,5 +9900,174 @@ mod tests {
                 graph.dump()
             );
         }
+    }
+
+    /// `rlib/jit.py:184-201 elidable_promote.decorator(func)` produces
+    /// **two** function objects after module import: the closure-
+    /// captured `func` (which carries `_elidable_function_`) and the
+    /// `exec`-built `result` (which does not).  Pyre's parser-level
+    /// synthesizer is the line-by-line mirror: a single
+    /// `#[elidable_promote] fn foo(...)` source item must produce two
+    /// `SemanticFunction`s — `_orig_foo_unlikely_name` carrying the
+    /// `elidable` hint, and the user-facing wrapper `foo` whose body
+    /// is `hint_promote(arg); …; _orig_foo_unlikely_name(args)`.
+    /// `rlib/jit.py:191` evaluates `args[int(i)]` in
+    /// `elidable_promote.decorator`, which raises `IndexError` when
+    /// the literal points past the function's argument list.  Pyre
+    /// mirrors the fail-loud behaviour through
+    /// `synthesize_elidable_promote_pair`'s index bounds check.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn elidable_promote_panics_on_out_of_range_promote_index() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[elidable_promote(promote_args = "0,5")]
+            pub fn foo(x: i64) -> i64 { x }
+        "#,
+        );
+        let _ = build_semantic_program(&parsed);
+    }
+
+    /// `rlib/jit.py:189-191 promote_args.split(",")` propagates
+    /// `ValueError` on a non-integer piece via `int(i)`.  Pyre matches
+    /// that by panicking on a `usize::parse` failure rather than
+    /// silently dropping the malformed literal.
+    #[test]
+    #[should_panic(expected = "elidable_promote")]
+    fn elidable_promote_panics_on_malformed_promote_args() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[elidable_promote(promote_args = "0,not_a_number")]
+            pub fn foo(x: i64) -> i64 { x }
+        "#,
+        );
+        let _ = build_semantic_program(&parsed);
+    }
+
+    /// `rlib/jit.py:184-201 elidable_promote.decorator(func)` applies
+    /// uniformly to any callable — module-level fn, instance method,
+    /// classmethod.  Pyre's `synthesize_or_passthrough` must produce
+    /// the (`_orig_<NAME>_unlikely_name`, wrapper) pair for impl
+    /// methods too, not just `Item::Fn`s, otherwise method callers
+    /// silently drop the elidable flag.
+    #[test]
+    fn elidable_promote_on_inherent_method_synthesizes_pair() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            impl S {
+                #[elidable_promote(promote_args = "all")]
+                pub fn double(&self, n: i64) -> i64 { n + n }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        // Two SemanticFunctions emitted from the decorated method —
+        // the synthesized orig and the wrapper.
+        let names: Vec<_> = program
+            .functions
+            .iter()
+            .map(|sf| sf.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"_orig_double_unlikely_name"),
+            "expected synthesized orig in {names:?}"
+        );
+        assert!(
+            names.contains(&"double"),
+            "expected wrapper retaining user-facing name in {names:?}"
+        );
+        // jit.py:185 — elidable flag lives on the orig only.
+        let orig = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "_orig_double_unlikely_name")
+            .expect("orig graph");
+        assert!(orig.hints.iter().any(|h| h == "elidable"));
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "double")
+            .expect("wrapper graph");
+        assert!(!wrapper.hints.iter().any(|h| h == "elidable"));
+    }
+
+    #[test]
+    fn elidable_promote_synthesizes_orig_and_wrapper_graphs() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[elidable_promote(promote_args = "all")]
+            pub fn foo(x: i64, y: i64) -> i64 {
+                x + y
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        assert_eq!(
+            program.functions.len(),
+            2,
+            "expected exactly two graphs after synthesis, got {:?}",
+            program
+                .functions
+                .iter()
+                .map(|sf| sf.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // jit.py:185 elidable(func) — the renamed original carries the
+        // `elidable` hint that downstream `mark_elidable` reads.
+        let orig = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "_orig_foo_unlikely_name")
+            .expect("orig graph");
+        assert!(
+            orig.hints.iter().any(|h| h == "elidable"),
+            "orig hints must include 'elidable', got {:?}",
+            orig.hints
+        );
+
+        // jit.py:198-201 — wrapper `result` has no `_elidable_function_`.
+        // After Slice C retired the `collect_jit_hints` fallback the
+        // wrapper's hints are empty unless the user explicitly added
+        // another decorator alongside `#[elidable_promote]`.
+        let wrapper = program
+            .functions
+            .iter()
+            .find(|sf| sf.name == "foo")
+            .expect("wrapper graph");
+        assert!(
+            !wrapper.hints.iter().any(|h| h == "elidable"),
+            "wrapper must not carry the 'elidable' hint — RPython places \
+             `_elidable_function_` only on the orig (jit.py:185), not \
+             on the wrapper (jit.py:198-201).  Got hints: {:?}",
+            wrapper.hints
+        );
+        let ops = &wrapper.graph.block(wrapper.graph.startblock).operations;
+        // jit.py:192-194 — one `hint(arg, promote=True)` per selected
+        // arg.  With promote_args="all" and two args, exactly two
+        // hint_promote calls.
+        let hint_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if target.path_segments().and_then(|s| s.last().copied()) == Some("hint_promote")
+                )
+            })
+            .count();
+        assert_eq!(
+            hint_count, 2,
+            "wrapper must emit hint_promote per arg; ops:\n{ops:#?}"
+        );
+        // jit.py:195 — tail call to the renamed original.
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().and_then(|s| s.last().copied()) == Some("_orig_foo_unlikely_name")
+            )),
+            "wrapper must tail-call _orig_foo_unlikely_name; ops:\n{ops:#?}"
+        );
     }
 }

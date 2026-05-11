@@ -235,35 +235,46 @@ fn collect_trait_impls_from_items(
                                 sig: method.sig.clone(),
                                 block: Box::new(method.block.clone()),
                             };
+                            // jit.py:184-201 — `@elidable_promote` on a
+                            // trait-impl method installs two callables
+                            // (orig + wrapper); `synthesize_or_passthrough`
+                            // makes this lowering pass see both.  Method
+                            // signature parity (return type, hints) is
+                            // taken from the synthesized `ItemFn`, not the
+                            // original `method`, so the orig's
+                            // `_orig_<NAME>_unlikely_name` identity
+                            // survives downstream.
                             // `?` propagates `FlowingError` out of the
                             // extractor (RPython re-raise at
                             // `flowspace/flowcontext.py:417`).
-                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                &fake_fn,
-                                self_ty_root.clone(),
-                                struct_fields,
-                                fn_return_types,
-                                prefix,
-                                known_struct_names,
-                                known_trait_names,
-                            )?;
-                            let return_type = match &method.sig.output {
-                                syn::ReturnType::Type(_, ty) => {
-                                    crate::front::ast::qualified_full_type_string(
-                                        ty,
-                                        prefix,
-                                        known_struct_names,
-                                        known_trait_names,
-                                    )
-                                }
-                                syn::ReturnType::Default => Some("()".to_string()),
-                            };
-                            methods.push(MethodInfo {
-                                name: method.sig.ident.to_string(),
-                                graph: Some(sf.graph),
-                                return_type,
-                                hints: sf.hints,
-                            });
+                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                                    &synth,
+                                    self_ty_root.clone(),
+                                    struct_fields,
+                                    fn_return_types,
+                                    prefix,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )?;
+                                let return_type = match &synth.sig.output {
+                                    syn::ReturnType::Type(_, ty) => {
+                                        crate::front::ast::qualified_full_type_string(
+                                            ty,
+                                            prefix,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )
+                                    }
+                                    syn::ReturnType::Default => Some("()".to_string()),
+                                };
+                                methods.push(MethodInfo {
+                                    name: synth.sig.ident.to_string(),
+                                    graph: Some(sf.graph),
+                                    return_type,
+                                    hints: sf.hints,
+                                });
+                            }
                         }
                     }
                     impls.push(TraitImplInfo {
@@ -291,32 +302,36 @@ fn collect_trait_impls_from_items(
                                 sig: method.sig.clone(),
                                 block: Box::new(block.clone()),
                             };
-                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                &fake_fn,
-                                None,
-                                struct_fields,
-                                fn_return_types,
-                                prefix,
-                                known_struct_names,
-                                known_trait_names,
-                            )?;
-                            let return_type = match &method.sig.output {
-                                syn::ReturnType::Type(_, ty) => {
-                                    crate::front::ast::qualified_full_type_string(
-                                        ty,
-                                        prefix,
-                                        known_struct_names,
-                                        known_trait_names,
-                                    )
-                                }
-                                syn::ReturnType::Default => Some("()".to_string()),
-                            };
-                            methods.push(MethodInfo {
-                                name: method.sig.ident.to_string(),
-                                graph: Some(sf.graph),
-                                return_type,
-                                hints: sf.hints,
-                            });
+                            // jit.py:184-201 — trait default methods get
+                            // the same wrapper/orig synthesis.
+                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                                    &synth,
+                                    None,
+                                    struct_fields,
+                                    fn_return_types,
+                                    prefix,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )?;
+                                let return_type = match &synth.sig.output {
+                                    syn::ReturnType::Type(_, ty) => {
+                                        crate::front::ast::qualified_full_type_string(
+                                            ty,
+                                            prefix,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )
+                                    }
+                                    syn::ReturnType::Default => Some("()".to_string()),
+                                };
+                                methods.push(MethodInfo {
+                                    name: synth.sig.ident.to_string(),
+                                    graph: Some(sf.graph),
+                                    return_type,
+                                    hints: sf.hints,
+                                });
+                            }
                         }
                     }
                 }
@@ -435,36 +450,40 @@ fn collect_inherent_methods_from_items(
                             sig: method.sig.clone(),
                             block: Box::new(method.block.clone()),
                         };
-                        // `?` propagates `FlowingError` — RPython
-                        // re-raise at `flowspace/flowcontext.py:417`.
-                        let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                            &fake_fn,
-                            self_ty_root.clone(),
-                            struct_fields,
-                            fn_return_types,
-                            prefix,
-                            known_struct_names,
-                            &std::collections::HashSet::new(),
-                        )?;
-                        let return_type = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => {
-                                crate::front::ast::qualified_full_type_string(
-                                    ty,
-                                    prefix,
-                                    known_struct_names,
-                                    &std::collections::HashSet::new(),
-                                )
-                            }
-                            syn::ReturnType::Default => Some("()".to_string()),
-                        };
-                        methods.push(InherentMethodInfo {
-                            for_type: for_type.clone(),
-                            self_ty_root: self_ty_root.clone(),
-                            name: method.sig.ident.to_string(),
-                            graph: sf.graph,
-                            return_type,
-                            hints: sf.hints,
-                        });
+                        // jit.py:184-201 — inherent-impl methods get the
+                        // same wrapper/orig synthesis as free fns;
+                        // `?` propagates `FlowingError` per
+                        // `flowspace/flowcontext.py:417`.
+                        for synth in crate::front::ast::synthesize_or_passthrough(fake_fn) {
+                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                                &synth,
+                                self_ty_root.clone(),
+                                struct_fields,
+                                fn_return_types,
+                                prefix,
+                                known_struct_names,
+                                &std::collections::HashSet::new(),
+                            )?;
+                            let return_type = match &synth.sig.output {
+                                syn::ReturnType::Type(_, ty) => {
+                                    crate::front::ast::qualified_full_type_string(
+                                        ty,
+                                        prefix,
+                                        known_struct_names,
+                                        &std::collections::HashSet::new(),
+                                    )
+                                }
+                                syn::ReturnType::Default => Some("()".to_string()),
+                            };
+                            methods.push(InherentMethodInfo {
+                                for_type: for_type.clone(),
+                                self_ty_root: self_ty_root.clone(),
+                                name: synth.sig.ident.to_string(),
+                                graph: sf.graph,
+                                return_type,
+                                hints: sf.hints,
+                            });
+                        }
                     }
                 }
             }
