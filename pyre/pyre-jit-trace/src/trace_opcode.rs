@@ -382,16 +382,27 @@ fn mirror_vable_static_to_boxes(
     }
 }
 
+/// Resolve the mutable frame-mirror index for a stack slot.
+///
+/// RPython `pyjitpl.py` keeps each kind-specific register bank indexed by
+/// post-regalloc register number. Pyre still uses `registers_r` as a
+/// semantic mirror for `locals_cells_stack_w`, so stack writers must not use
+/// post-regalloc colors here: stack colors can legally coalesce with dead
+/// local colors and would overwrite the local mirror before loop-close and
+/// guard snapshots consume it. The encoder builds the color-indexed Ref bank
+/// separately from liveness and the virtualizable shadow.
+pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
+    sym.nlocals + stack_idx
+}
+
 /// Write a Ref-boxed value to the symbolic operand stack at depth
 /// offset `stack_idx`. Centralizes the dual-shadow update that
 /// `push_typed_value`, `finishframe_exception`'s exception/lasti push,
 /// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
 /// inline-call setup all duplicated:
 ///
-/// - `registers_r[reg_idx]` — the unified register file (currently
-///   semantic-indexed `reg_idx == nlocals + stack_idx`; Step 2.2 will
-///   flip to color-indexed via `metadata.stack_slot_color_map[stack_idx]`
-///   when the trace owns the virtualizable shadow).
+/// - `registers_r[reg_idx]` — the semantic frame mirror slot
+///   (`reg_idx == nlocals + stack_idx`).
 /// - `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` —
 ///   `locals_cells_stack_w` heap mirror, ALWAYS semantic-indexed
 ///   (`pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable`).
@@ -417,13 +428,7 @@ pub(crate) fn write_stack_slot(
     concrete: ConcreteValue,
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
-    // Step 2.2 stub: reg_idx == semantic_idx today. After every stack
-    // writer call site routes through this helper, the body will flip
-    // to `stack_slot_color_map[stack_idx]` for owns_shadow traces in
-    // a single atomic edit. Until then, every site that previously
-    // wrote `registers_r[nlocals + stack_idx]` directly must use this
-    // helper so the eventual flip is bench-bisectable.
-    let reg_idx = semantic_idx;
+    let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
     }
@@ -460,16 +465,11 @@ pub(crate) fn write_stack_slot(
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
 ///
-/// Currently reads `registers_r[reg_idx]` with `reg_idx ==
-/// nlocals + stack_idx` (semantic). Step 2.2 will flip `reg_idx` to
-/// `stack_slot_color_map[stack_idx]` for owns_shadow traces in a
-/// single atomic edit, paired with the write helper's flip.
-///
-/// On NONE-fill, the IR `getarrayitem` op uses the SEMANTIC array
-/// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap
-/// layout the array descr describes — while the destination slot
-/// `reg_idx` is the JIT register-file slot subsequent reads
-/// consult.
+/// Reads the semantic frame mirror via `stack_slot_reg_idx`.  On
+/// NONE-fill, the IR `getarrayitem` op still uses the SEMANTIC array
+/// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap layout
+/// the array descr describes — and stores the result in the mirror slot
+/// subsequent stack reads consult.
 ///
 /// `init_symbolic` (state.rs:2785) leaves
 /// `locals_cells_stack_array_ref = OpRef::NONE` for active-owner
@@ -484,7 +484,7 @@ pub(crate) fn write_stack_slot(
 /// `GetarrayitemGcR` with a NONE base operand.
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
-    let reg_idx = semantic_idx;
+    let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
     }
@@ -511,8 +511,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// into the sentinel fallback, hence the `virtualizable_entry_at`
 /// pair-read+pair-write.
 ///
-/// Step 2.2 will flip `reg_top` / `reg_other` to colors here in the
-/// same atomic edit that flips `read_stack_slot` / `write_stack_slot`.
+/// `reg_top` / `reg_other` are semantic frame-mirror indices.
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -523,8 +522,8 @@ pub(crate) fn swap_stack_slots(
     let _ = read_stack_slot(sym, ctx, other_idx);
     let semantic_top = sym.nlocals + top_idx;
     let semantic_other = sym.nlocals + other_idx;
-    let reg_top = semantic_top;
-    let reg_other = semantic_other;
+    let reg_top = stack_slot_reg_idx(sym, top_idx);
+    let reg_other = stack_slot_reg_idx(sym, other_idx);
     if reg_top != reg_other {
         sym.registers_r.swap(reg_top, reg_other);
     }
@@ -552,6 +551,7 @@ pub(crate) fn swap_stack_slots(
 }
 
 impl MIFrame {
+    #[allow(dead_code)]
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         let exec_ctx = self.sym().concrete_execution_context;
         if !exec_ctx.is_null() {
@@ -567,6 +567,7 @@ impl MIFrame {
     }
 
     /// Get the concrete return value from the frame's stack top.
+    #[allow(dead_code)]
     fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
         // MIFrame Box tracking: read from concrete_stack
         let s = self.sym();
@@ -618,6 +619,7 @@ impl MIFrame {
             concrete_frame_addr: concrete_frame,
             orgpc,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -822,21 +824,16 @@ impl MIFrame {
         // `push_typed_value` / `store_local_value` for every trace that
         // satisfies `owns_virtualizable_shadow()` (loop portal +
         // bridges with seeded `bridge_local_oprefs`). Non-owner traces
-        // keep the legacy semantic registers_r snapshot.
+        // keep the semantic `registers_r` mirror snapshot.
         //
         // Prefix length: when reading from the shadow, use the full
         // `valuestackdepth` — the shadow covers the entire `nlocals +
         // co_stacksize` frame array regardless of `registers_r`
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
-        // operand stack.  The `registers_r` fallback path keeps the
-        // length cap because reading past `registers_r.len()` panics.
-        let prefix_len = if owns_shadow {
-            portal_vsd.unwrap_or(s.valuestackdepth)
-        } else {
-            s.valuestackdepth.min(s.registers_r.len())
-        };
-        if owns_shadow && prefix_len >= nlocals {
+        // operand stack.
+        let prefix_len = portal_vsd.unwrap_or(s.valuestackdepth);
+        let snapshot = if owns_shadow && prefix_len >= nlocals {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut snapshot = Vec::with_capacity(prefix_len);
             for i in 0..nlocals {
@@ -851,15 +848,23 @@ impl MIFrame {
                         .expect("capture_pre_opcode_state: missing virtualizable stack box"),
                 );
             }
-            self.pre_opcode_registers_r = Some(snapshot);
+            snapshot
         } else {
-            self.pre_opcode_registers_r = Some(s.registers_r[..prefix_len].to_vec());
-        }
+            s.registers_r.clone()
+        };
+        self.pre_opcode_semantic_depth = Some(prefix_len);
+        self.pre_opcode_registers_r = Some(snapshot);
     }
 
     #[inline]
     fn clear_pre_opcode_state(&mut self) {
         self.pre_opcode_registers_r = None;
+        self.pre_opcode_semantic_depth = None;
+    }
+
+    #[inline]
+    fn pre_opcode_depth_or(&self, fallback: usize) -> usize {
+        self.pre_opcode_semantic_depth.unwrap_or(fallback)
     }
 
     fn materialize_fail_arg_slot(
@@ -924,6 +929,7 @@ impl MIFrame {
             Float,
         }
         impl LiveBank {
+            #[allow(dead_code)]
             fn ty(self) -> Type {
                 match self {
                     LiveBank::Int => Type::Int,
@@ -953,9 +959,9 @@ impl MIFrame {
             // `load_local_value` whose vable-shadow read (line 1218)
             // works for any flat slot in `vb[NUM_VABLE_SCALARS..
             // NUM_VABLE_SCALARS + nlocals + ncells + stackdepth]`.
-            // The semantic_ref_slot_for_reg_color in-loop special-
-            // case below provides identity mapping for portal-bridge
-            // since no regalloc happens (color == slot index).
+            // Portal-bridge has no regalloc so colors == slot indices
+            // (identity); the `is_portal_bridge` guard in the Ref-bank
+            // materialization loop below provides the same bypass.
             if jc.payload.metadata.pc_map.is_empty() {
                 if jc.payload.is_portal_bridge() {
                     let stack_base = jc.payload.metadata.stack_base;
@@ -1025,111 +1031,159 @@ impl MIFrame {
         // pyjitpl.py:194-198 — pre_opcode_registers_r is captured at orgpc
         // and would mis-size live_max for the fallthrough_pc resume.
         let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
-        let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map, is_portal_bridge) = {
+        let (
+            nlocals,
+            valid_stack_only,
+            jitcode_ptr,
+            local_color_map,
+            stack_slot_color_map,
+            live_local_indices,
+            is_portal_bridge,
+        ) = {
             let s = self.sym();
+            let (
+                local_color_map,
+                stack_slot_color_map,
+                live_local_indices,
+                is_portal_bridge,
+                metadata_stack_depth,
+            ) =
+                if s.jitcode.is_null() {
+                    (Vec::new(), Vec::new(), Vec::new(), false, None)
+                } else {
+                    unsafe {
+                        let jc = &*s.jitcode;
+                        let live_local_indices = if jc.payload.code_ptr.is_null() {
+                            Vec::new()
+                        } else {
+                            let live_vars = crate::liveness::liveness_for(jc.payload.code_ptr);
+                            (0..s.nlocals)
+                                .filter(|&idx| live_vars.is_local_live(live_pc, idx))
+                                .collect()
+                        };
+                        (
+                            jc.payload.metadata.pyre_color_for_semantic_local.clone(),
+                            jc.payload.metadata.stack_slot_color_map.clone(),
+                            live_local_indices,
+                            jc.payload.is_portal_bridge(),
+                            jc.payload
+                                .metadata
+                                .depth_at_py_pc
+                                .get(live_pc)
+                                .copied()
+                                .map(|d| d as usize),
+                        )
+                    }
+                };
             let valid_stack_only = if let Some(vsd) = portal_live_vsd {
                 vsd.saturating_sub(s.nlocals)
-            } else if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                pre_r.len().saturating_sub(s.nlocals)
+            } else if self.pre_opcode_registers_r.is_some() {
+                metadata_stack_depth.unwrap_or_else(|| {
+                    s.valuestackdepth.saturating_sub(s.nlocals)
+                })
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
-            };
-            let (stack_slot_color_map, is_portal_bridge) = if s.jitcode.is_null() {
-                (Vec::new(), false)
-            } else {
-                unsafe {
-                    let jc = &*s.jitcode;
-                    (
-                        jc.payload.metadata.stack_slot_color_map.clone(),
-                        jc.payload.is_portal_bridge(),
-                    )
-                }
             };
             (
                 s.nlocals,
                 valid_stack_only,
                 s.jitcode,
+                local_color_map,
                 stack_slot_color_map,
+                live_local_indices,
                 is_portal_bridge,
             )
         };
+        // SSA-authoritative live_r slice 3b-2: Ref bank entries go
+        // through the read_live / lazy-fill / materialize pipeline to
+        // populate registers_r[color].  Int/Float banks already live in
+        // their own register arrays (registers_i / registers_f) and the
+        // clone at lines 1225-1227 captures them; materialization would
+        // only corrupt those values by overwriting with a Ref-derived
+        // fallback.  Skip non-Ref banks entirely.
         let mut bank_materializations: Vec<(LiveBank, usize, OpRef)> =
             Vec::with_capacity(live_regs_for_banks.len());
         for (bank, idx) in live_regs_for_banks {
-            // G.4.4-encoder.3: portal-bridge has no regalloc, so
-            // colors == slot indices (identity).  Bypass
-            // `semantic_ref_slot_for_reg_color`'s color-map search
-            // and stack_color_map fallback (which would only return
-            // identity for `idx < nlocals`, dropping cells + stack).
-            let slot_idx_opt = if is_portal_bridge {
-                Some(idx)
+            if !matches!(bank, LiveBank::Ref) {
+                continue;
+            }
+            let color_idx = idx;
+            // Derive semantic index for vable shadow / concrete_at.
+            // A stack slot color may be coalesced with a local identity
+            // color when the local is not live.  Mirror the decoder's
+            // `semantic_ref_slot_for_reg_color`: consult the live stack
+            // prefix first, and only fall back through the local color
+            // map if no live stack slot owns this color.
+            let Some(semantic_idx) = (if is_portal_bridge {
+                Some(color_idx)
             } else {
                 crate::state::semantic_ref_slot_for_reg_color(
                     nlocals,
                     valid_stack_only,
+                    &local_color_map,
                     &stack_slot_color_map,
-                    idx,
+                    &live_local_indices,
+                    color_idx,
                 )
-            };
-            let Some(slot_idx) = slot_idx_opt else {
+            }) else {
                 continue;
             };
-            // `load_local_value` errors when `slot_idx >= registers_r.len()`;
-            // a live semantic slot beyond the current register-file
-            // growth needs resizing before the mirror read can land the
-            // value.
             {
                 let s = self.sym_mut();
-                if slot_idx >= s.registers_r.len() {
-                    s.registers_r.resize(slot_idx + 1, OpRef::NONE);
+                if color_idx >= s.registers_r.len() {
+                    s.registers_r.resize(color_idx + 1, OpRef::NONE);
                 }
             }
-            // pyjitpl.py:177 + :223 parity (`get_list_of_active_boxes`
-            // → `LivenessIterator` reads `self.registers_r[index]`
-            // directly).  Pyre's `pre_opcode_registers_r` is a pyre-only
-            // mid-opcode guard recovery snapshot — when present and the
-            // snapshot slot is non-NONE it is the authoritative pre-
-            // opcode view, otherwise we fall back to the live read.
-            //
-            // Live source: the virtualizable shadow when the trace owns
-            // it (loop portal OR bridge with seeded
-            // `bridge_local_oprefs`) and the slot is a live frame slot
-            // (`slot_idx < valuestackdepth`); otherwise the unified
-            // `registers_r` register file.  The shadow covers the full
-            // `nlocals + co_stacksize` frame array; non-owner traces
-            // (inline-callee scaffolding before the inline path takes
-            // over) keep the legacy semantic registers_r path.
-            //
-            // If the live read is NONE, lazy-load via
-            // `MIFrame::load_local_value` (which writes the loaded
-            // OpRef into `registers_r[slot_idx]` for non-active traces
-            // and returns the shadow value for active-owner traces),
-            // then re-read so `semantic_value` uses the freshly loaded
-            // OpRef — matching main's pattern of reading from
-            // `registers_r` after the lazy-load side effect.
-            // Live max: portal-bridge frames keep `sym.valuestackdepth`
-            // at the initial seed because residual-call paths bypass
-            // `push_typed_value` / `pop_value` (see `portal_bridge_
-            // vable_vsd` doc at line 2043-2063 for the full rationale).
-            // Use the locally-derived `nlocals + valid_stack_only` —
-            // computed above from `pre_opcode_registers_r.len()` for
-            // portal-bridge or `sym.valuestackdepth` otherwise — so the
-            // shadow-vs-registers_r gate matches the metadata-driven
-            // live extent rather than the stale symbolic counter.
+            // pyjitpl.py:218-234 parity for the snapshot/fallback:
+            // produce the color-indexed Ref bank, but source active
+            // virtualizable frame slots from the semantic shadow. A
+            // stack color may be coalesced with a dead local color;
+            // reading `registers_r[color]` for the fallback would pick
+            // up the stale local mirror for a live stack slot.
             let live_max = nlocals + valid_stack_only;
             let read_live = |this: &MIFrame, ctx: &TraceCtx| -> OpRef {
                 let s = this.sym();
-                if s.owns_virtualizable_shadow() && slot_idx < live_max {
+                if s.owns_virtualizable_shadow() && semantic_idx < live_max {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                    ctx.virtualizable_box_at(nvs + slot_idx)
-                        .expect("get_list_of_active_boxes: missing virtualizable shadow box")
-                } else {
-                    s.registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE)
+                    return ctx
+                        .virtualizable_box_at(nvs + semantic_idx)
+                        .expect("get_list_of_active_boxes: missing vable frame box");
                 }
+                let val = s
+                    .registers_r
+                    .get(semantic_idx)
+                    .copied()
+                    .unwrap_or(OpRef::NONE);
+                if val != OpRef::NONE {
+                    return val;
+                }
+                OpRef::NONE
             };
             let live_value_pre = read_live(self, ctx);
             if live_value_pre == OpRef::NONE {
-                let _ = MIFrame::load_local_value(self, ctx, slot_idx);
+                if semantic_idx < nlocals {
+                    let value = MIFrame::load_local_value(self, ctx, semantic_idx)
+                        .expect("get_list_of_active_boxes: failed to lazy-load live local");
+                    self.sym_mut().registers_r[color_idx] = value;
+                } else {
+                    // Stack lazy-fill: heap read at semantic index,
+                    // store in both the semantic mirror (read_live) and
+                    // the color bank (Ref-bank fail args).
+                    let s = self.sym_mut();
+                    if s.locals_cells_stack_array_ref == OpRef::NONE {
+                        let frame_ref = s.frame;
+                        s.locals_cells_stack_array_ref =
+                            frame_locals_cells_stack_array(ctx, frame_ref);
+                    }
+                    let idx_const = ctx.const_int(semantic_idx as i64);
+                    let arr = s.locals_cells_stack_array_ref;
+                    let value = trace_array_getitem_value(ctx, arr, idx_const);
+                    if semantic_idx >= s.registers_r.len() {
+                        s.registers_r.resize(semantic_idx + 1, OpRef::NONE);
+                    }
+                    s.registers_r[semantic_idx] = value;
+                    s.registers_r[color_idx] = value;
+                }
             }
             let live_value = if live_value_pre == OpRef::NONE {
                 read_live(self, ctx)
@@ -1139,20 +1193,15 @@ impl MIFrame {
             let semantic_value = self
                 .pre_opcode_registers_r
                 .as_ref()
-                .and_then(|pre_r| pre_r.get(slot_idx).copied())
+                // `capture_pre_opcode_state` stores a semantic frame
+                // snapshot for both vable-owner and non-owner traces. A
+                // live stack color may reuse a dead local color, so reading
+                // the snapshot by color would capture the wrong local value.
+                .and_then(|pre_r| pre_r.get(semantic_idx).copied())
                 .filter(|value| !value.is_none())
                 .unwrap_or(live_value);
-            let bank_value = match bank {
-                LiveBank::Ref => {
-                    self.materialize_fail_arg_slot(ctx, semantic_value, Type::Ref, slot_idx)
-                }
-                LiveBank::Int | LiveBank::Float if self.value_type(semantic_value) == bank.ty() => {
-                    semantic_value
-                }
-                LiveBank::Int | LiveBank::Float => {
-                    self.materialize_fail_arg_slot(ctx, OpRef::NONE, bank.ty(), slot_idx)
-                }
-            };
+            let bank_value =
+                self.materialize_fail_arg_slot(ctx, semantic_value, Type::Ref, semantic_idx);
             bank_materializations.push((bank, idx, bank_value));
         }
         let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
@@ -1719,13 +1768,13 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Step 2.2 prerequisite: do NOT write registers_r[idx] = op.
-            // After Step 2.2 routes stack pushes to color-indexed slots
-            // (which may be coalesced with a local color), this sync
-            // line OVERWRITES a freshly-pushed stack value. Path C
-            // readers (Slices 1-6) all consult vable shadow first for
-            // active vable owner traces, so the registers_r mirror is
-            // no longer required for downstream consumers.
+            // Do NOT write registers_r[idx] = op here.  For active
+            // virtualizable-owner traces, the vable shadow is the
+            // authoritative source for locals, and stack colors can still
+            // coalesce with local colors in the encoder's temporary bank.
+            // Reintroducing a local mirror write here can overwrite the
+            // value that guard capture is about to materialize for a stack
+            // slot sharing the same color.
             return Ok(op);
         }
         let s = self.sym_mut();
@@ -2086,7 +2135,7 @@ impl MIFrame {
     /// (both populated by `install_portal_for` G.3h + G.4.2).  Returns
     /// `None` for non-portal-bridge or null-jitcode states so the caller
     /// can fall back to the stale `sym.valuestackdepth` /
-    /// `pre_opcode_registers_r.len()` heuristic that the per-CodeObject
+    /// `pre_opcode_semantic_depth` heuristic that the per-CodeObject
     /// path relies on.
     ///
     /// Why this is needed: portal-bridge tracing records each user opcode
@@ -2136,10 +2185,7 @@ impl MIFrame {
         let resume_pc = self.orgpc;
         let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
             let s = self.sym();
-            self.pre_opcode_registers_r
-                .as_ref()
-                .map(|pre_r| pre_r.len())
-                .unwrap_or(s.valuestackdepth) as i64
+            self.pre_opcode_depth_or(s.valuestackdepth) as i64
         });
         // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
         // `metainterp.virtualizable_boxes` without mutating it. The two
@@ -2686,7 +2732,6 @@ impl MIFrame {
             // `concrete_value_at` and falls back to `PY_NULL` for dead
             // capacity slots — mirroring RPython's null-padded
             // virtualizable_boxes tail.
-            let reg_len = s.registers_r.len();
             let target_stack_capacity = target_array_capacity.saturating_sub(nlocals);
             let mut stack_types_vec =
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec();
@@ -2732,14 +2777,16 @@ impl MIFrame {
                     .collect();
                 (locals_vec, stack_vec)
             } else {
-                let locals_len = nlocals.min(reg_len);
-                let live_stack_len = stack_only.min(reg_len.saturating_sub(locals_len));
-                let stack_slice_start = locals_len;
-                let stack_slice_end = stack_slice_start + live_stack_len;
-                (
-                    s.registers_r[..locals_len].to_vec(),
-                    s.registers_r[stack_slice_start..stack_slice_end].to_vec(),
-                )
+                let read_color =
+                    |color: usize| s.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
+                let locals_vec: Vec<OpRef> = (0..nlocals)
+                    .map(|i| read_color(i))
+                    .collect();
+                let live_stack_len = stack_only.min(target_stack_capacity);
+                let stack_vec: Vec<OpRef> = (0..live_stack_len)
+                    .map(|d| read_color(nlocals + d))
+                    .collect();
+                (locals_vec, stack_vec)
             };
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
             (
@@ -3586,7 +3633,7 @@ impl MIFrame {
         //
         // The slot-2 inline override re-derives the pre-opcode
         // valuestackdepth via `portal_bridge_vable_vsd(resume_pc)
-        // .unwrap_or(pre_opcode_registers_r.len() / s.valuestackdepth)`
+        // .unwrap_or(pre_opcode_semantic_depth / s.valuestackdepth)`
         // — same source `flush_to_frame_for_guard` uses to set
         // `s.vable_valuestackdepth`.
         //
@@ -3614,10 +3661,7 @@ impl MIFrame {
             let resume_pc = self.orgpc;
             Some(self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
                 let s = self.sym();
-                self.pre_opcode_registers_r
-                    .as_ref()
-                    .map(|pre_r| pre_r.len())
-                    .unwrap_or(s.valuestackdepth) as i64
+                self.pre_opcode_depth_or(s.valuestackdepth) as i64
             }))
         } else {
             None
@@ -3657,8 +3701,9 @@ impl MIFrame {
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;
-        let symbolic_stack_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-            pre_r.len().saturating_sub(sym.nlocals)
+        let symbolic_stack_len = if self.pre_opcode_registers_r.is_some() {
+            self.pre_opcode_depth_or(sym.valuestackdepth)
+                .saturating_sub(sym.nlocals)
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
@@ -3682,10 +3727,7 @@ impl MIFrame {
             .map(|f| f.locals_w().len())
             .unwrap_or_else(|| {
                 let current_vsd = self
-                    .pre_opcode_registers_r
-                    .as_ref()
-                    .map(|pre_r| pre_r.len())
-                    .unwrap_or(sym.valuestackdepth);
+                    .pre_opcode_depth_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
                     .saturating_sub(sym.nlocals)
                     .min(symbolic_stack_len);
@@ -3770,6 +3812,7 @@ impl MIFrame {
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
+    #[allow(dead_code)]
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
         ctx: &majit_metainterp::TraceCtx,
@@ -4124,12 +4167,14 @@ impl MIFrame {
         None
     }
 
+    #[allow(dead_code)]
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         let actual_value = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
         self.implement_guard_value(ctx, actual_value, expected);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
         if self.value_type(value) == Type::Int {
             self.implement_guard_value(ctx, value, expected);
@@ -4193,6 +4238,7 @@ impl MIFrame {
         self.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
         self.implement_guard_value(ctx, len, expected as i64);
     }
@@ -5767,6 +5813,7 @@ impl MIFrame {
         Ok(objspace_truth_value(concrete_val))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn concrete_branch_truth(&mut self) -> Result<bool, PyError> {
         self.concrete_branch_truth_for_value(OpRef::NONE, PY_NULL)
     }
@@ -6446,7 +6493,7 @@ impl MIFrame {
 unsafe fn trace_check_exc_match_against(
     exc_value: pyre_object::PyObjectRef,
     exc_type: pyre_object::PyObjectRef,
-) -> bool {
+) -> bool { unsafe {
     if !pyre_object::is_exception(exc_value) {
         return true;
     }
@@ -6503,7 +6550,7 @@ unsafe fn trace_check_exc_match_against(
     // ported yet; report a structural mismatch loudly so the caller
     // surfaces a tracer regression rather than silently emitting True.
     false
-}
+}}
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {
@@ -7316,14 +7363,11 @@ mod tests {
         let float_box = OpRef::float_op(30);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
-        // `registers_r` is the unified abstract register file
-        // (locals[..nlocals] then stack[nlocals..nlocals+stack_only]); the
-        // snapshot read translates the Ref liveness color through
-        // `semantic_ref_slot_for_reg_color` to land at the same slot the
-        // lazy-load preamble populates. Set nlocals=2 so the encoded ref
-        // color 1 maps to semantic slot `locals[1]` via the in-range
-        // fallback. Int and Float banks stay kind-specific (no
-        // unification), so their bank-indexed setup is unchanged.
+        // SSA-authoritative live_r slice 3b-2: the encoder reads the
+        // color-indexed Ref bank. Set nlocals=2 so the Ref liveness
+        // color 1 reads the temporary bank at index 1 (identity for locals).
+        // Int and Float banks stay kind-specific (no unification),
+        // so their bank-indexed setup is unchanged.
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
         sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];
@@ -7342,10 +7386,86 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
         assert_eq!(active, vec![int_box, ref_box, float_box]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+    }
+
+    #[test]
+    fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
+        use majit_translate::liveness::encode_liveness;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut all_liveness = vec![0, 1, 0];
+        all_liveness.extend(encode_liveness(&[0]));
+        let mut insns = HashMap::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new(
+                "pre_opcode_snapshot_coalesced_stack_color_test",
+            );
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+                c_num_regs_r: 3,
+                startpoints: Some([0_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.depth_at_py_pc.push(1);
+        pyjit.metadata.pyre_color_for_semantic_local = vec![0, 1];
+        pyjit.metadata.stack_slot_color_map = vec![0];
+        let inner_jc = crate::state::JitCode {
+            code: std::ptr::null(),
+            index: 0,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let local0 = OpRef::ref_op(10);
+        let local1 = OpRef::ref_op(11);
+        let stack0 = OpRef::ref_op(20);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 3;
+        // Semantic mirror: local0 is at slot 0, while stack depth 0 is at
+        // semantic slot 2. Liveness color 0 belongs to the live stack slot,
+        // reusing dead local0's color.
+        sym.registers_r = vec![local0, local1, stack0];
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
+            pre_opcode_semantic_depth: Some(3),
+        };
+
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
+        assert_eq!(active, vec![stack0]);
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);

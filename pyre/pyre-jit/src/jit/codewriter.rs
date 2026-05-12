@@ -26,7 +26,7 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand,
+    CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand,
     Register, ResKind, SSARepr, TLabel, slot_for_call_flavor,
 };
 
@@ -2112,7 +2112,7 @@ fn register_helper_fn_pointers(
     // `make_call_descr_from_target_slot` (`call_descr.rs:390`) so the
     // recorded trace descr's `EffectInfo` matches the producer's
     // hand-classified flavor.
-    let mut bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {
+    let bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {
         // `MayForce` / `ReleaseGil` are dispatched via the
         // `call_may_force_*` / `call_release_gil_*` paths whose EI is
         // resolved inline by the const factory at
@@ -2352,6 +2352,7 @@ fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
     depth_at_pc: &[u16],
+    local_color_map: &[u16],
     stack_slot_color_map: &[u16],
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
@@ -2424,15 +2425,14 @@ fn filter_liveness_in_place(
         }
         // PRE-EXISTING-ADAPTATION: LV∩SSA retain narrows the Ref bank
         // to the post-rename colors that correspond to LV-live Python
-        // locals or live stack slots at this PC. The encoder
-        // (`get_list_of_active_boxes`) populates only those colors via
-        // `semantic_ref_slot_for_reg_color`; scratches are not yet
-        // tracked in `PyreSym.registers_r`, so leaving them in the
-        // encoded `-live-` section would surface as `OpRef::NONE` in
-        // guard fail_args and BH dispatch reads of stale registers.
-        // Removing this retain requires extending the
-        // encoder/symbolic-state pair to the full post-color bank,
-        // mirroring `pyjitpl.py:218-225` line by line.
+        // locals or live stack slots at this PC.  After the slice
+        // 3b-2/3b-3 flip the encoder reads `registers_r[color]`
+        // directly, but scratch registers (temporaries that are SSA-
+        // live but have no Python-frame slot) remain `OpRef::NONE` in
+        // `registers_r` because no trace-time writer populates them.
+        // Removing this retain requires either (a) populating scratch
+        // colors during tracing (Task #158 graph regalloc) or (b) the
+        // encoder tolerating NONE for non-frame live registers.
         //
         // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
         // RPython-orthodox SSA-only `live_r` so probe-A logs in
@@ -2442,10 +2442,16 @@ fn filter_liveness_in_place(
         // once Task #158 graph regalloc lands a separate scratch
         // color space; until then this env-var is the only path back
         // to RPython form.
+        assert!(
+            local_color_map.len() >= nlocals,
+            "local_color_map is shorter than nlocals: {} < {}",
+            local_color_map.len(),
+            nlocals
+        );
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                .map(|idx| idx as u16)
+                .map(|idx| local_color_map[idx])
                 .collect();
             s.extend(live_stack_colors.iter().copied());
             s
@@ -2849,102 +2855,102 @@ impl CodeWriter {
             call_fn:
                 HelperHandle {
                     idx: call_fn_idx,
-                    flavor: call_fn_flavor,
+                    flavor: _call_fn_flavor,
                 },
             load_global_fn:
                 HelperHandle {
                     idx: load_global_fn_idx,
-                    flavor: load_global_fn_flavor,
+                    flavor: _load_global_fn_flavor,
                 },
             compare_fn:
                 HelperHandle {
                     idx: compare_fn_idx,
-                    flavor: compare_fn_flavor,
+                    flavor: _compare_fn_flavor,
                 },
             binary_op_fn:
                 HelperHandle {
                     idx: binary_op_fn_idx,
-                    flavor: binary_op_fn_flavor,
+                    flavor: _binary_op_fn_flavor,
                 },
             box_int_fn:
                 HelperHandle {
                     idx: box_int_fn_idx,
-                    flavor: box_int_fn_flavor,
+                    flavor: _box_int_fn_flavor,
                 },
             truth_fn:
                 HelperHandle {
                     idx: truth_fn_idx,
-                    flavor: truth_fn_flavor,
+                    flavor: _truth_fn_flavor,
                 },
             load_const_fn:
                 HelperHandle {
                     idx: load_const_fn_idx,
-                    flavor: load_const_fn_flavor,
+                    flavor: _load_const_fn_flavor,
                 },
             store_subscr_fn:
                 HelperHandle {
                     idx: store_subscr_fn_idx,
-                    flavor: store_subscr_fn_flavor,
+                    flavor: _store_subscr_fn_flavor,
                 },
             build_list_fn:
                 HelperHandle {
                     idx: build_list_fn_idx,
-                    flavor: build_list_fn_flavor,
+                    flavor: _build_list_fn_flavor,
                 },
             normalize_raise_varargs_fn:
                 HelperHandle {
                     idx: normalize_raise_varargs_fn_idx,
-                    flavor: normalize_raise_varargs_fn_flavor,
+                    flavor: _normalize_raise_varargs_fn_flavor,
                 },
             call_fn_0:
                 HelperHandle {
                     idx: call_fn_0_idx,
-                    flavor: call_fn_0_flavor,
+                    flavor: _call_fn_0_flavor,
                 },
             call_fn_2:
                 HelperHandle {
                     idx: call_fn_2_idx,
-                    flavor: call_fn_2_flavor,
+                    flavor: _call_fn_2_flavor,
                 },
             call_fn_3:
                 HelperHandle {
                     idx: call_fn_3_idx,
-                    flavor: call_fn_3_flavor,
+                    flavor: _call_fn_3_flavor,
                 },
             call_fn_4:
                 HelperHandle {
                     idx: call_fn_4_idx,
-                    flavor: call_fn_4_flavor,
+                    flavor: _call_fn_4_flavor,
                 },
             call_fn_5:
                 HelperHandle {
                     idx: call_fn_5_idx,
-                    flavor: call_fn_5_flavor,
+                    flavor: _call_fn_5_flavor,
                 },
             call_fn_6:
                 HelperHandle {
                     idx: call_fn_6_idx,
-                    flavor: call_fn_6_flavor,
+                    flavor: _call_fn_6_flavor,
                 },
             call_fn_7:
                 HelperHandle {
                     idx: call_fn_7_idx,
-                    flavor: call_fn_7_flavor,
+                    flavor: _call_fn_7_flavor,
                 },
             call_fn_8:
                 HelperHandle {
                     idx: call_fn_8_idx,
-                    flavor: call_fn_8_flavor,
+                    flavor: _call_fn_8_flavor,
                 },
             get_current_exception_fn:
                 HelperHandle {
                     idx: get_current_exception_fn_idx,
-                    flavor: get_current_exception_fn_flavor,
+                    flavor: _get_current_exception_fn_flavor,
                 },
             set_current_exception_fn:
                 HelperHandle {
                     idx: set_current_exception_fn_idx,
-                    flavor: set_current_exception_fn_flavor,
+                    flavor: _set_current_exception_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -6381,7 +6387,7 @@ impl CodeWriter {
         // drift into "assembler overflow" or "abort_permanent present"
         // — both of which the assembler/blackhole already handle without
         // a front-end gate.
-        let mut has_abort = assembler.has_abort_flag();
+        let has_abort = assembler.has_abort_flag();
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
@@ -7828,20 +7834,17 @@ impl CodeWriter {
                 .unwrap_or(pre);
             stack_slot_color_map.push(post);
         }
-        // Task #110 slice 3a (parent #185 epic, plan
-        // `task110_ssa_authoritative_live_r_epic_plan.md`): record each
-        // Python-semantic local slot's post-regalloc color so the encoder
-        // (`pyre-jit-trace::trace_opcode::get_list_of_active_boxes`) can
-        // stop assuming `local_idx == post-regalloc-color` before slice
-        // 3b rewrites it to read from `registers_r[color]` directly per
-        // `pyjitpl.py:218-234`.
+        // SSA-authoritative live_r slice 3a: record each Python-semantic
+        // local slot's post-regalloc color.  The encoder
+        // (`get_list_of_active_boxes`) derives `semantic_idx` from
+        // `color_idx < nlocals → identity` after the slice 3b-2 flip.
         //
         // Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88
         // -100 parity) pins each local-i inputarg color to identity
         // (`color = i`), so this map is `[0, 1, ..., nlocals-1]` for
-        // every populated jitcode. The map exists as a side channel —
-        // no production reader consumes it yet; slice 3b will pick it
-        // up site-by-site.
+        // every populated jitcode.  When `enforce_input_args` pinning
+        // is relaxed (Task #158), the encoder will read this map to
+        // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
             let post = alloc_result
@@ -7865,7 +7868,13 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        filter_liveness_in_place(&mut ssarepr, code, &depth_at_pc, &stack_slot_color_map);
+        filter_liveness_in_place(
+            &mut ssarepr,
+            code,
+            &depth_at_pc,
+            &pyre_color_for_semantic_local,
+            &stack_slot_color_map,
+        );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -7974,7 +7983,7 @@ impl CodeWriter {
         // parity: borrow the CodeWriter's single Assembler so
         // `all_liveness` / `num_liveness_ops` continue to accumulate
         // across every jitcode compiled on this thread.
-        let (mut jitcode, pc_map_bytes) = {
+        let (jitcode, pc_map_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &pc_map, num_regs)
         };
@@ -9315,8 +9324,15 @@ mod tests {
         }
 
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
+        let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        filter_liveness_in_place(&mut ssarepr, &code, &depth_at_pc, &stack_slot_color_map);
+        filter_liveness_in_place(
+            &mut ssarepr,
+            &code,
+            &depth_at_pc,
+            &local_color_map,
+            &stack_slot_color_map,
+        );
 
         let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
         let live_args = ssarepr.insns[live_idx]

@@ -73,8 +73,8 @@ use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::objspace::CO_NEWLOCALS;
 use crate::flowspace::operation::{
-    ArithOps, cmp_fold, coerce_arith, coerce_int_pair, float_py_mod, int_py_floor_div, int_py_mod,
-    is_foldable_numeric, python_eq_const,
+    ArithOps, cmp_fold, coerce_arith, coerce_int_pair, float_py_mod,
+    int_py_floor_div, int_py_mod, is_foldable_numeric, python_eq_const,
 };
 use crate::flowspace::pygraph::PyGraph;
 
@@ -1075,33 +1075,6 @@ fn eval_binop(
             "i64 {op_name} ({a} {op_name} {b}) exceeds i64 carrier; bignum constants are not supported"
         )))
     };
-    // Python floor-div for `i64`. Line-by-line port of
-    // `rpython/rtyper/rint.py:398 ll_int_py_div`. Returns `None` on
-    // `i64` overflow (`x == i64::MIN, y == -1`), which the caller
-    // surfaces as `AdapterError::Unsupported` at module top level.
-    let int_py_floor_div = |x: i64, y: i64| -> Option<i64> {
-        let r = x.checked_div(y)?;
-        let p = r.checked_mul(y)?;
-        let u = if y < 0 {
-            p.checked_sub(x)?
-        } else {
-            x.checked_sub(p)?
-        };
-        r.checked_add(u >> (i64::BITS - 1))
-    };
-    // Python `%` for `i64`. Line-by-line port of
-    // `rpython/rtyper/rint.py:496 ll_int_py_mod`. `y == -1` is
-    // short-circuited (matches `flowspace::operation::int_py_mod`)
-    // because `i64::MIN.checked_rem(-1)` returns `None` even though
-    // the well-defined remainder is `0`.
-    let int_py_mod = |x: i64, y: i64| -> Option<i64> {
-        if y == -1 {
-            return Some(0);
-        }
-        let r = x.checked_rem(y)?;
-        let u = if y < 0 { r.checked_neg()? } else { r };
-        r.checked_add(y & (u >> (i64::BITS - 1)))
-    };
     match (lhs, rhs) {
         (ConstValue::Int(a), ConstValue::Int(b)) => match op {
             // `+` / `-` / `*` overflow → `Unsupported`. At
@@ -1502,6 +1475,7 @@ fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
 /// `module_globals_lookup` under a `pub(crate)` name so cross-
 /// module tests can read the registry without exposing the
 /// `pub(super)` API surface.
+#[allow(dead_code)]
 pub(crate) fn module_globals_for_test(module_id: ModuleId, name: &str) -> Option<ConstValue> {
     module_globals_lookup(module_id, name)
 }

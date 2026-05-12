@@ -1,4 +1,5 @@
 //! JIT-enabled evaluation — the sole entry point for JIT execution.
+#![allow(non_camel_case_types, non_upper_case_globals)]
 //!
 //! This module owns the JitDriver, tracing hooks, and compiled-code
 //! execution. pyre-interpreter provides the pure interpreter (eval_frame_plain)
@@ -2739,11 +2740,11 @@ enum HandleFailOutcome {
 fn handle_fail(
     frame: &mut PyFrame,
     _green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
+    _trace_id: u64,
+    _fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
     should_bridge: bool,
-    owning_key: u64,
+    _owning_key: u64,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -3057,9 +3058,9 @@ fn execute_assembler(
                             // `ExitFrameWithExceptionRef` for uncaught
                             // exceptions, never returns a failure code).
                             // Pyre's `BlackholeResult::Failed` is a layered
-                            // adaptation that should be removed once the
-                            // upstream SSA-authoritative live_r work lands
-                            // (Task #110 / Option α step 6).  Until then
+                            // adaptation; SSA-authoritative live_r encoder /
+                            // decoder work should eliminate the remaining
+                            // triggers. Until then
                             // the bare `invalidate_loop` keeps the cell
                             // retraceable; the failure surfaces in
                             // check.sh rather than being masked.
@@ -3445,11 +3446,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // (`blackhole.py:1679` raises
                             // `ExitFrameWithExceptionRef` instead).  The
                             // `BlackholeResult::Failed` variant is a pyre
-                            // layering on top of an upstream SSA liveness
-                            // gap (Task #110 / Option α step 6); when it
-                            // hits, surface the failure to check.sh by
-                            // invalidating the loop without forcing a
-                            // permanent dont-trace.
+                            // layering; SSA-authoritative live_r slices
+                            // 3b-2/3b-3 should eliminate the triggers by
+                            // reading/writing registers_r at post-regalloc
+                            // color instead of semantic slot index.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — invalidating",
@@ -6381,29 +6381,19 @@ mod tests {
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
         );
-        // `registers_r` is keyed by semantic slot index (locals 0..nlocals,
-        // stack nlocals..nlocals+stack_only) — `load_local_value` writes
-        // there.  Phase 2.1c only changed the post-rename color landscape,
-        // not the semantic indexing.
-        assert!(
-            state.symbolic_registers_r()[2..4]
-                .iter()
-                .all(|opref| !opref.is_none()),
-            "live stack slots should be materialized into the symbolic register file"
-        );
-        for (depth, &color) in stack_colors.iter().enumerate() {
-            let color = color as usize;
-            if color < 2 {
-                let stack_value = [stack0, stack1][depth];
-                assert_ne!(
-                    state.symbolic_registers_r()[color],
-                    stack_value,
-                    "Ref-bank color {} for stack depth {} must not overwrite semantic local slot {}",
-                    color,
-                    depth,
-                    color
-                );
-            }
+        // `registers_r` remains the semantic frame mirror: stack values
+        // stay at `nlocals + depth`. Guard capture materializes the
+        // color-indexed bank separately from this mirror/vable state.
+        for depth in 0..stack_colors.len() {
+            let stack_value = [stack0, stack1][depth];
+            let semantic_idx = 2 + depth;
+            assert_eq!(
+                state.symbolic_registers_r()[semantic_idx],
+                stack_value,
+                "stack depth {} must be in semantic registers_r[{}]",
+                depth,
+                semantic_idx,
+            );
         }
     }
 

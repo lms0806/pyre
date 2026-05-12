@@ -49,7 +49,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::super::flowspace::model::{
-    BlockKey, BlockRef, ConstValue, Constant, HostObject, Variable,
+    BlockKey, BlockRef, Constant, HostObject, Variable,
 };
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
@@ -3386,6 +3386,7 @@ pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::ConstValue;
     use crate::flowspace::model::GraphFunc;
     use std::rc::Rc;
 

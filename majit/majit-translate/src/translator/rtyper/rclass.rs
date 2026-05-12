@@ -48,7 +48,7 @@ use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO,
+    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO,
     StructType,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
@@ -2006,6 +2006,7 @@ pub struct InstanceRepr {
     /// classdef=None, overwritten by `_check_for_immutable_hints` for
     /// classdef!=None (rclass.py:576). R2-C keeps it as an empty set —
     /// the immutable-hint derivation lands in R2-D.
+    #[allow(dead_code)]
     immutable_field_set: RefCell<HashSet<String>>,
     /// RPython `self._reusable_prebuilt_instance` (rclass.py:807).
     /// Lazy-initialised by [`Self::get_reusable_prebuilt_instance`] —
@@ -3347,6 +3348,7 @@ pub type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
     #[test]
     fn object_vtable_resolves_to_struct_with_subclassrange_fields() {

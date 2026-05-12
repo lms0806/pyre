@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+#[allow(dead_code)]
 static DUMMY_THREADLOCAL_SLOT: i64 = 0;
 
 thread_local! {
@@ -131,6 +132,7 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 }
 
 /// Return the base pointer passed to compiled entrypoints as x1.
+#[allow(dead_code)]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let slots = slots.borrow();
@@ -222,11 +224,11 @@ pub extern "C" fn dynasm_unregister_libc_jitframe(addr: i64) {
 }
 
 pub fn register_libc_jitframe_helper_addr() -> usize {
-    dynasm_register_libc_jitframe as usize
+    dynasm_register_libc_jitframe as *const () as usize
 }
 
 pub fn unregister_libc_jitframe_helper_addr() -> usize {
-    dynasm_unregister_libc_jitframe as usize
+    dynasm_unregister_libc_jitframe as *const () as usize
 }
 
 /// Register blackhole resume handler (same API as Cranelift).

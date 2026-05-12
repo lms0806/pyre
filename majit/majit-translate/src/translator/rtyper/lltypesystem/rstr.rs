@@ -89,7 +89,7 @@ pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
             crate::flowspace::model::ConstValue::Bool(true),
         )],
     );
-    let mut fwd = ForwardReference::gc();
+    let fwd = ForwardReference::gc();
     fwd.r#become(LowLevelType::Struct(Box::new(body)))
         .expect("STR.become should succeed");
     LowLevelType::ForwardReference(Box::new(fwd))
@@ -133,7 +133,7 @@ pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
             crate::flowspace::model::ConstValue::Bool(true),
         )],
     );
-    let mut fwd = ForwardReference::gc();
+    let fwd = ForwardReference::gc();
     fwd.r#become(LowLevelType::Struct(Box::new(body)))
         .expect("UNICODE.become should succeed");
     LowLevelType::ForwardReference(Box::new(fwd))
@@ -4413,6 +4413,7 @@ pub(crate) fn build_hash_string_helper_graph(
 /// name during this builder. The funcptr for the `direct_call` op is
 /// derived via [`crate::translator::rtyper::rtyper::RPythonTyper::getcallable`]
 /// once the inner helper materialises.
+#[allow(dead_code)]
 pub(crate) fn build_ll_hash_string_helper_graph(
     rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,
     name: &str,
