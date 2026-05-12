@@ -81,7 +81,10 @@ impl Optimization for OptEarlyForce {
                             builder.add_preamble_op_from_pop(&tracked, arg);
                         }
                     }
-                    let mut info = ctx.take_ptr_info(arg).unwrap();
+                    let arg_box = ctx
+                        .get_box_replacement_box(arg)
+                        .expect("recorder-populated");
+                    let mut info = ctx.take_ptr_info(&arg_box).unwrap();
                     let _forced = info.force_box(arg, ctx);
                 }
             }

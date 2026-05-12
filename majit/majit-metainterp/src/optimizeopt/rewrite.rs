@@ -1147,7 +1147,10 @@ impl OptRewrite {
         // pointing into a virtual raw buffer) skips the is_bool
         // shortcut because the buffer pointer's intbound is unrelated
         // to its boolean truthiness.
-        if !ctx.is_raw_ptr(arg0) {
+        // OpRef → BoxRef shim until this site's caller migrates (Phase D-2).
+        let arg0_box = ctx.get_box_replacement_box(arg0);
+        let arg0_is_raw = arg0_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b));
+        if !arg0_is_raw {
             if let Some(bound) = ctx.get_int_bound(arg0) {
                 if bound.is_bool() {
                     // make_equal_to: replace INT_IS_TRUE result with arg0.
@@ -1516,7 +1519,12 @@ impl OptRewrite {
                 raise_invalid_loop("promote of a virtual");
             }
             // rewrite.py:307-347: replace_old_guard_with_guard_value
-            if let Some(old_guard) = ctx.get_last_guard(obj).cloned() {
+            let obj_box = ctx.get_box_replacement_box(obj);
+            if let Some(old_guard) = obj_box
+                .as_ref()
+                .and_then(|b| ctx.get_last_guard(b))
+                .cloned()
+            {
                 // rewrite.py:320: c_value = op.getarg(1) — generic Const.
                 // Under typed seeding c_value can be Int OR Ref; the
                 // previous gating on get_constant_int dropped the Ref
@@ -1559,7 +1567,9 @@ impl OptRewrite {
                     // rewrite.py:339-340: old descr must not be ResumeAtPositionDescr
                     // — RPython's fresh ResumeGuardDescr() at line 335 must
                     // not overwrite a RAPD marker.
-                    if let Some(old_idx) = ctx.last_guard_pos_via_box(obj)
+                    let obj_box = ctx.get_box_replacement_box(obj);
+                    if let Some(old_idx) =
+                        obj_box.as_ref().and_then(|b| ctx.last_guard_pos_via_box(b))
                         && !ctx.is_resume_at_position_guard(old_idx as i32)
                     {
                         // rewrite.py:335-338 + resoperation.py:498-503
@@ -1577,7 +1587,9 @@ impl OptRewrite {
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
                         ctx.new_operations[old_idx] = replacement;
                         // rewrite.py:345-346: info.reset_last_guard_pos()
-                        ctx.with_ptr_info_mut(obj, |info_mut| info_mut.reset_last_guard_pos());
+                        if let Some(b) = ctx.ensure_box(obj) {
+                            ctx.with_ptr_info_mut(&b, |info_mut| info_mut.reset_last_guard_pos());
+                        }
                         // postprocess_GUARD_VALUE (rewrite.py:303-305): make_constant
                         // with the actual c_value (preserving Int vs Ref typing).
                         ctx.make_constant(arg0, c_value);
@@ -1646,13 +1658,17 @@ impl OptRewrite {
         // ResumeAtPositionDescr — RPython's fresh ResumeGuardDescr() at
         // line 417 must not overwrite a RAPD marker (rewrite.py:421-422
         // "old descr must not be ResumeAtPositionDescr").
-        if let Some(old_guard) = ctx.get_last_guard(obj) {
+        let obj_box = ctx.get_box_replacement_box(obj);
+        if let Some(old_guard) = obj_box.as_ref().and_then(|b| ctx.get_last_guard(b)) {
             if old_guard.opcode == OpCode::GuardNonnull
                 && op.num_args() >= 2
                 && ctx.can_replace_guards
             {
                 // last_guard_pos is a _newoperations index.
-                let old_guard_idx = ctx.last_guard_pos_via_box(obj);
+                let old_guard_idx = ctx
+                    .get_box_replacement_box(obj)
+                    .as_ref()
+                    .and_then(|b| ctx.last_guard_pos_via_box(b));
                 if let Some(old_idx) = old_guard_idx
                     && !ctx.is_resume_at_position_guard(old_idx as i32)
                 {
@@ -1698,9 +1714,11 @@ impl OptRewrite {
                             _ => None,
                         })
                     }) {
-                        crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                            ctx, obj, class_val, /* update_last_guard = */ false,
-                        );
+                        if let Some(b) = ctx.ensure_box(obj) {
+                            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                                ctx, &b, class_val, /* update_last_guard = */ false,
+                            );
+                        }
                     }
                     return OptimizationResult::Remove;
                 }
@@ -1737,7 +1755,18 @@ impl OptRewrite {
     /// converts the upstream `INFO_NULL` / `INFO_NONNULL` /
     /// `INFO_UNKNOWN` integer return into the local `Nullness` enum.
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
-        Self::nullness_from_info(ctx.getnullness(opref))
+        // optimizer.py:127-135 `getnullness` has no missing-Box branch —
+        // every `op` has a backing `AbstractValue` per
+        // `resoperation.py:233-248`. `ensure_box` lazy-allocates the
+        // Box (or constructs the const-namespace fresh) so the inlined
+        // `getintbound` side effect (`optimizer.py:110-113` unbounded
+        // install) materializes on first access. `INFO_UNKNOWN` only
+        // for OpRef::NONE sentinels (no upstream equivalent).
+        let info = match ctx.ensure_box(opref) {
+            Some(b) => ctx.getnullness(&b),
+            None => crate::optimizeopt::INFO_UNKNOWN,
+        };
+        Self::nullness_from_info(info)
     }
 
     /// Convert an `info.py` INFO_NULL/INFO_NONNULL/INFO_UNKNOWN return
@@ -2046,9 +2075,11 @@ impl OptRewrite {
                     });
                     if let Some(val) = val {
                         let idx = (index + dest_start) as usize;
-                        ctx.with_ptr_info_mut(dest_box, |info| {
-                            info.setinteriorfield_virtual(idx, fdescr_idx, val);
-                        });
+                        if let Some(b) = ctx.ensure_box(dest_box) {
+                            ctx.with_ptr_info_mut(&b, |info| {
+                                info.setinteriorfield_virtual(idx, fdescr_idx, val);
+                            });
+                        }
                     }
                 }
             }
@@ -2106,7 +2137,9 @@ impl OptRewrite {
             if dest_is_virtual {
                 // rewrite.py:662-665: dest_info.setitem(...)
                 let idx = (index + dest_start) as usize;
-                ctx.with_ptr_info_mut(dest_box, |info| info.setitem(idx, val));
+                if let Some(b) = ctx.ensure_box(dest_box) {
+                    ctx.with_ptr_info_mut(&b, |info| info.setitem(idx, val));
+                }
             } else {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC
                 let idx_const = ctx.make_constant_int(index + dest_start);
@@ -2548,7 +2581,9 @@ impl Optimization for OptRewrite {
                 // make_nonnull runs immediately; mark_last_guard deferred
                 // until emit adds the guard to new_operations.
                 if !ctx.has_ptr_info_via_box(obj) {
-                    ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
+                    if let Some(b) = ctx.ensure_box(obj) {
+                        ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
+                    }
                 }
                 // rewrite.py:282: mark_last_guard deferred to emit_operation
                 ctx.pending_mark_last_guard = Some(obj);
@@ -2875,7 +2910,9 @@ impl Optimization for OptRewrite {
                 // RPython: self.make_nonnull(op.getarg(0))
                 let obj = ctx.get_box_replacement(op.arg(0));
                 if !ctx.has_ptr_info_via_box(obj) {
-                    ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
+                    if let Some(b) = ctx.ensure_box(obj) {
+                        ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
+                    }
                 }
                 OptimizationResult::Remove
             }
@@ -2910,12 +2947,14 @@ impl Optimization for OptRewrite {
                             debug_assert_eq!(known.0 as i64, expected_class);
                             return OptimizationResult::Remove;
                         }
-                        crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                            ctx,
-                            obj,
-                            expected_class,
-                            false, // update_last_guard=False
-                        );
+                        if let Some(b) = ctx.ensure_box(obj) {
+                            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                                ctx,
+                                &b,
+                                expected_class,
+                                false, // update_last_guard=False
+                            );
+                        }
                     }
                 }
                 OptimizationResult::Remove

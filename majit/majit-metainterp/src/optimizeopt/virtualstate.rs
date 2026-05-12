@@ -2406,8 +2406,9 @@ mod tests {
         // virtualstate.py:185 requires `info.is_virtual()` for the
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
+        let b11 = ctx.ensure_box_at(OpRef::ref_op(11).raw() as usize);
         ctx.set_ptr_info(
-            OpRef::ref_op(11),
+            &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -2442,8 +2443,9 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(16);
+        let b21 = ctx.ensure_box_at(OpRef::ref_op(21).raw() as usize);
         ctx.set_ptr_info(
-            OpRef::ref_op(21),
+            &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -2499,8 +2501,10 @@ mod tests {
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
+        let outer_a_box = ctx.ensure_box_at(outer_a_ref.raw() as usize);
+        let outer_b_box = ctx.ensure_box_at(outer_b_ref.raw() as usize);
         ctx.set_ptr_info(
-            outer_a_ref,
+            &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, inner_field_value)],
@@ -2510,7 +2514,7 @@ mod tests {
             }),
         );
         ctx.set_ptr_info(
-            outer_b_ref,
+            &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, inner_field_value)],
@@ -2571,8 +2575,9 @@ mod tests {
             field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
+        let virtual_box = ctx.ensure_box_at(virtual_ref.raw() as usize);
         ctx.set_ptr_info(
-            virtual_ref,
+            &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, OpRef::NONE), (8, field_value)],
@@ -2630,8 +2635,9 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
+        let virtual_box = ctx.ensure_box_at(virtual_ref.raw() as usize);
         ctx.set_ptr_info(
-            virtual_ref,
+            &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],

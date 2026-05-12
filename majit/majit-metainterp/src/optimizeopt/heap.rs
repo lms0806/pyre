@@ -172,7 +172,9 @@ impl CachedField {
         // descriptor object.
         for &obj in &self.cached_structs {
             let resolved = ctx.get_box_replacement(obj);
-            ctx.with_ptr_info_mut(resolved, |info| info.clear_field(descr_idx));
+            if let Some(b) = ctx.ensure_box(resolved) {
+                ctx.with_ptr_info_mut(&b, |info| info.clear_field(descr_idx));
+            }
             // Clear existing const_infos slot if present; do NOT create.
             if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                 info.clear_field(descr_idx);
@@ -295,7 +297,9 @@ impl CachedField {
             } else {
                 self.cached_structs.swap_remove(i);
                 let resolved = ctx.get_box_replacement(obj);
-                ctx.with_ptr_info_mut(resolved, |info| info.clear_field(descr_idx));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.with_ptr_info_mut(&b, |info| info.clear_field(descr_idx));
+                }
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_field(descr_idx);
                 }
@@ -485,7 +489,9 @@ impl ArrayCachedItem {
         let index = self.index as usize;
         for &obj in &self.cached_structs {
             let resolved = ctx.get_box_replacement(obj);
-            ctx.with_ptr_info_mut(resolved, |info| info.clear_item(index));
+            if let Some(b) = ctx.ensure_box(resolved) {
+                ctx.with_ptr_info_mut(&b, |info| info.clear_item(index));
+            }
             // info.py:728 ConstPtrInfo._get_array_info — only clear
             // an existing ArrayPtrInfo slot; do NOT create on miss.
             if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
@@ -603,7 +609,9 @@ impl ArrayCachedItem {
             } else {
                 self.cached_structs.swap_remove(i);
                 let resolved = ctx.get_box_replacement(obj);
-                ctx.with_ptr_info_mut(resolved, |info| info.clear_item(idx));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.with_ptr_info_mut(&b, |info| info.clear_item(idx));
+                }
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_item(idx);
                 }
@@ -1319,7 +1327,9 @@ impl OptHeap {
                 .retain(|obj| vb_get(&unescaped_snapshot, obj.raw()));
             for obj in escaped_opref {
                 let resolved = ctx.get_box_replacement(obj);
-                ctx.with_ptr_info_mut(resolved, |info| info.clear_field(field_idx));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.with_ptr_info_mut(&b, |info| info.clear_field(field_idx));
+                }
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_field(field_idx);
                 }
@@ -1365,7 +1375,9 @@ impl OptHeap {
                 if let Some(idx) = idx {
                     for obj in escaped_opref {
                         let resolved = ctx.get_box_replacement(obj);
-                        ctx.with_ptr_info_mut(resolved, |info| info.clear_item(idx));
+                        if let Some(b) = ctx.ensure_box(resolved) {
+                            ctx.with_ptr_info_mut(&b, |info| info.clear_item(idx));
+                        }
                         if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                             info.clear_item(idx);
                         }
@@ -1427,7 +1439,9 @@ impl OptHeap {
                 }
                 if index >= 0 {
                     let idx = index as usize;
-                    ctx.with_ptr_info_mut(dest_resolved, |info| info.clear_item(idx));
+                    if let Some(b) = ctx.ensure_box(dest_resolved) {
+                        ctx.with_ptr_info_mut(&b, |info| info.clear_item(idx));
+                    }
                     if let Some(info) = ctx.get_const_info_mut_if_exists(dest_resolved) {
                         info.clear_item(idx);
                     }
@@ -2379,7 +2393,10 @@ impl OptHeap {
             // setarrayitem/call invalidates cached_arrayitems, the stale preamble
             // value cannot re-populate the cache on a subsequent getarrayitem.
             let pop = ctx
-                .with_ptr_info_mut(array, |info| info.take_preamble_item(const_index as usize))
+                .ensure_box(array)
+                .and_then(|b| {
+                    ctx.with_ptr_info_mut(&b, |info| info.take_preamble_item(const_index as usize))
+                })
                 .flatten()
                 .or_else(|| {
                     ctx.get_const_info_mut_if_exists(array)
@@ -2480,7 +2497,10 @@ impl OptHeap {
 
         // heap.py line 701: make_nonnull(op.getarg(0))
         vb_set(&mut self.known_nonnull, array_ref.raw());
-        ctx.make_nonnull(op.arg(0));
+        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        if let Some(arg0_box) = ctx.ensure_box(op.arg(0)) {
+            ctx.make_nonnull(&arg0_box);
+        }
         OptimizationResult::Emit(op.clone())
     }
 
@@ -3308,7 +3328,9 @@ impl Optimization for OptHeap {
             let needs_install = !ctx.is_constant(resolved) && !ctx.is_virtual_via_box(resolved);
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
-                ctx.set_ptr_info(resolved, PtrInfo::instance(parent_descr.clone(), None));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.set_ptr_info(&b, PtrInfo::instance(parent_descr.clone(), None));
+                }
             }
             // heap.py:882-883: cf = self.field_cache(descr)
             //                  structinfo.setfield(descr, box1, box2, optheap, cf=cf)
@@ -3319,7 +3341,9 @@ impl Optimization for OptHeap {
                 }
             } else {
                 let box2 = *box2;
-                ctx.with_ptr_info_mut(resolved, |info| info.setfield(field_idx, box2));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.with_ptr_info_mut(&b, |info| info.setfield(field_idx, box2));
+                }
             }
         }
     }
@@ -3408,13 +3432,15 @@ impl Optimization for OptHeap {
             //             box1.set_forwarded(arrayinfo)
             let needs_install = !ctx.is_constant(resolved) && !ctx.is_virtual_via_box(resolved);
             if needs_install {
-                ctx.set_ptr_info(
-                    resolved,
-                    PtrInfo::array(
-                        descr.clone(),
-                        crate::optimizeopt::intutils::IntBound::nonnegative(),
-                    ),
-                );
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.set_ptr_info(
+                        &b,
+                        PtrInfo::array(
+                            descr.clone(),
+                            crate::optimizeopt::intutils::IntBound::nonnegative(),
+                        ),
+                    );
+                }
             }
             // heap.py:893-894: cf = self.arrayitem_cache(descr, index)
             //                  arrayinfo.setitem(descr, index, box1, box2, optheap, cf=cf)
@@ -3428,7 +3454,9 @@ impl Optimization for OptHeap {
             } else {
                 let idx = *index as usize;
                 let box2 = *box2;
-                ctx.with_ptr_info_mut(resolved, |info| info.setitem(idx, box2));
+                if let Some(b) = ctx.ensure_box(resolved) {
+                    ctx.with_ptr_info_mut(&b, |info| info.setitem(idx, box2));
+                }
             }
         }
     }
@@ -3695,8 +3723,9 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        ctx.set_ptr_info(object, PtrInfo::instance(None, None));
-        ctx.with_ptr_info_mut(object, |info| {
+        let object_box = ctx.ensure_box(object).unwrap();
+        ctx.set_ptr_info(&object_box, PtrInfo::instance(None, None));
+        ctx.with_ptr_info_mut(&object_box, |info| {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
@@ -4101,7 +4130,8 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(OpRef::int_op(100), PtrInfo::virtual_array(d, 8, false));
+        let pos100 = ctx.ensure_box_at(OpRef::int_op(100).raw() as usize);
+        ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4133,10 +4163,8 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(
-            OpRef::int_op(100),
-            PtrInfo::virtual_array(d.clone(), 8, false),
-        );
+        let pos100 = ctx.ensure_box_at(OpRef::int_op(100).raw() as usize);
+        ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4634,8 +4662,9 @@ mod tests {
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
-        ctx.set_ptr_info(OpRef::int_op(100), PtrInfo::instance(None, None));
-        ctx.with_ptr_info_mut(OpRef::int_op(100), |info| {
+        let pos100 = ctx.ensure_box_at(OpRef::int_op(100).raw() as usize);
+        ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
+        ctx.with_ptr_info_mut(&pos100, |info| {
             info.setfield(descr.index(), OpRef::int_op(101));
         })
         .unwrap();
@@ -6302,8 +6331,10 @@ mod tests {
         let const_20 = ctx.emit_constant_int(20);
         let const_30 = ctx.emit_constant_int(30);
 
+        let op1_box = ctx.ensure_box_at(op1.raw() as usize);
+        let op2_box = ctx.ensure_box_at(op2.raw() as usize);
         ctx.set_ptr_info(
-            op1,
+            &op1_box,
             PtrInfo::Array(ArrayPtrInfo {
                 descr: arr_descr.clone(),
                 lenbound: IntBound::from_constant(2),
@@ -6312,7 +6343,7 @@ mod tests {
             }),
         );
         ctx.set_ptr_info(
-            op2,
+            &op2_box,
             PtrInfo::Array(ArrayPtrInfo {
                 descr: arr_descr,
                 lenbound: IntBound::from_constant(2),
@@ -6396,8 +6427,12 @@ mod tests {
         op1.descr = Some(descr.clone());
         op1.pos = pos1;
         // Pretend the result is known >= 0.
+        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // `reserve_pos_typed` skips extending box_pool when the pool is
+        // empty (test baseline), so lazy-allocate here.
+        let pos1_box = ctx.ensure_box_at(pos1.raw() as usize);
         ctx.setintbound(
-            pos1,
+            &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
         assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));

@@ -271,7 +271,10 @@ pub fn string_copy_parts(
 fn force_child_for_string(opref: OpRef, ctx: &mut OptContext) -> OpRef {
     let resolved = ctx.get_box_replacement(opref);
     if ctx.is_virtual_via_box(resolved) {
-        let mut info = ctx.take_ptr_info(resolved).unwrap();
+        let resolved_box = ctx
+            .get_box_replacement_box(resolved)
+            .expect("recorder-populated");
+        let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
         let forced = info.force_box(resolved, ctx);
         return ctx.get_box_replacement(forced);
     }
@@ -311,7 +314,8 @@ impl OptString {
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
         let resolved = ctx.get_box_replacement(opref);
-        ctx.with_ptr_info_mut(resolved, |info| {
+        let b = ctx.ensure_box(resolved)?;
+        ctx.with_ptr_info_mut(&b, |info| {
             if let PtrInfo::Str(sinfo) = info {
                 if let VStringVariant::Plain(plain) = &mut sinfo.variant {
                     return Some(f(plain));
@@ -372,7 +376,10 @@ impl OptString {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         if ctx.is_virtual_via_box(resolved) {
-            let mut info = ctx.take_ptr_info(resolved).unwrap();
+            let resolved_box = ctx
+                .get_box_replacement_box(resolved)
+                .expect("recorder-populated");
+            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);
         }
@@ -474,25 +481,31 @@ impl OptString {
         if let Some(len) = ctx.get_constant_int(len_ref) {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
                 // vstring.py:450: self.make_vstring_plain(op, mode, length)
-                ctx.set_ptr_info(
-                    op.pos,
-                    PtrInfo::Str(StrPtrInfo {
-                        lenbound: None,
-                        lgtop: None,
-                        mode,
-                        length: len as i32,
-                        variant: VStringVariant::Plain(VStringPlainInfo {
-                            _chars: vec![None; len as usize],
+                let b = ctx.ensure_box_at(op.pos.raw() as usize);
+                {
+                    ctx.set_ptr_info(
+                        &b,
+                        PtrInfo::Str(StrPtrInfo {
+                            lenbound: None,
+                            lgtop: None,
+                            mode,
+                            length: len as i32,
+                            variant: VStringVariant::Plain(VStringPlainInfo {
+                                _chars: vec![None; len as usize],
+                            }),
+                            last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         }),
-                        last_guard_pos: -1,
-                        cached_vinfo: std::cell::RefCell::new(None),
-                    }),
-                );
+                    );
+                }
                 return OptimizationResult::Remove;
             }
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
-        ctx.make_nonnull_str(op.pos, mode);
+        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        if let Some(op_box) = ctx.ensure_box(op.pos) {
+            ctx.make_nonnull_str(&op_box, mode);
+        }
         // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
         //   self.pure_from_args1(mode.STRLEN, op, op.getarg(0))
         let strlen_opcode = if mode == 1 {
@@ -709,7 +722,10 @@ impl OptString {
         } else {
             1u8
         };
-        ctx.make_nonnull_str(op.arg(0), mode);
+        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        if let Some(arg0_box) = ctx.ensure_box(op.arg(0)) {
+            ctx.make_nonnull_str(&arg0_box, mode);
+        }
         let str_ref = ctx.get_box_replacement(op.arg(0));
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             let _ = len;
@@ -767,10 +783,16 @@ impl OptString {
         if op.num_args() >= 3 {
             let vleft = ctx.get_box_replacement(op.arg(1));
             let vright = ctx.get_box_replacement(op.arg(2));
-            ctx.make_nonnull_str(vleft, mode);
-            ctx.make_nonnull_str(vright, mode);
+            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            if let Some(vleft_box) = ctx.ensure_box(vleft) {
+                ctx.make_nonnull_str(&vleft_box, mode);
+            }
+            if let Some(vright_box) = ctx.ensure_box(vright) {
+                ctx.make_nonnull_str(&vright_box, mode);
+            }
+            let b = ctx.ensure_box_at(op.pos.raw() as usize);
             ctx.set_ptr_info(
-                op.pos,
+                &b,
                 PtrInfo::Str(StrPtrInfo {
                     lenbound: None,
                     lgtop: None,
@@ -800,7 +822,10 @@ impl OptString {
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
             let mut s = ctx.get_box_replacement(op.arg(1));
-            ctx.make_nonnull_str(s, mode);
+            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            if let Some(s_box) = ctx.ensure_box(s) {
+                ctx.make_nonnull_str(&s_box, mode);
+            }
             let mut start = ctx.get_box_replacement(op.arg(2));
             let stop = ctx.get_box_replacement(op.arg(3));
             let lgtop = self.int_sub(stop, start, ctx);
@@ -812,8 +837,9 @@ impl OptString {
             }
             // vstring.py:220-225: VStringSliceInfo.__init__ sets
             // self.lgtop = length on the inherited StrPtrInfo field.
+            let b = ctx.ensure_box_at(op.pos.raw() as usize);
             ctx.set_ptr_info(
-                op.pos,
+                &b,
                 PtrInfo::Str(StrPtrInfo {
                     lenbound: None,
                     lgtop: Some(lgtop),
@@ -932,7 +958,10 @@ impl OptString {
                 // vstring.py:744-755: len-0 check
                 if self.is_known_nonnull(arg1, ctx) {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
-                    ctx.make_nonnull_str(arg1, mode);
+                    // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+                    if let Some(arg1_box) = ctx.ensure_box(arg1) {
+                        ctx.make_nonnull_str(&arg1_box, mode);
+                    }
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1, mode);
                     let zero = ctx.emit_constant_int(0);
@@ -1168,15 +1197,18 @@ impl OptString {
             // isinstance(i1, VStringPlainInfo)
             if let Some(length) = length {
                 let did_shrink = ctx
-                    .with_ptr_info_mut(arg1, |info| {
-                        if let PtrInfo::Str(sinfo) = info {
-                            if matches!(sinfo.variant, VStringVariant::Plain(_)) {
-                                // vstring.py:847: i1.shrink(length)
-                                Self::vstring_plain_shrink(sinfo, length as usize);
-                                return true;
+                    .ensure_box(arg1)
+                    .and_then(|b| {
+                        ctx.with_ptr_info_mut(&b, |info| {
+                            if let PtrInfo::Str(sinfo) = info {
+                                if matches!(sinfo.variant, VStringVariant::Plain(_)) {
+                                    // vstring.py:847: i1.shrink(length)
+                                    Self::vstring_plain_shrink(sinfo, length as usize);
+                                    return true;
+                                }
                             }
-                        }
-                        false
+                            false
+                        })
                     })
                     .unwrap_or(false);
                 if did_shrink {
@@ -1357,8 +1389,9 @@ mod tests {
 
     fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
         let length = chars.len() as i32;
+        let b = ctx.ensure_box_at(opref.raw() as usize);
         ctx.set_ptr_info(
-            opref,
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -1372,8 +1405,9 @@ mod tests {
     }
 
     fn set_vstring_concat(ctx: &mut OptContext, opref: OpRef, vleft: OpRef, vright: OpRef) {
+        let b = ctx.ensure_box_at(opref.raw() as usize);
         ctx.set_ptr_info(
-            opref,
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -1391,8 +1425,9 @@ mod tests {
     }
 
     fn set_vstring_slice(ctx: &mut OptContext, opref: OpRef, s: OpRef, start: OpRef, lgtop: OpRef) {
+        let b = ctx.ensure_box_at(opref.raw() as usize);
         ctx.set_ptr_info(
-            opref,
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: Some(lgtop), // vstring.py:223: self.lgtop = length
@@ -1620,7 +1655,8 @@ mod tests {
 
         // start is not a literal ConstInt box; it is only known via IntBound.
         let start_ref = OpRef::int_op(300);
-        ctx.with_intbound_mut(start_ref, |b| {
+        let start_box = ctx.ensure_box_at(start_ref.raw() as usize);
+        ctx.with_intbound_mut(&start_box, |b| {
             *b = IntBound::from_constant(1);
         });
         ctx.make_constant(OpRef::int_op(301), Value::Int(2)); // length
@@ -1672,7 +1708,9 @@ mod tests {
         // vstring.py:452 make_nonnull_str(op, mode_unicode) installs a
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
-        ctx.make_nonnull_str(unicode_ref, 1);
+        // Synthetic-OpRef test fixture: lazy-allocate BoxRef for the unicode_ref slot.
+        let unicode_box = ctx.ensure_box_at(unicode_ref.raw() as usize);
+        ctx.make_nonnull_str(&unicode_box, 1);
 
         let len_ref = pass.getstrlen(unicode_ref, &mut ctx);
         // getstrlen delegates to ctx.getstrlen_opref which emits via
@@ -2042,8 +2080,9 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
         let p0 = OpRef::int_op(0);
         // Non-virtual Str with unknown length
+        let p0_box = ctx.ensure_box_at(p0.raw() as usize);
         ctx.set_ptr_info(
-            p0,
+            &p0_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2122,8 +2161,9 @@ mod tests {
 
         // srcbox (p0): non-null string, not virtual
         let p0 = OpRef::int_op(0);
+        let p0_box = ctx.ensure_box_at(p0.raw() as usize);
         ctx.set_ptr_info(
-            p0,
+            &p0_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2140,7 +2180,8 @@ mod tests {
         // lengthbox (i2): int with constant intbound = 2
         // Use an OpRef with IntBound set (not a literal constant)
         let i2 = OpRef::int_op(2);
-        ctx.with_intbound_mut(i2, |b| {
+        let i2_box = ctx.ensure_box_at(i2.raw() as usize);
+        ctx.with_intbound_mut(&i2_box, |b| {
             *b = IntBound::from_constant(2);
         });
 
@@ -2184,9 +2225,10 @@ mod tests {
     fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
         let arg2 = OpRef::int_op(1);
+        let arg2_box = ctx.ensure_box_at(arg2.raw() as usize);
 
         ctx.set_ptr_info(
-            arg2,
+            &arg2_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2224,8 +2266,9 @@ mod tests {
         let arg2 = OpRef::int_op(1);
 
         // Attach non-virtual StrPtrInfo to arg2 with lgtop=None.
+        let arg2_box = ctx.ensure_box_at(arg2.raw() as usize);
         ctx.set_ptr_info(
-            arg2,
+            &arg2_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,

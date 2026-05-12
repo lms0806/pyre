@@ -396,6 +396,12 @@ impl Optimizer {
     ) {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
+        // BoxRef shim for all `set_ptr_info(opref, ...)` writes below.
+        // `opref` is a freshly-allocated op position so the recorder /
+        // `alloc_op_position_typed` has populated `box_pool[opref.raw()]`.
+        // Constants take an OpRef-only path via `make_constant`.
+        let opref_box = ctx.get_box_replacement_box(opref);
+
         match info {
             VirtualStateInfo::Constant(value) => {
                 ctx.make_constant(opref, value.clone());
@@ -428,38 +434,42 @@ impl Optimizer {
                     }
                     imported_fields.push((*field_idx, field_ref));
                 }
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::Virtual(
-                        crate::optimizeopt::info::VirtualInfo {
-                            descr: descr.clone(),
-                            known_class: *known_class,
-                            ob_type_descr: ob_type_descr.clone(),
-                            fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::Virtual(
+                            crate::optimizeopt::info::VirtualInfo {
+                                descr: descr.clone(),
+                                known_class: *known_class,
+                                ob_type_descr: ob_type_descr.clone(),
+                                fields: imported_fields,
+                                field_descrs: field_descrs.clone(),
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
                     .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArray(
-                        crate::optimizeopt::info::VirtualArrayInfo {
-                            descr: descr.clone(),
-                            clear: false,
-                            items: imported_items,
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArray(
+                            crate::optimizeopt::info::VirtualArrayInfo {
+                                descr: descr.clone(),
+                                clear: false,
+                                items: imported_items,
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VStruct {
                 descr,
@@ -471,18 +481,20 @@ impl Optimizer {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
                     imported_fields.push((*field_idx, field_ref));
                 }
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                        crate::optimizeopt::info::VirtualStructInfo {
-                            descr: descr.clone(),
-                            fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                            crate::optimizeopt::info::VirtualStructInfo {
+                                descr: descr.clone(),
+                                fields: imported_fields,
+                                field_descrs: field_descrs.clone(),
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
@@ -503,18 +515,20 @@ impl Optimizer {
                             .collect()
                     })
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
-                            descr: descr.clone(),
-                            fielddescrs: fielddescrs.clone(),
-                            element_fields: imported_elements,
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
+                            crate::optimizeopt::info::VirtualArrayStructInfo {
+                                descr: descr.clone(),
+                                fielddescrs: fielddescrs.clone(),
+                                element_fields: imported_elements,
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VirtualRawBuffer {
                 func,
@@ -530,39 +544,48 @@ impl Optimizer {
                     lengths.push(*length);
                     values.push(Self::import_virtual_state_value(entry_info, ctx));
                 }
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
-                        crate::optimizeopt::info::VirtualRawBufferInfo {
-                            func: *func,
-                            size: *size,
-                            offsets,
-                            lengths,
-                            descrs: descrs.clone(),
-                            values,
-                            last_guard_pos: -1,
-                            // resume.py:1452: calldescr from callinfo_for_oopspec
-                            calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
+                            crate::optimizeopt::info::VirtualRawBufferInfo {
+                                func: *func,
+                                size: *size,
+                                offsets,
+                                lengths,
+                                descrs: descrs.clone(),
+                                values,
+                                last_guard_pos: -1,
+                                // resume.py:1452: calldescr from callinfo_for_oopspec
+                                calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::KnownClass { class_ptr } => {
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
-                );
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
+                    );
+                }
             }
             VirtualStateInfo::NonNull => {
-                ctx.set_ptr_info(opref, crate::optimizeopt::info::PtrInfo::nonnull());
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(b, crate::optimizeopt::info::PtrInfo::nonnull());
+                }
             }
             VirtualStateInfo::IntBounded(bound) => {
                 // RPython parity: imported preamble bounds become the box's
                 // forwarded IntBound directly (optimizer.py:115-125
                 // setintbound). No separate "imported" or "lower-only" maps.
                 let widened = bound.widen();
-                ctx.setintbound(opref, &widened);
+                // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+                if let Some(op_box) = ctx.get_box_replacement_box(opref) {
+                    ctx.setintbound(&op_box, &widened);
+                }
             }
             VirtualStateInfo::Unknown(tp) => {
                 // virtualstate.py:655-683 make_inputargs parity: each
@@ -793,36 +816,41 @@ impl Optimizer {
                     entry.head, entry.fields
                 );
             }
+            let head_box = ctx.get_box_replacement_box(entry.head);
             match &entry.kind {
                 ImportedVirtualKind::Instance { known_class } => {
-                    ctx.set_ptr_info(
-                        entry.head,
-                        crate::optimizeopt::info::PtrInfo::Virtual(
-                            crate::optimizeopt::info::VirtualInfo {
-                                descr: entry.size_descr,
-                                known_class: *known_class,
-                                ob_type_descr: None,
-                                fields: entry.fields,
-                                field_descrs: entry.field_descrs,
-                                last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
-                            },
-                        ),
-                    );
+                    if let Some(b) = &head_box {
+                        ctx.set_ptr_info(
+                            b,
+                            crate::optimizeopt::info::PtrInfo::Virtual(
+                                crate::optimizeopt::info::VirtualInfo {
+                                    descr: entry.size_descr,
+                                    known_class: *known_class,
+                                    ob_type_descr: None,
+                                    fields: entry.fields,
+                                    field_descrs: entry.field_descrs,
+                                    last_guard_pos: -1,
+                                    cached_vinfo: std::cell::RefCell::new(None),
+                                },
+                            ),
+                        );
+                    }
                 }
                 ImportedVirtualKind::Struct => {
-                    ctx.set_ptr_info(
-                        entry.head,
-                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                            crate::optimizeopt::info::VirtualStructInfo {
-                                descr: entry.size_descr,
-                                fields: entry.fields,
-                                field_descrs: entry.field_descrs,
-                                last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
-                            },
-                        ),
-                    );
+                    if let Some(b) = &head_box {
+                        ctx.set_ptr_info(
+                            b,
+                            crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                                crate::optimizeopt::info::VirtualStructInfo {
+                                    descr: entry.size_descr,
+                                    fields: entry.fields,
+                                    field_descrs: entry.field_descrs,
+                                    last_guard_pos: -1,
+                                    cached_vinfo: std::cell::RefCell::new(None),
+                                },
+                            ),
+                        );
+                    }
                 }
             }
             // RPython parity: imported virtual heads are NOT looked up via
@@ -914,20 +942,23 @@ impl Optimizer {
                         (*field_idx, field_ref)
                     })
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::Virtual(
-                        crate::optimizeopt::info::VirtualInfo {
-                            descr: descr.clone(),
-                            known_class: *known_class,
-                            ob_type_descr: ob_type_descr.clone(),
-                            fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                let opref_box = ctx.get_box_replacement_box(opref);
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::Virtual(
+                            crate::optimizeopt::info::VirtualInfo {
+                                descr: descr.clone(),
+                                known_class: *known_class,
+                                ob_type_descr: ob_type_descr.clone(),
+                                fields: imported_fields,
+                                field_descrs: field_descrs.clone(),
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
                 opref
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
@@ -946,18 +977,21 @@ impl Optimizer {
                         )
                     })
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArray(
-                        crate::optimizeopt::info::VirtualArrayInfo {
-                            descr: descr.clone(),
-                            clear: false,
-                            items: imported_items,
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                let opref_box = ctx.get_box_replacement_box(opref);
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArray(
+                            crate::optimizeopt::info::VirtualArrayInfo {
+                                descr: descr.clone(),
+                                clear: false,
+                                items: imported_items,
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
                 opref
             }
             VirtualStateInfo::VStruct {
@@ -983,18 +1017,21 @@ impl Optimizer {
                         )
                     })
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                        crate::optimizeopt::info::VirtualStructInfo {
-                            descr: descr.clone(),
-                            fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                let opref_box = ctx.get_box_replacement_box(opref);
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                            crate::optimizeopt::info::VirtualStructInfo {
+                                descr: descr.clone(),
+                                fields: imported_fields,
+                                field_descrs: field_descrs.clone(),
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
                 opref
             }
             VirtualStateInfo::VArrayStruct {
@@ -1025,18 +1062,21 @@ impl Optimizer {
                             .collect()
                     })
                     .collect();
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
-                            descr: descr.clone(),
-                            fielddescrs: fielddescrs.clone(),
-                            element_fields: imported_elements,
-                            last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                let opref_box = ctx.get_box_replacement_box(opref);
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
+                            crate::optimizeopt::info::VirtualArrayStructInfo {
+                                descr: descr.clone(),
+                                fielddescrs: fielddescrs.clone(),
+                                element_fields: imported_elements,
+                                last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
                 opref
             }
             VirtualStateInfo::VirtualRawBuffer {
@@ -1061,23 +1101,26 @@ impl Optimizer {
                         walk_visited,
                     ));
                 }
-                ctx.set_ptr_info(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
-                        crate::optimizeopt::info::VirtualRawBufferInfo {
-                            func: *func,
-                            size: *size,
-                            offsets,
-                            lengths,
-                            descrs: descrs.clone(),
-                            values,
-                            last_guard_pos: -1,
-                            // resume.py:1452: calldescr from callinfo_for_oopspec
-                            calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
-                            cached_vinfo: std::cell::RefCell::new(None),
-                        },
-                    ),
-                );
+                let opref_box = ctx.get_box_replacement_box(opref);
+                if let Some(b) = &opref_box {
+                    ctx.set_ptr_info(
+                        b,
+                        crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
+                            crate::optimizeopt::info::VirtualRawBufferInfo {
+                                func: *func,
+                                size: *size,
+                                offsets,
+                                lengths,
+                                descrs: descrs.clone(),
+                                values,
+                                last_guard_pos: -1,
+                                // resume.py:1452: calldescr from callinfo_for_oopspec
+                                calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
+                                cached_vinfo: std::cell::RefCell::new(None),
+                            },
+                        ),
+                    );
+                }
                 opref
             }
             VirtualStateInfo::KnownClass { .. }
@@ -1443,7 +1486,10 @@ impl Optimizer {
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
-            let mut info = ctx.take_ptr_info(resolved).unwrap();
+            let resolved_box = ctx
+                .get_box_replacement_box(resolved)
+                .expect("recorder-populated");
+            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);
         }
@@ -1559,7 +1605,9 @@ impl Optimizer {
             info.force_at_the_end_of_preamble(|child| {
                 self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });
-            ctx.set_ptr_info(resolved, info);
+            if let Some(b) = ctx.get_box_replacement_box(resolved) {
+                ctx.set_ptr_info(&b, info);
+            }
             return resolved;
         }
 
@@ -1655,7 +1703,17 @@ impl Optimizer {
     /// Takes `&mut OptContext` to mirror the upstream `getintbound`
     /// lazy-install side effect (optimizer.py:102-112).
     pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
-        ctx.getnullness(opref)
+        // optimizer.py:127-135 `getnullness` has no missing-Box branch —
+        // every `op` has a backing `AbstractValue` per `resoperation.py:
+        // 233-248 _forwarded`. `ensure_box` lazy-allocates the Box (or
+        // returns the const-namespace fresh) so the inlined
+        // `getintbound` side effect (`optimizer.py:110-113` unbounded
+        // install) materializes on first access, matching upstream's
+        // Box-always-exists invariant.
+        let Some(b) = ctx.ensure_box(opref) else {
+            return crate::optimizeopt::INFO_UNKNOWN;
+        };
+        ctx.getnullness(&b)
     }
 
     /// optimizer.py:137-152: make_constant_class(op, class_const, update_last_guard)
@@ -1676,19 +1734,20 @@ impl Optimizer {
     /// drop the `Virtual` fields / descr / cached_vinfo state).
     pub fn make_constant_class(
         ctx: &mut OptContext,
-        opref: OpRef,
+        op: &crate::r#box::BoxRef,
         class_value: i64,
         update_last_guard: bool,
     ) {
         let class_ptr = GcRef(class_value as usize);
-        let resolved = ctx.get_box_replacement(opref);
-        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo).
+        // optimizer.py:138: op = op.get_box_replacement()
+        let resolved = op.get_box_replacement(false);
+        // optimizer.py:139: opinfo = op.get_forwarded()
         // RPython's InstancePtrInfo covers both virtual and non-virtual
         // instances (`is_virtual` is a field). Rust splits those states into
         // PtrInfo::Instance and PtrInfo::Virtual, so both arms must preserve
         // the existing object info and only update `_known_class`.
         let updated_existing = ctx
-            .with_ptr_info_mut(resolved, |info| match info {
+            .with_ptr_info_mut(&resolved, |info| match info {
                 PtrInfo::Instance(iinfo) => {
                     iinfo.known_class = Some(class_ptr);
                     true
@@ -1701,18 +1760,21 @@ impl Optimizer {
             })
             .unwrap_or(false);
         if !updated_existing {
-            // optimizer.py:142-148: preserve last_guard_pos from old info
-            let old_guard_pos = ctx
-                .last_guard_pos_via_box(resolved)
+            // optimizer.py:142-148: preserve last_guard_pos from old info.
+            // BoxRef-direct read mirrors `info.py:100-103 get_last_guard_pos`
+            // — drops the `last_guard_pos_via_box(opref)` bridge.
+            let old_guard_pos = resolved
+                .ptr_info()
+                .and_then(|p| p.get_last_guard_pos())
                 .map(|p| p as i32)
                 .unwrap_or(-1);
             let mut new_info = PtrInfo::known_class(class_ptr, true);
             new_info.set_last_guard_pos(old_guard_pos);
-            ctx.set_ptr_info(resolved, new_info);
+            ctx.set_ptr_info(&resolved, new_info);
         }
         // optimizer.py:150-151: if update_last_guard: mark_last_guard
         if update_last_guard {
-            ctx.mark_last_guard(resolved);
+            ctx.mark_last_guard(&resolved);
         }
     }
 
@@ -2434,7 +2496,9 @@ impl Optimizer {
                             }
                             other => other,
                         };
-                        ctx.set_ptr_info(fresh, fresh_info);
+                        if let Some(b) = ctx.get_box_replacement_box(fresh) {
+                            ctx.set_ptr_info(&b, fresh_info);
+                        }
                     }
                     *arg = fresh;
                     // After allocating a fresh alias for an inputarg position,
@@ -3659,7 +3723,8 @@ impl Optimizer {
             // value_types entry at this reused pos — precisely the cross-type
             // mutation the invariant guard is designed to surface.
             ctx.register_value_type(op.pos, majit_ir::Type::Int);
-            ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
+            let op_pos_box = ctx.ensure_box_at(op.pos.raw() as usize);
+            ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
         // optimizer.py:603-611: after emit, promote IntBound→Const.
@@ -3699,7 +3764,9 @@ impl Optimizer {
         // RPython calls OptimizationResult.callback() → propagate_postprocess.
         // rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard
         if let Some(opref) = ctx.pending_mark_last_guard.take() {
-            ctx.mark_last_guard(opref);
+            if let Some(b) = ctx.get_box_replacement_box(opref) {
+                ctx.mark_last_guard(&b);
+            }
         }
         if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
             // rewrite.py:430-436 postprocess_GUARD_CLASS:
@@ -3713,13 +3780,23 @@ impl Optimizer {
             // refreshes `_known_class`, matching upstream
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
-            let old_guard_pos = ctx
-                .last_guard_pos_via_box(pp.obj)
+            // optimizer.py:137-152 `make_constant_class` always updates
+            // `_forwarded` — `ensure_box` materializes the Box so the
+            // write is never silently skipped. Same materializer feeds
+            // the `last_guard_pos` read; `info.py:91-103
+            // get_last_guard_pos` reads the PtrInfo field (None if no
+            // PtrInfo, mapped to -1 = "no guard recorded").
+            let pp_obj_box = ctx.ensure_box(pp.obj);
+            let old_guard_pos = pp_obj_box
+                .as_ref()
+                .and_then(|b| ctx.last_guard_pos_via_box(b))
                 .map(|p| p as i32)
                 .unwrap_or(-1);
             let update_last_guard =
                 old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
-            Self::make_constant_class(ctx, pp.obj, pp.class_val, update_last_guard);
+            if let Some(b) = &pp_obj_box {
+                Self::make_constant_class(ctx, b, pp.class_val, update_last_guard);
+            }
         }
         ctx.in_final_emission = saved_in_final_emission;
     }
@@ -5470,8 +5547,9 @@ mod tests {
         // for the test, every slot uses Ref to match the producer-side shape
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
+        let b10 = ctx.ensure_box_at(10);
         ctx.set_ptr_info(
-            OpRef::from_raw(10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef::from_raw(11))],
@@ -5481,8 +5559,9 @@ mod tests {
             }),
         );
         ctx.replace_op(OpRef::from_raw(11), OpRef::from_raw(20));
+        let b20 = ctx.ensure_box_at(20);
         ctx.set_ptr_info(
-            OpRef::from_raw(20),
+            &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: Vec::new(),
@@ -5521,8 +5600,9 @@ mod tests {
         let descr = make_size_descr(16);
         let field_descr: DescrRef = std::sync::Arc::new(TestDescr(0));
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
+        let b10 = ctx.ensure_box_at(10);
         ctx.set_ptr_info(
-            OpRef::from_raw(10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, OpRef::from_raw(11))],

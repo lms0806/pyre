@@ -5407,8 +5407,9 @@ mod tests {
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
         let obj_resolved = ctx2.get_box_replacement(OpRef::int_op(10));
+        let obj_box = ctx2.get_box_replacement_box(obj_resolved).unwrap();
         let pop = ctx2
-            .with_ptr_info_mut(obj_resolved, |info| info.take_preamble_field(0))
+            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();

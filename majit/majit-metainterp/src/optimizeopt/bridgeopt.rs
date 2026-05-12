@@ -247,7 +247,13 @@ pub fn deserialize_optimizer_knowledge(
                 let raw_ref = frontend_boxes[i];
                 if raw_ref != 0 {
                     let cls = cls_fn(raw_ref);
-                    super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                    // optimizer.py:137-152 `make_constant_class` always
+                    // updates `_forwarded` after `get_box_replacement` —
+                    // `ensure_box` materializes a Box so the class info
+                    // install is never silently skipped.
+                    if let Some(b) = ctx.ensure_box(livebox) {
+                        super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
+                    }
                 }
             }
         }

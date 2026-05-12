@@ -1294,7 +1294,10 @@ impl PtrInfo {
         fn force_child(value_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
             let value_ref = ctx.get_box_replacement(value_ref);
             if ctx.is_virtual_via_box(value_ref) {
-                let mut info = ctx.take_ptr_info(value_ref).unwrap();
+                let value_box = ctx
+                    .get_box_replacement_box(value_ref)
+                    .expect("recorder-populated");
+                let mut info = ctx.take_ptr_info(&value_box).unwrap();
                 let forced = info.force_box_impl(value_ref, ctx);
                 return ctx.get_box_replacement(forced);
             }
@@ -1354,10 +1357,16 @@ impl PtrInfo {
                                 }
                             }
                         }
-                        // info.py:142: op.set_forwarded(constptr)
+                        // info.py:142: op.set_forwarded(constptr) — write
+                        // unconditional. Route through `ensure_box` so the
+                        // chain walks to the just-installed Const target
+                        // (where `set_ptr_info` is a no-op per Const-box
+                        // invariant) and never silently drops the write.
                         let const_ref = GcRef(ptr.0);
                         ctx.make_constant(opref, Value::Ref(const_ref));
-                        ctx.set_ptr_info(opref, PtrInfo::Constant(const_ref));
+                        if let Some(b) = ctx.ensure_box(opref) {
+                            ctx.set_ptr_info(&b, PtrInfo::Constant(const_ref));
+                        }
                         return opref;
                     }
                 }
@@ -1386,8 +1395,12 @@ impl PtrInfo {
                 new_op.pos = opref;
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
-                // Store preserved info on alloc_ref (canonical after force).
-                ctx.set_ptr_info(alloc_ref, preserved);
+                // info.py:152 `newop.set_forwarded(self)` — unconditional.
+                // Route through `ensure_box` so the just-emitted alloc op
+                // materializes a BoxRef and the PtrInfo install lands.
+                if let Some(b) = ctx.ensure_box(alloc_ref) {
+                    ctx.set_ptr_info(&b, preserved);
+                }
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit][force-box] virtual-struct {:?} -> {:?} in_final_emission={} pass_idx={}",
@@ -1435,7 +1448,10 @@ impl PtrInfo {
                 new_op.pos = opref;
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
-                ctx.set_ptr_info(alloc_ref, preserved);
+                // info.py:152 `newop.set_forwarded(self)` — unconditional.
+                if let Some(b) = ctx.ensure_box(alloc_ref) {
+                    ctx.set_ptr_info(&b, preserved);
+                }
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit][force-box] virtual {:?} -> {:?} in_final_emission={} pass_idx={}",
@@ -1459,8 +1475,12 @@ impl PtrInfo {
             }
             PtrInfo::VirtualArray(vinfo) => {
                 // info.py:540-558 ArrayPtrInfo._force_elements
+                // RPython `op.set_forwarded(self)` (post-force) is
+                // unconditional; route through `ensure_box`.
                 let len = vinfo.items.len();
-                ctx.set_ptr_info(opref, PtrInfo::nonnull());
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
+                }
 
                 let len_ref = ctx.emit_constant_int(len as i64);
                 let alloc_opcode = if vinfo.clear {
@@ -1511,8 +1531,12 @@ impl PtrInfo {
                 // virtualize.py:31: assert clear — ArrayStruct is always
                 // created with clear=True, so the original op is always
                 // NEW_ARRAY_CLEAR.
+                // RPython `op.set_forwarded(self)` (post-force) is
+                // unconditional; route through `ensure_box`.
                 let num_elements = vinfo.element_fields.len();
-                ctx.set_ptr_info(opref, PtrInfo::nonnull());
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
+                }
 
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
@@ -1574,7 +1598,10 @@ impl PtrInfo {
                 call_op.descr = calldescr;
                 let alloc_ref = emit_op(ctx, call_op);
 
-                ctx.set_ptr_info(alloc_ref, PtrInfo::nonnull());
+                // info.py:152 unconditional set_forwarded.
+                if let Some(b) = ctx.ensure_box(alloc_ref) {
+                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
+                }
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
@@ -1625,15 +1652,19 @@ impl PtrInfo {
                 let new_ref = emit_op(ctx, add_op);
                 // Preserve raw-slice identity; mark non-virtual via
                 // `parent = OpRef::NONE` (RPython `self.parent = None`).
-                ctx.set_ptr_info(
-                    new_ref,
-                    PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
-                        offset: slice.offset,
-                        parent: OpRef::NONE,
-                        last_guard_pos: slice.last_guard_pos,
-                        cached_vinfo: std::cell::RefCell::new(None),
-                    }),
-                );
+                // info.py:152 unconditional set_forwarded — route through
+                // `ensure_box` so the emitted IntAdd op carries PtrInfo.
+                if let Some(b) = ctx.ensure_box(new_ref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                            offset: slice.offset,
+                            parent: OpRef::NONE,
+                            last_guard_pos: slice.last_guard_pos,
+                            cached_vinfo: std::cell::RefCell::new(None),
+                        }),
+                    );
+                }
                 if opref != new_ref {
                     ctx.replace_op(opref, new_ref);
                 }
@@ -1695,19 +1726,21 @@ impl PtrInfo {
                 newstr_op.pos = opref;
                 let newop = emit_op(ctx, newstr_op);
 
-                // vstring.py:98: newop.set_forwarded(self)
-                ctx.set_ptr_info(
-                    newop,
-                    PtrInfo::Str(StrPtrInfo {
-                        lenbound: sinfo_full.lenbound,
-                        lgtop: Some(lengthbox), // vstring.py:98 preserve computed length
-                        mode: sinfo_full.mode,
-                        length: sinfo_full.length,
-                        variant: VStringVariant::Ptr, // non-virtual
-                        last_guard_pos: sinfo_full.last_guard_pos,
-                        cached_vinfo: std::cell::RefCell::new(None),
-                    }),
-                );
+                // vstring.py:98: newop.set_forwarded(self) — unconditional.
+                if let Some(b) = ctx.ensure_box(newop) {
+                    ctx.set_ptr_info(
+                        &b,
+                        PtrInfo::Str(StrPtrInfo {
+                            lenbound: sinfo_full.lenbound,
+                            lgtop: Some(lengthbox), // vstring.py:98 preserve computed length
+                            mode: sinfo_full.mode,
+                            length: sinfo_full.length,
+                            variant: VStringVariant::Ptr, // non-virtual
+                            last_guard_pos: sinfo_full.last_guard_pos,
+                            cached_vinfo: std::cell::RefCell::new(None),
+                        }),
+                    );
+                }
 
                 // vstring.py:99-100: op.set_forwarded(newop)
                 if opref != newop {
@@ -3203,8 +3236,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(21), Value::Int(2));
 
         let source = OpRef::int_op(1);
+        let source_box = ctx.ensure_box_at(source.raw() as usize);
         ctx.set_ptr_info(
-            source,
+            &source_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -3252,8 +3286,9 @@ mod tests {
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         });
+        let pos2 = ctx.ensure_box_at(OpRef::int_op(2).raw() as usize);
         ctx.set_ptr_info(
-            OpRef::int_op(2),
+            &pos2,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
