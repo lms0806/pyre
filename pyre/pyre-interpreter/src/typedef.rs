@@ -4173,15 +4173,24 @@ fn init_function_type_common(ns: &mut DictStorage) {
         Ok(unsafe { crate::function::fget_func_closure(func) })
     });
     dict_storage_store(ns, "__closure__", make_getset_descriptor(closure_getter));
-    // `typedef.py:812 __globals__ = interp_attrproperty_w('w_func_globals',
+    // `typedef.py:826 __globals__ = interp_attrproperty_w('w_func_globals',
     // cls=Function)` — read-only canonical W_DictObject view of the
-    // function's globals storage (lazy-cached on `w_func_globals_obj`).
+    // function's globals storage.  `interp_attrproperty_w`
+    // (`typedef.py:465-474`) fetches the attribute and substitutes
+    // `space.w_None` when the slot is `None`.  pyre's
+    // `function_get_globals_obj` returns `PY_NULL` for builtins
+    // allocated with a null storage pointer (gateway.rs:661-700);
+    // route that through `w_None` so `BuiltinFunction.__globals__`
+    // observes `None` rather than a raw null leak — the literal
+    // `if w_value is None` arm of fget.
     let globals_getter = make_builtin_function("__globals__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
+        let func = args[1];
+        let w_value = unsafe { crate::function::function_get_globals_obj(func) };
+        if w_value.is_null() {
+            Ok(pyre_object::w_none())
+        } else {
+            Ok(w_value)
         }
-        Ok(unsafe { crate::function::function_get_globals_obj(func) })
     });
     dict_storage_store(ns, "__globals__", make_getset_descriptor(globals_getter));
     // `pypy/interpreter/typedef.py:805 __objclass__ = getset_func_objclass`
@@ -4436,13 +4445,28 @@ fn init_builtin_code_type(ns: &mut DictStorage) {
 }
 
 fn init_method_type(ns: &mut DictStorage) {
+    // typedef.py:839-840 ─
+    //   __func__ = interp_attrproperty_w('w_function', cls=Method),
+    //   __self__ = interp_attrproperty_w('w_instance', cls=Method),
+    // — both read-only.  `interp_attrproperty_w` (typedef.py:465-474)
+    // fetches the attribute and substitutes `space.w_None` when the
+    // slot is `None`; the accessor returns w_method_get_func /
+    // w_method_get_self raw, so a null `w_function` / `w_instance`
+    // (unbound creation paths) leaked through the descriptor.  Mirror
+    // the upstream `if w_value is None: return space.w_None` arm.
     let func_getter = make_builtin_function_with_arity(
         "__func__",
         |args| {
-            Ok(args
-                .get(1)
-                .map(|&method| unsafe { pyre_object::w_method_get_func(method) })
-                .unwrap_or(pyre_object::w_none()))
+            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if !unsafe { pyre_object::methodobject::is_method(method) } {
+                return Ok(pyre_object::w_none());
+            }
+            let w_value = unsafe { pyre_object::w_method_get_func(method) };
+            if w_value.is_null() {
+                Ok(pyre_object::w_none())
+            } else {
+                Ok(w_value)
+            }
         },
         2,
     );
@@ -4450,10 +4474,16 @@ fn init_method_type(ns: &mut DictStorage) {
     let self_getter = make_builtin_function_with_arity(
         "__self__",
         |args| {
-            Ok(args
-                .get(1)
-                .map(|&method| unsafe { pyre_object::w_method_get_self(method) })
-                .unwrap_or(pyre_object::w_none()))
+            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if !unsafe { pyre_object::methodobject::is_method(method) } {
+                return Ok(pyre_object::w_none());
+            }
+            let w_value = unsafe { pyre_object::w_method_get_self(method) };
+            if w_value.is_null() {
+                Ok(pyre_object::w_none())
+            } else {
+                Ok(w_value)
+            }
         },
         2,
     );
@@ -4621,15 +4651,27 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__name__", make_getset_descriptor(name_getter));
-    // typedef.py:498 __objclass__ = interp_attrproperty_w('w_cls', ...)
+    // typedef.py:539 `__objclass__ = interp_attrproperty_w('w_cls',
+    // cls=Member)` — read-only.  `interp_attrproperty_w`
+    // (typedef.py:465-474) fetches the attribute and substitutes
+    // `space.w_None` when the slot is `None`; mirror that fget shape
+    // arm-for-arm.  The `is_member` guard stays as a defensive type
+    // check at the builtin-function boundary (PyPy's
+    // `descr_property_get` rejects non-Member instances before
+    // reaching fget; pyre's GetSetProperty path is less strict).
     let objclass_getter = make_builtin_function_with_arity(
         "__objclass__",
         |args| {
             let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
+            if !unsafe { pyre_object::memberobject::is_member(member) } {
                 return Ok(pyre_object::w_none());
             }
-            Ok(unsafe { pyre_object::w_member_get_cls(member) })
+            let w_value = unsafe { pyre_object::w_member_get_cls(member) };
+            if w_value.is_null() {
+                Ok(pyre_object::w_none())
+            } else {
+                Ok(w_value)
+            }
         },
         2,
     );
@@ -4651,6 +4693,42 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             Ok(pyre_object::propertyobject::w_staticmethod_new(func))
         }),
     );
+    // typedef.py:870-871 ─
+    //   __func__ = interp_attrproperty_w('w_function', cls=StaticMethod),
+    //   __wrapped__ = interp_attrproperty_w('w_function', cls=StaticMethod),
+    // — same `w_function` slot, two aliases, both routed through
+    // the interp_attrproperty_w fget shape (typedef.py:465-474):
+    // substitute w_None when the fetched slot is None.
+    fn staticmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if !unsafe { pyre_object::propertyobject::is_staticmethod(obj) } {
+            return Ok(pyre_object::w_none());
+        }
+        let w_value = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(obj) };
+        if w_value.is_null() {
+            Ok(pyre_object::w_none())
+        } else {
+            Ok(w_value)
+        }
+    }
+    dict_storage_store(
+        ns,
+        "__func__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__func__",
+            staticmethod_func_attr,
+            2,
+        )),
+    );
+    dict_storage_store(
+        ns,
+        "__wrapped__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__wrapped__",
+            staticmethod_func_attr,
+            2,
+        )),
+    );
 }
 
 /// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
@@ -4666,6 +4744,39 @@ fn init_classmethod_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::propertyobject::w_classmethod_new(func))
         }),
+    );
+    // typedef.py:884-885 ─
+    //   __func__ = interp_attrproperty_w('w_function', cls=ClassMethod),
+    //   __wrapped__ = interp_attrproperty_w('w_function', cls=ClassMethod),
+    fn classmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if !unsafe { pyre_object::propertyobject::is_classmethod(obj) } {
+            return Ok(pyre_object::w_none());
+        }
+        let w_value = unsafe { pyre_object::propertyobject::w_classmethod_get_func(obj) };
+        if w_value.is_null() {
+            Ok(pyre_object::w_none())
+        } else {
+            Ok(w_value)
+        }
+    }
+    dict_storage_store(
+        ns,
+        "__func__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__func__",
+            classmethod_func_attr,
+            2,
+        )),
+    );
+    dict_storage_store(
+        ns,
+        "__wrapped__",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "__wrapped__",
+            classmethod_func_attr,
+            2,
+        )),
     );
 }
 

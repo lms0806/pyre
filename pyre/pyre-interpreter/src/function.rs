@@ -266,6 +266,24 @@ fn function_new_impl(
     pyre_object::gc_roots::pin_root(closure);
     pyre_object::gc_roots::pin_root(code as PyObjectRef);
 
+    // `function.py:57 self.w_func_globals = w_globals` stores the
+    // dict object directly.  Pyre keeps both the storage pointer
+    // (for the JIT call-site layout) and the canonical W_DictObject
+    // sibling.  Resolve the sibling NOW so the freshly-allocated
+    // function carries a stable `__globals__` identity from
+    // construction onward; `function_get_globals_obj`'s lazy
+    // fallback becomes a zero-hit safety net for synthetic test
+    // stubs that pass a null storage pointer.  This is the first
+    // step of Phase 5 commit 3 — collapsing the dual storage to
+    // a single `PyObjectRef` field requires that every Function
+    // already has its `__globals__` resolved at construction time.
+    let w_func_globals_obj = if w_func_globals.is_null() {
+        PY_NULL
+    } else {
+        crate::baseobjspace::dict_storage_to_dict(w_func_globals)
+    };
+    pyre_object::gc_roots::pin_root(w_func_globals_obj);
+
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
     pyre_object::lltype::malloc_typed(Function {
         ob: PyObject {
@@ -280,7 +298,7 @@ fn function_new_impl(
         defs_w: PY_NULL,
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
-        w_func_globals_obj: PY_NULL,
+        w_func_globals_obj,
         w_ann: PY_NULL,
         w_doc: PY_NULL,
         w_qualname: PY_NULL,
@@ -540,17 +558,23 @@ pub unsafe fn function_get_globals(obj: PyObjectRef) -> *mut DictStorage {
     unsafe { (*(obj as *const Function)).w_func_globals }
 }
 
-/// Resolve the canonical W_DictObject paired with `function.w_func_globals`,
-/// caching the result in the adjacent `w_func_globals_obj` slot.
+/// Return the canonical W_DictObject paired with `function.w_func_globals`.
 ///
 /// `function.py:57 self.w_func_globals = w_globals` stores the dict
 /// object directly in PyPy.  Pyre's split storage / W_DictObject
 /// model means callers that want object identity
 /// (`function.__globals__ is module.__dict__`,
 /// `f.__globals__ is g.__globals__` for sibling closures) need to
-/// reach the canonical sibling.  `dict_storage_to_dict` returns the
-/// same instance per storage (`mirror_target` invariant), and the
-/// cache field skips the lookup on subsequent calls.
+/// reach the canonical sibling.  `function_new_impl` resolves the
+/// sibling at construction time via `dict_storage_to_dict` and
+/// stores it directly in `w_func_globals_obj`, so the fast path is
+/// a plain field load.
+///
+/// The lazy fallback below is retained as a safety net for synthetic
+/// test stubs that bypass `function_new_impl` and leave
+/// `w_func_globals_obj` unset; production call sites (`MAKE_FUNCTION`,
+/// `function_new_with_fixed_code`, `function_new_builtin`) always
+/// reach this getter with the slot pre-populated.
 ///
 /// Returns `PY_NULL` when `w_func_globals` is null (zero-arg test
 /// stubs); callers should null-check before dereferencing.
@@ -1123,20 +1147,6 @@ pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) -> Result<(), 
 }
 
 // _check_code_mutable is defined above (function.py:367-370 parity).
-
-/// PyPy-compatible `__globals__` getter alias.
-#[inline]
-pub unsafe fn function_get_w_globals(obj: PyObjectRef) -> *mut DictStorage {
-    unsafe { function_get_globals(obj) }
-}
-
-/// PyPy-compatible `__globals__` setter alias.
-#[inline]
-pub unsafe fn function_set_w_globals(obj: PyObjectRef, globals: *mut DictStorage) {
-    unsafe {
-        (*(obj as *mut Function)).w_func_globals = globals;
-    }
-}
 
 /// `function.py:525-553 fset_func_code` parity:
 ///
