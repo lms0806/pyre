@@ -70,7 +70,11 @@ impl Optimization for OptEarlyForce {
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
                 let arg = ctx.get_box_replacement(op.arg(i));
-                if ctx.is_virtual_via_box(arg) {
+                let arg_is_virtual = ctx
+                    .get_box_replacement_box(arg)
+                    .as_ref()
+                    .map_or(false, |b| ctx.is_virtual(b));
+                if arg_is_virtual {
                     // optimizer.py:345-364: force_box path.
                     // potential_extra_ops are handled by Optimizer.force_box,
                     // but earlyforce only needs the virtual materialization.

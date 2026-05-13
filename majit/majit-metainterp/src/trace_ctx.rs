@@ -498,31 +498,9 @@ impl TraceCtx {
             .get_or_insert_typed(value, majit_ir::Type::Float)
     }
 
-    /// Mark an existing constant OpRef with a specific type.
-    /// Used when const_int() was called but the value is actually a Ref pointer
-    /// (e.g., ob_type field). This preserves Cranelift's Int treatment while
-    /// recording the true type for resume data.
-    pub fn mark_const_type(&mut self, opref: OpRef, tp: majit_ir::Type) {
-        self.constants.mark_type(opref, tp);
-    }
-
     /// Return the type of a constant OpRef, if recorded.
-    ///
-    /// `numbering_type_overrides` takes priority over `constant_type`:
-    /// `mark_type(opref, Ref)` exists specifically to retype a raw-pointer
-    /// `ConstInt` as `Ref` for resume-data encoding, mirroring RPython's
-    /// `getrawptrinfo` ConstInt→Ref retag at numbering time. The intrinsic
-    /// `Box.type = 'i'` stays in `constant_type` but the snapshot consumer
-    /// needs the override to produce the correct `TAGCONSTPTR`. Without
-    /// checking the override first, `get_or_insert`'s `Type::Int` entry
-    /// masks every `mark_type(_, Ref)` and Ref pointers get serialized as
-    /// integer bits.
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
-        self.constants
-            .numbering_type_overrides()
-            .get(&opref.raw())
-            .copied()
-            .or_else(|| self.constants.constant_type(opref))
+        self.constants.constant_type(opref)
     }
 
     /// Return the concrete value for a constant OpRef, if it is a pooled constant.
@@ -2127,19 +2105,6 @@ mod tests {
     use majit_ir::Type;
 
     extern "C" fn dummy_call_target() {}
-
-    #[test]
-    fn const_type_honors_resume_data_override() {
-        let mut ctx = TraceCtx::for_test(0);
-        let c = ctx.const_int(0);
-        // Box.type immutability: a ConstInt's intrinsic type is always Int,
-        // recorded in the constant pool at allocation time.
-        assert_eq!(ctx.const_type(c), Some(Type::Int));
-        ctx.mark_const_type(c, Type::Ref);
-        // mark_type → numbering_type_overrides takes priority over the
-        // intrinsic Int; this is the raw-pointer-ConstInt retag path.
-        assert_eq!(ctx.const_type(c), Some(Type::Ref));
-    }
 
     // ── M1 · opref_to_box bridge tests ─────────────────────────────────
 

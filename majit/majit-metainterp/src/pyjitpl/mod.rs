@@ -361,6 +361,10 @@ fn snapshot_map_from_trace_snapshots(
                         let opref = majit_ir::OpRef::const_typed(next_const_idx, *tp);
                         next_const_idx += 1;
                         constants.insert(opref.raw(), *val);
+                        // Lockstep with the dedup loop (line ~332): the
+                        // search above reads `constant_types[k]` to filter
+                        // by type per `resume.py:158-183 getconst`. Writing
+                        // both maps together keeps the invariant.
                         constant_types.insert(opref.raw(), *tp);
                         opref
                     }
@@ -3963,7 +3967,6 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_snapshots = trace.snapshots.clone();
 
-        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved since the last
         // `get_or_insert_typed`.
@@ -4006,7 +4009,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.call_pure_results = call_pure_results.clone();
-        unroll_opt.numbering_type_overrides = numbering_overrides.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
         unroll_opt.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
@@ -4077,7 +4079,6 @@ impl<M: Clone> MetaInterp<M> {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types.clone();
-                        simple_opt.numbering_type_overrides = numbering_overrides.clone();
                         // history.py:_make_op parity — see the
                         // function-entry compile path below.
                         let inputarg_types: Vec<majit_ir::Type> =
@@ -4921,7 +4922,6 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             driver_descriptor,
             orig_vable_ptr_retrace,
-            numbering_overrides,
             mut constants,
             mut constant_types,
             trace,
@@ -4942,7 +4942,6 @@ impl<M: Clone> MetaInterp<M> {
             });
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
-            let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
             let constants = ctx.constants.snapshot();
             let constant_types = ctx.constants.constant_types_snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
@@ -4977,7 +4976,6 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
                 driver_descriptor,
                 orig_vable_ptr_retrace,
-                numbering_overrides,
                 constants,
                 constant_types,
                 trace,
@@ -5010,7 +5008,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
-        unroll_opt.numbering_type_overrides = numbering_overrides;
         let (
             retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
@@ -5477,7 +5474,6 @@ impl<M: Clone> MetaInterp<M> {
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let trace_snapshots = trace.snapshots.clone();
 
-        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
@@ -5493,7 +5489,6 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
-        optimizer.numbering_type_overrides = numbering_overrides;
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
@@ -5884,7 +5879,6 @@ impl<M: Clone> MetaInterp<M> {
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let trace_snapshots = trace.snapshots.clone();
 
-        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
@@ -5908,11 +5902,13 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
-        optimizer.numbering_type_overrides = numbering_overrides;
-        // history.py InputArg.type parity: register inputarg types.
-        for ia in &trace.inputargs {
-            optimizer.constant_types.insert(ia.opref().raw(), ia.tp);
-        }
+        // history.py InputArg.type parity: each `InputArg` already carries
+        // its type in the typed OpRef variant tag (`InputArg::opref()` calls
+        // `OpRef::input_arg_typed(idx, tp)` in majit-ir/src/value.rs:253).
+        // `opref_type` (optimizer/mod.rs:5016) reads `resolved.ty()` from the
+        // variant tag at priority-0 before consulting any side table, so the
+        // legacy `constant_types.insert(ia.opref().raw(), ia.tp)` writes
+        // were redundant for typed inputargs.
 
         let (
             snapshot_map,
@@ -7968,9 +7964,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
-        for arg in bridge_inputargs {
-            optimizer.constant_types.insert(arg.index, arg.tp);
-        }
+        // bridge_inputargs already carry their type via the typed `InputArg`
+        // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
+        // see optimizer.rs:5016 `opref_type` priority-0 variant-tag read.
+        // The legacy `constant_types.insert(arg.index, arg.tp)` was redundant.
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
@@ -8431,12 +8428,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
-        // RPython Box.type parity: inputargs carry their types implicitly
-        // via Box subclass. In majit, register inputarg types explicitly
-        // so fail_arg_types inference can resolve them.
-        for arg in bridge_inputargs {
-            optimizer.constant_types.insert(arg.index, arg.tp);
-        }
+        // history.py InputArg.type parity: each `InputArg` carries its type
+        // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
+        // legacy `constant_types.insert(arg.index, arg.tp)` writes were
+        // redundant with `opref_type`'s priority-0 variant-tag read.
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;

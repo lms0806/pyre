@@ -872,8 +872,10 @@ impl OptGuard {
             // AND a previous GUARD_CLASS with same args was already seen.
             OpCode::GuardNonnullClass if op.num_args() >= 2 => {
                 // RPython: subsumed if nonnull is known AND class matches.
-                let nonnull_known =
-                    self.truthy_values.contains(&op.arg(0)) || ctx.is_nonnull_via_box(op.arg(0));
+                let nonnull_known = self.truthy_values.contains(&op.arg(0))
+                    || ctx
+                        .get_box_replacement_box(op.arg(0))
+                        .map_or(false, |b| ctx.is_nonnull(&b));
                 if !nonnull_known {
                     return false;
                 }

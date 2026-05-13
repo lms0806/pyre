@@ -2161,13 +2161,8 @@ impl TraceCtx {
         if (opref.raw() as usize) < self.recorder.num_inputargs() {
             return Some(self.recorder.inputarg_types()[opref.raw() as usize]);
         }
-        // ConstantPool: check constant_type first, then numbering
-        // type overrides (mark_type for resume-data-only Ref constants).
         if opref.is_constant() {
             if let Some(tp) = self.constants.constant_type(opref) {
-                return Some(tp);
-            }
-            if let Some(&tp) = self.constants.numbering_type_overrides().get(&opref.raw()) {
                 return Some(tp);
             }
         }

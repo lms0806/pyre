@@ -41,8 +41,7 @@ pub struct Box {
 
     /// `resoperation.py:260 type` (`'i'` / `'r'` / `'f'` / `'v'`).
     /// Absorbs the frontend semantic portion that majit currently spreads
-    /// across `value_types` / `inputarg_types` /
-    /// `constant_types_for_numbering`.
+    /// across `value_types` / `inputarg_types` / `constant_types`.
     pub type_: Type,
 
     /// Rust enum mirror of RPython's subclass hierarchy.

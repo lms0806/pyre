@@ -98,8 +98,6 @@ pub struct UnrollOptimizer {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
-    /// RPython parity: GcRef constants that need Ref type for resume data.
-    pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython Box type parity: trace inputarg types from recorder.
     /// Each RPython Box carries its type; in majit OpRef is untyped u32.
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputarg_types
@@ -140,7 +138,6 @@ impl UnrollOptimizer {
             target_tokens: Vec::new(),
             retraced_count: 0,
             constant_types: std::collections::HashMap::new(),
-            numbering_type_overrides: std::collections::HashMap::new(),
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
@@ -333,7 +330,6 @@ impl UnrollOptimizer {
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.constant_types = self.constant_types.clone();
             opt_p1.callinfocollection = self.callinfocollection.clone();
-            opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -402,10 +398,12 @@ impl UnrollOptimizer {
                 opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live in ctx.constants but not in
-            // consts_p1 (which was only seeded from the input constants).
-            // Merge them back so build_short_preamble_from_exported_boxes
-            // can capture all constants referenced by short preamble ops.
+            // class pointers). These live on the BoxRef forwarded chain
+            // (and in `ctx.const_pool` for const-namespace OpRefs) but
+            // not in `consts_p1` (which was only seeded from the input
+            // constants). Merge them back so
+            // build_short_preamble_from_exported_boxes can capture all
+            // constants referenced by short preamble ops.
             if let Some(ref final_ctx) = opt_p1.final_ctx {
                 crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
                     final_ctx,
@@ -584,7 +582,6 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.callinfocollection = self.callinfocollection.clone();
-        opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
@@ -1040,7 +1037,11 @@ impl UnrollOptimizer {
         if let Some(ref final_ctx) = opt_p2.final_ctx {
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for &inputarg in &initial_sp.inputargs {
-                infos.push(final_ctx.peek_ptr_info_via_box(inputarg));
+                let info = final_ctx
+                    .get_box_replacement_box(inputarg)
+                    .as_ref()
+                    .and_then(|b| final_ctx.peek_ptr_info(b));
+                infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
         }
@@ -2646,7 +2647,11 @@ impl OptUnroll {
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
-        let has_fields = matches!(ctx.peek_ptr_info_via_box(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
+        let resolved_box = ctx.get_box_replacement_box(resolved);
+        let has_fields = matches!(
+            resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
+            Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
+        );
         infos.insert(resolved, info.clone());
         // Also store under the original (unresolved) key.
         if arg != resolved {
@@ -2665,7 +2670,8 @@ impl OptUnroll {
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
-        let fields: Vec<OpRef> = match ctx.peek_ptr_info_via_box(opref) {
+        let opref_box = ctx.get_box_replacement_box(opref);
+        let fields: Vec<OpRef> = match opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(crate::optimizeopt::info::PtrInfo::Virtual(v)) => {
                 v.fields.iter().map(|(_, r)| *r).collect()
             }
@@ -2911,10 +2917,17 @@ impl OptUnroll {
             if let Some(label) = current_label_args {
                 for (i, &jump_arg) in short_jump_args.iter().enumerate() {
                     let resolved = ctx.get_box_replacement(jump_arg);
-                    if !ctx.has_ptr_info_via_box(resolved) {
+                    let resolved_has_info = ctx
+                        .get_box_replacement_box(resolved)
+                        .as_ref()
+                        .map_or(false, |b| ctx.has_ptr_info(b));
+                    if !resolved_has_info {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
-                            if let Some(info) = ctx.peek_ptr_info_via_box(label_arg) {
+                            let label_box = ctx.get_box_replacement_box(label_arg);
+                            if let Some(info) =
+                                label_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+                            {
                                 ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
                             }
                         }
@@ -3066,7 +3079,17 @@ impl OptUnroll {
                 majit_ir::Type::Float => majit_ir::OpRef::const_float(idx),
             };
             ctx.make_constant(typed_opref, value);
-            optimizer.constant_types.entry(idx).or_insert(tp);
+            // `make_constant` early-returns on const-namespace OpRefs
+            // (history.py:208 — Const.is_constant() == True), so
+            // const_pool registration is the explicit seed below.
+            // Side-table type write keeps raw-u32 keyed readers in
+            // lockstep (optimizer.py:Const.type is intrinsic on the
+            // Box, history.py:220/261/307).
+            ctx.const_pool.entry(idx).or_insert(value);
+            optimizer
+                .constant_types
+                .entry(typed_opref.raw())
+                .or_insert(tp);
         }
 
         let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
@@ -3080,10 +3103,17 @@ impl OptUnroll {
                 // shortpreamble.py:414-425 parity: propagate PtrInfo from
                 // Phase 1 export to jump_args so guards are redundant.
                 let resolved = ctx.get_box_replacement(jump_arg);
-                if !ctx.has_ptr_info_via_box(resolved) {
-                    let info = ctx
-                        .peek_ptr_info_via_box(jump_arg)
-                        .or_else(|| ctx.peek_ptr_info_via_box(short_inputarg))
+                let resolved_has_info = ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .map_or(false, |b| ctx.has_ptr_info(b));
+                if !resolved_has_info {
+                    let jump_box = ctx.get_box_replacement_box(jump_arg);
+                    let short_box = ctx.get_box_replacement_box(short_inputarg);
+                    let info = jump_box
+                        .as_ref()
+                        .and_then(|b| ctx.peek_ptr_info(b))
+                        .or_else(|| short_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)))
                         .or_else(|| {
                             short_preamble
                                 .inputarg_infos
@@ -3584,7 +3614,8 @@ impl OptUnroll {
         // `OptIntBounds::export_arg_int_bounds`, which already filters by
         // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
         // lookup here cannot pull a bound for a ref/float box.
-        if let Some(ptr_info) = ctx.peek_ptr_info_via_box(resolved) {
+        let resolved_box = ctx.get_box_replacement_box(resolved);
+        if let Some(ptr_info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             return Some(OpInfo::Ptr(ptr_info));
         }
         // PRE-EXISTING-ADAPTATION: read from `exported_int_bounds`

@@ -1944,6 +1944,10 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             let const_opref = OpRef::const_int(next_const_idx);
             next_const_idx += 1;
             constants.insert(const_opref.raw(), index as i64);
+            // Lockstep with backend `set_constant_types`: typed-OpRef
+            // readers consult `v.ty()` priority-0, but raw-u32 keyed
+            // backend consumers (regalloc fail_args, GC rewrite) only
+            // see the `constants` map shape and need the side table.
             constant_types.insert(const_opref.raw(), Type::Int);
 
             let old_opref =
@@ -2630,6 +2634,8 @@ pub fn compile_tmp_callback(
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)).
     let funcbox_ref = OpRef::const_int(CONST_BASE);
     constants.insert(funcbox_ref.raw(), jitdriver_sd.portal_runner_adr);
+    // Lockstep with backend `set_constant_types`: raw-u32 keyed readers
+    // (regalloc fail_args, GC rewrite) need the side table.
     constant_types.insert(funcbox_ref.raw(), Type::Int);
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
@@ -2643,6 +2649,8 @@ pub fn compile_tmp_callback(
         };
         let g_ref = OpRef::const_typed(CONST_BASE + 1 + i as u32, tp);
         constants.insert(g_ref.raw(), raw);
+        // Lockstep with backend `set_constant_types`: raw-u32 keyed
+        // readers (regalloc fail_args, GC rewrite) need the side table.
         constant_types.insert(g_ref.raw(), tp);
         callargs.push(g_ref);
     }

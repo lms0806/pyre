@@ -112,14 +112,14 @@ impl OptIntBounds {
     ///
     /// RPython mints a fresh `ConstInt(value)` here without consulting any
     /// existing Box; `same_box` later does the value-aware match on the
-    /// pure cache side (history.py:204). The previous Rust port searched
-    /// `ctx.constants` (op-namespace value cache, populated by
-    /// `make_constant(box, ConstInt(...))` on arbitrary Boxes — not just
-    /// op results) and returned `OpRef::int_op(idx)` on hit, which mints
-    /// the wrong Box family when the original Box at slot `idx` was an
-    /// `InputArgInt(idx)` constant-folded via `optimizer.py:410`. Under
-    /// variant-aware OpRef Eq (resoperation.rs:290) `IntOp(idx) ==
-    /// InputArgInt(idx)` is false, so cache keys silently key-mismatch.
+    /// pure cache side (history.py:204). An earlier Rust port searched a
+    /// flat `OptContext.constants: Vec<Option<Value>>` op-namespace value
+    /// cache (now retired) and returned `OpRef::int_op(idx)` on hit,
+    /// which mints the wrong Box family when the original Box at slot
+    /// `idx` was an `InputArgInt(idx)` constant-folded via
+    /// `optimizer.py:410`. Under variant-aware OpRef Eq
+    /// (resoperation.rs:290) `IntOp(idx) == InputArgInt(idx)` is false,
+    /// so cache keys silently key-mismatch.
     ///
     /// Mint via `make_constant_int` (constant namespace, CONST_BIT set,
     /// typed `OpRef::const_int(idx)` per history.py:220 ConstInt.type).
@@ -3014,7 +3014,12 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) = ctx.peek_intbound_via_box(resolved) {
+            // BoxRef shim — peek_intbound_box takes &BoxRef.
+            let bound = ctx
+                .get_box_replacement_box(resolved)
+                .as_ref()
+                .and_then(|b| ctx.peek_intbound_box(b));
+            if let Some(bound) = bound {
                 if bound.is_unbounded() {
                     continue;
                 }

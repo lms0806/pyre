@@ -915,10 +915,9 @@ impl Default for OptPure {
 impl OptPure {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        if ctx.is_virtual_via_box(resolved) {
-            let resolved_box = ctx
-                .get_box_replacement_box(resolved)
-                .expect("recorder-populated");
+        let resolved_box = ctx.get_box_replacement_box(resolved);
+        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+            let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);

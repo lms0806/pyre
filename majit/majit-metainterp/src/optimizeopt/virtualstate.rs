@@ -964,7 +964,10 @@ impl VirtualState {
                 let resolved = ctx.get_box_replacement(opref);
                 // BoxRef-routing reader; cached once so the per-field walk below
                 // doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let info_snapshot = ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -1015,7 +1018,10 @@ impl VirtualState {
                 let resolved = ctx.get_box_replacement(opref);
                 // BoxRef-routing reader; cached once so the per-item walk
                 // below doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let info_snapshot = ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -1074,13 +1080,16 @@ impl VirtualState {
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
                 let resolved = ctx.get_box_replacement(opref);
-                let runtime_fields: Vec<Vec<(u32, OpRef)>> =
-                    match ctx.peek_ptr_info_via_box(resolved) {
-                        Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
-                            vinfo.element_fields
-                        }
-                        _ => return Err(()),
-                    };
+                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b))
+                {
+                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
+                        vinfo.element_fields
+                    }
+                    _ => return Err(()),
+                };
                 if runtime_fields.len() != element_fields.len() {
                     return Err(());
                 }
@@ -1124,7 +1133,10 @@ impl VirtualState {
                 let resolved = ctx.get_box_replacement(opref);
                 // BoxRef-routing reader; cached once so the per-entry walk
                 // below doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let info_snapshot = ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -1170,7 +1182,11 @@ impl VirtualState {
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_box_replacement(opref);
-                let forced = match ctx.peek_ptr_info_via_box(resolved) {
+                let forced = match ctx
+                    .get_box_replacement_box(resolved)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b))
+                {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
@@ -1950,48 +1966,21 @@ fn export_single_value_inner(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> VirtualStateInfo {
-    // Check for known constant.
-    // RPython parity: only export LEVEL_CONSTANT for truly invariant values
-    // (constant pool entries with OpRef >= 10000). Trace-computed values
-    // may have been constant-folded during Phase 1 but change across
-    // iterations. RPython's setinfo_from_preamble_list calls
-    // item.set_forwarded(None) — info is completely cleared for ALL types.
+    // virtualstate.py:743 `visit_not_virtual` dispatches via
+    // `not_virtual(cpu, value.type, optimizer.getinfo(value))`; when
+    // `info.is_constant()` is true the resulting state is LEVEL_CONSTANT
+    // (`info.py:not_virtual` builds `NotVirtualStateInfo*` with constant
+    // box stored). pyre's `get_constant(opref)` walks `_forwarded` and
+    // returns Some exactly when the chain terminates at a Const Box,
+    // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
+    // export LEVEL_CONSTANT regardless of OpRef namespace.
     if let Some(value) = ctx.get_constant(opref) {
-        // RPython setinfo_from_preamble parity (unroll.py:73-75):
-        // Only export LEVEL_CONSTANT for constant pool entries (>= 10000)
-        // and type descriptor pointers marked via numbering_type_overrides.
-        //
-        // Trace-computed Ref constants (e.g., W_IntObject(-1) pointer for
-        // sign) are NOT invariant — a different W_IntObject may be used on
-        // the next iteration. Only truly invariant GcRef pointers (ob_type)
-        // registered via mark_const_type get the Ref override.
-        let has_ref_override = ctx
-            .constant_types_for_numbering
-            .get(&opref.raw())
-            .is_some_and(|&t| t == majit_ir::Type::Ref);
-        if opref.raw() >= 10000 || has_ref_override {
-            let export_val = if has_ref_override && matches!(value, Value::Int(v) if v != 0) {
-                Value::Ref(majit_ir::GcRef(match value {
-                    Value::Int(v) => v as usize,
-                    _ => 0,
-                }))
-            } else {
-                value
-            };
-            return VirtualStateInfo::Constant(export_val);
-        }
-        // Trace-computed constants: export as Unknown (RPython LEVEL_UNKNOWN).
-        // Phase 2 will re-compute their values from runtime state. The
-        // explicit type mirrors RPython's constructor dispatch
-        // `not_virtual(cpu, box.type, info)` (virtualstate.py:360): the
-        // subclass (`NotVirtualStateInfoInt` / `NotVirtualStateInfoPtr` /
-        // base) is chosen by `box.type`, which comes from the constant's
-        // runtime shape.
-        return VirtualStateInfo::Unknown(value.get_type());
+        return VirtualStateInfo::Constant(value);
     }
 
-    // Check PtrInfo via BoxRef-routing reader (mirror-aware; legacy fallback for empty box pool).
-    if let Some(info) = ctx.peek_ptr_info_via_box(opref) {
+    // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
+    let opref_box = ctx.get_box_replacement_box(opref);
+    if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
         match info {
             PtrInfo::Virtual(vinfo) => {
                 // RPython parity: heaptracker.py:66-67 excludes typeptr from
