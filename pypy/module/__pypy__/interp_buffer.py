@@ -22,8 +22,8 @@ class W_Bufferable(W_Root):
     def readbuf_w(self, space):
         mv = space.call_method(self, '__buffer__', space.newint(0))
         buf = mv.buffer_w(space, 0)
-        result = buf.as_readbuf()
-        buf.releasebuffer()
+        with buf:
+            result = buf.as_readbuf()
         return result
 
 W_Bufferable.typedef = TypeDef("Bufferable", None, None, 'read-write',

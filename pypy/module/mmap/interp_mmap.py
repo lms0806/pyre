@@ -234,8 +234,8 @@ class W_MMap(W_BufferExporter):
                 if not e.match(space, space.w_TypeError):
                     raise
                 buf = space.buffer_w(w_value, space.BUF_FULL_RO)
-                value = buf.as_str()
-                buf.releasebuffer()
+                with buf:
+                    value = buf.as_str()
             if len(value) != length:
                 raise oefmt(space.w_ValueError,
                             "mmap slice assignment is wrong size")

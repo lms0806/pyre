@@ -469,8 +469,8 @@ def convert_to_regdata(space, w_value, typ):
                             "Objects of type '%T' can not be used as binary "
                             "registry values", w_value)
             else:
-                value = view.as_str()
-                view.releasebuffer()
+                with view:
+                    value = view.as_str()
             buflen = len(value)
             buf = rffi.str2charp(value)
 

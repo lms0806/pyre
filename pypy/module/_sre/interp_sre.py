@@ -284,8 +284,8 @@ class W_SRE_Pattern(W_Root):
             # state on group()), matching CPython's behaviour where the match
             # object reflects post-match mutations and allows resize.
             view = space.buffer_w(w_string, space.BUF_SIMPLE)
-            buf = view.as_readbuf()
-            view.releasebuffer()
+            with view:
+                buf = view.as_readbuf()
             size = buf.getlength()
             assert size >= 0
             if pos > size:

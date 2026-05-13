@@ -144,8 +144,8 @@ class W_BytearrayObject(W_BufferExporter):
             if not e.match(space, space.w_TypeError):
                 raise
         buf = space.buffer_w(w_other, space.BUF_SIMPLE)
-        result = buf.as_str()
-        buf.releasebuffer()
+        with buf:
+            result = buf.as_str()
         return result
 
     def _chr(self, char):

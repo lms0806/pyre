@@ -532,8 +532,8 @@ def make_formatter_subclass(do_unicode):
                     s = space.bytes_w(w_value)
                 elif space.isinstance_w(w_value, space.w_bytearray):
                     buf = w_value.buffer_w(space, 0)
-                    s = buf.as_str()
-                    buf.releasebuffer()
+                    with buf:
+                        s = buf.as_str()
                 else:
                     s = ''
                 if len(s) == 1:
@@ -558,8 +558,8 @@ def make_formatter_subclass(do_unicode):
                 return
             if space.isinstance_w(w_value, space.w_bytearray):
                 buf = w_value.buffer_w(space, 0)
-                s = buf.as_str()
-                buf.releasebuffer()
+                with buf:
+                    s = buf.as_str()
                 self.std_wp(s)
                 return
 
@@ -573,8 +573,8 @@ def make_formatter_subclass(do_unicode):
                 return
             if space.isinstance_w(w_value, space.w_memoryview):
                 buf = w_value.buffer_w(space, 0)
-                s = buf.as_str()
-                buf.releasebuffer()
+                with buf:
+                    s = buf.as_str()
                 self.std_wp(s)
                 return
 
@@ -609,8 +609,8 @@ def format(space, w_fmt, values_w, w_valuedict, fmt_type):
     if fmt_type != FORMAT_UNICODE:
         if fmt_type == FORMAT_BYTEARRAY:
             buf = w_fmt.buffer_w(space, 0)
-            fmt = buf.as_str()
-            buf.releasebuffer()
+            with buf:
+                fmt = buf.as_str()
         else:
             fmt = space.bytes_w(w_fmt)
         formatter = StringFormatter(space, fmt, values_w, w_valuedict)

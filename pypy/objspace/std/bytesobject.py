@@ -504,8 +504,8 @@ class W_BytesObject(W_AbstractBytesObject):
             if not e.match(space, space.w_TypeError):
                 raise
         buf = space.buffer_w(w_other, space.BUF_SIMPLE)
-        result = buf.as_str()
-        buf.releasebuffer()
+        with buf:
+            result = buf.as_str()
         return result
 
     def _chr(self, char):
@@ -833,8 +833,8 @@ def _convert_from_buffer_or_iterable(space, w_source):
         if not e.match(space, space.w_TypeError):
             raise
     else:
-        result = buf.as_str()
-        buf.releasebuffer()
+        with buf:
+            result = buf.as_str()
         return result
 
     if space.isinstance_w(w_source, space.w_unicode):

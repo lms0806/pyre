@@ -119,8 +119,8 @@ class W_BytesIO(W_BufferedIOBase):
         self._check_closed(space)
         self._check_exports(space)
         view = space.buffer_w(w_data, space.BUF_CONTIG_RO)
-        buf = view.as_str()
-        view.releasebuffer()
+        with view:
+            buf = view.as_str()
         length = len(buf)
         if length <= 0:
             return space.newint(0)

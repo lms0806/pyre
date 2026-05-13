@@ -1671,8 +1671,8 @@ class ObjSpace(object):
             return result
         try:
             buf = self._try_buffer_w(w_obj, self.BUF_SIMPLE)
-            result = buf.as_readbuf()
-            buf.releasebuffer()
+            with buf:
+                result = buf.as_readbuf()
             return result
         except BufferInterfaceNotFound:
             self._getarg_error("bytes-like object", w_obj)
@@ -1681,8 +1681,8 @@ class ObjSpace(object):
         # Old buffer interface, returns a writeable buffer (PyObject_AsWriteBuffer)
         try:
             buf = self._try_buffer_w(w_obj, self.BUF_WRITABLE)
-            result = buf.as_writebuf()
-            buf.releasebuffer()
+            with buf:
+                result = buf.as_writebuf()
             return result
         except (BufferInterfaceNotFound, OperationError):
             self._getarg_error("read-write bytes-like object", w_obj)
@@ -1784,8 +1784,8 @@ class ObjSpace(object):
                 return StringBuffer(w_obj.text_w(self))
             try:
                 buf = self._try_buffer_w(w_obj, self.BUF_SIMPLE)
-                result = buf.as_readbuf()
-                buf.releasebuffer()
+                with buf:
+                    result = buf.as_readbuf()
                 return result
             except BufferInterfaceNotFound:
                 self._getarg_error("bytes or buffer", w_obj)
@@ -1799,8 +1799,8 @@ class ObjSpace(object):
                 return w_obj.text_w(self)                 # surrogates here
             try:
                 buf = self._try_buffer_w(w_obj, self.BUF_SIMPLE)
-                result = buf.as_str()
-                buf.releasebuffer()
+                with buf:
+                    result = buf.as_str()
                 return result
             except BufferInterfaceNotFound:
                 self._getarg_error("bytes or read-only buffer", w_obj)
@@ -2011,8 +2011,8 @@ class ObjSpace(object):
             if not e.match(self, self.w_TypeError):
                 raise
             buf = self.buffer_w(w_obj, self.BUF_FULL_RO)
-            result = buf.as_str()
-            buf.releasebuffer()
+            with buf:
+                result = buf.as_str()
         if '\x00' in result:
             raise oefmt(self.w_ValueError, "embedded null byte")
         return rstring.assert_str0(result)

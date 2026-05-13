@@ -222,8 +222,8 @@ class W_MemoryView(W_BufferExporter):
                 return space.w_NotImplemented
             else:
                 str1 = self.view.as_str()
-                str2 = view.as_str()
-                view.releasebuffer()
+                with view:
+                    str2 = view.as_str()
                 return space.newbool(getattr(operator, name)(str1, str2))
         descr__cmp.func_name = name
         return descr__cmp
@@ -386,12 +386,11 @@ class W_MemoryView(W_BufferExporter):
             self.view.setbytes(offset, byteval)
         elif step == 1:
             value = space.buffer_w(w_obj, space.BUF_CONTIG_RO)
-            if value.getlength() != slicelength * itemsize:
-                value.releasebuffer()
-                raise oefmt(space.w_ValueError,
-                            "cannot modify size of memoryview object")
-            self.view.setbytes(start * itemsize, value.as_str())
-            value.releasebuffer()
+            with value:
+                if value.getlength() != slicelength * itemsize:
+                    raise oefmt(space.w_ValueError,
+                                "cannot modify size of memoryview object")
+                self.view.setbytes(start * itemsize, value.as_str())
         else:
             if self.getndim() != 1:
                 raise oefmt(space.w_NotImplementedError,
@@ -412,10 +411,10 @@ class W_MemoryView(W_BufferExporter):
             off = 0
             src_shape0 = slicelength
             src_stride0 = src.getstrides()[0]
-            for i in range(src_shape0):
-                data.append(src.getbytes(off, itemsize))
-                off += src_stride0
-            src.releasebuffer()
+            with src:
+                for i in range(src_shape0):
+                    data.append(src.getbytes(off, itemsize))
+                    off += src_stride0
             off = 0
             dst_stride0 = self.getstrides()[0] * step
             for dataslice in data:
