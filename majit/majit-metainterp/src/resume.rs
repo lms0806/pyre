@@ -4095,7 +4095,23 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(tagged);
                 continue;
             }
-            let box_type = snapshot_box.tp.unwrap_or_else(|| env.get_type(opref));
+            // resume.py:201-212:
+            //
+            //     box = iter.get(...)
+            //     box = box.get_box_replacement()
+            //     ...
+            //     if box.type == 'r':
+            //
+            // The type used for virtual classification is the replacement
+            // box's type, not the original snapshot slot's fallback type.  A
+            // snapshot slot can carry an Int fallback from tracing but forward
+            // to a Ref virtual after optimization; keeping the stale fallback
+            // would number that virtual as a TAGBOX and the subsequent
+            // optimizer.py:681 fail-arg force would materialize it.
+            let box_type = opref
+                .ty()
+                .or(snapshot_box.tp)
+                .unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
@@ -5071,6 +5087,102 @@ mod tests {
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
+        use majit_ir::OpRef;
+        struct RefOnlyVirtualEnv {
+            constants: HashMap<u32, (i64, majit_ir::Type)>,
+            replacements: HashMap<u32, majit_ir::OpRef>,
+            types: HashMap<u32, majit_ir::Type>,
+            virtuals: std::collections::HashSet<u32>,
+            virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo>,
+        }
+
+        impl RefOnlyVirtualEnv {
+            fn new() -> Self {
+                Self {
+                    constants: HashMap::new(),
+                    replacements: HashMap::new(),
+                    types: HashMap::new(),
+                    virtuals: std::collections::HashSet::new(),
+                    virtual_fields: HashMap::new(),
+                }
+            }
+        }
+
+        impl BoxEnv for RefOnlyVirtualEnv {
+            fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                self.replacements
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or(opref)
+            }
+
+            fn get_box_replacement_not_const(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                self.get_box_replacement(opref)
+            }
+
+            fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+                self.constants.contains_key(&opref.raw())
+            }
+
+            fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
+                self.constants
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int))
+            }
+
+            fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+                self.types
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int)
+            }
+
+            fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
+                self.virtuals.contains(&opref.raw())
+            }
+
+            fn is_virtual_raw(&self, _opref: majit_ir::OpRef) -> bool {
+                false
+            }
+
+            fn get_virtual_fields(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> Option<majit_ir::VirtualFieldsInfo> {
+                self.virtual_fields.get(&opref.raw()).cloned()
+            }
+        }
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = RefOnlyVirtualEnv::new();
+
+        // RPython resume.py reads box.type after get_box_replacement().
+        // Model a stale Int-typed snapshot slot that now forwards to a Ref
+        // virtual, the shape produced by optimized boxed-int locals.
+        let source = OpRef::int_op(1);
+        let target = OpRef::ref_op(2);
+        env.replacements.insert(source.raw(), target);
+        env.virtuals.insert(target.raw());
+        env.types.insert(target.raw(), majit_ir::Type::Ref);
+
+        let snapshot = Snapshot::single_frame_boxes(
+            0,
+            10,
+            vec![SnapshotBox::typed(source, majit_ir::Type::Int)],
+        );
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+
+        let (val, tagbits) = untag(items[6] as i16);
+        assert_eq!(tagbits, TAGVIRTUAL);
+        assert_eq!(val, 0);
+        assert_eq!(numb_state.num_boxes, 0);
+        assert_eq!(numb_state.num_virtuals, 1);
     }
 
     #[test]

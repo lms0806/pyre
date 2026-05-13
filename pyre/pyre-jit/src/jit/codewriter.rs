@@ -3146,25 +3146,13 @@ impl CodeWriter {
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
-        // jit_merge_point(). The blackhole's bhimpl_jit_merge_point raises
-        // ContinueRunningNormally at the bottommost level. Ideally all
-        // loop headers should emit BC_JIT_MERGE_POINT, but the
-        // CRN→interpreter→JIT-reentry cycle crashes in JIT compiled code
-        // because blackhole-modified frame locals can contain values
-        // incompatible with the compiled trace's assumptions. Until the
-        // full RPython CRN→portal_ptr restart is implemented, only the
-        // first loop header is a merge point.
-        // RPython jtransform.py:1690: jit_merge_point only in the portal
-        // graph. merge_point_pc is the trace entry PC (from bound_reached).
-        // Other loop headers use loop_header (no-op in the blackhole).
-        let merge_point_pc = if is_portal {
-            merge_point_pc.or_else(|| loop_header_pcs.iter().copied().min())
-        } else {
-            // Callee — no jit_merge_point emit. RPython's jtransform.py:1690
-            // `jit_merge_point only in the portal graph` is the matching
-            // statement.
-            None
-        };
+        // jit_merge_point(). `merge_point_pc` is still threaded in from
+        // bound_reached as the trace-entry refinement hint, but portal
+        // jitcode emission must not restrict merge-point bytecodes to that
+        // single PC: PyPy's dispatch loop reaches a portal merge point for
+        // every bytecode dispatch, and nested Python loops rely on the
+        // blackhole CRN at those inner headers to compile and target their
+        // own loops instead of growing giant bridges.
 
         // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
@@ -4478,7 +4466,7 @@ impl CodeWriter {
                 emit_live_placeholder!(ssarepr);
 
                 if loop_header_pcs.contains(&py_pc) {
-                    if merge_point_pc == Some(py_pc) {
+                    if is_portal {
                         // interp_jit.py:64 portal contract:
                         //   greens = ['next_instr', 'is_being_profiled', 'pycode']
                         //   reds = ['frame', 'ec']
@@ -4599,20 +4587,6 @@ impl CodeWriter {
                             },
                         )
                         .emit_space_operation(&graph_op);
-                    } else if let Some(jdindex) = portal_jd_index {
-                        // jtransform.py:1714 handle_jit_marker__loop_header
-                        // asserts `jd is not None` — only emit when this
-                        // compilation belongs to a registered jitdriver.
-                        let loop_header_op = emit_graph_op_void(
-                            &current_block.block(),
-                            "loop_header",
-                            vec![super::flow::Constant::signed(jdindex as i64).into()],
-                            py_pc as i64,
-                        );
-                        GraphFlattener::new(&mut ssarepr, |_variable| {
-                            unreachable!("loop_header graph op does not carry Variables")
-                        })
-                        .emit_space_operation(&loop_header_op);
                     }
                 }
 
@@ -9974,11 +9948,11 @@ mod tests {
             .callcontrol()
             .find_compiled_jitcode_arc(code_ptr)
             .expect("make_jitcodes must populate the registered portal");
-        assert!(
-            pyjit.merge_point_pc.is_some(),
-            "registered portal with no hint should infer its first loop header"
-        );
         assert_eq!(pyjit.jitcode.jitdriver_sd(), Some(0));
+        assert!(
+            pyjit.jitcode.exec.jit_merge_point_offset.is_some(),
+            "registered portal with no hint should still emit portal jit_merge_point bytecode"
+        );
     }
 
     #[test]
