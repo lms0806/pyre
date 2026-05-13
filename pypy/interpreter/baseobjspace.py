@@ -1689,9 +1689,9 @@ class ObjSpace(object):
 
     def acquire_readbuf(self, w_obj):
         """Paired GetBuffer / Release: returns (view, raw_buf).
-        Caller MUST call view.releasebuffer() (typically in try/finally)
-        when done with raw_buf. For bytes/str this is a no-op; for
-        bytearray it decrements the export counter.
+        Use view as a context manager (with view:) to ensure releasebuffer()
+        is called. For bytes/str this is a no-op; for bytearray it
+        decrements the export counter.
         """
         try:
             view = self._try_buffer_w(w_obj, self.BUF_SIMPLE)
@@ -1753,10 +1753,8 @@ class ObjSpace(object):
         if self.isinstance_w(w_obj, self.w_bytes):
             return w_obj.bytes_w(self)
         view, buf = self.acquire_readbuf(w_obj)
-        try:
+        with view:
             return buf.as_str()
-        finally:
-            view.releasebuffer()
 
     def charbuf_w(self, w_obj):
         # Old buffer interface, returns a character buffer (PyObject_AsCharBuffer)

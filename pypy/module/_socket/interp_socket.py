@@ -856,7 +856,7 @@ class W_Socket(W_Root):
         See recv() for documentation about the flags.
         """
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             lgt = rwbuffer.getlength()
             if nbytes < 0:
                 raise oefmt(space.w_ValueError, "negative buffersize in recv_into")
@@ -880,8 +880,6 @@ class W_Socket(W_Root):
             if rawbuf is not rwbuffer:
                 rwbuffer.setslice(0, rawbuf.getslice(0, 1, nbytes_read))
             return space.newint(nbytes_read)
-        finally:
-            view.releasebuffer()
 
     @unwrap_spec(nbytes=int, flags=int)
     def recvfrom_into_w(self, space, w_buffer, nbytes=0, flags=0):
@@ -890,7 +888,7 @@ class W_Socket(W_Root):
         Like recv_into(buffer[, nbytes[, flags]]) but also return the sender's address info.
         """
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             lgt = rwbuffer.getlength()
             if nbytes == 0:
                 nbytes = lgt
@@ -919,8 +917,6 @@ class W_Socket(W_Root):
             else:
                 w_addr = space.w_None
             return space.newtuple2(space.newint(readlgt), w_addr)
-        finally:
-            view.releasebuffer()
 
     @unwrap_spec(cmd=int)
     def ioctl_w(self, space, cmd, w_option):

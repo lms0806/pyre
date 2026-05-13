@@ -260,7 +260,7 @@ def ioctl(space, w_fd, w_request, w_arg, mutate_flag=-1):
                 e.match(space, space.w_BufferError)):
             raise
     else:
-        try:
+        with view:
             arg = rwbuffer.as_str()
             ll_arg = rffi.str2charp(arg)
             to_alloc = max(IOCTL_BUFSZ, len(arg))
@@ -278,8 +278,6 @@ def ioctl(space, w_fd, w_request, w_arg, mutate_flag=-1):
                     return space.newbytes(arg)
             finally:
                 lltype.free(ll_arg, flavor='raw')
-        finally:
-            view.releasebuffer()
 
     if mutate_flag != -1:
         raise oefmt(space.w_TypeError,

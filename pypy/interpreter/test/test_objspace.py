@@ -396,22 +396,18 @@ class TestObjSpace:
         space = self.space
         w_data = space.newbytes(b"hello")
         view, buf = space.acquire_readbuf(w_data)
-        try:
+        with view:
             assert buf.as_str() == b"hello"
-        finally:
-            view.releasebuffer()
 
     def test_acquire_readbuf_bytearray_tracks_exports(self):
         space = self.space
         w_ba = space.newbytearray([b'a', b'b', b'c'])
         view, buf = space.acquire_readbuf(w_ba)
-        try:
+        with view:
             assert buf.as_str() == b"abc"
             # while the buffer is held, the bytearray cannot be resized
             space.raises_w(space.w_BufferError,
                            space.call_method, w_ba, 'append', space.newint(ord('d')))
-        finally:
-            view.releasebuffer()
         # after releasing, the bytearray is unlocked again
         space.call_method(w_ba, 'append', space.newint(ord('d')))
 
@@ -419,10 +415,8 @@ class TestObjSpace:
         space = self.space
         w_ba = space.newbytearray([b'a', b'b', b'c'])
         view, buf = space.acquire_writebuf(w_ba)
-        try:
+        with view:
             buf.setitem(0, 'Z')
-        finally:
-            view.releasebuffer()
         assert space.bytes_w(space.call_function(space.w_bytes, w_ba)) == b"Zbc"
 
     def test_acquire_readbuf_type_error(self):

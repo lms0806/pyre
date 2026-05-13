@@ -119,7 +119,7 @@ state."""
 
     def _readinto(self, space, w_buffer, read_once):
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             length = rwbuffer.getlength()
             methodname = "read1" if read_once else "read"
             w_data = space.call_method(self, methodname, space.newint(length))
@@ -135,8 +135,6 @@ state."""
                             methodname, length, len(data))
             self.output_slice(space, rwbuffer, 0, data)
             return space.newint(len(data))
-        finally:
-            view.releasebuffer()
 
 W_BufferedIOBase.typedef = TypeDef(
     '_io._BufferedIOBase', W_IOBase.typedef,
@@ -955,7 +953,7 @@ class BufferedReaderMixin(object):
         self._check_init(space)
         self._check_closed(space, "readinto of closed file")
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             length = rwbuffer.getlength()
             with self.lock:
                 have = self._readahead()
@@ -1002,8 +1000,6 @@ class BufferedReaderMixin(object):
                     if read_once:
                         break
                 return space.newint(written)
-        finally:
-            view.releasebuffer()
 
 
 class W_BufferedReader(W_BufferedIOBase):

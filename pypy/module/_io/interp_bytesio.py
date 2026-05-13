@@ -109,13 +109,11 @@ class W_BytesIO(W_BufferedIOBase):
     def readinto_w(self, space, w_buffer):
         self._check_closed(space)
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             size = rwbuffer.getlength()
             output = self.read(size)
             self.output_slice(space, rwbuffer, 0, output)
             return space.newint(len(output))
-        finally:
-            view.releasebuffer()
 
     def write_w(self, space, w_data):
         self._check_closed(space)

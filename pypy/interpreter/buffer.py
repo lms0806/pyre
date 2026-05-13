@@ -71,6 +71,13 @@ class BufferView(object):
     def releasebuffer(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exctype, excvalue, exctb):
+        self.releasebuffer()
+        return False
+
     def needs_release(self):
         return False
 

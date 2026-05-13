@@ -381,7 +381,7 @@ class W_WinConsoleIO(W_RawIOBase):
         # Read wchar, convert to utf8, and put it into w_buffer.
         # We buffer left-over characters into self.buf
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             length = rwbuffer.getlength()
             oldmode = self.mode
             self.mode = 'u'
@@ -392,8 +392,6 @@ class W_WinConsoleIO(W_RawIOBase):
                 rwbuffer[i] = utf8[i]
                 i += 1
             return space.newint(i)
-        finally:
-            view.releasebuffer()
 
 
     def read(self, space, length):

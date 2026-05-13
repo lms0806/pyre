@@ -468,7 +468,7 @@ class W_FileIO(W_RawIOBase):
         self._check_closed(space)
         self._check_readable(space)
         view, rwbuffer = space.acquire_writebuf(w_buffer)
-        try:
+        with view:
             length = rwbuffer.getlength()
 
             target_address = lltype.nullptr(rffi.CCHARP.TO)
@@ -495,8 +495,6 @@ class W_FileIO(W_RawIOBase):
                 w_res = self._readinto_raw(space, target_address, length)
                 keepalive_until_here(rwbuffer)
                 return w_res
-        finally:
-            view.releasebuffer()
 
     def _readinto_raw(self, space, target_address, length):
         # optimized case: reading more than 64 bytes into a rwbuffer
