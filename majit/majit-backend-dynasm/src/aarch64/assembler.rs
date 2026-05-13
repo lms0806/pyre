@@ -3951,9 +3951,15 @@ impl<'a> AssemblerARM64<'a> {
                             // resume.py:411-417 parity: TAGCONST/TAGVIRTUAL
                             // slots are kept as OpRef::NONE in fail_args
                             // (PyPy filters them out; pyre keeps positional).
-                            // Type at this slot is never read at runtime —
-                            // the value comes from the resume snapshot.
-                            Type::Ref
+                            // `Type::Void` is the "hole" sentinel — value
+                            // comes from the resume snapshot, not the
+                            // deadframe, so downstream consumers
+                            // (`gc_ref_slots`, `guard_gcmap_from_faillocs`,
+                            // `typed_outputs` reconstruction) must skip
+                            // these slots. Earlier code used `Type::Ref`
+                            // which silently leaked a NULL `GcRef` into
+                            // `gc_ref_slots` and the shadow stack.
+                            Type::Void
                         } else {
                             self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
                                 panic!(
@@ -3973,8 +3979,9 @@ impl<'a> AssemblerARM64<'a> {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {
-                        // resume.py:411-417 parity: see comment above.
-                        Type::Ref
+                        // resume.py:411-417 parity: see comment above —
+                        // Type::Void is the "hole" sentinel.
+                        Type::Void
                     } else {
                         self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
                             panic!(

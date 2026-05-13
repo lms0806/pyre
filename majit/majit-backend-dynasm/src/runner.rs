@@ -1885,7 +1885,14 @@ impl Backend for DynasmBackend {
             typed_outputs.push(match fail_arg_types[i] {
                 Type::Ref => Value::Ref(GcRef(raw as usize)),
                 Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                _ => Value::Int(raw),
+                // `Type::Void` is the resume.py:411-417 hole sentinel —
+                // the slot's value is reconstructed from the resume
+                // snapshot (TAGCONST/TAGVIRTUAL), not from the deadframe.
+                // Surfacing `Value::Void` keeps `gc_ref_slots` and
+                // downstream type-tag dispatchers from misclassifying
+                // it as a live `Ref` and leaking a NULL `GcRef`.
+                Type::Void => Value::Void,
+                Type::Int => Value::Int(raw),
             });
         }
         let exit_layout = Some(descr.layout());

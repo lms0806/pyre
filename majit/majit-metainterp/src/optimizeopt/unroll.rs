@@ -1117,7 +1117,30 @@ impl UnrollOptimizer {
                     if seen_used.insert(ub) {
                         current_label_args.push(ub);
                     } else {
-                        current_label_args.push(OpRef::from_raw(next_fresh));
+                        // shortpreamble.py:343-350 inputarg_from_tp parity:
+                        // when the short preamble needs a fresh label slot,
+                        // PyPy creates a new typed InputArg from the source
+                        // box's `.type`. Carry that into duplicate used_box
+                        // slots: typed parents produce a matching
+                        // `InputArg{Int,Float,Ref}` alias.
+                        let tp = ub.ty().unwrap_or_else(|| {
+                            panic!(
+                                "duplicate short-preamble used_box {:?} has untyped variant; \
+                                 RPython label/inputarg boxes carry Int/Ref/Float type \
+                                 intrinsically (resoperation.py:1544 inputarg_from_tp)",
+                                ub
+                            )
+                        });
+                        if matches!(tp, Type::Void) {
+                            panic!(
+                                "duplicate short-preamble used_box {:?} has void type; \
+                                 RPython label/inputarg boxes must carry Int/Ref/Float \
+                                 type (resoperation.py:1544 inputarg_from_tp)",
+                                ub
+                            );
+                        }
+                        let alias = OpRef::input_arg_typed(next_fresh, tp);
+                        current_label_args.push(alias);
                         next_fresh += 1;
                     }
                 }
@@ -3786,16 +3809,8 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
     // every slot as Ref (matches the common loop-body shape; fixtures that
     // need typed inputargs construct ctx directly).
     let types = vec![Type::Ref; body_num_inputs];
-    let mut ctx = OptContext::with_inputarg_types(p1_ops.len() + p2_ops.len(), &types);
-    for op in p1_ops.iter().chain(p2_ops.iter()) {
-        if op.pos.is_none() || op.result_type() == Type::Void {
-            continue;
-        }
-        ctx.value_types
-            .entry(op.pos.raw())
-            .or_insert(op.result_type());
-    }
-    ctx
+    let _ = (p1_ops, p2_ops);
+    OptContext::with_inputarg_types(p1_ops.len() + p2_ops.len(), &types)
 }
 
 /// shortpreamble.py:436-439 alias-side `extra_same_as` emission.

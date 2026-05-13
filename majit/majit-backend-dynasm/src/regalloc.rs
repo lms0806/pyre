@@ -1176,18 +1176,10 @@ impl RegisterManager {
     /// `box.type == FLOAT` query for a constant `OpRef`.
     ///
     /// Typed variants (`OpRef::ConstFloat`) carry the type tag intrinsically,
-    /// matching `ConstFloat.type = FLOAT` (history.py:262). The
-    /// `constant_types` side-table fallback is transitional: it serves
-    /// `OpRef::Untyped(x | CONST_BIT)` constants until Phase 4 (Task #258)
-    /// retires that variant; once retired, the `None` arm becomes dead and
-    /// the side table can be deleted.
+    /// matching `ConstFloat.type = FLOAT` (history.py:262).
     #[inline]
     fn is_float_constant(&self, v: OpRef) -> bool {
-        match v.ty() {
-            Some(Type::Float) => true,
-            Some(_) => false,
-            None => self.constant_types.get(&v.raw()).copied() == Some(Type::Float),
-        }
+        matches!(v.ty(), Some(Type::Float))
     }
 
     /// regalloc.py:611

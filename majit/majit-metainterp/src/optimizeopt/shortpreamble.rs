@@ -482,18 +482,21 @@ impl PotentialShortOp {
                     //   lst[i].short_op.res = new_name
                     // The alias's type matches `compound.res.type`. PyPy
                     // Box.type is fixed at construction (resoperation.py:
-                    // 719/727/739); pyre's transitional `OpRef::Untyped(_)`
-                    // producers carry no type tag and fall back to a fresh
-                    // `from_raw` alias — eliminated once Task #258 retires
-                    // the Untyped variant.
+                    // 719/727/739) — an untyped compound.res would be an
+                    // upstream-invariant violation.
                     for (i, mut alt) in produced.into_iter().enumerate() {
                         if i == index {
                             continue;
                         }
-                        let alias = match compound.res.ty() {
-                            Some(tp) => OpRef::op_typed(sb.next_synthetic_pos, tp),
-                            None => OpRef::from_raw(sb.next_synthetic_pos),
-                        };
+                        let tp = compound.res.ty().unwrap_or_else(|| {
+                            panic!(
+                                "compound short-preamble alias source {:?} has no \
+                                 variant tag; same_as_for_type requires Int/Ref/Float \
+                                 (shortpreamble.py:326-330)",
+                                compound.res
+                            )
+                        });
+                        let alias = OpRef::op_typed(sb.next_synthetic_pos, tp);
                         sb.next_synthetic_pos += 1;
                         alt.preamble_op.pos = alias;
                         alt.invented_name = true;

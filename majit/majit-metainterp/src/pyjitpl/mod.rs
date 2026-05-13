@@ -301,8 +301,8 @@ fn snapshot_map_from_trace_snapshots(
     let mut pc_map = Vec::new();
     let mut next_const_idx = constants
         .keys()
-        .filter(|k| majit_ir::OpRef::from_raw(**k).is_constant())
-        .map(|k| majit_ir::OpRef::from_raw(*k).const_index())
+        .filter(|k| majit_ir::OpRef::raw_is_constant(**k))
+        .map(|k| majit_ir::OpRef::raw_const_index(*k))
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
@@ -350,13 +350,12 @@ fn snapshot_map_from_trace_snapshots(
                     // `OpRef::const_typed` factory) must not manufacture a
                     // malformed `OpRef::ConstInt(raw)`.
                     Some(raw) => {
-                        let cached = majit_ir::OpRef::from_raw(raw);
                         debug_assert!(
-                            cached.is_constant(),
+                            majit_ir::OpRef::raw_is_constant(raw),
                             "constants map key {} missing CONST_BIT",
                             raw
                         );
-                        majit_ir::OpRef::const_typed(cached.const_index(), *tp)
+                        majit_ir::OpRef::const_typed(majit_ir::OpRef::raw_const_index(raw), *tp)
                     }
                     None => {
                         let opref = majit_ir::OpRef::const_typed(next_const_idx, *tp);
@@ -12149,18 +12148,19 @@ impl<M: Clone> MetaInterp<M> {
         }
         let virtualbox = self.virtualref_boxes[i].0;
         let vrefbox = self.virtualref_boxes[i + 1].0;
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
-        }
+        // pyjitpl.py:3381-3387: this function is only reachable during
+        // tracing (called from vrefs_after_residual_call / vable_after_
+        // residual_call, both predicated on an active trace).
+        let ctx = self
+            .tracing
+            .as_mut()
+            .expect("stop_tracking_virtualref called outside an active trace");
+        ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
         // pyjitpl.py:3378 `self.virtualref_boxes[i+1] = CONST_NULL`
         // — ref-typed null preserves the slot's Ref type so subsequent
         // fail-arg type recovery and ref-typed guard processing match
         // upstream (history.py:361 `CONST_NULL = ConstPtr(ConstPtr.value)`).
-        let null_const = self
-            .tracing
-            .as_mut()
-            .map(|ctx| ctx.const_null())
-            .unwrap_or(OpRef::from_raw(0));
+        let null_const = ctx.const_null();
         self.virtualref_boxes[i + 1] = (null_const, 0);
     }
 

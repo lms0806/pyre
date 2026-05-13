@@ -20,6 +20,12 @@ use crate::value::{InputArg, Type};
 pub struct OpTypeIndex<'a> {
     inputargs: &'a [InputArg],
     ops: &'a [Op],
+    /// Retained as an API parameter for callers; queued for removal in
+    /// the `value_types` side-table drop alongside `OptContext::value_types`
+    /// (P8). Untyped variant retirement made this lookup unreachable from
+    /// `opref_type_at_or_after`, since every constant variant short-circuits
+    /// at `opref.ty()`.
+    #[allow(dead_code)]
     constant_types: &'a HashMap<u32, Type>,
     /// `inputarg_pos[raw] = slice index in inputargs`, sentinel
     /// [`NO_POS`] for unset slots. `arg.index` raw uniqueness is
@@ -158,10 +164,6 @@ impl<'a> OpTypeIndex<'a> {
     /// the inputarg type until the colliding op result has actually been
     /// defined.
     ///
-    /// `constant_types` may still contain compatibility seeds for non-constant
-    /// refs at some call sites, but RPython's `box.type` only takes the Const
-    /// path for actual Const boxes.  Guard the table by `OpRef::is_constant()`
-    /// so such seeds cannot shadow op/inputarg typing.
     pub fn opref_type(&self, opref: OpRef) -> Option<Type> {
         self.opref_type_at_or_after(opref, None)
     }
@@ -186,40 +188,9 @@ impl<'a> OpTypeIndex<'a> {
         // history.py:182 / resoperation.py:29: `box.type` lives on the Box
         // object itself; pyre's typed OpRef variants (`Const{Int,Float,Ptr}`
         // / `InputArg{Int,Float,Ref}` / `{Int,Float,Ref,Void}Op`) carry the
-        // matching type tag intrinsically. Trust the variant first; the
-        // side indexes are reserved for the transitional `Untyped` variant.
+        // matching type tag intrinsically.
         if let Some(tp) = opref.ty() {
             return (tp != Type::Void).then_some(tp);
-        }
-        if opref.is_constant() {
-            // history.py:220/261/307: `Const*` boxes pin `box.type` at
-            // construction.  Typed `OpRef::ConstInt/ConstFloat/ConstPtr`
-            // variants short-circuit at the `opref.ty()` arm above, so
-            // this branch only fires for `Untyped(x | CONST_BIT)` —
-            // legacy `OpRef::from_const` / `OpRef::from_raw` reconstructs
-            // produced before producer-side typing was complete. The
-            // canonical seeder (`ConstantPool::get_or_insert*`,
-            // constant_pool.rs:173) already guarantees that any constant
-            // present in a pool's `constants` map is also present in its
-            // `constant_types` map, so the only way to land here with a
-            // miss is for a caller to have built `OpTypeIndex` with a
-            // partial `constant_types` snapshot. Panic loudly so the
-            // misseed surfaces at the helper boundary instead of
-            // silently mis-typing the Const as Int.
-            return Some(
-                self.constant_types
-                    .get(&opref.raw())
-                    .copied()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "OpTypeIndex: untyped Const OpRef raw={} missing from constant_types — \
-                             every Const must have its type seeded (history.py:220/261/307); \
-                             producer must migrate to typed `OpRef::const_{{int,float,ref}}` \
-                             factories or seed `constant_types` in lockstep with the constant pool",
-                            opref.raw(),
-                        )
-                    }),
-            );
         }
         // raw uniqueness panic at build time means there is at most one
         // ops[]/inputargs[] entry per raw u32, so there is no

@@ -65,8 +65,8 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
     // inputarg slot 0 = first live value (Type::Int).  `force_start_tracing`'s
-    // record_input_arg allocates the Int slot first, so OpRef::from_raw(0).
-    let live_arg = majit_ir::OpRef::from_raw(0);
+    // record_input_arg allocates the Int slot first.
+    let live_arg = majit_ir::OpRef::input_arg_int(0);
     let const_y: i64 = 11;
     let const_arg = meta.trace_ctx().expect("active trace").const_int(const_y);
 

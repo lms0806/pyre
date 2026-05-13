@@ -420,17 +420,10 @@ pub struct OptContext {
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
-    /// compile.rs value_types parity: OpRef → Type for all defined values
-    /// (inputargs + operation results). Used by store_final_boxes_in_guard
-    /// to infer fail_arg types correctly for OpRefs from earlier phases.
-    pub value_types: HashMap<u32, majit_ir::Type>,
     /// Inputarg types indexed by slot, mirroring `Optimizer.trace_inputarg_types`
     /// (recorder side `InputArg{Int,Ref,Float}.tp`). Slot `i` corresponds to
     /// `OpRef(inputarg_base + i)`. Populated in `setup_optimizations` so
-    /// readers can resolve inputarg `box.type` (history.py:220 parity)
-    /// without going through the `value_types` HashMap. Slice 0.5 prep —
-    /// once all inputarg-type readers route through here, the inputarg
-    /// fan-in into `value_types` (optimizer.rs:1816-1818) goes away.
+    /// readers can resolve inputarg `box.type` (history.py:220 parity).
     pub inputarg_types: Vec<majit_ir::Type>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
@@ -615,20 +608,8 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 return op.type_;
             }
         }
-        // value_types aggregates the four upstream sources (original trace
-        // ops, prev-phase carry, inputarg types, transformed trace result
-        // types) seeded in `Optimizer::make_ctx`. Removed in Slice 0.5
-        // once writers feed Op.type_ exclusively.
-        if let Some(&tp) = self.ctx.value_types.get(&resolved.raw()) {
-            if tp != majit_ir::Type::Void {
-                return tp;
-            }
-        }
         // Inputarg slot (history.py:220 `InputArg{Int,Ref,Float}.type`
-        // parity). Slice 0.5 prep — placed last so legacy `value_types`
-        // writers keep priority during the transition; once Slice 0.5
-        // drops the inputarg fan-in this becomes the authoritative
-        // inputarg-type source.
+        // parity).
         if let Some(tp) = self.ctx.inputarg_type(resolved) {
             return tp;
         }
@@ -1178,16 +1159,15 @@ impl OptContext {
     /// RPython Box.type invariant: each OpRef's type is fixed at creation
     /// (IntFrontendOp / RefFrontendOp / FloatFrontendOp are separate classes
     /// and `box.type` is a class property, immutable for the box's lifetime).
-    /// pyre carries the type externally in `value_types`, so enforce the
-    /// invariant here: inserting an OpRef that already has a *different*
-    /// type is the only form of divergence from RPython. The assertion is
-    /// debug-only so release builds are unaffected; it flips on the
-    /// violation so we can locate the callsite and emit an explicit re-box
-    /// (wrapint / wrapfloat / unbox) instead of silently retyping.
+    /// The typed OpRef enum variant (`ConstInt`/`InputArgInt`/`IntOp`/…)
+    /// encodes `box.type` directly per resoperation.py:29
+    /// `AbstractValue.type` parity, so this function exists only as a
+    /// debug guardrail: it verifies the registered `tp` agrees with the
+    /// variant tag the producer minted (and with `Op.type_` on the
+    /// producing op) and otherwise short-circuits — there is no
+    /// side-table to populate.
     ///
-    /// Void (no result) is rejected because value_types keeps only
-    /// producing ops; callers gate on `op.result_type() != Void` before
-    /// calling in.
+    /// Void (no result) is rejected because there is no Box value.
     pub fn register_value_type(&mut self, opref: majit_ir::OpRef, tp: majit_ir::Type) {
         debug_assert_ne!(
             tp,
@@ -1195,13 +1175,6 @@ impl OptContext {
             "register_value_type: Void has no box value (opref={:?})",
             opref,
         );
-        // Slice 0.5: when `opref` already encodes its type via the Phase
-        // 1-5 OpRef enum variant tag (resoperation.py:29 AbstractValue.type
-        // parity), the side-table write is redundant — readers consult
-        // `opref.ty()` at priority 0 in `opref_type` /
-        // `OptBoxEnv::get_type`. Verify the variant-tag and registered
-        // `tp` agree (debug-only) and skip the HashMap write so producers
-        // that allocate typed positions never grow `value_types`.
         if let Some(variant_tp) = opref.ty() {
             debug_assert_eq!(
                 variant_tp, tp,
@@ -1210,23 +1183,7 @@ impl OptContext {
                  (typed factory mismatch with op.result_type())",
                 variant_tp, tp, opref,
             );
-            return;
         }
-        if let Some(&existing) = self.value_types.get(&opref.raw()) {
-            debug_assert_eq!(
-                existing, tp,
-                "register_value_type: OpRef {:?} retyped from {:?} to {:?} \
-                 (RPython Box.type invariant violation; emit explicit \
-                 wrapint/wrapfloat/unbox at the producer instead of \
-                 retyping in place)",
-                opref, existing, tp,
-            );
-        }
-        // Phase 0 dual-source check: when the producing Op already lives
-        // in new_operations its intrinsic `type_` field (resoperation.py:1693
-        // `opclasses[opnum].type` parity) must agree with the registered
-        // `tp`. Caught here during development; once all readers migrate
-        // to `op.type_` (Slice 0.4) the side-table itself disappears.
         #[cfg(debug_assertions)]
         if let Some(producer) = self.new_operations.iter().rev().find(|o| o.pos == opref) {
             debug_assert_eq!(
@@ -1237,7 +1194,6 @@ impl OptContext {
                 producer.type_, tp, opref, producer.opcode,
             );
         }
-        self.value_types.insert(opref.raw(), tp);
     }
 
     pub fn new(estimated_ops: usize) -> Self {
@@ -1290,7 +1246,6 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            value_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
@@ -1415,7 +1370,6 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            value_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
@@ -1428,14 +1382,8 @@ impl OptContext {
         self.num_inputs as usize
     }
 
-    /// Allocate a fresh OpRef position (for imported virtual heads).
-    pub fn alloc_op_position(&mut self) -> OpRef {
-        self.reserve_pos()
-    }
-
     /// Allocate a fresh OpRef position with the producer's result type
-    /// stamped on the variant tag (Slice 0.5 follow-up). Mirrors
-    /// `alloc_op_position` for callers that already know `box.type` —
+    /// stamped on the variant tag. Callers always know `box.type` —
     /// the resulting OpRef is recognized at priority 0 by `opref_type` /
     /// `OptBoxEnv::get_type`, and `register_value_type` no longer needs
     /// to grow the side-table for these positions.
@@ -1655,35 +1603,7 @@ impl OptContext {
         .flatten()
     }
 
-    pub(crate) fn reserve_pos(&mut self) -> OpRef {
-        let raw = self.allocate_next_pos_raw();
-        let idx = raw as usize;
-        // Cat 1.3 fix: same `box_pool` eager extension as `reserve_pos_typed`.
-        // PyPy single `_forwarded` slot model — every fresh OpRef must
-        // correspond to a `BoxRef` so `get_box_replacement_box` returns a
-        // valid Rc<Box> and `replace_op` mirror chains to the new target
-        // without skipping. Untyped allocation falls back to `Type::Void`.
-        if !self.box_pool.is_empty() {
-            while self.box_pool.len() < idx {
-                let position = self.box_pool.len() as u32;
-                self.box_pool.push(crate::r#box::BoxRef::new_resop(
-                    majit_ir::Type::Void,
-                    position,
-                ));
-            }
-            if self.box_pool.len() == idx {
-                let position = self.box_pool.len() as u32;
-                self.box_pool.push(crate::r#box::BoxRef::new_resop(
-                    majit_ir::Type::Void,
-                    position,
-                ));
-            }
-        }
-        OpRef::from_raw(raw)
-    }
-
-    /// Slice 0.5 follow-up: typed `reserve_pos`. Same allocation arithmetic
-    /// as `reserve_pos`, but tags the resulting OpRef with the producer's
+    /// Typed `reserve_pos`. Tags the resulting OpRef with the producer's
     /// result type so the Phase 1-5 variant tag (resoperation.py:29
     /// AbstractValue.type parity) is set at allocation time. Readers consult
     /// `opref.ty()` at priority 0 in `opref_type` / `OptBoxEnv::get_type`,
@@ -1740,7 +1660,7 @@ impl OptContext {
             self.next_pos += 1;
         }
         debug_assert!(
-            !OpRef::from_raw(self.next_pos).is_constant(),
+            !OpRef::raw_is_constant(self.next_pos),
             "reserve_pos overflowed into constant namespace: {}",
             self.next_pos
         );
@@ -2303,11 +2223,10 @@ impl OptContext {
             if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos) {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
-            // RPython PreambleOp carries Box.type intrinsically. majit's
-            // imported replay uses a distinct `resolved` OpRef, so preserve
-            // the replay result type on first force when the import path did
-            // not already seed `value_types` (e.g. focused unit fixtures).
-            self.value_types.entry(result.raw()).or_insert(result_type);
+            // RPython PreambleOp carries Box.type intrinsically; pyre's
+            // imported replay encodes the type in the `result` OpRef
+            // variant tag (resoperation.py:29).
+            let _ = result_type;
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
                 // unroll.py:35-36: invented_name → get_box_replacement(op)
@@ -4879,20 +4798,14 @@ impl OptContext {
         self.new_operations.clear();
         // Reset next_pos to the iteration's first fresh OpRef position
         // (right after the inputarg slice in the OpRef namespace), but
-        // never below an already-registered value_types position. The
-        // context survives across iterations (e.g. Phase 2 final_ctx
-        // reused as `jump_ctx` for short-preamble inlining), so every
-        // previously emitted op still sits in `value_types`. `reserve_pos`
-        // only skips constants; without accounting for the typed slots
-        // here, a subsequent `alloc_op_position` would hand out a pos
-        // already typed in the prior iteration and trip the Box.type
-        // retype invariant at `register_value_type`.
+        // never below the prior iteration's watermark. The context
+        // survives across iterations (e.g. Phase 2 final_ctx reused as
+        // `jump_ctx` for short-preamble inlining); `reserve_pos` only
+        // skips constants, so the previous iteration's typed slots must
+        // remain reserved to keep `alloc_op_position` from handing back
+        // a pos that already names an emitted op.
         let base = self.inputarg_base + self.num_inputs;
-        self.next_pos = if let Some(&max_typed_pos) = self.value_types.keys().max() {
-            base.max(max_typed_pos.saturating_add(1))
-        } else {
-            base
-        };
+        self.next_pos = self.next_pos.max(base);
         self.const_infos.clear();
     }
 
@@ -4901,26 +4814,13 @@ impl OptContext {
         self.new_operations.last_mut()
     }
 
-    /// resoperation.py: `op.type` parity. RPython Boxes carry their
-    /// type intrinsically (`AbstractValue.type` ∈ {`'i'`, `'r'`, `'f'`,
-    /// `'v'`}). majit's flat OpRef model has no such intrinsic field,
-    /// so the type is reconstructed from the available metadata sources
-    /// in priority order:
-    ///
-    /// 1. The seeded constant value's intrinsic Rust type. A
-    ///    `Value::Int` is `'i'`, `Value::Float` is `'f'`, `Value::Ref`
-    ///    is `'r'`. The `constant_types_for_numbering` override is a
-    ///    raw-pointer marker on `'i'`-typed Boxes (RPython's
-    ///    `getrawptrinfo` ConstInt path) — it does NOT change `op.type`
-    ///    from `'i'` to `'r'`, matching the upstream invariant that a
-    ///    raw-pointer `ConstInt` Box stays `op.type == 'i'` while still
-    ///    becoming `ConstPtrInfo` through `getrawptrinfo`.
-    /// 2. `value_types`, populated when an op is emitted via
-    ///    `OptContext::emit` (mirrors RPython `op.type` lookup on
-    ///    operations with a known result type).
-    /// 3. The producing op's static `result_type()` (last resort for
-    ///    OpRefs that have not been emitted yet but exist in
-    ///    `new_operations`).
+    /// resoperation.py: `op.type` parity. The Phase 1-5 OpRef enum
+    /// encodes `box.type` (`AbstractValue.type` ∈ {`'i'`, `'r'`, `'f'`,
+    /// `'v'`}) directly in the variant tag, so reading the tag is the
+    /// line-by-line equivalent of upstream `box.type`. The fall-through
+    /// arms cover residual cases — seeded constants without a typed
+    /// variant, ops that have not yet been emitted, inputarg slots, and
+    /// PtrInfo-derived Ref typing.
     ///
     /// Returns `None` only when none of the above sources have type
     /// information for the OpRef. Callers must treat `None` like
@@ -4928,69 +4828,22 @@ impl OptContext {
     /// assumptions about it.
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
-        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity. The
-        //    Phase 1-5 OpRef enum encodes `box.type` directly in the variant
-        //    tag (`ConstInt`/`InputArgInt`/`IntOp` → Int, etc.), so reading
-        //    the tag is the line-by-line equivalent of upstream `box.type`.
-        //    `Untyped(_)` and `None` return `None` here and fall through to
-        //    the legacy chain (Slice 0.5 in-progress: producers that still
-        //    allocate `Untyped` positions are being migrated to typed
-        //    factories so this becomes the only path).
+        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity.
         if let Some(tp) = resolved.ty() {
-            // Slice 0.5 dual-source check: when `value_types` carries an
-            // entry for a typed-variant OpRef it MUST agree with the
-            // variant tag. Surface any divergence so we can fix the
-            // producer, not paper over with a side-table read.
-            #[cfg(debug_assertions)]
-            if let Some(&table_tp) = self.value_types.get(&resolved.raw()) {
-                debug_assert_eq!(
-                    tp, table_tp,
-                    "opref_type: OpRef variant ({:?}) disagrees with \
-                     value_types entry ({:?}) for {:?}",
-                    tp, table_tp, resolved,
-                );
-            }
             return Some(tp);
         }
         // 1. Seeded constant — read the intrinsic Rust shape (history.py:220
         //    `ConstInt.type = INT` parity).
-        //    The constant_types_for_numbering override is intentionally
-        //    NOT consulted here — it is a raw-pointer marker on
-        //    'i'-typed Boxes, not a type-changing annotation.
         if let Some(val) = self.get_constant(resolved) {
             return Some(val.get_type());
         }
         // 2. Producing op's intrinsic `type_` (resoperation.py:1693
-        //    `opclasses[opnum].type` parity). Slice 0.1 populates this
-        //    at construction; this is now the primary fast path.
+        //    `opclasses[opnum].type` parity).
         if let Some(tp) = self.get_op_result_type(resolved) {
-            // Slice 0.3 dual-source check: when `value_types` carries an
-            // entry it must agree with the intrinsic. Disagreement = bug
-            // the side-table has been masking; surface during dev.
-            #[cfg(debug_assertions)]
-            if let Some(&table_tp) = self.value_types.get(&resolved.raw()) {
-                debug_assert_eq!(
-                    tp, table_tp,
-                    "opref_type: Op.type_ ({:?}) disagrees with \
-                     value_types entry ({:?}) for {:?}",
-                    tp, table_tp, resolved,
-                );
-            }
             return Some(tp);
         }
-        // 3. `value_types` side-table — covers OpRefs that have no
-        //    producing Op yet (e.g. registered via `register_value_type`
-        //    by passes that synthesize an aliased OpRef). Removed in
-        //    Slice 0.5 once all writers route through Op intrinsics or
-        //    the dedicated `inputarg_types` source below.
-        if let Some(&tp) = self.value_types.get(&resolved.raw()) {
-            return Some(tp);
-        }
-        // 4. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
-        //    history.py:220 parity). Slice 0.5 prep — placed last so
-        //    legacy `value_types` writers keep priority during the
-        //    transition; once Slice 0.5 drops the inputarg fan-in this
-        //    becomes the authoritative inputarg-type source.
+        // 3. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
+        //    history.py:220 parity).
         if let Some(tp) = self.inputarg_type(resolved) {
             return Some(tp);
         }
@@ -6538,17 +6391,17 @@ mod boxref_forwarding_tests {
             .insert(const_opref.const_index(), Value::Int(7));
         assert!(ctx.resolved_is_constant_via_box(const_opref));
         // (b) `Forwarded::Box(constbox)` chain on a non-Const-namespace OpRef.
-        ctx.replace_op(OpRef::from_raw(0), const_opref);
-        assert!(ctx.resolved_is_constant_via_box(OpRef::from_raw(0)));
+        ctx.replace_op(OpRef::input_arg_int(0), const_opref);
+        assert!(ctx.resolved_is_constant_via_box(OpRef::input_arg_int(0)));
         // `Forwarded::Box(constbox)` planted directly via set_forwarded_box.
         b1.set_forwarded_box(BoxRef::new_const_with_index(Value::Int(42), 1));
         ctx.const_pool.insert(1, Value::Int(42));
-        assert!(ctx.resolved_is_constant_via_box(OpRef::from_raw(1)));
+        assert!(ctx.resolved_is_constant_via_box(OpRef::input_arg_int(1)));
         // Negative case: OpRef with no constant forwarding.
         let mut ctx2 = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let nb = BoxRef::new_inputarg(Type::Int, Some(0));
         ctx2.box_pool = vec![nb].into();
-        assert!(!ctx2.resolved_is_constant_via_box(OpRef::from_raw(0)));
+        assert!(!ctx2.resolved_is_constant_via_box(OpRef::input_arg_int(0)));
     }
 
     /// `make_constant` mirrors PyPy optimizer.py:432
@@ -6908,23 +6761,23 @@ mod boxref_forwarding_tests {
         ctx.set_ptr_info(&b, info);
         // Legacy and BoxRef-routing path agree.
         assert!(
-            ctx.peek_ptr_info_via_box(OpRef::from_raw(0))
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
                 .is_some_and(|i| i.is_virtual())
         );
-        assert!(ctx.is_virtual_via_box(OpRef::from_raw(0)));
+        assert!(ctx.is_virtual_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_is_virtual_via_box_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
-        assert!(!ctx.is_virtual_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.is_virtual_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_is_virtual_via_box_returns_false_for_unset() {
         let (ctx, _b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_virtual_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.is_virtual_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
@@ -6932,25 +6785,27 @@ mod boxref_forwarding_tests {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(
-            ctx.peek_ptr_info_via_box(OpRef::from_raw(0))
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
                 .is_some_and(|i| i.is_nonnull())
         );
-        assert!(ctx.is_nonnull_via_box(OpRef::from_raw(0)));
+        assert!(ctx.is_nonnull_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_is_nonnull_via_box_returns_false_for_unset() {
         let (ctx, _b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_nonnull_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.is_nonnull_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_peek_intbound_via_box_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(42));
-        let legacy = ctx.peek_intbound(OpRef::from_raw(0)).expect("legacy bound");
+        let legacy = ctx
+            .peek_intbound(OpRef::input_arg_int(0))
+            .expect("legacy bound");
         let via_box = ctx
-            .peek_intbound_via_box(OpRef::from_raw(0))
+            .peek_intbound_via_box(OpRef::input_arg_int(0))
             .expect("box bound");
         assert!(legacy.is_constant());
         assert_eq!(legacy.get_constant_int(), 42);
@@ -6961,7 +6816,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_peek_intbound_via_box_returns_none_for_unset() {
         let (ctx, _b0, _b1) = ctx_with_two_int_boxes();
-        assert!(ctx.peek_intbound_via_box(OpRef::from_raw(0)).is_none());
+        assert!(ctx.peek_intbound_via_box(OpRef::input_arg_int(0)).is_none());
     }
 
     #[test]
@@ -6971,7 +6826,7 @@ mod boxref_forwarding_tests {
         assert_eq!(ctx.last_guard_pos_via_box(&b), Some(5));
         // legacy path agrees.
         assert_eq!(
-            ctx.peek_ptr_info_via_box(OpRef::from_raw(0))
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
                 .and_then(|i| i.get_last_guard_pos()),
             Some(5)
         );
@@ -7003,9 +6858,9 @@ mod boxref_forwarding_tests {
                 last_guard_pos: -1,
             }),
         );
-        assert!(ctx.is_virtualizable_via_box(OpRef::from_raw(0)));
+        assert!(ctx.is_virtualizable_via_box(OpRef::input_arg_ref(0)));
         assert!(matches!(
-            ctx.peek_ptr_info_via_box(OpRef::from_raw(0)),
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0)),
             Some(PtrInfo::Virtualizable(_))
         ));
     }
@@ -7014,27 +6869,27 @@ mod boxref_forwarding_tests {
     fn h3_2c_is_virtualizable_via_box_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
-        assert!(!ctx.is_virtualizable_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.is_virtualizable_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_is_virtualizable_via_box_returns_false_for_unset() {
         let (ctx, _b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_virtualizable_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.is_virtualizable_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
     fn h3_2c_has_ptr_info_via_box_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
-        assert!(ctx.has_ptr_info_via_box(OpRef::from_raw(0)));
-        assert!(ctx.peek_ptr_info_via_box(OpRef::from_raw(0)).is_some());
+        assert!(ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)));
+        assert!(ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0)).is_some());
     }
 
     #[test]
     fn h3_2c_has_ptr_info_via_box_returns_false_for_unset() {
         let (ctx, _b) = ctx_with_one_ref_box();
-        assert!(!ctx.has_ptr_info_via_box(OpRef::from_raw(0)));
+        assert!(!ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)));
     }
 
     #[test]
@@ -7042,7 +6897,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 5 });
         let via_box = ctx
-            .peek_ptr_info_via_box(OpRef::from_raw(0))
+            .peek_ptr_info_via_box(OpRef::input_arg_ref(0))
             .expect("box clone");
         assert!(matches!(via_box, PtrInfo::NonNull { last_guard_pos: 5 }));
     }
@@ -7050,7 +6905,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_peek_ptr_info_via_box_returns_none_for_unset() {
         let (ctx, _b) = ctx_with_one_ref_box();
-        assert!(ctx.peek_ptr_info_via_box(OpRef::from_raw(0)).is_none());
+        assert!(ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0)).is_none());
     }
 
     // H-3.2c slice 29: `with_ptr_info_mut(opref, |info| ...)` runs a
@@ -7079,7 +6934,7 @@ mod boxref_forwarding_tests {
         assert_eq!(ctx.last_guard_pos_via_box(&b), Some(42));
         // Legacy slot also reflects mutation (closure ran on &mut PtrInfo).
         assert_eq!(
-            ctx.peek_ptr_info_via_box(OpRef::from_raw(0))
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
                 .and_then(|i| i.get_last_guard_pos()),
             Some(42)
         );
@@ -7118,7 +6973,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_returns_constant_for_value_ref() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_000);
+        let opref = OpRef::ref_op(10_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         match ctx.getptrinfo(opref) {
             Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0xdead_beef),
@@ -7133,7 +6988,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_returns_constant_for_int_with_ref_override() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_001);
+        let opref = OpRef::int_op(10_001);
         ctx.seed_constant(opref, Value::Int(0x1234_5678));
         ctx.constant_types_for_numbering
             .insert(opref.raw(), Type::Ref);
@@ -7150,7 +7005,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_skips_int_without_ref_override() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_002);
+        let opref = OpRef::int_op(10_002);
         ctx.seed_constant(opref, Value::Int(42));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.getptrinfo(opref).is_none());
@@ -7170,7 +7025,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_null_int_constant_with_ref_override_is_constant_null() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_003);
+        let opref = OpRef::int_op(10_003);
         ctx.seed_constant(opref, Value::Int(0));
         ctx.constant_types_for_numbering
             .insert(opref.raw(), Type::Ref);
@@ -7190,7 +7045,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_int_zero_without_ref_override_is_none() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_009);
+        let opref = OpRef::int_op(10_009);
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.getptrinfo(opref).is_none());
@@ -7204,7 +7059,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_returns_same_slot_for_value_ref() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_004);
+        let opref = OpRef::ref_op(10_004);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xa5a5_a5a5)));
         // First lookup: install Instance via the Vacant entry path,
         // then mark a known class so the second lookup observes it.
@@ -7236,8 +7091,8 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_shares_slot_between_ref_and_tagged_int() {
         let mut ctx = OptContext::new(0);
-        let ref_op = OpRef::from_raw(10_005);
-        let int_op = OpRef::from_raw(10_006);
+        let ref_op = OpRef::ref_op(10_005);
+        let int_op = OpRef::int_op(10_006);
         let addr: usize = 0xfeed_face;
         ctx.seed_constant(ref_op, Value::Ref(GcRef(addr)));
         ctx.seed_constant(int_op, Value::Int(addr as i64));
@@ -7277,7 +7132,7 @@ mod constant_ptr_info_tests {
     fn const_info_mut_raises_on_null_value_ref_constant() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = OptContext::new(0);
-            let ref_null = OpRef::from_raw(10_007);
+            let ref_null = OpRef::ref_op(10_007);
             ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
             let _ = ctx.get_const_info_mut(ref_null, None);
         }));
@@ -7295,7 +7150,7 @@ mod constant_ptr_info_tests {
     fn const_info_mut_raises_on_null_typed_int_constant() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = OptContext::new(0);
-            let int_null = OpRef::from_raw(10_008);
+            let int_null = OpRef::int_op(10_008);
             ctx.seed_constant(int_null, Value::Int(0));
             ctx.constant_types_for_numbering
                 .insert(int_null.raw(), Type::Ref);
@@ -7315,7 +7170,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_returns_none_for_plain_int_zero() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_010);
+        let opref = OpRef::int_op(10_010);
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.get_const_info_mut(opref, None).is_none());
@@ -7328,8 +7183,8 @@ mod constant_ptr_info_tests {
     #[test]
     fn is_raw_ptr_accepts_virtual_raw_slice() {
         let mut ctx = OptContext::new(0);
-        let parent = OpRef::from_raw(10_010);
-        let slice = OpRef::from_raw(10_011);
+        let parent = OpRef::ref_op(10_010);
+        let slice = OpRef::ref_op(10_011);
 
         let parent_box = ctx.ensure_box_at(parent.raw() as usize);
         let slice_box = ctx.ensure_box_at(slice.raw() as usize);
@@ -7373,7 +7228,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn make_nonnull_str_initializes_ptr_variant() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(10_012);
+        let opref = OpRef::ref_op(10_012);
         // Synthetic-OpRef test fixture: lazy-allocate the BoxRef so the
         // BoxRef-direct `make_nonnull_str` can write through it. Production
         // callers obtain the box via `get_box_replacement_box`.
@@ -7486,7 +7341,7 @@ mod ensure_ptr_info_arg0_tests {
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], descr);
         op.pos = OpRef::int_op(1);
         op
     }
@@ -7496,7 +7351,7 @@ mod ensure_ptr_info_arg0_tests {
             index: 7,
             is_object: false,
         });
-        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::from_raw(0)], descr);
+        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], descr);
         op.pos = OpRef::int_op(1);
         op
     }
@@ -7506,7 +7361,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_ref() {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xdead_beef)));
+        ctx.seed_constant(OpRef::input_arg_ref(0), Value::Ref(GcRef(0xdead_beef)));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
         match info {
@@ -7523,7 +7378,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(0), Value::Int(1));
+        ctx.seed_constant(OpRef::input_arg_ref(0), Value::Int(1));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
         assert!(matches!(info, EnsuredPtrInfo::Constant { .. }));
@@ -7537,7 +7392,7 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_constant_string_returns_exact_length_via_resolver() {
         use std::sync::Arc;
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xC0FE)));
+        ctx.seed_constant(OpRef::input_arg_ref(0), Value::Ref(GcRef(0xC0FE)));
         // Resolver pretends every constant has byte-string length 5 in
         // mode_string and unicode length 7 in mode_unicode.
         ctx.string_length_resolver = Some(Arc::new(|gcref: GcRef, mode: u8| {
@@ -7553,7 +7408,7 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
             op.pos = OpRef::int_op(1);
             op
         };
@@ -7576,13 +7431,13 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_constant_string_falls_back_to_nonnegative_without_resolver() {
         use std::sync::Arc;
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0x1234)));
+        ctx.seed_constant(OpRef::input_arg_ref(0), Value::Ref(GcRef(0x1234)));
         let op = {
             let descr: DescrRef = Arc::new(TestSizeDescr {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
             op.pos = OpRef::int_op(1);
             op
         };
@@ -7651,7 +7506,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constant_arraylen_returns_nonnegative() {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xfeed)));
+        ctx.seed_constant(OpRef::input_arg_ref(0), Value::Ref(GcRef(0xfeed)));
         let op = array_op();
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let bound = info
@@ -7859,7 +7714,7 @@ mod intbound_invariant_tests {
     #[should_panic]
     fn getintbound_rejects_non_int_boxes() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef::from_raw(20_000);
+        let opref = OpRef::ref_op(20_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         let _ = ctx.getintbound(opref);
     }
@@ -7886,24 +7741,24 @@ mod imported_short_preamble_fallback_tests {
         let mut ctx =
             OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
         ctx.initialize_imported_short_preamble_builder(
-            &[OpRef::from_raw(0), OpRef::from_raw(1)],
-            &[OpRef::from_raw(7), OpRef::from_raw(8)],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            &[OpRef::int_op(7), OpRef::int_op(8)],
             &[],
         );
 
-        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(7), OpRef::from_raw(8)]);
+        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(7), OpRef::int_op(8)]);
         replay_op.pos = OpRef::int_op(14);
         // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::from_raw(41),
+            op: OpRef::int_op(41),
             invented_name: false,
             preamble_op: replay_op,
         };
 
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef::from_raw(41));
+        assert_eq!(forced, OpRef::int_op(41));
 
         let sp = ctx
             .build_imported_short_preamble()
@@ -7912,7 +7767,7 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(
             sp.ops[0].op.args.as_slice(),
-            &[OpRef::from_raw(7), OpRef::from_raw(8)]
+            &[OpRef::int_op(7), OpRef::int_op(8)]
         );
         assert_eq!(sp.ops[0].op.pos, OpRef::int_op(14));
     }
@@ -7963,8 +7818,8 @@ mod opt_box_env_tests {
     #[test]
     fn opt_box_env_is_virtual_ref_follows_box_replacement() {
         let mut ctx = OptContext::with_num_inputs(16, 0);
-        let source = OpRef::from_raw(12);
-        let target = OpRef::from_raw(21);
+        let source = OpRef::ref_op(12);
+        let target = OpRef::ref_op(21);
         ctx.replace_op(source, target);
         let target_box = ctx.ensure_box_at(target.raw() as usize);
         ctx.set_ptr_info(

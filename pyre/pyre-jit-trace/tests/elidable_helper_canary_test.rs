@@ -57,7 +57,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let live_arg = OpRef::from_raw(0);
+    let live_arg = OpRef::input_arg_int(0);
     // Use the macro ABI trampoline directly as the trace function
     // pointer — `extern "C" fn(i64) -> i64`.  The user fn's
     // `pub fn(i64) -> bool` signature may not share calling convention
@@ -113,7 +113,7 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let live_arg = OpRef::from_raw(0);
+    let live_arg = OpRef::input_arg_int(0);
     let trace_fn = __majit_call_target_jit_int_in_small_cache_range;
     let func_ptr = trace_fn as *const ();
     let concrete_result = trace_fn(live_x);
@@ -163,7 +163,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let live_arg = OpRef::from_raw(0);
+    let live_arg = OpRef::input_arg_int(0);
     let trace_fn = __majit_call_target_int_bit_count;
     let func_ptr = trace_fn as *const ();
     let concrete_result = trace_fn(live_x);
