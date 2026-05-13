@@ -77,4 +77,6 @@ def fannkuch(n):
                 p[i + 1] = t
                 i = i + 1
 
-print(fannkuch(DEFAULT_ARG))
+
+for i in range(3, 10):
+    print(fannkuch(DEFAULT_ARG))
