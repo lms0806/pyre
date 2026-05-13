@@ -540,33 +540,76 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         }
     }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let pc = frame.last_instr as u32;
+    // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
+    // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
+    // (See exception_table.rs: varint values are word offsets but the lookup
+    // operates in byte space, mirroring `pycode.py:241-246`.)
+    //
+    // `frame.last_instr == -1` is the pre-first-opcode sentinel
+    // (`pyframe.py:227-235` initialization).  An injected operr
+    // (`eval_frame_plain_with_operr`) drives `handle_exception` before any
+    // bytecode has executed, so the lookup must mirror PyPy
+    // `pycode.py:250-253`: with `instr_offset == -1`, the first entry's
+    // `start <= -1` is False and `start > -1` is True, returning the
+    // `depth == -1` sentinel (no handler).  Skip the table lookup outright
+    // rather than casting -1 to `u32::MAX` (panic in debug, wrap in
+    // release).
+    let lookup_result = if frame.last_instr < 0 {
+        None
+    } else {
+        let pc_bytes = (frame.last_instr as u32) * 2;
+        crate::exception_table::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+    };
+    let pc_units = if frame.last_instr < 0 {
+        0u32
+    } else {
+        frame.last_instr as u32
+    };
 
-    // Python 3.11+ exception table dispatch
-    if let Some(entry) = crate::bytecode::find_exception_handler(&code.exceptiontable, pc) {
-        // Unwind stack to handler's expected depth
-        let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
+    // `pypy/interpreter/pyopcode.py:151-173` exception-table dispatch.
+    if let Some((target_bytes, depth, lasti)) = lookup_result {
+        // `pyopcode.py:155-156` — depth is relative (0 = empty value
+        // stack); convert to absolute by adding the frame's locals+cells
+        // base, then drop the stack to that depth.
+        let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
         while frame.valuestackdepth > target_depth {
             frame.pop();
         }
-        if entry.push_lasti {
-            frame.push(pyre_object::w_int_new(pc as i64));
+        // `pyopcode.py:157-170` — lasti=True: push the raise-site offset
+        // as an int below the exception, so RERAISE N can read it for
+        // traceback/f_lineno correctness.  If this dispatch was triggered
+        // by RERAISE (reraise_lasti from PyError, mirroring PyPy's
+        // `handle_operation_error(reraise_lasti=...)`), use the original
+        // raise-site lasti the RERAISE carried; otherwise use the current
+        // instruction (the raising site itself).
+        if lasti {
+            let lasti_value: i64 = if err.reraise_lasti >= 0 {
+                err.reraise_lasti as i64
+            } else {
+                pc_units as i64
+            };
+            frame.push(pyre_object::w_int_new(lasti_value));
         }
-        // Push exception value as W_ExceptionObject
+        // pyopcode.py: reraise_lasti is a local of handle_operation_error;
+        // OperationError raised from this function carries no lasti.  Clear
+        // here so a re-thrown PyError does not double-consume.
+        err.reraise_lasti = -1;
         let exc_obj = err.to_exc_object();
         frame.push(exc_obj);
-        *next_instr = entry.target as usize;
+        // The decoded `target` is a byte offset; pyre's `next_instr` is a
+        // code-unit index, so divide by 2.
+        *next_instr = (target_bytes / 2) as usize;
         return true;
     }
 
-    // Fallback: lastblock (old-style SETUP_FINALLY/SETUP_EXCEPT)
-    if let Some(block) = frame.pop_block() {
-        block.cleanupstack(frame);
-        let exc_obj = err.to_exc_object();
-        frame.push(exc_obj);
-        *next_instr = block.handlerposition;
-        return true;
+    // `pyopcode.py:175-185` no-handler propagation: if this unwind was
+    // triggered by RERAISE N, restore `last_instr` to the original
+    // raise-site offset so `frame.f_lineno` reports the right line.
+    if err.reraise_lasti >= 0 {
+        frame.last_instr = err.reraise_lasti as isize;
     }
+    err.reraise_lasti = -1;
+    frame.frame_finished_execution = true;
 
     false
 }
@@ -1894,27 +1937,28 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── Reraise ──
-    // CPython: RERAISE raises the exception that's on TOS.
-    // The exception table handler (handle_exception) unwinds the stack.
-    // We peek TOS to get the exception but do NOT pop — handle_exception
-    // will set the stack to the correct depth.
-    fn reraise(&mut self) -> Result<(), Self::Error> {
-        // TOS is the exception, TOS1 is prev_exc_info
-        let exc = self.peek();
-        // `pyopcode.py:1370-1376 RERAISE raise
-        // RaiseWithExplicitTraceback` parity — flip `attach_tb` so
-        // `handle_exception` skips `record_application_traceback`
-        // and the cleanup-RERAISE doesn't double-stamp the traceback.
-        let mut err = unsafe {
-            if pyre_object::is_exception(exc) {
-                PyError::from_exc_object(exc)
-            } else if pyre_object::is_str(exc) {
-                PyError::runtime_error(pyre_object::w_str_get_value(exc).to_string())
-            } else {
-                PyError::runtime_error("exception re-raised")
-            }
+    // `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    fn reraise(&mut self, oparg: u32) -> Result<(), Self::Error> {
+        // pyopcode.py:1357-1363
+        let reraise_lasti: i32 = if oparg != 0 {
+            // pyopcode.py:1361 — self.space.int_w(self.peekvalue(oparg))
+            crate::baseobjspace::int_w(self.peekvalue(oparg as usize))? as i32
+        } else {
+            -1
         };
+        // pyopcode.py:1364 — w_exc = self.popvalue()
+        let w_exc = self.popvalue();
+        // pyopcode.py:1367 — w_value = space.interp_w(W_BaseException, w_exc)
+        if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+            return Err(PyError::type_error(
+                "exception must derive from BaseException",
+            ));
+        }
+        // pyopcode.py:1368-1369 — w_type = space.type(w_exc); operr = OperationError(w_type, w_exc, w_value.w_traceback)
+        let mut err = unsafe { PyError::from_exc_object(w_exc) };
+        // pyopcode.py:1376 — raise RaiseWithExplicitTraceback(operr, reraise_lasti)
         err.attach_tb = false;
+        err.reraise_lasti = reraise_lasti;
         Err(err)
     }
 

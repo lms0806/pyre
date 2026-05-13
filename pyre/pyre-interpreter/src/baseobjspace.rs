@@ -4706,6 +4706,15 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 "co_name" => return Ok(w_str_new(code.obj_name.as_ref())),
                 "co_filename" => return Ok(w_str_new(code.source_path.as_ref())),
                 "co_flags" => return Ok(w_int_new(code.flags.bits() as i64)),
+                // `pypy/interpreter/pycode.py:143` — `self.co_firstlineno = firstlineno`,
+                // `typedef.py:718` — `co_firstlineno = interp_attrproperty('co_firstlineno', cls=PyCode, wrapfn="newint")`.
+                // RustPython exposes the field as `Option<OneIndexed>`; map None to 1
+                // (matching CPython's default for module-level code).
+                "co_firstlineno" => {
+                    return Ok(w_int_new(
+                        code.first_line_number.map_or(1, |n| n.get() as i64),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -7465,6 +7474,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             });
         }
         // Range iterator
@@ -7487,6 +7497,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             });
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
@@ -7856,6 +7867,7 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         message: String::new(),
         exc_object: std::ptr::null_mut(),
         attach_tb: true,
+        reraise_lasti: -1,
     };
     match generator_send_ex(gen_obj, w_none(), Some(err)) {
         Ok(_) => {
@@ -7900,6 +7912,7 @@ fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
                     message: msg,
                     exc_object: std::ptr::null_mut(),
                     attach_tb: true,
+                    reraise_lasti: -1,
                 };
             }
         }

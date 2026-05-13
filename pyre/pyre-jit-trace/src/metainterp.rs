@@ -37,6 +37,17 @@ pub struct MetaInterpFrame {
     pub caller_result_stack_idx: Option<usize>,
     pub caller_result_type: Option<Type>,
     pub arg_state: pyre_interpreter::bytecode::OpArgState,
+    /// The CALL bytecode's pc on THIS frame at the moment it pushed an
+    /// inline callee.  `top.pc` is advanced to the post-CALL fallthrough
+    /// before the callee is pushed (PRE-EXISTING-ADAPTATION vs PyPy where
+    /// `self.last_instr` stays at the CALL during the call); when the
+    /// callee raises and `finishframe_exception` walks up to this frame,
+    /// the exception-table lookup must probe the CALL site, not the
+    /// post-call fallthrough, to mirror PyPy
+    /// `pyopcode.handle_operation_error` reading `self.last_instr` from
+    /// the still-at-CALL frame.  `None` when no inline call is in progress
+    /// from this frame.
+    pub call_site_pc: Option<usize>,
 }
 
 impl MetaInterpFrame {
@@ -183,6 +194,12 @@ impl PyreMetaInterp {
                 .pending_next_instr
                 .take()
                 .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
+            // Save the CALL-site pc on the caller before advancing
+            // `top.pc` past it.  `finishframe_exception` uses this when an
+            // inline callee raises, so the caller's exception_table is
+            // probed at the CALL bytecode (matching PyPy
+            // `pyopcode.handle_operation_error` reading `self.last_instr`).
+            top.call_site_pc = Some(pc);
             top.pc = next_pc;
             let result_idx = sym
                 .valuestackdepth
@@ -287,6 +304,7 @@ impl PyreMetaInterp {
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
                 let sfall = semantic_fallthrough_pc(code, pc);
+                top.call_site_pc = Some(pc);
                 top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
                 let result_idx = sym
                     .valuestackdepth
@@ -346,7 +364,15 @@ impl PyreMetaInterp {
                     !sym.last_exc_value.is_null() && sym.last_exc_box != OpRef::NONE
                 };
                 if has_exc {
-                    if let Some(action) = self.finishframe_exception(ctx) {
+                    // Single-frame finishframe_exception (called from the
+                    // inline trace step) already consumed any saved
+                    // reraise_lasti for the RERAISE-issuing frame (handler
+                    // push or no-handler last_instr restoration).  Multi-
+                    // frame escalation walks remaining frames whose handler
+                    // dispatch carries no lasti — match PyPy's
+                    // `pyopcode.handle_operation_error(reraise_lasti=-1)`
+                    // default.
+                    if let Some(action) = self.finishframe_exception(ctx, -1) {
                         return action;
                     }
                 }
@@ -363,6 +389,7 @@ impl PyreMetaInterp {
                 };
                 let sym = unsafe { &mut *top.sym };
                 let sfall = semantic_fallthrough_pc(code, pc);
+                top.call_site_pc = Some(pc);
                 top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
                 let result_idx = sym
                     .valuestackdepth
@@ -437,6 +464,10 @@ impl PyreMetaInterp {
             caller_result_stack_idx: caller_result_idx,
             caller_result_type: pending.caller_result_type,
             arg_state: pyre_interpreter::bytecode::OpArgState::default(),
+            // Freshly pushed inline frames have no outstanding call of
+            // their own; cleared when this frame becomes a caller via a
+            // subsequent inline push.
+            call_site_pc: None,
         };
 
         self.portal_call_depth += 1;
@@ -486,6 +517,12 @@ impl PyreMetaInterp {
 
         // make_result_of_lastop: store in parent
         let parent = self.framestack.last_mut().unwrap();
+        // The inline callee returned successfully — clear the saved CALL
+        // pc on the parent.  Mirrors PyPy `pyopcode.handle_bytecode`: after
+        // a normal return, `self.last_instr` advances past the call so a
+        // subsequent exception dispatched from this frame looks up the
+        // table at the post-call instruction, not the (now-consumed) CALL.
+        parent.call_site_pc = None;
         let parent_sym = unsafe { &mut *parent.sym };
 
         if let Some(result_idx) = popped.caller_result_stack_idx {
@@ -607,8 +644,20 @@ impl PyreMetaInterp {
     /// frames that don't have one. Structurally matches RPython's
     /// `while self.framestack: ... self.popframe()` loop.
     ///
+    /// `reraise_lasti` mirrors `pypy/interpreter/pyopcode.py:122
+    /// handle_operation_error`'s like-named parameter: when non-negative it
+    /// is the original raise-site offset extracted by a RERAISE bytecode.
+    /// Per PyPy's single-call locality (`:181-184`), only the FIRST frame
+    /// visited consumes it — either for the handler-entry lasti push
+    /// (`:165-170`) or for the no-handler `last_instr` restoration
+    /// (`:181-184`).  Subsequent frames see -1.
+    ///
     /// Returns Some(LoopAction) if handled, None if all frames exhausted.
-    fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
+    fn finishframe_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        mut reraise_lasti: i32,
+    ) -> Option<LoopAction> {
         // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
             let code = unsafe {
@@ -616,14 +665,29 @@ impl PyreMetaInterp {
                     as *const pyre_interpreter::CodeObject)
             };
             let sym = unsafe { &*top.sym };
-            let pc = top.pc;
+            // `top.pc` was advanced past the CALL bytecode before any
+            // inline callee was pushed (PRE-EXISTING-ADAPTATION).  When a
+            // callee raises and we walk up to this caller, the
+            // exception-table lookup must probe the CALL site (the saved
+            // `call_site_pc`) — mirroring PyPy
+            // `pyopcode.handle_operation_error` reading `self.last_instr`
+            // from the still-at-CALL frame (`pyopcode.py:151`).  Frames
+            // with no outstanding inline call (the original raiser or any
+            // frame whose call already returned) keep using `top.pc`.
+            let lookup_pc = top.call_site_pc.unwrap_or(top.pc);
 
-            // RPython: if opcode == op_catch_exception → handler found
-            if let Some(entry) =
-                pyre_interpreter::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+            // RPython: if opcode == op_catch_exception → handler found.
+            // `lookup_exceptiontable` takes byte offsets and returns byte
+            // offsets; pyre's JIT trace uses code-unit indices for `pc`
+            // and handler PC, so multiply/divide by 2 at the boundary.
+            if let Some((target_bytes, depth, lasti)) =
+                pyre_interpreter::exception_table::lookup_exceptiontable(
+                    &code.exceptiontable,
+                    (lookup_pc * 2) as u32,
+                )
             {
-                let handler_pc = entry.target as usize;
-                let handler_depth = entry.depth as usize;
+                let handler_pc = target_bytes as usize / 2;
+                let handler_depth = depth as usize;
                 let exc_opref = sym.last_exc_box;
                 let exc_obj = sym.last_exc_value;
 
@@ -681,13 +745,25 @@ impl PyreMetaInterp {
                     }
                 }
 
-                let lasti_obj = if entry.push_lasti {
-                    // Python 3.11 exception-table adaptation: `push_lasti`
-                    // pushes a real W_Int object onto `locals_cells_stack_w`.
-                    // Route it through the common stack/vable mirror so the
-                    // handler frame's `virtualizable_boxes` snapshot matches
-                    // the concrete PyFrame stack.
-                    let lasti_obj = pyre_object::w_int_new(pc as i64);
+                let lasti_obj = if lasti {
+                    // pyopcode.py:165-170 lasti push:
+                    //   if reraise_lasti >= 0:
+                    //       lasti_value = reraise_lasti
+                    //   else:
+                    //       lasti_value = intmask(self.last_instr)
+                    //   self.pushvalue(self.space.newint(lasti_value))
+                    //
+                    // `self.last_instr` in PyPy is the call/raise site —
+                    // the same offset we use for the table lookup
+                    // (`lookup_pc`), NOT the post-call fallthrough.  Route
+                    // through `lookup_pc` so a handler in a caller frame
+                    // sees the CALL bytecode's offset.
+                    let lasti_value: i64 = if reraise_lasti >= 0 {
+                        reraise_lasti as i64
+                    } else {
+                        lookup_pc as i64
+                    };
+                    let lasti_obj = pyre_object::w_int_new(lasti_value);
                     let lasti_opref = ctx.const_ref(lasti_obj as i64);
                     let stack_idx = sym.valuestackdepth - sym.nlocals;
                     super::trace_opcode::write_stack_slot(
@@ -714,6 +790,12 @@ impl PyreMetaInterp {
                     sym.valuestackdepth += 1;
                 }
                 sym.pending_next_instr = Some(handler_pc);
+                // Handler dispatch unwound the outstanding inline call —
+                // the frame is no longer in the middle of a CALL.  Clear
+                // call_site_pc so a subsequent exception dispatched from
+                // this frame's handler code uses the in-handler pc, not
+                // the stale CALL pc.
+                top.call_site_pc = None;
 
                 // Sync concrete frame
                 if let Some(ref mut cf) = top.owned_concrete_frame {
@@ -744,6 +826,27 @@ impl PyreMetaInterp {
                 let exc_value = sym.last_exc_value;
                 let exc_box = sym.last_exc_box;
                 let exc_const = sym.class_of_last_exc_is_const;
+
+                // pyopcode.py:181-184 no-handler propagation, applied to
+                // the about-to-be-popped frame's concrete shadow:
+                //   if reraise_lasti >= 0:
+                //       self.last_instr = reraise_lasti
+                //   self.frame_finished_execution = True
+                //
+                // Per `:122` single-call locality, reraise_lasti is
+                // consumed here for the RERAISE-issuing frame; further
+                // iterations see -1 so parent frames behave as if their
+                // own `handle_operation_error(reraise_lasti=-1)` was
+                // called.
+                if let Some(top_mut) = self.framestack.last_mut() {
+                    if let Some(ref mut cf) = top_mut.owned_concrete_frame {
+                        if reraise_lasti >= 0 {
+                            cf.last_instr = reraise_lasti as isize;
+                        }
+                        cf.frame_finished_execution = true;
+                    }
+                }
+                reraise_lasti = -1;
 
                 // Pop the inline frame
                 let popped = self.framestack.pop().unwrap();
@@ -787,6 +890,23 @@ impl PyreMetaInterp {
             let exc_opref = sym.last_exc_box;
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][finishframe_exception] root frame, no handler → FINISH");
+            }
+            // pyopcode.py:181-184 applied to the root concrete frame
+            // before FINISH escapes the trace.  Mirror the same shape as
+            // the inline-pop branch: if this root frame was the RERAISE
+            // origin, restore `last_instr`; either way, set
+            // `frame_finished_execution = True` so the dead frame surfaces
+            // the same flag state the interpreter would.
+            {
+                let concrete_frame_ptr =
+                    sym.concrete_vable_ptr as *mut pyre_interpreter::pyframe::PyFrame;
+                if !concrete_frame_ptr.is_null() {
+                    let cf = unsafe { &mut *concrete_frame_ptr };
+                    if reraise_lasti >= 0 {
+                        cf.last_instr = reraise_lasti as isize;
+                    }
+                    cf.frame_finished_execution = true;
+                }
             }
             // pyjitpl.py:3239: self.store_token_in_vable()
             // Record SetfieldGc on vable_token + GUARD_NOT_FORCED_2 with

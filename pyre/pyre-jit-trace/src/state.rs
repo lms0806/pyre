@@ -6376,13 +6376,43 @@ mod tests {
         }));
     }
 
+    /// Seed `sym` with `slots` on the symbolic value stack (TOS last).
+    ///
+    /// Mirrors the invariant a real trace would carry into RERAISE:
+    /// `pyopcode.py:1361` reads `peekvalue(oparg)` and `:1364` does
+    /// `popvalue()`, both of which require the stack to be populated with
+    /// the saved lasti (when `oparg != 0`) and the exception object on
+    /// top.  Sets `concrete_stack`, `symbolic_stack_types`, `registers_r`,
+    /// and `valuestackdepth` in lockstep.
+    fn seed_stack(
+        ctx: &mut TraceCtx,
+        sym: &mut PyreSym,
+        slots: &[(OpRef, ConcreteValue, majit_ir::Type)],
+    ) {
+        sym.nlocals = 0;
+        sym.valuestackdepth = slots.len();
+        sym.concrete_stack = slots.iter().map(|(_, cv, _)| *cv).collect();
+        sym.symbolic_stack_types = slots.iter().map(|(_, _, t)| *t).collect();
+        sym.registers_r = slots.iter().map(|(op, _, _)| *op).collect();
+        // Tests don't exercise the vable shadow path; pop_value's
+        // `is_active_vable_owner` branch stays inactive.
+        sym.locals_cells_stack_array_ref = ctx.const_ref(0);
+    }
+
     #[test]
     fn test_reraise_reuses_last_exception_object() {
         let mut ctx = TraceCtx::for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let exc_opref = ctx.const_ref(exc as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.last_exc_value = exc;
-        sym.last_exc_box = ctx.const_ref(exc as i64);
+        sym.last_exc_box = exc_opref;
+        // pyopcode.py:1353 — for `RERAISE 0`, stack is `[..., exc]`.
+        seed_stack(
+            &mut ctx,
+            &mut sym,
+            &[(exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref)],
+        );
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -6398,8 +6428,103 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let err = OpcodeStepExecutor::reraise(&mut state).expect_err("reraise should raise");
+        let err = OpcodeStepExecutor::reraise(&mut state, 0).expect_err("reraise should raise");
         assert_eq!(err.to_exc_object(), exc);
+        // pyopcode.py:1363 — oparg==0 → reraise_lasti = -1.
+        assert_eq!(err.reraise_lasti, -1);
+        // pyopcode.py:1376 — RaiseWithExplicitTraceback → attach_tb=False.
+        assert!(!err.attach_tb);
+    }
+
+    #[test]
+    fn test_reraise_nonzero_oparg_threads_saved_lasti() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let exc_opref = ctx.const_ref(exc as i64);
+        // pyopcode.py:165-170 lasti push synthesizes
+        // `space.newint(lasti_value)` — a fresh W_IntObject.
+        let saved_lasti_value: i64 = 42;
+        let saved_lasti_obj = pyre_object::w_int_new(saved_lasti_value);
+        let lasti_opref = ctx.const_ref(saved_lasti_obj as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.last_exc_value = exc;
+        sym.last_exc_box = exc_opref;
+        // pyopcode.py:1353 — for `RERAISE 1`, stack is `[..., lasti, exc]`.
+        seed_stack(
+            &mut ctx,
+            &mut sym,
+            &[
+                (
+                    lasti_opref,
+                    ConcreteValue::Ref(saved_lasti_obj),
+                    majit_ir::Type::Ref,
+                ),
+                (exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
+            ],
+        );
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
+        assert_eq!(err.to_exc_object(), exc);
+        // pyopcode.py:1361 — `reraise_lasti = self.space.int_w(self.peekvalue(oparg))`.
+        assert_eq!(err.reraise_lasti, saved_lasti_value as i32);
+        assert!(!err.attach_tb);
+    }
+
+    #[test]
+    fn test_reraise_nonconst_lasti_signals_abort_to_dispatcher() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let exc_opref = ctx.const_ref(exc as i64);
+        // Non-Int slot at peek(oparg): an exception object stands in for
+        // any non-Int concrete value (a const-int box is the only shape
+        // the trace can fold at compile time).
+        let non_int_opref = ctx.const_ref(exc as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.last_exc_value = exc;
+        sym.last_exc_box = exc_opref;
+        seed_stack(
+            &mut ctx,
+            &mut sym,
+            &[
+                (non_int_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
+                (exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
+            ],
+        );
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
+        // Non-Int lasti slot → reraise_lasti < 0; dispatcher detects the
+        // combination `oparg != 0 && reraise_lasti < 0` and routes to
+        // TraceAction::Abort, letting the interpreter handle the rare
+        // non-const case via the concrete-frame fallback.
+        assert!(err.reraise_lasti < 0);
     }
 
     #[test]
@@ -6704,12 +6829,14 @@ mod tests {
                 )
             })
             .expect("test bytecode should contain RAISE_VARARGS");
-        let handler_pc = pyre_interpreter::bytecode::find_exception_handler(
-            &code.exceptiontable,
-            raise_pc as u32,
-        )
-        .expect("raise should be covered by exception table")
-        .target as usize;
+        // Byte offsets in/out; pyre PC is a code-unit index.
+        let (target_bytes, _depth, _lasti) =
+            pyre_interpreter::exception_table::lookup_exceptiontable(
+                &code.exceptiontable,
+                (raise_pc * 2) as u32,
+            )
+            .expect("raise should be covered by exception table");
+        let handler_pc = target_bytes as usize / 2;
         let code_ref =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
