@@ -3932,14 +3932,12 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state
-            .concrete_types
-            .insert(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        type_state.concrete_types.insert(
+        type_state.set(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
+        type_state.set(
             index,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.concrete_types.insert(
+        type_state.set(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
@@ -4053,18 +4051,16 @@ mod tests {
         graph.set_return(graph.startblock, Some(array_result));
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state
-            .concrete_types
-            .insert(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        type_state.concrete_types.insert(
+        type_state.set(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
+        type_state.set(
             index,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.concrete_types.insert(
+        type_state.set(
             field_result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.concrete_types.insert(
+        type_state.set(
             array_result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );

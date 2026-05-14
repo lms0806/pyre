@@ -201,11 +201,8 @@ pub(crate) fn dual_gate_check(
     // Diff every legacy-defined value. Once this gate is used to prove
     // cutover parity, real-path `Unknown` for a legacy-known value is a
     // coverage bug, not success.
-    for (vid, legacy_kind) in &legacy_state.concrete_types {
-        if *legacy_kind == ConcreteType::Unknown {
-            continue;
-        }
-        let real_kind = real_state.get(*vid);
+    for (vid, legacy_kind) in legacy_state.iter() {
+        let real_kind = real_state.get(vid);
         if real_kind != legacy_kind {
             divergences.push(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
@@ -215,11 +212,8 @@ pub(crate) fn dual_gate_check(
     }
     // Asymmetry direction: real should not produce a definite kind for
     // a ValueId the legacy resolver never resolved.
-    for (vid, real_kind) in &real_state.concrete_types {
-        if *real_kind == ConcreteType::Unknown {
-            continue;
-        }
-        let legacy_kind = legacy_state.get(*vid);
+    for (vid, real_kind) in real_state.iter() {
+        let legacy_kind = legacy_state.get(vid);
         if *legacy_kind == ConcreteType::Unknown {
             divergences.push(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
@@ -415,11 +409,8 @@ fn compare_real_against_legacy(
     real_state: &TypeResolutionState,
     legacy_state: &TypeResolutionState,
 ) -> Option<String> {
-    for (vid, legacy_kind) in &legacy_state.concrete_types {
-        if *legacy_kind == ConcreteType::Unknown {
-            continue;
-        }
-        let real_kind = real_state.get(*vid);
+    for (vid, legacy_kind) in legacy_state.iter() {
+        let real_kind = real_state.get(vid);
         if real_kind != legacy_kind {
             return Some(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
@@ -427,11 +418,8 @@ fn compare_real_against_legacy(
             ));
         }
     }
-    for (vid, real_kind) in &real_state.concrete_types {
-        if *real_kind == ConcreteType::Unknown {
-            continue;
-        }
-        let legacy_kind = legacy_state.get(*vid);
+    for (vid, real_kind) in real_state.iter() {
+        let legacy_kind = legacy_state.get(vid);
         if *legacy_kind == ConcreteType::Unknown {
             return Some(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
@@ -1012,11 +1000,8 @@ pub(crate) fn dual_gate_check_with_registry_seed(
             // tests honest until the orthodox `RPythonAnnotator::
             // processblock` port produces the same shape.
             let mut divergences: Vec<String> = Vec::new();
-            for (vid, legacy_kind) in &legacy_state.concrete_types {
-                if *legacy_kind == ConcreteType::Unknown {
-                    continue;
-                }
-                let real_kind = real_state.get(*vid);
+            for (vid, legacy_kind) in legacy_state.iter() {
+                let real_kind = real_state.get(vid);
                 if real_kind != legacy_kind {
                     divergences.push(format!(
                         "ValueId({}): legacy={:?}, real={:?}",
@@ -1024,11 +1009,8 @@ pub(crate) fn dual_gate_check_with_registry_seed(
                     ));
                 }
             }
-            for (vid, real_kind) in &real_state.concrete_types {
-                if *real_kind == ConcreteType::Unknown {
-                    continue;
-                }
-                let legacy_kind = legacy_state.get(*vid);
+            for (vid, real_kind) in real_state.iter() {
+                let legacy_kind = legacy_state.get(vid);
                 if *legacy_kind == ConcreteType::Unknown {
                     divergences.push(format!(
                         "ValueId({}): legacy={:?}, real={:?}",
@@ -1285,9 +1267,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     for (&vid, var) in &value_to_var {
         let concretetype = var.concretetype.borrow();
         if let Some(lltype) = concretetype.as_ref() {
-            state
-                .concrete_types
-                .insert(vid, lowleveltype_to_concrete(lltype)?);
+            state.set(vid, lowleveltype_to_concrete(lltype)?);
         }
     }
     // RPython `Constant.concretetype` is the ground truth for constant
@@ -1297,9 +1277,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // legacy graph builder) does not silently strip the constant's
     // resolved kind.
     for (vid, lltype) in &constant_concretetypes {
-        state
-            .concrete_types
-            .insert(*vid, lowleveltype_to_concrete(lltype)?);
+        state.set(*vid, lowleveltype_to_concrete(lltype)?);
     }
 
     // ── Step 5 — read back per-ValueId AnnotationState ────────────

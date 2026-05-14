@@ -43,7 +43,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
 
     for (&vid, vtype) in &annotations.types {
         let concrete = valuetype_to_concrete(vtype);
-        state.concrete_types.insert(vid, concrete);
+        state.set(vid, concrete);
     }
 
     // Resolve from ops with explicit type info
@@ -54,7 +54,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                 let vtype = annotations.types.get(&vid).unwrap_or(&ValueType::Unknown);
                 let concrete = valuetype_to_concrete(vtype);
                 if concrete != ConcreteType::Unknown {
-                    state.concrete_types.insert(vid, concrete);
+                    state.set(vid, concrete);
                 }
             }
         }
@@ -70,7 +70,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
                     // rewrite arm.
-                    state.concrete_types.insert(result, inferred);
+                    state.set(result, inferred);
                 }
             }
         }
@@ -211,7 +211,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                                     ConcreteType::Float
                                 };
                                 if state.get(result) != &target {
-                                    state.concrete_types.insert(result, target);
+                                    state.set(result, target);
                                     changed = true;
                                 }
                             } else if !any_float || !both_numeric {
@@ -237,7 +237,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                             let operand_float = *state.get(*operand) == ConcreteType::Float;
                             if operand_float && opname == "neg" {
                                 if state.get(result) != &ConcreteType::Float {
-                                    state.concrete_types.insert(result, ConcreteType::Float);
+                                    state.set(result, ConcreteType::Float);
                                     changed = true;
                                 }
                             } else {
@@ -343,15 +343,9 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         }
     }
     for v in seen {
-        state
-            .concrete_types
-            .entry(v)
-            .and_modify(|c| {
-                if *c == ConcreteType::Unknown {
-                    *c = ConcreteType::GcRef;
-                }
-            })
-            .or_insert(ConcreteType::GcRef);
+        if state.get(v) == &ConcreteType::Unknown {
+            state.set(v, ConcreteType::GcRef);
+        }
     }
 
     state
@@ -503,7 +497,7 @@ fn maybe_seed_concrete_type(
     src_ty: ConcreteType,
 ) -> bool {
     if state.get(dst) == &ConcreteType::Unknown && src_ty != ConcreteType::Unknown {
-        state.concrete_types.insert(dst, src_ty);
+        state.set(dst, src_ty);
         true
     } else {
         false
@@ -851,7 +845,7 @@ mod tests {
 
         let annotations = annotate::annotate(&graph);
         let mut original = TypeResolutionState::new();
-        original.concrete_types.insert(result, ConcreteType::Void);
+        original.set(result, ConcreteType::Void);
 
         let types = resolve_rewritten_types(
             &original,

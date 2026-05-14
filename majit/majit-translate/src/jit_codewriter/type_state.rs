@@ -1,10 +1,19 @@
-//! ValueId → ConcreteType side table for the jit_codewriter IR.
+//! ValueId → ConcreteType inline carrier for the jit_codewriter IR.
 //!
 //! PRE-EXISTING-ADAPTATION. RPython stores `.concretetype` inline on each
-//! `Variable` after `RPythonTyper.specialize()` rewrites the graph, so no
-//! side table exists upstream. Pyre's current jit_codewriter consumes a
-//! `crate::model::FunctionGraph` (value-id-based, not variable-based),
-//! so the post-rtyper kind information lives in this separate table.
+//! `Variable` after `RPythonTyper.specialize()` rewrites the graph
+//! (`rpython/flowspace/model.py:280 Variable.__slots__ = [..., "concretetype"]`),
+//! so no side table exists upstream — every Variable carries its
+//! lowleveltype as an O(1) attribute access.
+//!
+//! Pyre's `ValueId(usize)` is a dense index minted by
+//! `FunctionGraph::alloc_value`, so the closest orthodox analogue is a
+//! dense `Vec<ConcreteType>` indexed by `ValueId.0`: every minted
+//! ValueId has exactly one slot, just like every Variable has one
+//! `.concretetype` attribute upstream.  `ConcreteType::Unknown` plays
+//! the role of "slot not yet populated" — equivalent to RPython's
+//! `hasattr(var, 'concretetype') is False` window between Variable
+//! creation and `RPythonTyper.setconcretetype()` (`rtyper.py:258`).
 //!
 //! `build_value_kinds` (pure `ConcreteType → RegKind` projection) and
 //! `merge_synth_kinds` (post-jtransform 4-source merge) live here
@@ -36,29 +45,93 @@ pub enum ConcreteType {
     Unknown,
 }
 
-/// Type resolution state: `ValueId → ConcreteType` map.
+/// Returned by [`TypeResolutionState::get`] when a slot has not been
+/// explicitly populated — mirrors the "no `concretetype` attribute yet"
+/// window between Variable creation and `setconcretetype()` upstream.
+const UNKNOWN: ConcreteType = ConcreteType::Unknown;
+
+/// Type resolution state: dense `ValueId → ConcreteType` carrier.
 ///
-/// Pyre's analogue of RPython's per-`Variable.concretetype`
-/// annotation — for each `ValueId`, what `lltype` low-level type
-/// the rtyper assigned (collapsed to the four-way `Signed` /
-/// `GcRef` / `Float` / `Void` axis used by the JIT codewriter, per
-/// `rpython/jit/metainterp/history.py:45-71 getkind`).
-#[derive(Debug)]
+/// Pyre's analogue of RPython's per-`Variable.concretetype` attribute
+/// (`flowspace/model.py:280`).  Storage is a dense `Vec<ConcreteType>`
+/// indexed by `ValueId.0`; an out-of-range index or an explicit
+/// `ConcreteType::Unknown` slot both denote "not yet populated",
+/// equivalent to `hasattr(var, 'concretetype') is False` upstream.
+///
+/// Collapsed to the four-way `Signed` / `GcRef` / `Float` / `Void` axis
+/// used by the JIT codewriter, per `rpython/jit/metainterp/history.py:45-71
+/// getkind`.
+#[derive(Debug, Default, Clone)]
 pub struct TypeResolutionState {
-    pub concrete_types: HashMap<ValueId, ConcreteType>,
+    slots: Vec<ConcreteType>,
 }
 
 impl TypeResolutionState {
     pub fn new() -> Self {
+        TypeResolutionState { slots: Vec::new() }
+    }
+
+    /// Reserve dense storage for ValueIds in `[0, capacity)`.
+    pub fn with_capacity(capacity: usize) -> Self {
         TypeResolutionState {
-            concrete_types: HashMap::new(),
+            slots: vec![ConcreteType::Unknown; capacity],
         }
     }
 
+    /// Lookup the concretetype for `id`.  Returns `&Unknown` for
+    /// unpopulated slots — equivalent to RPython's pre-`setconcretetype`
+    /// state where reading `var.concretetype` would `AttributeError`,
+    /// surfaced here as the placeholder enum rather than a panic since
+    /// merge_synth_kinds and friends iterate over all values blindly.
     pub fn get(&self, id: ValueId) -> &ConcreteType {
-        self.concrete_types
-            .get(&id)
-            .unwrap_or(&ConcreteType::Unknown)
+        self.slots.get(id.0).unwrap_or(&UNKNOWN)
+    }
+
+    /// Lookup with HashMap-`get`-style semantics: returns `None` for
+    /// unpopulated slots so callers can distinguish "no entry" from
+    /// "entry is Unknown" (in practice these coincide, but the
+    /// `Option` shape is load-bearing at jtransform's `get_value_type`
+    /// where an unknown slot must propagate as `None`).
+    pub fn try_get(&self, id: ValueId) -> Option<&ConcreteType> {
+        match self.slots.get(id.0) {
+            Some(ConcreteType::Unknown) | None => None,
+            Some(ct) => Some(ct),
+        }
+    }
+
+    /// True iff `id` has an explicitly-populated, non-Unknown slot.
+    /// Mirrors `HashMap::contains_key` semantics: Unknown is the
+    /// "absent" sentinel.
+    pub fn contains(&self, id: ValueId) -> bool {
+        matches!(
+            self.slots.get(id.0),
+            Some(ct) if *ct != ConcreteType::Unknown
+        )
+    }
+
+    /// Set the concretetype for `id`.  Auto-grows the dense storage
+    /// with `Unknown` padding if `id` was minted past the current
+    /// capacity — every ValueId minted by `alloc_value` ends up
+    /// reachable as a slot, matching RPython's invariant that every
+    /// Variable has a `concretetype` attribute slot reserved.
+    pub fn set(&mut self, id: ValueId, ct: ConcreteType) {
+        if id.0 >= self.slots.len() {
+            self.slots.resize(id.0 + 1, ConcreteType::Unknown);
+        }
+        self.slots[id.0] = ct;
+    }
+
+    /// Iterate `(ValueId, &ConcreteType)` over populated slots only —
+    /// skips both out-of-range (impossible here) and `Unknown`
+    /// (sentinel) entries.  Matches HashMap iter semantics.
+    pub fn iter(&self) -> impl Iterator<Item = (ValueId, &ConcreteType)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(idx, ct)| {
+            if *ct == ConcreteType::Unknown {
+                None
+            } else {
+                Some((ValueId(idx), ct))
+            }
+        })
     }
 }
 
@@ -111,21 +184,21 @@ pub fn merge_synth_kinds(
     let mut merged = post_resolve;
 
     // (1) `original` operand inferences fill unresolved slots, but
-    // never override `post_result`. Skip `Unknown` entries — they are
+    // never override `post_result`. Skip Unknown entries — they are
     // placeholders, not actual inferences.
-    for (&value, kind) in &original.concrete_types {
-        if *kind != ConcreteType::Unknown && !post_result.contains_key(&value) {
-            merged.concrete_types.insert(value, kind.clone());
+    for (value, kind) in original.iter() {
+        if !post_result.contains_key(&value) {
+            merged.set(value, kind.clone());
         }
     }
     // (2) Op-result kinds win over operand inferences.
     for (value, kind) in post_result {
-        merged.concrete_types.insert(value, kind);
+        merged.set(value, kind);
     }
     // (3) Synth kinds (jtransform-stamped) override everything — the
     // rewriter declares these at lowering time with full ground truth.
     for (&value, kind) in stamped {
-        merged.concrete_types.insert(value, kind.clone());
+        merged.set(value, kind.clone());
     }
 
     merged
@@ -237,9 +310,8 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Value
 pub fn build_value_kinds(types: &TypeResolutionState) -> HashMap<ValueId, crate::flatten::RegKind> {
     use crate::flatten::RegKind;
     types
-        .concrete_types
         .iter()
-        .filter_map(|(&vid, ct)| {
+        .filter_map(|(vid, ct)| {
             let kind = match ct {
                 ConcreteType::Signed => RegKind::Int,
                 ConcreteType::GcRef => RegKind::Ref,
@@ -258,7 +330,7 @@ mod tests {
     fn state_from(pairs: &[(ValueId, ConcreteType)]) -> TypeResolutionState {
         let mut s = TypeResolutionState::new();
         for (v, k) in pairs {
-            s.concrete_types.insert(*v, k.clone());
+            s.set(*v, k.clone());
         }
         s
     }
@@ -286,8 +358,8 @@ mod tests {
 
     #[test]
     fn merge_synth_kinds_original_fills_unresolved_slots() {
-        // post_resolve missing a value; original.concrete_types
-        // supplies it (since post_result does not claim it).
+        // post_resolve missing a value; original supplies it (since
+        // post_result does not claim it).
         let post_resolve = TypeResolutionState::new();
         let original = state_from(&[(ValueId(7), ConcreteType::Signed)]);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
@@ -300,16 +372,18 @@ mod tests {
     #[test]
     fn merge_synth_kinds_original_unknown_does_not_propagate() {
         // Unknown is a placeholder, not an inference. It must not fill
-        // a slot — leaving the merged state's `get` returning the
-        // default Unknown via `concrete_types` miss.
+        // a slot — the dense-Vec iter naturally skips Unknown sentinel
+        // slots, so the merged state's `contains(7)` stays false.
         let post_resolve = TypeResolutionState::new();
-        let original = state_from(&[(ValueId(7), ConcreteType::Unknown)]);
+        let mut original = TypeResolutionState::new();
+        // Deliberately seed an Unknown entry — `iter` should skip it.
+        original.set(ValueId(7), ConcreteType::Unknown);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
         let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
         let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
         assert!(
-            !merged.concrete_types.contains_key(&ValueId(7)),
+            !merged.contains(ValueId(7)),
             "Unknown originals must not seed the merged state"
         );
     }

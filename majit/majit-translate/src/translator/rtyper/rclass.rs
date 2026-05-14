@@ -91,9 +91,7 @@ pub fn class_get_method_ptr(
         },
     };
     graph.blocks[block_id.0].operations.insert(op_index, op);
-    type_state
-        .concrete_types
-        .insert(funcptr, ConcreteType::Signed);
+    type_state.set(funcptr, ConcreteType::Signed);
     funcptr
 }
 

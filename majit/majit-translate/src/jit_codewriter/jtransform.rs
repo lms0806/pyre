@@ -356,7 +356,7 @@ fn split_args_by_kind(
     let mut floats = Vec::new();
     for &v in args {
         let kind = if let Some(ts) = type_state {
-            match ts.concrete_types.get(&v) {
+            match ts.try_get(v) {
                 Some(crate::jit_codewriter::type_state::ConcreteType::Signed) => 'i',
                 Some(crate::jit_codewriter::type_state::ConcreteType::Float) => 'f',
                 Some(crate::jit_codewriter::type_state::ConcreteType::Void) => 'v',
@@ -1461,11 +1461,7 @@ impl<'a> Transformer<'a> {
         let base = if let Some(ct) = self.synth_kinds.get(&v) {
             ct
         } else if let Some(ts) = self.type_state {
-            if let Some(ct) = ts.concrete_types.get(&v) {
-                ct
-            } else {
-                &crate::jit_codewriter::type_state::ConcreteType::Unknown
-            }
+            ts.get(v)
         } else {
             &crate::jit_codewriter::type_state::ConcreteType::Unknown
         };
@@ -1480,7 +1476,7 @@ impl<'a> Transformer<'a> {
 
     fn get_value_type(&self, v: ValueId) -> Option<ValueType> {
         let ts = self.type_state?;
-        let ct = ts.concrete_types.get(&v)?;
+        let ct = ts.try_get(v)?;
         match ct {
             crate::jit_codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
             crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref),
@@ -3467,16 +3463,12 @@ fn resolve_non_void_arg_types(
     args.iter()
         .filter_map(|&v| {
             let kind = if let Some(ts) = type_state {
-                if let Some(ct) = ts.concrete_types.get(&v) {
-                    match ct {
-                        crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-                        crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-                        crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-                        crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-                        crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
-                    }
-                } else {
-                    'r'
+                match ts.get(v) {
+                    crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+                    crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+                    crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+                    crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+                    crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
                 }
             } else {
                 'r'
@@ -4233,11 +4225,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Float);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Float);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Float);
+        type_state.set(result, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config)
@@ -4311,11 +4301,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Float);
-        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(lhs, ConcreteType::Float);
+        type_state.set(rhs, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config)
@@ -4389,11 +4377,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Float);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Float);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Float);
+        type_state.set(result, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config)
@@ -4595,7 +4581,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.concrete_types.insert(
+        type_state.set(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
@@ -4632,7 +4618,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.concrete_types.insert(
+        type_state.set(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
@@ -4667,7 +4653,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.concrete_types.insert(
+        type_state.set(
             result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
@@ -4704,7 +4690,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.concrete_types.insert(
+        type_state.set(
             result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
@@ -4766,9 +4752,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
 
         let mut cc = crate::call::CallControl::new();
         let config = GraphTransformConfig::default();
@@ -4834,11 +4818,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -4918,11 +4900,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5002,11 +4982,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5083,11 +5061,9 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
 
         let mut type_state = TypeResolutionState::new();
-        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
-        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
-        type_state
-            .concrete_types
-            .insert(result, ConcreteType::Signed);
+        type_state.set(lhs, ConcreteType::Signed);
+        type_state.set(rhs, ConcreteType::Signed);
+        type_state.set(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5773,9 +5749,9 @@ mod tests {
         );
 
         let mut ts = TypeResolutionState::new();
-        ts.concrete_types.insert(g1, ConcreteType::Signed);
-        ts.concrete_types.insert(g2, ConcreteType::Signed);
-        ts.concrete_types.insert(r1, ConcreteType::Signed);
+        ts.set(g1, ConcreteType::Signed);
+        ts.set(g2, ConcreteType::Signed);
+        ts.set(r1, ConcreteType::Signed);
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config)
@@ -5848,7 +5824,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut ts = TypeResolutionState::new();
         let arg = ValueId(1);
-        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        ts.set(arg, ConcreteType::GcRef);
         let transformer = Transformer::new(&config).with_type_state(&ts);
         assert!(transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Ok"),
@@ -5865,7 +5841,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut ts = TypeResolutionState::new();
         let arg = ValueId(1);
-        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        ts.set(arg, ConcreteType::GcRef);
         let transformer = Transformer::new(&config).with_type_state(&ts);
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Ok"]),
@@ -5881,7 +5857,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut ts = TypeResolutionState::new();
         let arg = ValueId(1);
-        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        ts.set(arg, ConcreteType::GcRef);
         let transformer = Transformer::new(&config).with_type_state(&ts);
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Ok"]),
@@ -5897,7 +5873,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut ts = TypeResolutionState::new();
         let arg = ValueId(1);
-        ts.concrete_types.insert(arg, ConcreteType::Signed);
+        ts.set(arg, ConcreteType::Signed);
         let transformer = Transformer::new(&config).with_type_state(&ts);
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Ok"),
@@ -5914,7 +5890,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut ts = TypeResolutionState::new();
         let arg = ValueId(1);
-        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        ts.set(arg, ConcreteType::GcRef);
         let transformer = Transformer::new(&config).with_type_state(&ts);
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Result", "Ok"]),
@@ -6731,7 +6707,7 @@ mod tests {
         // and routes through the plain `<kind>_guard_value` path
         // instead of the str_guard_value helper chain.
         let mut ts = TypeResolutionState::new();
-        ts.concrete_types.insert(v, ConcreteType::Signed);
+        ts.set(v, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let result = Transformer::new(&config)
             .with_type_state(&ts)
