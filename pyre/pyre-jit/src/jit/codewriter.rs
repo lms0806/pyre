@@ -2419,6 +2419,8 @@ fn filter_liveness_in_place(
     depth_at_pc: &[u16],
     local_color_map: &[u16],
     stack_slot_color_map: &[u16],
+    portal_frame_reg: u16,
+    portal_ec_reg: u16,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
@@ -2519,6 +2521,27 @@ fn filter_liveness_in_place(
                 .map(|idx| local_color_map[idx])
                 .collect();
             s.extend(live_stack_colors.iter().copied());
+            // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
+            // reds = ['frame', 'ec']`) reach `live_r` through the RPython
+            // force-alive mechanism (`liveness.py:11-12`): the
+            // `emit_live_placeholder!` macro at codewriter.rs:3773 emits
+            // every PC's `-live-` op with explicit Register args for
+            // `portal_frame_reg` / `portal_ec_reg`, and `compute_liveness`
+            // (`liveness.rs:101-107` line-by-line port of
+            // `liveness.py:46-48`) adds those Register args to the
+            // backward-propagating `alive` set, leaving them in `existing`
+            // as live Register operands by the time this filter runs.
+            //
+            // The LV∩SSA `retain` below is a pyre adaptation for scratch
+            // colors; gate the portal colors past it explicitly so the
+            // retain does not drop the RPython-tracked live registers.
+            // Portal-bridge installs sentinel-skip (`u16::MAX`).
+            if portal_frame_reg != u16::MAX {
+                s.insert(portal_frame_reg);
+            }
+            if portal_ec_reg != u16::MAX {
+                s.insert(portal_ec_reg);
+            }
             s
         };
         if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
@@ -3781,7 +3804,43 @@ impl CodeWriter {
         // convergence path back to RPython orthodox emission.
         macro_rules! emit_live_placeholder {
             ($ssarepr:expr) => {{
-                $ssarepr.insns.push(Insn::live(Vec::new()));
+                // RPython force-alive mechanism (`liveness.py:11-12`):
+                //
+                //   You can also force extra variables to be alive by putting
+                //   them as args of the '-live-' operation in the first place.
+                //
+                // Use it to keep the portal red args (`pypy/module/pypyjit/
+                // interp_jit.py:67 reds = ['frame', 'ec']`) alive across every
+                // PC. RPython relies on natural SSA Register uses to keep ec
+                // alive because its JitCode encodes the full interpreter
+                // including the call-bytecode handlers that pass ec to
+                // `recursive_call_*`. Pyre's codewriter only encodes the
+                // dispatch-loop skeleton — the per-Python-bytecode handlers
+                // are emitted by the tracer (`pyre-jit-trace/src/trace_opcode
+                // .rs` CALL_ASSEMBLER paths) into the trace IR at trace time
+                // and never enter the codewriter's SSARepr. The compiled
+                // trace still reads ec from register slot `portal_ec_reg` at
+                // every CALL_ASSEMBLER. Forcing it alive at every PC's
+                // `-live-` op is the RPython-orthodox way to express this:
+                // `compute_liveness` (`liveness.py:46-48`,
+                // `liveness.rs:101-107`) adds Register args of `-live-` ops
+                // to the alive set during the backward walk, and the alive
+                // set propagates to all preceding labels / `-live-` ops.
+                //
+                // The pre-regalloc colors are used here; `apply_rename`
+                // (codewriter.rs:7776) translates them uniformly with every
+                // other use to post-regalloc colors.
+                let mut force_alive: Vec<Operand> = Vec::new();
+                if portal_frame_reg != u16::MAX {
+                    force_alive.push(Operand::Register(Register::new(
+                        Kind::Ref,
+                        portal_frame_reg,
+                    )));
+                }
+                if portal_ec_reg != u16::MAX {
+                    force_alive.push(Operand::Register(Register::new(Kind::Ref, portal_ec_reg)));
+                }
+                $ssarepr.insns.push(Insn::live(force_alive));
             }};
         }
 
@@ -7977,6 +8036,8 @@ impl CodeWriter {
             &depth_at_pc,
             &pyre_color_for_semantic_local,
             &stack_slot_color_map,
+            portal_frame_reg,
+            portal_ec_reg,
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
@@ -9528,6 +9589,8 @@ mod tests {
             &depth_at_pc,
             &local_color_map,
             &stack_slot_color_map,
+            u16::MAX,
+            u16::MAX,
         );
 
         let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
