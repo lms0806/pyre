@@ -495,12 +495,16 @@ def _ll_alloc_and_set_nojit(LIST, count, item):
     l = LIST.ll_newlist(count)
     if _ll_zero_or_null(item):
         if not malloc_zero_filled:
-            rgc.ll_arrayclear(l.ll_items())
+            if not isinstance(typeOf(item), Ptr):
+                # Signed/Float/etc.: zero_gc_pointers_inside is a no-op for
+                # non-GcPtr arrays, so we must zero explicitly.
+                rgc.ll_arrayclear(l.ll_items())
+            # GcPtr arrays: zero_gc_pointers_inside in ll_newlist already
+            # cleared every slot; ll_arrayclear would be a redundant memset.
         return l
-    i = 0
-    while i < count:
-        l.ll_setitem_fast(i, item)
-        i += 1
+    # Non-zero/non-null item: fill without write barriers -- the list is freshly
+    # allocated (always young), so write barriers can never fire here.
+    rgc.ll_arrayfill(l.ll_items(), item)
     return l
 
 def _ll_alloc_and_set_jit(LIST, count, item):
