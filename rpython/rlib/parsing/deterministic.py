@@ -300,6 +300,7 @@ class DFA(object):
         return d['recognize']
 
     def make_lexing_code(self):
+        # type: () -> Callable[[DFARunner, int], int]
         """Generate and compile a lexing function for use with a runner."""
         code = self.generate_lexing_code()
         exec(py.code.Source(code).compile())
@@ -501,7 +502,7 @@ class NFA(object):
         subtransitions.setdefault(input, set()).add(next_state)
 
     def get_next_states(self, state, char):
-        # type: (int, str) -> set
+        # type: (int, str) -> set[int]
         """Return all possible next states for the given state and character."""
         result = set()
         sub_transitions = self.transitions.get(state, {})
@@ -524,7 +525,7 @@ class NFA(object):
         return closure
 
     def make_deterministic(self, name_precedence=None):
-        # type: (Optional[list]) -> DFA
+        # type: (Optional[list[str]]) -> DFA
         """Convert this NFA into an equivalent DFA using subset construction."""
         fda = DFA()
         set_to_state = {}
@@ -592,6 +593,7 @@ class NFA(object):
         return mapping
 
     def view(self):
+        # type: () -> None
         """Display an interactive visualization of the NFA using GraphViz."""
         from dotviewer import graphclient
         p = py.test.ensuretemp("automaton").join("temp.dot")
@@ -641,6 +643,7 @@ class SetNFARunner(object):
         self.automaton = automaton
 
     def next_state(self, char):
+        # type: (str) -> set[int]
         """Return all possible next states after processing one character."""
         nextstates = set()
         for state in self.states:
