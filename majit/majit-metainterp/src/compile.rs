@@ -30,10 +30,11 @@ use majit_ir::{
 };
 
 use crate::blackhole::ExceptionState;
+use crate::history::TreeLoop;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
-    ResumeLayoutSummary, ResumeValueSource,
+    ResumeLayoutSummary, ResumeStorage, ResumeValueSource,
 };
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
@@ -217,6 +218,145 @@ pub struct DeadFrameArtifacts {
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
+}
+
+// ── CompileData input bundles (compile.py:31-139) ───────────────────────
+
+/// `compile.py:31` `class CompileData(object)`.
+///
+/// PYRE-ADAPTATION: RPython's `CompileData.optimize_trace()` builds the
+/// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
+/// forwarded boxes in one Python method. Pyre's optimizer entry points borrow
+/// `MetaInterp`, backend state, constant pools, and snapshot side tables
+/// directly in `pyjitpl/mod.rs`, so that dispatch remains flattened there.
+/// These structs intentionally model the RPython constructor payloads only;
+/// call sites must still pass the same trace/runtime/resume/call-pure/opts
+/// state that RPython would store on the corresponding object.
+pub struct CompileData<'a> {
+    pub trace: &'a TreeLoop,
+}
+
+impl<'a> CompileData<'a> {
+    pub fn new(trace: &'a TreeLoop) -> Self {
+        Self { trace }
+    }
+
+    pub fn inputargs(&self) -> &'a [InputArg] {
+        &self.trace.inputargs
+    }
+
+    pub fn operations(&self) -> &'a [Op] {
+        &self.trace.ops
+    }
+
+    pub fn snapshots(&self) -> &'a [crate::recorder::Snapshot] {
+        &self.trace.snapshots
+    }
+}
+
+/// `compile.py:62` `class PreambleCompileData(CompileData)`.
+pub struct PreambleCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub runtime_boxes: &'a [OpRef],
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub enable_opts: &'a [String],
+}
+
+impl<'a> PreambleCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        runtime_boxes: &'a [OpRef],
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace),
+            runtime_boxes,
+            call_pure_results,
+            enable_opts,
+        }
+    }
+}
+
+/// `compile.py:81` `class SimpleCompileData(CompileData)`.
+pub struct SimpleCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub resumestorage: Option<&'a ResumeStorage>,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub enable_opts: &'a [String],
+}
+
+impl<'a> SimpleCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        resumestorage: Option<&'a ResumeStorage>,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace),
+            resumestorage,
+            call_pure_results,
+            enable_opts,
+        }
+    }
+}
+
+/// `compile.py:98` `class BridgeCompileData(CompileData)`.
+pub struct BridgeCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub runtime_boxes: &'a [OpRef],
+    pub resumestorage: Option<&'a ResumeStorage>,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub inline_short_preamble: bool,
+    pub enable_opts: &'a [String],
+}
+
+impl<'a> BridgeCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        runtime_boxes: &'a [OpRef],
+        resumestorage: Option<&'a ResumeStorage>,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        inline_short_preamble: bool,
+        enable_opts: &'a [String],
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace),
+            runtime_boxes,
+            resumestorage,
+            call_pure_results,
+            inline_short_preamble,
+            enable_opts,
+        }
+    }
+}
+
+/// `compile.py:122` `class UnrolledLoopData(CompileData)`.
+pub struct UnrolledLoopData<'a> {
+    pub base: CompileData<'a>,
+    pub celltoken: &'a Arc<JitCellToken>,
+    pub state: &'a crate::optimizeopt::unroll::ExportedState,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub enable_opts: &'a [String],
+}
+
+impl<'a> UnrolledLoopData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        celltoken: &'a Arc<JitCellToken>,
+        state: &'a crate::optimizeopt::unroll::ExportedState,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace),
+            celltoken,
+            state,
+            call_pure_results,
+            enable_opts,
+        }
+    }
 }
 
 // ── Compilation helper functions ────────────────────────────────────────

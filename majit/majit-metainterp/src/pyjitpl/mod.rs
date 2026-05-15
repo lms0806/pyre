@@ -123,6 +123,27 @@ pub enum CompileOutcome {
     Aborted,
 }
 
+struct SimpleCompileViews<'a> {
+    data: compile::SimpleCompileData<'a>,
+    trace_snapshots: Vec<crate::recorder::Snapshot>,
+    trace_ops: Vec<Op>,
+}
+
+fn make_simple_compile_views<'a>(
+    trace: &'a TreeLoop,
+    call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    enable_opts: &'a [String],
+) -> SimpleCompileViews<'a> {
+    let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
+    let trace_snapshots = data.base.snapshots().to_vec();
+    let trace_ops = data.base.operations().to_vec();
+    SimpleCompileViews {
+        data,
+        trace_snapshots,
+        trace_ops,
+    }
+}
+
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -3965,7 +3986,10 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             trace
         };
-        let trace_snapshots = trace.snapshots.clone();
+        let enable_opts = self.warm_state.get_enable_opts();
+        let preamble_data =
+            compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
+        let trace_snapshots = preamble_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved since the last
@@ -3973,7 +3997,7 @@ impl<M: Clone> MetaInterp<M> {
         ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let trace_ops = trace.ops.clone();
+        let trace_ops = preamble_data.base.operations().to_vec();
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
@@ -4008,10 +4032,15 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
-        unroll_opt.call_pure_results = call_pure_results.clone();
+        unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
-        unroll_opt.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        unroll_opt.trace_inputarg_types = preamble_data
+            .base
+            .inputargs()
+            .iter()
+            .map(|ia| ia.tp)
+            .collect();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -4722,6 +4751,7 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
+        let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
             snapshot_boxes,
@@ -4812,6 +4842,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_vable_boxes,
                     snapshot_vref_boxes,
                     snapshot_frame_pcs,
+                    call_pure_results,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -4899,6 +4930,23 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+        // compile.py:355-359: resolve `loop_jitcell_token` before recording
+        // the closing JUMP.  Keep this lookup before any state is consumed so
+        // the rare missing-token path does not drain the active retrace.
+        let loop_jitcell_token = {
+            let green_key = match self.tracing.as_ref() {
+                Some(ctx) => ctx.green_key,
+                None => return false,
+            };
+            let Some(token) = self
+                .compiled_loops
+                .get(&green_key)
+                .map(|compiled| Arc::clone(&compiled.token))
+            else {
+                return false;
+            };
+            token
+        };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
             None => return false,
@@ -4922,9 +4970,11 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             driver_descriptor,
             orig_vable_ptr_retrace,
+            loop_jitcell_token,
             mut constants,
             mut constant_types,
             trace,
+            call_pure_results,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -4945,6 +4995,7 @@ impl<M: Clone> MetaInterp<M> {
             let constants = ctx.constants.snapshot();
             let constant_types = ctx.constants.constant_types_snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
+            let call_pure_results = ctx.take_call_pure_results();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -4976,13 +5027,24 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
                 driver_descriptor,
                 orig_vable_ptr_retrace,
+                loop_jitcell_token,
                 constants,
                 constant_types,
                 trace,
+                call_pure_results,
             )
         };
 
-        let trace_ops = trace.ops.clone();
+        let trace_ops = {
+            let loop_data = compile::UnrolledLoopData::new(
+                &trace,
+                &loop_jitcell_token,
+                &start_state,
+                &call_pure_results,
+                self.warm_state.get_enable_opts(),
+            );
+            loop_data.base.operations().to_vec()
+        };
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
@@ -5008,6 +5070,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
+        unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
@@ -5446,6 +5509,7 @@ impl<M: Clone> MetaInterp<M> {
         // `MIFrame::generate_guard` path.
         let green_key = ctx.green_key;
 
+        let call_pure_results = ctx.take_call_pure_results();
         let mut recorder = ctx.recorder;
         // `pyjitpl.py:3216-3217` / `pyjitpl.py:3241`:
         //   `token = sd.done_with_this_frame_descr_<type>` (normal) or
@@ -5472,14 +5536,20 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let trace_snapshots = trace.snapshots.clone();
+        let SimpleCompileViews {
+            data: simple_data,
+            trace_snapshots,
+            trace_ops,
+        } = make_simple_compile_views(
+            &trace,
+            &call_pure_results,
+            self.warm_state.get_enable_opts(),
+        );
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
-
-        let trace_ops = trace.ops.clone();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -5489,6 +5559,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
+        optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
@@ -5870,6 +5941,7 @@ impl<M: Clone> MetaInterp<M> {
         let orig_vable_ptr_simple =
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
+        let call_pure_results = ctx.take_call_pure_results();
         let recorder = ctx.recorder;
         // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
         // them so downstream consumers (`trace.snapshots`) still observe
@@ -5877,14 +5949,20 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let trace_snapshots = trace.snapshots.clone();
+        let SimpleCompileViews {
+            data: simple_data,
+            trace_snapshots,
+            trace_ops,
+        } = make_simple_compile_views(
+            &trace,
+            &call_pure_results,
+            self.warm_state.get_enable_opts(),
+        );
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
-
-        let trace_ops = trace.ops.clone();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -5892,7 +5970,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let num_ops_before = trace_ops.len();
-        let num_trace_inputargs = trace.inputargs.len();
+        let num_trace_inputargs = simple_data.base.inputargs().len();
 
         // Simple optimizer — no unrolling (compile.py:222-226 SimpleCompileData).
         let mut optimizer = if let Some(config) = vable_config {
@@ -5902,6 +5980,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
+        optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py InputArg.type parity: each `InputArg` already carries
         // its type in the typed OpRef variant tag (`InputArg::opref()` calls
         // `OpRef::input_arg_typed(idx, tp)` in majit-ir/src/value.rs:253).
@@ -7937,6 +8016,14 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
+        // separately from the trace iterator and stay as the original live
+        // boxes from the closing JUMP.
+        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -7987,6 +8074,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut constants,
                     bridge_inputargs.len(),
                     &mut compiled.front_target_tokens,
+                    &bridge_runtime_boxes,
                     true,
                     retraced_count,
                     retrace_limit,
@@ -8263,6 +8351,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
+        call_pure_results: HashMap<Vec<Value>, Value>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -8402,6 +8491,35 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // compile.py:1056-1060: BridgeCompileData is built from the original
+        // history trace/runtime boxes. The explicit Rust TraceIterator
+        // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
+        // and must happen after this payload is formed.
+        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
+        let bridge_trace_data =
+            TreeLoop::with_snapshots(bridge_inputargs.to_vec(), bridge_ops.to_vec(), Vec::new());
+        let bridge_resumestorage = pending_bridge_rd
+            .as_ref()
+            .map(|pending| pending.storage.as_ref());
+        let (bridge_inline_short_preamble, bridge_call_pure_results, bridge_runtime_boxes) = {
+            let bridge_data = compile::BridgeCompileData::new(
+                &bridge_trace_data,
+                &bridge_runtime_boxes,
+                bridge_resumestorage,
+                &call_pure_results,
+                inline_short_preamble,
+                self.warm_state.get_enable_opts(),
+            );
+            (
+                bridge_data.inline_short_preamble,
+                bridge_data.call_pure_results.clone(),
+                bridge_data.runtime_boxes.to_vec(),
+            )
+        };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -8416,6 +8534,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_bridge_rd,
             bridge_inputarg_base,
         );
+        let bridge_inputarg_types = prepared.inputargs.iter().map(|ia| ia.tp).collect();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         let pending_bridge_rd = prepared.pending_bridge_rd;
@@ -8428,6 +8547,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
+        optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
         // legacy `constant_types.insert(arg.index, arg.tp)` writes were
@@ -8439,7 +8559,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can propagate them
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
-        optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.trace_inputarg_types = bridge_inputarg_types;
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -8473,7 +8593,8 @@ impl<M: Clone> MetaInterp<M> {
                     &mut constants,
                     bridge_inputargs.len(),
                     &mut compiled.front_target_tokens,
-                    inline_short_preamble,
+                    &bridge_runtime_boxes,
+                    bridge_inline_short_preamble,
                     retraced_count,
                     retrace_limit,
                     pending_bridge_rd,
