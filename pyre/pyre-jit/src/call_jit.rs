@@ -3316,10 +3316,17 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     }
 }
 
-/// jtransform.py parity: namespace and code come from getfield_vable_r.
+/// jtransform.py parity: namespace and code come from getfield_vable_r; the
+/// live frame is passed explicitly so `_load_global` can mirror
+/// `self.get_builtin()` in compiled residual-call paths as well as blackhole.
 /// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
 /// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
-pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: i64) -> i64 {
+pub extern "C" fn bh_load_global_fn(
+    namespace_ptr: i64,
+    w_code_ptr: i64,
+    frame_ptr: i64,
+    namei: i64,
+) -> i64 {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject)
@@ -3331,21 +3338,49 @@ pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: 
         return 0;
     }
 
-    let name = code.names[idx].as_ref();
-    let ns = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
-    match ns.get(name) {
-        Some(&value) => value as i64,
-        None => {
-            // NameError: set exception object in TLS.
-            let err = pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::NameError,
-                format!("name '{}' is not defined", name),
-            );
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            0
+    let varname = code.names[idx].as_ref();
+    let w_globals = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
+    // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
+    //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
+    //   if w_value is None:
+    //       w_value = self.get_builtin().getdictvalue(self.space, varname)
+    //       if w_value is None:
+    //           self._load_global_failed(w_varname)
+    if let Some(&w_value) = pyre_interpreter::dict_storage_get(w_globals, varname).as_ref() {
+        return w_value as i64;
+    }
+
+    // Residual helper adaptation: `self` is the live portal frame passed as
+    // an explicit Ref argument, so `self.get_builtin()` maps to
+    // PyFrame::get_builtin() without relying on blackhole-only TLS.
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
+    if !parent_frame_ptr.is_null() {
+        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if !w_dict.is_null() {
+                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                    Ok(Some(w_value)) => return w_value as i64,
+                    Ok(None) => {}
+                    Err(err) => {
+                        let exc_obj = err.to_exc_object();
+                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                            .with(|c| c.set(exc_obj as i64));
+                        return 0;
+                    }
+                }
+            }
         }
     }
+
+    // pyopcode.py:970 `_load_global_failed`: raise NameError.
+    let err = pyre_interpreter::PyError::new(
+        pyre_interpreter::PyErrorKind::NameError,
+        format!("name '{}' is not defined", varname),
+    );
+    let exc_obj = err.to_exc_object();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    0
 }
 
 /// Load a constant from the code object.
