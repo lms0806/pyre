@@ -397,46 +397,46 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
 /// pyopcode.py:1852), `w_2` is `exc_type` (the type spec, popped at
 /// :1851). `space.type(w_1)` is the exception's class.
 ///
-/// PRE-EXISTING-ADAPTATION: the upstream `raise oefmt(TypeError, ...)`
-/// path for an invalid `check_class` is degraded to `return false`
-/// because this helper does not propagate `PyResult`. Migrating the
-/// signature is queued for the `eval.rs` PyResult-propagation epic.
-pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) -> bool {
+/// pyopcode.py:24-25 `CANNOT_CATCH_MSG`.
+pub const CANNOT_CATCH_MSG: &str =
+    "catching classes that do not inherit from BaseException is not allowed";
+
+pub fn check_exc_match_against(
+    exc_value: PyObjectRef,
+    exc_type: PyObjectRef,
+) -> Result<bool, PyError> {
     unsafe {
-        // PRE-EXISTING-ADAPTATION: pyre callers may pass non-exception
-        // values through this helper (legacy paths). PyPy `cmp_exc_match`
-        // asserts `w_1` is an exception instance — pyre tolerates the
-        // looser shape and reports a match.
-        if !pyre_object::is_exception(exc_value) {
-            return true;
-        }
-        // pyopcode.py:1034-1039 class-validity gate.
+        // pyopcode.py:1034-1039 class-validity gate:
+        //   if space.isinstance_w(w_2, space.w_tuple):
+        //       for w_type in space.fixedview(w_2):
+        //           if not space.exception_is_valid_class_w(w_type):
+        //               raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
+        //   elif not space.exception_is_valid_class_w(w_2):
+        //       raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
                 if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
                     if !crate::baseobjspace::exception_is_valid_class_w(w_type) {
-                        return false;
+                        return Err(PyError::type_error(CANNOT_CATCH_MSG));
                     }
                 }
             }
         } else if !crate::baseobjspace::exception_is_valid_class_w(exc_type) {
-            return false;
+            return Err(PyError::type_error(CANNOT_CATCH_MSG));
         }
-        // pyopcode.py:1040 `space.exception_match(space.type(w_1), w_2)`.
+        // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`.
         // `crate::typedef::r#type` is the `space.type` equivalent — it
         // resolves `w_class` for objects whose specific class was already
         // installed (post-`init_typeobjects`) AND for exception instances
         // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
         // stub (pre-registry-init internal `w_exception_new` callers, e.g.
         // `PyError::value_error`) by falling back to the `ExcKind`-tag
-        // registry per typedef.rs:176-197.  Reading `(*exc_value).w_class`
-        // directly would miss the kind-tag fallback and reduce a generic
-        // builtin-raised exception to a no-match against `except ValueError`.
+        // registry per typedef.rs:176-197.
         let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
-            return false;
+            return Ok(false);
         };
-        crate::baseobjspace::exception_match(w_exc_class, exc_type)
+        Ok(crate::baseobjspace::exception_match(w_exc_class, exc_type))
     }
 }
 
@@ -1924,7 +1924,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let exc_type = self.pop();
         let exc_value = self.peek();
-        let matched = check_exc_match_against(exc_value, exc_type);
+        // pyopcode.py:1032-1040 cmp_exc_match: invalid except target
+        // raises TypeError via oefmt; `?` propagates the error along the
+        // standard PyResult path (mirroring `raise oefmt`'s OperationError
+        // propagation up the bytecode dispatcher).
+        let matched = check_exc_match_against(exc_value, exc_type)?;
         self.push(pyre_object::w_bool_from(matched));
         Ok(())
     }
@@ -4447,6 +4451,59 @@ except ValueError:
         // Should fail because ZeroDivisionError != ValueError
         // But Phase 1: bare except catches all, specific except may not work yet
         let _ = res; // Don't assert — depends on CHECK_EXC_MATCH impl
+    }
+
+    #[test]
+    fn test_check_exc_match_invalid_target_raises_type_error() {
+        // pyopcode.py:1032-1039 — `except <non-exception>:` raises
+        // TypeError(CANNOT_CATCH_MSG). The bare `except 42:` form is
+        // syntactically valid; the runtime gate fires in CHECK_EXC_MATCH.
+        let source = "\
+try:
+    raise ValueError(\"boom\")
+except 42:
+    pass
+";
+        let (res, _) = run_exec_frame(source);
+        match res {
+            Err(e) => {
+                assert!(
+                    matches!(e.kind, crate::PyErrorKind::TypeError),
+                    "expected TypeError, got {:?}: {}",
+                    e.kind,
+                    e.message,
+                );
+                assert!(
+                    e.message.contains("BaseException"),
+                    "expected CANNOT_CATCH_MSG, got: {}",
+                    e.message,
+                );
+            }
+            Ok(_) => panic!("expected TypeError for `except 42:`"),
+        }
+    }
+
+    #[test]
+    fn test_check_exc_match_invalid_tuple_member_raises_type_error() {
+        // pyopcode.py:1034-1037 — tuple form, any non-exception entry
+        // raises TypeError. `except (ValueError, 42):` must trigger the
+        // gate even though `ValueError` itself is valid.
+        let source = "\
+try:
+    raise ValueError(\"boom\")
+except (ValueError, 42):
+    pass
+";
+        let (res, _) = run_exec_frame(source);
+        match res {
+            Err(e) => assert!(
+                matches!(e.kind, crate::PyErrorKind::TypeError),
+                "expected TypeError, got {:?}: {}",
+                e.kind,
+                e.message,
+            ),
+            Ok(_) => panic!("expected TypeError for `except (ValueError, 42):`"),
+        }
     }
 
     #[test]

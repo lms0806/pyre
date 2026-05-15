@@ -6845,39 +6845,48 @@ impl MIFrame {
 unsafe fn trace_check_exc_match_against(
     exc_value: pyre_object::PyObjectRef,
     exc_type: pyre_object::PyObjectRef,
-) -> bool {
+) -> Result<bool, PyError> {
     // pyopcode.py:1032-1040 cmp_exc_match line-by-line port (kept in
     // lockstep with `pyre-interpreter/src/eval.rs::check_exc_match_against`
-    // so the trace-time match equals the interpreter-time match).
+    // so the trace-time match equals the interpreter-time match, including
+    // the invalid-class `oefmt(space.w_TypeError, CANNOT_CATCH_MSG)` raise).
     unsafe {
-        if !pyre_object::is_exception(exc_value) {
-            return true;
-        }
-        // pyopcode.py:1034-1039 class-validity gate (TypeError raise
-        // degrades to `return false` because the trace helper has no
-        // PyResult propagation channel).
+        // pyopcode.py:1034-1039 class-validity gate. Invalid `w_2`
+        // (non-tuple non-exception-subclass, or any non-exception-subclass
+        // entry inside a tuple) raises TypeError; propagating the Err up
+        // through the trace dispatcher's PyResult chain aborts the trace
+        // (Self::Error = PyError at trace_opcode.rs:7091) and the
+        // interpreter re-runs CHECK_EXC_MATCH freshly to surface the
+        // TypeError without baking it into the recorded trace.
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
                 if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
                     if !pyre_interpreter::baseobjspace::exception_is_valid_class_w(w_type) {
-                        return false;
+                        return Err(PyError::type_error(
+                            pyre_interpreter::eval::CANNOT_CATCH_MSG,
+                        ));
                     }
                 }
             }
         } else if !pyre_interpreter::baseobjspace::exception_is_valid_class_w(exc_type) {
-            return false;
+            return Err(PyError::type_error(
+                pyre_interpreter::eval::CANNOT_CATCH_MSG,
+            ));
         }
-        // pyopcode.py:1040 `space.exception_match(space.type(w_1), w_2)`.
+        // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`.
         // `pyre_interpreter::typedef::r#type` is the `space.type` equivalent
         // — it resolves the specific class for fully-installed exceptions
         // AND falls back to the `ExcKind`-tag registry for instances
         // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
         // stub (pre-registry-init internal `w_exception_new` callers).
         let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
-            return false;
+            return Ok(false);
         };
-        pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
+        Ok(pyre_interpreter::baseobjspace::exception_match(
+            w_exc_class,
+            exc_type,
+        ))
     }
 }
 
@@ -7435,7 +7444,7 @@ impl OpcodeStepExecutor for MIFrame {
             ));
         }
 
-        let matched = unsafe { trace_check_exc_match_against(last_exc, exc_type_obj) };
+        let matched = unsafe { trace_check_exc_match_against(last_exc, exc_type_obj) }?;
 
         let result_obj = pyre_object::w_bool_from(matched);
         let result_opref = self.with_ctx(|_this, ctx| ctx.const_ref(result_obj as i64));

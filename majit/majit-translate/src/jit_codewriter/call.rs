@@ -3500,7 +3500,26 @@ impl CallControl {
                         // before the `f9738863011` squash widened this
                         // branch from warn-only to hard-fail.
                         if let Some(declared) = self.return_types.get(&path) {
-                            let expected_result = return_type_string_to_value_type(Some(declared));
+                            // RPython has no `Result<T, E>` type — its
+                            // rtyper extracts the exception via
+                            // `OperationError` propagation and presents
+                            // `op.result.concretetype` as the success
+                            // type alone. Pyre models RPython's
+                            // `bool` + `raise oefmt(...)` shape as
+                            // `Result<bool, PyError>` and threads
+                            // exceptions through `?`. When validating
+                            // the call's `result_type` (already
+                            // unwrapped through `?` at the AST lowerer)
+                            // against the declared signature, project
+                            // the declared `Result<T, E>` to `T` so the
+                            // comparison happens in the rtyper-derived
+                            // shape upstream uses (call.py:222 `FUNC.RESULT`).
+                            let effective_declared =
+                                crate::front::ast::transparent_result_ok_type(declared)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| declared.clone());
+                            let expected_result =
+                                return_type_string_to_value_type(Some(&effective_declared));
                             if result_type != expected_result {
                                 panic!(
                                     "in operation calling {target}: calling a \
@@ -3532,8 +3551,16 @@ impl CallControl {
                              kinds {arg_types:?}",
                         );
                     }
+                    // Project `Result<T, E>` → `T` to match rtyper's
+                    // `op.result.concretetype` shape — see the Direct arm
+                    // above for the full rationale.
+                    let effective_declared = self.return_types.get(witness_path).map(|declared| {
+                        crate::front::ast::transparent_result_ok_type(declared)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| declared.clone())
+                    });
                     let expected_result =
-                        return_type_string_to_value_type(self.return_types.get(witness_path));
+                        return_type_string_to_value_type(effective_declared.as_ref());
                     if result_type != expected_result {
                         panic!(
                             "indirect_call in family including {witness_path:?}: \

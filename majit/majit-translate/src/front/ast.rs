@@ -8535,7 +8535,7 @@ fn type_string_to_value_type(type_str: &str) -> ValueType {
     }
 }
 
-fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
+pub(crate) fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
     let trimmed = type_str.trim();
     for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
         let Some(inner) = trimmed
