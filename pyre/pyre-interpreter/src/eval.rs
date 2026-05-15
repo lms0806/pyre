@@ -442,18 +442,15 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
 pub const CANNOT_CATCH_MSG: &str =
     "catching classes that do not inherit from BaseException is not allowed";
 
-pub fn check_exc_match_against(
-    exc_value: PyObjectRef,
-    exc_type: PyObjectRef,
-) -> Result<bool, PyError> {
+/// pyopcode.py:1034-1039 — the class-validity gate of `cmp_exc_match`,
+/// split out from `check_exc_match_against` so the bool-returning hot
+/// helper keeps a 1-register C ABI suitable for residual JIT calls.
+/// PyPy's `@jit.unroll_safe` `cmp_exc_match` inlines into the trace and
+/// its `raise oefmt(...)` becomes a guard; pyre matches the structure
+/// by keeping the raise on the caller side (the BC handler), which
+/// likewise runs outside the JIT-traced bool-returning fast path.
+pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
     unsafe {
-        // pyopcode.py:1034-1039 class-validity gate:
-        //   if space.isinstance_w(w_2, space.w_tuple):
-        //       for w_type in space.fixedview(w_2):
-        //           if not space.exception_is_valid_class_w(w_type):
-        //               raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
-        //   elif not space.exception_is_valid_class_w(w_2):
-        //       raise oefmt(space.w_TypeError, CANNOT_CATCH_MSG)
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
@@ -466,19 +463,30 @@ pub fn check_exc_match_against(
         } else if !crate::baseobjspace::exception_is_valid_class_w(exc_type) {
             return Err(PyError::type_error(CANNOT_CATCH_MSG));
         }
-        // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`.
-        // `crate::typedef::r#type` is the `space.type` equivalent — it
-        // resolves `w_class` for objects whose specific class was already
-        // installed (post-`init_typeobjects`) AND for exception instances
-        // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
-        // stub (pre-registry-init internal `w_exception_new` callers, e.g.
-        // `PyError::value_error`) by falling back to the `ExcKind`-tag
-        // registry per typedef.rs:176-197.
-        let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
-            return Ok(false);
-        };
-        Ok(crate::baseobjspace::exception_match(w_exc_class, exc_type))
     }
+    Ok(())
+}
+
+pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) -> bool {
+    // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`.
+    // `crate::typedef::r#type` is the `space.type` equivalent — it
+    // resolves `w_class` for objects whose specific class was already
+    // installed (post-`init_typeobjects`) AND for exception instances
+    // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
+    // stub (pre-registry-init internal `w_exception_new` callers, e.g.
+    // `PyError::value_error`) by falling back to the `ExcKind`-tag
+    // registry per typedef.rs:176-197.
+    //
+    // The validity gate (pyopcode.py:1034-1039) lives in
+    // `validate_check_exc_match_class` and is invoked by the BC handler
+    // BEFORE this helper, mirroring PyPy's `@jit.unroll_safe` inlining
+    // where `raise oefmt(...)` becomes a guard outside the bool-returning
+    // residual call.  The 1-register `bool` ABI is preserved for
+    // cranelift / dynasm residual-call codegen.
+    let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
+        return false;
+    };
+    crate::baseobjspace::exception_match(w_exc_class, exc_type)
 }
 
 /// Try to dispatch an exception using the exception table or block stack.
@@ -1965,11 +1973,19 @@ impl OpcodeStepExecutor for PyFrame {
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let exc_type = self.pop();
         let exc_value = self.peek();
-        // pyopcode.py:1032-1040 cmp_exc_match: invalid except target
-        // raises TypeError via oefmt; `?` propagates the error along the
-        // standard PyResult path (mirroring `raise oefmt`'s OperationError
-        // propagation up the bytecode dispatcher).
-        let matched = check_exc_match_against(exc_value, exc_type)?;
+        // pyopcode.py:1032-1040 cmp_exc_match split:
+        //   :1034-1039 — `validate_check_exc_match_class(exc_type)?`
+        //                raises TypeError(CANNOT_CATCH_MSG) for invalid
+        //                except targets (`raise oefmt(...)` upstream).
+        //   :1040     — `check_exc_match_against(exc_value, exc_type)`
+        //                computes the match boolean.
+        // PyPy keeps both in a single `@jit.unroll_safe cmp_exc_match`;
+        // the JIT inlines and the `raise` becomes a guard. Pyre splits
+        // so the bool-returning hot helper keeps a 1-register ABI for
+        // residual JIT calls; the validity gate runs in this BC handler
+        // (outside the residual call path) and lifts to `?` propagation.
+        validate_check_exc_match_class(exc_type)?;
+        let matched = check_exc_match_against(exc_value, exc_type);
         self.push(pyre_object::w_bool_from(matched));
         Ok(())
     }

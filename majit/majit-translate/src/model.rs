@@ -1968,6 +1968,22 @@ pub struct FunctionGraph {
     /// completes, the bridge becomes the canonical narrow waist between
     /// the flowspace-shaped FrameState and pyre's IR.
     pub(crate) variable_to_vid: std::collections::HashMap<u64, ValueId>,
+    /// The source-level return type string (Rust `syn::ReturnType`
+    /// rendered through `qualified_full_type_string`). RPython
+    /// equivalent: `funcptr._obj.TO.RESULT` on the
+    /// `lltype.FuncType(ARGS, RESULT)` — every graph carries its result
+    /// type intrinsically as `op.result.concretetype` of the
+    /// returnblock's input variable.  Pyre stores the source string and
+    /// projects to `Type` via `return_type_string_to_value_type` so the
+    /// JIT codewriter's signature validator (`call.rs:3502/3555`) can
+    /// read `FUNC.RESULT` directly off the callee graph without
+    /// consulting the `CallControl::return_types` side-table.
+    ///
+    /// `None` for synthetic test-fixture graphs constructed via
+    /// `FunctionGraph::new("name")`; production paths populate via
+    /// `with_return_type(rt)` after construction (parse.rs +
+    /// lib.rs:430-512 trait-method + free-fn registration).
+    pub return_type: Option<String>,
 }
 
 impl FunctionGraph {
@@ -2022,7 +2038,19 @@ impl FunctionGraph {
             next_value: 3,
             value_names: std::collections::HashMap::new(),
             variable_to_vid: std::collections::HashMap::new(),
+            return_type: None,
         }
+    }
+
+    /// Builder-style setter for `return_type`. Used by production
+    /// registration paths (parse.rs / lib.rs) where the source-level
+    /// type is available; test fixtures that construct via
+    /// `FunctionGraph::new("name")` may skip and leave `None`. The JIT
+    /// codewriter signature validator (`call.rs:3502/3555`) falls back
+    /// to `CallControl::return_types` for `None`-carrying graphs.
+    pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
+        self.return_type = Some(rt.into());
+        self
     }
 
     /// Return the canonical exception block and its `(etype, evalue)`

@@ -3499,7 +3499,21 @@ impl CallControl {
                         // un-validated, matching the trait-method state
                         // before the `f9738863011` squash widened this
                         // branch from warn-only to hard-fail.
-                        if let Some(declared) = self.return_types.get(&path) {
+                        // RPython call.py:222/231 reads `FUNC.RESULT`
+                        // directly off the callee's funcptr type, so
+                        // every graph carries its result type
+                        // intrinsically. Pyre's orthodox source is
+                        // `graph.return_type` (populated at registration
+                        // from the parsed Rust signature); the
+                        // `CallControl::return_types` side-table is the
+                        // legacy fallback for synthetic test-fixture
+                        // graphs that construct via `FunctionGraph::new`
+                        // without a return_type.
+                        let declared = graph
+                            .return_type
+                            .as_ref()
+                            .or_else(|| self.return_types.get(&path));
+                        if let Some(declared) = declared {
                             // RPython has no `Result<T, E>` type — its
                             // rtyper extracts the exception via
                             // `OperationError` propagation and presents
@@ -3553,8 +3567,14 @@ impl CallControl {
                     }
                     // Project `Result<T, E>` → `T` to match rtyper's
                     // `op.result.concretetype` shape — see the Direct arm
-                    // above for the full rationale.
-                    let effective_declared = self.return_types.get(witness_path).map(|declared| {
+                    // above for the full rationale. Source priority:
+                    // graph.return_type (RPython `funcptr.TO.RESULT`) →
+                    // CallControl side-table.
+                    let declared = witness_graph
+                        .return_type
+                        .as_ref()
+                        .or_else(|| self.return_types.get(witness_path));
+                    let effective_declared = declared.map(|declared| {
                         crate::front::ast::transparent_result_ok_type(declared)
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| declared.clone())

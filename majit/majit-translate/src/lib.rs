@@ -345,16 +345,24 @@ fn analyze_pipeline_from_parsed(
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
     for func in &program.functions {
         if func.self_ty_root.is_none() {
+            // Stamp the source return type onto the graph so the JIT
+            // codewriter signature validator reads `FUNC.RESULT`
+            // directly off the callee graph (RPython
+            // `funcptr._obj.TO.RESULT`).
+            let graph = match &func.return_type {
+                Some(rt) => func.graph.clone().with_return_type(rt),
+                None => func.graph.clone(),
+            };
             // Free function: register under qualified segments.
             // func.name may be "a::helper" for module-internal functions.
             let segments: Vec<&str> = func.name.split("::").collect();
             let path = parse::CallPath::from_segments(segments.iter().copied());
-            canonical_function_graphs.insert(path, func.graph.clone());
+            canonical_function_graphs.insert(path, graph.clone());
             // Also register under ["crate", ...segments].
             let mut crate_segs = vec!["crate"];
             crate_segs.extend(segments.iter().copied());
             let crate_path = parse::CallPath::from_segments(crate_segs);
-            canonical_function_graphs.insert(crate_path, func.graph.clone());
+            canonical_function_graphs.insert(crate_path, graph);
         }
     }
 
@@ -404,21 +412,17 @@ fn analyze_pipeline_from_parsed(
         if !func.self_ty_root.is_none() || func.hints.is_empty() {
             continue;
         }
+        let graph = match &func.return_type {
+            Some(rt) => func.graph.clone().with_return_type(rt),
+            None => func.graph.clone(),
+        };
         let segments: Vec<&str> = func.name.split("::").collect();
         let path = parse::CallPath::from_segments(segments.iter().copied());
-        call_control.register_function_graph_with_hints(
-            path,
-            func.graph.clone(),
-            func.hints.clone(),
-        );
+        call_control.register_function_graph_with_hints(path, graph.clone(), func.hints.clone());
         let mut crate_segs = vec!["crate"];
         crate_segs.extend(segments.iter().copied());
         let crate_path = parse::CallPath::from_segments(crate_segs);
-        call_control.register_function_graph_with_hints(
-            crate_path,
-            func.graph.clone(),
-            func.hints.clone(),
-        );
+        call_control.register_function_graph_with_hints(crate_path, graph, func.hints.clone());
     }
     // RPython: op.result.concretetype — register return types per function.
     // Each function's return type is registered under its exact canonical path(s).
@@ -464,12 +468,16 @@ fn analyze_pipeline_from_parsed(
         };
         for method in &impl_info.methods {
             if let Some(graph) = &method.graph {
-                call_control.register_trait_method(
-                    &method.name,
-                    trait_root,
-                    impl_type,
-                    graph.clone(),
-                );
+                // Stamp the source return type onto the graph itself so
+                // the JIT codewriter signature validator reads
+                // `FUNC.RESULT` directly off the callee graph
+                // (RPython `funcptr._obj.TO.RESULT`) without the
+                // `CallControl::return_types` side-table fallback.
+                let graph = match &method.return_type {
+                    Some(rt) => graph.clone().with_return_type(rt),
+                    None => graph.clone(),
+                };
+                call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // Parity with upstream `rpython/annotator/classdesc.py:749
                 // lookup` MRO walk: a trait default body is the
                 // "base-class method" for every impl that does not
@@ -489,7 +497,15 @@ fn analyze_pipeline_from_parsed(
                         impl_info.trait_name.as_str(),
                         method.name.as_str(),
                     ]);
-                    call_control.register_function_graph(direct_path, graph.clone());
+                    let direct_graph = match &method.return_type {
+                        Some(rt) => method
+                            .graph
+                            .clone()
+                            .expect("method.graph populated above")
+                            .with_return_type(rt),
+                        None => method.graph.clone().expect("method.graph populated above"),
+                    };
+                    call_control.register_function_graph(direct_path, direct_graph);
                 }
             }
             // RPython: op.result.concretetype for trait/default method calls.
