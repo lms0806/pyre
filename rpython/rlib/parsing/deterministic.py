@@ -395,6 +395,7 @@ return ~i""")
         return DFARunner(self)
 
     def make_nondeterministic(self):
+        # type: () -> NFA
         """Convert this DFA into an equivalent NFA."""
         result = NFA()
         result.num_states = self.num_states
@@ -450,6 +451,7 @@ class DFARunner(object):
         self.state = 0
 
     def nextstate(self, char):
+        # type: (str) -> int
         """Advance the DFA by one character. Raises KeyError on invalid transition."""
         self.state = self.automaton[self.state, char]
         return self.state
