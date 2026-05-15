@@ -33,6 +33,7 @@ def compress_char_set(chars):
     return real_result
 
 def make_nice_charset_repr(chars):
+    """Create a human-readable representation of a character set."""
     # Compress the letters & digits
     letters = set(chars) & set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
     therest = set(chars) - letters - set(['-'])
@@ -53,6 +54,7 @@ def make_nice_charset_repr(chars):
     return "".join(result)
 
 class LexerError(Exception):
+    """Error raised by the DFA-based lexer on recognition failure."""
     def __init__(self, input, state, source_pos):
         self.input = input
         self.state = state
@@ -71,6 +73,7 @@ class LexerError(Exception):
         return self.nice_error_message()
 
 class DFA(object):
+    """Deterministic Finite Automaton implementation."""
     def __init__(self, num_states=0, transitions=None, final_states=None,
                  unmergeable_states=None, names=None):
         self.num_states = 0
@@ -94,6 +97,7 @@ class DFA(object):
             self.unmergeable_states, self.names)), )
 
     def add_state(self, name=None, final=False, unmergeable=False):
+        """Add a new state to the automaton and return its id."""
         state = self.num_states
         self.num_states += 1
         if final:
@@ -116,12 +120,14 @@ class DFA(object):
         return (state, input) in self.transitions
 
     def get_all_chars(self):
+        """Return all input characters that appear in transitions."""
         all_chars = set()
         for (state, input) in self.transitions:
             all_chars.add(input)
         return all_chars
 
     def optimize(self):
+        """Minimize the DFA by merging equivalent states. Returns True if merged."""
         all_chars = self.get_all_chars()
         # find mergeable
         non_final = frozenset(set(range(self.num_states)) - self.final_states -
@@ -215,6 +221,7 @@ class DFA(object):
         return True
 
     def make_code(self):
+        """Generate and compile a Python function that recognizes the DFA's language."""
         from rpython.rlib.parsing.codebuilder import Codebuilder
         result = Codebuilder()
         result.start_block("def recognize(input):")
@@ -289,11 +296,13 @@ class DFA(object):
         return d['recognize']
 
     def make_lexing_code(self):
+        """Generate and compile a lexing function for use with a runner."""
         code = self.generate_lexing_code()
         exec(py.code.Source(code).compile())
         return recognize
 
     def generate_lexing_code(self):
+        """Return source code for a lexing function that integrates with a runner."""
         from rpython.rlib.parsing.codebuilder import Codebuilder
         result = Codebuilder()
         result.start_block("def recognize(runner, i):")
@@ -377,9 +386,11 @@ return ~i""")
         return result
 
     def get_runner(self):
+        """Create and return a DFARunner for this automaton."""
         return DFARunner(self)
 
     def make_nondeterministic(self):
+        """Convert this DFA into an equivalent NFA."""
         result = NFA()
         result.num_states = self.num_states
         result.names = self.names
@@ -390,6 +401,7 @@ return ~i""")
         return result
 
     def dot(self):
+        """Generate a GraphViz DOT representation of the automaton."""
         result = ["graph G {"]
         for i in range(self.num_states):
             if i == 0:
@@ -414,6 +426,7 @@ return ~i""")
         return "\n".join(result)
 
     def view(self):
+        """Display an interactive visualization of the automaton using GraphViz."""
         from dotviewer import graphclient
         p = py.test.ensuretemp("automaton").join("temp.dot")
         dot = self.dot()
@@ -426,15 +439,18 @@ return ~i""")
         graphclient.display_dot_file(str(plainpath))
 
 class DFARunner(object):
+    """Deterministic runner that executes a DFA character by character."""
     def __init__(self, automaton):
         self.automaton = automaton
         self.state = 0
 
     def nextstate(self, char):
+        """Advance the DFA by one character. Raises KeyError on invalid transition."""
         self.state = self.automaton[self.state, char]
         return self.state
 
     def recognize(self, s):
+        """Check if the DFA accepts the given string. Returns True or False."""
         self.state = 0
         try:
             for char in s:
@@ -444,6 +460,7 @@ class DFARunner(object):
         return self.state in self.automaton.final_states
 
 class NFA(object):
+    """Nondeterministic Finite Automaton implementation."""
     def __init__(self):
         self.num_states = 0
         self.names = []
@@ -454,6 +471,7 @@ class NFA(object):
 
     def add_state(self, name=None, start=False, final=False,
                   unmergeable=False):
+        """Add a new state and return its id."""
         new_state = self.num_states
         self.num_states += 1
         if name is None:
@@ -468,10 +486,12 @@ class NFA(object):
         return new_state
 
     def add_transition(self, state, next_state, input=None):
+        """Add a transition from state to next_state on the given input."""
         subtransitions = self.transitions.setdefault(state, {})
         subtransitions.setdefault(input, set()).add(next_state)
 
     def get_next_states(self, state, char):
+        """Return all possible next states for the given state and character."""
         result = set()
         sub_transitions = self.transitions.get(state, {})
         for e_state in self.epsilon_closure([state]):
@@ -492,6 +512,7 @@ class NFA(object):
         return closure
 
     def make_deterministic(self, name_precedence=None):
+        """Convert this NFA into an equivalent DFA using subset construction."""
         fda = DFA()
         set_to_state = {}
         stack = []
@@ -543,6 +564,7 @@ class NFA(object):
         return fda
 
     def update(self, other):
+        """Copy all states and transitions from another NFA into this one."""
         mapping = {}
         for i, name in enumerate(other.names):
             new_state = self.add_state(name)
@@ -556,6 +578,7 @@ class NFA(object):
         return mapping
 
     def view(self):
+        """Display an interactive visualization of the NFA using GraphViz."""
         from dotviewer import graphclient
         p = py.test.ensuretemp("automaton").join("temp.dot")
         dot = self.dot()
@@ -573,6 +596,7 @@ class NFA(object):
         graphclient.display_dot_file(str(plainpath))
 
     def dot(self):
+        """Generate a GraphViz DOT representation of the NFA."""
         result = ["graph G {"]
         for i in range(self.num_states):
             if i in self.start_states:
@@ -597,10 +621,12 @@ class NFA(object):
         return "\n".join(result)
 
 class SetNFARunner(object):
+    """NFA runner that tracks a set of possible states at each step."""
     def __init__(self, automaton):
         self.automaton = automaton
 
     def next_state(self, char):
+        """Return all possible next states after processing one character."""
         nextstates = set()
         for state in self.states:
             nextstates.update(self.automaton.get_next_states(state, char))
@@ -619,10 +645,12 @@ class SetNFARunner(object):
         return False
 
 class BacktrackingNFARunner(object):
+    """NFA runner that uses backtracking to find an accepting path."""
     def __init__(self, automaton):
         self.automaton = automaton
 
     def recognize(self, s):
+        """Check if the NFA accepts the given string using backtracking search."""
         def recurse(i, state):
             if i == len(s):
                 return state in self.automaton.final_states
