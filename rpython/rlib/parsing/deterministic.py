@@ -7,6 +7,7 @@ except NameError:
     from sets import Set as set, ImmutableSet as frozenset
 
 def compress_char_set(chars):
+    # type: (str) -> list[(str, int)]
     """Take the character list and compress runs of adjacent
     characters; the result is a list of the first character in
     a run and the number of chars following, sorted with longer
