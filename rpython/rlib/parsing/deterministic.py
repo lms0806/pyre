@@ -457,6 +457,7 @@ class DFARunner(object):
         return self.state
 
     def recognize(self, s):
+        # type: (str) -> bool
         """Check if the DFA accepts the given string. Returns True or False."""
         self.state = 0
         try:
@@ -478,6 +479,7 @@ class NFA(object):
 
     def add_state(self, name=None, start=False, final=False,
                   unmergeable=False):
+        # type: (Optional[str], bool, bool, bool) -> int
         """Add a new state and return its id."""
         new_state = self.num_states
         self.num_states += 1
@@ -493,11 +495,13 @@ class NFA(object):
         return new_state
 
     def add_transition(self, state, next_state, input=None):
+        # type: (int, int, Optional[str]) -> None
         """Add a transition from state to next_state on the given input."""
         subtransitions = self.transitions.setdefault(state, {})
         subtransitions.setdefault(input, set()).add(next_state)
 
     def get_next_states(self, state, char):
+        # type: (int, str) -> set
         """Return all possible next states for the given state and character."""
         result = set()
         sub_transitions = self.transitions.get(state, {})
@@ -506,6 +510,7 @@ class NFA(object):
         return result
 
     def epsilon_closure(self, states):
+        # type: (list[int]) -> set[int]
         """Return the epsilon-closure of 'states'."""
         closure = set(states)   # states are in closure, by definition
         stack = list(states)
@@ -519,6 +524,7 @@ class NFA(object):
         return closure
 
     def make_deterministic(self, name_precedence=None):
+        # type: (Optional[list]) -> DFA
         """Convert this NFA into an equivalent DFA using subset construction."""
         fda = DFA()
         set_to_state = {}
@@ -571,6 +577,7 @@ class NFA(object):
         return fda
 
     def update(self, other):
+        # type: (NFA) -> dict[int, int]
         """Copy all states and transitions from another NFA into this one."""
         mapping = {}
         for i, name in enumerate(other.names):
@@ -603,6 +610,7 @@ class NFA(object):
         graphclient.display_dot_file(str(plainpath))
 
     def dot(self):
+        # type: () -> str
         """Generate a GraphViz DOT representation of the NFA."""
         result = ["graph G {"]
         for i in range(self.num_states):
