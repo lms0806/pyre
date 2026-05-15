@@ -1,25 +1,73 @@
-//! ValueId → ConcreteType inline carrier for the jit_codewriter IR.
+//! `ValueId → ConcreteType` slot table — pyre structural adapter.
 //!
-//! PRE-EXISTING-ADAPTATION. RPython stores `.concretetype` inline on each
-//! `Variable` after `RPythonTyper.specialize()` rewrites the graph
-//! (`rpython/flowspace/model.py:280 Variable.__slots__ = [..., "concretetype"]`),
-//! so no side table exists upstream — every Variable carries its
-//! lowleveltype as an O(1) attribute access.
+//! **NOT** RPython-orthodox.  RPython attaches `concretetype` to each
+//! `Variable` / `Constant` object as an inline slot
+//! (`rpython/flowspace/model.py:280 Variable.__slots__ = [..., "concretetype"]`;
+//! `:355 Constant.__slots__ = ["concretetype"]`) and the rtyper writes
+//! it in place via `RPythonTyper.setconcretetype()`
+//! (`rpython/rtyper/rtyper.py:258  v.concretetype = self.bindingrepr(v).lowleveltype`).
+//! Reading a Variable's type upstream is a plain attribute access on
+//! the object itself; there is no external lookup table and no
+//! iterator over a type-store.
 //!
-//! Pyre's `ValueId(usize)` is a dense index minted by
-//! `FunctionGraph::alloc_value`, so the closest orthodox analogue is a
-//! dense `Vec<ConcreteType>` indexed by `ValueId.0`: every minted
-//! ValueId has exactly one slot, just like every Variable has one
-//! `.concretetype` attribute upstream.  `ConcreteType::Unknown` plays
-//! the role of "slot not yet populated" — equivalent to RPython's
-//! `hasattr(var, 'concretetype') is False` window between Variable
-//! creation and `RPythonTyper.setconcretetype()` (`rtyper.py:258`).
+//! Pyre's `FunctionGraph` is `ValueId(usize)`-based: a ValueId is a
+//! detached index, not an object that can carry an inline slot.  Two
+//! genuine ports of RPython's per-Variable inline shape are possible
+//! and remain multi-session future work:
 //!
-//! `build_value_kinds` (pure `ConcreteType → RegKind` projection) and
-//! `merge_synth_kinds` (post-jtransform 4-source merge) live here
-//! beside the data type — these are pyre-only divergences from RPython
-//! that survive the rtyper cutover (`~/.claude/plans/0-warm-raccoon.md`
-//! Slice 3). The graph-walking algorithm `resolve_types` remains in
+//!   1. Carry the `concretetype` inline at each defining site —
+//!      `SpaceOperation.result_concretetype` and
+//!      `Block.inputarg_concretetypes` (parallel to
+//!      `Block.inputargs`).  Reads walk the graph to the defining
+//!      site.  Requires modifying every `SpaceOperation` / `Block`
+//!      construction site across the front-end, rtyper, and
+//!      jit_codewriter.
+//!
+//!   2. Replace `ValueId(usize)` with a `Variable`-like handle that
+//!      owns its `concretetype` slot, mirroring
+//!      `flowspace.model.Variable` more directly.
+//!
+//! Until then this file holds the structural adapter that bridges the
+//! gap: a `ValueId`-indexed `Vec<ConcreteType>` populated by the
+//! rtyper projection at `crate::translator::rtyper::cutover` ~1266
+//! (`for (&vid, var) in &value_to_var { state.set(vid, lowleveltype_to_concrete(...)) }`)
+//! and read by jtransform / codewriter / assembler.  The dense Vec
+//! preserves the "every ValueId has a slot" invariant — closer to
+//! RPython's per-object slot than a sparse `HashMap` would be, since
+//! HashMap models "Variables that *happen* to carry a type binding"
+//! whereas RPython's `__slots__` makes the slot a property of the
+//! object itself.  The storage type is an implementation detail
+//! callers must not depend on (access goes through `get` / `try_get`
+//! / `contains` / `set` / `iter`); the visible shape is "every
+//! ValueId resolves to one ConcreteType, with `Unknown` as the
+//! pre-rtyper sentinel".
+//!
+//! Resource-behaviour note: pyre's `FunctionGraph::set_next_value`
+//! (`model.rs:2114`) can advance the allocator cursor past unminted
+//! ValueIds — `Transformer::allocate_synthetic_value` does this at
+//! `jtransform.rs:452`, and front-end test fixtures seed the cursor
+//! to `100`.  The Vec pays Unknown-padding cost across such skip
+//! ranges; this is a Rust-IR-adapter property of pyre's cursor API,
+//! not a parity argument for or against the Vec shape.  Sizing this
+//! out either way requires the structural port (option 1 or 2 above),
+//! at which point the side-table goes away entirely.
+//!
+//! Related structural adapters worth keeping in view alongside this
+//! one: `crate::translator::rtyper::rclass::lower_vtable_method_ptr`
+//! (`rclass.rs` ~75) emits `OpKind::VtableMethodPtr` to materialise a
+//! callable funcptr ValueId before `OpKind::IndirectCall`; RPython's
+//! `ClassRepr.getclsfield` (`rpython/rtyper/rclass.py:371`) emits
+//! vtable field-access low-level ops directly, so the
+//! `VtableMethodPtr` shape is itself a Rust-IR bridge rather than an
+//! orthodox port.  Retiring the adapter list together is the
+//! eventual shape of full structural parity.
+//!
+//! The `build_value_kinds` (pure `ConcreteType → RegKind` projection)
+//! and `merge_synth_kinds` (post-jtransform 4-source merge) helpers
+//! live here beside the data type — these are pyre-only divergences
+//! from RPython that survive the rtyper cutover
+//! (`~/.claude/plans/0-warm-raccoon.md` Slice 3).  The graph-walking
+//! algorithm `resolve_types` remains in
 //! `translator/rtyper/legacy_resolve.rs` until the real rtyper
 //! (`translator/rtyper/`) produces per-Variable concretetypes
 //! end-to-end and replaces it.
@@ -45,22 +93,27 @@ pub enum ConcreteType {
     Unknown,
 }
 
-/// Returned by [`TypeResolutionState::get`] when a slot has not been
-/// explicitly populated — mirrors the "no `concretetype` attribute yet"
-/// window between Variable creation and `setconcretetype()` upstream.
+/// Returned by [`TypeResolutionState::get`] for slots that have not
+/// been populated.  Pyre's adapter returns this `Unknown` sentinel
+/// instead of failing the way RPython does on unset
+/// `var.concretetype` (`AttributeError`) — merge / resolver code
+/// paths poll bulk ValueIds blindly and need a total function rather
+/// than the upstream's selective access pattern.  Acknowledging the
+/// divergence: pre-`setconcretetype` Variables upstream are *invalid
+/// to read*; pyre's slot table treats absence as a regular value.
 const UNKNOWN: ConcreteType = ConcreteType::Unknown;
 
-/// Type resolution state: dense `ValueId → ConcreteType` carrier.
+/// `ValueId → ConcreteType` slot table — structural adapter, see the
+/// file header for the orthodox shape this stands in for.
 ///
-/// Pyre's analogue of RPython's per-`Variable.concretetype` attribute
-/// (`flowspace/model.py:280`).  Storage is a dense `Vec<ConcreteType>`
-/// indexed by `ValueId.0`; an out-of-range index or an explicit
-/// `ConcreteType::Unknown` slot both denote "not yet populated",
-/// equivalent to `hasattr(var, 'concretetype') is False` upstream.
-///
-/// Collapsed to the four-way `Signed` / `GcRef` / `Float` / `Void` axis
-/// used by the JIT codewriter, per `rpython/jit/metainterp/history.py:45-71
-/// getkind`.
+/// Storage is a `Vec<ConcreteType>` indexed by `ValueId.0`, so every
+/// ValueId in `[0, next_value)` has exactly one slot — the same
+/// "every Variable has a slot" invariant RPython gets from
+/// `__slots__`, just routed through a side table because pyre's
+/// `ValueId(usize)` is not an object.  Public surface is method
+/// shaped (`get` / `set` / `try_get` / `contains` / `iter`) to mirror
+/// `var.concretetype` / `setattr` / `hasattr` patterns; the Vec is
+/// an implementation detail.
 #[derive(Debug, Default, Clone)]
 pub struct TypeResolutionState {
     slots: Vec<ConcreteType>,
@@ -71,7 +124,7 @@ impl TypeResolutionState {
         TypeResolutionState { slots: Vec::new() }
     }
 
-    /// Reserve dense storage for ValueIds in `[0, capacity)`.
+    /// Reserve dense slot storage for ValueIds in `[0, capacity)`.
     pub fn with_capacity(capacity: usize) -> Self {
         TypeResolutionState {
             slots: vec![ConcreteType::Unknown; capacity],
@@ -79,41 +132,36 @@ impl TypeResolutionState {
     }
 
     /// Lookup the concretetype for `id`.  Returns `&Unknown` for
-    /// unpopulated slots — equivalent to RPython's pre-`setconcretetype`
-    /// state where reading `var.concretetype` would `AttributeError`,
-    /// surfaced here as the placeholder enum rather than a panic since
-    /// merge_synth_kinds and friends iterate over all values blindly.
+    /// slots that have not been populated (out-of-range or explicit
+    /// Unknown).  Divergence from upstream `Variable.concretetype`
+    /// noted on [`UNKNOWN`].
     pub fn get(&self, id: ValueId) -> &ConcreteType {
         self.slots.get(id.0).unwrap_or(&UNKNOWN)
     }
 
-    /// Lookup with HashMap-`get`-style semantics: returns `None` for
-    /// unpopulated slots so callers can distinguish "no entry" from
-    /// "entry is Unknown" (in practice these coincide, but the
-    /// `Option` shape is load-bearing at jtransform's `get_value_type`
-    /// where an unknown slot must propagate as `None`).
+    /// Lookup with `Option` semantics — returns `None` for slots that
+    /// have not been populated (and also for slots explicitly set to
+    /// `Unknown`).  Load-bearing at jtransform's `get_value_type`
+    /// where an unset slot must propagate as `None`.
     pub fn try_get(&self, id: ValueId) -> Option<&ConcreteType> {
         match self.slots.get(id.0) {
-            Some(ConcreteType::Unknown) | None => None,
+            None | Some(ConcreteType::Unknown) => None,
             Some(ct) => Some(ct),
         }
     }
 
-    /// True iff `id` has an explicitly-populated, non-Unknown slot.
-    /// Mirrors `HashMap::contains_key` semantics: Unknown is the
-    /// "absent" sentinel.
+    /// True iff `id` has an explicitly-populated, non-`Unknown` slot.
+    /// Closest pyre analogue to RPython's `hasattr(var,
+    /// 'concretetype')`, modulo the `Unknown`-as-sentinel divergence.
     pub fn contains(&self, id: ValueId) -> bool {
-        matches!(
-            self.slots.get(id.0),
-            Some(ct) if *ct != ConcreteType::Unknown
-        )
+        matches!(self.slots.get(id.0), Some(ct) if *ct != ConcreteType::Unknown)
     }
 
-    /// Set the concretetype for `id`.  Auto-grows the dense storage
-    /// with `Unknown` padding if `id` was minted past the current
-    /// capacity — every ValueId minted by `alloc_value` ends up
-    /// reachable as a slot, matching RPython's invariant that every
-    /// Variable has a `concretetype` attribute slot reserved.
+    /// Bind `id`'s concretetype.  Auto-extends the slot table with
+    /// `Unknown` padding when `id.0` is past the current length so
+    /// the "every ValueId has a slot" invariant holds.  Idempotent;
+    /// later writes win, mirroring RPython's `var.concretetype =
+    /// lltype` re-assignment.
     pub fn set(&mut self, id: ValueId, ct: ConcreteType) {
         if id.0 >= self.slots.len() {
             self.slots.resize(id.0 + 1, ConcreteType::Unknown);
@@ -121,9 +169,12 @@ impl TypeResolutionState {
         self.slots[id.0] = ct;
     }
 
-    /// Iterate `(ValueId, &ConcreteType)` over populated slots only —
-    /// skips both out-of-range (impossible here) and `Unknown`
-    /// (sentinel) entries.  Matches HashMap iter semantics.
+    /// Iterate populated slots in ascending `ValueId` order.  Stable
+    /// ordering is load-bearing for `cutover::compare_real_against_legacy`
+    /// (`cutover.rs:408`) whose "first divergence" message must be
+    /// deterministic across runs.  Skips both unpopulated and
+    /// explicit-`Unknown` slots (the latter is the sentinel for the
+    /// pre-`setconcretetype` state).
     pub fn iter(&self) -> impl Iterator<Item = (ValueId, &ConcreteType)> + '_ {
         self.slots.iter().enumerate().filter_map(|(idx, ct)| {
             if *ct == ConcreteType::Unknown {
@@ -184,8 +235,8 @@ pub fn merge_synth_kinds(
     let mut merged = post_resolve;
 
     // (1) `original` operand inferences fill unresolved slots, but
-    // never override `post_result`. Skip Unknown entries — they are
-    // placeholders, not actual inferences.
+    // never override `post_result`.  `iter` already skips `Unknown`
+    // sentinel slots.
     for (value, kind) in original.iter() {
         if !post_result.contains_key(&value) {
             merged.set(value, kind.clone());
@@ -371,12 +422,10 @@ mod tests {
 
     #[test]
     fn merge_synth_kinds_original_unknown_does_not_propagate() {
-        // Unknown is a placeholder, not an inference. It must not fill
-        // a slot — the dense-Vec iter naturally skips Unknown sentinel
-        // slots, so the merged state's `contains(7)` stays false.
+        // Unknown is a placeholder, not an inference.  `iter` skips it
+        // so the merged state never sees the entry.
         let post_resolve = TypeResolutionState::new();
         let mut original = TypeResolutionState::new();
-        // Deliberately seed an Unknown entry — `iter` should skip it.
         original.set(ValueId(7), ConcreteType::Unknown);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
         let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
@@ -442,5 +491,22 @@ mod tests {
         assert_eq!(merged.get(ValueId(2)), &ConcreteType::Signed);
         assert_eq!(merged.get(ValueId(3)), &ConcreteType::GcRef);
         assert_eq!(merged.get(ValueId(4)), &ConcreteType::Signed);
+    }
+
+    #[test]
+    fn iter_yields_ascending_value_id_order() {
+        // `cutover::compare_real_against_legacy` (cutover.rs:408)
+        // returns the first divergence as its diff message; with a
+        // HashMap-backed store the "first" entry would be hash-order
+        // and the message would jitter across runs.  Confirm we walk
+        // slots in ascending ValueId order so the message stays
+        // deterministic.
+        let state = state_from(&[
+            (ValueId(5), ConcreteType::Float),
+            (ValueId(2), ConcreteType::Signed),
+            (ValueId(9), ConcreteType::GcRef),
+        ]);
+        let collected: Vec<_> = state.iter().map(|(vid, _)| vid).collect();
+        assert_eq!(collected, vec![ValueId(2), ValueId(5), ValueId(9)]);
     }
 }
