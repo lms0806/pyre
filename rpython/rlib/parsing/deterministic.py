@@ -438,6 +438,7 @@ return ~i""")
         return "\n".join(result)
 
     def view(self):
+        # type: () -> None
         """Display an interactive visualization of the automaton using GraphViz."""
         from dotviewer import graphclient
         p = py.test.ensuretemp("automaton").join("temp.dot")
