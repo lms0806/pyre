@@ -205,9 +205,12 @@ impl MetaInterpStaticData {
         // immediately after `finish_setup(codewriter)` from
         // `warmspot.py:289`. Pyre's `ensure_finish_setup` is the lazy
         // first-trace gate, so the descr bitstring compaction runs
-        // exactly once on the very first JIT entry — `OnceLock` inside
-        // `effectinfo::publish_ei_index_table` keeps subsequent calls
-        // idempotent.
+        // exactly once on the very first JIT entry — the
+        // `finish_setup_done` flag above this block keeps subsequent
+        // calls idempotent. Bitstring writes land directly on each
+        // descr's `ei_index` slot via `effectinfo::compute_bitstrings`
+        // (`effectinfo.py:526 descr.ei_index = …`); no process-global
+        // side table.
         if !was_done {
             self.canonical.finish_setup_descrs();
         }
@@ -1354,8 +1357,8 @@ use pyre_interpreter::DictStorage;
 
 use crate::descr::{
     GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
-    float_floatval_descr, int_intval_descr, make_array_descr, make_array_descr_with_type,
-    w_float_size_descr, w_int_size_descr,
+    float_floatval_descr, int_intval_descr, make_array_descr_with_type, w_float_size_descr,
+    w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -1722,8 +1725,20 @@ pub struct PyreEnv;
 pub(crate) fn pyobject_array_descr() -> DescrRef {
     // `nolength=True` shape (descr.py:359-360): items start at offset 0,
     // no length header — `GETARRAYITEM_GC_R(ptr, i)` lands on
-    // `ptr + i * item_size`.
-    make_array_descr(0, 8, None, Type::Ref, false)
+    // `ptr + i * item_size`.  Stable identity carrier
+    // `"pyre::pyobject_array_nolength"` so every `pyobject_array_descr()`
+    // call returns the same Arc per PyPy `cpu.arraydescrof(ARRAY)`
+    // singleton — `gc_cache._cache_array[LLType::Array(path_hash(...))]`
+    // canonicalizes across analyzer / runtime consumers.
+    crate::descr::make_array_descr_with_full_id(
+        0,
+        8,
+        0,
+        None,
+        Type::Ref,
+        false,
+        Some("pyre::pyobject_array_nolength".to_string()),
+    )
 }
 
 /// Descriptor for RPython `Ptr(GcArray(PyObjectRef))` containers —
@@ -1759,12 +1774,31 @@ pub(crate) fn pyobject_gcarray_descr() -> DescrRef {
 
 pub(crate) fn int_array_descr() -> DescrRef {
     // `nolength=True` view: caller already holds `*ItemsBlock`-style
-    // pointer to the items region, so no length header.
-    make_array_descr(0, 8, None, Type::Int, true)
+    // pointer to the items region, so no length header.  Stable
+    // identity carrier `"pyre::int_array_nolength"` so every
+    // `int_array_descr()` call returns the same Arc (PyPy
+    // `cpu.arraydescrof` singleton).
+    crate::descr::make_array_descr_with_full_id(
+        0,
+        8,
+        0,
+        None,
+        Type::Int,
+        true,
+        Some("pyre::int_array_nolength".to_string()),
+    )
 }
 
 pub(crate) fn float_array_descr() -> DescrRef {
-    make_array_descr(0, 8, None, Type::Float, false)
+    crate::descr::make_array_descr_with_full_id(
+        0,
+        8,
+        0,
+        None,
+        Type::Float,
+        false,
+        Some("pyre::float_array_nolength".to_string()),
+    )
 }
 
 /// Descriptor for `Ptr(GcArray(Signed))` materialized from resume data:

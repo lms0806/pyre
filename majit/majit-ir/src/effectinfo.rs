@@ -844,79 +844,6 @@ impl CallInfoCollection {
 
 // ════════════════════════════════════════════════════════════════════════
 // effectinfo.py:465-547 `compute_bitstrings(all_descrs)`.
-// ════════════════════════════════════════════════════════════════════════
-
-/// Per-category `(descr_index → ei_index)` map produced by
-/// `compute_bitstrings`.
-///
-/// PRE-EXISTING-ADAPTATION: PyPy stores `descr.ei_index` directly on
-/// the descriptor object (`effectinfo.py:526`); pyre lacks a central
-/// descriptor enumeration (no upstream `cpu.setup_descrs()` analogue —
-/// `SimpleFieldDescr` / `SimpleArrayDescr` / `SimpleInteriorFieldDescr`
-/// are minted on demand by `pyre-jit-trace::descr` and the `jit_struct`
-/// macro without a registry). Publishing the map externally lets every
-/// consumer that holds the descr's `index()` value resolve its
-/// `ei_index` without enumeration.
-///
-/// Three categories mirror upstream's `for key in
-/// {'fields','arrays','interiorfields'}` loop (`effectinfo.py:498`).
-/// Pyre's `descr.index()` collides across categories (each LLType pool
-/// allocates from its own counter) so the maps are partitioned per
-/// category to avoid clobber.
-#[derive(Debug, Clone, Default)]
-pub struct EiIndexTable {
-    /// `effectinfo.py:498` `for key='fields'`.
-    pub fields: std::collections::HashMap<u32, u32>,
-    /// `effectinfo.py:498` `for key='arrays'`.
-    pub arrays: std::collections::HashMap<u32, u32>,
-    /// `effectinfo.py:498` `for key='interiorfields'`.
-    pub interiorfields: std::collections::HashMap<u32, u32>,
-}
-
-impl EiIndexTable {
-    /// Look up `descr.ei_index` for a field descr by `descr.index()`.
-    /// Returns `None` if the descr did not appear in any EI's raw
-    /// readonly/write set (matching PyPy's `descr.ei_index = sys.maxint`
-    /// sentinel — `effectinfo.py:496` — except pyre returns `None`
-    /// because the descr never participated).
-    pub fn lookup_field(&self, descr_index: u32) -> Option<u32> {
-        self.fields.get(&descr_index).copied()
-    }
-
-    /// Look up `descr.ei_index` for an array descr by `descr.index()`.
-    pub fn lookup_array(&self, descr_index: u32) -> Option<u32> {
-        self.arrays.get(&descr_index).copied()
-    }
-
-    /// Look up `descr.ei_index` for an interiorfield descr by `descr.index()`.
-    pub fn lookup_interiorfield(&self, descr_index: u32) -> Option<u32> {
-        self.interiorfields.get(&descr_index).copied()
-    }
-}
-
-/// Process-global publication slot for the active `EiIndexTable`.
-///
-/// `MetaInterpStaticData::finish_setup_descrs` writes here exactly
-/// once at JIT startup (`pyjitpl.py:2287-2290 finish_setup_descrs`);
-/// readers (`heap.rs::field_effect_index` and the array reader)
-/// query this slot to translate `descr.index()` to the `ei_index`
-/// position used inside the EI bitstrings.
-///
-/// PyPy `effectinfo.py:182-190` documents the same single-shot
-/// invariant in the dual form: bitstring fields are seeded with an
-/// `Ellipsis` sentinel at EI construction time, then overwritten
-/// inside `compute_bitstrings`; any EI created after compute_bitstrings
-/// keeps the sentinel and crashes on the next `bitcheck`. The intent
-/// is to prevent silent staleness when a new EI's raw set would have
-/// shifted the (eisetr, eisetw) class assignment of existing descrs.
-///
-/// Pyre's mirror: `OnceLock` lets the first `compute_bitstrings` win
-/// the table publication. `publish_ei_index_table` (below) panics
-/// loudly on a second publication whose population differs from the
-/// first — surfacing the same architectural violation PyPy guards
-/// against.
-pub static EI_INDEX_TABLE: std::sync::OnceLock<EiIndexTable> = std::sync::OnceLock::new();
-
 /// `effectinfo.py:182-184` "no new EffectInfo after compute_bitstrings"
 /// invariant — flipped to `true` on the first
 /// `MetaInterpStaticData::finish_setup_descrs` call.  Late call-descr
@@ -967,45 +894,6 @@ impl EffectInfo {
             || any_non_empty(&self._readonly_descrs_interiorfields)
             || any_non_empty(&self._write_descrs_interiorfields)
     }
-}
-
-/// Single-shot publisher with deterministic-equivalence assertion.
-///
-/// First call stores `new_table` and returns it. Subsequent calls
-/// must produce the same table (compute_bitstrings is deterministic
-/// for a given EI population). If they don't, panic — pyre's JIT
-/// pipeline minted new descrs/EIs after `compute_bitstrings` ran,
-/// shifting the (eisetr, eisetw) classification and invalidating
-/// every bitstring already keyed by old `ei_index` values. PyPy
-/// catches the same class of bug at `effectinfo.py:182-190` via the
-/// `Ellipsis` sentinel + `bitcheck` panic; pyre catches it earlier
-/// here so the architectural invariant ("all call descrs minted
-/// before `finish_setup_descrs` runs") is enforced at the point of
-/// violation rather than at the next bitcheck.
-///
-/// Returns a clone of the now-active table for the caller to inspect.
-pub fn publish_ei_index_table(new_table: EiIndexTable) -> EiIndexTable {
-    if let Err(_already_published) = EI_INDEX_TABLE.set(new_table.clone()) {
-        let existing = EI_INDEX_TABLE
-            .get()
-            .expect("EI_INDEX_TABLE Set succeeded above");
-        if existing.fields != new_table.fields
-            || existing.arrays != new_table.arrays
-            || existing.interiorfields != new_table.interiorfields
-        {
-            panic!(
-                "publish_ei_index_table: second publication differs from first — \
-                 a new call descr / EffectInfo was minted after compute_bitstrings \
-                 ran, shifting the (eisetr, eisetw) class partition. PyPy \
-                 effectinfo.py:182-190 forbids the same shape via the Ellipsis \
-                 sentinel + bitcheck panic. Fix: ensure all call descrs are \
-                 minted before MetaInterpStaticData::finish_setup_descrs runs.\n\
-                 existing: {existing:?}\n  new: {new_table:?}"
-            );
-        }
-        return existing.clone();
-    }
-    new_table
 }
 
 /// `effectinfo.py:147-148 EffectInfo._cache` parity key.
@@ -1156,17 +1044,27 @@ impl EiCanonKey {
 /// `EffectInfo.bitstring_*` field. Idempotent — calling it twice on
 /// the same input is a no-op.
 ///
-/// **Returns** the `(descr.index() → ei_index)` map per category.
-/// Pyre publishes this externally because the `Descr::set_ei_index`
-/// path only fires for descrs the caller has already enumerated into
-/// `all_descrs`; descrs that participate in EI raw sets but were minted
-/// outside any registry need the map for `descr.index() → ei_index`
-/// translation. See `EiIndexTable` doc.
-pub fn compute_bitstrings(
-    all_descrs: &[DescrRef],
-    all_eis: &mut [&mut EffectInfo],
-) -> EiIndexTable {
+/// PyPy `effectinfo.py:526 descr.ei_index = …` stamps the per-descr
+/// `ei_index` directly on the descriptor object; pyre matches via the
+/// `Descr::set_ei_index` atomic. Readers (`heap.rs::field_effect_index`
+/// etc.) then resolve through `descr.get_ei_index()` alone — no
+/// process-global side table.
+pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInfo]) {
     use std::collections::HashMap;
+
+    // `effectinfo.py:479-496` `for descr in all_descrs:` pre-loop —
+    // every non-call descr's `ei_index` is initialised to
+    // `sys.maxint` BEFORE any bitstring classification.  Pyre lifts
+    // this so re-running `compute_bitstrings` over an `all_descrs`
+    // that already received per-descr stamps from a prior invocation
+    // does not leak stale `ei_index` values into the post-classification
+    // raw-set probes (`heap.rs::field_effect_index` reads
+    // `descr.get_ei_index()` directly with no side-table fallback).
+    for descr in all_descrs {
+        if descr.as_call_descr().is_none() {
+            descr.set_ei_index(u32::MAX);
+        }
+    }
 
     // effectinfo.py:484-489: random-effects EIs zero out bitstrings.
     // The matching invariant — when `_readonly_descrs_fields` is None,
@@ -1209,7 +1107,7 @@ pub fn compute_bitstrings(
 
     // Per-category descr-Arc enumeration.
     //
-    // PyPy `effectinfo.py:493-495`:
+    // `effectinfo.py:493-495`:
     // ```python
     // descrs = {'fields': set(), 'arrays': set(),
     //           'interiorfields': set()}
@@ -1218,41 +1116,16 @@ pub fn compute_bitstrings(
     //     ...
     // ```
     // Python's `set.update` keys on `id(descr)`, so the partition is
-    // intrinsically collision-free by object identity.
+    // intrinsically collision-free by object identity. Pyre's lift
+    // builds the same set per category inside the loop below
+    // (`category_descrs`), keyed on `Arc::as_ptr` ptr-id — direct lift
+    // of Python's `id()`.
     //
-    // Pyre's lift carries `Vec<DescrRef>` so the partition is keyed
-    // on `Arc::as_ptr` ptr-id (`descr_ptr_id`) — direct lift of
-    // Python's `id()`. Two distinct Arcs (even if they happen to
-    // share a `descr.index()`) stay separate; two clones of the
-    // same Arc collapse to one entry.
-    //
-    // We also keep an `all_descrs`-derived ptr-id → `&DescrRef` map
-    // for two reasons:
-    //   1. The per-category descrs that participate in any EI raw
-    //      set must have their `ei_index` written — when raw set
-    //      Arc has not been enumerated through `all_descrs`, the
-    //      direct walk through raw sets below covers it (the Arcs
-    //      live IN the raw set).
-    //   2. Descrs in `all_descrs` that do NOT appear in any EI raw
-    //      set must keep their `ei_index = u32::MAX` sentinel
-    //      (PyPy `effectinfo.py:496` `descr.ei_index = sys.maxint`).
-    //      The map below identifies category membership for these
-    //      so the `EiIndexTable.fields/arrays/interiorfields` can
-    //      stay populated for legacy heap.rs readers that key by
-    //      `descr.index()`.
-    let mut all_descrs_by_category: [HashMap<usize, &DescrRef>; 3] =
-        [HashMap::new(), HashMap::new(), HashMap::new()];
-    for d in all_descrs {
-        if d.as_field_descr().is_some() {
-            all_descrs_by_category[0].insert(descr_ptr_id(d), d);
-        }
-        if d.as_array_descr().is_some() {
-            all_descrs_by_category[1].insert(descr_ptr_id(d), d);
-        }
-        if d.as_interior_field_descr().is_some() {
-            all_descrs_by_category[2].insert(descr_ptr_id(d), d);
-        }
-    }
+    // Descrs in `all_descrs` that never enter any EI raw set keep
+    // their `ei_index = u32::MAX` sentinel via the entry-loop pre-init
+    // (`effectinfo.py:496` `descr.ei_index = sys.maxint`), which runs
+    // unconditionally at the top of `compute_bitstrings` over every
+    // non-call descr — no per-category lookup is needed here.
 
     // `effectinfo.py:147-148` `EffectInfo._cache` parity — PyPy keys
     // the EffectInfo factory cache on the structural tuple (raw sets,
@@ -1276,7 +1149,6 @@ pub fn compute_bitstrings(
         canonical_id_for_position.push(canon);
     }
 
-    let mut output_table = EiIndexTable::default();
     // Three category iterations match `for key in descrs:` at
     // `effectinfo.py:498-540`. Each category is independent: a descr
     // is partitioned within its category, so the same `descr.ei_index`
@@ -1383,55 +1255,13 @@ pub fn compute_bitstrings(
             descr.set_ei_index(*ei_index);
         }
 
-        // PRE-EXISTING-ADAPTATION: `descr.index() → ei_index` side
-        // table for legacy `heap.rs` readers that still query by
-        // `descr.index()` (Task #306 — migrate `heap.rs` readers to
-        // canonical `descr.get_ei_index()`).
-        //
-        // **Divergence from PyPy**: `effectinfo.py:504-526` keys
-        // `compute_bitstrings` purely on descriptor **object identity**
-        // (Python `id(descr)` via dict containment + `descr.ei_index =
-        // bitstring_idx` write).  This side table keys on `descr.index()`,
-        // a u32 id minted by `descr_registry::register_*`. The mapping
-        // is correct **only** when each `descr.index()` value points
-        // to at most one Arc — i.e. the analyzer-time Arc and the
-        // runtime-time Arc that share a `(struct, fieldname)` happen
-        // to land on the same `descr.index()` bucket.  Task #316
-        // (`cc.fielddescrof` ↔ `gc_cache.get_field_descr` cache-or-mint
-        // convergence) is the structural fix; until it lands, two
-        // distinct Arcs with collidng `descr.index()` collapse to
-        // "first wins" here.  The `or_insert` is the audible signal
-        // of the collision.
-        //
-        // **Convergence path**: when Task #316 unifies the analyzer
-        // and runtime descr identity, drop this side table entirely —
-        // `descr.get_ei_index()` alone suffices, and the canonical
-        // reader path at `heap.rs::field_effect_index` already prefers
-        // it (the table is only consulted on the fallback branch).
-        let mut descr_to_eiindex_by_idx: HashMap<u32, u32> = HashMap::new();
-        for (_pid, (descr, ei_index)) in &descr_to_eiindex_by_ptr {
-            descr_to_eiindex_by_idx
-                .entry(descr.index())
-                .or_insert(*ei_index);
-        }
-        // Also cover descrs from `all_descrs` that did NOT appear in
-        // any EI raw set — they keep `ei_index = u32::MAX` (PyPy
-        // `effectinfo.py:496`) but should still be reachable via the
-        // EiIndexTable (heap.rs treats `u32::MAX` as no-bitstring).
-        // Currently this is implicit: descrs not in
-        // `descr_to_eiindex_by_ptr` simply don't get an entry, and
-        // heap.rs falls back to `descr.index()` legacy lookup which
-        // returns `None`.
-        let _ = &all_descrs_by_category[category]; // explicit usage marker
-
-        // Stash the resolved map onto the returned `EiIndexTable` for
-        // out-of-band callers (e.g. `heap.rs::field_effect_index`).
-        match category {
-            0 => output_table.fields = descr_to_eiindex_by_idx,
-            1 => output_table.arrays = descr_to_eiindex_by_idx,
-            2 => output_table.interiorfields = descr_to_eiindex_by_idx,
-            _ => unreachable!(),
-        }
+        // `effectinfo.py:496` `descr.ei_index = sys.maxint`:
+        // descrs from `all_descrs` that did NOT appear in any EI raw
+        // set keep their `ei_index = u32::MAX` sentinel set by the
+        // entry-loop pre-init at the top of this function. Readers
+        // (`heap.rs::field_effect_index`, etc.) treat MAX as
+        // no-bitstring per `bitstring.py:18 if byte_number >=
+        // len(bitstring)`.
 
         // `effectinfo.py:528-538`: encode the bitstring on each active
         // EI using `descr.get_ei_index()` per descr in the raw set.
@@ -1470,7 +1300,6 @@ pub fn compute_bitstrings(
             store_category_bitstrings(ei, category, Some(r_bs), Some(w_bs));
         }
     }
-    output_table
 }
 
 /// Helper: project `(_readonly_descrs_*, _write_descrs_*)` for a category.

@@ -14122,32 +14122,20 @@ impl MetaInterpStaticData {
     ///     effectinfo.compute_bitstrings(self.all_descrs)
     /// ```
     ///
-    /// Pyre lift: pulls every cached `MetaCallDescr` from
-    /// `crate::call_descr::cached_call_descrs` (CALL_DESCR_CACHE is
-    /// RPython's gc-cache call slot in pyre) and runs
-    /// `effectinfo::compute_bitstrings` over the population. The new
-    /// bitstrings are written back through `Descr::set_effect_bitstrings`
-    /// onto each `MetaCallDescr`'s `effect_info` (interior-mutable —
-    /// see the trait method's SAFETY note); the per-category
-    /// `(descr.index() → ei_index)` map returned by
-    /// `compute_bitstrings` is published into the process-global
-    /// `EI_INDEX_TABLE` so heap.rs (and other readers) can resolve
-    /// `descr.ei_index` for descrs that pyre never enumerated into
-    /// `all_descrs`.
-    ///
-    /// PRE-EXISTING-ADAPTATION: PyPy's `cpu.setup_descrs()` returns
-    /// every gc-cache descr (size/field/array/arraylen/call/
-    /// interiorfield) in one shot. Pyre lacks the central registry —
-    /// `SimpleFieldDescr` / `SimpleArrayDescr` etc. are minted on
-    /// demand by `pyre-jit-trace::descr` and `jit_struct!` macros
-    /// without registering anywhere. The side-table publication via
-    /// `EI_INDEX_TABLE` covers the gap; no GcCache parameter needed.
+    /// Pyre lift: concatenates every cached descr from
+    /// `descr_registry` (size, field, array, arraylen, interiorfield)
+    /// + `gc_cache._cache_call_order` (call) in PyPy's `descr.py:25-47
+    /// setup_descrs` group order, runs `effectinfo::compute_bitstrings`
+    /// over the population, and writes the new bitstrings back through
+    /// `Descr::set_effect_bitstrings` onto each call descr's interior
+    /// `effect_info` cell.  `effectinfo.py:523-526 descr.ei_index = …`
+    /// is the single writer of `ei_index` on every read/write set
+    /// member — heap.rs reads `descr.get_ei_index()` directly via the
+    /// `Descr` trait accessor; no process-global side table.
     ///
     /// Idempotent: re-running re-classifies in-place and emits the
     /// same bitstrings (compute_bitstrings's class assignment is
-    /// deterministic for a given EI population). The `OnceLock`
-    /// publication slot makes the second call's table store a no-op;
-    /// see `publish_ei_index_table` for the keep-first semantic.
+    /// deterministic for a given EI population).
     pub fn finish_setup_descrs(&self) {
         // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
@@ -14223,21 +14211,14 @@ impl MetaInterpStaticData {
                 writeback_descrs.push(d.clone());
             }
         }
-        let table = {
+        // `effectinfo.py:526 descr.ei_index = …` writes the per-class
+        // index directly onto each descr Arc via interior atomic.
+        // `heap.rs::field_effect_index` resolves through
+        // `descr.get_ei_index()` alone — no process-global side table.
+        {
             let mut ei_refs: Vec<&mut majit_ir::EffectInfo> = owned_eis.iter_mut().collect();
-            majit_ir::effectinfo::compute_bitstrings(&all_descrs, &mut ei_refs)
-        };
-        // `effectinfo.py:526` `descr.ei_index = …`. Pyre lacks a
-        // descriptor enumeration to back-write `ei_index` onto every
-        // field/array descr — `compute_bitstrings`'s `set_ei_index`
-        // loop only fires on descrs the caller has already collected
-        // into `all_descrs` (which excludes pyre's per-callsite
-        // `SimpleFieldDescr::new` allocations). Publishing the
-        // category-keyed map as the side-table lookup makes
-        // `heap.rs::field_effect_index` resolution unambiguous in
-        // either direction (descr-side `ei_index` field OR
-        // side-table map).
-        majit_ir::effectinfo::publish_ei_index_table(table);
+            majit_ir::effectinfo::compute_bitstrings(&all_descrs, &mut ei_refs);
+        }
         // Write back the rewritten bitstring fields. PyPy
         // `effectinfo.py:537-538` `setattr(ei, 'bitstring_*', ...)` runs
         // inside compute_bitstrings; pyre splits that into a separate

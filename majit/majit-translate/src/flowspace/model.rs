@@ -556,13 +556,13 @@ impl HostObject {
     }
 
     pub fn new_user_function(graph_func: GraphFunc) -> Self {
-        // Audit 1.5 extension (2026-05-08): class-owned methods carry
-        // `Class.method`-shaped qualnames mirroring upstream Python
-        // `func.__qualname__` which `def bar(self): ...` inside a
-        // `class Foo:` produces. `gf.class_` is the resolved owner
-        // (set by the impl-method walker path); when absent the fn is
-        // module-scoped and qualname falls through to `gf.name` per
-        // upstream free-fn shape.
+        // `pygraph.py:25-31 _sanitize_funcname`: if `func.class_` is set
+        // (attached by `classdesc.py:606` for method functions), the
+        // graph name is `'%s.%s' % (class_.__name__, func.__name__)`.
+        // Pyre's `GraphFunc.class_` carries the owner `HostObject` for
+        // method functions; `simple_name()` returns `cls.__name__` (the
+        // short name — NOT the dotted qualname, which would produce
+        // `module.Foo.bar` instead of upstream's `Foo.bar`).
         //
         // `name` (the short `__name__` slot) stays at `code.co_name` /
         // `gf.name` so callers reading the bare ident continue to see
@@ -570,7 +570,7 @@ impl HostObject {
         // derives from the owner class's module — `split_attr_name_module`
         // would mistake the class name for a module otherwise.
         let class_qualname = graph_func.class_.as_ref().and_then(|c| {
-            let q = c.qualname();
+            let q = c.simple_name();
             if q.is_empty() {
                 None
             } else {

@@ -1067,13 +1067,31 @@ pub fn resume_in_blackhole(
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
         bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
-        // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
-        // reds = ['frame', 'ec']`) are filled by `consume_one_section`
-        // (resume.py:1381 / `_prepare_next_section` resume.py:1017) from
-        // the regular `-live-` op slot list — the codewriter now seeds
-        // `portal_frame_reg` / `portal_ec_reg` into every -live- op's
-        // R-bank via `filter_liveness_in_place` (jit/codewriter.rs:2364).
-        // No separate fill step is needed; RPython has no counterpart.
+        // PRE-EXISTING-ADAPTATION (Task #122 epic, blocked on Task #185
+        // SSA-authoritative `live_r` rewire + Task #158 graph regalloc):
+        //
+        // RPython structure (`pypy/module/pypyjit/interp_jit.py:67
+        // reds = ['frame', 'ec']`):
+        //   * `JitDriver` declares `reds = ['frame', 'ec']` →
+        //     `warmstate.py` registers `frame`, `ec` as red inputargs at
+        //     trace start;
+        //   * every `-live-` op carries `frame`, `ec` in its liveness map
+        //     so they survive the trace;
+        //   * `consume_one_section` (`resume.py:1381` /
+        //     `_prepare_next_section` resume.py:1017) fills them back
+        //     into the BlackHole interp's register banks from the regular
+        //     resume-data slot list.
+        //
+        // pyre's current state: the codewriter has no JitDriver
+        // greens/reds → register-slot derivation, so `portal_frame_reg` /
+        // `portal_ec_reg` stay at the `u16::MAX` sentinel
+        // (`canonical_bridge.rs:165-166`, `pyjitcode.rs:403-404`) and the
+        // blackhole resume reconstructs `virtualizable_ptr` directly from
+        // the live `frame_ptr` field passed into this entry point above.
+        // This is a side-channel restore — RPython has the canonical
+        // counterpart (the `reds` declaration above), but porting it
+        // requires the JitDriver inputarg → liveness chain that the
+        // referenced epic landings will provide.
 
         // resume.py:1342 `curbh.handle_rvmprof_enter()` — runs the rvmprof
         // `entering=0` hook immediately after consume_one_section. For the

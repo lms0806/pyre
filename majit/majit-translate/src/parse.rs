@@ -121,12 +121,103 @@ pub struct InherentMethodInfo {
 /// Parsed representation of an interpreter source file.
 pub struct ParsedInterpreter {
     pub file: File,
+    /// Crate-stripped module path of this source file
+    /// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).
+    /// Empty when the caller did not supply one — top-level items
+    /// remain at simple-name registration.
+    pub module_path: String,
+    /// `use` declarations resolved into an alias → fully-qualified-path
+    /// table, populated by [`collect_use_imports`].  Mirrors PyPy's
+    /// `annotator.bookkeeper` import-resolution step: when the AST
+    /// references a bare type name `Foo` that this file pulled in via
+    /// `use other_mod::Foo;` (or `use other_mod::Foo as Q;`), the
+    /// canonical fully-qualified path lives under the in-scope alias
+    /// here so `qualify_to_canonical_struct` can resolve cross-module
+    /// type identity without re-walking the source tree.
+    pub use_imports: std::collections::HashMap<String, String>,
 }
 
-/// Parse a bundled Rust source file.
 pub fn parse_source(source: &str) -> ParsedInterpreter {
     let file = syn::parse_file(source).expect("failed to parse bundled source");
-    ParsedInterpreter { file }
+    let use_imports = collect_use_imports(&file.items);
+    ParsedInterpreter {
+        file,
+        module_path: String::new(),
+        use_imports,
+    }
+}
+
+/// Parse a bundled Rust source file with its crate-stripped module
+/// path.  e.g. `parse_source_with_module(src, "intobject")` for
+/// `pyre_object/src/intobject.rs` — aligns analyzer-side
+/// `path_hash(canonical_struct_name)` with the runtime's
+/// dual-published `path_hash(strip_crate(module_path!())::Name)` slot
+/// in `gc_cache._cache_size` (PyPy `cache[STRUCT]` lltype-object
+/// identity, descr.py:108-118).
+pub fn parse_source_with_module(source: &str, module_path: &str) -> ParsedInterpreter {
+    let file = syn::parse_file(source).expect("failed to parse bundled source");
+    let use_imports = collect_use_imports(&file.items);
+    ParsedInterpreter {
+        file,
+        module_path: module_path.to_string(),
+        use_imports,
+    }
+}
+
+/// Walk every `Item::Use` at the file root and recursively expand the
+/// use tree into an `{alias → full_path}` table.
+///
+/// Handles `UseTree::Path`, `UseTree::Name`, `UseTree::Rename` (`use X
+/// as Y`), and `UseTree::Group` (`use X::{A, B}`).  `UseTree::Glob`
+/// (`use X::*`) is recorded as a no-op: pyre cannot resolve glob
+/// exports without re-parsing the target module, so glob-imported
+/// bare names fall back to the same-module-default qualification.
+///
+/// Restricted to file-root use statements: PyPy's resolver also only
+/// honours module-level imports (`annrpython.py` bookkeeper); function-
+/// local `use` clauses are out of scope.
+pub(crate) fn collect_use_imports(items: &[Item]) -> std::collections::HashMap<String, String> {
+    let mut imports = std::collections::HashMap::new();
+    for item in items {
+        if let Item::Use(u) = item {
+            walk_use_tree(&u.tree, &mut Vec::new(), &mut imports);
+        }
+    }
+    imports
+}
+
+fn walk_use_tree(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    imports: &mut std::collections::HashMap<String, String>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            walk_use_tree(&p.tree, prefix, imports);
+            prefix.pop();
+        }
+        syn::UseTree::Name(n) => {
+            let alias = n.ident.to_string();
+            prefix.push(alias.clone());
+            imports.insert(alias, prefix.join("::"));
+            prefix.pop();
+        }
+        syn::UseTree::Rename(r) => {
+            prefix.push(r.ident.to_string());
+            let full = prefix.join("::");
+            imports.insert(r.rename.to_string(), full);
+            prefix.pop();
+        }
+        syn::UseTree::Glob(_) => {
+            // No exposed names — caller falls back to local-module qualification.
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                walk_use_tree(sub, prefix, imports);
+            }
+        }
+    }
 }
 
 /// Find a top-level function by exact name in the parsed source.

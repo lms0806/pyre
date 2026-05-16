@@ -3728,10 +3728,10 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
     let descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        // Note: BhDescr.type_id is the u64 cache key;
-        // `typedescr.type_id()` returns the u32 gc tid.  Widen via
-        // `as u64` until `SizeDescr` exposes a `cache_key()` accessor.
-        type_id: typedescr.type_id() as u64,
+        // `descr.py:108-118` cache identity — `SizeDescr.cache_key()`
+        // returns the `LLType::Struct(path_hash)` slot stamped at
+        // `get_size_descr` cache-miss-mint.
+        type_id: typedescr.cache_key(),
         vtable: 0,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(typedescr),
@@ -3811,8 +3811,8 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let vtable = descr.vtable();
     let bh_descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        // Note: u32 gc tid widened to u64 cache key slot.
-        type_id: descr.type_id() as u64,
+        // `descr.py:108-118` cache identity via `SizeDescr.cache_key()`.
+        type_id: descr.cache_key(),
         vtable,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
@@ -5919,8 +5919,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .expect("allocate_struct: not a SizeDescr");
         let bh_descr = majit_translate::jitcode::BhDescr::Size {
             size: sd.size(),
-            // Note: u32 gc tid widened to u64 cache key slot.
-            type_id: sd.type_id() as u64,
+            // `descr.py:108-118` cache identity via `SizeDescr.cache_key()`.
+            type_id: sd.cache_key(),
             vtable: 0,
             owner: String::new(),
             all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),

@@ -145,6 +145,59 @@ pub fn path_hash(s: &str) -> u64 {
     h.finish()
 }
 
+/// Use-import resolver / module-aware canonicalisation table.
+///
+/// Maps `bare_struct_name → defining_module_path` as discovered by
+/// `majit_translate::front::ast::collect_struct_origins`.  Once the
+/// analyzer pipeline populates this registry, `canonical_struct_name`
+/// can transform a bare token like `"W_IntObject"` into the canonical
+/// `"intobject::W_IntObject"` that the runtime's
+/// `build_object_descr_group_with_def_path` dual-publishes — bringing
+/// analyzer-side `path_hash` into structural parity with PyPy's
+/// `cache[STRUCT]` lltype-object identity (descr.py:108-118).
+///
+/// Global state mirrors the existing `gc_cache()` / descr-registry
+/// pattern: per-process, written once at JIT-start, read freely.
+/// Empty when the analyzer was invoked via the bare `parse_source`
+/// entry (no module_path supplied); consumers then fall back to the
+/// bare name, which still resolves through the runtime dual-publish's
+/// simple-name slot.
+static STRUCT_ORIGIN_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Populate / replace the global `STRUCT_ORIGIN_REGISTRY` with a fresh
+/// `(bare_name, defining_module_path)` table.  Analyzer calls this
+/// once after `collect_program_metadata_pub` so subsequent
+/// `canonical_struct_name` lookups see the resolver output.
+pub fn register_struct_origins(origins: std::collections::HashMap<String, String>) {
+    let mut guard = STRUCT_ORIGIN_REGISTRY.lock().unwrap();
+    *guard = origins;
+}
+
+/// Canonicalise a struct name into its `defining_module_path::Bare`
+/// form when the resolver has recorded an origin, otherwise return
+/// the input unchanged.  Used at every `path_hash` site that hashes
+/// a STRUCT identity so the cache key lands on the same slot the
+/// runtime's qualified def-path dual-publish wrote to.
+///
+/// Already-qualified inputs (containing `::`) pass through verbatim
+/// — they are presumed canonical (typically produced by upstream
+/// `use foo::bar::Baz` path expansion that yields `foo::bar::Baz`
+/// in the AST).
+pub fn canonical_struct_name(name: &str) -> String {
+    if name.contains("::") {
+        return name.to_string();
+    }
+    let guard = STRUCT_ORIGIN_REGISTRY.lock().unwrap();
+    match guard.get(name) {
+        Some(module_path) if !module_path.is_empty() => {
+            format!("{}::{}", module_path, name)
+        }
+        _ => name.to_string(),
+    }
+}
+
 impl LLType {
     /// descr.py:665: get_call_descr key tuple.
     pub fn func_key(
@@ -209,8 +262,12 @@ impl LLType {
 pub struct GcCache {
     /// descr.py:18: _cache_size[STRUCT]
     pub _cache_size: HashMap<LLType, DescrRef>,
-    /// descr.py:19: _cache_field[STRUCT][fieldname]
-    pub _cache_field: HashMap<LLType, HashMap<String, DescrRef>>,
+    /// descr.py:19: _cache_field[STRUCT][fieldname]. Typed `Arc<SimpleFieldDescr>`
+    /// per PyPy's concrete `FieldDescr` (descr.py:146 `class FieldDescr(ArrayOrFieldDescr)`).
+    /// Concrete-Arc return enables analyzer-side `cc.fielddescrof_concrete`
+    /// to cache-hit a previously-minted runtime `__majit_register_descrs`
+    /// Arc without an `Arc<dyn Descr>` → `Arc<SimpleFieldDescr>` downcast.
+    pub _cache_field: HashMap<LLType, HashMap<String, Arc<SimpleFieldDescr>>>,
     /// descr.py:20: _cache_array[ARRAY_OR_STRUCT]
     pub _cache_array: HashMap<LLType, DescrRef>,
     /// descr.py:21: _cache_arraylen[ARRAY_OR_STRUCT]
@@ -231,13 +288,19 @@ pub struct GcCache {
     _cache_call_order: Vec<DescrRef>,
     _cache_interiorfield_order: Vec<DescrRef>,
 
-    /// descr.py:109 + gc.py:536 init_size_descr: dense sequential tid.
-    /// RPython's `heaptracker.register_TYPE` hands out a fresh small
-    /// integer per STRUCT so `guard_class(obj, tid)` can use it as a
-    /// direct slot. We generate the same shape here by allocating
-    /// monotonically on first `get_size_descr` per key — collision-free
-    /// regardless of the caller-supplied LLType key derivation.
-    next_struct_tid: u32,
+    /// `gctypelayout.py:301-357 TypeLayoutBuilder.get_type_id` analog —
+    /// the shared dense sequential GC type-id allocator covering both
+    /// `GcStruct` and `GcArray`.  PyPy's `type_info_group.add_member`
+    /// returns a monotonically-increasing index across `id_of_type`;
+    /// `init_size_descr` (`gc.py:536-542`) and `init_array_descr`
+    /// (`gc.py:544-549`) call `layoutbuilder.get_type_id(TYPE)` to
+    /// stamp `descr.tid`.  Pyre lifts the allocator onto `GcCache`
+    /// itself (no separate layoutbuilder object) — analyzer-side
+    /// SizeDescr + ArrayDescr cache-miss-mint each pull one tid from
+    /// this counter via the matching `init_*_descr` hook, mirroring
+    /// PyPy's structure.  Tid 0 is reserved (`gctypelayout.py:328-331`
+    /// "don't use typeid 0, may help debugging").
+    next_type_id: u32,
 }
 
 impl GcCache {
@@ -255,8 +318,10 @@ impl GcCache {
             _cache_arraylen_order: Vec::new(),
             _cache_call_order: Vec::new(),
             _cache_interiorfield_order: Vec::new(),
-            // tid 0 is reserved as "no class" / sentinel.
-            next_struct_tid: 1,
+            // tid 0 is reserved as "no class" / sentinel —
+            // `gctypelayout.py:328-331 make_type_info_group` adds a
+            // DUMMY member at index 0.
+            next_type_id: 1,
         }
     }
 
@@ -304,25 +369,38 @@ impl GcCache {
         all_descrs
     }
 
-    /// descr.py:49-50 init_size_descr(self, STRUCT, sizedescr).
-    /// Hook for subclass overrides (e.g. GcLLDescr_framework sets tid).
-    ///
-    /// gc.py:536-542: GcLLDescr_framework.init_size_descr sets
-    /// `descr.tid = combine_ushort(type_id, 0)`. Called BEFORE
-    /// wrapping in Arc.
-    pub fn init_size_descr(&self, _key: &LLType, _sizedescr: &mut SimpleSizeDescr) {
-        // Base class does nothing — matches descr.py:50 `pass`.
+    /// `gc.py:536-542 GcLLDescr_framework.init_size_descr` analog.
+    /// Allocates a dense GC tid via `next_type_id` (the
+    /// `TypeLayoutBuilder.get_type_id` analog) and stamps
+    /// `SimpleSizeDescr.type_id`.  Called BEFORE Arc wrap so the
+    /// mutation lands on the unwrapped descriptor, matching PyPy's
+    /// mutable-object semantics.
+    pub fn init_size_descr(&mut self, _key: &LLType, sizedescr: &mut SimpleSizeDescr) {
+        let type_id = self.alloc_type_id();
+        sizedescr.set_type_id(type_id);
     }
 
-    /// descr.py:52-54 init_array_descr(self, ARRAY, arraydescr).
-    /// Hook for subclass overrides (e.g. GcLLDescr_framework sets tid).
-    ///
-    /// gc.py:544-549: GcLLDescr_framework.init_array_descr sets
-    /// `descr.tid = combine_ushort(type_id, 0)`. The `&mut` reference
-    /// allows the hook to mutate the descriptor BEFORE it is wrapped
-    /// in Arc, matching RPython's mutable-object semantics.
-    pub fn init_array_descr(&self, _key: &LLType, _arraydescr: &mut SimpleArrayDescr) {
-        // Base class: assert only — matches descr.py:53-54.
+    /// `gc.py:544-549 GcLLDescr_framework.init_array_descr` analog.
+    /// Same shape as `init_size_descr` — share the `next_type_id`
+    /// counter per PyPy's single `type_info_group` covering both
+    /// GcStruct and GcArray.
+    pub fn init_array_descr(&mut self, _key: &LLType, arraydescr: &mut SimpleArrayDescr) {
+        let type_id = self.alloc_type_id();
+        arraydescr.set_type_id(type_id);
+    }
+
+    /// `gctypelayout.py:349 type_info_group.add_member` analog — hand
+    /// out the next sequential tid and bump the counter.  u32::MAX
+    /// overflow panics (analyzer trace pool cannot exceed 2^32 distinct
+    /// types in any conceivable program; assertion guards programmer
+    /// error sooner than overflow corruption).
+    fn alloc_type_id(&mut self) -> u32 {
+        let tid = self.next_type_id;
+        self.next_type_id = self
+            .next_type_id
+            .checked_add(1)
+            .expect("GcCache type_id overflow (u32)");
+        tid
     }
 }
 
@@ -339,9 +417,10 @@ impl GcCache {
     /// `vtable` is a payload/assertion parameter, not part of the key.
     /// `immutable_flag`: descr.py:112 heaptracker.is_immutable_struct(STRUCT).
     ///
-    /// The numeric `tid` stored on the returned SizeDescr is allocated
-    /// monotonically from `next_struct_tid` (descr.py:109 +
-    /// gc.py:536 init_size_descr) — caller does not supply it. This
+    /// The numeric `tid` stamped on the returned SizeDescr is allocated
+    /// by `init_size_descr` from the shared `next_type_id` counter
+    /// (analog of `TypeLayoutBuilder.get_type_id` in
+    /// `gctypelayout.py:333-357`).  Caller does not supply it.  This
     /// guarantees dense, collision-free tids per distinct key regardless
     /// of how the caller derived the `LLType::Struct(u64)` identity.
     pub fn get_size_descr(
@@ -355,19 +434,25 @@ impl GcCache {
         if let Some(descr) = self._cache_size.get(&key) {
             return descr.clone();
         }
-        // Fresh tid per distinct key. See field-doc on `next_struct_tid`.
-        let type_id = self.next_struct_tid;
-        self.next_struct_tid = self
-            .next_struct_tid
-            .checked_add(1)
-            .expect("GcCache struct tid overflow (u32)");
         // descr.py:117-118: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
+        // `type_id` placeholder 0 — overwritten by `init_size_descr`
+        // below per `gc.py:536-542` structure.
         let mut sd = if vtable != 0 {
-            SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)
+            SimpleSizeDescr::with_vtable(u32::MAX, size, 0, vtable)
         } else {
-            SimpleSizeDescr::new(u32::MAX, size, type_id)
+            SimpleSizeDescr::new(u32::MAX, size, 0)
         };
         sd.is_immutable = immutable_flag;
+        // Stamp the original `LLType::Struct(u64)` cache key onto the
+        // descr so the inverse `bh_size_spec_from_descr` reader
+        // (`assembler.rs`) recovers the same key the analyzer-side
+        // `bh_size_spec_from_callcontrol` stamps.  Without this slot,
+        // `bh_size_spec_from_descr` returned `type_id` widened to u64,
+        // landing on a different `_cache_size` slot when round-tripped
+        // through `simple_descr_group_from_bh_size`.
+        if let LLType::Struct(k) = &key {
+            sd.set_cache_key(*k);
+        }
         // descr.py:119: gccache.init_size_descr(STRUCT, sizedescr)
         // gc.py:536-542: sets descr.tid — must happen BEFORE Arc wrap.
         self.init_size_descr(&key, &mut sd);
@@ -402,7 +487,7 @@ impl GcCache {
         is_immutable: bool,
         flag: ArrayFlag,
         index_in_parent: usize,
-    ) -> DescrRef {
+    ) -> Arc<SimpleFieldDescr> {
         // descr.py:220-221: cache[STRUCT][fieldname]
         if let Some(inner) = self._cache_field.get(&struct_key) {
             if let Some(descr) = inner.get(field_name) {
@@ -433,11 +518,11 @@ impl GcCache {
         if let Some(ref p) = parent {
             fd.parent_descr = Some(Arc::downgrade(p));
         }
-        let descr: DescrRef = Arc::new(fd);
+        let descr = Arc::new(fd);
         // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
         let inner = self._cache_field.entry(struct_key).or_default();
         inner.insert(field_name.to_string(), descr.clone());
-        self._cache_field_order.push(descr.clone());
+        self._cache_field_order.push(descr.clone() as DescrRef);
         descr
     }
 
@@ -507,6 +592,16 @@ impl GcCache {
         ad.lendescr = lendescr;
         ad.is_pure = is_pure;
         ad.concrete_type = concrete_type;
+        // Stamp the original `LLType::Array(u64)` cache key onto the
+        // descr so the inverse `BhDescr::Array.type_id` reader
+        // (`assembler.rs`, `jitcode.rs`) recovers the same key the
+        // analyzer-side `arraydescrof_concrete` stamped.  Without this
+        // slot, those readers returned `type_id` widened to u64, landing
+        // on a different `_cache_array` slot when round-tripped through
+        // `make_struct_array_descr_full_keyed`.
+        if let LLType::Array(k) = &key {
+            ad.set_cache_key(*k);
+        }
         // descr.py:377: gccache.init_array_descr(ARRAY_OR_STRUCT, arraydescr)
         // gc.py:544-549: sets descr.tid — must happen BEFORE Arc wrap.
         self.init_array_descr(&key, &mut ad);
@@ -516,6 +611,58 @@ impl GcCache {
         self._cache_array_order.push(descr.clone());
         // descr.py:372-375: all_interiorfielddescrs for struct arrays
         // — set externally via SimpleArrayDescr::set_all_interiorfielddescrs
+        descr
+    }
+
+    /// `descr.py:423-438 get_interiorfield_descr(gc_ll_descr, ARRAY, name, arrayfieldname=None)`
+    /// cache-or-mint.  Keys `_cache_interiorfield[(ARRAY, name, arrayfieldname)]`
+    /// so the analyzer's `cc.interiorfielddescrof` and the struct-array
+    /// `all_interiorfielddescrs` population path share a single
+    /// `Arc<SimpleInteriorFieldDescr>` per `(ARRAY, name)` tuple,
+    /// matching PyPy's `cpu.interiorfielddescrof(ARRAY, name)` per-tuple
+    /// object identity.
+    ///
+    /// Pyre callers pre-resolve the constituent `array_descr` /
+    /// `field_descr` Arcs via [`Self::get_array_descr`] and
+    /// [`Self::get_field_descr`] and pass them in; on a cache miss those
+    /// arcs feed [`SimpleInteriorFieldDescr::new`].  This mirrors PyPy
+    /// `descr.py:430-435` which calls `get_array_descr(ARRAY)` and
+    /// `get_field_descr(REALARRAY.OF, name)` inside the cache-miss arm.
+    ///
+    /// `arrayfieldname` is `""` (empty string) for the GcArray-of-Structs
+    /// case (`descr.py:431-432 if arrayfieldname is None: REALARRAY = ARRAY`).
+    /// The non-empty case (`descr.py:433-434` GcStruct containing an
+    /// inlined GcArray) is the only other PyPy variant; pyre carries the
+    /// same `(LLType, String, String)` key shape so both variants share
+    /// the same cache layout.
+    pub fn get_interiorfield_descr(
+        &mut self,
+        array_key: LLType,
+        name: String,
+        arrayfieldname: String,
+        array_descr_arc: Arc<dyn ArrayDescr>,
+        field_descr_arc: Arc<dyn FieldDescr>,
+    ) -> DescrRef {
+        let key = (array_key, name, arrayfieldname);
+        // `descr.py:427-428 try: return cache[(ARRAY, name,
+        // arrayfieldname)]` — cache hit returns the cached object
+        // VERBATIM, regardless of its concrete type.  Any-typed Arc in
+        // the slot survives; callers that need a concrete-type view
+        // downcast at consumption.  The previous "downcast or mint
+        // fresh" path overwrote the cache slot and broke PyPy
+        // per-tuple object identity.
+        if let Some(descr) = self._cache_interiorfield.get(&key) {
+            return descr.clone();
+        }
+        // descr.py:436: descr = InteriorFieldDescr(arraydescr, fielddescr)
+        let descr: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(
+            u32::MAX,
+            array_descr_arc,
+            field_descr_arc,
+        ));
+        // descr.py:437: cache[(ARRAY, name, arrayfieldname)] = descr
+        self._cache_interiorfield.insert(key, descr.clone());
+        self._cache_interiorfield_order.push(descr.clone());
         descr
     }
 
@@ -582,11 +729,61 @@ impl GcCache {
         }
     }
 
+    /// Keyed sibling of [`Self::register_external_size`] — also
+    /// populates `_cache_size[key]` so subsequent `get_size_descr(key, ...)`
+    /// calls hit the cache instead of minting a duplicate descr.
+    /// `descr.py:108-118 get_size_descr` cache-miss branch writes both
+    /// the keyed map and the order Vec; this method mirrors that for
+    /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
+    /// runtime macro `__majit_register_descrs`).  First-write wins —
+    /// subsequent calls with the same key keep the original Arc, matching
+    /// PyPy `cache[STRUCT] = sizedescr` semantics.
+    pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
+        // `descr.py:25-47 setup_descrs` iterates the keyed `_cache_*`
+        // dicts (per PyPy `setdescrs.py`: `for key, value in cache.iteritems()`).
+        // On cache hit we MUST NOT push the caller's losing Arc onto
+        // `_cache_size_order` — `setup_descrs()` would otherwise
+        // enumerate an orphan descr that has no map slot, breaking the
+        // PyPy invariant that every `all_descrs` member is reachable
+        // via `cache[key]`.  Only push when the entry was freshly
+        // inserted (i.e. our Arc is the one stored in the map).
+        let entry = self._cache_size.entry(key).or_insert_with(|| descr.clone());
+        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_size_order, &descr) {
+            self._cache_size_order.push(descr);
+        }
+    }
+
     /// External registration for field descrs minted outside
     /// `get_field_descr`.  PyPy `descr.py:30-33`.
     pub fn register_external_field(&mut self, descr: DescrRef) {
         if !arc_in_vec(&self._cache_field_order, &descr) {
             self._cache_field_order.push(descr);
+        }
+    }
+
+    /// Keyed sibling of [`Self::register_external_field`] — also
+    /// populates `_cache_field[struct_key][field_name]` so subsequent
+    /// `get_field_descr(struct_key, field_name, ...)` calls hit the
+    /// cache.  Mirrors `descr.py:218-239 get_field_descr` cache-miss
+    /// `cachedict[fieldname] = fielddescr`.  First-write wins.
+    pub fn register_keyed_field(
+        &mut self,
+        struct_key: LLType,
+        field_name: String,
+        descr: Arc<SimpleFieldDescr>,
+    ) {
+        // `descr.py:25-47 setup_descrs` cache-iteration invariant —
+        // only the descr actually stored in `_cache_field[struct_key]
+        // [field_name]` enters `all_descrs`.  Skip the `_order` push
+        // on cache hit so the losing Arc never appears as an orphan.
+        let inner = self._cache_field.entry(struct_key).or_default();
+        let entry = inner.entry(field_name).or_insert_with(|| descr.clone());
+        let stored: Arc<SimpleFieldDescr> = entry.clone();
+        if Arc::ptr_eq(&stored, &descr) {
+            let as_ref: DescrRef = descr as DescrRef;
+            if !arc_in_vec(&self._cache_field_order, &as_ref) {
+                self._cache_field_order.push(as_ref);
+            }
         }
     }
 
@@ -598,9 +795,40 @@ impl GcCache {
         }
     }
 
+    /// Keyed sibling of [`Self::register_external_array`] — also
+    /// populates `_cache_array[key]`.  Mirrors `descr.py:348-378
+    /// get_array_descr` cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
+    pub fn register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
+        // `descr.py:25-47 setup_descrs` cache-iteration invariant —
+        // cache hit must NOT push the losing Arc onto `_cache_array_order`.
+        let entry = self
+            ._cache_array
+            .entry(key)
+            .or_insert_with(|| descr.clone());
+        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_array_order, &descr) {
+            self._cache_array_order.push(descr);
+        }
+    }
+
     /// External registration for arraylen descrs.  PyPy `descr.py:37-39`.
     pub fn register_external_arraylen(&mut self, descr: DescrRef) {
         if !arc_in_vec(&self._cache_arraylen_order, &descr) {
+            self._cache_arraylen_order.push(descr);
+        }
+    }
+
+    /// Keyed sibling of [`Self::register_external_arraylen`] — also
+    /// populates `_cache_arraylen[key]`.  Mirrors
+    /// `descr.py:256-267 get_field_arraylen_descr` cache-miss
+    /// `cache[ARRAY_OR_STRUCT] = result`.
+    pub fn register_keyed_arraylen(&mut self, key: LLType, descr: DescrRef) {
+        // `descr.py:25-47 setup_descrs` cache-iteration invariant —
+        // cache hit must NOT push the losing Arc onto `_cache_arraylen_order`.
+        let entry = self
+            ._cache_arraylen
+            .entry(key)
+            .or_insert_with(|| descr.clone());
+        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_arraylen_order, &descr) {
             self._cache_arraylen_order.push(descr);
         }
     }
@@ -609,6 +837,34 @@ impl GcCache {
     /// `get_interiorfield_descr`.  PyPy `descr.py:43-45`.
     pub fn register_external_interiorfield(&mut self, descr: DescrRef) {
         if !arc_in_vec(&self._cache_interiorfield_order, &descr) {
+            self._cache_interiorfield_order.push(descr);
+        }
+    }
+
+    /// Keyed sibling of [`Self::register_external_interiorfield`] —
+    /// also populates `_cache_interiorfield[(array_key, name,
+    /// arrayfieldname)]`.  Mirrors `descr.py:404-433
+    /// get_interiorfield_descr` cache-miss
+    /// `cache[(ARRAY, name, arrayfieldname)] = interiorfielddescr`.
+    /// `arrayfieldname == ""` denotes PyPy `arrayfieldname=None`
+    /// (the GcArray-of-Structs case, `descr.py:431-432`); a
+    /// non-empty string denotes the GcStruct-containing-inlined-GcArray
+    /// case (`descr.py:433-434`).
+    pub fn register_keyed_interiorfield(
+        &mut self,
+        array_key: LLType,
+        name: String,
+        arrayfieldname: String,
+        descr: DescrRef,
+    ) {
+        // `descr.py:25-47 setup_descrs` cache-iteration invariant —
+        // cache hit must NOT push the losing Arc onto
+        // `_cache_interiorfield_order`.
+        let entry = self
+            ._cache_interiorfield
+            .entry((array_key, name, arrayfieldname))
+            .or_insert_with(|| descr.clone());
+        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_interiorfield_order, &descr) {
             self._cache_interiorfield_order.push(descr);
         }
     }
@@ -683,6 +939,89 @@ impl GcCache {
 #[inline]
 fn arc_in_vec(haystack: &[DescrRef], needle: &DescrRef) -> bool {
     haystack.iter().any(|d| Arc::ptr_eq(d, needle))
+}
+
+/// `Arc<dyn Descr>` → `Arc<T>` safe downcast.
+///
+/// Equivalent of `Arc::downcast` for the `Any+Send+Sync` family, but
+/// reified through the `Descr::as_any` trait method (so the concrete
+/// type asserts its identity rather than relying on a global `Any`
+/// supertrait on `Descr`).  The unsafe `Arc::from_raw` is gated on
+/// `as_any().is::<T>()` — the `Any` invariant guarantees the
+/// underlying allocation IS a `T`, making the pointer reinterpret
+/// sound.
+///
+/// PyPy parity: `gc_cache._cache_array[ARRAY_OR_STRUCT]` is typed
+/// `ArrayDescr` in Python.  Pyre's lift stores `Arc<dyn Descr>` to
+/// admit both `SimpleArrayDescr` (analyzer mint) and
+/// `PyreArrayDescr` (runtime mint); this helper restores the
+/// per-concrete-type Arc identity at the consumer boundary so
+/// `SimpleInteriorFieldDescr::new` can wrap the cached Arc directly
+/// without a fresh allocation.
+pub fn try_downcast_arc<T: 'static>(arc: DescrRef) -> Result<Arc<T>, DescrRef> {
+    if arc.as_any().is_some_and(|a| a.is::<T>()) {
+        // SAFETY: as_any returned a ref typed as T, so the underlying
+        // Arc<dyn Descr> allocation contains a T. Arc::from_raw on the
+        // typed ptr preserves the reference count.
+        let raw = Arc::into_raw(arc) as *const T;
+        Ok(unsafe { Arc::from_raw(raw) })
+    } else {
+        Err(arc)
+    }
+}
+
+/// Cross-trait Arc upcast from `Arc<dyn Descr>` → `Arc<dyn ArrayDescr>`.
+///
+/// Rust does not provide direct subtrait downcast on trait objects
+/// (`dyn Descr` is the supertrait of `dyn ArrayDescr`).  This helper
+/// walks a registry of `(TypeId → upcaster fn)` to recover the
+/// `Arc<dyn ArrayDescr>` view of the held concrete type — PyPy
+/// `cpu.arraydescrof(ARRAY)` per-tuple Arc identity for callers that
+/// hold a type-erased `DescrRef` and need the `ArrayDescr` trait
+/// surface (e.g. `SimpleInteriorFieldDescr.array_descr`).
+///
+/// `SimpleArrayDescr` is the built-in upcaster registered statically.
+/// External `ArrayDescr` impls (e.g. pyre's `PyreArrayDescr`) register
+/// their own upcasters at module-init via [`register_array_descr_upcaster`].
+type ArrayDescrUpcaster = fn(DescrRef) -> Result<Arc<dyn ArrayDescr>, DescrRef>;
+
+fn upcast_simple_array_descr(arc: DescrRef) -> Result<Arc<dyn ArrayDescr>, DescrRef> {
+    match try_downcast_arc::<SimpleArrayDescr>(arc) {
+        Ok(simple) => Ok(simple),
+        Err(arc) => Err(arc),
+    }
+}
+
+static ARRAY_DESCR_UPCASTERS: std::sync::OnceLock<std::sync::Mutex<Vec<ArrayDescrUpcaster>>> =
+    std::sync::OnceLock::new();
+
+fn upcasters() -> &'static std::sync::Mutex<Vec<ArrayDescrUpcaster>> {
+    ARRAY_DESCR_UPCASTERS.get_or_init(|| std::sync::Mutex::new(vec![upcast_simple_array_descr]))
+}
+
+/// Register an external `ArrayDescr` upcaster at module-init.
+///
+/// Pyre's `PyreArrayDescr` (in `pyre-jit-trace`) registers its own
+/// upcaster so `descr_arc_as_array_descr` recovers
+/// `Arc<dyn ArrayDescr>` for cache slots holding `PyreArrayDescr`
+/// instead of falling through to None.
+pub fn register_array_descr_upcaster(f: ArrayDescrUpcaster) {
+    upcasters().lock().unwrap().push(f);
+}
+
+/// Convert `Arc<dyn Descr>` → `Arc<dyn ArrayDescr>` if the underlying
+/// concrete type implements `ArrayDescr`.  Tries each registered
+/// upcaster in order; first match wins.
+pub fn descr_arc_as_array_descr(arc: DescrRef) -> Option<Arc<dyn ArrayDescr>> {
+    let list = upcasters().lock().unwrap();
+    let mut current = arc;
+    for f in list.iter() {
+        match f(current) {
+            Ok(a) => return Some(a),
+            Err(c) => current = c,
+        }
+    }
+    None
 }
 
 /// Process-global `GcCache` slot — pyre's lift of PyPy's per-CPU
@@ -863,6 +1202,18 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// descr.py:28: v.descr_index = len(all_descrs)
     /// Called by setup_descrs() to assign a sequential index.
     fn set_descr_index(&self, _index: i32) {}
+
+    /// Codewriter-side `index()` setter — pyre adaptation for the
+    /// per-trace tracking key used by `pyre-jit-trace::state` field
+    /// descr lookup (`fd.index() == field_idx`, state.rs:5879/5933).
+    /// `gc_cache.get_field_descr` cache-hit path lets the analyzer's
+    /// `fielddescrof_concrete` stamp its `descr_indices.field_index`
+    /// value onto a previously-cached `Arc<SimpleFieldDescr>` so
+    /// trace serialization round-trips on the analyzer's per-trace
+    /// codewriter id even when the cache was first populated by
+    /// `__majit_register_descrs`.  Default no-op — concrete descrs
+    /// that participate in trace serialization override.
+    fn set_index(&self, _index: u32) {}
 
     /// `effectinfo.py:496` `descr.ei_index = sys.maxint` — initial sentinel
     /// before `compute_bitstrings` partitions descrs into (eisetr, eisetw)
@@ -1611,6 +1962,23 @@ pub trait SizeDescr: Descr {
     /// Type ID (for GC header).
     fn type_id(&self) -> u32;
 
+    /// `gc_cache._cache_size[LLType::Struct(key)]` cache key — the
+    /// original `path_hash(module_path::Struct)` u64 (not the u32 GC
+    /// `type_id` allocated by `gc_cache.init_size_descr`).  Distinct
+    /// concepts: `type_id` is the dense sequential gc tid backends use
+    /// for `gc.alloc_*_typed`; `cache_key` is the structural identity
+    /// the cache slot is keyed on.  PyPy collapses both into the
+    /// `STRUCT` lltype object identity; pyre keeps them separate so
+    /// the keyed cache resolves `LLType::Struct(cache_key)` regardless
+    /// of the dense tid value.  Default 0 — concrete impls that own a
+    /// stamp slot should override.  Inverse `bh_size_spec_from_descr`
+    /// reader (`assembler.rs`) uses this for the `BhSizeSpec.type_id`
+    /// field to keep the analyzer and runtime cache key namespaces
+    /// aligned.
+    fn cache_key(&self) -> u64 {
+        0
+    }
+
     /// Whether this is an immutable object.
     fn is_immutable(&self) -> bool;
 
@@ -1849,6 +2217,31 @@ pub trait ArrayDescr: Descr {
 
     /// Type ID (for GC header).
     fn type_id(&self) -> u32;
+
+    /// `gc.py:544-549 init_array_descr` post-mint tid setter.  Default
+    /// no-op (PyPy's base `ArrayDescr.tid = 0` field is plain assign);
+    /// concrete pyre `SimpleArrayDescr` overrides to atomic store so
+    /// the analyzer's `arraydescrof` cache-or-mint path can stamp
+    /// `path_hash(array_type_id) as u32` onto a shared
+    /// `Arc<SimpleArrayDescr>` after `gc_cache.get_array_descr`
+    /// resolves.
+    fn set_type_id(&self, _id: u32) {}
+
+    /// `gc_cache._cache_array[LLType::Array(key)]` cache key — the
+    /// original `path_hash(array_type_id)` u64 (not the u32 GC `type_id`
+    /// allocated by `gc_cache.init_array_descr`).  Distinct concepts:
+    /// `type_id` is the dense sequential gc tid; `cache_key` is the
+    /// structural identity the cache slot is keyed on.  PyPy collapses
+    /// both into the `ARRAY` lltype object identity; pyre keeps them
+    /// separate so the keyed cache resolves `LLType::Array(cache_key)`
+    /// regardless of the dense tid value.  Default 0 — concrete impls
+    /// that own a stamp slot should override.  Inverse `BhDescr::Array`
+    /// producers (`assembler.rs`, `jitcode.rs`) use this for the
+    /// `type_id: u64` field so the runtime descr-back-to-spec round-trip
+    /// lands on the same `_cache_array` slot.
+    fn cache_key(&self) -> u64 {
+        0
+    }
 
     /// Type of each array item.
     fn item_type(&self) -> Type;
@@ -2374,7 +2767,17 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 /// RPython: `FieldDescr(name, offset, size, flag, index_in_parent, is_pure)`.
 #[derive(Debug)]
 pub struct SimpleFieldDescr {
-    index: u32,
+    /// Per-trace codewriter slot id (`descr_indices.field_index` from
+    /// `CallControl`). Pyre adaptation — PyPy's `FieldDescr` has no
+    /// equivalent (PyPy keys raw EI sets on Python `id(descr)` which
+    /// Rust models via `Arc::ptr_eq`). Atomic so the cache-or-mint
+    /// path (`gc_cache.get_field_descr`) can stamp the analyzer's
+    /// `idx` onto a shared `Arc<SimpleFieldDescr>` after a cache hit,
+    /// converging analyzer and runtime (`__majit_register_descrs`)
+    /// onto the same Arc instance while preserving the analyzer's
+    /// per-trace identity for `BhFieldSpec.index` round-trips in
+    /// `pyre-jit-trace::state` (line 5879 / 5933).
+    index: AtomicU32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
     /// `effectinfo.py:496` `descr.ei_index = sys.maxint` — initialised to
@@ -2418,7 +2821,7 @@ pub struct SimpleFieldDescr {
 impl Clone for SimpleFieldDescr {
     fn clone(&self) -> Self {
         SimpleFieldDescr {
-            index: self.index,
+            index: AtomicU32::new(self.index.load(Ordering::Relaxed)),
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             name: self.name.clone(),
@@ -2448,7 +2851,7 @@ impl SimpleFieldDescr {
         // Default: Int→Signed (RPython Signed), Ref→Pointer, Float→Float.
         let flag = ArrayFlag::from_field_type(field_type);
         SimpleFieldDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name: String::new(),
@@ -2478,7 +2881,7 @@ impl SimpleFieldDescr {
         name: String,
     ) -> Self {
         SimpleFieldDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name,
@@ -2546,8 +2949,14 @@ impl SimpleFieldDescr {
 }
 
 impl Descr for SimpleFieldDescr {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn index(&self) -> u32 {
-        self.index
+        self.index.load(Ordering::Relaxed)
+    }
+    fn set_index(&self, index: u32) {
+        self.index.store(index, Ordering::Relaxed);
     }
     fn get_descr_index(&self) -> i32 {
         self.descr_index.load(Ordering::Relaxed)
@@ -2626,6 +3035,16 @@ pub struct SimpleSizeDescr {
     descr_index: AtomicI32,
     size: usize,
     type_id: u32,
+    /// `gc_cache._cache_size[LLType::Struct(cache_key)]` keyed identity
+    /// — the original u64 `path_hash(module_path::Struct)` (not the
+    /// dense u32 `type_id` GC tid allocated post-mint).  Stamped at
+    /// `gc_cache.get_size_descr` cache-miss-mint so the inverse
+    /// `bh_size_spec_from_descr` reader can recover the same key the
+    /// analyzer-side `bh_size_spec_from_callcontrol` produces (without
+    /// this slot, the inverse path returned `type_id` widened to u64,
+    /// landing on a different cache slot and breaking round-trip
+    /// identity).
+    cache_key: u64,
     /// descr.py:64,112: SizeDescr.immutable_flag
     pub is_immutable: bool,
     vtable: usize,
@@ -2645,6 +3064,7 @@ impl Clone for SimpleSizeDescr {
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             size: self.size,
             type_id: self.type_id,
+            cache_key: self.cache_key,
             is_immutable: self.is_immutable,
             vtable: self.vtable,
             all_fielddescrs: self.all_fielddescrs.clone(),
@@ -2660,6 +3080,7 @@ impl SimpleSizeDescr {
             descr_index: AtomicI32::new(-1),
             size,
             type_id,
+            cache_key: 0,
             is_immutable: false,
             vtable: 0,
             all_fielddescrs: Vec::new(),
@@ -2673,11 +3094,19 @@ impl SimpleSizeDescr {
             descr_index: AtomicI32::new(-1),
             size,
             type_id,
+            cache_key: 0,
             is_immutable: false,
             vtable,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
+    }
+
+    /// Stamp the `gc_cache._cache_size[LLType::Struct(...)]` identity
+    /// onto this descr.  Called by `gc_cache.get_size_descr` cache-miss
+    /// path after `init_size_descr` allocates the dense GC `type_id`.
+    pub fn set_cache_key(&mut self, key: u64) {
+        self.cache_key = key;
     }
 
     /// descr.py:123-126 — `get_size_descr` calls
@@ -2704,6 +3133,9 @@ impl SimpleSizeDescr {
 }
 
 impl Descr for SimpleSizeDescr {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn index(&self) -> u32 {
         self.index
     }
@@ -2724,6 +3156,9 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn type_id(&self) -> u32 {
         self.type_id
+    }
+    fn cache_key(&self) -> u64 {
+        self.cache_key
     }
     fn is_immutable(&self) -> bool {
         self.is_immutable
@@ -2768,10 +3203,68 @@ pub struct SimpleDescrGroup {
     pub field_descrs: Vec<Arc<SimpleFieldDescr>>,
 }
 
-pub fn make_simple_descr_group(
+/// Keyed sibling of [`make_simple_descr_group`] — accepts a u64
+/// `cache_key` (= `path_hash(module_path::Struct)`) so the freshly
+/// minted descrs land in the keyed `gc_cache._cache_size[key]` and
+/// `_cache_field[key][name]` maps in addition to the snapshot order
+/// Vecs.  Subsequent `gc_cache.get_size_descr(LLType::Struct(key), ...)`
+/// or `get_field_descr(...)` callers (analyzer-side `cc.fielddescrof`,
+/// other runtime mint paths) see the same `Arc<dyn Descr>` instead of
+/// minting duplicates — restoring PyPy's `cpu.fielddescrof` per-
+/// `(STRUCT, name)` identity (`descr.py:218-239`).  First-write wins;
+/// the keyed map preserves the original Arc across redundant register
+/// calls.
+pub fn make_simple_descr_group_keyed(
     index: u32,
     size: usize,
     type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
+    let group = make_simple_descr_group_inner(index, size, type_id, cache_key, vtable, field_specs);
+    let struct_key = LLType::struct_key(cache_key);
+    // `descr.py:108-118 get_size_descr` cache-miss `cache[STRUCT] =
+    // sizedescr` — for mint sites that bypass `get_size_descr` proper
+    // and call this factory, publish into the keyed map so
+    // analyzer-side `cc.fielddescrof` lookups via the same cache_key
+    // resolve to the same Arc.
+    crate::descr_registry::register_keyed_size(
+        struct_key.clone(),
+        group.size_descr.clone() as DescrRef,
+    );
+    // `descr.py:225-235 get_field_descr` cache-miss
+    // `cachedict[fieldname] = fielddescr` — the inner-dict key at
+    // `descr.py:221 cache[STRUCT][fieldname]` is **bare** `fieldname`.
+    // `fd.name` carries the dotted display form
+    // (`'%s.%s' % (STRUCT._name, fieldname)`, `descr.py:227`); strip
+    // the `STRUCT._name` prefix to recover the bare `fieldname` key,
+    // matching the analyzer's bare-name `cc.fielddescrof_concrete`
+    // lookup (`call.rs` analyzer) and the runtime macro's bare-name
+    // `gc_cache.get_field_descr(__majit_key, fname_str, ...)` at
+    // `jit_struct.rs`.  Both arms must publish at the same key so
+    // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple Arc identity
+    // holds across analyzer / runtime / BhSize round-trip.
+    for fd in &group.field_descrs {
+        let bare_name = fd
+            .name
+            .rsplit_once('.')
+            .map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| fd.name.clone());
+        crate::descr_registry::register_keyed_field(struct_key.clone(), bare_name, fd.clone());
+    }
+    group
+}
+
+/// Inner factory shared between [`make_simple_descr_group`] (no
+/// cache key) and [`make_simple_descr_group_keyed`] (registers into
+/// the keyed cache map after construction).  `cache_key == 0` is the
+/// no-identity sentinel for the non-keyed path.
+fn make_simple_descr_group_inner(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
     vtable: usize,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
@@ -2783,7 +3276,7 @@ pub fn make_simple_descr_group(
             .iter()
             .map(|spec| {
                 Arc::new(SimpleFieldDescr {
-                    index: spec.index,
+                    index: AtomicU32::new(spec.index),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
                     name: spec.name.clone(),
@@ -2806,46 +3299,79 @@ pub fn make_simple_descr_group(
             .cloned()
             .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
             .collect();
-        // descr.py:123-126 precompute both lists — `with_all_fielddescrs`
-        // derives the `gc_fielddescrs` subset via `is_pointer_field()`.
-        SimpleSizeDescr::with_vtable(index, size, type_id, vtable)
-            .with_all_fielddescrs(all_fielddescrs)
+        let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
+        // descr.py:108-118 `get_size_descr` cache-miss path stamps the
+        // `LLType::Struct(cache_key)` slot onto the descr before Arc
+        // wrap; mint sites that bypass `get_size_descr` proper and call
+        // this factory must do the same so the inverse
+        // `bh_size_spec_from_descr` reader (`assembler.rs`) round-trips
+        // through `_cache_size[LLType::Struct(cache_key)]` instead of
+        // landing on a stale slot via `type_id` widening.
+        sd.set_cache_key(cache_key);
+        sd.with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
-    // descr.py:236-247 `get_size_descr` cache-miss branch — every
-    // freshly-minted size descr enters `gc_cache._cache_size`. Pyre
-    // mirrors via `descr_registry::register_size`; this is what makes
-    // `MetaInterpStaticData::finish_setup_descrs` see the size category
-    // when computing sequential `descr_index` values per
-    // `descr.py:25-47 setup_descrs` group order.
-    crate::descr_registry::register_size(size_descr.clone() as DescrRef);
-    // descr.py:225-235 `get_field_descr` cache-miss branch — every
-    // freshly-minted field descr enters `gc_cache._cache_field`. Pyre's
-    // mirror is `descr_registry::register_field`; the mint sites that
-    // call `make_simple_descr_group` (jit_struct! macro expansion +
-    // pyre-jit-trace::descr) implicitly register through this loop so
-    // `MetaInterpStaticData::finish_setup_descrs` can enumerate the
-    // full population for `compute_bitstrings`.
-    for fd in &field_descrs {
-        crate::descr_registry::register_field(fd.clone() as DescrRef);
-    }
     SimpleDescrGroup {
         size_descr,
         field_descrs,
     }
 }
 
+/// No-cache-key variant of [`make_simple_descr_group_keyed`].  Used
+/// by legacy mint sites that don't yet plumb the `path_hash` cache
+/// key surrogate.  Publishes into snapshot-order Vecs only; the
+/// keyed `_cache_*[key]` map stays empty for these descrs so
+/// `gc_cache.get_*_descr` lookups for the same struct will mint
+/// fresh duplicates.  Callers that have the cache key should prefer
+/// `make_simple_descr_group_keyed`.
+pub fn make_simple_descr_group(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
+    let group = make_simple_descr_group_inner(index, size, type_id, 0, vtable, field_specs);
+    // descr.py:236-247 `get_size_descr` cache-miss branch — snapshot
+    // order only.
+    crate::descr_registry::register_size(group.size_descr.clone() as DescrRef);
+    for fd in &group.field_descrs {
+        crate::descr_registry::register_field(fd.clone() as DescrRef);
+    }
+    group
+}
+
 /// Simple concrete ArrayDescr.
 #[derive(Debug)]
 pub struct SimpleArrayDescr {
-    index: u32,
+    /// Per-trace codewriter slot id. See `SimpleFieldDescr.index` for
+    /// the rationale — atomic so the cache-or-mint
+    /// (`gc_cache.get_array_descr`) path can stamp the analyzer's
+    /// `idx` (from `descr_indices.array_index`) onto a shared
+    /// `Arc<SimpleArrayDescr>` after cache resolves.
+    index: AtomicU32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
     /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See SimpleFieldDescr.
     ei_index: AtomicU32,
     base_size: usize,
     item_size: usize,
-    type_id: u32,
+    /// `descr.py:274 ArrayDescr.tid` — u32 GC type id.  Atomic so the
+    /// analyzer's arraydescrof cache-or-mint path can stamp
+    /// `path_hash(array_type_id) as u32` onto a shared
+    /// `Arc<SimpleArrayDescr>` after cache resolves (mirrors the
+    /// `gc.py:544-549 init_array_descr` post-mint tid write, which
+    /// pyre lifts to a settable atomic for analyzer-side parity).
+    type_id: AtomicU32,
+    /// `gc_cache._cache_array[LLType::Array(cache_key)]` keyed identity
+    /// surrogate — the full `path_hash(array_type_id)` u64 that the
+    /// analyzer-side `arraydescrof_concrete` published into the cache.
+    /// 0 means "no identity carrier" (legacy non-keyed callers).  The
+    /// inverse `BhDescr::Array.type_id` field reads this so round-trips
+    /// through `simple_descr_group_from_bh_size` resolve `LLType::Array(
+    /// cache_key)` in the same slot.  Stamped at `get_array_descr`
+    /// cache-miss-mint when `key == LLType::Array(k)`.
+    cache_key: u64,
     item_type: Type,
     /// descr.py:277,286: ArrayDescr.lendescr — length field descriptor, or None.
     pub lendescr: Option<DescrRef>,
@@ -2874,12 +3400,13 @@ impl Clone for SimpleArrayDescr {
             let _ = interior.set(existing.clone());
         }
         SimpleArrayDescr {
-            index: self.index,
+            index: AtomicU32::new(self.index.load(Ordering::Relaxed)),
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             base_size: self.base_size,
             item_size: self.item_size,
-            type_id: self.type_id,
+            type_id: AtomicU32::new(self.type_id.load(Ordering::Relaxed)),
+            cache_key: self.cache_key,
             item_type: self.item_type,
             lendescr: self.lendescr.clone(),
             flag: self.flag,
@@ -2900,12 +3427,13 @@ impl SimpleArrayDescr {
     ) -> Self {
         let flag = ArrayFlag::from_item_type(item_type, false);
         SimpleArrayDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             base_size,
             item_size,
-            type_id,
+            type_id: AtomicU32::new(type_id),
+            cache_key: 0,
             item_type,
             lendescr: None,
             flag,
@@ -2915,7 +3443,7 @@ impl SimpleArrayDescr {
         }
     }
 
-    /// RPython: ArrayDescr with explicit flag (for struct arrays).
+    /// `ArrayDescr` with explicit flag (for struct arrays).
     pub fn with_flag(
         index: u32,
         base_size: usize,
@@ -2925,12 +3453,13 @@ impl SimpleArrayDescr {
         flag: ArrayFlag,
     ) -> Self {
         SimpleArrayDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             base_size,
             item_size,
-            type_id,
+            type_id: AtomicU32::new(type_id),
+            cache_key: 0,
             item_type,
             lendescr: None,
             flag,
@@ -2938,6 +3467,13 @@ impl SimpleArrayDescr {
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Stamp the `gc_cache._cache_array[LLType::Array(...)]` identity
+    /// surrogate onto this descr.  Called by `gc_cache.get_array_descr`
+    /// cache-miss path before Arc wrap.
+    pub fn set_cache_key(&mut self, key: u64) {
+        self.cache_key = key;
     }
 
     /// RPython: arraydescr.all_interiorfielddescrs = descrs
@@ -2952,14 +3488,20 @@ impl SimpleArrayDescr {
 
     /// gc.py:548: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
     /// Called by init_array_descr hook before Arc wrapping.
-    pub fn set_type_id(&mut self, type_id: u32) {
-        self.type_id = type_id;
+    pub fn set_type_id(&self, type_id: u32) {
+        self.type_id.store(type_id, Ordering::Relaxed);
     }
 }
 
 impl Descr for SimpleArrayDescr {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn index(&self) -> u32 {
-        self.index
+        self.index.load(Ordering::Relaxed)
+    }
+    fn set_index(&self, index: u32) {
+        self.index.store(index, Ordering::Relaxed);
     }
     fn get_descr_index(&self) -> i32 {
         self.descr_index.load(Ordering::Relaxed)
@@ -2990,7 +3532,13 @@ impl ArrayDescr for SimpleArrayDescr {
         self.item_size
     }
     fn type_id(&self) -> u32 {
-        self.type_id
+        self.type_id.load(Ordering::Relaxed)
+    }
+    fn set_type_id(&self, id: u32) {
+        self.type_id.store(id, Ordering::Relaxed);
+    }
+    fn cache_key(&self) -> u64 {
+        self.cache_key
     }
     fn item_type(&self) -> Type {
         self.item_type
@@ -3035,20 +3583,38 @@ impl ArrayDescr for SimpleArrayDescr {
 /// Simple concrete InteriorFieldDescr.
 #[derive(Debug)]
 pub struct SimpleInteriorFieldDescr {
-    index: u32,
+    /// per-trace analyzer slot id. Stored atomic so the analyzer's
+    /// `cc.interiorfielddescrof` cache-or-mint can stamp on a
+    /// `Arc<SimpleInteriorFieldDescr>` returned from
+    /// `gc_cache._cache_interiorfield` without cloning the Arc, mirroring
+    /// the `SimpleFieldDescr.index` / `SimpleArrayDescr.index` stamp
+    /// hooks added for `cpu.fielddescrof` / `cpu.arraydescrof` parity.
+    index: AtomicU32,
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
     /// `effectinfo.py:496` `descr.ei_index = sys.maxint`. See SimpleFieldDescr.
     ei_index: AtomicU32,
-    array_descr: std::sync::Arc<SimpleArrayDescr>,
-    field_descr: std::sync::Arc<SimpleFieldDescr>,
-    owner_size_descr: Option<std::sync::Arc<SimpleSizeDescr>>,
+    /// `descr.py:388 InteriorFieldDescr.__init__` carries the
+    /// containing `ArrayDescr` object. PyPy duck-types this — any
+    /// `ArrayDescr` instance suffices.  Pyre stores `Arc<dyn ArrayDescr>`
+    /// to admit cached `Arc<SimpleArrayDescr>` (analyzer mint) and
+    /// `Arc<PyreArrayDescr>` (runtime mint) interchangeably; both
+    /// downcasted via `try_downcast_arc` at the analyzer wrap site.
+    array_descr: std::sync::Arc<dyn ArrayDescr>,
+    /// `descr.py:388 InteriorFieldDescr.__init__` field descr —
+    /// concrete `FieldDescr` in PyPy.
+    field_descr: std::sync::Arc<dyn FieldDescr>,
+    /// Pyre-side parent SizeDescr backreference; `descr.py` has no
+    /// equivalent (PyPy's InteriorFieldDescr derives parent from
+    /// `arraydescr`).  Kept for pyre's
+    /// `ensure_ptr_info_arg0`-style dispatch paths.
+    owner_size_descr: Option<std::sync::Arc<dyn SizeDescr>>,
 }
 
 impl Clone for SimpleInteriorFieldDescr {
     fn clone(&self) -> Self {
         SimpleInteriorFieldDescr {
-            index: self.index,
+            index: AtomicU32::new(self.index.load(Ordering::Relaxed)),
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             array_descr: self.array_descr.clone(),
@@ -3061,11 +3627,11 @@ impl Clone for SimpleInteriorFieldDescr {
 impl SimpleInteriorFieldDescr {
     pub fn new(
         index: u32,
-        array_descr: std::sync::Arc<SimpleArrayDescr>,
-        field_descr: std::sync::Arc<SimpleFieldDescr>,
+        array_descr: std::sync::Arc<dyn ArrayDescr>,
+        field_descr: std::sync::Arc<dyn FieldDescr>,
     ) -> Self {
         SimpleInteriorFieldDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             array_descr,
@@ -3076,12 +3642,12 @@ impl SimpleInteriorFieldDescr {
 
     pub fn new_with_owner(
         index: u32,
-        array_descr: std::sync::Arc<SimpleArrayDescr>,
-        field_descr: std::sync::Arc<SimpleFieldDescr>,
-        owner_size_descr: std::sync::Arc<SimpleSizeDescr>,
+        array_descr: std::sync::Arc<dyn ArrayDescr>,
+        field_descr: std::sync::Arc<dyn FieldDescr>,
+        owner_size_descr: std::sync::Arc<dyn SizeDescr>,
     ) -> Self {
         SimpleInteriorFieldDescr {
-            index,
+            index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             array_descr,
@@ -3093,7 +3659,10 @@ impl SimpleInteriorFieldDescr {
 
 impl Descr for SimpleInteriorFieldDescr {
     fn index(&self) -> u32 {
-        self.index
+        self.index.load(Ordering::Relaxed)
+    }
+    fn set_index(&self, index: u32) {
+        self.index.store(index, Ordering::Relaxed);
     }
     fn get_descr_index(&self) -> i32 {
         self.descr_index.load(Ordering::Relaxed)
@@ -3106,6 +3675,9 @@ impl Descr for SimpleInteriorFieldDescr {
     }
     fn set_ei_index(&self, ei_index: u32) {
         self.ei_index.store(ei_index, Ordering::Relaxed);
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
     fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
         Some(self)

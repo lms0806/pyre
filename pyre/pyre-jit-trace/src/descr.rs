@@ -111,6 +111,13 @@ pub struct PyreArrayDescr {
     /// `Descr::get_ei_index()` readers fall back to `descr.index()`
     /// while the bridge is unset.
     ei_index: AtomicU32,
+    /// `gc_cache._cache_array[LLType::Array(cache_key)]` keyed identity
+    /// surrogate — `path_hash(array_type_id)` for the runtime mint sites
+    /// that carry an identity carrier; 0 for legacy no-identity mints.
+    /// Mirrors `SimpleArrayDescr.cache_key` so the cross-impl
+    /// `ArrayDescr::cache_key()` accessor reports a stable identity slot
+    /// regardless of which concrete impl is in the cache.
+    cache_key: u64,
 }
 
 /// Structural key for `ARRAY_DESCR_REGISTRY`. Combination of all fields
@@ -162,6 +169,27 @@ fn alloc_array_descr_id() -> u32 {
     id
 }
 
+/// `descr_arc_as_array_descr` plugin: recover `Arc<dyn ArrayDescr>`
+/// from an `Arc<dyn Descr>` whose underlying concrete type is
+/// `PyreArrayDescr`.  Registered process-wide on first PyreArrayDescr
+/// mint so analyzer-side consumers (in majit-translate) can upcast
+/// `_cache_array` slot hits without knowing the concrete type.
+fn upcast_pyre_array_descr(
+    arc: majit_ir::DescrRef,
+) -> Result<Arc<dyn majit_ir::descr::ArrayDescr>, majit_ir::DescrRef> {
+    match majit_ir::descr::try_downcast_arc::<PyreArrayDescr>(arc) {
+        Ok(pyre) => Ok(pyre),
+        Err(c) => Err(c),
+    }
+}
+
+fn ensure_pyre_array_descr_upcaster_registered() {
+    static REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        majit_ir::descr::register_array_descr_upcaster(upcast_pyre_array_descr);
+    });
+}
+
 fn get_or_create_array_descr(
     base_size: usize,
     item_size: usize,
@@ -199,7 +227,52 @@ fn get_or_create_array_descr_with_full_id(
     if let Some(existing) = cache.get(&key) {
         return existing.clone();
     }
+    // `descr.py:348-378 get_array_descr(gccache, ARRAY)`: when the
+    // caller has an `array_type_id` (the codewriter lltype identity
+    // proxy), `gc_cache._cache_array[LLType::Array(path_hash(atid))]`
+    // is the authoritative cache slot — consult it FIRST so a prior
+    // analyzer-side `gc_cache.get_array_descr` mint
+    // (`SimpleArrayDescr`) is reused instead of layered under a fresh
+    // `PyreArrayDescr`.  Matches PyPy `cpu.arraydescrof(ARRAY)`
+    // per-ARRAY object identity — both analyzer and pyre runtime
+    // consumers share one Arc per `LLType::Array(path_hash(atid))`.
+    if let Some(ref atid) = key.array_type_id {
+        let gc_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid));
+        if let Some(existing) = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            ._cache_array
+            .get(&gc_key)
+            .cloned()
+        {
+            // Memoise into the local structural cache so subsequent
+            // `get_or_create_array_descr_with_full_id` calls with the
+            // same structural key hit the local fast path without
+            // re-consulting gc_cache.
+            cache.insert(key.clone(), existing.clone());
+            return existing;
+        }
+    }
+    ensure_pyre_array_descr_upcaster_registered();
     let descr_id = alloc_array_descr_id();
+    // `array_type_id` Some → `LLType::Array(path_hash(atid))` cache
+    // slot (analyzer ↔ runtime convergence path).
+    // `array_type_id` None but `type_id != 0` → no codewriter
+    // lltype-identity carrier but a stable GC-tid is available
+    // (`make_array_descr_with_type` path).  Widening that tid to
+    // u64 preserves per-tid identity in `BhDescr::Array.type_id`,
+    // matching the behaviour producer sites in `eval.rs` /
+    // `assembler.rs` / `jitcode.rs` relied on before the
+    // `cache_key()` migration — without this fallback, every
+    // `PY_OBJECT_ARRAY_GC_TYPE_ID`-class runtime descr collapsed
+    // onto slot 0 at the `BhDescr` boundary.
+    // `array_type_id` None and `type_id == 0` → no identity carrier
+    // at all (legacy `make_array_descr` no-identity path); stay 0.
+    let cache_key = match key.array_type_id.as_deref() {
+        Some(atid) => majit_ir::descr::path_hash(atid),
+        None if type_id != 0 => type_id as u64,
+        None => 0,
+    };
     let arc: DescrRef = Arc::new(PyreArrayDescr {
         base_size,
         item_size,
@@ -209,12 +282,29 @@ fn get_or_create_array_descr_with_full_id(
         len_descr: maybe_array_lendescr_at_offset(len_offset),
         descr_id,
         ei_index: AtomicU32::new(u32::MAX),
+        cache_key,
     });
-    cache.insert(key, arc.clone());
+    cache.insert(key.clone(), arc.clone());
+    // Publish the freshly-minted PyreArrayDescr into
+    // `gc_cache._cache_array` keyed on `LLType::Array(path_hash(atid))`
+    // so later analyzer-side `gc_cache.get_array_descr` cache-hit
+    // returns this exact Arc.  Without an `array_type_id` (legacy
+    // `make_array_descr` callers), only the local
+    // `ARRAY_DESCR_REGISTRY` carries the descr — gc_cache cannot
+    // identify it.
+    if let Some(ref atid) = key.array_type_id {
+        majit_ir::descr_registry::register_keyed_array(
+            majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid)),
+            arc.clone(),
+        );
+    }
     arc
 }
 
 impl Descr for PyreFieldDescr {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn index(&self) -> u32 {
         stable_field_index(self.offset, self.field_size, self.field_type, self.signed)
     }
@@ -242,6 +332,9 @@ impl Descr for PyreFieldDescr {
 }
 
 impl Descr for PyreArrayDescr {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn index(&self) -> u32 {
         // Registry-bound identity (`descr.py:350-351 cache[ARRAY_OR_STRUCT]`):
         // bits 0-27 carry the sequential `descr_id` allocated at
@@ -317,6 +410,10 @@ impl ArrayDescr for PyreArrayDescr {
 
     fn type_id(&self) -> u32 {
         self.type_id
+    }
+
+    fn cache_key(&self) -> u64 {
+        self.cache_key
     }
 
     fn item_type(&self) -> Type {
@@ -467,6 +564,15 @@ pub fn make_quasi_immutable_field_descr(
 pub struct PyreSizeDescr {
     obj_size: usize,
     type_id: u32,
+    /// `_cache_size[LLType::Struct(cache_key)]` 슬롯 키 — `path_hash`로
+    /// 만들어진 STRUCT 구조 identity (publish 슬롯과 동일).  `type_id`
+    /// 는 `gc.alloc_gc_typed`용 dense u32 GC tid 이고, `cache_key` 는
+    /// `descr.py:108-118 cache[STRUCT]`의 lltype-object identity 와 1:1
+    /// 대응한다.  `SizeDescr.cache_key()` 가 이 값을 반환해
+    /// `bh_size_spec_from_descr` 역방향 reader 가 publish 슬롯과 같은
+    /// `LLType::Struct(cache_key)` 로 round-trip 한다.  init 0 은 단발
+    /// fixture 용 fall-back (구조 identity 없는 케이스).
+    cache_key: u64,
     /// descr.get_vtable() parity: ob_type pointer for NewWithVtable.
     /// optimize_new_with_vtable reads this to set VirtualInfo.known_class.
     vtable: usize,
@@ -649,11 +755,31 @@ fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRe
     field_descr
 }
 
-fn build_object_descr_group(
+/// Build a SizeDescr group for a runtime PyObject layout and publish
+/// it into `gc_cache._cache_size` under both the simple-name slot
+/// AND the crate-stripped def-path slot.  PyPy `cache[STRUCT]`
+/// collapses both into a single lltype-object identity; pyre's
+/// analyzer currently hashes the simple name (use-site bare
+/// identifier — collect_struct_names registers top-level structs by
+/// `simple_name`) so that slot is the de-facto convergence point.
+/// The def-path slot is published alongside as a forward-compatible
+/// alias for the future analyzer use-import resolver (B-5 follow-up):
+/// when that lands, analyzer's `owner_root` switches to qualified
+/// form and the SAME `Arc<PyreSizeDescr>` is reachable via the
+/// qualified hash.  `register_keyed_size` is first-write-wins per
+/// `descr.py:25-47 setup_descrs` cache-iteration invariant — the
+/// second publish's losing Arc does NOT enter `_cache_size_order`,
+/// so `all_descrs` enumerates exactly one entry per logical
+/// SizeDescr (PyPy's per-tuple identity).
+///
+/// `def_path` empty (or equal to `simple_name`) → single publish.
+fn build_object_descr_group_with_def_path(
     obj_size: usize,
     type_id: u32,
     vtable: usize,
     fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
 ) -> PyreObjectDescrGroup {
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<PyreSizeDescr>| {
         let parent_descr: Weak<dyn Descr> = weak_size.clone();
@@ -687,19 +813,63 @@ fn build_object_descr_group(
             .filter(|fd| fd.is_pointer_field())
             .cloned()
             .collect();
+        // `descr.py:108-118 get_size_descr` cache key — `path_hash`로
+        // 만들어진 lltype-object identity 대응값.  `register_keyed_size`
+        // 가 `LLType::Struct(path_hash(simple_name))` 슬롯에 first-write-wins
+        // 으로 등록하므로(`descr.py:25-47 setup_descrs` cache-iteration
+        // invariant) `simple_name` 의 path_hash 를 cache_key 로 저장한다.
+        // `def_path` 도 alias 로 publish 되지만 둘 다 같은 Arc 를 가리키므로
+        // round-trip 키 후보로 simple_name 슬롯이 first 인 simple 가 자연.
+        let cache_key = if !simple_name.is_empty() {
+            majit_ir::descr::path_hash(simple_name)
+        } else {
+            0
+        };
         PyreSizeDescr {
             obj_size,
             type_id,
+            cache_key,
             vtable,
             all_fielddescrs,
             gc_fielddescrs,
         }
     });
+    // Dual-publish: register under BOTH the simple-name slot AND
+    // (when supplied) the crate-stripped def-path slot.
+    //
+    // PyPy `cache[STRUCT]` collapses both namespaces into a single
+    // lltype-object identity; pyre's analyzer currently hashes the
+    // use-site bare identifier (collect_struct_names registers
+    // top-level structs at simple-name) so the simple-name slot is
+    // the primary cache hit point.  The def-path slot is published
+    // alongside as a forward-compatible alias for the future
+    // analyzer use-import resolver (B-5 follow-up): when that lands,
+    // analyzer's `owner_root` switches to qualified form and the
+    // SAME `Arc<PyreSizeDescr>` is reachable via the qualified
+    // hash.  `register_keyed_size` is first-write-wins per
+    // `descr.py:25-47 setup_descrs` cache-iteration invariant — the
+    // second registration's losing Arc does NOT enter
+    // `_cache_size_order`, so `all_descrs` enumerates exactly one
+    // entry per logical SizeDescr (PyPy's per-tuple identity).
+    if !simple_name.is_empty() {
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));
+        majit_ir::descr_registry::register_keyed_size(
+            key,
+            size_descr.clone() as majit_ir::DescrRef,
+        );
+    }
+    if !def_path.is_empty() && def_path != simple_name {
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+        majit_ir::descr_registry::register_keyed_size(
+            key,
+            size_descr.clone() as majit_ir::DescrRef,
+        );
+    }
     PyreObjectDescrGroup { size_descr }
 }
 
 static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_IntObject>(),
         W_INT_GC_TYPE_ID,
         &INT_TYPE as *const _ as usize,
@@ -712,11 +882,13 @@ static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             true,
             false,
         )],
+        "W_IntObject",
+        "intobject::W_IntObject",
     )
 });
 
 static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_FloatObject>(),
         W_FLOAT_GC_TYPE_ID,
         &FLOAT_TYPE as *const _ as usize,
@@ -729,11 +901,13 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             true,
             false,
         )],
+        "W_FloatObject",
+        "floatobject::W_FloatObject",
     )
 });
 
 static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
         W_BOOL_GC_TYPE_ID,
         &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
@@ -746,11 +920,13 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             true,
             false,
         )],
+        "W_BoolObject",
+        "boolobject::W_BoolObject",
     )
 });
 
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
         RANGE_ITER_GC_TYPE_ID,
         &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
@@ -783,6 +959,8 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
         ],
+        "W_RangeIterator",
+        "rangeobject::W_RangeIterator",
     )
 });
 
@@ -801,7 +979,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
         W_METHOD_OBJECT_SIZE,
     };
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
         W_METHOD_GC_TYPE_ID,
         &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
@@ -834,6 +1012,8 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
+        "W_MethodObject",
+        "methodobject::W_MethodObject",
     )
 });
 
@@ -843,7 +1023,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // The parity-field pair is `(length, items)`. `strategy` +
     // `int_items` / `float_items` are pyre-only PRE-EXISTING-
     // ADAPTATIONs for the PyPy interp-level strategy split.
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_ListObject>(),
         W_LIST_GC_TYPE_ID,
         &pyre_object::pyobject::LIST_TYPE as *const _ as usize,
@@ -957,6 +1137,8 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
+        "W_ListObject",
+        "listobject::W_ListObject",
     )
 });
 
@@ -968,7 +1150,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // the field descr (`immutable: true`) AND the GcArray contents
     // (read via `getfield_gc_pure_r`). Length comes from the GcArray
     // header via `arraylen_gc(items_block)` — no inline length cache.
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_TupleObject>(),
         W_TUPLE_GC_TYPE_ID,
         &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
@@ -984,6 +1166,8 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
+        "W_TupleObject",
+        "tupleobject::W_TupleObject",
     )
 });
 
@@ -992,7 +1176,7 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
     // 'value1']` — both fields immutable. Inline-field shape, no array
     // indirection.
     use pyre_object::specialisedtupleobject::*;
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_SpecialisedTupleObject_ii>(),
         SPECIALISED_TUPLE_II_GC_TYPE_ID,
         &SPECIALISED_TUPLE_II_TYPE as *const _ as usize,
@@ -1016,12 +1200,14 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
         ],
+        "W_SpecialisedTupleObject_ii",
+        "specialisedtupleobject::W_SpecialisedTupleObject_ii",
     )
 });
 
 static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::specialisedtupleobject::*;
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_SpecialisedTupleObject_ff>(),
         SPECIALISED_TUPLE_FF_GC_TYPE_ID,
         &SPECIALISED_TUPLE_FF_TYPE as *const _ as usize,
@@ -1045,12 +1231,14 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
         ],
+        "W_SpecialisedTupleObject_ff",
+        "specialisedtupleobject::W_SpecialisedTupleObject_ff",
     )
 });
 
 static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::specialisedtupleobject::*;
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<W_SpecialisedTupleObject_oo>(),
         SPECIALISED_TUPLE_OO_GC_TYPE_ID,
         &SPECIALISED_TUPLE_OO_TYPE as *const _ as usize,
@@ -1074,11 +1262,13 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
         ],
+        "W_SpecialisedTupleObject_oo",
+        "specialisedtupleobject::W_SpecialisedTupleObject_oo",
     )
 });
 
 static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::DictStorage>(),
         0,
         0,
@@ -1102,6 +1292,8 @@ static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
                 false,
             ),
         ],
+        "DictStorage",
+        "executioncontext::DictStorage",
     )
 });
 
@@ -1113,7 +1305,7 @@ static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 // `optimizeopt/virtualize.py optimize_NEW_WITH_VTABLE`).
 static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::sliceobject::*;
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         W_SLICE_OBJECT_SIZE,
         W_SLICE_GC_TYPE_ID,
         &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
@@ -1146,11 +1338,13 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
+        "W_SliceObject",
+        "sliceobject::W_SliceObject",
     )
 });
 
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
         0,
@@ -1268,6 +1462,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
+        "PyFrame",
+        "pyframe::PyFrame",
     )
 });
 
@@ -1288,6 +1484,18 @@ impl SizeDescr for PyreSizeDescr {
 
     fn type_id(&self) -> u32 {
         self.type_id
+    }
+
+    /// `descr.py:108-118 get_size_descr` cache identity 와 line-by-line
+    /// 동등: `register_keyed_size` 가 publish 한
+    /// `LLType::Struct(path_hash(simple_name))` 슬롯 키를 그대로 반환.
+    /// `bh_size_spec_from_descr` 역방향 reader 는 이 값을
+    /// `BhSizeSpec.type_id` 에 넣고 `simple_descr_group_from_bh_size` 는
+    /// `LLType::Struct(spec.type_id)` 로 publish 슬롯에 round-trip 한다.
+    /// `type_id` (dense GC tid) 와 `cache_key` (structural identity) 는
+    /// `descr.rs:1928-1934` 트레이트 doc 의 분리 contract 를 따른다.
+    fn cache_key(&self) -> u64 {
+        self.cache_key
     }
 
     fn vtable(&self) -> usize {
@@ -1324,9 +1532,14 @@ pub fn make_size_descr_with_type_and_vtable(
     type_id: u32,
     vtable: usize,
 ) -> DescrRef {
+    // 빈 fielddescr fallback — `BhDescr::Size` 디코더가 구조 identity
+    // 캐리어 없이 호출하는 자리.  `cache_key = 0` 은 round-trip 시
+    // `simple_descr_group_from_bh_size` 의 no-identity branch
+    // (`descr.rs:2382-2388`) 가 per-call distinct 처리하므로 안전.
     Arc::new(PyreSizeDescr {
         obj_size,
         type_id,
+        cache_key: 0,
         vtable,
         all_fielddescrs: Vec::new(),
         gc_fielddescrs: Vec::new(),
@@ -1365,14 +1578,26 @@ fn maybe_array_lendescr_at_offset(len_offset: Option<usize>) -> Option<DescrRef>
     len_offset.map(array_lendescr_at_offset)
 }
 
-/// Create an array descriptor for a pointer-backed array field.
+/// Create a fresh ARRAY descriptor without identity carrier.
 ///
 /// `len_offset`: `None` for the `nolength=True` shape (descr.py:360);
 /// `Some(off)` for length-prefixed layouts (descr.py:362).
 ///
-/// Routes through `ARRAY_DESCR_REGISTRY` so repeat calls with the same
-/// structural tuple return the same `Arc`, mirroring PyPy's
-/// `cache[ARRAY_OR_STRUCT]` (descr.py:350-351).
+/// PyPy `descr.py:348-378 get_array_descr(gccache, ARRAY)` keys
+/// `_cache_array[ARRAY_OR_STRUCT]` on the ARRAY object identity, never
+/// on its structural shape — two distinct lltype ARRAYs that share
+/// `(base_size, item_size, item_type, signed, len_offset)` get
+/// distinct `ArrayDescr` Arcs.  Pyre's no-identity-carrier callers
+/// (this function: `array_type_id = None`, `type_id = 0`) cannot
+/// participate in the keyed cache because they have no ARRAY-object
+/// surrogate to hash; the orthodox behaviour is therefore "each call
+/// is a distinct ARRAY" — mint fresh `PyreArrayDescr` per call so
+/// shape-coincident-but-logically-distinct ARRAYs receive distinct
+/// `descr_id` slots.  Callers that need singleton semantics
+/// (`int_array_descr`, `float_array_descr`, `pyobject_array_descr`,
+/// …) route through [`make_array_descr_with_full_id`] with a stable
+/// identity string instead — the keyed cache canonicalises by that
+/// string.
 pub fn make_array_descr(
     base_size: usize,
     item_size: usize,
@@ -1380,7 +1605,21 @@ pub fn make_array_descr(
     item_type: Type,
     signed: bool,
 ) -> DescrRef {
-    get_or_create_array_descr(base_size, item_size, 0, item_type, signed, len_offset)
+    ensure_pyre_array_descr_upcaster_registered();
+    let descr_id = alloc_array_descr_id();
+    Arc::new(PyreArrayDescr {
+        base_size,
+        item_size,
+        type_id: 0,
+        item_type,
+        signed,
+        len_descr: maybe_array_lendescr_at_offset(len_offset),
+        descr_id,
+        ei_index: AtomicU32::new(u32::MAX),
+        // No identity carrier — fresh mint per call (cache_key = 0
+        // means "no cache slot").
+        cache_key: 0,
+    })
 }
 
 pub fn make_array_descr_with_type(
@@ -1755,13 +1994,50 @@ mod tests {
     }
 
     #[test]
-    fn test_array_descr_indices_are_stable_and_distinct() {
+    fn test_array_descr_indices_are_distinct_per_call() {
+        // PyPy `descr.py:350-351 cache[ARRAY_OR_STRUCT]` keys on ARRAY
+        // object identity; `make_array_descr` callers without an
+        // identity carrier (`array_type_id = None`) each produce a
+        // distinct ARRAY → distinct `descr_id`.  Singleton semantics
+        // require routing through `make_array_descr_with_full_id` with
+        // a stable identity string instead.
         let a = make_array_descr(0, 8, None, Type::Int, false);
         let b = make_array_descr(0, 8, None, Type::Int, false);
         let c = make_array_descr(0, 8, None, Type::Ref, false);
 
-        assert_eq!(a.index(), b.index());
+        assert_ne!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
+        assert_ne!(b.index(), c.index());
+    }
+
+    #[test]
+    fn test_array_descr_with_full_id_singleton_per_identity() {
+        // `descr.py:348-378 get_array_descr` cache hit on
+        // `LLType::Array(path_hash(atid))` returns the existing Arc
+        // — `make_array_descr_with_full_id` with the same identity
+        // string is a singleton.
+        let a = crate::descr::make_array_descr_with_full_id(
+            0,
+            8,
+            0,
+            None,
+            Type::Int,
+            false,
+            Some("pyre::test_singleton_id".to_string()),
+        );
+        let b = crate::descr::make_array_descr_with_full_id(
+            0,
+            8,
+            0,
+            None,
+            Type::Int,
+            false,
+            Some("pyre::test_singleton_id".to_string()),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "same identity carrier must collapse to the same Arc"
+        );
     }
 
     #[test]
@@ -1971,7 +2247,18 @@ mod tests {
         let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
 
         assert!(array.is_array_of_structs());
-        assert_eq!(array.type_id(), 42);
+        // `type_id` is the dense sequential GC tid allocated by
+        // `GcCache::init_array_descr` (analog of `gc.py:544-549
+        // GcLLDescr_framework.init_array_descr` + `gctypelayout.py:301-357
+        // TypeLayoutBuilder.get_type_id`).  Exact value depends on the
+        // global allocator state — test-suite ordering is non-deterministic
+        // so we only assert it is non-zero (tid 0 reserved per
+        // `gctypelayout.py:328-331`).  The structural identity that
+        // round-trips through `BhDescr::Array.type_id` (path_hash payload)
+        // lives in `cache_key` (descr.rs:2120-2131), independent of the
+        // GC tid.
+        assert_ne!(array.type_id(), 0);
+        assert_eq!(array.cache_key(), 42);
         assert_eq!(array.item_type(), Type::Ref);
         let interior = array
             .get_all_interiorfielddescrs()
@@ -2093,14 +2380,23 @@ fn simple_descr_group_from_bh_size(
             .iter()
             .map(simple_field_spec_from_bh)
             .collect();
-        majit_ir::descr::make_simple_descr_group(
+        // `descr.py:108-118 get_size_descr` + `:218-239 get_field_descr`
+        // keyed publish: `spec.type_id` is the u64 `path_hash` cache
+        // key matching the runtime macro's `__majit_type_id`.  Route
+        // through the keyed factory so analyzer-side `cc.fielddescrof`
+        // lookups (via `gc_cache.get_field_descr(LLType::Struct(key),
+        // name, ...)`) resolve to the same Arc this mint produces —
+        // restoring PyPy `cpu.fielddescrof` per-`(STRUCT, name)`
+        // identity.  The u32 truncation for the SimpleSizeDescr's gc
+        // tid is a PRE-EXISTING-ADAPTATION (the tid is allocated by
+        // gc_cache.init_size_descr in the canonical path; this factory
+        // bypasses that, so the tid stays a path_hash-derived u32 with
+        // birthday-paradox collision risk around 2^16 distinct STRUCTs).
+        majit_ir::descr::make_simple_descr_group_keyed(
             u32::MAX,
             spec.size,
-            // PRE-EXISTING-ADAPTATION: `make_simple_descr_group` takes
-            // the u32 gc tid; `spec.type_id` is the u64 cache key.
-            // Truncate `as u32` until gc_cache routing allocates the
-            // proper gc tid here.
             spec.type_id as u32,
+            spec.type_id,
             spec.vtable,
             &field_specs,
         )
@@ -2247,32 +2543,131 @@ pub fn make_struct_array_descr_full(
     item_type: Type,
     interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
 ) -> DescrRef {
-    use majit_ir::descr::{ArrayFlag, SimpleArrayDescr};
-    // RPython `descr.py:388 InteriorFieldDescr.__init__(arraydescr,
-    // fielddescr)` keeps the exact `arraydescr` object passed in.
-    // Publish the final `Arc<SimpleArrayDescr>` first so every
-    // `SimpleInteriorFieldDescr` clones the same Arc, then push the
-    // interior list back onto that Arc through the `OnceLock`-backed
-    // setter — `Arc::ptr_eq(interior.array_descr,
-    // returned_array_descr)` now holds, matching the upstream
-    // identity invariant.
-    let mut raw_array_descr = SimpleArrayDescr::with_flag(
+    // No cache key plumbed — fall through to the keyed variant with
+    // `cache_key = 0` (no-identity sentinel).  Callers that have a
+    // real u64 path_hash should call `make_struct_array_descr_full_keyed`.
+    make_struct_array_descr_full_keyed(
         descr_index,
         base_size,
         item_size,
+        len_offset,
         type_id,
+        0,
         item_type,
-        ArrayFlag::Struct,
-    );
-    raw_array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
-    let array_descr = Arc::new(raw_array_descr);
-    // descr.py:354-364 `get_array_descr` cache-miss path.
-    majit_ir::descr_registry::register_array(array_descr.clone() as DescrRef);
+        interior_fields,
+    )
+}
+
+/// Keyed sibling: accepts the u64 `cache_key` (= `path_hash(array_type_id)`)
+/// so the freshly-minted `SimpleArrayDescr` lands in
+/// `gc_cache._cache_array[LLType::Array(cache_key)]` in addition to
+/// the snapshot order Vec.  Mirrors PyPy `cpu.arraydescrof(ARRAY)`
+/// per-ARRAY cache identity (`descr.py:348-378`).  `cache_key == 0`
+/// is the no-identity sentinel — registers via the non-keyed path.
+pub fn make_struct_array_descr_full_keyed(
+    descr_index: u32,
+    base_size: usize,
+    item_size: usize,
+    len_offset: Option<usize>,
+    type_id: u32,
+    cache_key: u64,
+    item_type: Type,
+    interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
+) -> DescrRef {
+    use majit_ir::descr::{ArrayFlag, LLType, SimpleArrayDescr, gc_cache, try_downcast_arc};
+    // `descr.py:348-378 get_array_descr(gccache, ARRAY)` cache-or-mint:
+    // an `LLType::Array(cache_key)` cache hit returns the existing Arc
+    // (whichever concrete type lives in the slot — `SimpleArrayDescr`
+    // from a prior analyzer call or `PyreArrayDescr` from
+    // `make_array_descr_with_full_id`); only a miss mints a fresh
+    // descr.  Matches PyPy `cpu.arraydescrof(ARRAY)` per-ARRAY object
+    // identity — both pyre runtime mint sites and analyzer share a
+    // single Arc per cache key.  `cache_key == 0` is the no-identity
+    // sentinel (legacy non-keyed callers) — mint locally, no cache
+    // publication.
+    let array_descr_dyn: DescrRef = if cache_key != 0 {
+        let array_key = LLType::Array(cache_key);
+        let cached = gc_cache().lock().unwrap().get_array_descr(
+            array_key.clone(),
+            base_size,
+            item_size,
+            ArrayFlag::Struct,
+            item_type,
+            len_offset.is_none(),
+            len_offset.unwrap_or(0),
+            false,
+            '\x00',
+        );
+        // PyPy `gc.py:544-549 init_array_descr` stamps `descr.tid`
+        // from `layoutbuilder.get_type_id(A)` — a dense sequential
+        // GC type id.  Pyre does not yet port the layoutbuilder
+        // analog (multi-session epic), so the cache-hit branch only
+        // updates the per-trace `descr_index` and leaves
+        // `SimpleArrayDescr.type_id` at its mint default (0, set in
+        // `get_array_descr` at descr.rs:515).  The
+        // `BhDescr::Array.type_id` payload threaded through this
+        // helper is the producer-side `path_hash(array_type_id)` and
+        // already lands in `SimpleArrayDescr.cache_key` via the
+        // `get_array_descr` cache-miss-mint stamp at descr.rs:526-528
+        // — structural identity (`cache_key`) is decoupled from GC tid
+        // (`type_id`) per the trait doc at descr.rs:2120-2131.  Runtime
+        // registrations (`PyreArrayDescr`) carry their real GC tid
+        // immutably at mint and win the cache slot.
+        cached.set_index(descr_index);
+        cached
+    } else {
+        // No cache identity — local mint.  Two `cache_key == 0`
+        // entries are intentionally distinct STRUCTs sharing the
+        // no-identity sentinel; per-`make_array_descr` legacy callers
+        // rely on this.
+        let mut raw_array_descr = SimpleArrayDescr::with_flag(
+            descr_index,
+            base_size,
+            item_size,
+            type_id,
+            item_type,
+            ArrayFlag::Struct,
+        );
+        raw_array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
+        let arc: DescrRef = Arc::new(raw_array_descr);
+        majit_ir::descr_registry::register_array(arc.clone());
+        arc
+    };
     if interior_fields.is_empty() {
-        return array_descr;
+        return array_descr_dyn;
     }
 
-    let mut descrs = Vec::new();
+    // Upcast the cached array descr to `Arc<dyn ArrayDescr>` for
+    // `SimpleInteriorFieldDescr.array_descr` storage.  The cache slot
+    // can hold either concrete `SimpleArrayDescr` (analyzer mint or
+    // gc_cache internal mint) or `PyreArrayDescr` (legacy runtime mint
+    // from `make_array_descr_with_full_id`).  Both implement
+    // `ArrayDescr`; downcast to the appropriate Arc type, then upcast.
+    let array_descr_for_interior: Arc<dyn majit_ir::descr::ArrayDescr> =
+        match try_downcast_arc::<SimpleArrayDescr>(array_descr_dyn.clone()) {
+            Ok(simple) => simple,
+            Err(orig) => match try_downcast_arc::<PyreArrayDescr>(orig) {
+                Ok(pyre) => pyre,
+                Err(_) => {
+                    // Cache slot held an Arc we cannot downcast to either
+                    // known concrete ArrayDescr type — this should not
+                    // happen in production paths.  Fall back to a fresh
+                    // SimpleArrayDescr so the interior loop has a stable
+                    // `array_descr` anchor (will not share identity with
+                    // the cache, but better than panicking).
+                    Arc::new(SimpleArrayDescr::with_flag(
+                        descr_index,
+                        base_size,
+                        item_size,
+                        type_id,
+                        item_type,
+                        ArrayFlag::Struct,
+                    ))
+                }
+            },
+        };
+
+    let mut descrs: Vec<DescrRef> = Vec::new();
     for interior in interior_fields {
         let owner_group = simple_descr_group_from_bh_size(&interior.owner);
         let field_pos = interior
@@ -2285,21 +2680,54 @@ pub fn make_struct_array_descr_full(
             })
             .unwrap_or(interior.field.index_in_parent);
         if let Some(field_descr) = owner_group.field_descrs.get(field_pos) {
-            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
-                interior.index,
-                array_descr.clone(),
-                field_descr.clone(),
-                owner_group.size_descr.clone(),
-            );
-            let arc: DescrRef = Arc::new(ifd);
-            // descr.py:404-414 `get_interiorfield_descr` cache-miss path.
-            majit_ir::descr_registry::register_interior_field(arc.clone());
-            descrs.push(arc);
+            // `descr.py:423-438 get_interiorfield_descr` cache-or-mint
+            // is keyed on the outer ARRAY's lltype identity.  When the
+            // outer array carries `cache_key != 0`, route through the
+            // keyed `_cache_interiorfield[(LLType::Array(cache_key),
+            // name, "")]` so both analyzer and runtime share one Arc
+            // per `(ARRAY, name)` tuple.  With `cache_key == 0`
+            // (no-identity outer array) PyPy has NO "merge several
+            // ARRAYs' interiors into one slot" behavior — local mint
+            // a fresh `SimpleInteriorFieldDescr` per call so distinct
+            // no-identity arrays do not alias on their interior field
+            // descrs.
+            //
+            // Bare interior field name (`spec.name`) is the cache key per
+            // `descr.py:221 cache[STRUCT][fieldname]` shape.
+            let bare_name = interior
+                .field
+                .name
+                .rsplit_once('.')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| interior.field.name.clone());
+            let field_dyn: Arc<dyn majit_ir::descr::FieldDescr> = field_descr.clone();
+            let ifd: DescrRef = if cache_key != 0 {
+                gc_cache().lock().unwrap().get_interiorfield_descr(
+                    LLType::Array(cache_key),
+                    bare_name,
+                    String::new(),
+                    array_descr_for_interior.clone(),
+                    field_dyn,
+                )
+            } else {
+                Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                    u32::MAX,
+                    array_descr_for_interior.clone(),
+                    field_dyn,
+                )) as DescrRef
+            };
+            // Per-trace `interior.index` stamp matches the analyzer's
+            // `cc.interiorfielddescrof` codewriter idx convention.
+            ifd.set_index(interior.index);
+            descrs.push(ifd);
         }
     }
 
-    array_descr.set_all_interiorfielddescrs(descrs);
-    array_descr
+    // `descr.py:372-375 arraydescr.all_interiorfielddescrs = descrs`
+    // set-once via OnceLock.  Cache-hit case: a prior populator already
+    // set the list; our set is a no-op which is the desired semantic.
+    array_descr_for_interior.set_all_interiorfielddescrs(descrs);
+    array_descr_dyn
 }
 
 /// Concrete `JitCodeDescr` adapter for `inline_call_*` opcodes.
@@ -2544,15 +2972,23 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             ..
         } => {
             let descr = if *is_array_of_structs {
-                make_struct_array_descr_full(
+                // `descr.py:348-378 get_array_descr(gccache, ARRAY)`:
+                // the u64 `*type_id` from `BhDescr::Array` is the cache
+                // key (`path_hash` of the producer-side `array_type_id`,
+                // see `BhSizeSpec.type_id` doc); thread it into the
+                // keyed factory so `gc_cache._cache_array[LLType::Array(
+                // cache_key)]` is populated and subsequent lookups
+                // resolve to the same Arc.  The u32 truncation for the
+                // SimpleArrayDescr gc tid is a PRE-EXISTING-ADAPTATION
+                // (gc tid should come from `init_array_descr`
+                // sequential allocation).
+                make_struct_array_descr_full_keyed(
                     u32::MAX,
                     *base_size,
                     *itemsize,
                     *len_offset,
-                    // PRE-EXISTING-ADAPTATION: `make_struct_array_descr_full`
-                    // takes the u32 gc tid; `*type_id` is the u64 cache key.
-                    // Truncate `as u32` until gc_cache routing.
                     *type_id as u32,
+                    *type_id,
                     *item_type,
                     interior_fields,
                 )

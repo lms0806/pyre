@@ -53,6 +53,13 @@ fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
 
+/// Re-export of `pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots`
+/// so the codewriter pipeline shares the same formula with the
+/// portal-bridge install path in `canonical_bridge.rs`.  See the
+/// definition site for the `interp_jit.py:67 reds = ['frame', 'ec']`
+/// rationale.
+use pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots;
+
 #[inline]
 fn entry_arg_slots(code: &CodeObject) -> usize {
     let mut argcount = code.arg_count as usize + code.kwonlyarg_count as usize;
@@ -3011,8 +3018,8 @@ impl CodeWriter {
         // `null_ref_reg` PY_NULL holder before Tier 4 Epic A retired it; the
         // portal red regs keep their numerical positions so layout-sensitive
         // tests stay stable.
-        let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;
-        let portal_ec_reg = (nlocals + max_stackdepth + 12) as u16;
+        let (portal_frame_reg, portal_ec_reg) =
+            portal_red_pre_regalloc_slots(nlocals, max_stackdepth);
         // Per-arm fresh ref scratch slots — Phase 2 Commit 2.2 first slice
         // (Tasks #158/#159/#122 plan).  Each opcode handler arm that needs
         // a transient ref-typed register allocates one or more fresh slots

@@ -1602,6 +1602,29 @@ impl<'a> Assembler386<'a> {
             ; mov rcx, [rcx]            // rcx = *rst_addr = root_stack_top
             ; mov rbp, [rcx - 8]        // rbp = *(top - WORD) = jf_ptr
         );
+        // assembler.py:1378-1383 `_reload_frame_if_necessary` parity:
+        //
+        // ```python
+        // wbdescr = self.cpu.gc_ll_descr.write_barrier_descr
+        // if gcrootmap and wbdescr:
+        //     # frame never uses card marking, so we enforce this is not
+        //     # an array
+        //     self._write_barrier_fastpath(mc, wbdescr, [ebp], array=False,
+        //                                  is_frame=True)
+        // ```
+        //
+        // After a collecting helper call the jitframe may have been
+        // promoted from nursery to old-gen.  Subsequent stores of young
+        // Refs into `[rbp + ofs]` would create old→young pointers
+        // invisible to the GC — the WB fastpath re-arms the `TRACK_YOUNG_PTRS`
+        // bit so the next collection scans the frame.  Reuses the shared
+        // `emit_write_barrier_fastpath_kind` helper — `assembler.py:2388-2419`
+        // expresses both `is_frame=True` and `is_frame=False` in a single
+        // `_write_barrier_fastpath` whose addressing degenerates naturally
+        // when `loc_base == ebp`.  `is_array=false` skips card marking
+        // (assembler.py:2401 `if array and jit_wb_cards_set` gate); the
+        // `helper_num=4` XMM-skip optimization is a perf adaptation not
+        // a correctness gap and remains a future-session task.
         if crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
             cell.borrow()
                 .as_ref()
@@ -2374,35 +2397,56 @@ impl<'a> Assembler386<'a> {
             | OpCode::ArraylenGc
             | OpCode::Strlen
             | OpCode::Unicodelen => {
-                if let (Some(Loc::Reg(base)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let ofs = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.offset() as i32)
-                        .unwrap_or(0);
-                    let field_size = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.field_size())
-                        .unwrap_or(8);
-                    if dst.is_xmm {
-                        dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
-                    } else {
-                        match field_size {
-                            1 => {
-                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs]);
-                            }
-                            2 => {
-                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs]);
-                            }
-                            4 => {
-                                dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs]);
-                            }
-                            _ => {
-                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]);
-                            }
+                // regalloc.py:1154-1167 `_consider_gc_load` parity: both
+                // `base_loc = self.rm.make_sure_var_in_reg(op.getarg(0), args)`
+                // and `result_loc = self.force_allocate_reg(op)` force
+                // register materialisation — pyre's
+                // `consider_getfield_j2` (regalloc.rs:4309-4321) does the
+                // same.  Silently no-op'ing on a non-Reg base or result
+                // would mask a regalloc bug (e.g. a fresh `GETFIELD_GC`
+                // arm that forgot the `make_sure_var_in_reg` call), so
+                // surface the invariant violation explicitly.
+                let base = match arglocs.first() {
+                    Some(Loc::Reg(r)) => *r,
+                    other => panic!(
+                        "GetfieldGc/Strlen/Unicodelen/ArraylenGc base must be Loc::Reg \
+                         (regalloc.py:1156 make_sure_var_in_reg invariant), got {other:?}",
+                    ),
+                };
+                let dst = match result_loc {
+                    Some(Loc::Reg(r)) => *r,
+                    other => panic!(
+                        "GetfieldGc/Strlen/Unicodelen/ArraylenGc result_loc must be Loc::Reg \
+                         (regalloc.py:1158 force_allocate_reg invariant), got {other:?}",
+                    ),
+                };
+                let ofs = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_field_descr())
+                    .map(|fd| fd.offset() as i32)
+                    .unwrap_or(0);
+                let field_size = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_field_descr())
+                    .map(|fd| fd.field_size())
+                    .unwrap_or(8);
+                if dst.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
+                } else {
+                    match field_size {
+                        1 => {
+                            dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs]);
+                        }
+                        2 => {
+                            dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs]);
+                        }
+                        4 => {
+                            dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs]);
+                        }
+                        _ => {
+                            dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]);
                         }
                     }
                 }

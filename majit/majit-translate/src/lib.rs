@@ -257,6 +257,49 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
     )
 }
 
+/// Multi-file analysis with explicit per-source module paths.
+///
+/// `sources` and `module_paths` are parallel slices of equal length:
+/// `module_paths[i]` is the crate-stripped module path of `sources[i]`
+/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  Each file
+/// is parsed via [`parse::parse_source_with_module`], populating
+/// `ParsedInterpreter.{module_path, use_imports}` so the metadata
+/// collectors can record `struct_origins[bare_name] = module_path`
+/// and `qualify_to_canonical_struct` resolves cross-module references
+/// through the use-import table.
+///
+/// An empty `module_paths[i]` keeps the simple-name registration of
+/// the bare `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
+/// entry — runtime convergence is then handled solely by the
+/// `build_object_descr_group_with_def_path` dual-publish.
+pub fn analyze_multiple_pipeline_with_modules(
+    sources: &[&str],
+    module_paths: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+) -> pipeline::ProgramPipelineResult {
+    assert_eq!(
+        sources.len(),
+        module_paths.len(),
+        "analyze_multiple_pipeline_with_modules: parallel slices must have equal length",
+    );
+    let parsed_files: Vec<_> = sources
+        .iter()
+        .zip(module_paths.iter())
+        .map(|(s, mp)| parse::parse_source_with_module(s, mp))
+        .collect();
+    analyze_pipeline_from_parsed(
+        &parsed_files,
+        config,
+        layout_provider,
+        vinfo_factory,
+        fnaddr_bindings,
+        &[],
+    )
+}
+
 /// Like `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings` but
 /// additionally accepts an `impl_fnaddr_bindings` table produced by the
 /// macro's `__majit_helper_impl_trace_fnaddrs()` registry. Entries bind
@@ -307,6 +350,26 @@ fn analyze_pipeline_from_parsed(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    // Use-import resolver: harvest `(bare_name → defining_module_path)`
+    // from every `ParsedInterpreter.module_path` non-empty entry, then
+    // publish into the `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` global
+    // so subsequent `canonical_struct_name` lookups at `path_hash`
+    // sites resolve bare struct tokens to their qualified canonical
+    // form (PyPy `bookkeeper.getdesc(TYPE)` analog).  Empty
+    // `module_path` files skip registration; their bare-name hashes
+    // still resolve via the runtime's simple-name dual-publish slot.
+    let mut struct_origins: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for parsed in parsed_files {
+        if !parsed.module_path.is_empty() {
+            front::ast::collect_struct_origins(
+                &parsed.file.items,
+                &parsed.module_path,
+                &mut struct_origins,
+            );
+        }
+    }
+    majit_ir::descr::register_struct_origins(struct_origins);
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-

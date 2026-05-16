@@ -2629,18 +2629,17 @@ fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitc
 fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcode::BhSizeSpec {
     crate::jitcode::BhSizeSpec {
         size: sd.size(),
-        // PRE-EXISTING-ADAPTATION: descr-back-to-spec inverse path.
-        // `SizeDescr::type_id()` returns the u32 GC tid (allocated by
-        // `gc_cache.next_struct_tid`, used by backends for
-        // `gc.alloc_*_typed`), NOT the u64 `path_hash` cache key the
-        // analyzer route stamps via `bh_size_spec_from_callcontrol`.
-        // Widen via `as u64` here so the field type stays consistent;
-        // callers reading this `BhSizeSpec` to look up the gc_cache
-        // entry will not hit (the cache key u64 path_hash differs from
-        // the u32 tid).  Plumbing a real `cache_key()` accessor onto
-        // `SizeDescr` is the structural fix — once landed, this
-        // becomes `sd.cache_key()` directly.
-        type_id: sd.type_id() as u64,
+        // Descr-back-to-spec inverse path: pyre's analyzer-side
+        // `bh_size_spec_from_callcontrol` stamps
+        // `type_id = path_hash(owner)` (u64) so the
+        // `simple_descr_group_from_bh_size` round-trip resolves
+        // `LLType::Struct(path_hash)` in `gc_cache._cache_size`.  The
+        // `SizeDescr.cache_key()` accessor returns that same u64 (set
+        // by `get_size_descr` cache-miss-mint).  Previously this used
+        // `sd.type_id() as u64` — the dense GC tid widened to u64,
+        // which lands on a DIFFERENT cache slot than the analyzer's
+        // path_hash key, polluting cross-path identity.
+        type_id: sd.cache_key(),
         vtable: sd.vtable(),
         all_fielddescrs: sd
             .all_fielddescrs()
@@ -2685,6 +2684,12 @@ fn bh_interior_field_specs_from_array_descr(
 /// When `array_type_id` is available (e.g. `Vec<i32>` → element `i32`),
 /// the result is exact. Fallback uses descr.py:241-254 get_type_flag()
 /// semantics: Int → FLAG_SIGNED, Float/Ref → FLAG_UNSIGNED/FLAG_FLOAT.
+///
+/// When `callcontrol` is present, this routes through
+/// `CallControl::arraydescrof_for_type` and carries the EffectInfo
+/// `ei_index` across the BhDescr boundary.  The `callcontrol == None`
+/// fallback is descriptor-shape-only: it must not be used for EffectInfo raw
+/// sets because there is no codewriter-side array namespace to publish.
 fn arraydescrof(
     ty: &crate::model::ValueType,
     array_type_id: &Option<String>,
@@ -2707,10 +2712,12 @@ fn arraydescrof(
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            // PRE-EXISTING-ADAPTATION: same descr-back-to-spec gap
-            // as `BhDescr::from_array_descr` — widen via `as u64`
-            // until `ArrayDescr` exposes a `cache_key()` accessor.
-            type_id: array_descr.type_id() as u64,
+            // `descr.py:348-378` cache identity — `ArrayDescr.cache_key()`
+            // returns the u64 `path_hash(array_type_id)` slot the analyzer
+            // stamped at `gc_cache.get_array_descr` cache-miss-mint.
+            // Round-trips through `_cache_array[LLType::Array(cache_key)]`
+            // on the runtime side.
+            type_id: array_descr.cache_key(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
@@ -2776,9 +2783,10 @@ fn arraydescrof(
         is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
         is_array_of_structs: flag == majit_ir::descr::ArrayFlag::Struct,
         is_item_signed: flag == majit_ir::descr::ArrayFlag::Signed,
-        // No CallControl-side `array_index` for the fallback path —
-        // mint-time bridge unset; readers consult `get_ei_index()` and
-        // fall back to `descr.index()` per heap.rs::array_effect_index.
+        // No CallControl-side `array_index` for the fallback path.  This
+        // descriptor is shape-only for codewriter-less emission helpers; any
+        // path that needs EffectInfo heap invalidation must pass CallControl
+        // so `arraydescrof_for_type` can publish the real `ei_index`.
         ei_index: u32::MAX,
         // Codewriter-less fallback still carries the ARRAY identity
         // string so the runtime registry keeps distinct lltypes

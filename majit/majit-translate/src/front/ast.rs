@@ -258,6 +258,25 @@ pub struct ProgramMetadata {
     pub known_trait_names: std::collections::HashSet<String>,
     pub struct_fields: StructFieldRegistry,
     pub fn_return_types: HashMap<String, String>,
+    /// Bare struct name → defining module path (use-import resolver
+    /// support).  Populated when `collect_struct_names` walks per-file
+    /// `ParsedInterpreter.module_path` non-empty: each top-level
+    /// `Struct` registers as `struct_origins["Struct"] = module_path`.
+    /// PyPy parity: `annotator.bookkeeper.getdesc(TYPE)` resolves the
+    /// canonical defining-module path for every lltype reference;
+    /// pyre carries names as strings so this map carries that
+    /// resolution.  Empty when every parsed file was supplied via the
+    /// bare `parse_source` entry — caller falls back to the
+    /// dual-publish runtime convergence.
+    pub struct_origins: HashMap<String, String>,
+    /// Merged use-import table across all parsed files: each entry
+    /// `(file_module_path, alias) → fully_qualified_path` mirrors the
+    /// per-file `ParsedInterpreter.use_imports` populated by
+    /// `parse::collect_use_imports`.  Keyed by `(module, alias)` rather
+    /// than `alias` alone because the same alias `Foo` can resolve to
+    /// different paths in different files (`use other_a::Foo` in one
+    /// vs `use other_b::Foo` in another).
+    pub use_imports: HashMap<(String, String), String>,
 }
 
 /// RPython `annrpython.py:103-150 build_types` whole-program walk —
@@ -279,9 +298,28 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
     let mut struct_fields = StructFieldRegistry::default();
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
     let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
+    let mut struct_origins: HashMap<String, String> = HashMap::new();
+    let mut use_imports: HashMap<(String, String), String> = HashMap::new();
     for parsed in parsed_files {
         collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
         collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
+        // PyPy `annrpython.py` bookkeeper: every newly-seen STRUCT
+        // gets cached under its lltype-object identity, which is the
+        // defining-module path.  Pyre carries names as strings — record
+        // `bare_name → module_path` so cross-file references can
+        // resolve to the canonical hash slot the runtime publishes.
+        // Empty `module_path` (legacy `parse_source` entry) skips the
+        // record; consumers fall back to dual-publish convergence.
+        if !parsed.module_path.is_empty() {
+            collect_struct_origins(&parsed.file.items, &parsed.module_path, &mut struct_origins);
+        }
+        // Mirror the per-file `ParsedInterpreter.use_imports` into the
+        // program-wide `(module_path, alias) → fully_qualified_path`
+        // registry.  Caller may pass the same alias across multiple
+        // files; the per-file key disambiguates.
+        for (alias, full) in &parsed.use_imports {
+            use_imports.insert((parsed.module_path.clone(), alias.clone()), full.clone());
+        }
     }
     for parsed in parsed_files {
         collect_fields_and_returns(
@@ -299,6 +337,50 @@ pub fn collect_program_metadata_pub(parsed_files: &[ParsedInterpreter]) -> Progr
         known_trait_names,
         struct_fields,
         fn_return_types,
+        struct_origins,
+        use_imports,
+    }
+}
+
+/// Walk all top-level (and nested `mod`) `Item::Struct` declarations in
+/// `items` and record each struct's bare name → defining module path.
+/// Mirrors PyPy `bookkeeper.getdesc(TYPE)` resolution: every observed
+/// lltype STRUCT identity has a canonical home module; pyre carries
+/// names as strings so this map serves the same role.
+///
+/// Nested `mod foo { struct Bar; }` extends the prefix to `outer::foo`
+/// so the registered origin matches what `path_hash(canonical)` would
+/// produce for the qualified key.
+pub(crate) fn collect_struct_origins(
+    items: &[Item],
+    module_prefix: &str,
+    origins: &mut HashMap<String, String>,
+) {
+    for item in items {
+        match item {
+            Item::Struct(s) => {
+                let bare = s.ident.to_string();
+                // First-write-wins: if two files defined the same bare
+                // name, keep the first-seen.  Callers can disambiguate
+                // via use-import alias; the program-wide map only
+                // serves the most-common-case "bare name resolves to
+                // single module" path.
+                origins
+                    .entry(bare)
+                    .or_insert_with(|| module_prefix.to_string());
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let nested = if module_prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", module_prefix, m.ident)
+                    };
+                    collect_struct_origins(sub_items, &nested, origins);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

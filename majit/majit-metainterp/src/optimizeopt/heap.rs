@@ -774,7 +774,7 @@ pub struct OptHeap {
     /// `arraydescr.ei_index` inside `effectinfo.check_write_descr_array(arraydescr)`
     /// at invalidation time (`effectinfo.py:220-222`).  Pyre keeps the
     /// `DescrRef` alive on the value side so the same lazy resolution can
-    /// happen via `descr.get_ei_index()` (with `EI_INDEX_TABLE` fallback) at
+    /// happen via `descr.get_ei_index()` at
     /// `force_from_effectinfo`; the `u32` key dedups by raw `descr.index()`
     /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
     /// (the registration is gated by a `cached_dict_reads` first-encounter
@@ -855,54 +855,24 @@ impl OptHeap {
     /// `effectinfo.py:529-532` `bitstrr = [descr.ei_index for descr in
     /// getattr(ei, '_readonly_descrs_' + key)]` — the bit position in
     /// each EI's `bitstring_*` is the descr's `ei_index`, set by
-    /// `compute_bitstrings`. Pyre resolves it in priority order:
-    ///
-    /// 1. `descr.get_ei_index()` — populated by `compute_bitstrings`
-    ///    only when the descr was reachable through the caller's
-    ///    `all_descrs`. Pyre's production path rarely has the
-    ///    field/array descr Arc on hand because there is no central
-    ///    descriptor enumeration (PyPy's `cpu.fetch_all_descrs()`),
-    ///    so this fast path mostly applies to test fixtures that
-    ///    pre-build their `all_descrs`.
-    /// 2. `EI_INDEX_TABLE.lookup_field(descr.index())` — side-table
-    ///    map published by `MetaInterpStaticData::finish_setup_descrs`
-    ///    after `compute_bitstrings` returns. Production callers see
-    ///    the compaction here.
-    /// 3. Sentinel `u32::MAX` — PyPy `effectinfo.py:496` writes
-    ///    `descr.ei_index = sys.maxint` for descrs absent from any
-    ///    EI's raw set. `bitstring.py:18 if byte_number >= len(bitstring)`
-    ///    then makes `bitcheck` return false out of range. Pyre
-    ///    matches by returning `u32::MAX`, whose
-    ///    `byte_number = u32::MAX >> 3` is far past any realistic
-    ///    bitstring length so `bitcheck` shorts to false the same way.
+    /// `compute_bitstrings` (`effectinfo.py:526 descr.ei_index = …`).
+    /// `effectinfo.py:496 descr.ei_index = sys.maxint` is the sentinel
+    /// for descrs absent from any EI's raw set;
+    /// `bitstring.py:18 if byte_number >= len(bitstring)` then makes
+    /// `bitcheck` return false out of range. Pyre matches by returning
+    /// `u32::MAX`, whose `byte_number = u32::MAX >> 3` is far past any
+    /// realistic bitstring length so `bitcheck` shorts to false the
+    /// same way.
     fn field_effect_index(descr: &DescrRef) -> u32 {
-        let ei_idx = descr.get_ei_index();
-        if ei_idx != u32::MAX {
-            return ei_idx;
-        }
-        if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
-            if let Some(idx) = table.lookup_field(descr.index()) {
-                return idx;
-            }
-        }
-        u32::MAX
+        descr.get_ei_index()
     }
 
-    /// Same priority chain as [`field_effect_index`] for the array
-    /// namespace (`effectinfo.py:307-311 add_array` writes `ei_index`
-    /// onto the array descr; `EI_INDEX_TABLE.lookup_array` is the
-    /// production-path side-table fallback).
+    /// Same as [`field_effect_index`] for the array namespace
+    /// (`effectinfo.py:307-311 add_array` writes `ei_index` onto the
+    /// array descr; `compute_bitstrings` re-stamps in-place per
+    /// `effectinfo.py:526 descr.ei_index = …`).
     fn array_effect_index(descr: &DescrRef) -> u32 {
-        let ei_idx = descr.get_ei_index();
-        if ei_idx != u32::MAX {
-            return ei_idx;
-        }
-        if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
-            if let Some(idx) = table.lookup_array(descr.index()) {
-                return idx;
-            }
-        }
-        u32::MAX
+        descr.get_ei_index()
     }
 
     /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
@@ -2019,26 +1989,15 @@ impl OptHeap {
         }
 
         // heap.py:554-558: for arraydescr, submap in self.cached_arrayitems.items()
-        // Bitstring bit position resolution mirrors `field_effect_index`:
-        // descr-side `get_ei_index` → published `EI_INDEX_TABLE.lookup_array`
-        // → `u32::MAX` sentinel matching PyPy `effectinfo.py:496`'s
-        // `descr.ei_index = sys.maxint` for descrs absent from any EI's
-        // raw set. See `field_effect_index` doc for the full priority chain.
+        // Bitstring bit position resolves through `descr.get_ei_index()`
+        // directly; `effectinfo.py:526 descr.ei_index = …` stamps the
+        // slot in-place at `compute_bitstrings` time, and
+        // `effectinfo.py:496 descr.ei_index = sys.maxint` is the
+        // sentinel for descrs absent from any EI's raw set.
         let array_descrs: Vec<(u32, u32)> = self
             .cached_arrayitems
             .iter()
-            .map(|(idx, descr, _)| {
-                let ei_idx = descr.get_ei_index();
-                if ei_idx != u32::MAX {
-                    return (*idx, ei_idx);
-                }
-                if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
-                    if let Some(eii) = table.lookup_array(*idx) {
-                        return (*idx, eii);
-                    }
-                }
-                (*idx, u32::MAX)
-            })
+            .map(|(idx, descr, _)| (*idx, descr.get_ei_index()))
             .collect();
         for (descr_idx, effect_idx) in array_descrs {
             let read = ei.check_readonly_descr_array(effect_idx);
@@ -2138,24 +2097,13 @@ impl OptHeap {
         // heap.py:560-563: invalidate cached_dict_reads via corresponding_array_descrs.
         // PyPy `effectinfo.check_write_descr_array(arraydescr)` reads
         // `arraydescr.ei_index` (`effectinfo.py:220-222`); pyre's lift
-        // resolves `descr.get_ei_index()` (with `EI_INDEX_TABLE`
-        // fallback for descrs minted outside any registry —
-        // mirroring `cached_arrayitems` above) before passing into
-        // `check_write_descr_array(effect_idx)`.
+        // resolves `descr.get_ei_index()` directly per
+        // `effectinfo.py:526 descr.ei_index = …` in-place stamp.
         let array_ids_to_clear: Vec<usize> = self
             .corresponding_array_descrs
             .iter()
             .filter_map(|(_, (arr_descr, dict_id))| {
-                let effect_idx = {
-                    let ei_idx = arr_descr.get_ei_index();
-                    if ei_idx != u32::MAX {
-                        ei_idx
-                    } else if let Some(table) = majit_ir::effectinfo::EI_INDEX_TABLE.get() {
-                        table.lookup_array(arr_descr.index()).unwrap_or(u32::MAX)
-                    } else {
-                        u32::MAX
-                    }
-                };
+                let effect_idx = arr_descr.get_ei_index();
                 if ei.check_write_descr_array(effect_idx) {
                     Some(*dict_id)
                 } else {

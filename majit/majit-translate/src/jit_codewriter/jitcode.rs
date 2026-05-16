@@ -1334,12 +1334,12 @@ impl BhDescr {
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            // PRE-EXISTING-ADAPTATION: descr-back-to-spec inverse path.
-            // `ArrayDescr::type_id()` returns the u32 GC tid, not the
-            // u64 `path_hash` cache key.  Widen via `as u64` here; the
-            // structural fix is a `cache_key()` accessor on
-            // `ArrayDescr` paired with `gc_cache` routing.
-            type_id: array_descr.type_id() as u64,
+            // `descr.py:348-378` cache identity — `ArrayDescr.cache_key()`
+            // returns the u64 `path_hash(array_type_id)` slot stamped by
+            // the analyzer's `gc_cache.get_array_descr` cache-miss-mint
+            // (zero for legacy non-keyed mints).  Round-trips through
+            // `_cache_array[LLType::Array(cache_key)]` on the runtime side.
+            type_id: array_descr.cache_key(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),

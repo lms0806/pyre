@@ -1,6 +1,6 @@
 //! Smoke tests for `#[jit_struct]` — descr.py:105-127 / :218-239 auto-discovery.
 
-use majit_ir::descr::{GcCache, LLType};
+use majit_ir::descr::{Descr, FieldDescr, GcCache, LLType};
 use majit_ir::value::Type;
 use majit_macros::jit_struct;
 

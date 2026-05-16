@@ -141,8 +141,22 @@ fn real_main() {
     // `CallControl::make_virtualizable_infos`.
     let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
-    let pipeline = majit_translate::analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
+    // Per-source crate-stripped module paths — feeds
+    // `parse::parse_source_with_module` so analyzer-side metadata
+    // records `struct_origins[bare_name] = module_path`.  Aligns with
+    // the runtime's `build_object_descr_group_with_def_path` qualified
+    // def-path slot in `gc_cache._cache_size` so a future
+    // `path_hash(canonical_struct_name)` analyzer hash lands on the
+    // same Arc the runtime publishes (PyPy `cache[STRUCT]` lltype-
+    // object identity, descr.py:108-118).
+    let module_paths: Vec<String> = source_paths
+        .iter()
+        .map(|p| module_path_from_source_file(p))
+        .collect();
+    let module_path_refs: Vec<&str> = module_paths.iter().map(|s| s.as_str()).collect();
+    let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
         &source_refs,
+        &module_path_refs,
         &analyze_config,
         None,
         vinfo_factory,
@@ -317,6 +331,41 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
 /// follow-up to thread `pyre-jit/src/eval.rs` (the portal canonical)
 /// into the analysis without including the rest of pyre-jit's JIT
 /// infrastructure (codewriter, assembler, regalloc, ...).
+/// Crate-stripped module path for a source file at `path`.
+///
+/// Strips the crate root (`/.../<crate>/src/` prefix) and the `.rs`
+/// suffix, then converts `/` to `::` for nested files.  Matches the
+/// runtime `module_path!()` macro output after the leading crate
+/// segment is dropped — both sides hash the same string so
+/// `gc_cache._cache_size[LLType::Struct(path_hash(path))]` slots
+/// align (PyPy descr.py:108-118 `cache[STRUCT]` identity).
+///
+/// Examples (input → output):
+/// - `"pyre/pyre-object/src/intobject.rs"` → `"intobject"`
+/// - `"pyre/pyre-interpreter/src/pyframe.rs"` → `"pyframe"`
+/// - `"pyre/pyre-interpreter/src/foo/bar.rs"` → `"foo::bar"`
+/// - `"pyre/pyre-interpreter/src/lib.rs"` → `""` (crate root, no qualifier)
+///
+/// Returns `""` when the path does not contain `/src/` — callers
+/// outside the canonical layout (synthesized files, fixtures) keep
+/// the simple-name registration.
+fn module_path_from_source_file(path: &str) -> String {
+    let marker = "/src/";
+    let Some(idx) = path.rfind(marker) else {
+        return String::new();
+    };
+    let rest = &path[idx + marker.len()..];
+    let stem = rest.strip_suffix(".rs").unwrap_or(rest);
+    let normalized = stem
+        .strip_suffix("/lib")
+        .or_else(|| stem.strip_suffix("/mod"))
+        .unwrap_or(stem);
+    if normalized == "lib" || normalized == "mod" {
+        return String::new();
+    }
+    normalized.replace('/', "::")
+}
+
 fn collect_single_file(path: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
     match std::fs::read_to_string(path) {
         Ok(content) => {

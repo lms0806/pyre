@@ -34,11 +34,37 @@ pub fn register_size(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_size(descr);
 }
 
+/// Keyed sibling: publishes the descr to `gc_cache._cache_size[key]`
+/// AND `_cache_size_order`, so subsequent
+/// `gc_cache.get_size_descr(key, ...)` calls return the same Arc.
+/// Mirrors `descr.py:108-118 get_size_descr` cache-miss
+/// `cache[STRUCT] = sizedescr` (the keyed half) for mint sites that
+/// bypass `get_size_descr` proper.
+pub fn register_keyed_size(key: crate::descr::LLType, descr: DescrRef) {
+    gc_cache().lock().unwrap().register_keyed_size(key, descr);
+}
+
 /// `descr.py:225-235 get_field_descr` cache-miss publication.
 /// PRE-EXISTING-ADAPTATION: prefer
 /// `gc_cache.get_field_descr(LLType::Struct(...), ...)`.
 pub fn register_field(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_field(descr);
+}
+
+/// Keyed sibling: publishes the descr to
+/// `gc_cache._cache_field[struct_key][field_name]` AND
+/// `_cache_field_order`.  Mirrors `descr.py:218-239 get_field_descr`
+/// cache-miss `cachedict[fieldname] = fielddescr` for mint sites that
+/// bypass `get_field_descr` proper.
+pub fn register_keyed_field(
+    struct_key: crate::descr::LLType,
+    field_name: String,
+    descr: std::sync::Arc<crate::descr::SimpleFieldDescr>,
+) {
+    gc_cache()
+        .lock()
+        .unwrap()
+        .register_keyed_field(struct_key, field_name, descr);
 }
 
 /// `descr.py:354-364 get_array_descr` cache-miss publication.
@@ -48,11 +74,27 @@ pub fn register_array(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_array(descr);
 }
 
+/// Keyed sibling: publishes the descr to `gc_cache._cache_array[key]`
+/// AND `_cache_array_order`.  Mirrors `descr.py:348-378 get_array_descr`
+/// cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
+pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
+    gc_cache().lock().unwrap().register_keyed_array(key, descr);
+}
+
 /// `descr.py:374-385 get_arraylen_descr` cache-miss publication.
 /// PRE-EXISTING-ADAPTATION: prefer
 /// `gc_cache.get_field_arraylen_descr(LLType::Array(...), ...)`.
 pub fn register_array_len(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_arraylen(descr);
+}
+
+/// Keyed sibling: publishes the descr to
+/// `gc_cache._cache_arraylen[key]` AND `_cache_arraylen_order`.
+pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
+    gc_cache()
+        .lock()
+        .unwrap()
+        .register_keyed_arraylen(key, descr);
 }
 
 /// `descr.py:404-414 get_interiorfield_descr` cache-miss publication.
@@ -63,6 +105,27 @@ pub fn register_interior_field(descr: DescrRef) {
         .lock()
         .unwrap()
         .register_external_interiorfield(descr);
+}
+
+/// Keyed sibling: publishes the descr to
+/// `gc_cache._cache_interiorfield[(array_key, name, arrayfieldname)]`
+/// AND `_cache_interiorfield_order`.  Mirrors `descr.py:404-433
+/// get_interiorfield_descr` cache-miss
+/// `cache[(ARRAY, name, arrayfieldname)] = interiorfielddescr`.
+/// `arrayfieldname == ""` denotes PyPy `arrayfieldname=None`
+/// (the GcArray-of-Structs case, `descr.py:431-432`); a non-empty
+/// string denotes the GcStruct-containing-inlined-GcArray case
+/// (`descr.py:433-434`).
+pub fn register_keyed_interior_field(
+    array_key: crate::descr::LLType,
+    name: String,
+    arrayfieldname: String,
+    descr: DescrRef,
+) {
+    gc_cache()
+        .lock()
+        .unwrap()
+        .register_keyed_interiorfield(array_key, name, arrayfieldname, descr);
 }
 
 /// `descr.py:647-675 get_call_descr` cache-miss publication.  Sole

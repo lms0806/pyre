@@ -231,6 +231,34 @@ impl DerefMut for PyJitCode {
     }
 }
 
+/// `interp_jit.py:67 reds = ['frame', 'ec']` pre-regalloc slot derivation.
+///
+/// Returns `(portal_frame_reg, portal_ec_reg)` — the SSARepr Variable
+/// indices the per-CodeObject codewriter emits for the portal red args.
+/// The slot positions are `(nlocals + max_stackdepth + 11)` and
+/// `(nlocals + max_stackdepth + 12)` respectively; slot `+10` was the
+/// dedicated `null_ref_reg` PY_NULL holder before Tier 4 Epic A retired
+/// it, and the portal reds kept their numerical positions so
+/// layout-sensitive tests stay stable.
+///
+/// PyPy structural counterpart: `pypy/module/pypyjit/interp_jit.py:67
+/// reds = ['frame', 'ec']` is the JitDriver declaration; `warmspot.py`
+/// derives per-driver red arg slot indices from this list when wiring
+/// up the trace's inputargs.  Pyre's codewriter pipeline lacks the
+/// JitDriver greens/reds → register-slot derivation that
+/// `warmspot.setup_jit` runs, so the slot positions are encoded here
+/// as a shared formula instead — both `pyre-jit/src/jit/codewriter.rs`
+/// `MetainterpCodeWriter::compile` and `canonical_bridge.rs`
+/// `install_portal_for` route through this helper so they cannot drift.
+///
+/// Item 10 epic prerequisite (Task #122 / #185 / #158 plan).
+#[inline]
+pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (u16, u16) {
+    let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;
+    let portal_ec_reg = (nlocals + max_stackdepth + 12) as u16;
+    (portal_frame_reg, portal_ec_reg)
+}
+
 impl PyJitCode {
     pub fn new(payload: PyJitCodePayload) -> Self {
         Self {

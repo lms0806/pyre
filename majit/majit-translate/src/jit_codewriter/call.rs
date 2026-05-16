@@ -1042,6 +1042,32 @@ impl CallControl {
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
+        self.arraydescrof_concrete(idx, array_type_id, ir_type, len_offset, Some(idx))
+            as majit_ir::descr::DescrRef
+    }
+
+    /// Trait-typed sibling of [`Self::arraydescrof`] returning the cached
+    /// `Arc<dyn ArrayDescr>` rather than the trait-erased `DescrRef`.
+    /// Used by [`Self::interiorfielddescrof`] which needs the array-descr
+    /// trait surface for `SimpleInteriorFieldDescr::new`, mirroring
+    /// `descr.py:430 arraydescr = get_array_descr(gc_ll_descr, ARRAY)`
+    /// reuse inside `get_interiorfield_descr` (`descr.py:404-437`).
+    ///
+    /// `ei_publish`: `Some(array_idx)` stamps `descr.set_ei_index(array_idx)`
+    /// per the codewriter array-namespace pre-seed (`effectinfo.py:307-311`);
+    /// `None` leaves `ei_index = u32::MAX` for callers that embed this
+    /// array into a larger descr (e.g. `InteriorFieldDescr`) where the
+    /// outer descr already owns its own ei-index slot and stamping the
+    /// nested array with the outer's idx would corrupt
+    /// `force_from_effectinfo`'s array-bitstring lookup.
+    fn arraydescrof_concrete(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+        ei_publish: Option<u32>,
+    ) -> std::sync::Arc<dyn majit_ir::descr::ArrayDescr> {
         // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
         let elem_name = array_type_id
             .as_deref()
@@ -1050,9 +1076,8 @@ impl CallControl {
             .map(String::from);
         let elem_ref = elem_name.as_deref();
         let is_struct = elem_ref.is_some_and(|n| self.is_known_struct(n));
-        // RPython: descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF)
-        // RPython: descr.py:354 — itemsize from symbolic.get_array_token().
         // descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF).
+        // descr.py:354 — itemsize from symbolic.get_array_token().
         // descr.py:365 — ArrayDescr(basesize, itemsize, ..., flag).
         // Even for struct(struct), itemsize is correct from symbolic.
         let (flag, item_size) = if is_struct {
@@ -1069,7 +1094,6 @@ impl CallControl {
                 8,
             )
         };
-        // RPython: basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc).
         // descr.py:359-362 + symbolic.get_array_token — basesize follows
         // the lltype's nolength flag:
         //   `nolength=True`  → no length header → items at offset 0
@@ -1084,69 +1108,129 @@ impl CallControl {
         // `descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT)`:
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
         // object identity.  Pyre's analogue is the codewriter
-        // `array_type_id` Rust type spelling (`"Vec<Foo>"`, `"GcArray<i64>"`,
-        // `"[Point; 4]"`, …) — two distinct ARRAYs disagree on this
-        // string, so it is the right surrogate for ARRAY identity.
-        // Hash it down to fit the u32 `SimpleArrayDescr.type_id` slot
-        // (the GC tid PyPy `init_array_descr` allocates).
-        //
-        // PRE-EXISTING-ADAPTATION: this is a u64→u32 truncation of the
-        // path_hash that loses identity around 2^16 distinct ARRAYs
-        // (birthday paradox); the structural fix is to route through
-        // `gc_cache.get_array_descr(LLType::Array(u64), ...)` and use
-        // the sequential u32 tid `gc_cache.init_array_descr` allocates
-        // (slice 3).  Until then, `path_hash(array_type_id) as u32`
-        // restores per-ARRAY distinction that the prior `0` literal
-        // collapsed — distinct ARRAYs get distinct tids whereas before
-        // every CallControl-minted array shared `tid = 0`.
-        let array_tid = majit_ir::descr::path_hash(array_type_id.as_deref().unwrap_or("")) as u32;
-        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-            idx, base_size, item_size, array_tid, ir_type, flag,
-        );
-        // descr.py:359-362 — `nolength=True` arrays carry no length
-        // FieldDescr (`lendescr = None`); length-prefixed arrays carry a
-        // FieldDescr at the supplied offset. The synthetic shape mirrors
-        // `get_field_arraylen_descr` (descr.py:256-267): FieldDescr("len",
-        // off, WORD, FLAG_SIGNED).
-        ad.lendescr = len_offset.map(|off| {
-            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
-                u32::MAX,
-                off,
-                std::mem::size_of::<usize>(),
-                majit_ir::value::Type::Int,
-                false,
-                majit_ir::descr::ArrayFlag::Signed,
-                "len".to_string(),
-            )) as majit_ir::descr::DescrRef
-        });
-        // `effectinfo.py:465 compute_bitstrings` ei_index publish: `idx`
-        // is the codewriter's per-trace `array_index`
-        // (`effectinfo.py:307-311`), the same key that EffectInfo
-        // `read_descrs_arrays` / `write_descrs_arrays` raw sets use.
-        // Publishing it onto the descr lets `force_from_effectinfo`
-        // (`heap.py:537-571`) lookup `descr.get_ei_index()` to find the
-        // bitstring slot directly, instead of relying on `descr.index()`
-        // namespace alignment.
-        let publish_ei = |descr: &dyn majit_ir::descr::Descr| descr.set_ei_index(idx);
-        // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
-        if is_struct {
-            if let Some(struct_name) = elem_ref {
-                // `descr.py:388 InteriorFieldDescr.__init__` carries the
-                // exact `arraydescr` object the surrounding ArrayDescr
-                // factory returns; preserve that identity by publishing
-                // the final Arc first and routing the interior list back
-                // onto it via the `OnceLock` interior-mutability setter.
-                let ad_arc = std::sync::Arc::new(ad);
-                publish_ei(ad_arc.as_ref());
-                let (descrs, _) = all_interiorfielddescrs(self, struct_name, ad_arc.clone());
-                if !descrs.is_empty() {
-                    ad_arc.set_all_interiorfielddescrs(descrs);
+        // `array_type_id` Rust type spelling — distinct ARRAYs disagree
+        // on this string.  Without one (legacy callers that emit array
+        // ops without the identity carrier plumbed) PyPy has NO
+        // "merge several ARRAYs into one slot" behavior; the
+        // parity-correct response is to skip cache publish and mint
+        // fresh per call so shape-coincident-but-logically-distinct
+        // ARRAYs do not alias.
+        use majit_ir::descr::Descr;
+        let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> = match array_type_id.as_deref()
+        {
+            Some(atid) => {
+                let path_hash_u64 = majit_ir::descr::path_hash(atid);
+                let nolength = len_offset.is_none();
+                let length_offset = len_offset.unwrap_or(0);
+                // `descr.py:348-378 get_array_descr` cache-or-mint:
+                // `LLType::Array(path_hash(atid))` cache hit returns the
+                // runtime `__majit_register_descrs`-or-prior-analyzer-
+                // minted Arc (`SimpleArrayDescr` or `PyreArrayDescr`);
+                // a miss mints a fresh `Arc<SimpleArrayDescr>` and
+                // caches it.  Both sides converge on one Arc per
+                // ARRAY identity.
+                //
+                // No `set_type_id` stamp here.  PyPy `gc.py:544-549
+                // init_array_descr` stamps `descr.tid` from
+                // `layoutbuilder.get_type_id(A)` — a dense sequential
+                // GC type id allocated by the GC layoutbuilder.  Pyre
+                // does not yet port the layoutbuilder analog (multi-
+                // session epic); analyzer-side `SimpleArrayDescr.type_id`
+                // stays at 0 (the `get_array_descr` cache-miss-mint
+                // default at `descr.rs:515`).  Runtime-registered
+                // `PyreArrayDescr` carries a real GC tid stamped at
+                // module init (`LIST_TYPE_ID`, `DICT_TYPE_ID`, …) and
+                // wins the cache slot when both paths race.  The
+                // structural identity used for `_cache_array` lookups
+                // is `SimpleArrayDescr.cache_key` (= `path_hash(atid)`,
+                // stamped at descr.rs:526-528 inside `get_array_descr`),
+                // kept fully separate from `type_id` per the trait doc
+                // at descr.rs:2120-2131.
+                let cached: majit_ir::descr::DescrRef =
+                    majit_ir::descr::gc_cache().lock().unwrap().get_array_descr(
+                        majit_ir::descr::LLType::Array(path_hash_u64),
+                        base_size,
+                        item_size,
+                        flag,
+                        ir_type,
+                        nolength,
+                        length_offset,
+                        false,  // is_pure (pyre lacks immutable-array surface)
+                        '\x00', // concrete_type (descr.py:366-370 Float-only marker)
+                    );
+                let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+                    majit_ir::descr::descr_arc_as_array_descr(cached)
+                        .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+                // descr.py:372-375 — struct arrays get interior field
+                // descriptors.  `set_all_interiorfielddescrs` is
+                // `OnceLock` (first-call wins) so re-populating on
+                // cache hit is safe.
+                if is_struct {
+                    if let Some(struct_name) = elem_ref {
+                        let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
+                        let (descrs, _) =
+                            all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
+                        if !descrs.is_empty() {
+                            ad_arc.set_all_interiorfielddescrs(descrs);
+                        }
+                    }
                 }
-                return ad_arc;
+                ad_arc
             }
+            None => {
+                // No identity carrier — local mint, no cache publish.
+                // `elem_ref` is `None` here so `is_struct == false`;
+                // interior field descrs are not required.  Length-
+                // prefixed arrays still need a lendescr; mint it locally
+                // (not via `gc_cache.get_field_arraylen_descr` which
+                // would publish into `_cache_arraylen` keyed on a
+                // synthetic slot that other no-identity arrays would
+                // alias on).
+                let lendescr: Option<majit_ir::descr::DescrRef> = len_offset.map(|off| {
+                    use majit_ir::descr::SimpleFieldDescr;
+                    // `descr.py:264 get_field_arraylen_descr` shape:
+                    // `FieldDescr("len", ofs, WORD, FLAG_SIGNED)`.
+                    let word_size = std::mem::size_of::<usize>();
+                    std::sync::Arc::new(SimpleFieldDescr::new_with_name(
+                        u32::MAX,
+                        off,
+                        word_size,
+                        majit_ir::value::Type::Int,
+                        false,
+                        majit_ir::descr::ArrayFlag::Signed,
+                        "len".to_string(),
+                    )) as majit_ir::descr::DescrRef
+                });
+                let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                    u32::MAX,
+                    base_size,
+                    item_size,
+                    0,
+                    ir_type,
+                    flag,
+                );
+                ad.lendescr = lendescr;
+                ad.is_pure = false;
+                ad.concrete_type = '\x00';
+                let arc: std::sync::Arc<majit_ir::descr::SimpleArrayDescr> =
+                    std::sync::Arc::new(ad);
+                majit_ir::descr_registry::register_array(arc.clone() as majit_ir::descr::DescrRef);
+                arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>
+            }
+        };
+        // Per-trace codewriter id stamp — analyzer's
+        // `descr_indices.array_index` identifies this descr in BhDescr
+        // round-trips on `pyre-jit-trace::state` decoders.
+        ad_arc.set_index(idx);
+        // `effectinfo.py:465 compute_bitstrings` ei_index pre-seed
+        // (analyzer publishes the codewriter array_index for
+        // `force_from_effectinfo` lookup before `compute_bitstrings`
+        // overwrites with the (eisetr, eisetw) class index).  `None`
+        // skips — interiorfielddescrof embeds this array as the
+        // container and owns its own ei-index slot.
+        if let Some(arr_idx) = ei_publish {
+            ad_arc.set_ei_index(arr_idx);
         }
-        let ad_arc = std::sync::Arc::new(ad);
-        publish_ei(ad_arc.as_ref());
         ad_arc
     }
 
@@ -1158,25 +1242,27 @@ impl CallControl {
     /// element type come from `get_type_flag(field_type_str)` (same
     /// mechanism `arraydescrof` uses for primitive item sizing).
     ///
-    /// PRE-EXISTING-ADAPTATION: the resulting Arc does not share
-    /// identity with the runtime descr that `gc_cache.get_field_descr(
-    /// LLType::Struct(type_id), name, ...)` returns at runtime. PyPy's
-    /// `cpu.fielddescrof` is cached by `(STRUCT, fieldname)` identity
-    /// so analyzer and runtime both reach the same `FieldDescr` Arc.
-    /// Pyre's `__majit_type_id()` is now path-stable
-    /// (`path_hash(concat!(module_path!(), "::", stringify!(Struct)))`,
-    /// `majit-macros/src/jit_struct.rs:92`), so the runtime side
-    /// hashes the struct's *definition* module path; the analyzer's
-    /// `field.owner_root` is qualified with `ctx.module_prefix` (the
-    /// *use-site* module path, `front/ast.rs:255-261 qualify_type_name`).
-    /// When use-site and definition module coincide (most pyre code is
-    /// single-crate), the two routes converge naturally; cross-module
-    /// references still need Task #316's full module-path resolver to
-    /// reach the canonical definition path before hashing.  Until then
-    /// the analyzer-time Arc gets its own `descr.set_ei_index()` in
-    /// `compute_bitstrings`; the `EI_INDEX_TABLE.fields` side-table
-    /// absorbs the descr.index mismatch as a structural-completeness
-    /// placeholder.
+    /// `descr.py:218-239 get_field_descr` cache-or-mint: PyPy
+    /// `cpu.fielddescrof` 는 `(STRUCT, fieldname)` identity 로 cache 하여
+    /// 분석기와 런타임이 동일한 `FieldDescr` Arc 에 도달한다.  Pyre 는
+    /// `path_hash(STRUCT)` 를 surrogate identity 로 쓰는데, 런타임은
+    /// `__majit_type_id` = `path_hash(concat!(module_path!(), "::",
+    /// stringify!(Struct)))` (`jit_struct.rs:92`) 로 def-path 를 해시
+    /// 한다.  분석기 `field.owner_root` 는 `qualify_type_name(type_root,
+    /// ctx.module_prefix)` 로 use-site 모듈 qualifier 를 받으므로
+    /// `canonical_struct_name` (Followup 2, `5fcab5ddc8`,
+    /// `STRUCT_ORIGIN_REGISTRY` 컨설팅) 를 거쳐 정의-모듈 qualifier 로
+    /// 표준화해야 publish 슬롯과 일치한다.  `fielddescrof_concrete` 의
+    /// `path_hash` boundary 에서 canonicalise (이 모듈 fix), 그리고
+    /// `interiorfielddescrof`/`all_interiorfielddescrs` 와 동일 패턴
+    /// (`call.rs:1492` + `:5067`).
+    ///
+    /// `ei_index` consequence (`effectinfo.py:465-538 compute_bitstrings`):
+    /// `EI_INDEX_TABLE` side-table 폐기 (Round 4) 이후
+    /// `descr.get_ei_index()` 만 readback (`heap.rs:866`).  canonicalise
+    /// 가 분석기와 런타임을 같은 `register_keyed_field` Arc 로 모으므로
+    /// `set_ei_index` 가 단일 슬롯에 도달, cross-module 호출 사이트도
+    /// effectinfo bitstring 을 정상 소비한다.
     ///
     /// `None` when the struct is not registered in `self.struct_fields`
     /// (unanalyzable callee — caller silently skips the raw-set push).
@@ -1186,35 +1272,159 @@ impl CallControl {
         owner_root: &str,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
-        Some(self.fielddescrof_concrete(idx, owner_root, field_name)?)
+        self.fielddescrof_concrete(idx, owner_root, field_name)
     }
 
-    /// Concrete-typed sibling of [`Self::fielddescrof`] returning
-    /// `Arc<SimpleFieldDescr>` rather than the trait-erased
-    /// `DescrRef`. Used by [`Self::interiorfielddescrof`] which needs
-    /// the concrete field-descr type for
-    /// `SimpleInteriorFieldDescr::new`.
+    /// Trait-object sibling of [`Self::fielddescrof`] returning the
+    /// resolved field-descr `Arc<dyn FieldDescr>` so analyzer and
+    /// runtime share the SAME Arc — `set_ei_index` stamps land on
+    /// the runtime's `PyreFieldDescr` instead of a parallel
+    /// analyzer-mint `SimpleFieldDescr`.  Resolution order matches
+    /// PyPy `descr.py:218-239 get_field_descr`:
+    ///
+    ///   1. `gc_cache.get_size_descr(struct_key)` → cache hit on
+    ///      runtime-published `PyreSizeDescr` (publish key = same
+    ///      `path_hash(strip_crate(module_path!())::Name)` analyzer
+    ///      builds for `owner_root` via `qualify_type_name` +
+    ///      `ParsedInterpreter.module_path`).
+    ///   2. Walk `size_descr.all_fielddescrs()` matching the bare
+    ///      `field_name` against each entry's `fd.field_name()` —
+    ///      PyreFieldDescr names follow `"STRUCT.field"` per
+    ///      descr.py:227 so the bare match uses suffix `.field_name`
+    ///      OR exact `field_name` (the latter covers SimpleFieldDescr
+    ///      mints that store the bare name).
+    ///   3. Found → return that trait-obj Arc with `set_index(idx)`
+    ///      applied (no-op on PyreFieldDescr — fd.index() is the
+    ///      deterministic `stable_field_index` carried through
+    ///      BhDescr structural fields, not via the atomic).
+    ///   4. Miss → fall through to
+    ///      `gc_cache.get_field_descr(struct_key, ...)` mint —
+    ///      analyzer-only path; runtime convergence skipped for
+    ///      this `(STRUCT, fieldname)` pair (logged absence of a
+    ///      runtime `build_object_descr_group` publish).
     fn fielddescrof_concrete(
         &self,
         idx: u32,
         owner_root: &str,
         field_name: &str,
-    ) -> Option<std::sync::Arc<majit_ir::descr::SimpleFieldDescr>> {
-        use majit_ir::descr::SimpleFieldDescr;
+    ) -> Option<majit_ir::descr::DescrRef> {
+        use majit_ir::descr::{LLType, path_hash};
         let fields = self.struct_fields.fields.get(owner_root)?;
         let mut offset: usize = 0;
+        // `heaptracker.py:97-113 get_fielddescr_index_in(STRUCT, fieldname)`
+        // — positional index in `STRUCT._names`, skipping `Void` and
+        // `typeptr`.  Pyre's `struct_fields.fields[owner_root]` is the
+        // flat field list (no nested-struct inlining at analyzer time),
+        // so the enumeration position with `typeptr` skipped matches
+        // PyPy's `index_in_parent`.  Threaded into
+        // `gc_cache.get_field_descr` so the optimizer's
+        // `field_index_in_parent`-keyed slot maps
+        // (`optimizeopt/heap.rs FieldDescr::index_in_parent` consumer)
+        // get the slot-per-field discrimination PyPy's heaptracker
+        // assigns; the previous `0`-for-every-field stamp collided
+        // every field of one struct onto slot 0.
+        let mut field_pos: usize = 0;
         for (fname, fty) in fields {
-            let (_flag, ir_type, field_size) = get_type_flag(fty);
+            let (flag, ir_type, field_size) = get_type_flag(fty);
+            if fname == "typeptr" {
+                // heaptracker.py:102-103: `if name == 'typeptr': continue`
+                continue;
+            }
             if fname == field_name {
-                // is_immutable=false: pyre's analyzer has no immutability
-                // annotation surface today; the conservative `false` keeps
-                // the optimizer from elision-folding stores. Upstream sets
-                // this from `lltype.Ptr(...)._hints['immutable']`.
-                return Some(std::sync::Arc::new(SimpleFieldDescr::new(
-                    idx, offset, field_size, ir_type, false,
-                )));
+                // `descr.py:218-239 get_field_descr(gccache, STRUCT,
+                // fieldname)` cache-or-mint: a `(STRUCT, fieldname)`
+                // cache hit returns the runtime
+                // `__majit_register_descrs`-minted Arc; a miss mints a
+                // fresh `Arc<SimpleFieldDescr>` and caches.  Analyzer
+                // and runtime sides converge on the same `Arc<
+                // SimpleFieldDescr>` instance — PyPy's
+                // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple
+                // object identity.
+                //
+                // After the cache-or-mint resolves, stamp the
+                // analyzer's per-trace `idx` (from
+                // `descr_indices.field_index`) onto the descr via
+                // `set_index` so trace serialization round-trips on
+                // the analyzer's id (`pyre-jit-trace::state` line
+                // 5879/5933 matches by `fd.index() == field_idx`).
+                // The atomic write is benign on cache hit — analyzer
+                // is the sole writer of this slot (the macro path
+                // discards the return).
+                //
+                // is_immutable=false: pyre's analyzer has no
+                // immutability annotation surface today; the
+                // conservative `false` keeps the optimizer from
+                // elision-folding stores. Upstream reads from
+                // `STRUCT._immutable_field(fieldname)` (`descr.py:229`).
+                // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
+                // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
+                // (`qualify_type_name(type_root, ctx.module_prefix)`,
+                // `front/ast.rs:255-261`) 인 동안 런타임 publish 는
+                // `path_hash(strip_crate(module_path!())::Name)` (def-path).
+                // `canonical_struct_name` 가 `STRUCT_ORIGIN_REGISTRY`
+                // (Followup 2, `5fcab5ddc8`) 를 통해 bare-name 입력에
+                // 정의-모듈 qualifier 를 붙여 `path_hash` 가 publish 슬롯
+                // 과 일치하게 한다.  Cross-module use-site 도 같은
+                // `register_keyed_field` Arc 에 도달하므로 `set_ei_index`
+                // 가 런타임 reader 와 단일 슬롯에서 만난다.
+                // `interiorfielddescrof`/`all_interiorfielddescrs` 와 동일
+                // 패턴 (`call.rs:1492` + `:5067`).
+                let canonical_owner = majit_ir::descr::canonical_struct_name(owner_root);
+                let struct_key = LLType::Struct(path_hash(&canonical_owner));
+                // `descr.py:234-238 get_field_descr` always calls
+                // `get_size_descr(gccache, STRUCT, vtable)` to bind
+                // `fielddescr.parent_descr` before returning. Pyre's
+                // `get_field_descr` only reads `_cache_size` (no mint).
+                // Mirror upstream by minting/hitting the parent here
+                // from the analyzer's struct layout knowledge:
+                // `compute_struct_size` matches `symbolic.get_size(STRUCT)`;
+                // analyzer has no vtable / immutability surface so we
+                // pass 0 / false (a runtime `build_object_descr_group`
+                // publish under the same `struct_key` carries the real
+                // vtable on its PyreSizeDescr — cache-hit returns
+                // *that* Arc here unchanged).
+                let struct_size = compute_struct_size(self, owner_root);
+                use majit_ir::descr::Descr;
+                let size_descr_arc = {
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+                };
+                // Field-walk pass (PyPy `cpu.fielddescrof` per-tuple
+                // identity convergence): when the runtime published
+                // a SizeDescr under this `struct_key` (via
+                // `build_object_descr_group` →
+                // `register_keyed_size`), its `PyreFieldDescr`s live
+                // in `size_descr.all_fielddescrs()` already.  Return
+                // that Arc directly so analyzer's `set_ei_index`
+                // lands on the SAME slot the runtime reads.  Name
+                // match: PyreFieldDescr stores `"STRUCT.field"`
+                // (descr.py:227 format) so the analyzer's bare
+                // `field_name` must match as suffix; SimpleFieldDescr
+                // mints store either form so exact match also wins.
+                if let Some(sd) = size_descr_arc.as_size_descr() {
+                    let needle = format!(".{}", field_name);
+                    for fd in sd.all_fielddescrs() {
+                        let stored = fd.field_name();
+                        if stored == field_name || stored.ends_with(&needle) {
+                            fd.set_index(idx);
+                            return Some(fd.clone() as majit_ir::descr::DescrRef);
+                        }
+                    }
+                }
+                // No runtime publish for this `(STRUCT, fieldname)`
+                // tuple — fall back to analyzer-only mint.  The
+                // `SimpleFieldDescr.parent_descr` Weak still binds to
+                // the cached SizeDescr (which may be a PyreSizeDescr
+                // if the runtime published the parent but not this
+                // field, or a SimpleSizeDescr from line above).
+                let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
+                    struct_key, field_name, offset, field_size, ir_type, false, flag, field_pos,
+                );
+                descr.set_index(idx);
+                return Some(descr as majit_ir::descr::DescrRef);
             }
             offset = offset.saturating_add(field_size);
+            field_pos += 1;
         }
         None
     }
@@ -1245,38 +1455,156 @@ impl CallControl {
     ) -> Option<majit_ir::descr::DescrRef> {
         use majit_ir::descr::{ArrayFlag, SimpleArrayDescr, SimpleInteriorFieldDescr};
         let array_str = array_type_id.as_deref()?;
-        // RPython: ARRAY.OF.fieldname — extract the element type from
-        // the container type, then look up field info in
-        // `self.struct_fields`.
+        // ARRAY.OF.fieldname — extract the element type from the
+        // container type, then look up field info in `self.struct_fields`.
         let elem_name =
             extract_element_type_from_str(array_str).or_else(|| Some(array_str.to_string()))?;
-        // Validate the element is a known struct (PyPy
-        // `consider_array(ARRAY)` filter at `effectinfo.py:392-397`).
+        // Validate the element is a known struct (`consider_array(ARRAY)`
+        // filter at `effectinfo.py:392-397`).
         if !self.is_known_struct(&elem_name) {
             return None;
         }
-        let field_descr = self.fielddescrof_concrete(idx, &elem_name, field_name)?;
-        // Mint the containing `SimpleArrayDescr` inline. `arraydescrof`
-        // exists but returns the trait-erased `DescrRef`; here we need
-        // the concrete `Arc<SimpleArrayDescr>` to wrap into
-        // `SimpleInteriorFieldDescr::new`. The shape mirrors
-        // `arraydescrof`'s struct-array branch (`ArrayFlag::Struct`,
-        // `compute_struct_size`, IR type `Ref`).
+        // PyPy `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
+        // REALARRAY.OF, name)` — the inner FieldDescr.index is the
+        // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
+        // (descr.py:228), NOT the analyzer's interiorfield-namespace
+        // idx.  Pyre's `fielddescrof_concrete` stamps the caller's
+        // per-trace idx onto the shared `SimpleFieldDescr` cached at
+        // `_cache_field[struct_key][bare_name]`; calling that path
+        // from `interiorfielddescrof` would clobber the field-namespace
+        // idx already stamped by a sibling `fielddescrof` call on the
+        // same descr, breaking FieldDescr.index stability.  Resolve
+        // the inner FieldDescr directly through `gc_cache.get_field_descr`
+        // here so the analyzer's interiorfield idx lives ONLY on the
+        // outer `SimpleInteriorFieldDescr.index`, mirroring PyPy's
+        // FieldDescr / InteriorFieldDescr index namespace split.
+        let fields = self.struct_fields.fields.get(&elem_name)?;
+        let mut offset: usize = 0;
+        let mut field_pos: usize = 0;
+        let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+        for (fname, fty) in fields {
+            let (flag, ir_type, field_size) = get_type_flag(fty);
+            if fname == "typeptr" {
+                continue;
+            }
+            if fname == field_name {
+                // Use-import resolver: hash the canonical
+                // `defining_module::Bare` form so analyzer hits the
+                // same `_cache_size` slot the runtime's qualified
+                // def-path dual-publish wrote to (PyPy
+                // `cache[STRUCT]` lltype-object identity).  When the
+                // resolver has no entry (legacy `parse_source` entry
+                // without module_path), `canonical_struct_name`
+                // returns the bare name verbatim and we hit the
+                // simple-name slot — same Arc via dual-publish.
+                let elem_canonical = majit_ir::descr::canonical_struct_name(&elem_name);
+                let struct_key =
+                    majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(&elem_canonical));
+                // Seed parent (Round 6 parity, descr.py:238) so the
+                // returned SizeDescr Arc carries vtable/all_fielddescrs
+                // populated by either the runtime publish or the
+                // analyzer-only mint.
+                let struct_size = compute_struct_size(self, &elem_name);
+                let size_descr_arc = {
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+                };
+                // Field-walk pass (same convergence pattern as
+                // `fielddescrof_concrete` B-3): when runtime published
+                // the element struct's SizeDescr via
+                // `build_object_descr_group`, its PyreFieldDescrs live
+                // in `all_fielddescrs` already.  Return that Arc so
+                // `compute_bitstrings`' downstream `set_ei_index` on
+                // the interior field's INNER FieldDescr lands on the
+                // SAME slot the runtime reads.  Name match: bare or
+                // `.{field_name}` suffix per descr.py:227.
+                if let Some(sd) = size_descr_arc.as_size_descr() {
+                    let needle = format!(".{}", field_name);
+                    for fd in sd.all_fielddescrs() {
+                        let stored = fd.field_name();
+                        if stored == field_name || stored.ends_with(&needle) {
+                            found = Some(fd.clone());
+                            break;
+                        }
+                    }
+                }
+                if found.is_none() {
+                    // No runtime publish for this `(STRUCT, fieldname)` —
+                    // analyzer-only mint.
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mint = gc.get_field_descr(
+                        struct_key, field_name, offset, field_size, ir_type, false, flag, field_pos,
+                    );
+                    found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+                }
+                break;
+            }
+            offset = offset.saturating_add(field_size);
+            field_pos += 1;
+        }
+        let field_descr = found?;
+        // `descr.py:430 arraydescr = get_array_descr(gc_ll_descr, ARRAY)`:
+        // PyPy `get_interiorfield_descr` reuses the per-ARRAY cached
+        // array descr.  Pyre routes through `gc_cache.get_array_descr`
+        // cache-or-mint so analyzer's `arraydescrof` and
+        // `interiorfielddescrof` share Arc identity for the same
+        // `LLType::Array(path_hash(atid))` cache key.  `try_downcast_arc`
+        // recovers `Arc<SimpleArrayDescr>` from the cache's
+        // `Arc<dyn Descr>` (the `Descr::as_any` override on
+        // `SimpleArrayDescr` / `PyreArrayDescr` makes the cast sound),
+        // then cast `as Arc<dyn ArrayDescr>` matches the trait-object
+        // field type on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
         let base_size = self.array_header_size;
-        let array_descr = std::sync::Arc::new(SimpleArrayDescr::with_flag(
-            idx,
-            base_size,
-            item_size,
-            0,
-            majit_ir::value::Type::Ref,
-            ArrayFlag::Struct,
-        ));
-        Some(std::sync::Arc::new(SimpleInteriorFieldDescr::new(
-            idx,
-            array_descr,
-            field_descr,
-        )))
+        let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
+        let cached: majit_ir::descr::DescrRef = {
+            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            gc.get_array_descr(
+                array_key.clone(),
+                base_size,
+                item_size,
+                ArrayFlag::Struct,
+                majit_ir::value::Type::Ref,
+                false, // !nolength — length word at offset 0
+                0,     // length_offset
+                false, // is_pure
+                '\x00',
+            )
+        };
+        // `descr.py:348-378 get_array_descr` cache hit returns the
+        // existing Arc — whichever concrete `ArrayDescr` impl is in
+        // the slot.  Plugin-registry upcast (`SimpleArrayDescr` built-in
+        // + pyre's `PyreArrayDescr` registered at module-init) keeps
+        // identity across runtime / analyzer paths per PyPy
+        // `cpu.arraydescrof(ARRAY)`.
+        let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+            majit_ir::descr::descr_arc_as_array_descr(cached)
+                .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+        // `descr.py:423-438 get_interiorfield_descr` cache-or-mint:
+        // key is `(ARRAY, name, arrayfieldname=None)` — for the
+        // GcArray-of-Structs case (which is the only case pyre's
+        // analyzer mints) `arrayfieldname` is None per descr.py:431-432.
+        // Pyre encodes `None` as the empty string in the tuple key.
+        // Both arms of `make_simple_descr_group`'s array-of-struct
+        // population (Task D) and this analyzer mint must hit the same
+        // cache slot for `cpu.interiorfielddescrof` per-tuple identity.
+        use majit_ir::descr::Descr;
+        // `field_descr` is already `Arc<dyn FieldDescr>` (post B-4):
+        // either PyreFieldDescr from the runtime publish walk OR
+        // SimpleFieldDescr from the analyzer-only mint.  Matches
+        // `SimpleInteriorFieldDescr::new` (descr.rs:3521) field type.
+        let descr = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            .get_interiorfield_descr(
+                array_key,
+                field_name.to_string(),
+                String::new(),
+                array_descr,
+                field_descr,
+            );
+        descr.set_index(idx);
+        Some(descr as majit_ir::descr::DescrRef)
     }
 
     /// Register a free function graph.
@@ -4031,39 +4359,22 @@ fn effectinfo_from_writeanalyze(
     // `UnsupportedFieldExc` filters at `effectinfo.py:380-397` +
     // `:316-324`.
     //
-    // The architectural fix path (Task #316, multi-session):
-    //   1. `__majit_type_id` is already path-stable (`majit-macros/src/
-    //      jit_struct.rs:92` emits `path_hash(concat!(module_path!(),
-    //      "::", stringify!(Struct)))`).  The remaining gap is on the
-    //      analyzer side: `field.owner_root` is built with
-    //      `qualify_type_name(type_root, ctx.module_prefix)` —
-    //      `ctx.module_prefix` is the *use-site* module, not the
-    //      struct's *definition* module.  When they coincide (most
-    //      pyre code), `path_hash(owner_root)` already matches the
-    //      runtime macro's `__majit_type_id`; cross-module references
-    //      need a name → definition-path resolver (Task #316) to
-    //      replace the use-site qualifier with the canonical
-    //      definition path before hashing.  With both sides aligned,
-    //      `cc.fielddescrof()` / `cc.interiorfielddescrof()` route
-    //      through `gc_cache.get_field_descr(LLType::Struct(
-    //      path_hash(owner_root)), field_name, ...)` and analyzer
-    //      mints prime the cache so analyzer- and runtime-side Arcs
-    //      match by identity.
-    //   2. OR reorder `__majit_register_descrs` calls to run BEFORE
-    //      the analyzer.
+    // Identity convergence (Followup 2 + Reviewer fix-1):
+    // `__majit_type_id` 는 `path_hash(concat!(module_path!(), "::",
+    // stringify!(Struct)))` (`jit_struct.rs:92`) 로 def-path 해시.
+    // 분석기 `field.owner_root` 는 `qualify_type_name(type_root,
+    // ctx.module_prefix)` 로 use-site qualifier 를 받는다.  `canonical_
+    // struct_name` (`STRUCT_ORIGIN_REGISTRY`, `5fcab5ddc8`) 가
+    // bare-name 입력을 정의-모듈 qualifier 로 표준화하므로
+    // `cc.fielddescrof()` / `cc.interiorfielddescrof()` / `all_interior
+    // fielddescrs` 가 `gc_cache.get_field_descr(LLType::Struct(
+    // path_hash(canonical)), field_name, ...)` 로 분기 통합 —
+    // 분석기와 런타임이 같은 `register_keyed_field` Arc 에 도달
+    // (`descr.py:218-239 get_field_descr` per-tuple identity).
     //
-    // Both touch majit-translate (analyzer-side resolver) + pyre-jit-trace.
-    //
-    // Today's heap-invalidation behaviour: `compute_bitstrings`
-    // re-encodes bitstrings keyed on `descr.get_ei_index()`. For the
-    // interiorfield slots the bitstring is empty Vec<u8>, so
-    // `check_*_descr_interiorfields` returns false → interiorfield
-    // cache survives the call (under-invalidation possible if the
-    // call actually writes those interior slots). Field/array slots
-    // now get populated bitstrings but the runtime
-    // `descr.get_ei_index()` query still misses because analyzer-time
-    // Arcs and runtime Arcs don't share identity (same Task #316 root
-    // cause).
+    // `compute_bitstrings` 도 `descr.get_ei_index()` 단일 Arc 슬롯으로
+    // 수렴하므로 heap-invalidation 이 cross-module 호출 사이트에서도
+    // populated bitstring 을 정상 소비한다.
     // PyPy `effectinfo.py:345-360` `readonly` rule:
     //   elif tup[0] == "readstruct":
     //       tupw = ("struct",) + tup[1:]
@@ -4742,11 +5053,59 @@ fn collect_readwrite_effects(
 fn all_interiorfielddescrs(
     cc: &CallControl,
     struct_name: &str,
-    array_descr: std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
+    array_key: majit_ir::descr::LLType,
+    array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
 ) -> (Vec<majit_ir::descr::DescrRef>, usize) {
+    use majit_ir::descr::{Descr, LLType, path_hash};
+    // `descr.py:423-438 get_interiorfield_descr` reuses
+    // `gc_cache._cache_field[REALARRAY.OF][name]` for the inner
+    // FieldDescr and `gc_cache._cache_interiorfield[(ARRAY, name,
+    // arrayfieldname=None)]` for the InteriorFieldDescr wrapper.
+    // Route both lookups through `gc_cache.get_field_descr` /
+    // `gc_cache.get_interiorfield_descr` so the analyzer's
+    // `cc.interiorfielddescrof(ARRAY, fieldname)` (call.rs analyzer
+    // arm above) and the struct-array `all_interiorfielddescrs`
+    // population path share a single `Arc<SimpleInteriorFieldDescr>`
+    // per `(ARRAY, fieldname)` tuple — PyPy `cpu.interiorfielddescrof`
+    // per-tuple object identity.
+    //
+    // Use-import resolver: canonicalise `struct_name` to
+    // `defining_module::Bare` so the analyzer hits the same
+    // `_cache_size` slot the runtime's qualified def-path dual-publish
+    // wrote to (PyPy `cache[STRUCT]` lltype-object identity).  When
+    // the resolver has no entry, `canonical_struct_name` returns the
+    // bare name verbatim and we hit the simple-name slot.
+    let struct_canonical = majit_ir::descr::canonical_struct_name(struct_name);
+    let struct_key = LLType::Struct(path_hash(&struct_canonical));
+    // `descr.py:238 fielddescr.parent_descr = get_size_descr(gccache,
+    // STRUCT, vtable)` — PyPy's `get_field_descr` calls
+    // `get_size_descr` on cache miss so the freshly-minted FieldDescr
+    // gets a non-None `parent_descr`.  Pyre's `gc_cache.get_field_descr`
+    // only READS `_cache_size[struct_key]` (descr.rs:418); ensure the
+    // slot is populated first by routing through `get_size_descr` here,
+    // so the inner-FieldDescr loop below sees the parent.  Cache hit
+    // is a no-op; cache miss mints the SizeDescr per `descr.py:108-118`.
+    // Path 1 carries `layout.size` directly; Path 2 derives from
+    // accumulated offsets after the heuristic walk.
     // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
     if let Some(layout) = cc.struct_layouts.get(struct_name) {
-        let mut field_specs = Vec::new();
+        let size_descr_arc = {
+            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            // descr.py:108-118: vtable=0 here — pyre struct-array
+            // interior fields are not GcStruct-of-Object so no vtable.
+            // immutable_flag=false: defensive default; field-level
+            // immutability lives on FieldDescr.is_immutable.
+            gc.get_size_descr(struct_key.clone(), layout.size, 0, false)
+        };
+        let mut entries: Vec<(
+            String,
+            usize,
+            usize,
+            majit_ir::value::Type,
+            bool,
+            majit_ir::descr::ArrayFlag,
+            bool,
+        )> = Vec::new();
         for fl in &layout.fields {
             if fl.field_type == majit_ir::value::Type::Void {
                 continue;
@@ -4754,30 +5113,76 @@ fn all_interiorfielddescrs(
             if fl.flag == majit_ir::descr::ArrayFlag::Struct {
                 return (Vec::new(), 0);
             }
-            let index_in_parent = field_specs.len();
-            field_specs.push(majit_ir::descr::SimpleFieldDescrSpec {
-                index: index_in_parent as u32,
-                name: format!("{}.{}", struct_name, fl.name),
-                offset: fl.offset,
-                field_size: fl.size,
-                field_type: fl.field_type,
-                is_immutable: fl.is_immutable(),
-                is_quasi_immutable: fl.is_quasi_immutable(),
-                flag: fl.flag,
-                virtualizable: false,
-                index_in_parent,
-            });
+            entries.push((
+                fl.name.clone(),
+                fl.offset,
+                fl.size,
+                fl.field_type,
+                fl.is_immutable(),
+                fl.flag,
+                fl.is_quasi_immutable(),
+            ));
         }
-        let group = majit_ir::descr::make_simple_descr_group(0, layout.size, 0, 0, &field_specs);
         let mut result = Vec::new();
-        for (index_in_parent, fd) in group.field_descrs.iter().enumerate() {
-            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
-                index_in_parent as u32,
-                array_descr.clone(),
-                fd.clone(),
-                group.size_descr.clone(),
-            );
-            result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+        for (
+            index_in_parent,
+            (name, offset, field_size, field_type, is_immutable, flag, _is_quasi_immutable),
+        ) in entries.iter().enumerate()
+        {
+            // `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
+            // REALARRAY.OF, name)` — PyPy's `get_field_descr` returns the
+            // SAME FieldDescr object that `cpu.fielddescrof(STRUCT, name)`
+            // (the direct path) returns, because `_cache_field[STRUCT][name]`
+            // is a single slot.  Pyre's runtime publishes its
+            // `PyreFieldDescr` inside `PyreSizeDescr.all_fielddescrs`
+            // (build_object_descr_group), NOT into `_cache_field`; the
+            // analyzer's direct interiorfielddescrof path
+            // (call.rs:1489) walks `sd.all_fielddescrs()` to find that
+            // PyreFieldDescr.  Mirror that walk here so struct-array
+            // population also reuses the runtime PyreFieldDescr Arc —
+            // otherwise the two paths mint divergent FieldDescr Arcs and
+            // `compute_bitstrings`' `set_ei_index` lands on a different
+            // descr than `force_from_effectinfo` reads.  Name match:
+            // bare or `.{name}` suffix per descr.py:227 naming convention.
+            let mut walked: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+            if let Some(sd) = size_descr_arc.as_size_descr() {
+                let needle = format!(".{}", name);
+                for fd in sd.all_fielddescrs() {
+                    let stored = fd.field_name();
+                    if stored == *name || stored.ends_with(&needle) {
+                        walked = Some(fd.clone());
+                        break;
+                    }
+                }
+            }
+            let fd: std::sync::Arc<dyn majit_ir::descr::FieldDescr> = match walked {
+                Some(fd) => fd,
+                None => {
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    gc.get_field_descr(
+                        struct_key.clone(),
+                        name,
+                        *offset,
+                        *field_size,
+                        *field_type,
+                        *is_immutable,
+                        *flag,
+                        index_in_parent,
+                    )
+                }
+            };
+            let ifd = {
+                let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                gc.get_interiorfield_descr(
+                    array_key.clone(),
+                    name.clone(),
+                    String::new(),
+                    array_descr.clone(),
+                    fd,
+                )
+            };
+            ifd.set_index(index_in_parent as u32);
+            result.push(ifd as majit_ir::descr::DescrRef);
         }
         return (result, layout.size);
     }
@@ -4800,7 +5205,15 @@ fn all_interiorfielddescrs(
         .map(|v| v.iter().map(|(n, r)| (n.as_str(), *r)).collect())
         .unwrap_or_default();
     let mut offset: usize = 0;
-    let mut field_specs = Vec::new();
+    let mut entries: Vec<(
+        String,
+        usize,
+        usize,
+        majit_ir::value::Type,
+        bool,
+        bool,
+        majit_ir::descr::ArrayFlag,
+    )> = Vec::new();
     for (_i, (field_name, field_type_str)) in fields.iter().enumerate() {
         let (flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
@@ -4816,20 +5229,16 @@ fn all_interiorfielddescrs(
         if align > 0 {
             offset = (offset + align - 1) & !(align - 1);
         }
-        let index_in_parent = field_specs.len();
         let rank = immutable_ranks.get(field_name.as_str()).copied();
-        field_specs.push(majit_ir::descr::SimpleFieldDescrSpec {
-            index: index_in_parent as u32,
-            name: format!("{}.{}", struct_name, field_name),
+        entries.push((
+            field_name.clone(),
             offset,
             field_size,
             field_type,
-            is_immutable: rank.is_some(),
-            is_quasi_immutable: rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+            rank.is_some(),
+            rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
             flag,
-            virtualizable: false,
-            index_in_parent,
-        });
+        ));
         offset += field_size;
     }
     let max_align = fields
@@ -4843,16 +5252,66 @@ fn all_interiorfielddescrs(
     } else {
         0
     };
-    let group = majit_ir::descr::make_simple_descr_group(0, item_size, 0, 0, &field_specs);
+    // Path 2 mirror of the Path 1 `get_size_descr` seed — populates
+    // `_cache_size[struct_key]` before the per-field loop so each
+    // `gc_cache.get_field_descr` cache-miss-mint resolves
+    // `parent_descr` to the size descr instead of `None` (`descr.py:238`).
+    let size_descr_arc = {
+        let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+        gc.get_size_descr(struct_key.clone(), item_size, 0, false)
+    };
     let mut result = Vec::new();
-    for (index_in_parent, fd) in group.field_descrs.iter().enumerate() {
-        let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
-            index_in_parent as u32,
-            array_descr.clone(),
-            fd.clone(),
-            group.size_descr.clone(),
-        );
-        result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+    for (
+        index_in_parent,
+        (name, fld_offset, field_size, field_type, is_immutable, _is_quasi_immutable, flag),
+    ) in entries.iter().enumerate()
+    {
+        // `descr.py:435` field-walk convergence — same rationale as the
+        // Path 1 arm above.  Runtime `build_object_descr_group` publishes
+        // `PyreFieldDescr` Arcs inside `PyreSizeDescr.all_fielddescrs`;
+        // walk that list first so struct-array population reuses the
+        // runtime Arc, ensuring `cpu.interiorfielddescrof` per-tuple
+        // identity matches PyPy's single FieldDescr-object-per-(STRUCT,
+        // name) invariant.
+        let mut walked: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+        if let Some(sd) = size_descr_arc.as_size_descr() {
+            let needle = format!(".{}", name);
+            for fd in sd.all_fielddescrs() {
+                let stored = fd.field_name();
+                if stored == *name || stored.ends_with(&needle) {
+                    walked = Some(fd.clone());
+                    break;
+                }
+            }
+        }
+        let fd: std::sync::Arc<dyn majit_ir::descr::FieldDescr> = match walked {
+            Some(fd) => fd,
+            None => {
+                let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                gc.get_field_descr(
+                    struct_key.clone(),
+                    name,
+                    *fld_offset,
+                    *field_size,
+                    *field_type,
+                    *is_immutable,
+                    *flag,
+                    index_in_parent,
+                )
+            }
+        };
+        let ifd = {
+            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            gc.get_interiorfield_descr(
+                array_key.clone(),
+                name.clone(),
+                String::new(),
+                array_descr.clone(),
+                fd,
+            )
+        };
+        ifd.set_index(index_in_parent as u32);
+        result.push(ifd as majit_ir::descr::DescrRef);
     }
     (result, item_size)
 }
