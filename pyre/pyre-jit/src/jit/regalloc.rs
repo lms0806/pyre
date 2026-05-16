@@ -23,7 +23,7 @@
 //!     `JitCode`. Pyre's analog is `RegAllocator::num_colors` plus the
 //!     `AllocationResult.num_regs` field.
 //!
-//! Architecture difference (PRE-EXISTING-ADAPTATION): RPython's
+//! Architecture difference (Note): RPython's
 //! `RegAllocator` consumes a `FunctionGraph` (block + link.args
 //! structure). Pyre's input is a CPython `CodeObject` translated into
 //! a flat `SSARepr` by the dispatch loop, so `make_dependencies` works
@@ -51,7 +51,7 @@ fn variable_value_id(v: Variable) -> ValueId {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct GraphAllocationResult {
+pub struct GraphAllocationResult {
     pub coloring: HashMap<super::flow::VariableId, u16>,
     pub num_colors: u16,
 }
@@ -356,7 +356,7 @@ pub(super) fn perform_graph_register_allocation(
 /// analog of upstream's `regallocs` dict and is the input shape that a
 /// future `flatten_graph(graph, regallocs, ...)` driver will read.
 /// (Phase 1 of the production-wiring plan tracked as Task #224.)
-pub(super) fn perform_graph_register_allocation_all_kinds(
+pub fn perform_graph_register_allocation_all_kinds(
     graph: &FlowGraph,
 ) -> HashMap<Kind, GraphAllocationResult> {
     let mut regallocs = HashMap::new();
@@ -384,7 +384,7 @@ pub(super) fn perform_graph_register_allocation_all_kinds(
 /// run this simulation explicitly first.
 ///
 /// Tracks the production-wiring follow-up in Task #214.
-pub(super) fn enforce_input_args_simulation(
+pub fn enforce_input_args_simulation(
     graph: &FlowGraph,
     regallocs: &mut HashMap<Kind, GraphAllocationResult>,
 ) {
@@ -448,7 +448,7 @@ pub(super) fn count_link_renamings_per_kind(
     graph: &FlowGraph,
     regallocs: &HashMap<Kind, GraphAllocationResult>,
 ) -> HashMap<Kind, usize> {
-    // PRE-EXISTING-ADAPTATION: the `regallocs` passed in come from
+    // Note: the `regallocs` passed in come from
     // `perform_graph_register_allocation_all_kinds`, which runs the
     // chordal coloring directly. Upstream `flatten_graph` follows
     // that with `enforce_input_args` (`flatten.py:88-100`), swapping
@@ -576,8 +576,8 @@ pub(super) fn count_graph_ops_per_opname(graph: &FlowGraph) -> HashMap<String, u
 /// Count `Insn::Op` opnames in `ssarepr.insns`. The inline-emit
 /// counterpart to `count_graph_ops_per_opname`; together they bracket
 /// the convergence target for `flatten_graph` adoption (Task #227).
-/// Skips `Insn::Label`, `Insn::Unreachable`, and `Insn::PcAnchor`
-/// (none of which are emitted by `GraphFlattener::emit_space_operation`).
+/// Skips `Insn::Label` and `Insn::Unreachable` (neither is emitted by
+/// `GraphFlattener::serialize_op`).
 pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for insn in &ssarepr.insns {
@@ -808,7 +808,7 @@ fn enforce_input_args(
 ///      construction — their `try_coalesce` is a no-op when
 ///      `src_slot == dst_slot`, but the call preserves RPython's
 ///      exact iteration shape.
-///   2. SSARepr `*_copy` scanner (PRE-EXISTING-ADAPTATION) — pyre's
+///   2. SSARepr `*_copy` scanner (Note) — pyre's
 ///      walker emits intra-block `int_copy` / `ref_copy` /
 ///      `float_copy` ops for stack shuffling / STORE_FAST sequences
 ///      that have no CFG / Link representation.  The scanner unions
@@ -944,24 +944,25 @@ impl RegAllocator {
             let mut must_continue = false;
 
             for insn in ssarepr.insns.iter().rev() {
-                match insn {
-                    // PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor` in
-                    // `flatten.rs`). Anchors carry no operand or
-                    // liveness — pure SSARepr-position markers for
-                    // post-assemble pc_map build. Skip in the
-                    // interference walk.
-                    Insn::PcAnchor(_) => {}
-                    Insn::Label(label) => {
-                        let alive_at_point = label2alive.entry(label.name.clone()).or_default();
-                        let prevlength = alive_at_point.len();
-                        alive_at_point.extend(alive.iter().copied());
-                        if prevlength != alive_at_point.len() {
-                            must_continue = true;
-                        }
+                let label_name = match insn {
+                    Insn::Label(label) => Some(label.name.clone()),
+                    Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
+                    _ => None,
+                };
+                if let Some(name) = label_name {
+                    let alive_at_point = label2alive.entry(name).or_default();
+                    let prevlength = alive_at_point.len();
+                    alive_at_point.extend(alive.iter().copied());
+                    if prevlength != alive_at_point.len() {
+                        must_continue = true;
                     }
+                    continue;
+                }
+                match insn {
                     Insn::Unreachable => {
                         alive.clear();
                     }
+                    Insn::Label(_) | Insn::PcAnchor { .. } => unreachable!("handled above"),
                     Insn::Op { args, result, .. } => {
                         // Defs: `'->' result` interferes with everything
                         // currently alive (regalloc.py:70-76).
@@ -1031,7 +1032,7 @@ impl RegAllocator {
     /// coloring assign them the same color, turning the copy into a
     /// runtime no-op when src == dst.
     ///
-    /// PRE-EXISTING-ADAPTATION: SSARepr-level copy coalescing instead
+    /// Note: SSARepr-level copy coalescing instead
     /// of FunctionGraph-level link.args coalescing. The effect is a
     /// strict subset of RPython's because pyre still does not see the
     /// original cross-block link representation.
@@ -1179,7 +1180,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
                     rename_operand(op, rename);
                 }
             }
-            Insn::Label(_) | Insn::Unreachable | Insn::PcAnchor(_) => {}
+            Insn::Label(_) | Insn::PcAnchor { .. } | Insn::Unreachable => {}
         }
     }
 }

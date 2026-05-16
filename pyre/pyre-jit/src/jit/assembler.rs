@@ -37,7 +37,7 @@ pub struct NumRegs {
 /// at runtime. pyre-jit-trace cannot depend on pyre-jit, so we
 /// publish the latest `all_liveness` snapshot to
 /// `pyre_jit_trace::assembler::ASSEMBLER_STATE` after every write
-/// — PRE-EXISTING-ADAPTATION for the crate layering, not a state
+/// — Note for the crate layering, not a state
 /// relocation.
 #[derive(Debug, Default)]
 pub struct Assembler {
@@ -168,7 +168,7 @@ impl Assembler {
     /// into `list_of_addr2name` for `MetaInterpStaticData`'s
     /// debug-symbol map.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `oopspec` system, so the
+    /// Note: pyre has no `oopspec` system, so the
     /// callinfocollection is empty (see
     /// [`super::call::CallInfoCollection`]) and the iteration is a
     /// no-op. The slot is preserved so `make_jitcodes` calls through
@@ -237,18 +237,15 @@ impl Assembler {
     fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) {
         match insn {
             Insn::Unreachable => {}
-            // PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor` docstring in
-            // `flatten.rs`). Anchors carry no bytecode; they exist only
-            // so the post-assemble byte-offset table (`ssarepr.insns_pos`)
-            // records the position of each Python PC for trace-time
-            // dispatch. No emit, no liveness side effect.
-            Insn::PcAnchor(_) => {}
             Insn::Label(label) => {
-                let label_id = builder_label(state, &label.name);
-                state
-                    .label_positions
-                    .insert(label.name.clone(), state.builder.current_pos());
-                state.builder.mark_label(label_id);
+                mark_label_first_wins(state, &label.name);
+            }
+            // pyre per-PC anchor — synthesizes the same byte-position
+            // recording as `Insn::Label(Label::new(pc_label_name(N)))`
+            // so `TLabel("pc{N}")` branches resolve identically.
+            Insn::PcAnchor { py_pc } => {
+                let name = super::flatten::pc_label_name(*py_pc);
+                mark_label_first_wins(state, &name);
             }
             Insn::Op {
                 opname,
@@ -279,7 +276,7 @@ impl Assembler {
                 //
                 // RPython's `write_insn` iterates every operand and dispatches
                 // by Python type.  pyre's `dispatch_op` is keyed on `opname`
-                // (PRE-EXISTING-ADAPTATION — see below), so operand iteration
+                // (Note — see below), so operand iteration
                 // is split: `IndirectCallTargets` is collected here before the
                 // opcode-specific lowering runs.  The operand is purely
                 // metadata for the call — it is not written into the jitcode
@@ -306,7 +303,7 @@ impl Assembler {
 
     /// `assembler.py:250-263` `fix_labels()`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's runtime `JitCodeBuilder` patches
+    /// Note: pyre's runtime `JitCodeBuilder` patches
     /// jumps by symbolic label id rather than by rewriting raw bytes, so
     /// the label-position loop is folded into the builder. The per-descr
     /// switch patching that upstream runs here is handled through the
@@ -354,7 +351,7 @@ impl Assembler {
     /// After the per-instance update we publish the latest buffer to
     /// the `pyre_jit_trace::assembler::ASSEMBLER_STATE` thread-local so
     /// the blackhole reader (a lower-crate consumer that cannot depend
-    /// on `pyre_jit`) sees the same bytes. PRE-EXISTING-ADAPTATION for
+    /// on `pyre_jit`) sees the same bytes. Note for
     /// the crate layering, not a relocation of the RPython state.
     fn encode_liveness_info(
         &mut self,
@@ -546,6 +543,43 @@ fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
     let label = state.builder.new_label();
     state.builder_labels.push((name.to_owned(), label));
     label
+}
+
+/// First-wins record of a `Label`/`PcAnchor` byte position.  When the
+/// same label name appears multiple times in the drained `SSARepr`
+/// stream (the supersede-newblock re-walk case under pyre's `pc{N}`
+/// PC-keyed labelling: both the original SpamBlock and the supersede
+/// newblock emit `Label("pcN")` for the same `N` when the supersede
+/// re-walks under a widened framestate), the FIRST occurrence wins
+/// for byte-position resolution.  This matches the runtime's
+/// `pc_anchor_positions` first-wins semantics in
+/// `codewriter.rs::pc_anchor_positions`, so the byte position that
+/// `pc{N}` resolves to via `TLabel("pcN")` branches agrees with the
+/// byte position recorded in the PC dispatch table.  Without this,
+/// `mark_label` would last-wins overwrite the builder's label slot
+/// (`majit-metainterp/jitcode/assembler.rs::mark_label` blindly sets
+/// `*slot = Some(code.len())`), so a back-edge via `TLabel(pcN)`
+/// would land on a different block than a fresh PC-dispatch through
+/// `pc_anchor_positions[N]`.  RPython's block-identity labels
+/// (`flatten.py:116 self.emitline(Label(block))`) sidestep this
+/// because two SpamBlocks reaching PC N carry distinct `Label`
+/// values; pyre's PC-keyed scheme reuses the same name, so we must
+/// enforce first-wins explicitly on the marking side too.
+///
+/// Eliminating the duplication entirely requires switching pyre's
+/// label key from `pc{N}` to block-identity (the Task #227 walker
+/// restructure noted in `pc_anchor_positions`); until then,
+/// first-wins on both the dispatch table and the assembler label
+/// slot keeps the two paths in sync.
+fn mark_label_first_wins(state: &mut AssemblyState, name: &str) {
+    let label_id = builder_label(state, name);
+    if state.label_positions.contains_key(name) {
+        return;
+    }
+    state
+        .label_positions
+        .insert(name.to_owned(), state.builder.current_pos());
+    state.builder.mark_label(label_id);
 }
 
 fn get_liveness_info(args: &[Operand], kind: Kind) -> VecSet<u8> {
@@ -868,7 +902,7 @@ fn dispatch_op(
         // `kind = getkind(...)[0]` in jtransform.py forces single-char
         // suffix everywhere — `getfield_vable_i` / `_r` / `_f` and
         // `setfield_vable_i` / `_r` / `_f`. pyre's JitCodeBuilder methods
-        // retain the `vable_*` prefix as a PRE-EXISTING-ADAPTATION so the
+        // retain the `vable_*` prefix as a Note so the
         // rename is scoped to the Insn::Op key.  Long-form `_int` /
         // `_ref` / `_float` aliases retired — no SSARepr emitter writes
         // them (codewriter.rs `emit_vable_*` macros use the short form).
@@ -982,10 +1016,23 @@ fn dispatch_op(
         }
         "getarrayitem_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
-            state
-                .builder
-                .vable_getarrayitem_ref_with_base(dst, vable_reg, array_idx, index_reg);
+            let (vable_reg, array_idx) = expect_vable_array_read_prefix(args);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Int => {
+                    state
+                        .builder
+                        .vable_getarrayitem_ref_with_base(dst, vable_reg, array_idx, r.index);
+                }
+                Operand::ConstInt(value) => {
+                    state.builder.vable_getarrayitem_ref_const_idx_with_base(
+                        dst, vable_reg, array_idx, *value,
+                    );
+                }
+                other => panic!(
+                    "getarrayitem_vable_r expects Register(Int) or ConstInt index, got {:?}",
+                    other,
+                ),
+            }
         }
         "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
@@ -1015,21 +1062,36 @@ fn dispatch_op(
             }
         }
         "setarrayitem_vable_r" => {
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            match &args[2] {
-                Operand::Register(r) if r.kind == Kind::Ref => {
-                    state
-                        .builder
-                        .vable_setarrayitem_ref_with_base(vable_reg, array_idx, index_reg, r.index);
-                }
-                Operand::ConstRef(value) => {
-                    state.builder.vable_setarrayitem_ref_const_value_with_base(
-                        vable_reg, array_idx, index_reg, *value,
+            let (vable_reg, array_idx) = expect_vable_array_write_prefix_no_idx(args);
+            match (&args[1], &args[2]) {
+                (Operand::Register(idx), Operand::Register(src))
+                    if idx.kind == Kind::Int && src.kind == Kind::Ref =>
+                {
+                    state.builder.vable_setarrayitem_ref_with_base(
+                        vable_reg, array_idx, idx.index, src.index,
                     );
                 }
-                other => panic!(
-                    "setarrayitem_vable_r expects Register(Ref) or ConstRef, got {:?}",
-                    other,
+                (Operand::Register(idx), Operand::ConstRef(value)) if idx.kind == Kind::Int => {
+                    state.builder.vable_setarrayitem_ref_const_value_with_base(
+                        vable_reg, array_idx, idx.index, *value,
+                    );
+                }
+                (Operand::ConstInt(idx_value), Operand::Register(src)) if src.kind == Kind::Ref => {
+                    state.builder.vable_setarrayitem_ref_const_idx_with_base(
+                        vable_reg, array_idx, *idx_value, src.index,
+                    );
+                }
+                (Operand::ConstInt(idx_value), Operand::ConstRef(src_value)) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_ref_const_idx_const_value_with_base(
+                            vable_reg, array_idx, *idx_value, *src_value,
+                        );
+                }
+                (idx, src) => panic!(
+                    "setarrayitem_vable_r expects (Register(Int) | ConstInt) index and \
+                     (Register(Ref) | ConstRef) value, got idx={:?} src={:?}",
+                    idx, src,
                 ),
             }
         }
@@ -1634,6 +1696,20 @@ fn expect_vable_array_read_args(args: &[Operand]) -> (u16, u16, u16) {
     (vable_reg, index_reg, array_idx)
 }
 
+/// Read prefix for getarrayitem_vable_*: returns (vable_reg, array_idx)
+/// without dispatching on the index slot, leaving the caller to decide
+/// between Register and ConstInt index.
+fn expect_vable_array_read_prefix(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        4,
+        "getarrayitem_vable_* expects [vable, index, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let array_idx = expect_matching_vable_array_descrs(&args[2], &args[3], "getarrayitem_vable_*");
+    (vable_reg, array_idx)
+}
+
 fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
     assert_eq!(
         args.len(),
@@ -1644,6 +1720,20 @@ fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
     let index_reg = expect_reg(&args[1], Kind::Int);
     let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
     (vable_reg, index_reg, array_idx)
+}
+
+/// Write prefix for setarrayitem_vable_* WITHOUT dispatching on the
+/// index slot — returns (vable_reg, array_idx) only.  Caller dispatches
+/// on args[1] (index) and args[2] (value) shape combinations.
+fn expect_vable_array_write_prefix_no_idx(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        5,
+        "setarrayitem_vable_* expects [vable, index, value, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
+    (vable_reg, array_idx)
 }
 
 fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {

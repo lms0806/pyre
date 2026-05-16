@@ -3421,64 +3421,73 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getfield_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getfield_vable_int(vable_opref, fielddescr)
+        self.meta
+            .opimpl_getfield_vable_int(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getfield_vable_ref(vable_opref, fielddescr)
+        self.meta
+            .opimpl_getfield_vable_ref(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta
-            .opimpl_getfield_vable_float(vable_opref, fielddescr)
+            .opimpl_getfield_vable_float(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_setfield_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_int(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_int(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_setfield_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_ref(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_ref(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_setfield_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_float(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_float(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_getarrayitem_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3486,6 +3495,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_int(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3496,6 +3506,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getarrayitem_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3503,6 +3514,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_ref(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3513,6 +3525,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getarrayitem_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3520,6 +3533,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_float(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3530,6 +3544,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3539,6 +3554,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_int(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3551,6 +3567,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3560,6 +3577,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_ref(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3572,6 +3590,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3581,6 +3600,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_float(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3593,11 +3613,13 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_arraylen_vable(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
-        self.meta.opimpl_arraylen_vable(vable_opref, fdescr, adescr)
+        self.meta
+            .opimpl_arraylen_vable(pc, vable_opref, fdescr, adescr)
     }
 
     /// Start bridge tracing from a guard failure point.

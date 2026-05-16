@@ -199,6 +199,49 @@ impl TLabel {
     }
 }
 
+/// pyre-only naming convention for the per-Python-PC anchor label that
+/// the walker emits at every PC entry.  Upstream RPython's `flatten.py`
+/// emits exactly one `Label(block)` per SpamBlock; the JIT resumes only
+/// at `jit_merge_point` boundaries (loop headers + guard fail bounce
+/// points) so per-PC anchors are unnecessary.  Pyre's runtime instead
+/// resumes at arbitrary Python PCs (blackhole bridge-resume, inline
+/// call tracing), which requires a per-PC byte-offset table populated
+/// from anchor positions in the assembled JitCode.
+///
+/// All five emit / branch sites that materialise the `pc{N}` naming
+/// route through these helpers so the convention is single-sourced.
+/// A future Phase 4 step can rename the marker shape (e.g.,
+/// `Insn::PcAnchor { py_pc }` distinct from `Insn::Label`) by changing
+/// only these two functions plus the runtime consumers
+/// (`pc_anchor_positions` / `live_marker_indices_by_pc`).
+pub fn pc_label_name(py_pc: usize) -> String {
+    format!("pc{py_pc}")
+}
+
+/// Companion to [`pc_label_name`] producing the matching `TLabel`
+/// branch target.  Walker `goto Label("pc{N}")` callsites build the
+/// target via this helper.
+pub fn pc_tlabel(py_pc: usize) -> TLabel {
+    TLabel::new(pc_label_name(py_pc))
+}
+
+/// Recover the Python PC index from a `Insn::PcAnchor`, or `None`
+/// for any other Insn shape.  Consumed by the runtime's
+/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans.
+///
+/// `Insn::Label("pc{N}")` was the transitional shape before the
+/// `Insn::PcAnchor` variant landed; every walker emit site and every
+/// in-tree test fixture now produces `Insn::PcAnchor` directly, so the
+/// recognition path is retired and `Insn::Label` is reserved purely
+/// for upstream-orthodox block / link / catch-landing labels.
+pub fn label_pc_index(insn: &Insn) -> Option<usize> {
+    if let Insn::PcAnchor { py_pc } = insn {
+        Some(*py_pc)
+    } else {
+        None
+    }
+}
+
 /// `flatten.py:28-33` `class Register(object)`.
 ///
 /// Python:
@@ -492,7 +535,7 @@ pub fn intern_call_descr_stub(
 /// (assembler / blackhole / trace recorder) from reading `flavor`
 /// directly to reading `effect_info.extraeffect`.
 ///
-/// **Stub limitations (PRE-EXISTING-ADAPTATION on every variant).**
+/// **Stub limitations.**
 /// RPython `call.py:296-326 getcalldescr` constructs the EffectInfo
 /// from four static analyzers run over the callee graph:
 ///
@@ -1002,276 +1045,28 @@ impl Operand {
 /// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
 pub const OPNAME_LIVE: &str = "-live-";
 
-/// Classify whether an `Insn::Op` is a flatten_graph-emitted artifact
-/// that has no walker-time `record_graph_op` counterpart by design.
-/// Used by the `[phase4-graph-shape]` probe in `codewriter.rs` to
-/// separate "true walker→graph gap" (closing requires
-/// `record_graph_op` coverage) from "expected SSA-only emit"
-/// (closes naturally once `flatten_graph(graph, regallocs)` becomes
-/// the canonical SSARepr source — Task #227 walker restructure).
-///
-/// Currently recognises:
-///   * Terminator ops emitted by `make_return` / `make_exception_link`
-///     (`flatten.py:236-303`):
-///     `int_return`, `ref_return`, `float_return`, `void_return`,
-///     `raise`, `reraise`.
-///   * Block-exit dispatch ops emitted by `insert_exits` /
-///     `insert_switch_exits` (`flatten.py:107-200` 1-exit / 2-exit /
-///     switch dispatch): `goto`, `goto_if_not`, `goto_if_not_<marker>`
-///     (overflow / int_lt / ...), `goto_if_exception_mismatch`,
-///     `switch`, `unreachable`, `catch_exception`.
-///   * Link-rename `*_push`/`*_pop` and link-driven
-///     `last_exception`/`last_exc_value` — `flatten.py:306-334
-///     insert_renamings` + `generate_last_exc`. `*_push` carries one
-///     register source (`int_push %iN`), `*_pop` carries one register
-///     result (`int_pop -> %iN`); both arise from
-///     `reorder_renaming_list` swap-cycle resolution.  `*_copy` is
-///     not classified here: pyre's walker also emits register-source
-///     copies for stack / local / call-argument movement, so
-///     treating all register-source copies as SSA-only would hide
-///     real walker→graph gaps until copy provenance is represented
-///     explicitly.
-///
-///   * `OPNAME_LIVE` (`-live-`) — `liveness.py:5-12`. **Walker-shape
-///     adaptation, not orthodox.** Upstream `-live-` placement comes
-///     from two distinct producers:
-///       1. **Graph-side, per raising/virtualizable/inline-call op**:
-///          `jtransform.py:469-471 handle_residual_call` (post-call,
-///          if `may_call_jitcodes` or `calldescr_canraise`),
-///          `jtransform.py:481 handle_regular_call` (post inline_call),
-///          `jtransform.py:845` (pre `getfield_vable_<kind>`).  These
-///          end up in the SSARepr via `flatten.py:126 serialize_op`.
-///       2. **SSA-only, per branch / raise / switch boundary**:
-///          `flatten.py:142` (raise non-Variable),
-///          `flatten.py:259` (before `goto_if_not`),
-///          `flatten.py:285` (before `switch`),
-///          `flatten.py:303` (per switch case label).  These have no
-///          graph counterpart by design.
-///     Pyre's renderer-side `flatten_graph` (`FlattenGraph::insert_exits`
-///     / `make_return`) already mirrors group-2 line-for-line at
-///     `flatten.rs:1000, 1139, 1208, 1228`.  Pyre's *codewriter walker*
-///     (`emit_live_placeholder!` in
-///     `codewriter.rs::transform_graph_to_jitcode`) is a different
-///     producer: it runs 1:1 against the Python bytecode and pushes
-///     `Insn::live(Vec::new())` at every PC entry to seed the
-///     post-regalloc `all_liveness` table (`assembler.py:146-158`)
-///     under pyre's bytecode-1:1 walker model.  That per-PC emission
-///     intentionally has **no `record_graph_op` companion** — recording
-///     it graph-side would create a `-live-` cluster the upstream
-///     graph never holds and would mask real graph→inline gaps in the
-///     `[phase4-graph-shape]` probe.  Classifying walker-emitted
-///     per-PC `-live-` as an SSA-only artifact here is the matching
-///     probe-side carveout.
-///
-///     **Convergence path back to RPython orthodox emission**:
-///     when pyre's walker is restructured to drop per-PC `-live-` in
-///     favour of group-2 emission only (mirror `flatten.py:142, 259,
-///     285, 303` exactly the way `flatten_graph` already does) and
-///     gain a graph-side group-1 emission (mirror jtransform's
-///     residual_call / inline_call / vable getfield decomposition),
-///     this clause must be removed so the probe surfaces real
-///     graph→inline `-live-` gaps.  Until then it is a *known*
-///     adaptation rather than a silent one — the docstring above
-///     names the orthodox positions that pyre is not yet emitting.
-pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
-    let Insn::Op { opname, .. } = insn else {
-        return false;
-    };
-    // Walker-shape adaptation: the codewriter walker emits a `-live-`
-    // placeholder at every PC entry (no `record_graph_op` companion),
-    // unlike RPython's per-raising-op + per-branch emission. See the
-    // docstring above for the orthodox emission sites and convergence
-    // path.
-    if opname == OPNAME_LIVE {
-        return true;
-    }
-    // Terminators: `flatten.py:236-303 make_return` /
-    // `make_exception_link`.
-    if matches!(
-        opname.as_str(),
-        "int_return" | "ref_return" | "float_return" | "void_return" | "raise" | "reraise"
-    ) {
-        return true;
-    }
-    // Block-exit dispatch: `insert_exits` 1-/2-exit / `insert_switch_exits`
-    // (`flatten.py:107-200`).
-    if matches!(
-        opname.as_str(),
-        "goto"
-            | "goto_if_not"
-            | "goto_if_exception_mismatch"
-            | "switch"
-            | "unreachable"
-            | "catch_exception"
-    ) {
-        return true;
-    }
-    // `goto_if_not_<marker>` from `flatten_tuple_exitswitch`
-    // (`flatten.py:118-144`): overflow / int_lt / etc.
-    if opname.starts_with("goto_if_not_") {
-        return true;
-    }
-    // Link-driven loads: `generate_last_exc` (`flatten.py:336-352`).
-    if matches!(opname.as_str(), "last_exception" | "last_exc_value") {
-        return true;
-    }
-    // `*_copy` is deliberately counted as walker-emitted unless the
-    // instruction carries explicit link-rename provenance. Pyre's walker
-    // emits register-source copies for stack/local/call argument shuffles.
-    // Link-rename `*_push %iN` / `*_pop -> %iN`
-    // (`flatten.py:325-330 reorder_renaming_list`): swap-cycle
-    // resolution. `*_push` carries a register source; `*_pop` carries
-    // a register result. Both are flatten-time emissions with no
-    // graph counterpart by design.
-    matches!(
-        opname.as_str(),
-        "int_push" | "ref_push" | "float_push" | "int_pop" | "ref_pop" | "float_pop"
-    )
-}
-
-/// Symmetric counterpart to [`is_ssa_only_artifact`]: classify whether
-/// a graph-side `Insn::Op` is a pre-rtype `flowcontext.py` HLOperation
-/// shape that has no inline-walker counterpart by design.
-///
-/// Pyre's codewriter pipeline runs two parallel emit streams at
-/// different abstraction levels:
-///
-/// 1. **Graph (pre-rtype HLOperation, flowspace level)** —
-///    `emit_frontend_*` helpers (`codewriter.rs:1390-1620`) record
-///    `flowcontext.py:135-139 self.recorder.append(spaceop)` shapes
-///    like `add(reg_r, reg_r) -> reg_r`, `lt(reg_r, reg_r) -> reg_r`,
-///    `bool(reg_r) -> reg_i`, `setitem(reg_r, reg_r, reg_r)`,
-///    `simple_call(reg_r, reg_r) -> reg_r`, etc.  Variables produced
-///    here flow through `current_state.stack`, drive
-///    `block.exitswitch`, and feed graph regalloc liveness — they are
-///    load-bearing for graph-side analysis even though no runtime IR
-///    consumer reads the `opname`.
-///
-/// 2. **Inline (post-rtype + helper-call, assembler level)** —
-///    `emit_residual_call_shape` (`codewriter.rs:2513`) writes
-///    `residual_call_{kinds}_{reskind}(const_int(fn_idx), list_X...,
-///    descr)` directly into the SSARepr.  Pyre routes binary ops,
-///    comparisons, `bool`, container access, etc., through helper
-///    functions (`bh_binary_op_fn`, `bh_compare_op_fn`,
-///    `bh_truth_fn`, `bh_setitem_fn`, ...).  This is RPython
-///    post-rtype + helper-lowering — the proper assembler-level
-///    shape pyre emits because pyre's values are uniformly
-///    `PyObject*` (no rtyper, no `int_add`/`int_lt`/`direct_call`
-///    typed split).
-///
-/// The two streams represent the SAME logical operations at different
-/// abstraction levels.  Graph's `add(reg_r, reg_r)` corresponds to
-/// inline's `residual_call_ir_r(box_int_fn) + residual_call_ir_r(
-/// binary_add_fn) + ...` decomposition — multiple post-rtype helper
-/// calls per graph HLOp.  **Op-count multiset_match across streams
-/// cannot be 1:1 by design**.
-///
-/// `is_graph_only_artifact` lets the `[phase4-graph-shape]` probe
-/// (`codewriter.rs:6420-6510`) classify the pre-rtype HLOps as
-/// expected-graph-only, mirroring what `is_ssa_only_artifact` already
-/// does for SSA-only artifacts (terminators, branch dispatch,
-/// link-rename push/pop, walker per-PC `-live-`).  Without this
-/// filter, the probe's "graph-only(top)" line surfaces every
-/// `add/lt/bool/setitem/...` as if it were a graph→inline gap when in
-/// fact the inline-side `residual_call_*` IS the corresponding
-/// post-lowering emit.
-///
-/// Convergence path:
-///   * Task #46 lands graph-side `residual_call_*` dual-write at each
-///     `emit_residual_call` callsite (using Task #41's
-///     `intern_call_descr_stub` + `flatten_descr_by_ptr` plumbing).
-///     That closes the inline-only `residual_call_*` half of the gap
-///     symmetrically.
-///   * The pre-rtype HLOp filter here closes the graph-only half by
-///     measurement honesty — the HLOp emit is intentional, not a bug.
-///
-/// Recognised opname families:
-///   * Binary arithmetic (`emit_frontend_binary` →
-///     `binary_opname`): `add`, `sub`, `mul`, `floordiv`, `mod`,
-///     `truediv`, `pow`, `lshift`, `rshift`, `and_`, `or_`, `xor`
-///     plus their `inplace_*` siblings, plus `getitem` (BINARY_SUBSCR).
-///   * Comparison (`emit_frontend_compare` → `compare_opname`):
-///     `lt`, `le`, `eq`, `ne`, `gt`, `ge`.
-///   * Container subscript store (`emit_frontend_setitem`): `setitem`.
-///   * Boolean coercion / unary (`emit_frontend_bool`,
-///     `emit_frontend_neg`): `bool`, `neg`.
-///   * Function call (`emit_frontend_simple_call`): `simple_call`.
-///   * Sequence construction (`emit_frontend_newlist`): `newlist`.
-///
-/// **Not recognised** (intentionally surface as graph-only deviations):
-/// `setattr` and `getattr` were previously included but removed
-/// 2026-05-06 — inspection of `Instruction::StoreAttr` (codewriter.rs
-/// :6116-6124) and `Instruction::LoadAttr` (codewriter.rs:6138-6146)
-/// shows the inline side fires `emit_abort_permanent!` instead of a
-/// `residual_call_*`, so there is no inline lowering to "match" the
-/// graph HLOp.  Filtering them masked the lowering gap; surfacing
-/// them as graph-only deviations in `[phase4-graph-shape]` honestly
-/// reflects pyre's missing residual_call helpers for these families.
-pub fn is_graph_only_artifact(insn: &Insn) -> bool {
-    let Insn::Op { opname, .. } = insn else {
-        return false;
-    };
-    if matches!(
-        opname.as_str(),
-        // Binary arithmetic + subscript (BinaryOperator → opname,
-        // codewriter.rs:1541-1571 binary_opname).
-        "add"
-            | "sub"
-            | "mul"
-            | "floordiv"
-            | "mod"
-            | "truediv"
-            | "pow"
-            | "lshift"
-            | "rshift"
-            | "and_"
-            | "or_"
-            | "xor"
-            | "getitem"
-            | "inplace_add"
-            | "inplace_sub"
-            | "inplace_mul"
-            | "inplace_floordiv"
-            | "inplace_mod"
-            | "inplace_truediv"
-            | "inplace_pow"
-            | "inplace_lshift"
-            | "inplace_rshift"
-            | "inplace_and"
-            | "inplace_or"
-            | "inplace_xor"
-    ) {
-        return true;
-    }
-    if matches!(
-        opname.as_str(),
-        // Comparison (ComparisonOperator → opname,
-        // codewriter.rs:1592-1602 compare_opname).
-        "lt" | "le" | "eq" | "ne" | "gt" | "ge"
-    ) {
-        return true;
-    }
-    matches!(
-        opname.as_str(),
-        // Container subscript store / unary / call / sequence construction
-        // (emit_frontend_{setitem,bool,neg,simple_call,newlist,newslice}).
-        // `setattr` and `getattr` are intentionally NOT here — see
-        // function-level docstring for the abort_permanent rationale.
-        "setitem" | "bool" | "neg" | "simple_call" | "newlist" | "newslice"
-    )
-}
-
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
-/// The four RPython tuple shapes enumerated above (`Label`, `-live-`,
-/// `---`, regular op), plus one pyre-specific `PcAnchor` variant — see
-/// its docstring for rationale. `-live-` shares the `Op` variant with
-/// regular operations, matching RPython's tuple representation where
-/// `insn[0] == '-live-'` is the discriminator.
+/// The three RPython tuple shapes enumerated above: `Label`, `---`
+/// (`Unreachable`), and regular op (which also carries the `-live-`
+/// marker via `opname == OPNAME_LIVE`).  `-live-` shares the `Op`
+/// variant with regular operations, matching RPython's tuple
+/// representation where `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
     /// `(Label(name),)` — block-entry marker.
     Label(Label),
+    /// pyre-only per-PC anchor marker emitted by the walker at every
+    /// Python PC entry.  Semantically equivalent to a block-entry
+    /// `Insn::Label` with the synthesized name `pc_label_name(py_pc)`,
+    /// but kept as a distinct variant so the runtime can structurally
+    /// distinguish "block entry per `flatten.py:116`" from "per-PC
+    /// anchor for any-PC resume (pyre's NEW-DEVIATION; upstream PyPy
+    /// only resumes at `jit_merge_point` boundaries)".  The assembler
+    /// records the byte position under `pc_label_name(py_pc)` in
+    /// `label_positions` so existing `TLabel("pc{N}")` branch targets
+    /// continue to resolve.
+    PcAnchor { py_pc: usize },
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
     /// set (`liveness.py:70`).
     Unreachable,
@@ -1286,25 +1081,6 @@ pub enum Insn {
         args: Vec<Operand>,
         result: Option<Register>,
     },
-    /// PRE-EXISTING-ADAPTATION: pyre-only marker recording the SSARepr
-    /// position where a Python bytecode (py_pc) starts. RPython has no
-    /// equivalent because its jitcode is graph-derived (not Python-
-    /// bytecode-1:1) and Python PCs do not appear in jitcode space.
-    ///
-    /// pyre's dispatch loop emits one `PcAnchor` at every Python PC so
-    /// the trace-time dispatch can map `next_instr` to the JitCode byte
-    /// offset post-assemble. The `compute_liveness` and `regalloc`
-    /// passes ignore anchors entirely (no liveness, no interference, no
-    /// rename); `assembler.assemble` records each anchor's byte offset
-    /// without emitting any bytecode. This replaces the older
-    /// dispatch-time `pc_map[py_pc] = current_pos()` snapshot, which
-    /// became stale whenever `compute_liveness::remove_repeated_live`
-    /// merged consecutive `-live-` markers and shifted insn indices.
-    ///
-    /// Closest RPython analog: `Label(block)` markers used to anchor
-    /// merge-point block entries (`flatten.py`); pyre's anchor is the
-    /// same idea applied per Python bytecode rather than per graph block.
-    PcAnchor(usize),
 }
 
 impl Insn {
@@ -1333,6 +1109,14 @@ impl Insn {
             args,
             result: None,
         }
+    }
+
+    /// pyre-only per-PC anchor for `py_pc`.  Walker emits one per
+    /// Python PC entry; the runtime resolves `pc{N}` jumps via
+    /// `pc_anchor_positions` / `live_marker_indices_by_pc` scans
+    /// against this variant.
+    pub fn pc_anchor(py_pc: usize) -> Self {
+        Insn::PcAnchor { py_pc }
     }
 
     /// `true` iff this instruction is a `-live-` marker.
@@ -1375,14 +1159,29 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     link_names: HashMap<LinkRef, String>,
     next_label_id: usize,
     include_all_exc_links: bool,
-    /// Slice #48.18 (Option C pipeline-flip prep): when `Some`,
-    /// `flatten_space_operation` routes pre-rtype HLOp opnames from
-    /// the four retired families (BINARY_OP / COMPARE_OP / BOOL /
-    /// SETITEM) through `try_flatten_retired_family_hlop_to_insn`,
-    /// producing the post-rtype `residual_call_*` Insn the assembler
-    /// expects.  When `None`, the legacy opname-passthrough behaves
-    /// as before (emitting `Insn::op("add", ...)` etc. — useful for
-    /// tests and structural-only graphs).
+    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
+    ///
+    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
+    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
+    /// can read `self.cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
+    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
+    /// as a borrow; production callers thread `CodeWriter::cpu()`
+    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
+    /// the overflow path leave it `None`, matching upstream's
+    /// `cpu=None` default at `flatten.py:64`.
+    cpu: Option<&'a super::cpu::Cpu>,
+    /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
+    /// opnames from the four retired families (BINARY_OP / COMPARE_OP
+    /// / BOOL / SETITEM) through
+    /// `try_flatten_retired_family_hlop_to_insn`, producing the
+    /// post-rtype `residual_call_*` Insn the assembler expects.  When
+    /// `None`, the legacy opname-passthrough emits `Insn::op("add",
+    /// ...)` etc. directly — used by tests against structural-only
+    /// graphs.
+    ///
+    /// Production callers populate it via `cpu.lowering_ctx`
+    /// (`codewriter.rs::transform_graph_to_jitcode`).
     lowering_ctx: Option<LoweringContext>,
 }
 
@@ -1400,6 +1199,7 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: None,
         }
     }
@@ -1424,20 +1224,21 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: None,
         }
     }
 
-    /// Slice #48.18 (Option C pipeline-flip prep): GraphFlattener
-    /// constructor that enables retired-family HLOp lowering.  Routes
-    /// `add` / `lt` / ... / `bool` / `setitem` SpaceOperations through
-    /// `try_flatten_retired_family_hlop_to_insn` (which lowers them to
-    /// the matching `residual_call_*` Insn shape) before the
-    /// passthrough opname-emit fallback.  Non-HLOp opnames (structural
-    /// ops like `loop_header` / `jit_merge_point`, post-rtype
-    /// `residual_call_*` ops recorded by factor-refactored families'
-    /// graph dual-writes) keep their existing passthrough handling
-    /// because the dispatcher's `try_*` returns `None` for them.
+    /// GraphFlattener constructor that enables retired-family HLOp
+    /// lowering.  Routes `add` / `lt` / ... / `bool` / `setitem`
+    /// SpaceOperations through `try_flatten_retired_family_hlop_to_insn`
+    /// (which lowers them to the matching `residual_call_*` Insn
+    /// shape) before the passthrough opname-emit fallback.  Non-HLOp
+    /// opnames (structural ops like `loop_header` /
+    /// `jit_merge_point`, post-rtype `residual_call_*` ops recorded
+    /// by factor-refactored families' graph dual-writes) keep their
+    /// existing passthrough handling because the dispatcher's `try_*`
+    /// returns `None` for them.
     pub fn new_with_full_lowering(
         ssarepr: &'a mut SSARepr,
         get_register: F,
@@ -1453,17 +1254,44 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: Some(lowering_ctx),
         }
     }
 
-    pub fn emit_space_operation(&mut self, op: &SpaceOperation) {
+    /// `flatten.py:63 def flatten_graph(graph, regallocs,
+    /// _include_all_exc_links=False, cpu=None)` cpu kwarg parity.
+    ///
+    /// Production callers thread `CodeWriter::cpu()` so
+    /// `make_exception_link`'s `handling_ovf=True` arm can fetch the
+    /// `OverflowError` exception instance (`flatten.py:166-170`).
+    /// Returns `self` to support builder-style chaining at construction.
+    pub fn with_cpu(mut self, cpu: &'a super::cpu::Cpu) -> Self {
+        self.cpu = Some(cpu);
+        self
+    }
+
+    pub fn serialize_op(&mut self, op: &SpaceOperation) {
+        // `flatten.py:373-380 serialize_op`: serialise an op into the
+        // SSARepr via `emitline`.  Pyre's `flatten_space_operation`
+        // splits out the per-op lowering (HLOp dispatch + arg /
+        // result handling); the `emitline` call below matches
+        // upstream's final push.
         let insn = self.flatten_space_operation(op);
-        self.ssarepr.insns.push(insn);
+        self.emitline(insn);
     }
 
     fn emitline(&mut self, insn: Insn) {
         self.ssarepr.insns.push(insn);
+    }
+
+    /// `flatten.py:352-353 popline`: pop the most recently emitted
+    /// insn off `ssarepr.insns`.  Used by the `_ovf` rewrite at
+    /// `flatten.py:194 line = self.popline()` to retract the arithmetic
+    /// op just emitted by `serialize_op` and replace it with the
+    /// `*_jump_if_ovf` twin.
+    fn popline(&mut self) -> Option<Insn> {
+        self.ssarepr.insns.pop()
     }
 
     fn label_name_for_block(&mut self, block: &BlockRef) -> String {
@@ -1514,7 +1342,7 @@ where
     }
 
     fn rename_operand(&mut self, value: &FlowValue) -> RenameOperand {
-        match self.flatten_value(value) {
+        match self.getcolor(value) {
             Operand::Register(register) => RenameOperand::Register(register),
             Operand::ConstInt(value) => RenameOperand::ConstInt(value),
             Operand::ConstRef(value) => RenameOperand::ConstRef(value),
@@ -1529,7 +1357,7 @@ where
                 None => self.emitline(Insn::op("void_return", Vec::new())),
                 Some(kind) => {
                     let opname = format!("{}_return", kind.as_str());
-                    let operand = self.flatten_value(value);
+                    let operand = self.getcolor(value);
                     self.emitline(Insn::op(opname, vec![operand]));
                 }
             },
@@ -1537,7 +1365,7 @@ where
                 if exc_value.as_variable().is_some() {
                     self.emitline(Insn::live(Vec::new()));
                 }
-                let operand = self.flatten_value(exc_value);
+                let operand = self.getcolor(exc_value);
                 self.emitline(Insn::op("raise", vec![operand]));
             }
             _ => panic!("make_return expects 1 or 2 args, got {}", args.len()),
@@ -1546,12 +1374,36 @@ where
     }
 
     fn make_link(&mut self, link: &LinkRef, handling_ovf: bool) {
-        let (target, args, last_exception, last_exc_value, can_return_directly) = {
+        // `rpython/jit/codewriter/flatten.py:148-155 make_link`:
+        //
+        //     if (link.target.exits == ()
+        //         and link.last_exception not in link.args
+        //         and link.last_exc_value not in link.args):
+        //         self.make_return(link.args)     # optimization only
+        //         return
+        //     self.insert_renamings(link)
+        //     self.make_bytecode_block(link.target, handling_ovf)
+        let (target, args, can_return_directly) = {
             let link_borrow = link.borrow();
             let target = link_borrow
                 .target
                 .clone()
                 .expect("link target required for make_link");
+            // `flatten.py:148-155 make_link` has no `target.dead`
+            // check.  RPython `flowspace/flowcontext.py:455 mergeblock`
+            // marks the superseded block dead and reroutes incoming
+            // edges to the newblock via `recloseblock`, but the old
+            // block itself stays linked from any predecessor whose
+            // outgoing edge already named it as target — it serves as
+            // a forwarding stub (`model.py:240-253 recloseblock` only
+            // replaces exits; predecessors retain their original
+            // target reference).  `iterblocks` (`model.py:55-77`)
+            // follows links without filtering on `dead`, so flatten
+            // legitimately recurses through a dead target whose
+            // single exit forwards to the newblock.  Re-asserting
+            // here would reject this legal upstream shape; the
+            // empty-`operations` invariant set by mergeblock is
+            // what carries the "no codegen" semantics.
             let target_is_final = target.borrow().exits.is_empty();
             let uses_last_exception = link_borrow.args.iter().any(|arg| {
                 arg.as_ref()
@@ -1569,30 +1421,9 @@ where
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            // RPython `flatten.py:130-160`: a final-target Link (target
-            // has empty exits, i.e. returnblock or exceptblock) carries
-            // exactly 1 or 2 args.  Any other arg count for a final
-            // target is a walker NEW-DEVIATION (orphan join-point with
-            // FrameState-merge inputargs — see
-            // `w1_root_cause_analysis_2026_05_07.md`).  Assert the
-            // invariant fail-loud; the `[phase4-flatten-graph]` probe
-            // wraps in `catch_unwind` so probe runs report `panic=true`
-            // rather than crashing production (production paths use
-            // the inline ssarepr emit, not flatten_graph).
-            if target_is_final {
-                assert!(
-                    matches!(collected_args.len(), 1 | 2),
-                    "make_link: final-target Link with args.len={} \
-                     (W-1 invariant: returnblock/exceptblock only carry 1 or 2 \
-                     args per flatten.py:130-160)",
-                    collected_args.len(),
-                );
-            }
             (
                 target,
                 collected_args,
-                link_borrow.last_exception,
-                link_borrow.last_exc_value,
                 target_is_final && !uses_last_exception && !uses_last_exc_value,
             )
         };
@@ -1600,7 +1431,6 @@ where
             self.make_return(&args);
             return;
         }
-        let _ = (last_exception, last_exc_value, handling_ovf);
         self.insert_renamings(link);
         self.make_bytecode_block(target, handling_ovf);
     }
@@ -1648,21 +1478,172 @@ where
                 && link_borrow.args[1] == Some(last_exc_value.into())
         };
         if should_reraise {
-            assert!(
-                !handling_ovf,
-                "overflow exception edges are not modeled in pyre flatten_graph yet"
-            );
-            self.emitline(Insn::op("reraise", Vec::new()));
+            if handling_ovf {
+                // `flatten.py:165-170` direct-OverflowError raise:
+                //   exc_data = self.cpu.rtyper.exceptiondata
+                //   ll_ovf = exc_data.get_standard_ll_exc_instance_by_class(
+                //       OverflowError)
+                //   c = Constant(ll_ovf, concretetype=lltype.typeOf(ll_ovf))
+                //   self.emitline("raise", c)
+                let cpu = self.cpu.expect(
+                    "make_exception_link: handling_ovf=true requires a Cpu; \
+                     production callers thread `CodeWriter::cpu()` so \
+                     `cpu.rtyper.exceptiondata.\
+                     get_standard_ll_exc_instance_by_class(OverflowError)` \
+                     resolves per flatten.py:166-170",
+                );
+                let exc_data = &cpu.rtyper.exceptiondata;
+                let ll_ovf = exc_data
+                    .get_standard_ll_exc_instance_by_class("OverflowError")
+                    .expect(
+                        "ExceptionData::get_standard_ll_exc_instance_by_class\
+                         (OverflowError) must succeed for the standard \
+                         exception (flatten.py:167)",
+                    );
+                let operand = (self.lower_constant)(&ll_ovf);
+                self.emitline(Insn::op("raise", vec![operand]));
+            } else {
+                self.emitline(Insn::op("reraise", Vec::new()));
+            }
             self.emitline(Insn::Unreachable);
             return;
         }
         self.make_link(link, handling_ovf);
     }
 
+    /// `rpython/jit/codewriter/flatten.py:189-204` `_ovf` rewrite of
+    /// the canraise tail.
+    ///
+    /// Upstream:
+    /// ```py
+    /// if '_ovf' in opname:
+    ///     line = self.popline()
+    ///     self.emitline(opname[:7] + '_jump_if_ovf',
+    ///                   TLabel(block.exits[1]), *line[1:])
+    ///     assert len(block.exits) in (2, 3)
+    ///     self.make_link(block.exits[0], False)
+    ///     self.emitline(Label(block.exits[1]))
+    ///     self.make_exception_link(block.exits[1], True)
+    ///     if len(block.exits) == 3:
+    ///         assert block.exits[2].exitcase is Exception
+    ///         self.make_exception_link(block.exits[2], False)
+    ///     return
+    /// ```
+    ///
+    /// Pyre's `Insn::Op` carries `opname` separately from `args` /
+    /// `result`, so `line[1:]` translates to "args + the trailing
+    /// `->` result hint kept as `Insn::Op::result`".  The popped
+    /// `_ovf` op's `opname[:7]` always yields the upstream "int_xxx"
+    /// prefix (`int_add`, `int_sub`, `int_mul`, `int_neg`, …).
+    fn flatten_ovf_canraise(&mut self, exits: &[LinkRef], raising_opname: &str) {
+        // `flatten.py:194 line = self.popline()`.  The most recent
+        // serialized op is the `_ovf` arithmetic itself.
+        let line = self
+            .popline()
+            .expect("flatten_ovf_canraise: ssarepr.insns must contain the just-emitted _ovf op");
+        let (popped_opname, popped_args, popped_result) = match line {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => (opname, args, result),
+            other => panic!(
+                "flatten_ovf_canraise: popline expected Insn::Op('{raising_opname}', ...), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            popped_opname, raising_opname,
+            "flatten_ovf_canraise: popped opname {popped_opname:?} disagrees with \
+             block.raising_op() opname {raising_opname:?} — serialize_op \
+             order is corrupted",
+        );
+        // `flatten.py:195-196` `opname[:7] + '_jump_if_ovf'`.
+        assert!(
+            popped_opname.len() >= 7,
+            "flatten_ovf_canraise: opname {popped_opname:?} is shorter than the \
+             upstream 7-char `int_xxx` prefix expected at flatten.py:195",
+        );
+        let jump_opname = format!("{}_jump_if_ovf", &popped_opname[..7]);
+        // `flatten.py:196` `*line[1:]` — prepend the overflow target
+        // TLabel, then keep all original args.  The result hint
+        // (`Insn::Op::result`) stays on the new op since upstream's
+        // `line[1:]` includes the trailing `'->', result` pair.
+        let mut new_args = Vec::with_capacity(popped_args.len() + 1);
+        new_args.push(self.tlabel_for_link(&exits[1]));
+        new_args.extend(popped_args);
+        let jump_insn = match popped_result {
+            Some(result) => Insn::op_with_result(jump_opname, new_args, result),
+            None => Insn::op(jump_opname, new_args),
+        };
+        self.emitline(jump_insn);
+        // `flatten.py:197 assert len(block.exits) in (2, 3)`.
+        assert!(
+            matches!(exits.len(), 2 | 3),
+            "flatten_ovf_canraise: _ovf canraise block must have 2 or 3 exits per \
+             flatten.py:197 (got {})",
+            exits.len(),
+        );
+        // `flatten.py:198 self.make_link(block.exits[0], False)`.
+        self.make_link(&exits[0], false);
+        // `flatten.py:199 self.emitline(Label(block.exits[1]))`.
+        let exit1_label = self.label_for_link(&exits[1]);
+        self.emitline(exit1_label);
+        // `flatten.py:200 self.make_exception_link(block.exits[1], True)`.
+        self.make_exception_link(&exits[1], true);
+        if exits.len() == 3 {
+            // `flatten.py:202 assert block.exits[2].exitcase is Exception`.
+            // pyre represents the `Exception` catch-all by an exception
+            // link with the extravars (`last_exception`, `last_exc_value`)
+            // pair seeded by `attach_catch_exception_edge`, no typed
+            // `llexitcase` (untyped catch-all), and arity-2 args mirroring
+            // the reraise shape — together those distinguish the catch-all
+            // from a normal-flow link (which has all three None) and from
+            // a typed catch (which has `llexitcase = Some(case)`).
+            let exit2 = exits[2].borrow();
+            assert!(
+                exit2.llexitcase.is_none(),
+                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                 the `Exception` catch-all (llexitcase=None) per flatten.py:202",
+            );
+            assert!(
+                exit2.last_exception.is_some() && exit2.last_exc_value.is_some(),
+                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                 an exception link with extravars seeded per flowcontext.py:130-143 \
+                 (matches `exitcase is Exception` invariant from flatten.py:202)",
+            );
+            drop(exit2);
+            // `flatten.py:203 self.make_exception_link(block.exits[2], False)`.
+            self.make_exception_link(&exits[2], false);
+        }
+    }
+
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
-            self.make_link(&exits[0], handling_ovf);
+            // `flatten.py:181 assert link.exitcase in (None, False, True)`
+            // — single-exit links carry either the default fall-through
+            // marker (None) or a Bool case from a hand-hacked generator
+            // graph (False/True).  Upstream's comment says "the cases
+            // False or True should not really occur, but can show up in
+            // the manually hacked graphs for generators…", so accept
+            // them but fail loud on anything else.
+            let link = &exits[0];
+            let exitcase = link.borrow().exitcase.clone();
+            match &exitcase {
+                None => {}
+                Some(super::flow::FlowValue::Constant(c)) => match &c.value {
+                    super::flow::ConstantValue::Bool(_) => {}
+                    other => panic!(
+                        "flatten.py:181 invariant: single-exit link.exitcase \
+                         must be None / False / True, got Constant({other:?})"
+                    ),
+                },
+                Some(other) => panic!(
+                    "flatten.py:181 invariant: single-exit link.exitcase \
+                     must be None / False / True, got {other:?}"
+                ),
+            }
+            self.make_link(link, handling_ovf);
             return;
         }
         if block.borrow().canraise() {
@@ -1678,15 +1659,39 @@ where
             // mergeblock.  Inline the assertion below as fail-loud so
             // any future walker regression that violates the
             // exits[0]=normal invariant surfaces immediately.
+            // `flatten.py:211 assert block.exits[0].exitcase is None`.
+            // Upstream's `flowcontext.py` guarantees the normal-flow
+            // link is always exits[0] for canraise blocks; pyre's
+            // `flatten.py:211` `assert exits[0].exitcase is None`.
+            assert!(
+                exits[0].borrow().exitcase.is_none(),
+                "flatten.py:211 invariant: canraise block's exits[0] must \
+                 be the normal-flow link (exitcase=None)"
+            );
             let normal_link = exits[0].clone();
-            {
-                let lb = normal_link.borrow();
-                assert!(
-                    lb.last_exception.is_none() && lb.llexitcase.is_none(),
-                    "W-3 invariant: canraise block exits[0] must be the \
-                     normal-flow link (last_exception=None, \
-                     llexitcase=None) per flatten.py:211"
-                );
+            // `flatten.py:189-204` `_ovf` rewrite.  When the last op
+            // of a canraise block is an overflow-checked arithmetic
+            // op (`int_add_ovf`, `int_sub_ovf`, `int_mul_ovf`,
+            // `int_neg_ovf`, ...), pop the just-serialized op and
+            // emit its `_jump_if_ovf` twin: the new op carries the
+            // overflow-target TLabel as its first operand, followed
+            // by the original op's args/result.  Then walk the normal
+            // exit, emit `Label(exits[1])`, walk the OverflowError
+            // edge with `handling_ovf=True`, and optionally walk the
+            // `Exception` catch-all (`exits[2]`).
+            //
+            // The W-3 catch-link-order assertion below does NOT apply
+            // to `_ovf` blocks because their `exits[1]` is the direct
+            // OverflowError-reraise edge (not a typed catch), so check
+            // for `_ovf` first and early-return before that assertion.
+            let raising_opname = block
+                .borrow()
+                .raising_op()
+                .map(|op| op.opname.clone())
+                .unwrap_or_default();
+            if raising_opname.contains("_ovf") {
+                self.flatten_ovf_canraise(&exits, &raising_opname);
+                return;
             }
             // RPython `flatten.py:223-238` invariant: typed catches
             // (`llexitcase = Some(case)`) precede the catch-all
@@ -1699,21 +1704,28 @@ where
             // W-4 self-loop fix retired the supersede-induced catch-edge
             // re-entries that fed that shape; the order is now stable
             // out of the walker.
+            // `flatten.py:223-238` walks the catch links in graph
+            // order, breaking on the catch-all (`link.exitcase is
+            // Exception`).  Upstream's `flowcontext.py` produces catch
+            // links in typed-then-catch-all order at graph
+            // construction time, so the iteration order is graph
+            // order without sorting.
             let catch_links: Vec<LinkRef> = exits.iter().skip(1).cloned().collect();
-            {
-                let mut catch_all_seen = false;
-                for link in &catch_links {
-                    let is_catch_all = link.borrow().llexitcase.is_none();
-                    assert!(
-                        !(catch_all_seen && !is_catch_all),
-                        "W-3 invariant: canraise catch links must be in \
-                         typed-then-catch-all order per flatten.py:223-238 \
-                         (flowcontext.py emits Exception catch-all last)"
-                    );
-                    catch_all_seen = catch_all_seen || is_catch_all;
-                }
-            }
-            if !self.include_all_exc_links && block.borrow().raising_op().is_none() {
+            // `flatten.py:206-217` trailing `-live-` scan: walk
+            // `block.operations` from the end skipping `-live-`
+            // markers.  If the final op is NOT `-live-` (upstream's
+            // `index == -1` after the loop), the canraise block does
+            // not actually raise — emit the normal exit directly.
+            // Without `_include_all_exc_links` this is the early
+            // return path that upstream takes for canraise blocks
+            // that survived metainterp policy but lack a real
+            // raising-op-with-trailing-`-live-` pattern.
+            let last_op_is_live = block
+                .borrow()
+                .operations
+                .last()
+                .map_or(false, |op| op.opname == OPNAME_LIVE);
+            if !self.include_all_exc_links && !last_op_is_live {
                 self.make_link(&normal_link, false);
                 return;
             }
@@ -1726,7 +1738,7 @@ where
             for link in &catch_links {
                 let llexitcase = link.borrow().llexitcase.clone();
                 if let Some(case) = llexitcase {
-                    let case_operand = self.flatten_value(&case);
+                    let case_operand = self.getcolor(&case);
                     let mismatch_label = self.tlabel_for_link(link);
                     self.emitline(Insn::op(
                         "goto_if_exception_mismatch",
@@ -1759,7 +1771,7 @@ where
             }
             let (opname, mut opargs) = match exitswitch {
                 super::flow::ExitSwitch::Value(value) => {
-                    ("goto_if_not".to_owned(), vec![self.flatten_value(&value)])
+                    ("goto_if_not".to_owned(), vec![self.getcolor(&value)])
                 }
                 super::flow::ExitSwitch::Tuple(values) => self.flatten_tuple_exitswitch(values),
             };
@@ -1796,7 +1808,7 @@ where
         let args = values
             .into_iter()
             .map(|value| match value {
-                super::flow::ExitSwitchElement::Value(value) => self.flatten_value(&value),
+                super::flow::ExitSwitchElement::Value(value) => self.getcolor(&value),
                 super::flow::ExitSwitchElement::Marker(marker) => {
                     panic!("flatten_graph: unexpected tuple exitswitch marker {marker:?}")
                 }
@@ -1812,13 +1824,14 @@ where
         handling_ovf: bool,
     ) {
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
-            let block_for_panic = exits[0]
-                .borrow()
-                .prevblock
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .expect("link prevblock");
-            let block_borrow = block_for_panic.borrow();
+            // RPython `flatten.py:282-309 insert_switch_exits` is only
+            // called via `insert_exits` when the block already has a
+            // Variable exitswitch (`flatten.py:107-115` dispatch by
+            // `exits.len()` + `exitswitch.concretetype`).  A None
+            // exitswitch on a multi-exit block is a malformed graph
+            // shape upstream would never produce; fail loud so the
+            // walker non-orthodoxy that produced it is visible rather
+            // than silently materialising bytes.
             let exitcase_summary: Vec<String> = exits
                 .iter()
                 .map(|link| {
@@ -1827,11 +1840,10 @@ where
                 })
                 .collect();
             panic!(
-                "flatten_graph: unsupported exits shape for block with {} exits; exitswitch={:?}, src(ops.len={}, canraise={}), exits={:?}",
+                "flatten.py:282 insert_switch_exits invariant: \
+                 multi-exit block must carry a Variable exitswitch, got \
+                 None on {} exits = {:?}",
                 exits.len(),
-                exitswitch,
-                block_borrow.operations.len(),
-                block_borrow.canraise(),
                 exitcase_summary,
             );
         };
@@ -1850,7 +1862,7 @@ where
                 .push((key, self.tlabel_value_for_link(switch)));
         }
 
-        let switch_value = self.flatten_value(&exitswitch);
+        let switch_value = self.getcolor(&exitswitch);
         self.emitline(Insn::live(Vec::new()));
         self.emitline(Insn::op(
             "switch",
@@ -1975,30 +1987,43 @@ where
         }
     }
 
+    /// `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
+    /// rotate startblock inputarg colors so each kind's inputargs occupy
+    /// the canonical `0..n-1` slots, swapping any current allocation
+    /// into the inputarg's target slot.  Upstream stores `regallocs` as
+    /// `self.regallocs`; pyre threads it through the call because the
+    /// `get_register` closure already encapsulates regallocs access for
+    /// the rest of the flatten pass.  The two-callsite shape is a
+    /// pre-Phase-4 adaptation; once the walker stops computing
+    /// regallocs externally, both reduce to one canonical call.
+    pub fn enforce_input_args(
+        &mut self,
+        graph: &super::flow::FunctionGraph,
+        regallocs: &mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    ) {
+        super::regalloc::enforce_input_args_simulation(graph, regallocs);
+    }
+
+    /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
+    /// reset `seen_blocks` and recurse from `graph.startblock`.  Upstream
+    /// stores `graph` as `self.graph`; pyre threads it through because
+    /// `make_bytecode_block` operates on the block argument and does not
+    /// need a graph backreference for any other step.
+    pub fn generate_ssa_form(&mut self, graph: &super::flow::FunctionGraph) {
+        self.seen_blocks.clear();
+        self.make_bytecode_block(graph.startblock.clone(), false);
+    }
+
     fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
         if block.borrow().exits.is_empty() {
+            // `rpython/jit/codewriter/flatten.py:107-109`: empty-exits
+            // blocks are `returnblock` (1 arg) or `exceptblock` (2 args)
+            // and `make_return` handles both shapes.  Any other arg
+            // count is a walker non-orthodoxy that fails fail-loud
+            // inside `make_return` (upstream raises `Exception("?")` at
+            // `flatten.py:145`).  Pyre keeps the upstream behavior:
+            // delegate to `make_return` directly.
             let args = block.borrow().inputargs.clone();
-            // RPython `flatten.py:130-160`: empty-exits blocks are
-            // exclusively `returnblock` (1 arg) or `exceptblock`
-            // (2 args), and both are handled by `make_return`.  Any
-            // other empty-exits block shape is a walker NEW-DEVIATION
-            // (orphan join-point left by the PC-sequential walker
-            // creating a fresh `joinpoints[pc]` entry with FrameState-
-            // merge inputargs and no incoming fall-through edge —
-            // see `w1_root_cause_analysis_2026_05_07.md`).
-            // Fail-loud here so any future flatten_graph driver
-            // promotion against such graphs surfaces immediately
-            // instead of silently emitting `Insn::Unreachable`; the
-            // `[phase4-flatten-graph]` probe wraps this in
-            // `catch_unwind` (codewriter.rs:7625), so probe runs
-            // report `panic=true` rather than crashing production.
-            assert!(
-                matches!(args.len(), 1 | 2),
-                "make_bytecode_block: empty-exits block with inputargs.len={} \
-                 (W-1 invariant: only returnblock/exceptblock have empty exits, \
-                 with 1 or 2 args per flatten.py:130-160)",
-                args.len(),
-            );
             self.make_return(&args);
             return;
         }
@@ -2012,19 +2037,38 @@ where
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
         let operations = block.borrow().operations.clone();
+        let exits_len = block.borrow().exits.len();
+        let exitswitch_is_last_exception = block.borrow().canraise();
         for op in &operations {
-            self.emit_space_operation(op);
+            // `flatten.py:120-125` `_ovf` validity check: an overflow-
+            // checked op must live in a canraise block with 2 or 3
+            // exits; otherwise the rtyper-side guarantee that an
+            // `OverflowError` is caught fails to hold, and the
+            // `_jump_if_ovf` rewrite in `flatten_ovf_canraise`
+            // (`flatten.py:189-204`) would have no overflow target.
+            if op.opname.contains("_ovf") {
+                assert!(
+                    matches!(exits_len, 2 | 3) && exitswitch_is_last_exception,
+                    "detected a block containing ovfcheck() but no \
+                     OverflowError is caught, this is not legal in \
+                     jitted blocks (op={op_name}, exits={exits_len}, \
+                     canraise={exitswitch_is_last_exception}) — \
+                     flatten.py:122-125",
+                    op_name = op.opname,
+                );
+            }
+            self.serialize_op(op);
         }
         self.insert_exits(&block, handling_ovf);
     }
 
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
-        // Slice #48.18: if the GraphFlattener was constructed with a
-        // `LoweringContext`, retired-family HLOp opnames (`add` / `lt`
-        // / ... / `bool` / `setitem`) lower to the matching
-        // `residual_call_*` Insn shape via the dispatcher.  Non-HLOp
-        // opnames return `None` from the dispatcher and fall through
-        // to the legacy opname-passthrough below.
+        // If the GraphFlattener was constructed with a `LoweringContext`,
+        // retired-family HLOp opnames (`add` / `lt` / ... / `bool` /
+        // `setitem`) lower to the matching `residual_call_*` Insn shape
+        // via the dispatcher.  Non-HLOp opnames return `None` from the
+        // dispatcher and fall through to the legacy opname-passthrough
+        // below.
         if let Some(ref ctx) = self.lowering_ctx {
             // Borrow-split: the dispatcher needs `&mut self.get_register`
             // and `&mut self.lower_constant` simultaneously, which Rust
@@ -2040,7 +2084,7 @@ where
                 return insn;
             }
         }
-        let args = op.args.iter().map(|arg| self.flatten_arg(arg)).collect();
+        let args = self.flatten_list(&op.args);
         match op.result {
             None => Insn::op(op.opname.clone(), args),
             Some(FlowValue::Variable(variable)) => {
@@ -2062,12 +2106,12 @@ where
 
     fn flatten_arg(&mut self, arg: &SpaceOperationArg) -> Operand {
         match arg {
-            SpaceOperationArg::Value(value) => self.flatten_value(value),
+            SpaceOperationArg::Value(value) => self.getcolor(value),
             SpaceOperationArg::ListOfKind(list) => Operand::ListOfKind(ListOfKind::new(
                 list.kind,
                 list.content
                     .iter()
-                    .map(|value| self.flatten_value(value))
+                    .map(|value| self.getcolor(value))
                     .collect(),
             )),
             // `flatten.py:365-367` passes AbstractDescr through
@@ -2085,7 +2129,25 @@ where
         }
     }
 
-    fn flatten_value(&mut self, value: &FlowValue) -> Operand {
+    /// `flatten.py:355-371 flatten_list(arglist)` — iterate `arglist`
+    /// and dispatch each arg via `flatten_arg`.  Upstream inlines the
+    /// per-variant dispatch inside `flatten_list`; pyre splits the
+    /// per-arg dispatch into `flatten_arg` for reuse (e.g. by
+    /// `flatten_op_to_insn` via `flatten_arg_with_lowering`).  The
+    /// named wrapper matches upstream's `serialize_op` call shape
+    /// (`args = self.flatten_list(op.args)`).
+    fn flatten_list(&mut self, arglist: &[SpaceOperationArg]) -> Vec<Operand> {
+        arglist.iter().map(|arg| self.flatten_arg(arg)).collect()
+    }
+
+    /// `flatten.py:382-391 GraphFlattener.getcolor(v)`: Variable →
+    /// Register (via the regallocs coloring), Constant → pass-through
+    /// lowered Operand.  Upstream returns `v` unchanged for the
+    /// Constant case; pyre's typed `Operand` enum requires explicit
+    /// lowering via `lower_constant` (a closure that resolves opaque
+    /// pycode / jitdriver pointers — see `GraphFlattener.lower_constant`
+    /// docstring).
+    fn getcolor(&mut self, value: &FlowValue) -> Operand {
         match value {
             FlowValue::Variable(variable) => Operand::Register((self.get_register)(*variable)),
             FlowValue::Constant(constant) => (self.lower_constant)(constant),
@@ -2097,6 +2159,17 @@ fn is_bool_or_tuple_exitswitch(
     exits: &[LinkRef],
     exitswitch: &Option<super::flow::ExitSwitch>,
 ) -> bool {
+    // `flatten.py:240-242` upstream check: `block.exitswitch` is a
+    // tuple (jtransform-fused `goto_if_not_<opname>` form) OR
+    // `block.exitswitch.concretetype == lltype.Bool` (post-rtype bool
+    // exitswitch).  Pyre collapses upstream's `Bool` and `Signed`
+    // lltypes into a single `Kind::Int`, so the second clause can't
+    // be expressed as a direct kind comparison — instead, require
+    // BOTH exit links to carry a Bool `llexitcase` (a True/False pair
+    // populated by `set_last_bool_exitcase` for POP_JUMP_IF_FALSE /
+    // POP_JUMP_IF_TRUE walker branches).  Requiring both (stricter
+    // than `any`) prevents malformed 2-exit graphs from silently
+    // falling into the bool-branch path with only one Bool exitcase.
     matches!(exitswitch, Some(super::flow::ExitSwitch::Tuple(_)))
         || exits
             .iter()
@@ -2114,6 +2187,19 @@ fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
 }
 
 fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
+    // Upstream uses the string sentinel `"default"` for the catch-all
+    // switch link (`flatten.py:280 if link.exitcase != 'default':`).
+    // RPython parity: ONLY `Str("default")` counts as the catch-all;
+    // `None` is a malformed shape upstream would never produce and
+    // must surface from `switch_llexitcase_key` as a fail-loud panic
+    // (caller `insert_switch_exits` filters defaults before the
+    // Signed-key extraction).  Any `None` reaching this point would
+    // be a walker non-orthodoxy that needs fixing at the graph-
+    // construction site rather than papered over here — either set
+    // `exitcase = Str("default")` for a true switch catch-all, or
+    // make both bool-branch links carry a `Bool` `llexitcase` so the
+    // bool-branch path (`flatten.rs:1761 is_bool_or_tuple_exitswitch`)
+    // fires instead of the switch path.
     matches!(
         exitcase,
         Some(FlowValue::Constant(Constant {
@@ -2123,13 +2209,40 @@ fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
     )
 }
 
+/// `rpython/jit/codewriter/flatten.py:296 lltype.cast_primitive(
+/// lltype.Signed, switch.llexitcase)`.
+///
+/// RPython's switch path runs only after `flatten.py:275 kind ==
+/// 'int'` asserts — Bool exitswitches go through the bool-branch
+/// path at `flatten.py:240-267`, not this switch path.  So the
+/// switch llexitcase keys are Signed only; `cast_primitive(Signed,
+/// switch.llexitcase)` is effectively an identity cast.  Pyre's
+/// previous Bool-widening clause was added when Bool exitcase pairs
+/// fell through to switch handling, but that path no longer fires
+/// (the stricter `is_bool_or_tuple_exitswitch` requires BOTH exits
+/// to carry Bool llexitcase, so a partial-Bool 2-exit shape goes
+/// to the switch path which now fails loud on the Bool).
 fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
     match llexitcase {
         Some(FlowValue::Constant(Constant {
             value: ConstantValue::Signed(value),
             ..
         })) => *value,
-        other => panic!("flatten_graph: switch link requires signed llexitcase, got {other:?}"),
+        // `flatten.py:283` — `kind == 'int'` includes lltype `Bool`
+        // (Bool is an Int subtype upstream); `cast_primitive(Signed,
+        // link.llexitcase)` coerces False → 0, True → 1.  Pyre collapses
+        // upstream's Bool/Signed lltypes into `Kind::Int` and represents
+        // bool exitcases as `Constant(Bool(true|false))`, so accept and
+        // coerce here matching the upstream semantics.
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Bool(value),
+            ..
+        })) => i64::from(*value),
+        other => panic!(
+            "flatten_graph: switch link requires Signed/Bool llexitcase per \
+             flatten.py:275-296 (kind == 'int' assert + cast_primitive); \
+             got {other:?}"
+        ),
     }
 }
 
@@ -2157,28 +2270,40 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         (ConstantValue::None, Some(Kind::Ref)) => Operand::ConstRef(0),
         (ConstantValue::Bool(value), Some(Kind::Int)) => Operand::ConstInt(i64::from(*value)),
         (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
+        // RPython rtyper post-pass: a `Constant(ll_ptr, concretetype=
+        // lltype.Ptr(...))` carries an integer pointer in its `value`
+        // field with a `Ptr` concretetype.  Pyre's canonical
+        // `flatten_graph` consumes graphs that already carry this
+        // post-rtype shape (the production walker emits Signed(Ref)
+        // directly for resolved exception classes via `ExceptionData::
+        // get_standard_ll_exc_instance_by_class`, and other Opaque(Ref)
+        // sites resolve through the closure-based
+        // `flatten_graph_with_lowering` path used today).
+        (ConstantValue::Signed(value), Some(Kind::Ref)) => Operand::ConstRef(*value),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
-            panic!("GraphFlattener: opaque ref constants need runtime lowering support")
+            panic!(
+                "GraphFlattener: opaque ref constants must be resolved \
+                 before the canonical flatten_graph driver — production \
+                 callers run flatten_graph_with_lowering with a per-call \
+                 lower_constant closure (matches rpython/rtyper/rtyper.py\
+                 :specialize substep)"
+            )
         }
         other => panic!("GraphFlattener: unsupported constant operand {other:?}"),
     }
 }
 
-/// Probe-side lowering: same as [`flatten_constant_operand`] but
+/// Test-fixture lowering: same as [`flatten_constant_operand`] but
 /// returns a placeholder for `Opaque(Ref)` instead of panicking.
 ///
-/// `flatten_arg_for_probe` runs from a debug-only shape comparison
-/// pass that walks every graph op; portal `jit_merge_point` carries an
-/// `Opaque(Ref)` pycode constant
-/// (`pyre/pyre-jit/src/jit/codewriter.rs:4351-4356`), and production
-/// emission threads a per-call `lower_constant` closure
-/// (`codewriter.rs:4381-4396`) to recover the real `w_code` pointer.
-/// The probe has no such closure available, so route `Opaque(Ref)` to
-/// `Operand::ConstRef(0)`. `shape_descriptor`
-/// (`codewriter.rs:1179-1215`) tags `Operand::ConstRef(_)` as
-/// `"const_ref"` regardless of value, so the placeholder still
-/// produces the same shape signature production emits when its
-/// closure lowers the same op to `Operand::ConstRef(real_ptr)`.
+/// Test fixtures construct synthetic `SpaceOperation` shapes whose
+/// `Opaque(Ref)` constants don't have a real PyObject pointer; production
+/// callers thread their per-call `lower_constant` closure
+/// (`codewriter.rs::transform_graph_to_jitcode`) to recover the real
+/// `w_code` pointer.  Tests pass this placeholder so they don't need a
+/// production-grade closure.  Tests that compare two SSARepr streams
+/// only compare opname + register kinds, so the `ConstRef(0)` value
+/// doesn't matter for those assertions.
 pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
@@ -2186,40 +2311,19 @@ pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constan
     }
 }
 
-/// Block-level walker matching `rpython/jit/codewriter/flatten.py:60
-/// flatten_graph(graph, regallocs)`.  Walks every block in `graph`,
-/// emits a `Label` for each block and an `Insn` for each
-/// `SpaceOperation`, producing the SSARepr that the assembler consumes.
+/// Test-fixture entry mirroring `rpython/jit/codewriter/flatten.py:63
+/// flatten_graph(graph, regallocs)` — wraps `GraphFlattener::
+/// generate_ssa_form` for callers that already have closure-shaped
+/// `get_register` / `lower_constant` rather than a `regallocs`
+/// HashMap.  Production callers should use the canonical
+/// [`flatten_graph`] entry which carries the full `flatten.py:63-70`
+/// shape (regallocs swap + cpu + lowering_ctx).
 ///
-/// `regallocs` keyed by `Kind` provides the per-kind
-/// `GraphAllocationResult` that the caller computed via
-/// `regalloc::perform_graph_register_allocation_all_kinds(graph)`
-/// (upstream `codewriter.py:44-46`'s `regallocs` dict).  `get_register`
-/// projects `Variable` to `Register` using the appropriate per-kind
-/// coloring; `lower_constant` handles non-raw constants (pycode opaque
-/// refs, jitdriver descrs, etc.) that default `flatten_constant_operand`
-/// cannot express on its own.
-///
-/// **Phase 1 scaffold for Task #224**: currently covers the ops whose
-/// graph shape exists in production (`loop_header`, `jit_merge_point`
-/// with the 7-arg upstream shape); ops that pyre's walker still emits
-/// directly into the SSARepr (the bulk of opcodes in
-/// `codewriter.rs::transform_graph_to_jitcode`) do not yet have a
-/// corresponding graph-side `SpaceOperation`, so `flatten_graph`
-/// cannot reproduce the walker's full output.  Wiring Phase 1c
-/// replaces the direct SSARepr emission with `record_graph_op` at
-/// every walker emit point and then switches production to call this
-/// function in place of the walker's interleaved
-/// `ssarepr.insns.push(...)` calls.
-///
-/// Matches upstream structure:
-/// - `flatten_graph`: driver entry point (this function)
-/// - `generate_ssa_form`: block iteration + per-op dispatch
-///   (delegated here to `GraphFlattener::emit_space_operation`)
-/// - `make_bytecode_block`/`make_link`/`insert_exits`: block boundary
-///   handling — not yet implemented; `Label` insertion happens at
-///   block entry only, `insert_exits` equivalent is not yet wired.
-pub fn flatten_graph<F, C>(
+/// The `enforce_input_args` step (`flatten.py:68`) is skipped because
+/// callers supply `get_register` directly: the closure projects
+/// whatever color scheme the test fixture computed, so no
+/// inputarg-color rotation is needed.
+pub fn flatten_graph_with_closures<F, C>(
     graph: &super::flow::FunctionGraph,
     ssarepr: &mut SSARepr,
     get_register: F,
@@ -2230,32 +2334,25 @@ pub fn flatten_graph<F, C>(
 {
     let mut flattener =
         GraphFlattener::new_with_constant_lowering(ssarepr, get_register, lower_constant);
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
 }
 
-/// Slice #48.18 (Option C pipeline-flip prep): variant of
-/// [`flatten_graph`] that threads a `LoweringContext` so the
-/// retired-family pre-rtype HLOps (`add` / `lt` / `bool` / `setitem`)
-/// lower to their post-rtype `residual_call_*` Insn shapes during the
-/// per-block walk.  Non-HLOp opnames retain the existing passthrough
-/// handling (`Insn::op(opname, args)`), so this driver is byte-equivalent
-/// to [`flatten_graph`] on graphs that contain no retired-family HLOps.
+/// Test-fixture variant of [`flatten_graph`] that takes
+/// `get_register` and `lower_constant` as explicit closures and a
+/// pre-built `LoweringContext`, rather than reading them off
+/// `regallocs` and `cpu`.  Used by the retired-family HLOp lowering
+/// tests where constructing a real `Cpu` and `regallocs` HashMap is
+/// disproportionate to the test's scope.
 ///
-/// The dispatcher routes constants through the caller-supplied
-/// `lower_constant` closure (matching the `flatten_arg` production
-/// path), so `Opaque(Ref)` constants on `jit_merge_point` etc. lower
-/// the same way they would through [`flatten_graph`].
-///
-/// **Still a Phase 1 SCAFFOLD**: production callers don't yet flip to
-/// this driver because most ops the walker emits inline (LoadConst,
-/// LoadGlobal, CALL, BuildList, ...) lack graph SpaceOperations.
-/// Subsequent slices (Slice #48.19+) introduce frontend HLOp recording
-/// at those walker arms; this driver becomes the production SSARepr
-/// producer once every walker emit point has a graph counterpart.
-pub fn flatten_graph_with_lowering<F, C>(
+/// Production callers should use [`flatten_graph`] (the canonical
+/// entry matching `flatten.py:63-70`); this helper exists only to
+/// keep test fixtures concise.
+pub fn flatten_graph_with_lowering<'a, F, C>(
     graph: &super::flow::FunctionGraph,
-    ssarepr: &mut SSARepr,
+    ssarepr: &'a mut SSARepr,
     lowering_ctx: LoweringContext,
+    cpu: Option<&'a super::cpu::Cpu>,
     get_register: F,
     lower_constant: C,
 ) where
@@ -2264,114 +2361,111 @@ pub fn flatten_graph_with_lowering<F, C>(
 {
     let mut flattener =
         GraphFlattener::new_with_full_lowering(ssarepr, get_register, lower_constant, lowering_ctx);
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
-}
-
-/// Phase 4 Session 18 (Task #227 prerequisite) — single-family parallel
-/// flatten probe.  Walks `graph.iterblocks()` (DFS from startblock per
-/// `flowspace/model.py:66-77 FunctionGraph.iterblocks`) and emits one
-/// `Insn::Op` per `block.operations` entry whose `opname` matches
-/// `family_opname`, using `get_register` to project graph Variables onto
-/// register slots.  Constants in arg position lower through
-/// `flatten_constant_operand`.
-///
-/// **NOT a `flatten_graph` replacement.**  `rpython/jit/codewriter/
-/// flatten.py:63 flatten_graph` runs `enforce_input_args()` followed by
-/// `generate_ssa_form()` (`flatten.py:88` + `:102`); the latter walks
-/// `make_bytecode_block`/`make_link`/`insert_exits` recursively and
-/// emits the canonical `Label` per block, `make_return` /
-/// `make_exception_link` per terminator, and `insert_renamings` per
-/// link.  This helper deliberately skips ALL of that:
-///   - no `enforce_input_args` simulation (start inputarg colors are
-///     left at their raw chordal-coloring assignment, which can differ
-///     from the canonical `0, 1, 2, …` per kind),
-///   - no `Label` emission (the SSARepr would interleave block-entry
-///     labels with the family ops),
-///   - no `insert_exits` / `make_link` / `insert_renamings` (link-arg
-///     rename `*_copy` / `*_push` / `*_pop` ops are absent),
-///   - no return / exception terminator emission (`make_return`,
-///     `make_exception_link`, `reraise`, `raise`),
-///   - no `last_exception` / `last_exc_value` book-keeping.
-///
-/// The helper exists for the `[phase4-flatten-family]` probe at
-/// `codewriter.rs::transform_graph_to_jitcode` whose goal is the
-/// narrower question "does the graph carry the SAME `family_opname`
-/// op sequence the inline walker emits, in the same order and with
-/// the same operand shape, IGNORING register colors?".  Probe-positive
-/// answer is necessary but not sufficient for retirement: full
-/// retirement still requires regalloc unification (graph regalloc and
-/// SSA `RegisterLayout::compute` produce different colorings) and
-/// proper canonical `flatten_graph` plumbing including all the items
-/// above.  Tracked as Task #227 walker restructure.
-pub fn flatten_family_ops<F>(
-    graph: &super::flow::FunctionGraph,
-    family_opname: &str,
-    mut get_register: F,
-) -> Vec<Insn>
-where
-    F: FnMut(Variable) -> Register,
-{
-    let mut out = Vec::new();
-    for block in graph.iterblocks() {
-        let block = block.borrow();
-        for op in &block.operations {
-            if op.opname != family_opname {
-                continue;
-            }
-            if let Some(insn) = flatten_op_to_insn(op, &mut get_register) {
-                out.push(insn);
-            }
-        }
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
     }
-    out
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
 }
 
-/// Walk every block in `graph.iterblocks()` DFS order and produce the
-/// `Vec<Insn>` that a future `flatten_graph(graph, regallocs)` driver
-/// would emit BEFORE `Label`/terminator/`insert_renamings` emission.
-/// All-families generalisation of [`flatten_family_ops`]; same caveats
-/// (`flatten_family_ops` docstring above) apply — this is NOT a full
-/// `flatten_graph` replacement, only the `block.operations` body walk.
+/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// regallocs, _include_all_exc_links=False, cpu=None)`.
 ///
-/// Used by the `[phase4-graph-shape]` probe to surface every remaining
-/// orphan-inline emit family across the whole graph at once, not just
-/// the per-family `[phase4-flatten-family]` cover. Probe-positive
-/// answer ("graph multiset == inline multiset for ALL Op opnames") is
-/// the structural precondition for retiring the entire walker → SSA
-/// inline emit path in favour of post-walker `flatten_graph` (Task
-/// #227 walker restructure endgame).
-pub fn flatten_all_graph_ops<F>(
+/// The canonical entry point matching upstream signature exactly.
+/// Constructs the `SSARepr` internally, derives `get_register` from
+/// `regallocs[kind].getcolor(v)` (`flatten.py:382-391`), and threads
+/// `cpu` through `make_exception_link` for `handling_ovf=True` reraise
+/// targets (`flatten.py:166-170`).
+///
+/// **`LoweringContext` derivation.**
+/// Upstream's `flatten_graph` does not take a `LoweringContext` because
+/// the rtyper rewrites the graph to post-rtype shape BEFORE flatten_graph
+/// runs.  Pyre's graph carries pre-rtype HLOps (BINARY_OP / COMPARE_OP /
+/// BOOL / SETITEM families) directly; the canonical entry derives the
+/// dispatcher's `LoweringContext` from `cpu.lowering_ctx` (a pyre
+/// extension on `Cpu`) so the upstream `flatten_graph(graph, regallocs,
+/// _include_all_exc_links, cpu)` signature stays intact.
+///
+/// **Upstream-orthodox entry** matching
+/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// regallocs, _include_all_exc_links=False, cpu=None)` signature with
+/// no additional parameters.  Derives the dispatcher's
+/// `LoweringContext` from `cpu.lowering_ctx` (a pyre-specific
+/// extension on `Cpu` documented at `cpu.rs::Cpu::lowering_ctx`).
+/// When `cpu` is `None` or `cpu.lowering_ctx` is unset, the HLOp
+/// dispatcher is disabled and pre-rtype HLOp opnames passthrough to
+/// the SSARepr — useful for tests against structural-only graphs.
+pub fn flatten_graph<'a>(
     graph: &super::flow::FunctionGraph,
-    mut get_register: F,
-) -> Vec<Insn>
-where
-    F: FnMut(Variable) -> Register,
-{
-    let mut out = Vec::new();
-    for block in graph.iterblocks() {
-        let block = block.borrow();
-        for op in &block.operations {
-            if let Some(insn) = flatten_op_to_insn(op, &mut get_register) {
-                out.push(insn);
-            }
-        }
+    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+) -> SSARepr {
+    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
+    // `regallocs` on `self.regallocs` and the method mutates it
+    // in place; pyre's `get_register` closure (constructed below)
+    // captures `&regallocs`, so the swap runs BEFORE the closure exists.
+    super::regalloc::enforce_input_args_simulation(graph, regallocs);
+    // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
+    // _include_all_exc_links, cpu)`.
+    let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
+    let mut ssarepr = SSARepr::new(graph.name.clone());
+    // `flatten.py:382-391 getcolor(v)` — read
+    // `regallocs[kind].coloring[variable.id]` through the closure.
+    let get_register = |variable: Variable| -> Register {
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        let color = regallocs
+            .get(&kind)
+            .and_then(|r| r.coloring.get(&variable.id).copied())
+            .unwrap_or(u16::MAX);
+        Register::new(kind, color)
+    };
+    // `flatten_constant_operand` panics on `Opaque(Ref)` constants
+    // — upstream's `flatten` lowering relies on the rtyper preserving
+    // `Constant(ll_ovf, concretetype=...)` through to the assembler,
+    // and pyre's canonical entry takes the same fail-loud stance:
+    // graphs that carry opaque Ref constants (production pycode /
+    // jitdriver pointers, the OverflowError instance from
+    // `make_exception_link`) MUST be flattened via
+    // `flatten_graph_with_lowering` with a production `lower_constant`
+    // closure that resolves the opaque to the runtime PyObject
+    // pointer.  Calling the canonical entry on such a graph surfaces
+    // the divergence instead of silently materialising `ConstRef(0)`.
+    let lower_constant = flatten_constant_operand;
+    let mut flattener = if let Some(ctx) = lowering_ctx {
+        GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
+    } else {
+        GraphFlattener::new_with_constant_lowering(&mut ssarepr, get_register, lower_constant)
+    };
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
     }
-    out
+    // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
+    // _include_all_exc_links`.
+    flattener.include_all_exc_links = include_all_exc_links;
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
+    ssarepr
 }
 
-/// Lower one `SpaceOperation` to a single `Insn::Op` using probe-side
-/// argument flattening. Shared between [`flatten_family_ops`] and
-/// [`flatten_all_graph_ops`] so both paths agree on result-handling
-/// and argument lowering. Returns `None` only when the op is not
-/// representable as a single `Insn::Op` (currently never).
-fn flatten_op_to_insn<F>(op: &super::flow::SpaceOperation, get_register: &mut F) -> Option<Insn>
+/// Lower one `SpaceOperation` to a single `Insn::Op`.  Used by
+/// [`flatten_op_to_insn_with_lowering`] as the passthrough fallback
+/// when no HLOp lowering matches.  Constant operands lower via the
+/// caller-supplied `lower_constant` closure (production threads its
+/// real `lower_constant`; tests pass `flatten_constant_operand_for_probe`).
+fn flatten_op_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
 where
     F: FnMut(Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
 {
     let args: Vec<Operand> = op
         .args
         .iter()
-        .map(|arg| flatten_arg_for_probe(arg, get_register))
+        .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
         .collect();
     let insn = match &op.result {
         None => Insn::op(op.opname.clone(), args),
@@ -2379,49 +2473,25 @@ where
             let reg = get_register(*variable);
             Insn::op_with_result(op.opname.clone(), args, reg)
         }
-        Some(FlowValue::Constant(constant)) => {
-            // Same invariant as `flatten_space_operation` (line ~1271):
-            // graph op results must be Variables. Panic with the same
-            // message so a probe-side hit surfaces the broken graph
-            // exactly the way the production path would, instead of
-            // silently emitting a no-result Op that would falsely
-            // shape-match an inline-walker entry with a `dst` register.
-            panic!(
-                "GraphFlattener probe: op {} has Constant result {:?}; \
-                 flow graph results must be Variables",
-                op.opname, constant
-            );
-        }
+        Some(FlowValue::Constant(constant)) => panic!(
+            "GraphFlattener: op {} has Constant result {:?}; \
+             flow graph results must be Variables",
+            op.opname, constant
+        ),
     };
     Some(insn)
-}
-
-fn flatten_arg_for_probe<F>(arg: &super::flow::SpaceOperationArg, get_register: &mut F) -> Operand
-where
-    F: FnMut(Variable) -> Register,
-{
-    flatten_arg_with_lowering(arg, get_register, &mut flatten_constant_operand_for_probe)
 }
 
 /// Generalized `SpaceOperationArg → Operand` lowering with a
 /// caller-supplied `lower_constant` closure that decides how
 /// `FlowValue::Constant` values map to `Operand`s.
 ///
-/// Slice #48.18 (Option C pipeline-flip prep): the four
-/// `lower_*_hlop_to_insn` helpers used to call `flatten_arg_for_probe`
-/// directly, hardcoding probe-side constant lowering
-/// (`flatten_constant_operand_for_probe` — `Opaque(Ref) → ConstRef(0)`
-/// placeholder).  Production-side callers
-/// (`GraphFlattener::flatten_arg` via `self.lower_constant`) need a
-/// real pycode pointer for `Opaque(Ref)`, so this generalized version
-/// accepts the lowering closure as a parameter.  Variable / list /
-/// descr / indirect-call-targets handling is identical to
-/// `flatten_arg_for_probe`; only constant operand lowering is
-/// pluggable.
-///
-/// The probe-side wrapper [`flatten_arg_for_probe`] threads
-/// `flatten_constant_operand_for_probe` as `lower_constant`; the
-/// production side threads `&mut self.lower_constant`.
+/// Production callers (`GraphFlattener::flatten_arg` via
+/// `self.lower_constant`) thread the per-call closure that resolves
+/// `Opaque(Ref)` to the real `w_code` PyObject pointer.  Tests pass
+/// [`flatten_constant_operand_for_probe`] (a `ConstRef(0)` placeholder).
+/// Variable / list / descr / indirect-call-targets handling is the
+/// same in both cases; only constant operand lowering is pluggable.
 fn flatten_arg_with_lowering<F, LC>(
     arg: &super::flow::SpaceOperationArg,
     get_register: &mut F,
@@ -2615,15 +2685,12 @@ fn binary_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// HLOp (caller falls through to the default opname-passthrough Insn
 /// arm in `flatten_op_to_insn`).
 ///
-/// Task #48 micro-slice 1: BINARY_OP family lowering.  Not yet wired
-/// into `flatten_op_to_insn`; lives standalone with unit tests until
-/// micro-slice 2 introduces the `[phase4-flatten-lowering]`
-/// sequence_match probe that compares this helper's output against
-/// the existing dual-write residual_call across production fixtures.
-/// Once verified byte-equivalent, micro-slice 3 retires the inline
-/// `emit_residual_call(binary_op_fn_idx, ...)` callsite plus the
-/// matching graph dual-write — the graph then carries only the
-/// `add(...)` HLOp and flatten lowers it here into the SSARepr.
+/// BINARY_OP family lowering.  Production walker emits the lowered
+/// `residual_call_ir_r` Insn directly via
+/// [`build_binary_op_residual_call_ir_r_insn`] at the callsite; the
+/// graph carries only the pre-rtype `add(...)` HLOp.  This helper
+/// produces the same Insn from the HLOp for the post-walker
+/// `flatten_op_to_insn_with_lowering` dispatcher.
 pub fn lower_binary_op_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -2661,10 +2728,9 @@ where
 /// `emit_residual_call(binary_op_fn_idx, ...)` + matching graph
 /// dual-write at codewriter.rs:5335-5378.
 ///
-/// Mirrors [`lower_binary_op_hlop_to_insn`]'s output shape so the
-/// `[phase4-flatten-lowering]` probe's `sequence_match=true`
-/// invariant guarantees byte-equivalence with what
-/// `emit_residual_call_shape` produced before retirement.
+/// Mirrors [`lower_binary_op_hlop_to_insn`]'s output shape: the
+/// post-walker dispatcher and the walker-time direct push both produce
+/// the same `residual_call_ir_r` Insn bytes.
 ///
 /// `op_val` is the `binary_op_tag` integer derived from the
 /// `BinaryOperator` (e.g., `add → 0`, `sub → 1`); production
@@ -2765,13 +2831,11 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// leading `fn_idx` literal.  Returns `None` for non-family opnames
 /// so the caller can fall through.
 ///
-/// Task #48 micro-slice 4 (COMPARE_OP retirement): same pattern as
-/// [`lower_binary_op_hlop_to_insn`].  The
-/// `[phase4-flatten-lowering]` probe gains a parallel COMPARE_OP
-/// arm; once `sequence_match=true` is verified the inline
-/// `emit_residual_call(compare_fn_idx, ...)` callsite plus its
-/// graph dual-write are retired in favour of the
-/// `build_compare_op_residual_call_ir_r_insn` helper.
+/// COMPARE_OP family lowering — same pattern as
+/// [`lower_binary_op_hlop_to_insn`].  Production walker emits via
+/// [`build_compare_op_residual_call_ir_r_insn`]; this helper
+/// reconstructs the same Insn from the HLOp for the post-walker
+/// dispatcher.
 pub fn lower_compare_op_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -2881,8 +2945,7 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
 }
 
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
-/// register indices.  Production codewriter callsite (Slice #48.9
-/// factor refactor) replaces the prior `emit_residual_call(
+/// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// call_fn_N_idx, ...)` SSARepr emit at codewriter.rs:5747-5754
 /// (the `nargs <= 8` branch of the Instruction::Call arm) with a
 /// single direct push of this helper's output.  The matching graph
@@ -2926,8 +2989,7 @@ pub fn build_call_fn_residual_call_r_r_insn(
 }
 
 /// Construct the get_current_exception-family `residual_call_r_r`
-/// Insn.  Production codewriter callsite (Slice #48.15 factor
-/// refactor) replaces the prior `emit_residual_call(
+/// Insn.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// get_current_exception_fn_idx, ...)` SSARepr emit at
 /// codewriter.rs:6116-6123 (PushExcInfo).  The matching graph
 /// dual-write at codewriter.rs:6141-6152 stays in place.
@@ -3010,8 +3072,7 @@ fn build_residual_call_r_r_insn_from_operands(
 ///
 /// The shared shape constructor
 /// `build_residual_call_r_r_insn_from_operands` accepts arbitrary
-/// `ref_operands.len()` plus a `flavor` parameter (extended in
-/// Slice #48.15 from MayForce-only to support the
+/// `ref_operands.len()` plus a `flavor` parameter (extended from MayForce-only to support the
 /// PlainCannotRaiseNoHeap exception-family helpers); this caller
 /// passes `MayForce` matching the production source.
 pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
@@ -3029,8 +3090,7 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
 }
 
 /// Construct the box_int-family `residual_call_ir_r` Insn from raw
-/// register indices.  Production codewriter callsites (Slice #48.10
-/// factor refactor) replace three prior `emit_residual_call(
+/// register indices.  Production codewriter callsites replace three prior `emit_residual_call(
 /// box_int_fn_idx, ...)` SSARepr emits with single direct pushes of
 /// this helper's output:
 ///   * LoadSmallInt at codewriter.rs:4867-4874 (val = literal small
@@ -3251,13 +3311,12 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
 /// BINARY_OP / COMPARE_OP).  Returns `None` for non-`bool`
 /// opnames.
 ///
-/// Task #48 micro-slice 5 (BOOL retirement): same per-family
-/// pattern as micro-slices 3-4 but a different residual_call
-/// shape.  After the `[phase4-flatten-lowering]` probe verifies
-/// `sequence_match=true` on production fixtures, the inline
-/// `emit_residual_call(truth_fn_idx, ...)` callsites at
-/// PopJumpIfFalse / PopJumpIfTrue and their graph dual-writes
-/// retire in favour of `build_truth_fn_residual_call_r_i_insn`.
+/// BOOL family lowering — same per-family pattern as the BINARY_OP
+/// and COMPARE_OP retirements but a different residual_call shape.
+/// Production walker emits the lowered Insn via
+/// [`build_truth_fn_residual_call_r_i_insn`] at PopJumpIfFalse /
+/// PopJumpIfTrue; this helper reconstructs the same Insn from the
+/// `bool` HLOp for the post-walker dispatcher.
 pub fn lower_bool_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -3274,8 +3333,22 @@ where
     if op.args.len() != 1 {
         return None;
     }
+    // `truth_fn` returns Int (the boolean 0/1 result), so the
+    // dispatcher must emit `dst_reg` with `Kind::Int` regardless of
+    // the HLOp result Variable's recorded kind.  `emit_frontend_bool`
+    // currently records the result as `Kind::Ref` (matching the
+    // upstream `op.bool(w_value)` HLOp result type at the flowspace
+    // level), but the post-rtype `residual_call_r_i` Insn carries an
+    // Int destination register — the byte-equivalence check vs the
+    // inline emit (`scratch_truth = fresh_var(Kind::Int, ...)`)
+    // requires forcing Int here.  Matches upstream
+    // `jtransform.py`-style rtype rewrite that retypes the bool
+    // result to `Bool`/`Int` before flatten_graph runs.
     let result_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        Some(super::flow::FlowValue::Variable(var)) => {
+            let r = get_register(*var);
+            Register::new(Kind::Int, r.index)
+        }
         _ => return None,
     };
     let arg_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
@@ -3393,7 +3466,7 @@ where
 /// the matching `lower_*_hlop_to_insn` helper, falling through to the
 /// passthrough [`flatten_op_to_insn`] for any other opname.
 ///
-/// Slice #48.17 (Option C pipeline-flip prep): a future post-walker
+/// A future post-walker
 /// `flatten_graph(graph, ssarepr, ctx)` driver calls this dispatcher
 /// once per `block.operations` entry to translate graph ops back into
 /// the SSARepr Insn stream the assembler consumes.  Today the
@@ -3401,17 +3474,9 @@ where
 /// via the `build_*_residual_call_*_insn` helpers at every walker
 /// callsite while the graph carries pre-rtype HLOps for the retired
 /// families and post-rtype `residual_call_*` ops for the
-/// factor-refactored families (Slice #48.7-#48.16).  After
+/// factor-refactored families.  After
 /// retirement the walker would only record graph ops; this dispatcher
 /// is the per-op core of the post-walker driver.
-///
-/// The `[phase4-flatten-driver]` probe at codewriter.rs verifies
-/// that walking `graph.iterblocks()` once through this dispatcher
-/// produces a residual_call_* Insn sequence (per retired family,
-/// filtered by `(opname, fn_idx)`) byte-equivalent in shape to the
-/// inline-emitted SSARepr.  Probe-positive answer is the precondition
-/// for switching production from inline emit to a post-walker
-/// `flatten_graph` driver that uses this dispatcher.
 ///
 /// Dispatch order is incidental — the four retired-family opname sets
 /// are disjoint (`binary_op_tag_for_opname` / `compare_op_tag_for_opname`
@@ -3436,7 +3501,7 @@ where
     {
         return Some(insn);
     }
-    flatten_op_to_insn(op, get_register)
+    flatten_op_to_insn(op, get_register, lower_constant)
 }
 
 /// Retired-family-only variant of [`flatten_op_to_insn_with_lowering`]:
@@ -3444,7 +3509,7 @@ where
 /// `None` when no arm matches, instead of falling through to the
 /// passthrough [`flatten_op_to_insn`].
 ///
-/// Slice #48.18: `GraphFlattener::flatten_space_operation` uses this
+/// `GraphFlattener::flatten_space_operation` uses this
 /// variant to avoid double-handling of non-HLOp ops.  The dispatcher's
 /// passthrough fallback uses `flatten_arg_for_probe` (probe-side
 /// constant lowering, `Opaque(Ref) → ConstRef(0)` placeholder) which
@@ -3503,7 +3568,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
 
 /// Construct the set_current_exception-family `residual_call_r_v`
 /// Insn from a raw register index.  Production codewriter callsites
-/// (Slice #48.15 factor refactor) replace the prior
+/// replace the prior
 /// `emit_residual_call(set_current_exception_fn_idx, ...)` SSARepr
 /// emits at codewriter.rs:6134-6144 (PushExcInfo) and
 /// codewriter.rs:6269-6279 (PopExcept).  Both sites' graph
@@ -3558,8 +3623,7 @@ fn build_residual_call_r_v_insn_from_operands(
 }
 
 /// Construct the LoadConst-family `residual_call_ir_r` Insn from raw
-/// register indices.  Production codewriter callsite (Slice #48.7
-/// factor refactor) replaces the prior `emit_residual_call(
+/// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// load_const_fn_idx, ...)` SSARepr emit at codewriter.rs:4933-4946
 /// with a single direct push of this helper's output.  The matching
 /// graph dual-write at codewriter.rs:4954-4965 stays in place — this
@@ -3643,6 +3707,34 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
 mod tests {
     use super::*;
     use crate::jit::flow::{FlowListOfKind, VariableId};
+
+    #[test]
+    fn pc_anchor_round_trip_matches_py_pc() {
+        for py_pc in [0usize, 1, 42, 99, 123_456] {
+            assert_eq!(pc_label_name(py_pc), format!("pc{py_pc}"));
+            let insn = Insn::pc_anchor(py_pc);
+            assert_eq!(
+                label_pc_index(&insn),
+                Some(py_pc),
+                "round-trip py_pc={py_pc}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_pc_index_rejects_non_anchor_insns() {
+        // Block / link / catch-landing labels must be rejected — only
+        // `Insn::PcAnchor` returns Some(py_pc).
+        for name in ["block0", "block42", "link1", "catch_landing_3"] {
+            assert_eq!(
+                label_pc_index(&Insn::Label(Label::new(name))),
+                None,
+                "label_pc_index must reject Label({name:?})"
+            );
+        }
+        assert_eq!(label_pc_index(&Insn::Unreachable), None);
+        assert_eq!(label_pc_index(&Insn::op("plain", vec![])), None);
+    }
 
     #[test]
     fn call_flavor_round_trip_through_effect_info() {
@@ -3915,7 +4007,7 @@ mod tests {
             Register::new(Kind::Ref, VariableId(0).0 as u16)
         });
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
@@ -3970,7 +4062,7 @@ mod tests {
             },
         );
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
@@ -4043,7 +4135,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("flat_walk");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
@@ -4079,7 +4171,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("renaming");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4123,6 +4215,15 @@ mod tests {
         super::super::flow::push_op(
             &start,
             SpaceOperation::new("call_can_raise", Vec::new(), None, 0),
+        );
+        // `flatten.py:206-210` recognises a canraise block as "actually
+        // raising" only when there is a trailing `-live-` marker after
+        // the raising op (the rtyper emits one per call/raisecheck;
+        // pyre's frontend uses the same convention).  Append it so
+        // `insert_exits` takes the catch_exception emission path.
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(crate::jit::flatten::OPNAME_LIVE, Vec::new(), None, 0),
         );
 
         typed_handler.closeblock(vec![
@@ -4169,7 +4270,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("exc_dispatch");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4231,7 +4332,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("bool_branch");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4289,7 +4390,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one, default]);
 
         let mut ssarepr = SSARepr::new("int_switch");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4358,7 +4459,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one]);
 
         let mut ssarepr = SSARepr::new("int_switch_no_default");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4378,6 +4479,116 @@ mod tests {
             ssarepr.insns.get(switch_idx + 2),
             Some(Insn::Unreachable)
         ));
+    }
+
+    #[test]
+    fn flatten_graph_routes_str_default_link_to_default_branch() {
+        // `flatten.py:280 if link.exitcase != 'default':` — the
+        // catch-all switch link is identified by the string sentinel
+        // `"default"`.  Pyre's strict `is_default_exitcase`
+        // (flatten.rs::is_default_exitcase) recognises ONLY this shape
+        // (not `None`).  Verify a 3-exit switch with two Signed cases
+        // plus one `Str("default")` catch-all lowers to switch + the
+        // default link, not to switch + unreachable.
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch_with_default", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        let case_three = Link::new(
+            vec![Constant::signed(30).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(3).into()),
+        )
+        .with_llexitcase(Constant::signed(3).into())
+        .into_ref();
+        let default = Link::new(
+            vec![Constant::signed(99).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::string("default").into()),
+        )
+        .into_ref();
+        // `insert_switch_exits` reads the default off `exits.last()` so
+        // place the catch-all at the tail of the exits vec.
+        start.closeblock(vec![case_three, case_one, default]);
+
+        let mut ssarepr = SSARepr::new("int_switch_with_default");
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        let switch_idx = ssarepr
+            .insns
+            .iter()
+            .position(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "switch"))
+            .expect("integer exits should lower to switch");
+        // No unreachable: default link supplies the catch-all branch.
+        assert!(
+            !matches!(
+                ssarepr.insns.get(switch_idx + 1),
+                Some(Insn::Op { opname, .. }) if opname == "unreachable"
+            ),
+            "Str(\"default\") link must replace the unreachable catch-all"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "flatten_graph: switch link requires Signed/Bool llexitcase")]
+    fn flatten_graph_panics_on_none_exitcase_switch_link() {
+        // RPython `flatten.py:280` recognises ONLY `Str("default")` as
+        // the switch catch-all; `None` exitcase on a switch link is a
+        // walker non-orthodoxy.  After the strict
+        // `is_default_exitcase` change, a `None` link reaches
+        // `switch_llexitcase_key`, which fails loud on a non-
+        // Signed/Bool llexitcase.  The panic surfaces the malformed
+        // shape so the walker site producing `None` can be fixed
+        // (either to set `Str("default")` for true catch-alls, or to
+        // ensure both bool-branch links carry `Bool` `llexitcase` so
+        // the bool-branch path fires instead of the switch path).
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch_none_exitcase", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        // None exitcase + None llexitcase — the malformed shape.
+        let none_link = Link::new(
+            vec![Constant::signed(99).into()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![case_one, none_link]);
+
+        let mut ssarepr = SSARepr::new("int_switch_none_exitcase");
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
     }
 
     #[test]
@@ -4413,7 +4624,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("tuple_branch");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
@@ -4446,7 +4657,7 @@ mod tests {
             )
         });
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
@@ -4472,7 +4683,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
-        // Slice #48.18: a graph carrying one HLOp from each of the four
+        // a graph carrying one HLOp from each of the four
         // retired families must lower to the matching `residual_call_*`
         // Insn shape under `flatten_graph_with_lowering`.  Builds a
         // minimal start block with `add(lhs, rhs)` + `lt(lhs, rhs)` +
@@ -4524,6 +4735,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4606,16 +4818,12 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_lowering_byte_equivalent_across_blocks() {
-        // Slice #48.19: the `[phase4-flatten-graph]` probe runs the
-        // FULL `flatten_graph_with_lowering` driver end-to-end against
-        // a fresh SSARepr.  Production graphs span multiple blocks, so
-        // the per-family `(opname, fn_idx)` filter must survive the
+        // Pin that the per-family `(opname, fn_idx)` lowering survives the
         // GraphFlattener's `make_link` / `insert_exits` block boundary
-        // emission (Labels, terminators, link renamings) without
-        // dropping or reordering the retired-family residual_calls.
-        // This test pins that invariant: a 2-block graph with one
-        // BINARY_OP `add` in the start block and one COMPARE_OP `lt`
-        // in the second block lowers to a single
+        // emission (Labels, terminators, link renamings) without dropping
+        // or reordering the retired-family residual_calls.  A 2-block
+        // graph with one BINARY_OP `add` in the start block and one
+        // COMPARE_OP `lt` in the second block must lower to a single
         // `residual_call_ir_r` per block in start-then-next order.
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
@@ -4652,6 +4860,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4733,16 +4942,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "flatten_graph: unsupported exits shape for block with 2 exits")]
-    fn flatten_graph_with_lowering_2_exit_no_exitswitch_now_fails_loud() {
-        // The 2-exit-no-exitswitch shape was the W-4 self-loop fallback
-        // (`[w-fallback w4/1797]`), retired in commit `537e26bccba` along
-        // with the recognizer that walked both subtrees.  The follow-on
-        // arm in `insert_switch_exits` now panics fail-loud if a future
-        // walker regression reproduces the shape.  This test pins that
-        // contract: constructing the shape and feeding it to
-        // `flatten_graph_with_lowering` MUST panic with the documented
-        // message.
+    #[should_panic(expected = "flatten.py:282 insert_switch_exits invariant")]
+    fn flatten_graph_with_lowering_2_exit_no_exitswitch_panics() {
+        // `flatten.py:282-309 insert_switch_exits` is only entered for
+        // blocks that already carry a Variable exitswitch.  A 2-exit
+        // block with `exitswitch = None` is a malformed graph shape
+        // upstream would never produce; fail loud so the upstream
+        // contract is preserved (codex review parity revert).
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -4783,6 +4989,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4790,7 +4997,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_without_lowering_ctx_preserves_passthrough() {
-        // Slice #48.18: when `flatten_graph` (no ctx) sees a retired-
+        // when `flatten_graph` (no ctx) sees a retired-
         // family HLOp like `add`, the legacy passthrough must still
         // emit `Insn::op("add", ...)` — no silent rewrite via the
         // dispatcher.  This guards the "default GraphFlattener
@@ -4816,7 +5023,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("passthrough");
-        flatten_graph(
+        flatten_graph_with_closures(
             &graph,
             &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
@@ -4838,6 +5045,198 @@ mod tests {
         assert!(
             !has_residual_call,
             "legacy flatten_graph must NOT lower `add` to residual_call: {:?}",
+            ssarepr.insns
+        );
+    }
+
+    #[test]
+    fn canonical_flatten_graph_resolves_ovf_via_pre_resolved_exception_pointers() {
+        // Combined Phase-4 pipeline: a graph with an `_ovf` rewrite
+        // (canraise int_add_ovf with two exits → normal/overflow)
+        // lowered through canonical `flatten_graph(graph, regallocs,
+        // false, Some(&cpu))`.  The `handling_ovf=true` arm of
+        // `make_exception_link` reaches `cpu.rtyper.exceptiondata.
+        // get_standard_ll_exc_instance_by_class("OverflowError")` per
+        // flatten.py:166-170 — when the exceptiondata has been
+        // pre-resolved via `resolve_standard_exception_pointers`, the
+        // returned Constant carries `Signed(pointer)` with `Kind::Ref`
+        // (rtyped form) and `flatten_constant_operand` lowers it to
+        // `Operand::ConstRef(pointer)` directly, without a per-flatten
+        // `lower_constant` closure.
+        use crate::jit::cpu::Cpu;
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let except_etype = Variable::new(VariableId(3), Kind::Int);
+        let except_evalue = Variable::new(VariableId(4), Kind::Ref);
+
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("canonical_ovf_with_resolved", start.clone(), Some(res));
+
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(
+                "int_add_ovf",
+                vec![lhs.into(), rhs.into()],
+                Some(res.into()),
+                42,
+            ),
+        );
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+
+        let normal_link =
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref();
+        let mut ovf_link = Link::new(
+            vec![except_etype.into(), except_evalue.into()],
+            Some(graph.exceptblock.clone()),
+            None,
+        );
+        ovf_link.extravars(Some(except_etype), Some(except_evalue));
+        start.closeblock(vec![normal_link, ovf_link.into_ref()]);
+
+        let mut cpu = Cpu::new();
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xface_beef),
+                _ => None,
+            });
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
+
+        // handling_ovf=true emits `raise <ConstRef(pointer)>` per
+        // flatten.py:165-170; the pointer is the pre-resolved value.
+        let raise_args = ssarepr
+            .insns
+            .iter()
+            .find_map(|insn| match insn {
+                Insn::Op { opname, args, .. } if opname == "raise" => Some(args),
+                _ => None,
+            })
+            .expect("canonical flatten_graph handling_ovf=true must emit `raise <const>`");
+        assert_eq!(raise_args.len(), 1);
+        assert!(
+            matches!(raise_args[0], Operand::ConstRef(0xface_beef)),
+            "raise must carry the pre-resolved OverflowError pointer 0xface_beef \
+             (rtyped via resolve_standard_exception_pointers), got {:?}",
+            raise_args[0]
+        );
+    }
+
+    #[test]
+    fn canonical_flatten_graph_lowers_retired_family_via_cpu_lowering_ctx() {
+        // Production-shape pipeline: graph carries a BINARY_OP `add`
+        // HLOp; canonical `flatten_graph(graph, regallocs, false,
+        // Some(&cpu))` derives `LoweringContext` from
+        // `cpu.lowering_ctx` and lowers the HLOp via the dispatcher
+        // (`flatten_op_to_insn_with_lowering`) into the matching
+        // `residual_call_ir_r` Insn shape.  This pins the post-Phase-3
+        // pipeline equivalence between the walker's inline
+        // `build_binary_op_residual_call_ir_r_insn` push and the
+        // canonical entry's dispatcher-driven emission.
+        use crate::jit::cpu::Cpu;
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let add_res = Variable::new(VariableId(2), Kind::Ref);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("canonical_retired_family", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(add_res.into()), 0),
+        );
+        start.closeblock(vec![
+            Link::new(vec![add_res.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let cpu = Cpu::new();
+        *cpu.lowering_ctx.write().unwrap() = Some(LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+        });
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
+
+        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "residual_call_ir_r"
+                        && matches!(args.first(), Some(Operand::ConstInt(11)))
+            )
+        });
+        let has_raw_add = ssarepr
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "add"));
+        assert!(
+            has_binary_op_lowered,
+            "canonical flatten_graph with cpu.lowering_ctx must lower BINARY_OP \
+             `add` HLOp to residual_call_ir_r(fn_idx=11, ...): {:?}",
+            ssarepr.insns
+        );
+        assert!(
+            !has_raw_add,
+            "canonical flatten_graph must NOT passthrough `add` opname when \
+             LoweringContext is present: {:?}",
+            ssarepr.insns
+        );
+    }
+
+    #[test]
+    fn canonical_flatten_graph_lowers_rtyped_signed_ref_link_arg() {
+        // End-to-end pipeline: graph carrying an already-rtyped
+        // `Signed(0xfeed)/Ref` link arg (the post-rtype shape the
+        // canonical `flatten_graph(graph, regallocs, false, cpu=None)`
+        // entry expects) is lowered by `flatten_constant_operand` to
+        // `Operand::ConstRef(0xfeed)`, and `insert_renamings` emits
+        // a `ref_copy(ConstRef(0xfeed) -> Reg)` matching the
+        // returnblock inputarg's color.  Test fixtures construct
+        // post-rtype shapes directly; production callers route
+        // pre-rtype `Opaque(Ref)` through the closure-based
+        // `flatten_graph_with_lowering` path (a per-call
+        // `lower_constant` closure handles the resolution).
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("rtyped_canonical", start.clone(), None);
+        let signed_ovf = super::super::flow::Constant::new(
+            super::super::flow::ConstantValue::Signed(0xfeed),
+            Some(Kind::Ref),
+        );
+        start.closeblock(vec![
+            Link::new(
+                vec![signed_ovf.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, None);
+
+        let has_const_ref_feed = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::ConstRef(0xfeed)))
+            )
+        });
+        assert!(
+            has_const_ref_feed,
+            "canonical flatten_graph must lower rtyped Signed(0xfeed)/Ref to \
+             Operand::ConstRef(0xfeed): {:?}",
             ssarepr.insns
         );
     }
@@ -5088,8 +5487,12 @@ mod tests {
             Some(result.into()),
             0,
         );
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
 
         // Compare via Debug formatting — Insn does not derive Eq, but
         // the Debug output is structurally faithful for the variants
@@ -5476,7 +5879,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_binary_op_hlop() {
-        // Slice #48.17: the unified dispatcher must route a `add`
+        // the unified dispatcher must route a `add`
         // BINARY_OP HLOp through `lower_binary_op_hlop_to_insn` and
         // produce the same Insn shape the per-family helper produces
         // on its own.
@@ -5504,7 +5907,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_compare_op_hlop() {
-        // Slice #48.17: dispatcher routes `lt` through
+        // dispatcher routes `lt` through
         // `lower_compare_op_hlop_to_insn` even when binary_op /
         // truth / store_subscr fn indices are also set on the ctx.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
@@ -5531,7 +5934,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_bool_hlop() {
-        // Slice #48.17: dispatcher routes `bool(v) → r` through
+        // dispatcher routes `bool(v) → r` through
         // `lower_bool_hlop_to_insn`.  Different residual_call shape
         // (`_r_i` vs `_ir_r`) and different result Kind (Int vs Ref)
         // from BINARY_OP/COMPARE_OP, so this is non-trivial coverage.
@@ -5557,7 +5960,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_setitem_hlop() {
-        // Slice #48.17: dispatcher routes void-result `setitem(obj,
+        // dispatcher routes void-result `setitem(obj,
         // key, value)` through `lower_setitem_hlop_to_insn`.  The
         // void-result arm exercises the dispatcher's no-result path,
         // distinct from the value-producing arms above.
@@ -5590,7 +5993,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_falls_through_for_residual_call_op() {
-        // Slice #48.17: for opnames outside the four retired families
+        // for opnames outside the four retired families
         // (e.g. an already-lowered `residual_call_ir_r` SpaceOperation
         // as recorded by the factor-refactored families' graph
         // dual-write at codewriter.rs::record_residual_call_graph_op),
@@ -5628,8 +6031,12 @@ mod tests {
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("residual_call SpaceOperation must lower via dispatcher");
-        let direct = flatten_op_to_insn(&op, &mut get_register_b)
-            .expect("residual_call SpaceOperation must lower via passthrough");
+        let direct = flatten_op_to_insn(
+            &op,
+            &mut get_register_b,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower via passthrough");
         assert_eq!(format!("{dispatched:?}"), format!("{direct:?}"));
     }
 
@@ -5741,9 +6148,12 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
         let prod = build_load_const_fn_residual_call_ir_r_insn(9, 17, 4, 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -5873,9 +6283,12 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
         let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 7);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6101,9 +6514,12 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
         let prod = build_call_fn_residual_call_r_r_insn(33, 5, &[6, 7, 8], 9);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6227,9 +6643,12 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
         let prod = build_box_int_fn_residual_call_ir_r_insn(4, 42, 7);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6436,9 +6855,12 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual = flatten_op_to_insn(
+            &dual_op,
+            &mut get_register,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6649,5 +7071,351 @@ mod tests {
             }
             other => panic!("expected Insn::Op (Void), got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 1 — `_ovf` popline rewrite + handling_ovf=true reraise.
+    //
+    // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
+    //   * `make_bytecode_block` `_ovf` validity check (lines 120-125)
+    //   * `insert_exits` `_ovf` tail rewrite (lines 191-204) routed
+    //     through `flatten_ovf_canraise`.
+    //   * `make_exception_link` `handling_ovf=True` arm (lines 165-170)
+    //     emitting `raise <OverflowError const>` via the cpu/rtyper/
+    //     exceptiondata shim.
+    // ----------------------------------------------------------------
+
+    /// Build a canraise startblock containing a single overflow-checked
+    /// arithmetic op, then close it with `(normal, ovf [, catch_all])`
+    /// exits.  Returns `(graph, ssarepr)` after `flatten_graph` runs;
+    /// the test asserts on the recorded `ssarepr.insns` shape.
+    fn flatten_ovf_canraise_graph(
+        name: &str,
+        opname: &str,
+        with_catch_all: bool,
+        cpu: &super::super::cpu::Cpu,
+    ) -> SSARepr {
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let except_etype = Variable::new(VariableId(3), Kind::Int);
+        let except_evalue = Variable::new(VariableId(4), Kind::Ref);
+
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        // `make_return` for the normal path expects the returnblock
+        // input to be a single Variable; pass `res` as the return slot
+        // (will be renamed via the normal link).
+        let mut graph = FunctionGraph::new(name, start.clone(), Some(res));
+
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(opname, vec![lhs.into(), rhs.into()], Some(res.into()), 42),
+        );
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+
+        let normal_link =
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref();
+
+        let mut ovf_link = Link::new(
+            vec![except_etype.into(), except_evalue.into()],
+            Some(graph.exceptblock.clone()),
+            None,
+        );
+        ovf_link.extravars(Some(except_etype), Some(except_evalue));
+
+        let mut exits = vec![normal_link, ovf_link.into_ref()];
+        if with_catch_all {
+            let mut catch_all = Link::new(
+                vec![except_etype.into(), except_evalue.into()],
+                Some(graph.exceptblock.clone()),
+                None,
+            );
+            catch_all.extravars(Some(except_etype), Some(except_evalue));
+            exits.push(catch_all.into_ref());
+        }
+        start.closeblock(exits);
+
+        let mut ssarepr = SSARepr::new(name);
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+        };
+        flatten_graph_with_lowering(
+            &graph,
+            &mut ssarepr,
+            ctx,
+            Some(cpu),
+            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
+            |c| match (&c.value, c.kind) {
+                (ConstantValue::Opaque(opaque), Some(Kind::Ref)) => {
+                    // Test-side lowering: encode the OverflowError
+                    // marker as `ConstRef(0xFFFF_FFFF)` so the assertion
+                    // can recognize it without resolving the runtime
+                    // pointer.
+                    let _ = opaque;
+                    Operand::ConstRef(0xFFFF_FFFF)
+                }
+                _ => flatten_constant_operand(c),
+            },
+        );
+        ssarepr
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_rewrites_to_jump_if_ovf_two_exits() {
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
+        let ssarepr = flatten_ovf_canraise_graph("int_add_ovf_2exit", "int_add_ovf", false, &cpu);
+        // Expected shape after flatten_graph:
+        //   Label(startblock)
+        //   int_add_jump_if_ovf TLabel(ovf_link) %i0 %i1 -> %i2
+        //   <normal path: link renamings + ref_return>
+        //   Label(ovf_link)
+        //   raise ConstRef(OverflowError)
+        //   ---
+        let jump = ssarepr
+            .insns
+            .iter()
+            .find(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "int_add_jump_if_ovf"))
+            .expect("int_add_ovf must rewrite to int_add_jump_if_ovf per flatten.py:195");
+        match jump {
+            Insn::Op { args, result, .. } => {
+                // First arg is the TLabel for the overflow target.
+                assert!(matches!(args[0], Operand::TLabel(_)));
+                // Remaining args are the original lhs/rhs registers.
+                assert!(matches!(
+                    args[1],
+                    Operand::Register(Register {
+                        kind: Kind::Int,
+                        index: 0
+                    })
+                ));
+                assert!(matches!(
+                    args[2],
+                    Operand::Register(Register {
+                        kind: Kind::Int,
+                        index: 1
+                    })
+                ));
+                // Result is the original op's result Variable.
+                assert!(matches!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Int,
+                        index: 2
+                    })
+                ));
+            }
+            _ => unreachable!(),
+        }
+        // The handling_ovf=true arm of make_exception_link emits
+        // `raise ConstRef(OverflowError)` (see flatten.py:165-170).
+        let raise = ssarepr.insns.iter().find_map(|insn| match insn {
+            Insn::Op { opname, args, .. } if opname == "raise" => Some(args),
+            _ => None,
+        });
+        let raise_args =
+            raise.expect("flatten.py:166-170 handling_ovf=true must emit `raise <const>`");
+        assert_eq!(
+            raise_args.len(),
+            1,
+            "raise carries exactly one operand: the OverflowError instance"
+        );
+        assert!(matches!(raise_args[0], Operand::ConstRef(0xFFFF_FFFF)));
+        // The driver no longer emits `reraise` for the ovf direct-raise edge.
+        assert!(
+            !ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "reraise")),
+            "handling_ovf=true must NOT emit reraise (upstream replaces it with `raise <const>`)"
+        );
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_three_exits_emits_catch_all() {
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
+        let ssarepr = flatten_ovf_canraise_graph("int_mul_ovf_3exit", "int_mul_ovf", true, &cpu);
+        // Three-exit shape per flatten.py:201-203:
+        //   - exits[1]: handling_ovf=true → raise <const>
+        //   - exits[2]: handling_ovf=false → reraise (catch-all)
+        // Both should appear in the SSARepr.
+        let has_raise_const = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "raise" && matches!(args.first(), Some(Operand::ConstRef(_)))
+            )
+        });
+        let has_reraise = ssarepr
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "reraise"));
+        assert!(has_raise_const, "ovf direct edge must emit raise <const>");
+        assert!(has_reraise, "Exception catch-all must emit reraise");
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_uses_seven_char_prefix() {
+        // flatten.py:195 `opname[:7] + '_jump_if_ovf'` — verify the
+        // prefix transform for each of the standard upstream `_ovf` ops.
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
+        for (input, expected) in [
+            ("int_add_ovf", "int_add_jump_if_ovf"),
+            ("int_sub_ovf", "int_sub_jump_if_ovf"),
+            ("int_mul_ovf", "int_mul_jump_if_ovf"),
+        ] {
+            let ssarepr = flatten_ovf_canraise_graph(input, input, false, &cpu);
+            assert!(
+                ssarepr
+                    .insns
+                    .iter()
+                    .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == expected)),
+                "{input} must rewrite to {expected} per flatten.py:195"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_graph_canonical_four_arg_entry_works_without_lowering_ctx() {
+        // Phase 4 — `flatten.py:63-70` orthodox 4-arg entry.  No
+        // `lowering_ctx` parameter; `cpu=None` so dispatcher is
+        // disabled and pre-rtype HLOp opnames passthrough.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let retval = Variable::new(VariableId(99), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("orthodox4arg", start.clone(), Some(retval));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("loop_header", vec![Constant::signed(11).into()], None, 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![retval.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let mut regallocs =
+            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
+        assert_eq!(ssarepr.name, "orthodox4arg");
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "loop_header"))
+        );
+    }
+
+    #[test]
+    fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
+        // Phase 4 — `flatten.py:63-70` orthodox entry.
+        // Build a trivial portal-like graph with a single
+        // `loop_header` op (passthrough family — no LoweringContext
+        // arm needs to fire) and verify the canonical entry returns a
+        // populated `SSARepr` named after the graph.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let retval = Variable::new(VariableId(0), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("orthodox", start.clone(), Some(retval));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("loop_header", vec![Constant::signed(7).into()], None, 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![retval.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let mut regallocs =
+            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        // Use the canonical `flatten_graph(graph, regallocs,
+        // include_all_exc_links, cpu)` entry — the loop_header op is a
+        // passthrough family and needs no LoweringContext arm to fire.
+        let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
+        assert_eq!(ssarepr.name, "orthodox");
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "loop_header")),
+            "canonical entry must walk graph.startblock and emit the `loop_header` op"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "detected a block containing ovfcheck() but no OverflowError is caught"
+    )]
+    fn flatten_ovf_op_in_non_canraise_block_panics() {
+        // flatten.py:120-125 — `_ovf` op outside a 2-or-3-exit canraise
+        // block is illegal.  Build such a block and verify the
+        // `make_bytecode_block` validity check fires.
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let mut graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(
+                "int_add_ovf",
+                vec![lhs.into(), rhs.into()],
+                Some(res.into()),
+                0,
+            ),
+        );
+        // Close with a single normal link → returnblock; no canraise
+        // exitswitch → triggers the validity panic.
+        start.closeblock(vec![
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let mut ssarepr = SSARepr::new("ovf_no_catch");
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
+            flatten_constant_operand,
+        );
     }
 }

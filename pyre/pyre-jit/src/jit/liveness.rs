@@ -79,8 +79,19 @@ fn _compute_liveness_must_continue(
         let insn = ssarepr.insns[i].clone();
 
         // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
-        if let Insn::Label(label) = &insn {
-            let alive_at_point = label2alive.entry(label.name.clone()).or_default();
+        //
+        // Pyre's `Insn::PcAnchor { py_pc }` is the per-PC anchor variant
+        // synthesized by the walker; it shares Label's snapshot-and-merge
+        // semantic, keyed on `pc_label_name(py_pc)` so the resulting
+        // `label2alive` entry matches what `TLabel("pc{N}")` branches
+        // resolve to.
+        let label_name = match &insn {
+            Insn::Label(label) => Some(label.name.clone()),
+            Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
+            _ => None,
+        };
+        if let Some(name) = label_name {
+            let alive_at_point = label2alive.entry(name).or_default();
             // `liveness.py:38` `prevlength = len(alive_at_point)`.
             let prevlength = alive_at_point.len();
             // `liveness.py:39` `alive_at_point.update(alive)`.
@@ -134,14 +145,6 @@ fn _compute_liveness_must_continue(
             continue;
         }
 
-        // PRE-EXISTING-ADAPTATION: `Insn::PcAnchor(py_pc)` carries no
-        // operands or liveness side effect (see `flatten.rs::Insn::PcAnchor`).
-        // Skip without affecting `alive` so the SSARepr-position marker
-        // is a no-op for the RPython `liveness.py:19-78` walk.
-        if let Insn::PcAnchor(_) = &insn {
-            continue;
-        }
-
         // Regular instruction (`liveness.py:59-78`).
         //
         // `liveness.py:59-65` pre-strips the `-> result` suffix: the
@@ -150,8 +153,8 @@ fn _compute_liveness_must_continue(
         // consuming operands.
         let (args, result) = match &insn {
             Insn::Op { args, result, .. } => (args.as_slice(), result),
-            // `Label`, `-live-` (via `live_args`), `Unreachable`, and
-            // `PcAnchor` were handled above.
+            // `Label`, `-live-` (via `live_args`), and `Unreachable`
+            // were handled above.
             _ => unreachable!("non-Op insn after branches"),
         };
         if let Some(reg) = result {
@@ -272,11 +275,25 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         let mut lives: Vec<Insn> = vec![insn];
 
         // `liveness.py:97-106` inner loop.
+        //
+        // Task #227.5 item 6: pyre emits `Label("pc{N}")` at every
+        // Python PC entry as a per-PC anchor (pyre-specific
+        // construct; upstream RPython has no per-PC Labels — only
+        // block-entry Labels).  `remove_repeated_live` must NOT
+        // merge `-live-` runs across `Label("pc{N}")` boundaries —
+        // otherwise consecutive per-PC live markers collapse into
+        // one and `live_marker_indices_by_pc` loses the per-PC
+        // mapping.  Other Labels (catch_landing, link-target) keep
+        // merging per upstream `liveness.py:99-100`.  This carveout
+        // is the necessary structural adaptation for pyre's per-PC
+        // Label model.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
                 lives.push(next);
                 i += 1;
+            } else if matches!(&next, Insn::PcAnchor { .. }) {
+                break;
             } else if matches!(next, Insn::Label(_)) {
                 labels.push(next);
                 i += 1;

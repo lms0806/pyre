@@ -11,7 +11,7 @@
 //! convenience accessor `CodeWriter::cpu(&self)` so the upstream
 //! attribute access pattern still works.
 //!
-//! PRE-EXISTING-ADAPTATION: pyre's "cpu" is much smaller than RPython's
+//! Note: pyre's "cpu" is much smaller than RPython's
 //! `LLGraphCPU` — there is no `calldescrof`, no `setup_descrs`, no
 //! vector-extension support, and no GC integration at this layer.
 //! All those concerns either live in `pyre_jit_trace::state` (descrs)
@@ -62,6 +62,30 @@ pub struct Cpu {
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
     /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
     pub set_current_exception_fn: extern "C" fn(i64),
+    /// `rpython/jit/backend/llgraph/runner.py:LLGraphCPU.rtyper` —
+    /// upstream `flatten_graph` reaches `cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` at
+    /// `flatten.py:166-170` (the `handling_ovf=True` arm of
+    /// `make_exception_link`).  Pyre's rtyper shim
+    /// ([`super::exceptiondata::Rtyper`]) exposes only that attribute
+    /// chain; other rtyper machinery is intentionally absent because
+    /// pyre operates on the flowspace graph directly, without a
+    /// typed-low-level rewrite.
+    pub rtyper: super::exceptiondata::Rtyper,
+    /// Retired-family fn-idx pool — pyre-specific extension carried
+    /// on `Cpu` so the canonical `flatten_graph(graph, regallocs,
+    /// _include_all_exc_links, cpu)` entry can derive the
+    /// dispatcher's `LoweringContext` from `cpu` alone (matching
+    /// upstream's "cpu carries everything flatten needs" contract).
+    /// Each `Option<u16>` is populated by `CodeWriter::transform_
+    /// graph_to_jitcode` from `descrs.intern_int_method_index`.
+    /// **Note**: upstream's `cpu` does not carry
+    /// these because upstream's rtyper rewrites the graph to post-
+    /// rtype shape before `flatten_graph` runs, so the dispatcher has
+    /// no upstream analog.  Phase 5 retires these fields once pyre's
+    /// walker stops emitting pre-rtype HLOps in favour of post-rtype
+    /// residual_call SpaceOperations on the graph.
+    pub lowering_ctx: std::sync::RwLock<Option<super::flatten::LoweringContext>>,
 }
 
 impl Cpu {
@@ -69,6 +93,40 @@ impl Cpu {
     /// `crate::call_jit`. Matches the implicit `cpu = LLGraphCPU(...)`
     /// constructor in `warmspot.py:243` for the standard JIT.
     pub fn new() -> Self {
+        let mut rtyper = super::exceptiondata::Rtyper::new();
+        // Install a **lazy** resolver for standard exception instance
+        // pointers — RPython's `RPythonTyper.specialize` ->
+        // `ExceptionData.finish` invokes `get_standard_ll_exc_instance(
+        // rtyper, clsdef)` at rtyper construction time
+        // (`rpython/rtyper/exceptiondata.py:34-38`), which calls
+        // `r_inst.get_reusable_prebuilt_instance()` and returns the
+        // **prebuilt INSTANCE** pointer (not the class pointer).
+        // Downstream `get_standard_ll_exc_instance_by_class` wraps
+        // that pointer in a `Constant` and `flatten.py:165-170` emits
+        // it directly as the operand of `raise/r`; feeding the
+        // **class** pointer here would be semantically wrong
+        // (`raise CLASS` is not the same as `raise INSTANCE`).
+        //
+        // Pyre's analog is `pyre_interpreter::lookup_exc_instance`
+        // which materialises a process-global singleton
+        // `W_ExceptionObject` per `ExcKind` (see
+        // `pyre_object::excobject::standard_exc_instance`).  We install
+        // the resolver here but defer the per-`ExcKind` singleton
+        // allocation to the first
+        // `get_standard_ll_exc_instance_by_class` lookup; under the
+        // current walker-driven pipeline the canonical
+        // `flatten_graph` `_ovf` direct-raise rewrite (the sole
+        // consumer of this table in production) never fires, so the
+        // singletons stay unallocated.  The deferral matters because
+        // the cranelift backend's trace compilation is sensitive to
+        // heap layout — eagerly allocating 16 `W_ExceptionObject`
+        // singletons at `Cpu::new` time shifts subsequent heap
+        // addresses enough to consistently push raise_catch_loop
+        // tracing into a slow recompile path.
+        rtyper.exceptiondata.set_lazy_resolver(|name| {
+            let ptr = pyre_interpreter::lookup_exc_instance(name)?;
+            Some(ptr as i64)
+        });
         Self {
             call_fn: crate::call_jit::bh_call_fn,
             call_fn_0: crate::call_jit::bh_call_fn_0,
@@ -91,6 +149,8 @@ impl Cpu {
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_fn,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
+            rtyper,
+            lowering_ctx: std::sync::RwLock::new(None),
         }
     }
 }
