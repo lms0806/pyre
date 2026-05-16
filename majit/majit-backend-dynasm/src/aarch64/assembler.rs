@@ -208,7 +208,7 @@ pub struct AssemblerARM64<'a> {
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// Fail descriptors built during assembly.
-    fail_descrs: Vec<Arc<DynasmFailDescr>>,
+    fail_descrs: Vec<majit_ir::DescrRef>,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -281,13 +281,17 @@ pub struct AssemblerARM64<'a> {
     /// at CALL_ASSEMBLER emission time so we can store its pointer to
     /// jf_force_descr before the call. Consumed by the subsequent
     /// GUARD_NOT_FORCED guard emission.
-    pending_force_descr: Option<Arc<DynasmFailDescr>>,
-    /// `compile.py:665-674` + `pyjitpl.py:2283`: snapshot of the six
-    /// descr pointers attached to the owning cpu instance.  Matches
-    /// RPython backend code that reads `self.cpu.done_with_this_frame_descr_*`
-    /// / `self.cpu.exit_frame_with_exception_descr_ref` /
-    /// `self.cpu.propagate_exception_descr` at every FINISH /
-    /// CALL_ASSEMBLER emission site.
+    pending_force_descr: Option<majit_ir::DescrRef>,
+    /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
+    /// snapshot of the six descr pointers attached to the owning cpu
+    /// instance.  Retained for constructor signature stability across
+    /// runner / call_assembler callsites — emission helpers
+    /// (`done_with_this_frame_descr_ptr_for_type`,
+    /// `exit_frame_with_exception_descr_ref_ptr`,
+    /// `propagate_exception_descr_ptr`) read live from `cpu_handle`
+    /// instead so the raw ptr baked into `JF_DESCR_OFS` and the Arc
+    /// stamped into `meta_descr` come from the same snapshot.
+    #[allow(dead_code)]
     attached_descrs: crate::guard::AttachedDescrPtrs,
     /// `Arc` clone of the owning cpu's attachment handle.  Its heap
     /// address is baked into the CALL_ASSEMBLER helper call site as a
@@ -306,7 +310,7 @@ struct GuardToken {
     /// write_pending_failure_recoveries to the recovery stub.
     fail_label: DynamicLabel,
     /// The fail descriptor for this guard.
-    fail_descr: Arc<DynasmFailDescr>,
+    fail_descr: majit_ir::DescrRef,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -325,7 +329,7 @@ pub struct CompiledCode {
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
-    pub fail_descrs: Box<[Arc<DynasmFailDescr>]>,
+    pub fail_descrs: Box<[majit_ir::DescrRef]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
@@ -434,15 +438,42 @@ impl<'a> AssemblerARM64<'a> {
 
     /// `compile.py:665-674` parity: attach the six metainterp descrs on
     /// the emission side.  Mirrors `self.cpu.done_with_this_frame_descr_*`
-    /// reads in `rpython/jit/backend/aarch64/assembler.py`.
+    /// reads in `rpython/jit/backend/aarch64/assembler.py`.  Reads from
+    /// the live `cpu_handle` snapshot so the raw pointer baked into
+    /// `JF_DESCR_OFS` and the Arc returned by
+    /// `done_with_this_frame_descr_arc_for_type` resolve to the same
+    /// metainterp singleton.
     fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> i64 {
-        self.attached_descrs
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
             .done_with_this_frame_descr_ptr_for_type(tp) as i64
+    }
+
+    /// `compile.py:665-674` `make_and_attach_done_descrs` Arc lookup —
+    /// returns the metainterp `DoneWithThisFrameDescr*` Arc the
+    /// optimizer attached for the given result type.  Used to stamp
+    /// `meta_descr` on backend FINISH descrs so trait forwarding routes
+    /// `is_finish` / `fail_arg_types` through the metainterp class
+    /// hierarchy (`compile.py:624 final_descr=True`).
+    fn done_with_this_frame_descr_arc_for_type(&self, tp: Type) -> Option<majit_ir::DescrRef> {
+        let attachments = self.cpu_handle.read().unwrap();
+        match tp {
+            Type::Void => attachments.done_with_this_frame_descr_void.clone(),
+            Type::Int => attachments.done_with_this_frame_descr_int.clone(),
+            Type::Ref => attachments.done_with_this_frame_descr_ref.clone(),
+            Type::Float => attachments.done_with_this_frame_descr_float.clone(),
+        }
     }
 
     /// `compile.py:658` parity: `self.cpu.exit_frame_with_exception_descr_ref`.
     fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
-        self.attached_descrs.exit_frame_with_exception_descr_ref as i64
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
+            .exit_frame_with_exception_descr_ref as i64
     }
 
     /// `pyjitpl.py:2283` parity: `self.cpu.propagate_exception_descr`.
@@ -450,7 +481,11 @@ impl<'a> AssemblerARM64<'a> {
     /// `OpCode::CheckMemoryError` (opassembler.py:258
     /// `emit_op_check_memory_error` → `propagate_memoryerror_if_reg_is_null`).
     fn propagate_exception_descr_ptr(&self) -> i64 {
-        self.attached_descrs.propagate_exception_descr as i64
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
+            .propagate_exception_descr as i64
     }
 
     // ----------------------------------------------------------------
@@ -1362,10 +1397,9 @@ impl<'a> AssemblerARM64<'a> {
         // build catches the position/fail_index mismatch eagerly rather
         // than dispatching to the wrong descr at runtime.
         assert!(
-            self.fail_descrs
-                .iter()
-                .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+            self.fail_descrs.iter().enumerate().all(|(i, d)| d
+                .as_fail_descr()
+                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -1394,7 +1428,7 @@ impl<'a> AssemblerARM64<'a> {
     /// The bridge sees live registers exactly as they were at guard time.
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
-        descr: &DynasmFailDescr,
+        descr: &dyn majit_ir::FailDescr,
         inputargs: &[InputArg],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
@@ -1402,7 +1436,7 @@ impl<'a> AssemblerARM64<'a> {
         let float_regs = all_float_regs();
         let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
         let mut input_i = 0usize;
-        for &pos in &descr.rd_locs {
+        for &pos in descr.rd_locs() {
             if pos == 0xFFFF {
                 continue;
             }
@@ -1492,10 +1526,9 @@ impl<'a> AssemblerARM64<'a> {
         // build catches the position/fail_index mismatch eagerly rather
         // than dispatching to the wrong descr at runtime.
         assert!(
-            self.fail_descrs
-                .iter()
-                .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+            self.fail_descrs.iter().enumerate().all(|(i, d)| d
+                .as_fail_descr()
+                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -2560,12 +2593,23 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py:185` skips these — not a `ResumeDescr`.
-                let descr = Arc::new(DynasmFailDescr::new(
+                // `compile.py:665-674` link to the metainterp class-distinct
+                // singleton so trait forwarding routes is_finish /
+                // is_exit_frame_with_exception through the upstream class.
+                let meta_descr = if is_exit_exc {
+                    self.cpu_handle
+                        .read()
+                        .unwrap()
+                        .exit_frame_with_exception_descr_ref
+                        .clone()
+                } else {
+                    self.done_with_this_frame_descr_arc_for_type(result_type)
+                };
+                let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
                     fail_index,
                     self.trace_id,
                     fail_arg_types.clone(),
-                    true,  // is_finish
-                    false, // is_resume_guard
+                    meta_descr,
                 ));
 
                 // Store result to jf_frame[0]
@@ -2596,7 +2640,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
 
                 self._call_footer();
-                self.fail_descrs.push(descr);
+                self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -3353,18 +3397,50 @@ impl<'a> AssemblerARM64<'a> {
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
         // that was written to jf_force_descr.
-        let descr = if let Some(pre) = self.pending_force_descr.take() {
+        // Stamp the per-trace fail_index and trace_id onto the metainterp
+        // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
+        // routing the writes through the trait at codegen time lets readers
+        // consume the canonical metainterp identity before
+        // `build_guard_metadata` (`compile.rs:232`) re-stamps.
+        if let Some(d) = op.descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(self.trace_id);
+                }
+            }
+        }
+        let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
-        } else {
+        } else if let Some(d) = op.descr.clone() {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
-            Arc::new(DynasmFailDescr::new(
-                fail_index,
-                self.trace_id,
-                fail_arg_types,
-                false, // is_finish
-                true,  // is_resume_guard
-            ))
+            // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
+            // directly; per-trace fail_index / trace_id were stamped
+            // above.  Refresh the descr's `fail_arg_types` slot when the
+            // inferred list disagrees: `store_final_boxes_in_guard` is
+            // supposed to keep it in sync, but test scaffolds and earlier
+            // optimizer paths can leave it empty.  The GC map below
+            // (`guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), ...)`)
+            // reads back through the descr, so a stale empty list would
+            // under-report `Type::Ref` slots and miss live roots.
+            if let Some(fd) = d.as_fail_descr() {
+                if fd.fail_arg_types() != fail_arg_types.as_slice() {
+                    fd.set_fail_arg_types(fail_arg_types);
+                }
+            }
+            d
+        } else {
+            // Test scaffold: tests synthesise guard ops without op.descr.
+            // Mint a fresh metainterp ResumeGuardDescr to carry the
+            // codegen-time identity (fail_index / trace_id / fail_arg_types).
+            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            if let Some(fd) = fresh.as_fail_descr() {
+                fd.set_fail_index_per_trace(fail_index);
+                fd.set_trace_id(self.trace_id);
+            }
+            fresh
         };
+        let descr_fd = descr.as_fail_descr().expect("guard descr is FailDescr");
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token: fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?} faillocs={:?}",
@@ -3372,39 +3448,19 @@ impl<'a> AssemblerARM64<'a> {
                 op_index,
                 op.opcode,
                 op.fail_args.as_ref(),
-                descr.fail_arg_types(),
+                descr_fd.fail_arg_types(),
                 faillocs
             );
         }
 
-        // Convert regalloc faillocs to absolute jf_frame slots for the
-        // helper/runner. This matches the fixed-slot-inclusive coordinate
-        // system used by get_fp_offset() and compiled_loop_token._ll_initial_locs
-        // in RPython.
+        // `llsupport/assembler.py:248-276 store_info_on_descr` parity.
+        // PyPy encodes each fail-arg location as a USHORT in `rd_locs`;
+        // pyre allocates a const-store slot for `Loc::Immed` and writes
+        // the slot into rd_locs so the deopt path reads it via PyPy's
+        // stack-position decode (`llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
-        let fail_arg_locs: Vec<Option<usize>> = faillocs
-            .iter()
-            .map(|fl| match fl {
-                Some(Loc::Reg(r)) => {
-                    if r.is_xmm {
-                        float_reg_position(*r)
-                    } else {
-                        core_reg_position(*r)
-                    }
-                }
-                Some(Loc::Frame(f)) => Some(f.position + JITFRAME_FIXED_SIZE),
-                Some(Loc::Immed(i)) => {
-                    // Allocate a slot for this constant in the save area.
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    Some(slot)
-                }
-                _ => None,
-            })
-            .collect();
         let rd_locs: Vec<u16> = faillocs
             .iter()
             .map(|fl| match fl {
@@ -3423,54 +3479,35 @@ impl<'a> AssemblerARM64<'a> {
                     .position(|reg| *reg == *r)
                     .expect("rd_locs: register not in gen_regs")
                     as u16,
-                Some(Loc::Immed(_)) => 0xFFFF,
+                Some(Loc::Immed(i)) => {
+                    let slot = self.frame_depth;
+                    self.frame_depth += 1;
+                    const_stores.push((slot, i.value));
+                    slot as u16
+                }
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
-        // Build identity recovery_layout (Cranelift identity_recovery_layout parity).
-        // `jitcode_index: 0` is a placeholder: every guard is later patched
-        // via `compile::patch_backend_guard_recovery_layouts_for_trace`
-        // (compile.rs:1596) with a resume_layout-derived layout whose
-        // jitcode_index originates from `Snapshot::single_frame`.
-        let recovery_layout = {
-            let slot_types = descr.fail_arg_types();
-            ExitRecoveryLayout {
-                vable_array: vec![],
-                vref_array: vec![],
-                frames: vec![ExitFrameLayout {
-                    trace_id: Some(self.trace_id),
-                    header_pc: Some(self.header_pc),
-                    source_guard: None,
-                    pc: self.header_pc,
-                    jitcode_index: 0,
-                    slots: (0..slot_types.len())
-                        .map(ExitValueSourceLayout::ExitValue)
-                        .collect(),
-                    slot_types: Some(slot_types.to_vec()),
-                }],
-                virtual_layouts: vec![],
-                pending_field_layouts: vec![],
-            }
-        };
-        unsafe {
-            let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
-            descr_mut.fail_arg_locs = fail_arg_locs;
-            descr_mut.rd_locs = rd_locs;
-            descr_mut.source_op_index = Some(op_index);
-            *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
-            // Unified-Descr Port Epic Session 5a: capture the metainterp
-            // ResumeGuardDescr Arc as a back-pointer.  rd_numb/rd_consts/
-            // rd_virtuals/rd_pendingfields readers (Session 5b) forward
-            // through this Arc.
-            descr_mut.meta_descr = op.descr.clone();
-        }
+        // Slice KK/NN: source_op_index uses SOURCE_OP_INDEX_TABLE (kept
+        // pending source_op_index removal); recovery_layout caching is
+        // removed — the metainterp's `StoredExitLayout.recovery_layout`
+        // (populated by `patch_backend_guard_recovery_layouts_for_trace`)
+        // is the canonical store per `resume.py:450-488`.
+        crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
+        // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
+        // — write through the trait accessor so the metainterp
+        // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
+        // canonical copy when present.  Must follow the `meta_descr`
+        // stamp above for the forward to reach the meta side.
+        descr_fd.set_rd_locs(rd_locs);
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
-                fail_index, &descr.fail_arg_locs, &descr.rd_locs
+                "[dynasm] guard-token-slots: fail_index={} rd_locs={:?}",
+                fail_index,
+                descr_fd.rd_locs()
             );
         }
-        let gcmap = self.guard_gcmap_from_faillocs(descr.fail_arg_types(), faillocs);
+        let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);
 
         self.pending_guard_tokens.push(GuardToken {
             fail_label,
@@ -3481,7 +3518,7 @@ impl<'a> AssemblerARM64<'a> {
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
         }
-        self.fail_descrs.push(descr);
+        self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
     }
 
     // ----------------------------------------------------------------
@@ -3496,7 +3533,7 @@ impl<'a> AssemblerARM64<'a> {
         &mut self,
         guard_token: GuardToken,
         save_regs_label: DynamicLabel,
-    ) -> (Arc<DynasmFailDescr>, usize) {
+    ) -> (majit_ir::DescrRef, usize) {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
@@ -3507,7 +3544,7 @@ impl<'a> AssemblerARM64<'a> {
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
 
-        let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as i64;
+        let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as *const () as i64;
         self.emit_mov_imm64(0, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
             ; str x0, [x29, JF_DESCR_OFS as u32]
@@ -3526,7 +3563,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:1005 write_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
-    fn write_pending_failure_recoveries(&mut self) -> Vec<(Arc<DynasmFailDescr>, usize)> {
+    fn write_pending_failure_recoveries(&mut self) -> Vec<(majit_ir::DescrRef, usize)> {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.
         let save_regs_label = self.mc.new_dynamic_label();
@@ -3565,11 +3602,13 @@ impl<'a> AssemblerARM64<'a> {
     /// buffer-relative offsets to absolute addresses after finalize.
     fn patch_pending_failure_recoveries(
         rawstart: usize,
-        stub_offsets: &[(Arc<DynasmFailDescr>, usize)],
+        stub_offsets: &[(majit_ir::DescrRef, usize)],
     ) {
         for (descr, stub_offset) in stub_offsets {
             let abs_addr = rawstart + stub_offset;
-            descr.set_adr_jump_offset(abs_addr);
+            if let Some(fd) = descr.as_fail_descr() {
+                fd.set_adr_jump_offset(abs_addr);
+            }
         }
     }
 
@@ -3585,7 +3624,7 @@ impl<'a> AssemblerARM64<'a> {
     /// stub with "MOV r11, bridge_addr; JMP r11" (x64) or "BL imm26"
     /// (aarch64), matching rpython/jit/backend/aarch64/assembler.py
     /// patch_trace().
-    pub fn patch_jump_for_descr(descr: &DynasmFailDescr, adr_new_target: usize) {
+    pub fn patch_jump_for_descr(descr: &dyn majit_ir::FailDescr, adr_new_target: usize) {
         let stub_addr = descr.adr_jump_offset();
         assert!(stub_addr != 0, "guard already patched");
 
@@ -4055,14 +4094,37 @@ impl<'a> AssemblerARM64<'a> {
         // when the guard is actually emitted in append_guard_token_with_faillocs.
         let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
         // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
-        let descr = Arc::new(DynasmFailDescr::new(
-            fail_index,
-            self.trace_id,
-            fail_arg_types,
-            false, // is_finish
-            true,  // is_resume_guard
-        ));
-        let descr_ptr = Arc::as_ptr(&descr) as i64;
+        // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
+        // here so `append_guard_token_with_faillocs` does not need a second
+        // pass through `unsafe { Arc::as_ptr as *mut }`.
+        if let Some(d) = next_op.descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(self.trace_id);
+                }
+            }
+        }
+        let descr: majit_ir::DescrRef = if let Some(d) = next_op.descr.clone() {
+            // Same staleness guard as the main guard-emission path: keep
+            // descriptor `fail_arg_types` in sync with the inferred list
+            // so downstream GC-map / rd_locs readers see the right Ref
+            // slots.
+            if let Some(fd) = d.as_fail_descr() {
+                if fd.fail_arg_types() != fail_arg_types.as_slice() {
+                    fd.set_fail_arg_types(fail_arg_types);
+                }
+            }
+            d
+        } else {
+            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            if let Some(fd) = fresh.as_fail_descr() {
+                fd.set_fail_index_per_trace(fail_index);
+                fd.set_trace_id(self.trace_id);
+            }
+            fresh
+        };
+        let descr_ptr = Arc::as_ptr(&descr) as *const () as i64;
         self.pending_force_descr = Some(descr);
 
         // x86/assembler.py:2210-2222: store descr to jf_force_descr,
@@ -4284,13 +4346,6 @@ impl<'a> AssemblerARM64<'a> {
         };
         // compile.py:618-669 parity: use type-specific global singleton.
         // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
-        let descr = Arc::new(DynasmFailDescr::new(
-            fail_index,
-            self.trace_id,
-            fail_arg_types.clone(),
-            true,  // is_finish
-            false, // is_resume_guard
-        ));
         // Finish ops write the type-appropriate singleton pointer to jf_descr
         // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
         let result_type = if fail_arg_types.is_empty() {
@@ -4299,6 +4354,12 @@ impl<'a> AssemblerARM64<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
+        let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
+            fail_index,
+            self.trace_id,
+            fail_arg_types.clone(),
+            self.done_with_this_frame_descr_arc_for_type(result_type),
+        ));
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
@@ -4343,7 +4404,7 @@ impl<'a> AssemblerARM64<'a> {
         // Emit epilogue (return jf_ptr).
         self._call_footer();
 
-        self.fail_descrs.push(descr);
+        self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
     }
 
     // ----------------------------------------------------------------

@@ -4220,14 +4220,12 @@ fn materialize_bridge_virtual(
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             fieldnums,
             kind,
-            descr_index,
             arraydescr,
             ..
         }
         | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             fieldnums,
             kind,
-            descr_index,
             arraydescr,
             ..
         } => {
@@ -4236,7 +4234,7 @@ fn materialize_bridge_virtual(
                 majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
             );
             let kind = *kind;
-            let descr_index = *descr_index;
+            let descr_index = arraydescr.as_ref().map_or(0, |d| d.index());
             let length = fieldnums.len();
             let len_ref = ctx.const_int(length as i64);
             // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
@@ -4293,7 +4291,6 @@ fn materialize_bridge_virtual(
         // resume.py:747-760 VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
-            descr_index,
             fielddescrs,
             size,
             base_size,
@@ -4303,8 +4300,19 @@ fn materialize_bridge_virtual(
         } => {
             let len_ref = ctx.const_int(*size as i64);
             // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
+            //
+            // When `arraydescr` is missing from the resume payload (older
+            // serialization, test scaffolds), synthesize one keyed by
+            // shape (`base_size`, `item_size`, `size`) so distinct array
+            // shapes get distinct descriptor identities.  The previous
+            // `arraydescr.as_ref().map_or(0, ...)` always evaluated `0`
+            // inside the `None` branch and aliased every fallback descr
+            // to a single registry slot.
             let array_descr = arraydescr.clone().unwrap_or_else(|| {
-                crate::descr::make_struct_array_descr(*descr_index, *base_size, *item_size)
+                let shape_idx = (*base_size as u32).wrapping_mul(0x0001_0001)
+                    ^ (*item_size as u32).wrapping_mul(0x0100_0001)
+                    ^ (*size as u32);
+                crate::descr::make_struct_array_descr(shape_idx, *base_size, *item_size)
             });
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
@@ -4507,8 +4515,8 @@ fn materialize_bridge_virtual(
         //     str1box = self.decode_box(str1num, REF)
         //     str2box = self.decode_box(str2num, REF)
         //     execute_and_record_varargs(CALL_R, [ConstInt(func), str1box, str2box], calldescr)
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
@@ -4555,8 +4563,8 @@ fn materialize_bridge_virtual(
         //     stopbox = execute_and_record(INT_ADD, startbox, lengthbox)
         //     execute_and_record_varargs(CALL_R,
         //         [ConstInt(func), strbox, startbox, stopbox], calldescr)
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
@@ -7530,7 +7538,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: crate::descr::W_FLOAT_GC_TYPE_ID,
-            descr_index: descr.index(),
             fields: vec![(
                 crate::descr::float_floatval_descr().index(),
                 MaterializedValue::Value(value.to_bits() as i64),
@@ -7564,7 +7571,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: 0,
-            descr_index: descr.index(),
             fields: vec![(
                 crate::descr::bool_boolval_descr().index(),
                 MaterializedValue::Value(1),
@@ -7598,7 +7604,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: 0,
-            descr_index: descr.index(),
             fields: vec![
                 (
                     crate::descr::range_iter_current_descr().index(),
@@ -7686,7 +7691,6 @@ mod tests {
         let list_virtual = MaterializedVirtual::Obj {
             descr: None,
             type_id: 0,
-            descr_index: 0,
             fields: vec![
                 (
                     crate::descr::ob_type_descr().index(),

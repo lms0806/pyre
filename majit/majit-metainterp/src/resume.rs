@@ -555,126 +555,28 @@ struct DecodedResumeLayout {
     pending_fields: Vec<PendingFieldInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeValueKind {
-    FailArg,
-    Constant,
-    Virtual,
-    Uninitialized,
-    Unavailable,
-}
+// ResumeValueKind / ResumeValueLayoutSummary moved to
+// majit-ir::resumedata (Phase C-1 cascade) so backend codepaths can
+// reference the resume-value tag discriminator + summary without a
+// metainterp dependency.
+pub use majit_ir::resumedata::{ResumeValueKind, ResumeValueLayoutSummary};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumeValueLayoutSummary {
-    pub kind: ResumeValueKind,
-    pub fail_arg_index: usize,
-    pub raw_fail_arg_position: Option<usize>,
-    /// RPython parity: `Const.value` raw bits (getint/getref_base/getfloatstorage
-    /// all project to `i64`).
-    pub constant: Option<i64>,
-    /// RPython parity: `Const.type` — paired with `constant` so the summary
-    /// round-trips back into a typed `ResumeValueSource::Constant(Const)`.
-    pub constant_type: Option<Type>,
-    pub virtual_index: Option<usize>,
-}
+// ResumeFrameLayoutSummary moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeFrameLayoutSummary;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumeFrameLayoutSummary {
-    pub trace_id: Option<u64>,
-    pub header_pc: Option<u64>,
-    pub source_guard: Option<(u64, u32)>,
-    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
-    pub jitcode_index: i32,
-    pub pc: u64,
-    pub slot_sources: Vec<ResumeValueKind>,
-    pub slot_layouts: Vec<ResumeValueLayoutSummary>,
-    pub slot_types: Option<Vec<Type>>,
-}
+// ResumeVirtualKind moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeVirtualKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeVirtualKind {
-    Object,
-    Struct,
-    Array,
-    ArrayStruct,
-    RawBuffer,
-    /// resume.py:763 VStrPlainInfo — virtual plain string.
-    StrPlain,
-    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
-    StrConcat,
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
-    StrSlice,
-    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
-    UniPlain,
-    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
-    UniConcat,
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
-    UniSlice,
-}
+// ResumeVirtualLayoutSummary moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeVirtualLayoutSummary;
 
-#[derive(Debug, Clone)]
-pub enum ResumeVirtualLayoutSummary {
-    Object {
-        /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
-        descr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        /// info.py:318 _known_class — vtable pointer.
-        known_class: Option<i64>,
-        fields: Vec<(u32, ResumeValueLayoutSummary)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    Struct {
-        /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
-        typedescr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        fields: Vec<(u32, ResumeValueLayoutSummary)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:643-684 AbstractVArrayInfo
-    Array {
-        /// resume.py:646: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
-        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
-        clear: bool,
-        items: Vec<ResumeValueLayoutSummary>,
-    },
-    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
-    ArrayStruct {
-        /// resume.py:739: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
-        /// resume.py:740: self.fielddescrs
-        fielddescrs: Vec<majit_ir::DescrRef>,
-        element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
-    },
-    RawBuffer {
-        /// resume.py:694: self.func
-        func: i64,
-        size: usize,
-        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
-        offsets: Vec<i64>,
-        /// resume.py:697: self.descrs
-        descrs: Vec<majit_ir::ArrayDescrInfo>,
-        /// resume.py:693: fieldnums (decoded)
-        values: Vec<ResumeValueLayoutSummary>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingFieldLayoutSummary {
-    pub descr_index: u32,
-    pub item_index: Option<usize>,
-    pub is_array_item: bool,
-    pub target_kind: ResumeValueKind,
-    pub value_kind: ResumeValueKind,
-    pub target: ResumeValueLayoutSummary,
-    pub value: ResumeValueLayoutSummary,
-}
+// PendingFieldLayoutSummary moved to majit-ir::resumedata along with
+// opt_descr_arc_ptr_eq helper (Phase C-1 cascade); re-exported for
+// caller compatibility.
+pub use majit_ir::resumedata::{PendingFieldLayoutSummary, opt_descr_arc_ptr_eq};
 
 #[derive(Debug, Clone)]
 pub struct ResumeLayoutSummary {
@@ -691,161 +593,87 @@ pub struct ResumeLayoutSummary {
     pub const_pool_size: usize,
 }
 
-impl ResumeValueLayoutSummary {
-    pub(crate) fn raw_fail_arg_position(&self) -> usize {
-        if let Some(position) = self.raw_fail_arg_position {
-            return position;
-        }
-        self.fail_arg_index
-    }
+// ResumeValueLayoutSummary inherent impls moved to
+// majit-backend::resume_value (Phase C-1 cascade).  The conversion
+// methods (raw_fail_arg_position, to_resume_source, to_exit_source)
+// are available through the ResumeValueLayoutSummaryExt trait
+// re-exported above.
 
-    fn to_resume_source(&self) -> ResumeValueSource {
-        match self.kind {
-            ResumeValueKind::FailArg => ResumeValueSource::FailArg(self.raw_fail_arg_position()),
-            ResumeValueKind::Constant => {
-                let raw = self.constant.expect("missing constant value");
-                // Constant kind requires both raw and type to be set; the
-                // .expect() above already enforces raw, mirror it for type.
-                let tp = self.constant_type.expect("missing constant type");
-                ResumeValueSource::Constant(majit_ir::Const::from_raw_i64(raw, tp))
-            }
-            ResumeValueKind::Virtual => {
-                ResumeValueSource::Virtual(self.virtual_index.expect("missing virtual index"))
-            }
-            ResumeValueKind::Uninitialized => ResumeValueSource::Uninitialized,
-            ResumeValueKind::Unavailable => ResumeValueSource::Unavailable,
-        }
-    }
-
-    fn to_exit_source(&self, virtual_offset: usize) -> ExitValueSourceLayout {
-        match self.kind {
-            ResumeValueKind::FailArg => {
-                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position())
-            }
-            ResumeValueKind::Constant => {
-                ExitValueSourceLayout::Constant(self.constant.expect("missing constant value"))
-            }
-            ResumeValueKind::Virtual => ExitValueSourceLayout::Virtual(
-                self.virtual_index.expect("missing virtual index") + virtual_offset,
-            ),
-            ResumeValueKind::Uninitialized => ExitValueSourceLayout::Uninitialized,
-            ResumeValueKind::Unavailable => ExitValueSourceLayout::Unavailable,
-        }
-    }
-}
-
-impl ResumeFrameLayoutSummary {
-    fn to_frame_info(&self) -> FrameInfo {
-        FrameInfo {
-            jitcode_index: self.jitcode_index,
-            pc: self.pc,
-            slot_map: self
-                .slot_layouts
-                .iter()
-                .map(|slot| slot.to_resume_source())
-                .collect(),
-        }
-    }
-
-    fn to_exit_frame_layout(&self, virtual_offset: usize) -> ExitFrameLayout {
-        ExitFrameLayout {
-            trace_id: self.trace_id,
-            header_pc: self.header_pc,
-            source_guard: self.source_guard,
-            pc: self.pc,
-            jitcode_index: self.jitcode_index,
-            slots: self
-                .slot_layouts
-                .iter()
-                .map(|slot| slot.to_exit_source(virtual_offset))
-                .collect(),
-            slot_types: self.slot_types.clone(),
-        }
-    }
-
-    /// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
-    ///
-    /// Each `ExitValueSourceLayout` slot is converted to the corresponding
-    /// `ResumeValueLayoutSummary`, preserving slot types when present.
-    pub fn from_exit_frame_layout(exit_frame: &ExitFrameLayout) -> Self {
-        let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
-            .slots
+// ResumeFrameLayoutSummary inherent impls extracted as free functions
+// (cross-crate orphan rule after the type moved to majit-ir::resumedata).
+fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> FrameInfo {
+    FrameInfo {
+        jitcode_index: layout.jitcode_index,
+        pc: layout.pc,
+        slot_map: layout
+            .slot_layouts
             .iter()
-            .map(ResumeValueLayoutSummary::from_exit_value_source)
-            .collect();
-        let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
-
-        Self {
-            trace_id: exit_frame.trace_id,
-            header_pc: exit_frame.header_pc,
-            source_guard: exit_frame.source_guard,
-            jitcode_index: exit_frame.jitcode_index,
-            pc: exit_frame.pc,
-            slot_sources,
-            slot_layouts,
-            slot_types: exit_frame.slot_types.clone(),
-        }
+            .map(|slot| slot.to_resume_source())
+            .collect(),
     }
 }
 
-impl ResumeValueLayoutSummary {
-    /// Build a `ResumeValueLayoutSummary` from a backend-origin `ExitValueSourceLayout`.
-    ///
-    /// Backend-origin constants are always `Int` (numeric or tagged) — the
-    /// backend layer is untyped, so we default the Const type to Int here.
-    pub fn from_exit_value_source(source: &ExitValueSourceLayout) -> Self {
-        match source {
-            ExitValueSourceLayout::ExitValue(index) => Self {
-                kind: ResumeValueKind::FailArg,
-                fail_arg_index: *index,
-                raw_fail_arg_position: Some(*index),
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Constant(value) => Self {
-                kind: ResumeValueKind::Constant,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: Some(*value),
-                constant_type: Some(Type::Int),
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Virtual(index) => Self {
-                kind: ResumeValueKind::Virtual,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: Some(*index),
-            },
-            ExitValueSourceLayout::Uninitialized => Self {
-                kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Unavailable => Self {
-                kind: ResumeValueKind::Unavailable,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-        }
+fn resume_frame_layout_to_exit_frame_layout(
+    layout: &ResumeFrameLayoutSummary,
+    virtual_offset: usize,
+) -> ExitFrameLayout {
+    ExitFrameLayout {
+        trace_id: layout.trace_id,
+        header_pc: layout.header_pc,
+        source_guard: layout.source_guard,
+        pc: layout.pc,
+        jitcode_index: layout.jitcode_index,
+        slots: layout
+            .slot_layouts
+            .iter()
+            .map(|slot| slot.to_exit_source(virtual_offset))
+            .collect(),
+        slot_types: layout.slot_types.clone(),
     }
 }
 
-impl ResumeVirtualLayoutSummary {
-    fn to_virtual_info(&self) -> VirtualInfo {
-        match self {
+/// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
+///
+/// Each `ExitValueSourceLayout` slot is converted to the corresponding
+/// `ResumeValueLayoutSummary`, preserving slot types when present.
+/// Free function — `ResumeFrameLayoutSummary` lives in `majit-ir`
+/// (orphan rule prevents inherent impl outside of that crate).
+pub fn resume_frame_layout_from_exit_frame_layout(
+    exit_frame: &ExitFrameLayout,
+) -> ResumeFrameLayoutSummary {
+    let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
+        .slots
+        .iter()
+        .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
+        .collect();
+    let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
+
+    ResumeFrameLayoutSummary {
+        trace_id: exit_frame.trace_id,
+        header_pc: exit_frame.header_pc,
+        source_guard: exit_frame.source_guard,
+        jitcode_index: exit_frame.jitcode_index,
+        pc: exit_frame.pc,
+        slot_sources,
+        slot_layouts,
+        slot_types: exit_frame.slot_types.clone(),
+    }
+}
+
+// `from_exit_value_source` constructor moved to
+// majit-backend::resume_value as
+// `resume_value_layout_summary_from_exit_value_source` (cross-crate
+// orphan rule prevents inherent impl on the foreign type).
+// `to_virtual_info` / `to_exit_virtual_layout` extracted as free
+// functions after `ResumeVirtualLayoutSummary` moved to
+// `majit-ir::resumedata` (cross-crate orphan rule).
+fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) -> VirtualInfo {
+    let s = layout;
+    {
+        match s {
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 fielddescrs,
@@ -853,7 +681,6 @@ impl ResumeVirtualLayoutSummary {
             } => VirtualInfo::VirtualObj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -865,14 +692,12 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.to_resume_source()))
@@ -882,12 +707,10 @@ impl ResumeVirtualLayoutSummary {
             },
             ResumeVirtualLayoutSummary::Array {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
             } => VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: *clear,
                 items: items
                     .iter()
@@ -896,13 +719,11 @@ impl ResumeVirtualLayoutSummary {
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr,
-                descr_index,
                 fielddescrs,
                 element_fields,
                 ..
             } => VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
@@ -930,15 +751,62 @@ impl ResumeVirtualLayoutSummary {
                     .map(|source| source.to_resume_source())
                     .collect(),
             },
+            ResumeVirtualLayoutSummary::RawSlice { offset, parent } => VirtualInfo::VRawSlice {
+                offset: *offset,
+                parent: parent.to_resume_source(),
+            },
+            ResumeVirtualLayoutSummary::StrPlain { chars } => VirtualInfo::VStrPlain {
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_resume_source())
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::StrConcat { left, right } => VirtualInfo::VStrConcat {
+                left: Box::new(left.to_resume_source()),
+                right: Box::new(right.to_resume_source()),
+            },
+            ResumeVirtualLayoutSummary::StrSlice {
+                source,
+                start,
+                length,
+            } => VirtualInfo::VStrSlice {
+                source: Box::new(source.to_resume_source()),
+                start: Box::new(start.to_resume_source()),
+                length: Box::new(length.to_resume_source()),
+            },
+            ResumeVirtualLayoutSummary::UniPlain { chars } => VirtualInfo::VUniPlain {
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_resume_source())
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::UniConcat { left, right } => VirtualInfo::VUniConcat {
+                left: Box::new(left.to_resume_source()),
+                right: Box::new(right.to_resume_source()),
+            },
+            ResumeVirtualLayoutSummary::UniSlice {
+                source,
+                start,
+                length,
+            } => VirtualInfo::VUniSlice {
+                source: Box::new(source.to_resume_source()),
+                start: Box::new(start.to_resume_source()),
+                length: Box::new(length.to_resume_source()),
+            },
         }
     }
+}
 
-    fn to_exit_virtual_layout(&self, virtual_offset: usize) -> ExitVirtualLayout {
-        match self {
+fn resume_virtual_layout_to_exit_virtual_layout(
+    layout: &ResumeVirtualLayoutSummary,
+    virtual_offset: usize,
+) -> ExitVirtualLayout {
+    let s = layout;
+    {
+        match s {
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 fielddescrs,
@@ -946,7 +814,6 @@ impl ResumeVirtualLayoutSummary {
             } => ExitVirtualLayout::Object {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -959,14 +826,12 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => ExitVirtualLayout::Struct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(field_descr, source)| {
@@ -979,11 +844,10 @@ impl ResumeVirtualLayoutSummary {
             },
             ResumeVirtualLayoutSummary::Array {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
             } => ExitVirtualLayout::Array {
-                descr_index: *descr_index,
+                arraydescr: arraydescr.clone(),
                 clear: *clear,
                 // resume.py:656-670: element type from arraydescr
                 kind: array_kind_from_descr(arraydescr.as_ref()),
@@ -994,11 +858,9 @@ impl ResumeVirtualLayoutSummary {
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr,
-                descr_index,
                 fielddescrs,
                 element_fields,
             } => ExitVirtualLayout::ArrayStruct {
-                descr_index: *descr_index,
                 arraydescr: arraydescr.clone(),
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
@@ -1029,31 +891,92 @@ impl ResumeVirtualLayoutSummary {
                     .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
+            ResumeVirtualLayoutSummary::RawSlice { offset, parent } => {
+                ExitVirtualLayout::RawSlice {
+                    offset: *offset,
+                    base: parent.to_exit_source(virtual_offset),
+                }
+            }
+            ResumeVirtualLayoutSummary::StrPlain { chars } => ExitVirtualLayout::StrPlain {
+                is_unicode: false,
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_exit_source(virtual_offset))
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::UniPlain { chars } => ExitVirtualLayout::StrPlain {
+                is_unicode: true,
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_exit_source(virtual_offset))
+                    .collect(),
+            },
+            // resume.py:781 VStrConcatInfo / resume.py:836 VUniConcatInfo
+            // — funcptr/calldescr resolved at materialization via
+            // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT /
+            // OS_UNI_CONCAT)` (resume.py:1467-1468 / 1494-1495), so the
+            // exit layout carries no funcptr.
+            ResumeVirtualLayoutSummary::StrConcat { left, right } => ExitVirtualLayout::StrConcat {
+                is_unicode: false,
+                left: left.to_exit_source(virtual_offset),
+                right: right.to_exit_source(virtual_offset),
+            },
+            ResumeVirtualLayoutSummary::UniConcat { left, right } => ExitVirtualLayout::StrConcat {
+                is_unicode: true,
+                left: left.to_exit_source(virtual_offset),
+                right: right.to_exit_source(virtual_offset),
+            },
+            // resume.py:801 VStrSliceInfo / resume.py:856 VUniSliceInfo
+            // — funcptr/calldescr resolved via callinfocollection at
+            // materialization (resume.py:1477-1478 / 1504-1505).
+            ResumeVirtualLayoutSummary::StrSlice {
+                source,
+                start,
+                length,
+            } => ExitVirtualLayout::StrSlice {
+                is_unicode: false,
+                str_src: source.to_exit_source(virtual_offset),
+                start: start.to_exit_source(virtual_offset),
+                length: length.to_exit_source(virtual_offset),
+            },
+            ResumeVirtualLayoutSummary::UniSlice {
+                source,
+                start,
+                length,
+            } => ExitVirtualLayout::StrSlice {
+                is_unicode: true,
+                str_src: source.to_exit_source(virtual_offset),
+                start: start.to_exit_source(virtual_offset),
+                length: length.to_exit_source(virtual_offset),
+            },
         }
     }
 }
 
-impl PendingFieldLayoutSummary {
-    fn to_pending_field_info(&self) -> PendingFieldInfo {
-        PendingFieldInfo {
-            descr_index: self.descr_index,
-            target: self.target.to_resume_source(),
-            value: self.value.to_resume_source(),
-            item_index: self.item_index,
-        }
+// PendingFieldLayoutSummary inherent impls extracted as free
+// functions (cross-crate orphan rule after the type moved to
+// majit-ir::resumedata).
+fn pending_field_layout_to_pending_field_info(
+    layout: &PendingFieldLayoutSummary,
+) -> PendingFieldInfo {
+    PendingFieldInfo {
+        descr: layout.descr.clone(),
+        target: layout.target.to_resume_source(),
+        value: layout.value.to_resume_source(),
+        item_index: layout.item_index,
     }
+}
 
-    fn to_exit_pending_field_layout(&self, virtual_offset: usize) -> ExitPendingFieldLayout {
-        ExitPendingFieldLayout {
-            descr_index: self.descr_index,
-            item_index: self.item_index,
-            is_array_item: self.is_array_item,
-            target: self.target.to_exit_source(virtual_offset),
-            value: self.value.to_exit_source(virtual_offset),
-            field_offset: 0,
-            field_size: 0,
-            field_type: majit_ir::Type::Int,
-        }
+fn pending_field_layout_to_exit_pending_field_layout(
+    layout: &PendingFieldLayoutSummary,
+    virtual_offset: usize,
+) -> ExitPendingFieldLayout {
+    ExitPendingFieldLayout {
+        descr: layout.descr.clone(),
+        item_index: layout.item_index,
+        is_array_item: layout.is_array_item,
+        target: layout.target.to_exit_source(virtual_offset),
+        value: layout.value.to_exit_source(virtual_offset),
     }
 }
 
@@ -1065,17 +988,17 @@ impl ResumeLayoutSummary {
             frames: self
                 .frame_layouts
                 .iter()
-                .map(|frame| frame.to_frame_info())
+                .map(resume_frame_layout_to_frame_info)
                 .collect(),
             virtuals: self
                 .virtual_layouts
                 .iter()
-                .map(|virt| virt.to_virtual_info())
+                .map(resume_virtual_layout_to_virtual_info)
                 .collect(),
             pending_fields: self
                 .pending_field_layouts
                 .iter()
-                .map(|pending| pending.to_pending_field_info())
+                .map(pending_field_layout_to_pending_field_info)
                 .collect(),
         }
     }
@@ -1125,18 +1048,16 @@ impl ResumeLayoutSummary {
         frames.extend(
             self.frame_layouts
                 .iter()
-                .map(|frame| frame.to_exit_frame_layout(virtual_offset)),
+                .map(|frame| resume_frame_layout_to_exit_frame_layout(frame, virtual_offset)),
         );
         virtual_layouts.extend(
             self.virtual_layouts
                 .iter()
-                .map(|virt| virt.to_exit_virtual_layout(virtual_offset)),
+                .map(|virt| resume_virtual_layout_to_exit_virtual_layout(virt, virtual_offset)),
         );
-        pending_field_layouts.extend(
-            self.pending_field_layouts
-                .iter()
-                .map(|pending| pending.to_exit_pending_field_layout(virtual_offset)),
-        );
+        pending_field_layouts.extend(self.pending_field_layouts.iter().map(|pending| {
+            pending_field_layout_to_exit_pending_field_layout(pending, virtual_offset)
+        }));
 
         ExitRecoveryLayout {
             vable_array: Vec::new(),
@@ -1258,454 +1179,38 @@ fn decode_u64(value: i64) -> u64 {
     value as u64
 }
 
-/// Describes how to reconstruct a single frame in the interpreter's call stack.
-///
-/// Each frame has a bytecode position (pc) and a set of named/indexed slots
-/// that map to tagged resume sources.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrameInfo {
-    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
-    pub jitcode_index: i32,
-    /// Bytecode position (program counter) for this frame.
-    pub pc: u64,
-    /// Mapping from slot index to a tagged resume source.
-    pub slot_map: Vec<FrameSlotSource>,
-}
+// FrameInfo moved to majit-backend::resume_value (Phase C-1 cascade).
+// Re-exported so existing crate::resume::FrameInfo references stay
+// resolvable.
+pub use majit_backend::FrameInfo;
 
-/// Complete resume data for a guard exit point.
-///
-/// Contains enough information to reconstruct the full interpreter state
-/// from the values stored in a DeadFrame.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResumeData {
-    /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
-    pub vable_array: Vec<ResumeValueSource>,
-    /// resume.py: snapshot_iter.vref_array / virtualref_boxes
-    pub vref_array: Vec<ResumeValueSource>,
-    /// Stack of frames, outermost first.
-    /// For a simple non-inlined trace, this has exactly one entry.
-    pub frames: Vec<FrameInfo>,
-    /// Virtual object descriptions for virtualized state.
-    /// Each entry maps a fail_arg position to a virtual object that needs
-    /// to be materialized when resuming.
-    pub virtuals: Vec<VirtualInfo>,
-    /// Deferred heap writes that must be replayed when resuming.
-    ///
-    /// Mirrors RPython's `rd_pendingfields`, which applies writes after
-    /// virtuals and boxes have been reconstructed.
-    pub pending_fields: Vec<PendingFieldInfo>,
-}
+// ResumeData moved to majit-backend::resume_value (Phase C-1 cascade);
+// re-exported for caller compatibility.  Inherent impl methods are
+// provided by ResumeDataExt trait declared below.
+pub use majit_backend::ResumeData;
 
-/// Tagged source for a value that must be reconstructed on resume.
-///
-/// This is the majit equivalent of the tagged numbering used by
-/// `rpython/jit/metainterp/resume.py`. Each `Constant` entry carries a
-/// full `majit_ir::Const` (Int/Float/Ref) so the encoder's `getconst`
-/// dispatch (resume.py:157-188) can route through the shared pool
-/// (`ResumeDataLoopMemo.consts`) without losing type information.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResumeValueSource {
-    /// Value comes from the deadframe fail-args array.
-    FailArg(usize),
-    /// Value is a compile-time constant — carries the Const so that the
-    /// type survives encoding, matching RPython's `Const` object.
-    Constant(majit_ir::Const),
-    /// Value is a virtual object that must be materialized on resume.
-    Virtual(usize),
-    /// Value exists conceptually but is still uninitialized.
-    ///
-    /// Mirrors RPython's `UNINITIALIZED` tag used for string/unicode content.
-    Uninitialized,
-    /// Slot is not live at this guard.
-    Unavailable,
-}
+// ResumeValueSource moved to majit-backend::resume_value (Phase C-1
+// cascade) so the resume-data type chain can live in a
+// backend-accessible crate.  Re-export so existing
+// crate::resume::ResumeValueSource references stay resolvable.
+pub use majit_backend::ResumeValueLayoutSummaryExt;
+pub use majit_backend::ResumeValueSource;
 
-impl ResumeValueSource {
-    pub fn kind(&self) -> ResumeValueKind {
-        match self {
-            ResumeValueSource::FailArg(_) => ResumeValueKind::FailArg,
-            ResumeValueSource::Constant(_) => ResumeValueKind::Constant,
-            ResumeValueSource::Virtual(_) => ResumeValueKind::Virtual,
-            ResumeValueSource::Uninitialized => ResumeValueKind::Uninitialized,
-            ResumeValueSource::Unavailable => ResumeValueKind::Unavailable,
-        }
-    }
+// FrameSlotSource type alias re-exported from majit-backend
+// (Phase C-1 cascade) alongside FrameInfo.
+pub use majit_backend::FrameSlotSource;
 
-    pub fn layout_summary(&self) -> ResumeValueLayoutSummary {
-        match self {
-            ResumeValueSource::FailArg(index) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::FailArg,
-                fail_arg_index: *index,
-                raw_fail_arg_position: Some(*index),
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ResumeValueSource::Constant(c) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Constant,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: Some(c.as_raw_i64()),
-                constant_type: Some(c.get_type()),
-                virtual_index: None,
-            },
-            ResumeValueSource::Virtual(index) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Virtual,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: Some(*index),
-            },
-            ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ResumeValueSource::Unavailable => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Unavailable,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-        }
-    }
-}
+// VirtualInfo moved to majit-backend::resume_value (Phase C-1
+// cascade) along with its PartialEq + first impl block
+// (field_sources / kind / layout_summary).  The second impl block
+// (allocate / is_about_raw, line ~5577) stays in metainterp since it
+// depends on ResumeDataDirectReader + BlackholeAllocator which are
+// metainterp-specific.  Re-exported here for caller compatibility.
+pub use majit_backend::VirtualInfo;
 
-/// Source for a resumed frame slot.
-pub type FrameSlotSource = ResumeValueSource;
-
-/// Description of a virtual object that needs materialization on resume.
-///
-/// Mirrors RPython's AbstractVirtualInfo hierarchy:
-/// - VirtualInfo (NEW_WITH_VTABLE)
-/// - VStructInfo (NEW / plain struct)
-/// - VArrayInfoClear / VArrayInfoNotClear (NEW_ARRAY)
-/// - VArrayStructInfo (array of structs with interior fields)
-/// - VRawBufferInfo (raw memory buffer)
-#[derive(Debug, Clone)]
-pub enum VirtualInfo {
-    /// resume.py:612 VirtualInfo(descr, fielddescrs).
-    VirtualObj {
-        /// resume.py:615 self.descr — live SizeDescr.
-        descr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        /// info.py:318 _known_class — vtable pointer.
-        known_class: Option<i64>,
-        fields: Vec<(u32, VirtualFieldSource)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
-    VStruct {
-        /// resume.py:631 self.typedescr — the full SizeDescr.
-        typedescr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        fields: Vec<(u32, VirtualFieldSource)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:643-684 AbstractVArrayInfo (from NEW_ARRAY).
-    VArray {
-        /// resume.py:646: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
-        /// resume.py:680-683: VArrayInfoClear.clear / VArrayInfoNotClear.clear
-        clear: bool,
-        /// Element values.
-        items: Vec<VirtualFieldSource>,
-    },
-    /// resume.py:736 VArrayStructInfo (from arrays with interior field access).
-    VArrayStruct {
-        /// resume.py:739: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
-        /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects
-        /// for setinteriorfield dispatch.
-        fielddescrs: Vec<majit_ir::DescrRef>,
-        /// Per-element fields: outer Vec = elements, inner Vec = (field_index, source).
-        element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
-    },
-    /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
-    VRawBuffer {
-        /// resume.py:694: self.func — raw malloc function pointer.
-        func: i64,
-        /// Size of the buffer in bytes.
-        size: usize,
-        /// resume.py:695: self.offsets — byte offsets for each stored
-        /// value. Signed to match rawbuffer.py:14.
-        offsets: Vec<i64>,
-        /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
-        descrs: Vec<majit_ir::ArrayDescrInfo>,
-        /// resume.py:693: fieldnums — per-entry source (decoded from tagged fieldnums).
-        values: Vec<VirtualFieldSource>,
-    },
-    /// resume.py: VRawSliceInfo — a slice into a virtual raw buffer.
-    VRawSlice {
-        /// Offset from the parent raw buffer.
-        offset: i64,
-        /// Source of the parent buffer.
-        parent: VirtualFieldSource,
-    },
-    /// resume.py:763 VStrPlainInfo — virtual string (known characters).
-    VStrPlain {
-        /// Character values (as OpRef sources).
-        chars: Vec<VirtualFieldSource>,
-    },
-    /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
-    VStrConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
-    VStrSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
-    /// resume.py:817 VUniPlainInfo — virtual unicode string.
-    VUniPlain { chars: Vec<VirtualFieldSource> },
-    /// resume.py:836 VUniConcatInfo — virtual unicode concat.
-    VUniConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
-    VUniSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
-}
-
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
-impl PartialEq for VirtualInfo {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                VirtualInfo::VirtualObj {
-                    descr: None,
-                    type_id: a1,
-                    descr_index: a2,
-                    fields: a3,
-                    fielddescrs: a4,
-                    descr_size: a5,
-                    ..
-                },
-                VirtualInfo::VirtualObj {
-                    descr: None,
-                    type_id: b1,
-                    descr_index: b2,
-                    fields: b3,
-                    fielddescrs: b4,
-                    descr_size: b5,
-                    ..
-                },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
-            (
-                VirtualInfo::VStruct {
-                    type_id: a1,
-                    descr_index: a2,
-                    fields: a3,
-                    fielddescrs: a4,
-                    descr_size: a5,
-                    ..
-                },
-                VirtualInfo::VStruct {
-                    type_id: b1,
-                    descr_index: b2,
-                    fields: b3,
-                    fielddescrs: b4,
-                    descr_size: b5,
-                    ..
-                },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
-            (
-                VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: a1,
-                    clear: a_clear,
-                    items: a2,
-                },
-                VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: b1,
-                    clear: b_clear,
-                    items: b2,
-                },
-            ) => a1 == b1 && a_clear == b_clear && a2 == b2,
-            _ => false,
-        }
-    }
-}
-impl Eq for VirtualInfo {}
-
-impl VirtualInfo {
-    /// Iterate over all field sources in this virtual.
-    /// resume.py: visitor_walk_recursive walks all box references in a virtual.
-    pub fn field_sources(&self) -> Vec<&VirtualFieldSource> {
-        match self {
-            VirtualInfo::VirtualObj { fields, .. } | VirtualInfo::VStruct { fields, .. } => {
-                fields.iter().map(|(_, src)| src).collect()
-            }
-            VirtualInfo::VArray { items, .. } => items.iter().collect(),
-            VirtualInfo::VArrayStruct { element_fields, .. } => element_fields
-                .iter()
-                .flat_map(|el| el.iter().map(|(_, src)| src))
-                .collect(),
-            VirtualInfo::VRawBuffer { values, .. } => values.iter().collect(),
-            VirtualInfo::VRawSlice { parent, .. } => vec![parent],
-            VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
-                chars.iter().collect()
-            }
-            VirtualInfo::VStrConcat { left, right } | VirtualInfo::VUniConcat { left, right } => {
-                vec![left.as_ref(), right.as_ref()]
-            }
-            VirtualInfo::VStrSlice {
-                source,
-                start,
-                length,
-            }
-            | VirtualInfo::VUniSlice {
-                source,
-                start,
-                length,
-            } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
-        }
-    }
-
-    pub fn kind(&self) -> ResumeVirtualKind {
-        match self {
-            VirtualInfo::VirtualObj { .. } => ResumeVirtualKind::Object,
-            VirtualInfo::VStruct { .. } => ResumeVirtualKind::Struct,
-            VirtualInfo::VArray { .. } => ResumeVirtualKind::Array,
-            VirtualInfo::VArrayStruct { .. } => ResumeVirtualKind::ArrayStruct,
-            VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. } => {
-                ResumeVirtualKind::RawBuffer
-            }
-            VirtualInfo::VStrPlain { .. } => ResumeVirtualKind::StrPlain,
-            VirtualInfo::VStrConcat { .. } => ResumeVirtualKind::StrConcat,
-            VirtualInfo::VStrSlice { .. } => ResumeVirtualKind::StrSlice,
-            VirtualInfo::VUniPlain { .. } => ResumeVirtualKind::UniPlain,
-            VirtualInfo::VUniConcat { .. } => ResumeVirtualKind::UniConcat,
-            VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::UniSlice,
-        }
-    }
-
-    pub fn layout_summary(&self) -> ResumeVirtualLayoutSummary {
-        match self {
-            VirtualInfo::VirtualObj {
-                descr,
-                type_id,
-                descr_index,
-                known_class,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ResumeVirtualLayoutSummary::Object {
-                descr: descr.clone(),
-                type_id: *type_id,
-                descr_index: *descr_index,
-                known_class: *known_class,
-                fields: fields
-                    .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary()))
-                    .collect(),
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            VirtualInfo::VStruct {
-                typedescr,
-                type_id,
-                descr_index,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ResumeVirtualLayoutSummary::Struct {
-                typedescr: typedescr.clone(),
-                type_id: *type_id,
-                descr_index: *descr_index,
-                fields: fields
-                    .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary()))
-                    .collect(),
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            VirtualInfo::VArray {
-                arraydescr,
-                descr_index,
-                clear,
-                items,
-            } => ResumeVirtualLayoutSummary::Array {
-                arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
-                clear: *clear,
-                items: items.iter().map(|source| source.layout_summary()).collect(),
-            },
-            VirtualInfo::VArrayStruct {
-                arraydescr,
-                descr_index,
-                fielddescrs,
-                element_fields,
-            } => ResumeVirtualLayoutSummary::ArrayStruct {
-                arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
-                fielddescrs: fielddescrs.clone(),
-                element_fields: element_fields
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(field_descr, source)| (*field_descr, source.layout_summary()))
-                            .collect()
-                    })
-                    .collect(),
-            },
-            VirtualInfo::VRawBuffer {
-                func,
-                size,
-                offsets,
-                descrs,
-                values,
-            } => ResumeVirtualLayoutSummary::RawBuffer {
-                func: *func,
-                size: *size,
-                offsets: offsets.clone(),
-                descrs: descrs.clone(),
-                values: values.iter().map(|src| src.layout_summary()).collect(),
-            },
-            // String/unicode virtual infos — represented as structs
-            // with synthetic field indices for reconstruction.
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
-                typedescr: None,
-                type_id: 0,
-                descr_index: 0,
-                fields: vec![],
-                fielddescrs: vec![],
-                descr_size: 0,
-            },
-        }
-    }
-}
-
-/// Source of a virtual object's field value.
-pub type VirtualFieldSource = ResumeValueSource;
+// VirtualFieldSource type alias re-exported from majit-backend
+// (Phase C-1 cascade), same as FrameSlotSource.
+pub use majit_backend::VirtualFieldSource;
 
 /// Convert a tagged fieldnum (i16, resume.py encoding) to a VirtualFieldSource.
 ///
@@ -1765,7 +1270,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             type_id,
-            descr_index,
             known_class,
             fielddescrs,
             fieldnums,
@@ -1779,7 +1283,6 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields,
                 fielddescrs: fielddescrs.clone(),
@@ -1789,7 +1292,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
             type_id,
-            descr_index,
             fielddescrs,
             fieldnums,
             descr_size,
@@ -1802,7 +1304,6 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields,
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -1810,7 +1311,6 @@ pub fn rd_virtual_to_virtual_info(
         }
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             arraydescr,
-            descr_index,
             fieldnums,
             ..
         } => {
@@ -1820,14 +1320,12 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: true,
                 items,
             }
         }
         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             arraydescr,
-            descr_index,
             fieldnums,
             ..
         } => {
@@ -1837,14 +1335,12 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: false,
                 items,
             }
         }
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
-            descr_index,
             size,
             fielddescrs: rd_fielddescrs,
             fieldnums,
@@ -1868,7 +1364,6 @@ pub fn rd_virtual_to_virtual_info(
             }
             VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 fielddescrs: rd_fielddescrs.clone(),
                 element_fields,
             }
@@ -1951,7 +1446,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
             descr: None,
             type_id: 0,
-            descr_index: 0,
             known_class: None,
             fields: vec![],
             fielddescrs: vec![],
@@ -1960,38 +1454,21 @@ pub fn rd_virtual_to_virtual_info(
     }
 }
 
-/// Deferred heap write to replay during resume.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingFieldInfo {
-    /// Descriptor index identifying the target field or array descriptor.
-    pub descr_index: u32,
-    /// Source of the object/array pointer to update.
-    pub target: ResumeValueSource,
-    /// Source of the value to write.
-    pub value: ResumeValueSource,
-    /// Array item index. `None` means a plain field write.
-    pub item_index: Option<usize>,
-}
-
-impl PendingFieldInfo {
-    pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
-        PendingFieldLayoutSummary {
-            descr_index: self.descr_index,
-            item_index: self.item_index,
-            is_array_item: self.item_index.is_some(),
-            target_kind: self.target.kind(),
-            value_kind: self.value.kind(),
-            target: self.target.layout_summary(),
-            value: self.value.layout_summary(),
-        }
-    }
-}
+// PendingFieldInfo moved to majit-backend::resume_value (Phase C-1
+// cascade) along with its PartialEq and layout_summary impl.
+// Re-exported for caller compatibility.
+pub use majit_backend::PendingFieldInfo;
 
 /// Concrete pending heap write reconstructed from resume data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `resume.py:1000-1007 _prepare_pendingfields` parity — RPython
+/// hands the live `descr` Arc into `setfield` / `setarrayitem` and
+/// they dispatch via `descr.is_pointer_field()` /
+/// `descr.is_array_of_pointers()` etc.
+#[derive(Debug, Clone)]
 pub struct ResolvedPendingFieldWrite {
-    /// Descriptor index identifying the field or array descriptor.
-    pub descr_index: u32,
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    pub descr: Option<majit_ir::DescrRef>,
     /// Concrete object/array pointer.
     pub target: MaterializedValue,
     /// Concrete value to write.
@@ -2000,14 +1477,43 @@ pub struct ResolvedPendingFieldWrite {
     pub item_index: Option<usize>,
 }
 
+impl PartialEq for ResolvedPendingFieldWrite {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq.
+        majit_ir::resumedata::opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+impl Eq for ResolvedPendingFieldWrite {}
+
 /// Encoded pending field write stored alongside an encoded resume snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `resume.py:87-92 PENDINGFIELDSTRUCT` parity — the encoded form
+/// carries `lldescr` (the descriptor object itself) so decoding can
+/// hand back a live `Arc<dyn Descr>` via `descr.clone()` rather than
+/// rebuilding it through an index lookup
+/// (`resume.py:1000-1001 cast_base_ptr_to_instance`).
+#[derive(Debug, Clone)]
 pub struct EncodedPendingFieldWrite {
-    pub descr_index: u32,
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    pub descr: Option<majit_ir::DescrRef>,
     pub target: i64,
     pub value: i64,
     pub item_index: Option<usize>,
 }
+
+impl PartialEq for EncodedPendingFieldWrite {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq.
+        majit_ir::resumedata::opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+impl Eq for EncodedPendingFieldWrite {}
 
 impl EncodedResumeData {
     pub fn encode(rd: &ResumeData) -> Self {
@@ -2027,10 +1533,11 @@ impl EncodedResumeData {
     /// `ResumeData` after compilation. The production path obtains the
     /// same fields directly from `ResumeDataVirtualAdder::finish`.
     ///
-    /// `EncodedResumeData` carries pending fields without their live
-    /// field/array descriptors, so this helper cannot safely synthesize
-    /// `GuardPendingFieldEntry` replay entries. Production pending-field
-    /// replay still comes from `store_final_boxes_in_guard`.
+    /// Pending-field replay still comes from `store_final_boxes_in_guard`
+    /// in production. The encoded pending-field records do carry their
+    /// live descr Arc (`resume.py:88 PENDINGFIELDSTRUCT.lldescr`), but
+    /// this helper does not currently rebuild `GuardPendingFieldEntry`
+    /// from them — the production path attaches that elsewhere.
     pub fn to_resume_storage(&self) -> Arc<ResumeStorage> {
         fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> i16 {
             let idx = rd_consts
@@ -2088,7 +1595,6 @@ impl EncodedResumeData {
                 VirtualInfo::VirtualObj {
                     descr,
                     type_id,
-                    descr_index,
                     known_class,
                     fields,
                     fielddescrs,
@@ -2096,7 +1602,6 @@ impl EncodedResumeData {
                 } => majit_ir::RdVirtualInfo::VirtualInfo {
                     descr: descr.clone(),
                     type_id: *type_id,
-                    descr_index: *descr_index,
                     known_class: *known_class,
                     fielddescrs: fielddescrs.clone(),
                     fieldnums: fieldnums(
@@ -2109,14 +1614,12 @@ impl EncodedResumeData {
                 VirtualInfo::VStruct {
                     typedescr,
                     type_id,
-                    descr_index,
                     fields,
                     fielddescrs,
                     descr_size,
                 } => majit_ir::RdVirtualInfo::VStructInfo {
                     typedescr: typedescr.clone(),
                     type_id: *type_id,
-                    descr_index: *descr_index,
                     fielddescrs: fielddescrs.clone(),
                     fieldnums: fieldnums(
                         fields.iter().map(|(_, source)| source.clone()),
@@ -2127,7 +1630,6 @@ impl EncodedResumeData {
                 },
                 VirtualInfo::VArray {
                     arraydescr,
-                    descr_index,
                     clear,
                     items,
                 } => {
@@ -2135,14 +1637,12 @@ impl EncodedResumeData {
                     if *clear {
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             kind: array_kind_from_descr(arraydescr.as_ref()),
                             fieldnums,
                         }
                     } else {
                         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             kind: array_kind_from_descr(arraydescr.as_ref()),
                             fieldnums,
                         }
@@ -2150,7 +1650,6 @@ impl EncodedResumeData {
                 }
                 VirtualInfo::VArrayStruct {
                     arraydescr,
-                    descr_index,
                     fielddescrs,
                     element_fields,
                 } => {
@@ -2190,7 +1689,6 @@ impl EncodedResumeData {
                         .collect();
                     majit_ir::RdVirtualInfo::VArrayStructInfo {
                         arraydescr: arraydescr.clone(),
-                        descr_index: *descr_index,
                         size: element_fields.len(),
                         fielddescrs: fielddescrs.clone(),
                         fielddescr_indices: (0..fielddescrs.len()).map(|i| i as u32).collect(),
@@ -2232,7 +1730,7 @@ impl EncodedResumeData {
                 VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VStrConcat { left, right } => {
+                VirtualInfo::VStrConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VStrConcatInfo {
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
@@ -2245,6 +1743,7 @@ impl EncodedResumeData {
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VStrSliceInfo {
                     fieldnums: fieldnums(
                         [
@@ -2259,7 +1758,7 @@ impl EncodedResumeData {
                 VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VUniConcat { left, right } => {
+                VirtualInfo::VUniConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VUniConcatInfo {
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
@@ -2272,6 +1771,7 @@ impl EncodedResumeData {
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VUniSliceInfo {
                     fieldnums: fieldnums(
                         [
@@ -2381,7 +1881,9 @@ impl EncodedResumeData {
         let rd_pendingfields: Vec<_> = pending_fields
             .iter()
             .map(|pending| EncodedPendingFieldWrite {
-                descr_index: pending.descr_index,
+                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
+                // the encoded form carries the descr itself, not a handle.
+                descr: pending.descr.clone(),
                 target: memo.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: memo.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
@@ -2463,12 +1965,16 @@ impl EncodedResumeData {
             self.rd_numb.len(),
             "resume decoder left trailing data"
         );
-        // resume.py:926 _prepare_pendingfields
+        // resume.py:993-1001 _prepare_pendingfields — lldescr is restored
+        // directly from `PENDINGFIELDSTRUCT.lldescr` via
+        // `cast_base_ptr_to_instance(AbstractDescr, lldescr)`; pyre keeps
+        // the live `Arc<dyn Descr>` on the encoded record, so decoding is
+        // a clone.
         let pending_fields = self
             .rd_pendingfields
             .iter()
             .map(|pending| PendingFieldInfo {
-                descr_index: pending.descr_index,
+                descr: pending.descr.clone(),
                 target: self.decode_box(pending.target),
                 value: self.decode_box(pending.value),
                 item_index: pending.item_index,
@@ -2642,9 +2148,71 @@ impl EncodedResumeData {
     }
 }
 
-impl ResumeData {
+/// Metainterp-side extension trait for `ResumeData` (which lives in
+/// `majit-backend::resume_value` after the Phase C-1 cascade).
+///
+/// All inherent methods on `ResumeData` move here as trait methods
+/// (with default impls) — the trait sits in metainterp because the
+/// methods reference metainterp-specific types (`EncodedResumeData`,
+/// `DecodedResumeLayout`, `ReconstructedState`, `ReconstructedFrame`,
+/// `MaterializedVirtual`, `MaterializedValue`, `ReconstructedValue`,
+/// `ResolvedPendingFieldWrite`) and the orphan rule forbids inherent
+/// impls on a foreign type.
+///
+/// Callers reach the methods through `use ResumeDataExt;` plus the
+/// usual receiver syntax (`data.encode()`, `data.reconstruct_state(...)`,
+/// etc.) or the static-method syntax (`ResumeData::simple(...)`,
+/// `ResumeData::resolve_field_source(...)`) — both work for trait
+/// associated items as long as the trait is in scope.
+pub trait ResumeDataExt {
     /// Create a simple ResumeData for a single-frame trace.
-    pub fn simple(pc: u64, num_slots: usize) -> Self {
+    fn simple(pc: u64, num_slots: usize) -> Self
+    where
+        Self: Sized;
+
+    /// Encode this resume snapshot into a compact RPython-style numbering.
+    fn encode(&self) -> EncodedResumeData;
+
+    /// Decode the encoded resume snapshot back into a layout summary.
+    fn decode_layout(&self) -> DecodedResumeLayout;
+
+    /// Reconstruct the full resume state from fail_args data.
+    fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState;
+
+    /// Reconstruct frame slots from fail_args data.
+    fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame>;
+
+    /// Materialize virtual objects from resume data.
+    fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual>;
+
+    fn materialize_virtuals_from_infos(
+        virtuals: &[VirtualInfo],
+        fail_values: &[i64],
+    ) -> Vec<MaterializedVirtual>;
+
+    /// Resolve pending heap writes into concrete values.
+    fn resolve_pending_field_writes(
+        pending_fields: &[PendingFieldInfo],
+        fail_values: &[i64],
+    ) -> Vec<ResolvedPendingFieldWrite>;
+
+    /// Resolve a single VirtualFieldSource to a concrete i64 value.
+    fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64;
+
+    fn resolve_materialized_source(
+        source: &VirtualFieldSource,
+        fail_values: &[i64],
+    ) -> MaterializedValue;
+
+    /// Resolve a single frame-slot source into a reconstructed value.
+    fn resolve_frame_slot_source(
+        source: &FrameSlotSource,
+        fail_values: &[i64],
+    ) -> ReconstructedValue;
+}
+
+impl ResumeDataExt for ResumeData {
+    fn simple(pc: u64, num_slots: usize) -> Self {
         let slot_map: Vec<FrameSlotSource> = (0..num_slots).map(FrameSlotSource::FailArg).collect();
         ResumeData {
             vable_array: Vec::new(),
@@ -2659,8 +2227,7 @@ impl ResumeData {
         }
     }
 
-    /// Encode this resume snapshot into a compact RPython-style numbering.
-    pub fn encode(&self) -> EncodedResumeData {
+    fn encode(&self) -> EncodedResumeData {
         EncodedResumeData::from_semantic(
             &self.vable_array,
             &self.vref_array,
@@ -2674,13 +2241,12 @@ impl ResumeData {
         self.encode().decode_layout()
     }
 
-    /// Reconstruct the full resume state from fail_args data.
-    ///
-    /// `fail_values` are the concrete values extracted from the DeadFrame.
-    pub fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
+    fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
         let decoded = self.decode_layout();
-        let materialized_virtuals =
-            Self::materialize_virtuals_from_infos(&decoded.virtuals, fail_values);
+        let materialized_virtuals = <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
+            &decoded.virtuals,
+            fail_values,
+        );
         let frames = decoded
             .frames
             .iter()
@@ -2688,7 +2254,9 @@ impl ResumeData {
                 let values = frame
                     .slot_map
                     .iter()
-                    .map(|slot| Self::resolve_frame_slot_source(slot, fail_values))
+                    .map(|slot| {
+                        <ResumeData as ResumeDataExt>::resolve_frame_slot_source(slot, fail_values)
+                    })
                     .collect();
                 ReconstructedFrame {
                     trace_id: None,
@@ -2704,30 +2272,23 @@ impl ResumeData {
         ReconstructedState {
             frames,
             virtuals: materialized_virtuals,
-            pending_fields: Self::resolve_pending_field_writes(
+            pending_fields: <ResumeData as ResumeDataExt>::resolve_pending_field_writes(
                 &decoded.pending_fields,
                 fail_values,
             ),
         }
     }
 
-    /// Reconstruct frame slots from fail_args data.
-    pub fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame> {
+    fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame> {
         self.reconstruct_state(fail_values).frames
     }
 
-    /// Materialize virtual objects from resume data.
-    ///
-    /// When a guard fails and some fail_args slots hold virtual objects
-    /// (objects that were never allocated during optimized execution),
-    /// this method resolves each VirtualInfo into a `MaterializedVirtual`.
-    ///
-    /// `fail_values` are the concrete i64 values from the DeadFrame.
-    ///
-    /// Mirrors RPython's `ResumeDataVirtualAdder.finish()` → `virtual_materialize()`.
-    pub fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
+    fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
         let decoded = self.decode_layout();
-        Self::materialize_virtuals_from_infos(&decoded.virtuals, fail_values)
+        <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
+            &decoded.virtuals,
+            fail_values,
+        )
     }
 
     fn materialize_virtuals_from_infos(
@@ -2735,48 +2296,44 @@ impl ResumeData {
         fail_values: &[i64],
     ) -> Vec<MaterializedVirtual> {
         let mut result = Vec::with_capacity(virtuals.len());
-        // First pass: create empty materialized shells (handles forward references)
         for vinfo in virtuals {
             result.push(MaterializedVirtual::from_info(vinfo));
         }
-
-        // Second pass: resolve field sources
         for (i, vinfo) in virtuals.iter().enumerate() {
             result[i].resolve_fields(vinfo, fail_values);
         }
-
         result
     }
 
-    /// Resolve pending heap writes into concrete values.
-    pub fn resolve_pending_field_writes(
+    fn resolve_pending_field_writes(
         pending_fields: &[PendingFieldInfo],
         fail_values: &[i64],
     ) -> Vec<ResolvedPendingFieldWrite> {
         pending_fields
             .iter()
             .map(|pending| ResolvedPendingFieldWrite {
-                descr_index: pending.descr_index,
-                target: Self::resolve_materialized_source(&pending.target, fail_values),
-                value: Self::resolve_materialized_source(&pending.value, fail_values),
+                descr: pending.descr.clone(),
+                target: <ResumeData as ResumeDataExt>::resolve_materialized_source(
+                    &pending.target,
+                    fail_values,
+                ),
+                value: <ResumeData as ResumeDataExt>::resolve_materialized_source(
+                    &pending.value,
+                    fail_values,
+                ),
                 item_index: pending.item_index,
             })
             .collect()
     }
 
-    /// Resolve a single VirtualFieldSource to a concrete i64 value.
-    ///
-    /// For `Virtual(idx)` references, returns 0 as a placeholder —
-    /// the actual object address is only known after allocation by the
-    /// interpreter's allocator.
-    pub fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64 {
-        match Self::resolve_materialized_source(source, fail_values) {
+    fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64 {
+        match <ResumeData as ResumeDataExt>::resolve_materialized_source(source, fail_values) {
             MaterializedValue::Value(value) => value,
             MaterializedValue::VirtualRef(_) => 0,
         }
     }
 
-    pub fn resolve_materialized_source(
+    fn resolve_materialized_source(
         source: &VirtualFieldSource,
         fail_values: &[i64],
     ) -> MaterializedValue {
@@ -2792,8 +2349,7 @@ impl ResumeData {
         }
     }
 
-    /// Resolve a single frame-slot source into a reconstructed value.
-    pub fn resolve_frame_slot_source(
+    fn resolve_frame_slot_source(
         source: &FrameSlotSource,
         fail_values: &[i64],
     ) -> ReconstructedValue {
@@ -2910,7 +2466,6 @@ pub enum MaterializedVirtual {
         /// SizeDescr for allocation (exposes vtable + obj_size).
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// (field_descr_index, concrete_value).
         fields: Vec<(u32, MaterializedValue)>,
     },
@@ -2919,17 +2474,18 @@ pub enum MaterializedVirtual {
         /// resume.py:631 self.typedescr.
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, MaterializedValue)>,
     },
-    /// Array.
+    /// Array — resume.py:646 VArrayInfo*.
     Array {
-        descr_index: u32,
+        /// resume.py:646 self.arraydescr.
+        descr: Option<majit_ir::DescrRef>,
         items: Vec<MaterializedValue>,
     },
-    /// Array of structs.
+    /// Array of structs — resume.py:739 VArrayStructInfo.
     ArrayStruct {
-        descr_index: u32,
+        /// resume.py:739 self.arraydescr.
+        descr: Option<majit_ir::DescrRef>,
         /// Per-element: Vec<(field_index, value)>.
         elements: Vec<Vec<(u32, MaterializedValue)>>,
     },
@@ -2948,44 +2504,34 @@ impl MaterializedVirtual {
     /// Create an empty shell from a VirtualInfo (forward-reference safe).
     fn from_info(info: &VirtualInfo) -> Self {
         match info {
-            VirtualInfo::VirtualObj {
-                descr,
-                type_id,
-                descr_index,
-                ..
-            } => MaterializedVirtual::Obj {
+            VirtualInfo::VirtualObj { descr, type_id, .. } => MaterializedVirtual::Obj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: Vec::new(),
             },
             VirtualInfo::VStruct {
-                typedescr,
-                type_id,
-                descr_index,
-                ..
+                typedescr, type_id, ..
             } => MaterializedVirtual::Struct {
                 descr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: Vec::new(),
             },
             VirtualInfo::VArray {
-                arraydescr: _,
-                descr_index,
+                arraydescr,
                 clear: _,
                 items,
+                ..
             } => MaterializedVirtual::Array {
-                descr_index: *descr_index,
+                descr: arraydescr.clone(),
                 items: vec![MaterializedValue::Value(0); items.len()],
             },
             VirtualInfo::VArrayStruct {
-                arraydescr: _,
-                descr_index,
+                arraydescr,
                 fielddescrs: _,
                 element_fields,
+                ..
             } => MaterializedVirtual::ArrayStruct {
-                descr_index: *descr_index,
+                descr: arraydescr.clone(),
                 elements: vec![Vec::new(); element_fields.len()],
             },
             VirtualInfo::VRawBuffer {
@@ -3004,7 +2550,6 @@ impl MaterializedVirtual {
             VirtualInfo::VRawSlice { .. } => MaterializedVirtual::Struct {
                 descr: None,
                 type_id: 0,
-                descr_index: 0,
                 fields: Vec::new(),
             },
             // resume.py:763-870 VStr/VUni*Info — virtual string shells
@@ -3020,7 +2565,6 @@ impl MaterializedVirtual {
             | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
                 descr: None,
                 type_id: 0,
-                descr_index: 0,
                 fields: Vec::new(),
             },
         }
@@ -3107,12 +2651,10 @@ impl MaterializedVirtual {
             MaterializedVirtual::Obj {
                 descr,
                 type_id,
-                descr_index,
                 fields,
             } => Some(MaterializedVirtual::Obj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(idx, value)| {
@@ -3126,12 +2668,10 @@ impl MaterializedVirtual {
             MaterializedVirtual::Struct {
                 descr,
                 type_id,
-                descr_index,
                 fields,
             } => Some(MaterializedVirtual::Struct {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(idx, value)| {
@@ -3142,8 +2682,8 @@ impl MaterializedVirtual {
                     })
                     .collect::<Option<Vec<_>>>()?,
             }),
-            MaterializedVirtual::Array { descr_index, items } => Some(MaterializedVirtual::Array {
-                descr_index: *descr_index,
+            MaterializedVirtual::Array { descr, items } => Some(MaterializedVirtual::Array {
+                descr: descr.clone(),
                 items: items
                     .iter()
                     .map(|value| {
@@ -3153,28 +2693,27 @@ impl MaterializedVirtual {
                     })
                     .collect::<Option<Vec<_>>>()?,
             }),
-            MaterializedVirtual::ArrayStruct {
-                descr_index,
-                elements,
-            } => Some(MaterializedVirtual::ArrayStruct {
-                descr_index: *descr_index,
-                elements: elements
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(idx, value)| {
-                                Some((
-                                    *idx,
-                                    MaterializedValue::Value(
-                                        value.resolve_with_refs(materialized_refs)?,
-                                    ),
-                                ))
-                            })
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-            }),
+            MaterializedVirtual::ArrayStruct { descr, elements } => {
+                Some(MaterializedVirtual::ArrayStruct {
+                    descr: descr.clone(),
+                    elements: elements
+                        .iter()
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .map(|(idx, value)| {
+                                    Some((
+                                        *idx,
+                                        MaterializedValue::Value(
+                                            value.resolve_with_refs(materialized_refs)?,
+                                        ),
+                                    ))
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            }
             MaterializedVirtual::RawBuffer {
                 func,
                 size,
@@ -3291,7 +2830,6 @@ impl ResumeDataVirtualAdder {
         &mut self,
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         known_class: Option<i64>,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
@@ -3300,7 +2838,6 @@ impl ResumeDataVirtualAdder {
         self.add_virtual(VirtualInfo::VirtualObj {
             descr,
             type_id,
-            descr_index,
             known_class,
             fields,
             fielddescrs,
@@ -3313,7 +2850,6 @@ impl ResumeDataVirtualAdder {
         &mut self,
         typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
@@ -3321,7 +2857,6 @@ impl ResumeDataVirtualAdder {
         self.add_virtual(VirtualInfo::VStruct {
             typedescr,
             type_id,
-            descr_index,
             fields,
             fielddescrs,
             descr_size,
@@ -3332,13 +2867,11 @@ impl ResumeDataVirtualAdder {
     pub fn add_virtual_array(
         &mut self,
         arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
         clear: bool,
         items: Vec<VirtualFieldSource>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VArray {
             arraydescr,
-            descr_index,
             clear,
             items,
         })
@@ -3349,13 +2882,11 @@ impl ResumeDataVirtualAdder {
     pub fn add_virtual_array_struct(
         &mut self,
         arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
         fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VArrayStruct {
             arraydescr,
-            descr_index,
             fielddescrs,
             element_fields,
         })
@@ -3380,14 +2911,17 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Add a deferred field write to replay on resume.
+    ///
+    /// `resume.py:88 PENDINGFIELDSTRUCT.lldescr` — RPython always
+    /// captures a live descr off the originating SetfieldGc op.
     pub fn add_pending_field_write(
         &mut self,
-        descr_index: u32,
+        descr: Option<majit_ir::DescrRef>,
         target: ResumeValueSource,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
-            descr_index,
+            descr,
             target,
             value,
             item_index: None,
@@ -3397,13 +2931,13 @@ impl ResumeDataVirtualAdder {
     /// Add a deferred array item write to replay on resume.
     pub fn add_pending_arrayitem_write(
         &mut self,
-        descr_index: u32,
+        descr: Option<majit_ir::DescrRef>,
         target: ResumeValueSource,
         item_index: usize,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
-            descr_index,
+            descr,
             target,
             value,
             item_index: Some(item_index),
@@ -4590,7 +4124,9 @@ impl ResumeDataLoopMemo {
         let rd_pendingfields: Vec<_> = pending_fields_snapshot
             .into_iter()
             .map(|pending| EncodedPendingFieldWrite {
-                descr_index: pending.descr_index,
+                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
+                // the encoded form carries the descr itself, not a handle.
+                descr: pending.descr.clone(),
                 target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
@@ -5645,35 +5181,54 @@ pub trait BlackholeAllocator {
         let _ = (descr, vtable);
         0
     }
-    /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr)
-    fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+    /// resume.py:1442 cpu.bh_new(typedescr)
+    fn bh_new(&self, typedescr: &majit_ir::DescrRef) -> i64 {
         let _ = typedescr;
         0
     }
-    /// resume.py:1444 allocate_array(length, arraydescr, clear)
-    fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
-        let _ = (length, arraydescr, clear);
+    /// resume.py:1446 cpu.bh_new_array_clear(length, arraydescr)
+    fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        let _ = (length, arraydescr);
         0
     }
-    /// resume.py:1509 setfield
-    fn setfield(&self, struct_ptr: i64, field_descr: u32, value: i64) {
-        let _ = (struct_ptr, field_descr, value);
+    /// resume.py:1447 cpu.bh_new_array(length, arraydescr)
+    fn bh_new_array(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        let _ = (length, arraydescr);
+        0
     }
-    /// resume.py:1531 setarrayitem_int(array, i, value, arraydescr)
-    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1533 cpu.bh_setarrayitem_gc_i(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1535 setarrayitem_ref(array, i, value, arraydescr)
-    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1537 cpu.bh_setarrayitem_gc_r(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1539 setarrayitem_float(array, i, value, arraydescr)
-    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1541 cpu.bh_setarrayitem_gc_f(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
     /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
     /// RPython passes the live descr object; backend reads offset/size/type from it.
-    fn setinteriorfield_gc_i(
+    fn bh_setinteriorfield_gc_i(
         &self,
         array: i64,
         index: usize,
@@ -5682,7 +5237,7 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    fn setinteriorfield_gc_r(
+    fn bh_setinteriorfield_gc_r(
         &self,
         array: i64,
         index: usize,
@@ -5691,7 +5246,7 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    fn setinteriorfield_gc_f(
+    fn bh_setinteriorfield_gc_f(
         &self,
         array: i64,
         index: usize,
@@ -5699,16 +5254,71 @@ pub trait BlackholeAllocator {
         descr: &majit_ir::DescrRef,
     ) {
         let _ = (array, index, value, descr);
+    }
+    /// resume.py:1449-1450 allocate_string(length) → cpu.bh_newstr(length)
+    fn bh_newstr(&self, length: usize) -> i64 {
+        let _ = length;
+        0
+    }
+    /// resume.py:1458-1460 string_setitem(str, index, charnum) →
+    /// cpu.bh_strsetitem(str, index, char) — `char` is the decoded
+    /// integer from the tagged `charnum`.
+    fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
+        let _ = (string, index, char);
+    }
+    /// resume.py:1462-1470 concat_strings(str1, str2) — implementations
+    /// look up `OS_STR_CONCAT` via `callinfocollection.funcptr_for_oopspec`
+    /// (resume.py:1467-1468) and call it directly.  The variant carries
+    /// no funcptr.
+    fn os_str_concat(&self, str1: i64, str2: i64) -> i64 {
+        let _ = (str1, str2);
+        0
+    }
+    /// resume.py:1472-1480 slice_string(str, start, length) →
+    /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, stop)` where the
+    /// caller pre-computes `stop = start + length` (the OS_STR_SLICE
+    /// oopspec signature).  Implementations resolve the funcptr via
+    /// `callinfocollection`.
+    fn os_str_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (str, start, stop);
+        0
+    }
+    /// resume.py:1482-1483 allocate_unicode(length) →
+    /// cpu.bh_newunicode(length)
+    fn bh_newunicode(&self, length: usize) -> i64 {
+        let _ = length;
+        0
+    }
+    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) →
+    /// cpu.bh_unicodesetitem(str, index, char)
+    fn bh_unicodesetitem(&self, string: i64, index: usize, char: i64) {
+        let _ = (string, index, char);
+    }
+    /// resume.py:1489-1497 concat_unicodes(str1, str2) →
+    /// `funcptr_for_oopspec(OS_UNI_CONCAT)(str1, str2)`. Implementations
+    /// resolve the funcptr via `callinfocollection`.
+    fn os_uni_concat(&self, str1: i64, str2: i64) -> i64 {
+        let _ = (str1, str2);
+        0
+    }
+    /// resume.py:1499-1507 slice_unicode(str, start, length) →
+    /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, stop)` where the
+    /// caller pre-computes `stop = start + length`.  Implementations
+    /// resolve the funcptr via `callinfocollection`.
+    fn os_uni_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (str, start, stop);
+        0
     }
     /// resume.py:1452 allocate_raw_buffer(func, size)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let _ = (func, size);
         0
     }
-    /// resume.py:1543 setrawbuffer_item(buffer, fieldnum, offset, descr).
-    /// `offset` mirrors `RawBuffer.offsets[i]` and is signed
-    /// (rawbuffer.py:14).
-    fn setrawbuffer_item(
+    /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr) —
+    /// float raw store dispatched from setrawbuffer_item when
+    /// `descr.is_array_of_floats()`.  `offset` mirrors
+    /// `RawBuffer.offsets[i]` and is signed (rawbuffer.py:14).
+    fn bh_raw_store_f(
         &self,
         buffer: i64,
         offset: i64,
@@ -5717,21 +5327,32 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (buffer, offset, value, descr);
     }
-    /// resume.py:1509-1528 setfield — write field value at known offset.
-    fn setfield_typed(
+    /// resume.py:1550 cpu.bh_raw_store_i(buffer, offset, value, descr) —
+    /// integer raw store dispatched from setrawbuffer_item (default
+    /// branch — descr is not an array of pointers / floats).
+    fn bh_raw_store_i(
         &self,
-        struct_ptr: i64,
+        buffer: i64,
+        offset: i64,
         value: i64,
-        descr: u32,
-        field_offset: usize,
-        field_size: usize,
+        descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let _ = (field_offset, field_size);
-        self.setfield(struct_ptr, descr, value);
+        let _ = (buffer, offset, value, descr);
     }
-    /// pendingfields: setarrayitem dispatch by descr_index (legacy u32 path).
-    fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
-        let _ = (array, index, value, descr);
+    /// `resume.py:1517 cpu.bh_setfield_gc_i(struct, value, descr)` —
+    /// integer setfield dispatched from `resume.py:1509-1518 setfield`.
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        let _ = (struct_ptr, value, descr_info);
+    }
+    /// `resume.py:1512 cpu.bh_setfield_gc_r(struct, value, descr)` —
+    /// pointer setfield dispatched when `descr.is_pointer_field()`.
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        let _ = (struct_ptr, value, descr_info);
+    }
+    /// `resume.py:1515 cpu.bh_setfield_gc_f(struct, value, descr)` —
+    /// float setfield dispatched when `descr.is_float_field()`.
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        let _ = (struct_ptr, value, descr_info);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
     ///
@@ -5752,10 +5373,113 @@ pub trait BlackholeAllocator {
 pub struct NullAllocator;
 impl BlackholeAllocator for NullAllocator {}
 
-impl VirtualInfo {
+/// Metainterp-side extension methods on `VirtualInfo` (which lives in
+/// majit-backend since the Phase C-1 cascade).  These methods depend
+/// on `ResumeDataDirectReader` + `BlackholeAllocator` — both
+/// metainterp-specific — so they stay here as a trait extension.
+pub trait VirtualInfoBlackholeExt {
+    fn is_about_raw(&self) -> bool;
+    fn allocate(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64;
+    fn allocate_int(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64;
+}
+
+/// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
+/// VUniPlainInfo.allocate` share the same loop body — the only
+/// difference is `decoder.allocate_string` vs `allocate_unicode` and
+/// `string_setitem` vs `unicode_setitem`.  The pyre helper takes an
+/// `is_unicode` flag to dispatch.  `chars` carries one
+/// `VirtualFieldSource` per character (the pyre equivalent of RPython's
+/// tagged `fieldnums`); `VirtualFieldSource::Uninitialized` matches
+/// resume.py's `tagged_eq(charnum, UNINITIALIZED)` skip.
+fn vstr_plain_info_allocate(
+    decoder: &mut ResumeDataDirectReader,
+    index: usize,
+    chars: &[VirtualFieldSource],
+    is_unicode: bool,
+) -> i64 {
+    let length = chars.len();
+    // resume.py:769 string = decoder.allocate_string(length)
+    // resume.py:824 string = decoder.allocate_unicode(length)
+    let string = if is_unicode {
+        decoder.allocate_unicode(length)
+    } else {
+        decoder.allocate_string(length)
+    };
+    // resume.py:770 / 825 decoder.virtuals_cache.set_ptr(index, string)
+    decoder.virtuals_cache.set_ptr(index, string);
+    for (i, char_source) in chars.iter().enumerate() {
+        // resume.py:773 / 828 if not tagged_eq(charnum, UNINITIALIZED)
+        if matches!(char_source, VirtualFieldSource::Uninitialized) {
+            continue;
+        }
+        // resume.py:774 / 829 decoder.{string,unicode}_setitem(string, i, charnum)
+        if is_unicode {
+            decoder.unicode_setitem(string, i, char_source);
+        } else {
+            decoder.string_setitem(string, i, char_source);
+        }
+    }
+    string
+}
+
+/// `resume.py:596-603 AbstractVirtualStructInfo.setfields(decoder, struct)`
+/// — iterate fielddescrs/fieldnums and call decoder.setfield per
+/// non-UNINITIALIZED entry.  pyre threads the spec-form `FieldDescrInfo`
+/// through `bh_setfield_gc_{i,r,f}` directly because the descr Arc
+/// is not interned alongside the spec on `VirtualInfo::{VirtualObj,
+/// VStruct}.fielddescrs` (a future slice can replace `Vec<FieldDescrInfo>`
+/// with `Vec<Arc<dyn FieldDescr>>` so this helper can call
+/// `decoder.setfield(struct, num, descr)` byte-for-byte with RPython).
+fn abstract_virtual_struct_info_setfields(
+    decoder: &mut ResumeDataDirectReader,
+    allocator: &dyn BlackholeAllocator,
+    struct_ptr: i64,
+    fielddescrs: &[majit_ir::FieldDescrInfo],
+    fields: &[(u32, VirtualFieldSource)],
+) {
+    for (i, (_field_descr, source)) in fields.iter().enumerate() {
+        let Some(descr_info) = fielddescrs.get(i) else {
+            continue;
+        };
+        // resume.py:601 if not tagged_eq(num, UNINITIALIZED)
+        if matches!(source, VirtualFieldSource::Uninitialized) {
+            continue;
+        }
+        // resume.py:602 decoder.setfield(struct, num, descr)
+        // — pyre dispatches by descr_info.field_type because pyre's
+        //   fielddescrs collection holds the spec form, not the live
+        //   FieldDescr Arc that RPython passes to decoder.setfield.
+        match descr_info.field_type {
+            majit_ir::Type::Ref => {
+                let value = decoder.decode_field_source(source);
+                allocator.bh_setfield_gc_r(struct_ptr, value, descr_info);
+            }
+            majit_ir::Type::Float => {
+                let value = decoder.decode_field_source_float(source);
+                allocator.bh_setfield_gc_f(struct_ptr, value, descr_info);
+            }
+            _ => {
+                let value = decoder.decode_field_source_int(source);
+                allocator.bh_setfield_gc_i(struct_ptr, value, descr_info);
+            }
+        }
+    }
+}
+
+impl VirtualInfoBlackholeExt for VirtualInfo {
     /// resume.py:576 kind attribute — REF for object/struct/array/string,
     /// INT for raw buffers.
-    pub fn is_about_raw(&self) -> bool {
+    fn is_about_raw(&self) -> bool {
         matches!(
             self,
             VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. }
@@ -5766,7 +5490,7 @@ impl VirtualInfo {
     ///
     /// Allocate a virtual object and fill in its fields from the decoder.
     /// Sets virtuals_cache_ptr[index] before filling fields (for recursive refs).
-    pub fn allocate(
+    fn allocate(
         &self,
         decoder: &mut ResumeDataDirectReader,
         index: usize,
@@ -5780,31 +5504,21 @@ impl VirtualInfo {
                 known_class,
                 ..
             } => {
-                // resume.py:619 allocate_with_vtable(descr=self.descr)
+                // resume.py:619 struct = decoder.allocate_with_vtable(descr=self.descr)
                 let vtable = known_class.unwrap_or(0) as usize;
                 let obj = descr
                     .as_ref()
-                    .map(|d| allocator.allocate_with_vtable(d, vtable))
+                    .map(|d| decoder.allocate_with_vtable(d, vtable))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                for (i, (field_descr, source)) in fields.iter().enumerate() {
-                    let fd = fielddescrs.get(i);
-                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
-                    let value = match field_type {
-                        majit_ir::Type::Ref => decoder.decode_field_source(source),
-                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
-                        _ => decoder.decode_field_source_int(source),
-                    };
-                    // resume.py:1509-1528 setfield uses the descr's byte
-                    // offset/size rather than a symbolic `field_descr` id.
-                    // PyreBlackholeAllocator only implements setfield_typed
-                    // (pyre objects are raw Rust structs); the default
-                    // `setfield` in the trait is a no-op. Always route
-                    // through setfield_typed so the field actually lands.
-                    let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
-                    let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
-                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
-                }
+                // resume.py:621 return self.setfields(decoder, struct)
+                abstract_virtual_struct_info_setfields(
+                    decoder,
+                    allocator,
+                    obj,
+                    fielddescrs,
+                    fields,
+                );
                 obj
             }
             VirtualInfo::VStruct {
@@ -5813,24 +5527,20 @@ impl VirtualInfo {
                 fielddescrs,
                 ..
             } => {
-                // resume.py:635 allocate_struct(self.typedescr)
+                // resume.py:635 struct = decoder.allocate_struct(self.typedescr)
                 let obj = typedescr
                     .as_ref()
-                    .map(|d| allocator.allocate_struct(d))
+                    .map(|d| decoder.allocate_struct(d))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                for (i, (field_descr, source)) in fields.iter().enumerate() {
-                    let fd = fielddescrs.get(i);
-                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
-                    let value = match field_type {
-                        majit_ir::Type::Ref => decoder.decode_field_source(source),
-                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
-                        _ => decoder.decode_field_source_int(source),
-                    };
-                    let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
-                    let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
-                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
-                }
+                // resume.py:637 return self.setfields(decoder, struct)
+                abstract_virtual_struct_info_setfields(
+                    decoder,
+                    allocator,
+                    obj,
+                    fielddescrs,
+                    fields,
+                );
                 obj
             }
             VirtualInfo::VArray {
@@ -5843,7 +5553,7 @@ impl VirtualInfo {
                 // resume.py:653: array = decoder.allocate_array(length, arraydescr, self.clear)
                 let array = arraydescr
                     .as_ref()
-                    .map(|d| allocator.allocate_array(length, d, *clear))
+                    .map(|d| decoder.allocate_array(length, d, *clear))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:656-670: dispatch by arraydescr element type
@@ -5858,17 +5568,17 @@ impl VirtualInfo {
                 if let Some(ad) = arraydescr.as_ref() {
                     for (i, source) in items.iter().enumerate() {
                         if is_pointers {
-                            // resume.py:659: decoder.setarrayitem_ref(array, i, num, arraydescr)
+                            // resume.py:659: decoder.bh_setarrayitem_gc_r(array, i, num, arraydescr)
                             let value = decoder.decode_field_source(source);
-                            allocator.setarrayitem_ref(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_r(array, i, value, ad);
                         } else if is_floats {
-                            // resume.py:664: decoder.setarrayitem_float(array, i, num, arraydescr)
+                            // resume.py:664: decoder.bh_setarrayitem_gc_f(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_float(source);
-                            allocator.setarrayitem_float(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_f(array, i, value, ad);
                         } else {
-                            // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
+                            // resume.py:669: decoder.bh_setarrayitem_gc_i(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_int(source);
-                            allocator.setarrayitem_int(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_i(array, i, value, ad);
                         }
                     }
                 }
@@ -5885,7 +5595,7 @@ impl VirtualInfo {
                 // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
                 let array = arraydescr
                     .as_ref()
-                    .map(|d| allocator.allocate_array(size, d, true))
+                    .map(|d| decoder.allocate_array(size, d, /* clear */ true))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:752-759:
@@ -5913,6 +5623,46 @@ impl VirtualInfo {
                 }
                 array
             }
+            // resume.py:766-775 VStrPlainInfo.allocate
+            VirtualInfo::VStrPlain { chars } => {
+                vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ false)
+            }
+            // resume.py:821-830 VUniPlainInfo.allocate
+            VirtualInfo::VUniPlain { chars } => {
+                vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ true)
+            }
+            // resume.py:786-793 VStrConcatInfo.allocate
+            VirtualInfo::VStrConcat { left, right } => {
+                let string = decoder.concat_strings(left, right);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:805-809 VStrSliceInfo.allocate
+            VirtualInfo::VStrSlice {
+                source,
+                start,
+                length,
+            } => {
+                let string = decoder.slice_string(source, start, length);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:841-848 VUniConcatInfo.allocate
+            VirtualInfo::VUniConcat { left, right } => {
+                let string = decoder.concat_unicodes(left, right);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:860-864 VUniSliceInfo.allocate
+            VirtualInfo::VUniSlice {
+                source,
+                start,
+                length,
+            } => {
+                let string = decoder.slice_unicode(source, start, length);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
             _ => {
                 decoder.virtuals_cache.set_ptr(index, 0);
                 0
@@ -5921,7 +5671,7 @@ impl VirtualInfo {
     }
 
     /// resume.py:701 VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
-    pub fn allocate_int(
+    fn allocate_int(
         &self,
         decoder: &mut ResumeDataDirectReader,
         index: usize,
@@ -5938,28 +5688,39 @@ impl VirtualInfo {
                 assert_eq!(offsets.len(), descrs.len());
                 assert_eq!(offsets.len(), values.len());
                 // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-                let buffer = allocator.allocate_raw_buffer(*func, *size);
+                let buffer = decoder.allocate_raw_buffer(*func, *size);
                 // resume.py:704
                 decoder.virtuals_cache.set_int(index, buffer);
                 // resume.py:705-708: for i in range(len(self.offsets)):
                 //     offset = self.offsets[i]; descr = self.descrs[i]
                 //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
+                //
+                // Pyre stores fieldnums[i] as a tagged
+                // VirtualFieldSource (the value lives on the virtual
+                // layout rather than in the resume tape), so we encode
+                // it back into the i16 charnum the dispatcher accepts
+                // via decode_field_source_{float,int} → tag.
                 for i in 0..offsets.len() {
                     let descr = &descrs[i];
                     let source = &values[i];
-                    // resume.py:1543-1550: dispatch by descr kind
+                    if matches!(source, VirtualFieldSource::Uninitialized) {
+                        continue;
+                    }
+                    // pyre extracts the per-entry value from the virtual
+                    // layout instead of the tagged fieldnum, then writes
+                    // through bh_raw_store_{i,f} per descr kind — same
+                    // dispatch as resume.py:1545-1550 setrawbuffer_item.
                     assert!(
                         descr.item_type != 0,
                         "raw buffer entry must not be pointer type"
                     );
-                    let value = if descr.item_type == 2 {
-                        // resume.py:1545: descr.is_array_of_floats() → decode_float
-                        decoder.decode_field_source_float(source)
+                    if descr.item_type == 2 {
+                        let value = decoder.decode_field_source_float(source);
+                        allocator.bh_raw_store_f(buffer, offsets[i], value, descr);
                     } else {
-                        // resume.py:1549: else → decode_int
-                        decoder.decode_field_source_int(source)
-                    };
-                    allocator.setrawbuffer_item(buffer, offsets[i], value, descr);
+                        let value = decoder.decode_field_source_int(source);
+                        allocator.bh_raw_store_i(buffer, offsets[i], value, descr);
+                    }
                 }
                 buffer
             }
@@ -6076,8 +5837,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                 None
             } else {
                 panic!(
-                    "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
-                    pf.descr_index,
+                    "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
+                    descr,
                 );
             };
             // resume.py:1002-1007 tagged path. UNASSIGNED tags must
@@ -6085,52 +5846,247 @@ impl<'a> ResumeDataDirectReader<'a> {
             assert!(
                 pf.target_tagged != UNASSIGNED && pf.value_tagged != UNASSIGNED,
                 "GuardPendingFieldEntry reached prepare_guard_pendingfields with \
-                 UNASSIGNED tag (target_tagged={}, value_tagged={}, descr_index={}); \
+                 UNASSIGNED tag (target_tagged={}, value_tagged={}, descr={:?}); \
                  _add_pending_fields must have run before restore time",
                 pf.target_tagged,
                 pf.value_tagged,
-                pf.descr_index,
+                descr,
             );
             // resume.py:1002: struct = self.decode_ref(num)
             let struct_ptr = self.decode_ref(pf.target_tagged);
 
             if pf.item_index < 0 {
-                let (field_offset, field_size, field_type) =
-                    field_info.expect("resume.py:1005 setfield pending entry requires FieldDescr");
-                let value = match field_type {
-                    majit_ir::Type::Ref => self.decode_ref(pf.value_tagged),
-                    majit_ir::Type::Float => self.decode_float(pf.value_tagged),
-                    _ => self.decode_int(pf.value_tagged),
-                };
+                let _ = field_info; // setfield dispatcher reads descr directly.
                 // resume.py:1005: self.setfield(struct, fieldnum, descr)
-                self.allocator.setfield_typed(
-                    struct_ptr,
-                    value,
-                    pf.descr_index,
-                    field_offset,
-                    field_size,
-                );
+                self.setfield(struct_ptr, pf.value_tagged, descr);
             } else {
-                // resume.py:1007-1015: self.setarrayitem dispatches by
-                // arraydescr and passes that same descriptor through.
-                let ad = descr
-                    .as_array_descr()
-                    .expect("resume.py:1007 setarrayitem pending entry requires ArrayDescr");
+                // resume.py:1007: self.setarrayitem(struct, itemindex,
+                //                  fieldnum, descr).
                 let index = pf.item_index as usize;
-                if ad.is_array_of_pointers() {
-                    let value = self.decode_ref(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_ref(struct_ptr, index, value, descr);
-                } else if ad.is_array_of_floats() {
-                    let value = self.decode_float(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_float(struct_ptr, index, value, descr);
-                } else {
-                    let value = self.decode_int(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_int(struct_ptr, index, value, descr);
-                }
+                self.setarrayitem(struct_ptr, index, pf.value_tagged, descr);
             }
+        }
+    }
+
+    /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` dispatcher:
+    /// forwards to `bh_setfield_gc_r` / `bh_setfield_gc_f` /
+    /// `bh_setfield_gc_i` based on `descr.is_pointer_field()` /
+    /// `is_float_field()`.  `fieldnum` is the resume.py-tagged value
+    /// to decode (decode_ref / decode_float / decode_int per kind).
+    pub fn setfield(&mut self, struct_ptr: i64, fieldnum: i16, descr: &majit_ir::DescrRef) {
+        let fd = descr
+            .as_field_descr()
+            .expect("resume.py:1509 setfield requires FieldDescr");
+        let descr_info = majit_ir::FieldDescrInfo {
+            index: descr.index(),
+            offset: fd.offset(),
+            field_type: fd.field_type(),
+            field_size: fd.field_size(),
+        };
+        if fd.is_pointer_field() {
+            // resume.py:1511 newvalue = self.decode_ref(fieldnum)
+            // resume.py:1512 self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
+            let value = self.decode_ref(fieldnum);
+            self.allocator
+                .bh_setfield_gc_r(struct_ptr, value, &descr_info);
+        } else if fd.is_float_field() {
+            // resume.py:1514 newvalue = self.decode_float(fieldnum)
+            // resume.py:1515 self.cpu.bh_setfield_gc_f(struct, newvalue, descr)
+            let value = self.decode_float(fieldnum);
+            self.allocator
+                .bh_setfield_gc_f(struct_ptr, value, &descr_info);
+        } else {
+            // resume.py:1517 newvalue = self.decode_int(fieldnum)
+            // resume.py:1518 self.cpu.bh_setfield_gc_i(struct, newvalue, descr)
+            let value = self.decode_int(fieldnum);
+            self.allocator
+                .bh_setfield_gc_i(struct_ptr, value, &descr_info);
+        }
+    }
+
+    /// resume.py:1437-1439 allocate_with_vtable(descr) →
+    /// `executor.exec_new_with_vtable(self.cpu, descr)` — pyre's
+    /// `vtable` argument is the resolved class pointer carried on the
+    /// virtual layout (info.py:318 _known_class).
+    pub fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        self.allocator.allocate_with_vtable(descr, vtable)
+    }
+
+    /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
+    pub fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        self.allocator.bh_new(typedescr)
+    }
+
+    /// resume.py:1444-1447 allocate_array(length, arraydescr, clear) →
+    /// `cpu.bh_new_array_clear` (clear=True) or `cpu.bh_new_array`.
+    pub fn allocate_array(
+        &self,
+        length: usize,
+        arraydescr: &majit_ir::DescrRef,
+        clear: bool,
+    ) -> i64 {
+        if clear {
+            self.allocator.bh_new_array_clear(length, arraydescr)
+        } else {
+            self.allocator.bh_new_array(length, arraydescr)
+        }
+    }
+
+    /// resume.py:1452-1456 allocate_raw_buffer(func, size) → calldescr =
+    /// `callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)`,
+    /// `cpu.bh_call_i(func, [size], None, None, calldescr)` — pyre's
+    /// `BlackholeAllocator::allocate_raw_buffer` keeps the wrapped form
+    /// (the calldescr / cic resolution lives inside the allocator impl
+    /// because pyre lacks a callinfocollection on the reader side).
+    pub fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
+        self.allocator.allocate_raw_buffer(func, size)
+    }
+
+    /// resume.py:1449-1450 allocate_string(length) — forward to allocator.
+    pub fn allocate_string(&self, length: usize) -> i64 {
+        self.allocator.bh_newstr(length)
+    }
+
+    /// resume.py:1458-1460 string_setitem(str, index, charnum) — decode
+    /// the per-character source and forward to the allocator.  Pyre
+    /// threads a `VirtualFieldSource` where resume.py threads a tagged
+    /// i16 charnum; the structural shape matches because both decoders
+    /// resolve to an integer character value before calling
+    /// bh_strsetitem.
+    pub fn string_setitem(&mut self, string: i64, index: usize, source: &VirtualFieldSource) {
+        let char = self.decode_field_source_int(source);
+        self.allocator.bh_strsetitem(string, index, char);
+    }
+
+    /// resume.py:1462-1470 concat_strings(str1num, str2num) — decode
+    /// the two ref sources and dispatch to OS_STR_CONCAT.  The funcptr
+    /// is resolved by the allocator via
+    /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
+    /// (resume.py:1467-1468); the variant carries no funcptr.
+    pub fn concat_strings(
+        &mut self,
+        str1_source: &VirtualFieldSource,
+        str2_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str1 = self.decode_field_source(str1_source);
+        let str2 = self.decode_field_source(str2_source);
+        self.allocator.os_str_concat(str1, str2)
+    }
+
+    /// resume.py:1472-1480 slice_string(strnum, startnum, lengthnum) →
+    /// OS_STR_SLICE funcptr(str, start, start + length).  Funcptr is
+    /// resolved by the allocator via `callinfocollection`.
+    pub fn slice_string(
+        &mut self,
+        str_source: &VirtualFieldSource,
+        start_source: &VirtualFieldSource,
+        length_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str = self.decode_field_source(str_source);
+        let start = self.decode_field_source_int(start_source);
+        let length = self.decode_field_source_int(length_source);
+        let stop = start.wrapping_add(length);
+        self.allocator.os_str_slice(str, start, stop)
+    }
+
+    /// resume.py:1482-1483 allocate_unicode(length) → cpu.bh_newunicode.
+    pub fn allocate_unicode(&self, length: usize) -> i64 {
+        self.allocator.bh_newunicode(length)
+    }
+
+    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) — same
+    /// shape as string_setitem.
+    pub fn unicode_setitem(&mut self, string: i64, index: usize, source: &VirtualFieldSource) {
+        let char = self.decode_field_source_int(source);
+        self.allocator.bh_unicodesetitem(string, index, char);
+    }
+
+    /// resume.py:1489-1497 concat_unicodes(str1num, str2num).  Funcptr
+    /// is resolved by the allocator via `callinfocollection`.
+    pub fn concat_unicodes(
+        &mut self,
+        str1_source: &VirtualFieldSource,
+        str2_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str1 = self.decode_field_source(str1_source);
+        let str2 = self.decode_field_source(str2_source);
+        self.allocator.os_uni_concat(str1, str2)
+    }
+
+    /// resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset,
+    /// descr) dispatcher: `assert not descr.is_array_of_pointers()`,
+    /// then dispatch to `bh_raw_store_f` (float) or `bh_raw_store_i`
+    /// (default).
+    pub fn setrawbuffer_item(
+        &mut self,
+        buffer: i64,
+        fieldnum: i16,
+        offset: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        // resume.py:1544 assert not descr.is_array_of_pointers()
+        assert!(
+            descr.item_type != 0,
+            "setrawbuffer_item: descr must not be array_of_pointers"
+        );
+        if descr.item_type == 2 {
+            // resume.py:1546-1547 newvalue = self.decode_float(fieldnum)
+            //                    self.cpu.bh_raw_store_f(...)
+            let value = self.decode_float(fieldnum);
+            self.allocator.bh_raw_store_f(buffer, offset, value, descr);
+        } else {
+            // resume.py:1549-1550 newvalue = self.decode_int(fieldnum)
+            //                    self.cpu.bh_raw_store_i(...)
+            let value = self.decode_int(fieldnum);
+            self.allocator.bh_raw_store_i(buffer, offset, value, descr);
+        }
+    }
+
+    /// resume.py:1499-1507 slice_unicode(strnum, startnum, lengthnum).
+    /// Funcptr resolved by the allocator via `callinfocollection`.
+    pub fn slice_unicode(
+        &mut self,
+        str_source: &VirtualFieldSource,
+        start_source: &VirtualFieldSource,
+        length_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str = self.decode_field_source(str_source);
+        let start = self.decode_field_source_int(start_source);
+        let length = self.decode_field_source_int(length_source);
+        let stop = start.wrapping_add(length);
+        self.allocator.os_uni_slice(str, start, stop)
+    }
+
+    /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`
+    /// dispatcher: forwards to `setarrayitem_ref` /
+    /// `setarrayitem_float` / `setarrayitem_int` based on the live
+    /// `arraydescr.is_array_of_pointers()` / `is_array_of_floats()`
+    /// methods.  `fieldnum` is the resume.py-tagged value to decode.
+    pub fn setarrayitem(
+        &mut self,
+        array: i64,
+        index: usize,
+        fieldnum: i16,
+        arraydescr: &majit_ir::DescrRef,
+    ) {
+        let ad = arraydescr
+            .as_array_descr()
+            .expect("resume.py:1009 setarrayitem requires ArrayDescr");
+        if ad.is_array_of_pointers() {
+            // resume.py:1011 self.bh_setarrayitem_gc_r(array, index, fieldnum, arraydescr)
+            let value = self.decode_ref(fieldnum);
+            self.allocator
+                .bh_setarrayitem_gc_r(array, index, value, arraydescr);
+        } else if ad.is_array_of_floats() {
+            // resume.py:1013 self.bh_setarrayitem_gc_f(array, index, fieldnum, arraydescr)
+            let value = self.decode_float(fieldnum);
+            self.allocator
+                .bh_setarrayitem_gc_f(array, index, value, arraydescr);
+        } else {
+            // resume.py:1015 self.bh_setarrayitem_gc_i(array, index, fieldnum, arraydescr)
+            let value = self.decode_int(fieldnum);
+            self.allocator
+                .bh_setarrayitem_gc_i(array, index, value, arraydescr);
         }
     }
 
@@ -6352,6 +6308,103 @@ impl<'a> ResumeDataDirectReader<'a> {
             // `offset` is the end of the float section; no further use.
             let _ = offset;
         }
+    }
+
+    /// Callback-driven sibling of `_prepare_next_section` — drives the
+    /// same `enumerate_vars(info, all_liveness, _callback_i/r/f)`
+    /// walk (`resume.py:1017-1026`) but lets the caller decide what to
+    /// do with each `(kind, reg_idx, value)` triple.  Three Rust
+    /// FnMut closures cannot share `&mut bh` simultaneously (E0524),
+    /// so the kind dispatch happens INSIDE the single closure rather
+    /// than across three separate ones.  The on-demand cranelift
+    /// deopt callback (Slice QQ-2) uses a closure that appends each
+    /// value to a flat `Vec<i64>` mirroring the recovery_layout
+    /// walker's `rebuilt` output.
+    pub fn _prepare_next_section_with(
+        &mut self,
+        info: usize,
+        mut cb: impl FnMut(majit_ir::Type, u32, i64),
+    ) {
+        use majit_translate::liveness::LivenessIterator;
+
+        // `self.all_liveness` is `&'a [u8]` — copying the reference does
+        // not borrow `self`, so the inner `self.next_*` calls below are
+        // free to take `&mut self`.
+        let all_liveness: &[u8] = self.all_liveness;
+
+        // jitcode.py:149-151 — three length bytes.
+        let length_i = all_liveness[info] as u32;
+        let length_r = all_liveness[info + 1] as u32;
+        let length_f = all_liveness[info + 2] as u32;
+        // jitcode.py:152
+        let mut offset = info + 3;
+
+        // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
+        if length_i != 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_int();
+                cb(majit_ir::Type::Int, reg_idx, value);
+            }
+            offset = it.offset;
+        }
+        // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
+        if length_r != 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_ref();
+                cb(majit_ir::Type::Ref, reg_idx, value);
+            }
+            offset = it.offset;
+        }
+        // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
+        if length_f != 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_float();
+                cb(majit_ir::Type::Float, reg_idx, value);
+            }
+            // `offset` is the end of the float section; no further use.
+            let _ = offset;
+        }
+    }
+
+    /// On-demand variant for cranelift's deopt path: walk the resume
+    /// tape section-by-section, append each decoded `(int|ref|float)`
+    /// value into a flat `Vec<i64>` (innermost-first concatenation,
+    /// matching the existing recovery_layout walker's `rebuilt`
+    /// output).  `resolve_jitcode` mirrors `resume.py:1339
+    /// jitcode = jitcodes[jitcode_pos]` and returns the per-PC
+    /// `op_live` byte that `BlackholeInterpreter::get_current_position_info`
+    /// uses to index `all_liveness`.
+    ///
+    /// Caller is expected to drive `prepare(rd_virtuals,
+    /// rd_guard_pendingfields)` + `consume_vref_and_vable` first per
+    /// `resume.py:1324-1325 blackhole_from_resumedata`.
+    pub fn consume_all_sections_into_vec(
+        &mut self,
+        resolve_jitcode: &dyn Fn(
+            i32,
+            i32,
+        )
+            -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
+        outputs: &mut Vec<i64>,
+    ) -> bool {
+        while !self.done_reading() {
+            // resume.py:1338-1340 read_jitcode_pos_pc.
+            let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
+            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
+                return false;
+            };
+            // `blackhole.rs:1435 get_current_position_info` parity —
+            // `jitcode.get_live_vars_info(position, op_live)` is the
+            // section info offset for the current PC.
+            let info = jitcode.get_live_vars_info(resolved_pc, op_live);
+            self._prepare_next_section_with(info, |_kind, _reg_idx, value| {
+                outputs.push(value);
+            });
+        }
+        true
     }
 
     /// resume.py:1386 consume_virtualref_info
@@ -6599,13 +6652,13 @@ impl<'a> ResumeDataDirectReader<'a> {
             .map_or(false, |ifd| ifd.field_descr().is_float_field());
         if is_pointer {
             let value = self.decode_field_source(source);
-            allocator.setinteriorfield_gc_r(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_r(array, index, value, descr);
         } else if is_float {
             let value = self.decode_field_source_float(source);
-            allocator.setinteriorfield_gc_f(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_f(array, index, value, descr);
         } else {
             let value = self.decode_field_source_int(source);
-            allocator.setinteriorfield_gc_i(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_i(array, index, value, descr);
         }
     }
 

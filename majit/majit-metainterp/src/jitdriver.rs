@@ -1,6 +1,9 @@
 use majit_backend::ExitValueSourceLayout;
 
-/// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
+/// `resume.py:993-1007 _prepare_pendingfields` parity for the bridge /
+/// deopt path — replay deferred SetfieldGc / SetarrayitemGc writes
+/// via descr-method dispatch (`resume.py:1509-1518` setfield,
+/// `resume.py:1531-1541` setarrayitem_int / _ref / _float).
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
     let Some(ref recovery) = exit_layout.recovery_layout else {
         return;
@@ -21,21 +24,34 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
         if struct_ptr.is_null() {
             continue;
         }
-        // Virtualizable field offsets from descriptor index encoding:
-        // 0x8000_0003 = head (offset 0), 0x8000_0004 = size (offset 8)
-        let (offset, size) = match pf.descr_index {
-            idx if idx & 0x8000_0000 != 0 => match idx {
-                0x8000_0003 => (0, 8),
-                0x8000_0004 => (8, 8),
-                _ => continue,
-            },
-            idx => ((idx >> 2) as usize, 8),
+        // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
+        // RPython — fail loud if it's missing, the entry cannot be
+        // replayed without it.
+        let descr = pf
+            .descr
+            .as_ref()
+            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+        let (offset, size) = if pf.is_array_item {
+            let ad = descr
+                .as_array_descr()
+                .expect("setarrayitem pending field must carry an ArrayDescr");
+            let item_index = pf
+                .item_index
+                .expect("setarrayitem pending field must carry an item_index");
+            (ad.base_size() + item_index * ad.item_size(), ad.item_size())
+        } else {
+            let fd = descr
+                .as_field_descr()
+                .expect("setfield pending field must carry a FieldDescr");
+            (fd.offset(), fd.field_size())
         };
         unsafe {
             let p = struct_ptr.add(offset);
             match size {
                 8 => *(p as *mut i64) = value,
                 4 => *(p as *mut i32) = value as i32,
+                2 => *(p as *mut i16) = value as i16,
+                1 => *(p as *mut u8) = value as u8,
                 _ => {}
             }
         }
@@ -3629,14 +3645,15 @@ impl<S: JitState> JitDriver<S> {
     /// `resume_pc` is where interpretation resumes after the guard failure.
     pub fn start_bridge_tracing(
         &mut self,
-        // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
-        // threads the descr (`resumedescr`) as the canonical bridge-source
-        // identity.  The pyre backend FailDescr Arc plays the same role —
-        // `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
-        // `arc.fail_index_per_trace()` are the line-by-line readers — so
-        // start_bridge_tracing now consumes the descr Arc directly and
-        // derives the legacy surrogate triple internally.
-        descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+        // `pyjitpl.py:2890 handle_guard_failure(self, resumedescr,
+        // deadframe)` threads the descr (`resumedescr`) as the
+        // canonical bridge-source identity.  The descr Arc returned by
+        // `cpu.get_latest_descr` (`history.py:125`) plays the same role
+        // — `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
+        // `arc.fail_index_per_trace()` are the line-by-line readers.
+        // Pyre threads `Arc<dyn Descr>` and obtains the `FailDescr`
+        // facet via `as_fail_descr()` (sub-trait of `Descr`).
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         state: &mut S,
         env: &S::Env,
         raw_fail_values: &[i64],
@@ -3645,13 +3662,17 @@ impl<S: JitState> JitDriver<S> {
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by
-        // returning false.
-        let Some(jct) = majit_backend::descr_owning_jct(descr_arc.as_ref()) else {
+        // returning false; also returns false if the descr is not a
+        // FailDescr at all (e.g. a synthetic terminal-exit Descr).
+        let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            return false;
+        };
+        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
             return false;
         };
         let green_key = jct.green_key;
-        let trace_id = descr_arc.trace_id();
-        let fail_index = descr_arc.fail_index_per_trace();
+        let trace_id = descr_fd.trace_id();
+        let fail_index = descr_fd.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return false;
         };

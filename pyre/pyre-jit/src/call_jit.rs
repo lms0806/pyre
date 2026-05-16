@@ -1791,8 +1791,11 @@ fn jit_blackhole_resume_from_guard(
     let (driver, _) = crate::eval::driver_pair();
     let backend = driver.meta_interp().backend();
     let descr_arc = backend.fail_descr_arc_from_addr(descr_addr);
-    let trace_id = descr_arc.trace_id();
-    let fail_index = descr_arc.fail_index_per_trace();
+    let descr_fd = descr_arc
+        .as_fail_descr()
+        .expect("fail_descr_arc_from_addr returned non-FailDescr");
+    let trace_id = descr_fd.trace_id();
+    let fail_index = descr_fd.fail_index_per_trace();
 
     // `descr_owning_jct == None` is the giveup signal: the descr's
     // `rd_loop_token.loop_token_wref()` is dead (memmgr-evicted JCT —
@@ -1816,20 +1819,19 @@ fn jit_blackhole_resume_from_guard(
     // Phase E.3+ unification (Task #235) replaces `(green_key, trace_id,
     // fail_index)` keying with descr identity — at which point this
     // whole recovery block collapses.
-    let actual_green_key =
-        match majit_backend::descr_owning_jct(descr_arc.as_ref()).map(|j| j.green_key) {
-            Some(gk) => gk,
-            None if num_fail_values >= 1 => {
-                let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
-                if !frame_ptr.is_null() {
-                    let code = unsafe { (*frame_ptr).pycode };
-                    crate::eval::make_green_key(code, 0)
-                } else {
-                    0
-                }
+    let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
+        Some(gk) => gk,
+        None if num_fail_values >= 1 => {
+            let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
+            if !frame_ptr.is_null() {
+                let code = unsafe { (*frame_ptr).pycode };
+                crate::eval::make_green_key(code, 0)
+            } else {
+                0
             }
-            None => 0,
-        };
+        }
+        None => 0,
+    };
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -2281,11 +2283,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// `resume_in_blackhole`.  Pyre's caller signals the same intent by
 /// returning `false` to drop into blackhole resume.
 fn bridge_source_identity_from_descr(
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
 ) -> Option<(u64, u64, u32)> {
-    let green_key = majit_backend::descr_owning_jct(descr_arc.as_ref())?.green_key;
-    let trace_id = descr_arc.trace_id();
-    let fail_index = descr_arc.fail_index_per_trace();
+    let descr_fd = descr_arc.as_fail_descr()?;
+    let green_key = majit_backend::descr_owning_jct(descr_fd)?.green_key;
+    let trace_id = descr_fd.trace_id();
+    let fail_index = descr_fd.fail_index_per_trace();
     Some((green_key, trace_id, fail_index))
 }
 
@@ -2324,7 +2327,7 @@ pub fn trace_and_compile_from_bridge(
     // backends the `Backend::fail_descr_arc_from_addr` registry), so the
     // surrogate `(green_key, trace_id, fail_index)` parameters retired
     // in T-final.B.
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
@@ -2596,7 +2599,7 @@ fn jit_ca_handle_guard_failure(
     // on a registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
     // (warmspot.py:1021) which has no failure mode.  T-final.B made
     // `trace_and_compile_from_bridge` itself descr-only.
-    let descr_arc = {
+    let descr_arc: std::sync::Arc<dyn majit_ir::Descr> = {
         use majit_backend::Backend;
         let (driver, _) = crate::eval::driver_pair();
         driver
@@ -3784,6 +3787,182 @@ pub extern "C" fn bh_get_current_exception() -> i64 {
 /// exception becomes current).
 pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+}
+
+/// On-demand resume callback (Slice QQ-2, pyre-jit side).  Registered
+/// into cranelift via `register_resumedata_deopt` (eval.rs:init_callbacks)
+/// and called from the six `recovery_layout_ref()` consumer sites
+/// once they migrate off the pre-baked `ExitRecoveryLayout` cache
+/// (Slice QQ-3+).
+///
+/// PyPy parity target: `pyjitpl.py:3424
+/// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
+/// drives `resume.rebuild_from_resumedata` to materialise virtuals +
+/// replay pending fields from `rd_numb` / `rd_consts` / `rd_virtuals` /
+/// `rd_pendingfields` carried on the `ResumeGuardDescr`.
+///
+/// `outputs` enters carrying the failing-guard fail_args (the JITed
+/// exit code stored them).  We treat that as the `deadframe` input to
+/// the decoder and replace `*outputs` with the per-section
+/// concatenation that the recovery_layout walker produced before
+/// (innermost-first per `compiler.rs:1481` `recovery.frames.iter().rev()`).
+///
+/// Implementation lives in `call_jit.rs` rather than `eval.rs` because
+/// `pyre-jit-trace`'s build.rs:66 reads `eval.rs` through the JIT
+/// translator's RPython subset, which rejects the trait-object
+/// downcast pattern used here.
+#[cfg(feature = "cranelift")]
+pub fn cranelift_resumedata_deopt(
+    descr_addr: usize,
+    outputs: &mut Vec<i64>,
+    types: &[majit_ir::Type],
+    _bridge_num_inputs: usize,
+) -> bool {
+    use majit_backend::Backend;
+    use majit_metainterp::resume;
+
+    // 1. Recover descr Arc.
+    let (driver, driver_vinfo) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let descr = backend.fail_descr_arc_from_addr(descr_addr);
+
+    // 2. Downcast to ResumeGuardDescr.  Synthetic FINISH /
+    //    ExitFrameWithException / external-JUMP descrs have no `rd_*`
+    //    payload upstream (compile.py:624-662) — they short-circuit
+    //    here.  Callers fall back to the recovery_layout walker for
+    //    these until the synthetic construction path is restructured.
+    let Some(any) = descr.as_any() else {
+        return false;
+    };
+    let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
+        return false;
+    };
+
+    // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
+    let Some(rd_numb) = rgd.payload.rd_numb() else {
+        return false;
+    };
+    if rd_numb.is_empty() {
+        return false;
+    }
+    let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
+    let rd_virtuals_rcs = rgd.payload.rd_virtuals();
+    let rd_pendingfields = rgd.payload.rd_pendingfields();
+
+    // 4. resume.py:983-991 _prepare_virtuals — convert RdVirtualInfo →
+    //    VirtualInfo so the decoder can materialise lazily.
+    let count = outputs.len() as i32;
+    let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals_rcs.map(|rcs| {
+        rcs.iter()
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .collect()
+    });
+    let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+
+    // 5. Construct ResumeDataDirectReader.  `outputs` enters as the
+    //    deadframe (the JITed exit code stored fail_args here).
+    //    Snapshot all_liveness once so the slice outlives the reader.
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+    let deadframe: Vec<i64> = outputs.clone();
+    let allocator = crate::eval::PyreBlackholeAllocator;
+    let mut reader = resume::ResumeDataDirectReader::new(
+        rd_numb,
+        rd_consts,
+        &all_liveness,
+        &deadframe,
+        Some(types),
+        None,
+        &allocator,
+    );
+
+    // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
+    //    consume the vref + vable sections that precede the per-frame
+    //    sections.
+    reader.prepare(rd_virtuals_slice, rd_pendingfields);
+    let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None);
+
+    // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
+    //    blackhole_resume_via_rd_numb's resolve_jitcode (line 1891),
+    //    but returns the (jitcode, pc, op_live) triple
+    //    consume_all_sections_into_vec needs to compute the per-section
+    //    liveness offset.
+    let (op_live_i32, _op_catch_exception, _op_rvmprof_code) =
+        pyre_jit_trace::state::blackhole_control_opcodes();
+    // op_live is the `-live-` opcode byte that JitCode::get_live_vars_info
+    // (translate/jit_codewriter/jitcode.rs:477) uses to skip past the
+    // op header.  state.rs returns it as i32 for the
+    // `setup_cached_control_opcodes` API; we narrow here.  A negative
+    // or out-of-range value means the control opcodes were not set up,
+    // which would break the per-section walk — short-circuit to the
+    // recovery_layout fallback instead.
+    if op_live_i32 < 0 || op_live_i32 > 255 {
+        return false;
+    }
+    let op_live = op_live_i32 as u8;
+    let resolve_jitcode = |jitcode_index: i32,
+                           pc: i32|
+     -> Option<(
+        std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+        usize,
+        u8,
+    )> {
+        if pc < 0 {
+            return None;
+        }
+        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        if pyjitcode.has_abort_opcode() {
+            return None;
+        }
+        let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        Some((pyjitcode.jitcode.clone(), jitcode_pc, op_live))
+    };
+
+    // 8. Drive the per-section consume loop, appending decoded values
+    //    into a fresh rebuilt vec.  Mirrors the
+    //    `rebuild_state_after_failure(outputs, types, recovery)` walker:
+    //    innermost-first concatenation of (i, r, f) sections.
+    let mut rebuilt: Vec<i64> = Vec::with_capacity(outputs.len());
+    if !reader.consume_all_sections_into_vec(&resolve_jitcode, &mut rebuilt) {
+        // resolve_jitcode failure — leave outputs as-is so the
+        // recovery_layout fallback path can take over.
+        return false;
+    }
+
+    // 9. Replace outputs with rebuilt.
+    *outputs = rebuilt;
+    true
+}
+
+/// Path 1 Slice 1 — pyre-jit side of the on-demand
+/// `ExitRecoveryLayout` reconstruction callback registered into
+/// cranelift via `register_recovery_layout` (eval.rs:init_callbacks).
+/// Used by `CraneliftFailDescr::recovery_layout_ref` to derive the
+/// layout from the metainterp-side `StoredExitLayout.resume_layout`
+/// summary instead of reading the
+/// `ResumeGuardDescr.recovery_layout` cache (Path 1 epic — eliminate
+/// the cache so the meta-side slot can be deleted).
+///
+/// Returns `None` for synthetic descrs (FINISH / external-JUMP /
+/// overlay) without a `ResumeGuardDescr` meta_descr or for descrs
+/// whose `compiled_loops` entry has been evicted; callers fall back
+/// to the meta-side slot read (current behaviour) until Slice 3
+/// deletes the slot entirely.
+#[cfg(feature = "cranelift")]
+pub fn cranelift_recovery_layout_for_descr(
+    descr_addr: usize,
+    caller_prefix: Option<&majit_backend::ExitRecoveryLayout>,
+) -> Option<majit_backend::ExitRecoveryLayout> {
+    use majit_backend::Backend;
+
+    let (driver, _) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let descr = backend.fail_descr_arc_from_addr(descr_addr);
+    let fd = descr.as_fail_descr()?;
+    driver
+        .meta_interp()
+        .compute_recovery_layout_for_descr(fd, caller_prefix)
 }
 
 #[cfg(test)]

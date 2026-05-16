@@ -6,15 +6,19 @@
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
 ///
-/// # TODO: migrate `descr_index: u32` → `descr: DescrRef` on ResOperation
+/// # TODO: migrate `descr_index: u32` → `descr: DescrRef` on resume metadata
 ///
 /// **Deviation.** RPython's `ResOperation` carries `Arc<dyn Descr>`
 /// directly (`history.py:95 AbstractDescr`); identity is pointer
-/// comparison via `op.getdescr() is other.getdescr()`. Pyre stores a
-/// `descr_index: u32` pool handle (resoperation.rs:100/112/121/130/139)
-/// and resolves it through `pool.resolve(idx)`. The pool canonicalizes
-/// per-LLType so `u32` equality is identity-equivalent to RPython's
-/// pointer equality, but the indirection layer is pyre-only.
+/// comparison via `op.getdescr() is other.getdescr()`.  Pyre's
+/// resume-metadata structs (`RdVirtualInfo` variants at
+/// resoperation.rs:436/448/457/466/475, `GuardPendingFieldEntry` at
+/// resoperation.rs:784) carry a `descr_index: u32` alongside `descr:
+/// Option<DescrRef>` for serialization sinks
+/// (`ExitVirtualLayout` / `ExitPendingFieldLayout` /
+/// `PendingFieldLayoutSummary`).  The pool canonicalises per-LLType so
+/// `u32` equality is identity-equivalent to RPython's pointer
+/// equality, but the indirection layer is pyre-only.
 ///
 /// **When to fix.** When the build-time `opcode_insns.bin`
 /// determinism guarantee no longer needs to come from a `u32` pool
@@ -22,11 +26,12 @@
 /// or when an upstream pass requires in-place descr mutation that the
 /// pool indirection blocks.
 ///
-/// **How to fix.** (1) Replace `descr_index: u32` with `descr:
-/// DescrRef` in every `OpKind` variant in `resoperation.rs`. (2) Drop
-/// `pool.resolve(idx)` call sites; consumers read `op.descr` directly.
-/// (3) Stand up a stable-id registry that takes over the pool's
-/// trace-dump / serialization determinism role. (4) Audit for new Arc
+/// **How to fix.** (1) Switch identity `PartialEq` comparisons in
+/// `RdVirtualInfo` / `GuardPendingFieldEntry` from `descr_index` to
+/// `Arc::ptr_eq` on the carried `descr` Arcs (PyPy `id(descr)`
+/// parity).  (2) Keep `descr_index` as a pure serialization handle
+/// (downstream `ExitVirtualLayout` / `ExitPendingFieldLayout` still
+/// need a stable `u32` for trace-dump replay).  (3) Audit for Arc
 /// cycle risk between IR ops and the descr graph (FieldDescr →
 /// SizeDescr, CallDescr → effectinfo's field/array descr lists).
 use std::collections::HashMap;
@@ -1274,7 +1279,11 @@ pub trait FailDescr: Descr {
 
     /// history.py:470 TargetToken descriptor identifying the JUMP target.
     /// Present only when `is_external_jump()` is true.
-    fn target_descr(&self) -> Option<&DescrRef> {
+    ///
+    /// Returns an owned `DescrRef` (cloned `Arc`) — Session 5i-cl moved
+    /// the cranelift implementation to a backend-static side-table that
+    /// cannot hand out a borrow under a lock.
+    fn target_descr(&self) -> Option<DescrRef> {
         None
     }
 
@@ -1357,9 +1366,8 @@ pub trait FailDescr: Descr {
     /// `compile.py:185 isinstance(descr, ResumeDescr)` and never receive
     /// a clt stamp.  `ResumeGuardDescr` (and subclasses) override this to
     /// return the captured `Arc<CompiledLoopToken>`; the bridge-source
-    /// path consumes the metainterp ResumeGuardDescr Arc directly
-    /// (Unified-Descr Port Epic, Session 6.7) so no proxy override is
-    /// needed.
+    /// path consumes the metainterp `AbstractFailDescr` Arc directly so
+    /// no proxy override is needed.
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         None
     }
@@ -1377,43 +1385,56 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Backend-specific extension slot.
+    /// `history.py:132` `AbstractFailDescr._attrs_ = ('adr_jump_offset',
+    /// 'rd_locs', 'rd_loop_token', 'rd_vector_info')`.
     ///
-    /// In RPython the same `ResumeGuardDescr` object carries both the
-    /// metainterp-side fields (`rd_numb`, `rd_consts`, `rd_virtuals`,
-    /// `rd_pendingfields`, `status`, `rd_loop_token`) at compile.py:855
-    /// + compile.py:186 *and* the backend-stored fields (`rd_locs`,
-    /// `adr_jump_offset`, `fail_arg_locs`) that
-    /// `llsupport/assembler.py:279` and `x86/assembler.py:857` write
-    /// directly through Python's dynamic attribute model.  The Rust
-    /// direct translation uses a type-erased `Box<dyn Any + Send + Sync>`
-    /// slot the backend fills with a backend-specific struct
-    /// (e.g. `DynasmGuardData`, `CraneliftGuardData`) at compile time.
-    /// Callers downcast through `downcast_ref::<T>()` on the returned
-    /// reference.
+    /// `assembler.py:966` `tok.faildescr.adr_jump_offset = addr` — the
+    /// address in compiled code where the guard's conditional jump
+    /// offset is stored.  `assembler.py:987` `faildescr.adr_jump_offset
+    /// = 0` after `patch_jump_for_descr` redirects the guard to a
+    /// bridge ("0 means patched").
     ///
-    /// Default `None` — non-resume FailDescrs (`_DoneWithThisFrameDescr`
-    /// family, `ExitFrameWithExceptionDescrRef`) never go through the
-    /// backend-codegen path that populates this slot, mirroring how
-    /// upstream's `assembler.py:279 guardtok.faildescr.rd_locs =
-    /// positions` only fires for `ResumeGuardDescr`-family descrs.
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        None
+    /// Default `0` — every `AbstractFailDescr` instance has the slot
+    /// (`_attrs_`), but only `ResumeGuardDescr`-family guards reach the
+    /// backend codegen path that stamps it via
+    /// `patch_pending_failure_recoveries` (`assembler.py:849`).
+    fn adr_jump_offset(&self) -> usize {
+        0
     }
 
-    /// Setter for the backend extension slot. Default panics — only
-    /// `ResumeGuardDescr` and its subtypes (`ResumeAtPositionDescr`,
-    /// `ResumeGuardForcedDescr`, `ResumeGuardExcDescr`,
-    /// `ResumeGuardCopiedDescr`, `ResumeGuardCopiedExcDescr`,
-    /// `CompileLoopVersionDescr`) accept it. Implementations replace
-    /// any prior `Box` in place — the descr identity (Arc address,
-    /// fail_index, status, subtype tag) survives the write.
-    fn set_backend_data(&self, _data: Box<dyn std::any::Any + Send + Sync>) {
+    /// `assembler.py:966,987` write side.  Default panics — non-`ResumeDescr`
+    /// FailDescrs (`DoneWithThisFrame*`, `ExitFrameWithExceptionDescrRef`,
+    /// `PropagateExceptionDescr`) never go through
+    /// `patch_pending_failure_recoveries` and so never receive a stamp.
+    fn set_adr_jump_offset(&self, _offset: usize) {
         panic!(
-            "set_backend_data invoked on a FailDescr that does not \
-             carry a backend_data slot (compile.py:186 + \
-             llsupport/assembler.py:279,857: only ResumeGuardDescr-family \
-             descrs receive backend extension data)"
+            "set_adr_jump_offset invoked on a FailDescr that does not \
+             carry the AbstractFailDescr.adr_jump_offset slot \
+             (history.py:132 — only ResumeGuardDescr-family guards \
+             reach assembler.py:849 patch_pending_failure_recoveries)"
+        );
+    }
+
+    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` —
+    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
+    /// positions` writes the per-fail-arg jitframe slot positions as a
+    /// `Vec<u16>`.  `llsupport/llmodel.py:424 descr.rd_locs[index] *
+    /// WORD` reads to compute the absolute jitframe offset during
+    /// `get_value_direct`.
+    ///
+    /// Default `&[]` — every `AbstractFailDescr` instance has the slot,
+    /// empty by default; populated by
+    /// `llsupport/assembler.py:225 write_failure_recovery_description`.
+    fn rd_locs(&self) -> &[u16] {
+        &[]
+    }
+
+    /// `llsupport/assembler.py:279` write side.  Default panics — only
+    /// `ResumeGuardDescr`-family guards reach this writer.
+    fn set_rd_locs(&self, _locs: Vec<u16>) {
+        panic!(
+            "set_rd_locs invoked on a FailDescr that does not carry \
+             the AbstractFailDescr.rd_locs slot (history.py:132)"
         );
     }
 
@@ -1426,25 +1447,43 @@ pub trait FailDescr: Descr {
     }
 
     /// Exit slot indices that carry opaque force-token handles.
-    fn force_token_slots(&self) -> &[usize] {
-        &[]
+    ///
+    /// Returns owned `Vec<usize>` (cloned per call) — Session 5i-cl moved
+    /// the cranelift implementation to `FORCE_TOKEN_SLOTS_TABLE`, a
+    /// backend-static side-table that cannot hand out a borrow under a
+    /// lock.
+    fn force_token_slots(&self) -> Vec<usize> {
+        Vec::new()
     }
 
-    /// compile.py:741-745: read status for must_compile.
+    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
+    /// — packs `ST_BUSY_FLAG` + type tag + hash on the resume-guard
+    /// descr.  `compile.py:741-745` `self.status` read for
+    /// `must_compile`.
     fn get_status(&self) -> u64 {
         0
     }
 
-    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    /// `compile.py:786-788` `start_compiling — self.status |=
+    /// ST_BUSY_FLAG`.
     fn start_compiling(&self) {}
 
-    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    /// `compile.py:790-795` `done_compiling — self.status &=
+    /// ~ST_BUSY_FLAG`.
     fn done_compiling(&self) {}
 
-    /// compile.py:750: check ST_BUSY_FLAG.
+    /// `compile.py:750` check `ST_BUSY_FLAG`.
     fn is_compiling(&self) -> bool {
         false
     }
+
+    /// `compile.py:826-830` `store_hash(metainterp_sd)` — write the
+    /// jitcounter hash bits (status with `ST_SHIFT_MASK` applied).
+    fn store_hash(&self, _hash: u64) {}
+
+    /// `compile.py:813-824` `make_a_counter_per_value(op, index)` —
+    /// pack `type_tag | (index << ST_SHIFT)` into status.
+    fn make_a_counter_per_value(&self, _index: u32, _type_tag: u64) {}
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.

@@ -31,7 +31,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -46,7 +46,7 @@ use crate::jitdriver::JitDriverStaticData;
 use crate::optimizeopt::snapshot_get;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
 use crate::resume::{
-    MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData,
+    MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
 };
 use crate::trace_ctx::TraceCtx;
@@ -1278,6 +1278,43 @@ impl<M: Clone> MetaInterp<M> {
     #[cfg(test)]
     pub fn compiled_root_trace_id(&self, green_key: u64) -> Option<u64> {
         self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
+    }
+
+    /// Path 1 Slice 1: on-demand `ExitRecoveryLayout` reconstruction for
+    /// the cranelift overlay path.  Returns the `ExitRecoveryLayout` that
+    /// would be cached on `ResumeGuardDescr.recovery_layout` for a given
+    /// production guard, computed from the metainterp-side
+    /// `StoredExitLayout.resume_layout` (the canonical store).  Caller
+    /// supplies `caller_prefix` for CALL_ASSEMBLER overlay framing.
+    ///
+    /// Lookup path: descr → `rd_loop_token_clt()` → `CompiledLoopToken`
+    /// → `loop_token_wref.upgrade()` → `JitCellToken.green_key` →
+    /// `compiled_loops[green_key].traces[trace_id].exit_layouts[fail_index]`.
+    ///
+    /// Returns `None` for non-`ResumeDescr` descrs (synthetic FINISH /
+    /// external-JUMP / Done* / overlay synthetics with no `rd_loop_token`),
+    /// or when the descr's compiled entry has been evicted, or when the
+    /// `resume_layout` summary hasn't been built yet (codegen-time read
+    /// before metainterp publishes resume payload).
+    pub fn compute_recovery_layout_for_descr(
+        &self,
+        descr: &dyn FailDescr,
+        caller_prefix: Option<&majit_backend::ExitRecoveryLayout>,
+    ) -> Option<majit_backend::ExitRecoveryLayout> {
+        let trace_id = descr.trace_id();
+        let fail_index = descr.fail_index_per_trace();
+        let clt_any = descr.rd_loop_token_clt()?;
+        let clt = clt_any.downcast_ref::<majit_backend::CompiledLoopToken>()?;
+        let token_arc = clt.loop_token_wref.lock().upgrade()?;
+        let green_key = token_arc.green_key;
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let exit_layout = compiled
+            .traces
+            .get(&trace_id)?
+            .exit_layouts
+            .get(&fail_index)?;
+        let resume_layout = exit_layout.resume_layout.as_ref()?;
+        Some(resume_layout.to_exit_recovery_layout_with_caller_prefix(caller_prefix))
     }
 
     /// Salvage the evicted entry's per-trace metadata into the new
@@ -4481,7 +4518,6 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -5311,7 +5347,6 @@ impl<M: Clone> MetaInterp<M> {
                     &combined_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -5805,7 +5840,6 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -6172,7 +6206,6 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -6440,7 +6473,9 @@ impl<M: Clone> MetaInterp<M> {
             .execute_token_ints(&compiled.token, live_values);
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = &*descr_arc;
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -6593,7 +6628,9 @@ impl<M: Clone> MetaInterp<M> {
         // assembler_call_helper (called from compiled code). No deferred queue.
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = &*descr_arc;
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -7193,13 +7230,10 @@ impl<M: Clone> MetaInterp<M> {
             // ```
             // The metainterp-side ResumeGuardDescr (this `descr`, carried
             // on `op.descr` in the IR) is the canonical RPython location
-            // of `rd_loop_token`. Phase A/B previously stamped only the
-            // backend descr because `cpu.get_latest_descr()` returns the
-            // backend object; with Phase E foundation in place
-            // (E.1 backend_data slot, E.2/E.5 backend stamp on op.descr,
-            // E.3-prereq keepalive) the same stamp now also lands on the
-            // metainterp descr — closing the deviation called out in
-            // mod.rs:632/729 audit.
+            // of `rd_loop_token`.  An earlier split-descr era stamped only
+            // the backend descr because `cpu.get_latest_descr()` returned
+            // the backend object; the Unified-Descr migration routes the
+            // stamp to the metainterp descr instead.
             //
             // Also push the metainterp ResumeGuardDescr Arc onto the
             // JitCellToken keepalive so it outlives the IR Loop drop
@@ -7524,13 +7558,16 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
         &mut self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
         fallback_green_key: u64,
     ) -> (bool, u64) {
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
-        let trace_id = descr_arc.trace_id();
-        let fail_index = descr_arc.fail_index_per_trace();
+        let descr_fd = descr_arc
+            .as_fail_descr()
+            .expect("must_compile_with_values: descr_arc must be a FailDescr");
+        let trace_id = descr_fd.trace_id();
+        let fail_index = descr_fd.fail_index_per_trace();
         // compile.py:725 `_trace_and_compile_from_bridge` walks
         // `resumedescr.rd_loop_token.loop_token_wref()` for the owning
         // JCT.  When the weakref is dead (memmgr eviction —
@@ -7539,7 +7576,7 @@ impl<M: Clone> MetaInterp<M> {
         // outer entry key.  RPython doesn't have this fallback because
         // its identity is descr-pointer-based, never indirected through
         // a numeric `green_key`.
-        let owning_key = majit_backend::descr_owning_jct(descr_arc.as_ref())
+        let owning_key = majit_backend::descr_owning_jct(descr_fd)
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
@@ -7744,22 +7781,16 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // `warmspot.py:1022` `cpu.get_latest_descr(deadframe)` parity:
-        // when `op.descr` is unavailable (synthetic / cut-tentative ops,
-        // post-retrace stale traces) the backend still owns the live
-        // FailDescr Arc — it's the same identity pyre's runtime guard-
-        // failure helpers received as `descr_addr` and the same identity
-        // PyPy's deadframe carries.  Walk the current token first, then
-        // `previous_tokens` (matches `bridge_was_compiled`'s chain at
-        // mod.rs:7710).
-        //
-        // Empirically (epic #236 Slice E, 2026-05-05) this fallback
-        // fires zero times across nbody / fannkuch / fib_recursive /
-        // raise_catch_loop / spectral_norm × {dynasm, cranelift};
-        // current production benchmarks always carry a live `op.descr`
-        // at the lookup.  The fallback is kept as defensive RPython
-        // parity for the split-descr period — Phase E.3+ unification
-        // will eventually collapse both paths back to a single
-        // ResumeGuardDescr identity.
+        // when `op.descr` is unavailable on the primary path (post-retrace
+        // exit_layouts eviction, synthetic / cut-tentative ops) the
+        // backend still owns the live FailDescr Arc via its per-token
+        // `fail_descrs` vec — same identity pyre's runtime guard-failure
+        // helpers received as `descr_addr` and the same identity PyPy's
+        // deadframe carries.  Walk the current token first, then
+        // `previous_tokens` (matches `bridge_was_compiled`).  The full
+        // Unified-Descr identity flip (jf_descr embedding the meta Arc
+        // address) is the structural fix that lets this fallback retire;
+        // until then it covers exit_layouts eviction.
         if let Some(descr) =
             self.backend
                 .compiled_bridge_descr_arc(&compiled.token, trace_id, fail_index)
@@ -8237,7 +8268,6 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     original_green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     bridge_inputargs,
@@ -8751,6 +8781,15 @@ impl<M: Clone> MetaInterp<M> {
                     optimized_ops.len()
                 );
             }
+            // Slice QQ-7: source guard's recovery_layout is read from
+            // the metainterp's `StoredExitLayout` cache (per-trace,
+            // keyed by per-trace fail_index) and passed to the backend
+            // so the backend doesn't need a descr-side cache.
+            let caller_recovery_layout = compiled
+                .traces
+                .get(&fail_descr.trace_id())
+                .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
+                .and_then(|sl| sl.recovery_layout.clone());
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
@@ -8758,6 +8797,7 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     &source_jct,
                     previous_tokens,
+                    caller_recovery_layout.as_ref(),
                 )
             })) {
                 Ok(r) => r,
@@ -8820,7 +8860,6 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                         green_key,
                         &compiled_constant_types,
-                        self.callinfocollection.as_deref(),
                     );
                     let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                         bridge_inputargs,
@@ -13086,11 +13125,11 @@ pub enum DetailedDriverRunOutcome {
         fail_index: u32,
         trace_id: u64,
         /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
-        /// backend-side guard descr recovered from the failing frame.
-        /// Pyre currently has split metainterp/backend descr objects;
-        /// this Arc is the runtime descr whose `rd_loop_token_clt` and
-        /// `fail_index_per_trace` mirror the metainterp guard descr.
-        descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
+        /// runtime descr Arc returned by `Backend::get_latest_descr_arc`,
+        /// preferring the metainterp `AbstractFailDescr` reached
+        /// through `meta_descr`.  Consumers call `descr_arc.as_fail_descr()`
+        /// to access `rd_loop_token_clt` / `fail_index_per_trace`.
+        descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         /// compile.py:702: must_compile() result.
         should_bridge: bool,
         /// compile.py: rd_loop_token — owning compiled loop key.
@@ -17688,6 +17727,7 @@ mod tests {
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     fn patch_dynasm_fail_descr_resume_data(
+        backend: &majit_backend_dynasm::runner::DynasmBackend,
         token: &std::sync::Arc<JitCellToken>,
         fail_index: u32,
         rd_numb: Vec<u8>,
@@ -17705,46 +17745,28 @@ mod tests {
             .expect("compiled token")
             .downcast_mut::<DynasmCompiledCode>()
             .expect("dynasm compiled code");
-        let descr = compiled
+        let descr_ref = compiled
             .fail_descrs
-            .iter_mut()
-            .find(|descr| descr.fail_index == fail_index)
+            .iter()
+            .find(|descr| {
+                descr
+                    .as_fail_descr()
+                    .map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
+            })
             .expect("fail descr");
-        // Session 5b: rd_* now forward through `meta_descr` to the
-        // metainterp ResumeGuardDescr Arc.  Test fixtures synthesise
-        // DynasmFailDescr without going through the assembler, so they
-        // have no meta_descr.  Mint a fresh metainterp ResumeGuardDescr
-        // (carries the rd_* setters) and stamp it as the back-pointer.
-        let descr = unsafe {
-            &mut *(std::sync::Arc::as_ptr(descr)
-                as *mut majit_backend_dynasm::guard::DynasmFailDescr)
-        };
-        if descr.meta_descr.is_none() {
-            let meta = crate::compile::make_resume_guard_descr_typed(descr.fail_arg_types.clone());
-            // `DynasmFailDescr::trace_id()` (`guard.rs:380-392`) forwards
-            // through `meta_resume_fd().trace_id()` whenever a meta_descr
-            // is attached and falls back to the backend-local
-            // `self.trace_id` field only when meta_descr is absent.
-            // `make_resume_guard_descr_typed` initialises trace_id to 0
-            // (`compile.rs:3425`); without copying the backend-local
-            // trace_id over, the freshly-stamped meta_descr would mask
-            // the descr's real trace_id and break `(trace_id, fail_index)`
-            // lookups in `try_find_descr`.
-            if let Some(meta_fd) = meta.as_fail_descr() {
-                meta_fd.set_trace_id(descr.trace_id);
-            }
-            descr.meta_descr = Some(meta);
-        }
-        let meta_fd = descr
-            .meta_descr
-            .as_ref()
-            .unwrap()
+        // After backend struct deletion, the `fail_descrs` vec stores
+        // `Arc<ResumeGuardDescr>` directly (production guards use op.descr;
+        // test scaffolds where op.descr is None mint a fresh metainterp
+        // ResumeGuardDescr at codegen time).  Either way, the rd_* setters
+        // route through the FailDescr trait surface on the descr Arc.
+        let descr_fd = descr_ref
             .as_fail_descr()
-            .expect("metainterp descr must implement FailDescr");
-        meta_fd.set_rd_numb(Some(rd_numb));
-        meta_fd.set_rd_consts(Some(rd_consts));
-        meta_fd.set_rd_virtuals(Some(vec![]));
-        meta_fd.set_rd_pendingfields(Some(vec![]));
+            .expect("descr must implement FailDescr");
+        descr_fd.set_rd_numb(Some(rd_numb));
+        descr_fd.set_rd_consts(Some(rd_consts));
+        descr_fd.set_rd_virtuals(Some(vec![]));
+        descr_fd.set_rd_pendingfields(Some(vec![]));
+        backend.register_fail_descrs(&compiled.fail_descrs);
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
@@ -17791,7 +17813,13 @@ mod tests {
                 .compiled_loops
                 .get_mut(&green_key)
                 .expect("compiled entry");
-            patch_dynasm_fail_descr_resume_data(&entry.token, fail_index, rd_numb, vec![]);
+            patch_dynasm_fail_descr_resume_data(
+                &meta.backend,
+                &entry.token,
+                fail_index,
+                rd_numb,
+                vec![],
+            );
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
@@ -17900,13 +17928,8 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-            inputargs,
-            &ops,
-            green_key,
-            &HashMap::new(),
-            meta.callinfocollection.as_deref(),
-        );
+        let (mut resume_data, mut exit_layouts) =
+            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
         let mut terminal_exit_layouts =
             compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
@@ -18193,7 +18216,8 @@ mod tests {
                 .get_mut(&green_key)
                 .expect("compiled entry");
             patch_dynasm_fail_descr_resume_data(
-                &mut entry.token,
+                &meta.backend,
+                &entry.token,
                 fail_index,
                 expected_rd_numb.clone(),
                 vec![],

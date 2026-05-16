@@ -928,7 +928,6 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         Some(majit_ir::RdVirtualInfo::VirtualInfo {
             descr: Some(descr.clone()),
             type_id: sd.map(|s| s.type_id()).unwrap_or(0),
-            descr_index: descr.index(),
             // resume.py:619 allocate_with_vtable(descr=self.descr) — the
             // vtable is derived from descr; majit mirrors by reading it
             // off the SizeDescr when the descr carries class info.
@@ -964,7 +963,6 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         Some(majit_ir::RdVirtualInfo::VStructInfo {
             typedescr: Some(typedescr.clone()),
             type_id: sd.map(|s| s.type_id()).unwrap_or(0),
-            descr_index: typedescr.index(),
             fielddescrs: built_fielddescrs,
             fieldnums: Vec::new(),
             descr_size: sd.map(|s| s.size()).unwrap_or(0),
@@ -982,18 +980,15 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
             })
             .unwrap_or(0);
         let ad = Some(arraydescr.clone());
-        let descr_index = arraydescr.index();
         Some(if clear {
             majit_ir::RdVirtualInfo::VArrayInfoClear {
                 arraydescr: ad,
-                descr_index,
                 kind,
                 fieldnums: Vec::new(),
             }
         } else {
             majit_ir::RdVirtualInfo::VArrayInfoNotClear {
                 arraydescr: ad,
-                descr_index,
                 kind,
                 fieldnums: Vec::new(),
             }
@@ -1042,7 +1037,6 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         let fielddescr_count = canonical_fielddescrs.len();
         Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr: Some(arraydescr.clone()),
-            descr_index: arraydescr.index(),
             size: length,
             fielddescrs: canonical_fielddescrs,
             fielddescr_indices: (0..fielddescr_count).map(|i| i as u32).collect(),
@@ -1120,6 +1114,10 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 
     // resume.py:347-351 visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
     fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo {
+        // resume.py:347-351 — visitor constructs the shell variant with
+        // no funcptr; the decoder looks up OS_STR_CONCAT / OS_UNI_CONCAT
+        // via `callinfocollection.funcptr_for_oopspec(...)` at
+        // materialization time (resume.py:1467-1468 / 1494-1495).
         Some(if is_unicode {
             majit_ir::RdVirtualInfo::VUniConcatInfo {
                 fieldnums: Vec::new(),

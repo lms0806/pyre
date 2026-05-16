@@ -437,7 +437,6 @@ pub enum RdVirtualInfo {
         descr: Option<crate::DescrRef>,
         /// descr.tid — GC type identifier for allocation dispatch.
         type_id: u32,
-        descr_index: u32,
         known_class: Option<i64>,
         fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
@@ -449,7 +448,6 @@ pub enum RdVirtualInfo {
         typedescr: Option<crate::DescrRef>,
         /// typedescr.tid — GC type identifier (cached for serialization).
         type_id: u32,
-        descr_index: u32,
         fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
         descr_size: usize,
@@ -458,7 +456,6 @@ pub enum RdVirtualInfo {
     VArrayInfoClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
@@ -467,7 +464,6 @@ pub enum RdVirtualInfo {
     VArrayInfoNotClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
@@ -476,7 +472,6 @@ pub enum RdVirtualInfo {
     VArrayStructInfo {
         /// resume.py:739 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         size: usize,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects.
         fielddescrs: Vec<crate::DescrRef>,
@@ -523,12 +518,20 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:781 `VStrConcatInfo` — virtual concatenation of two
-    /// strings. `fieldnums = [left, right]`.
+    /// strings. `fieldnums = [left, right]`. The OS_STR_CONCAT funcptr
+    /// is resolved at materialization time via
+    /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
+    /// (resume.py:1467-1468); the variant carries no funcptr itself.
     VStrConcatInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
-    /// `fieldnums = [largerstr, start, length]`.
+    /// `fieldnums = [largerstr, start, length]` (pyre stores `length`;
+    /// the backend reader converts to RPython's `(start, start + length)`
+    /// before calling the OS_STR_SLICE funcptr — see
+    /// `resume.py:1479` and `resume.rs::ResumeDataDirectReader::slice_string`).
+    /// OS_STR_SLICE funcptr is resolved via callinfocollection at
+    /// materialization time.
     VStrSliceInfo {
         fieldnums: Vec<i16>,
     },
@@ -537,92 +540,114 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:836 `VUniConcatInfo` — unicode counterpart of VStrConcat.
+    /// OS_UNI_CONCAT funcptr is resolved via callinfocollection at
+    /// materialization time.
     VUniConcatInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of VStrSlice.
+    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of `VStrSlice`
+    /// (same length-vs-stop convention; backend reader adds
+    /// `start + length` before calling the OS_UNI_SLICE funcptr).
+    /// OS_UNI_SLICE funcptr is resolved via callinfocollection at
+    /// materialization time.
     VUniSliceInfo {
         fieldnums: Vec<i16>,
     },
     Empty,
 }
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+/// `history.py:125` `id(descr)` parity — Option<Arc<dyn Descr>> identity
+/// compare.  Both `None` are equal (unset slots); two `Some` are equal
+/// iff their Arcs share the underlying object (`Arc::ptr_eq`).  Backs
+/// the `RdVirtualInfo` / `GuardPendingFieldEntry` `PartialEq` impls so
+/// resume-info canonicalisation matches PyPy's `descr is other_descr`
+/// rather than relying on the pyre-only `descr_index` serialization
+/// handle.
+#[inline]
+fn opt_descr_ptr_eq(a: &Option<crate::DescrRef>, b: &Option<crate::DescrRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+// `PartialEq/Eq` parity: compare resume-info structurally + descr Arc
+// identity (`history.py:125`); `descr_index` is a serialization handle,
+// not identity.
 impl PartialEq for RdVirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::VirtualInfo {
+                    descr: a_descr,
                     type_id: a0,
-                    descr_index: a1,
                     known_class: a2,
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
-                    ..
                 },
                 Self::VirtualInfo {
+                    descr: b_descr,
                     type_id: b0,
-                    descr_index: b1,
                     known_class: b2,
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
-                    ..
                 },
-            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a0 == b0
+                    && a2 == b2
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             (
                 Self::VStructInfo {
+                    typedescr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
-                    ..
                 },
                 Self::VStructInfo {
+                    typedescr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a1 == b1 && a3 == b3 && a4 == b4 && a5 == b5,
             (
                 Self::VArrayInfoClear {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoClear {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
                     kind: b2,
                     fieldnums: b3,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3,
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a2 == b2 && a3 == b3,
             (
                 Self::VArrayInfoNotClear {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoNotClear {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
                     kind: b2,
                     fieldnums: b3,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3,
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a2 == b2 && a3 == b3,
             (
                 Self::VArrayStructInfo {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
                     size: a2,
-                    fielddescrs: _,
+                    fielddescrs: a_fielddescrs,
                     fielddescr_indices: a3,
                     field_types: a4,
                     base_size: a4b,
@@ -632,10 +657,9 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: a8,
                 },
                 Self::VArrayStructInfo {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
                     size: b2,
-                    fielddescrs: _,
+                    fielddescrs: b_fielddescrs,
                     fielddescr_indices: b3,
                     field_types: b4,
                     base_size: b4b,
@@ -645,8 +669,13 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: b8,
                 },
             ) => {
-                a1 == b1
+                opt_descr_ptr_eq(a_descr, b_descr)
                     && a2 == b2
+                    && a_fielddescrs.len() == b_fielddescrs.len()
+                    && a_fielddescrs
+                        .iter()
+                        .zip(b_fielddescrs.iter())
+                        .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
                     && a3 == b3
                     && a4 == b4
                     && a4b == b4b
@@ -712,11 +741,11 @@ impl RdVirtualInfo {
             | Self::VRawBufferInfo { fieldnums, .. }
             | Self::VRawSliceInfo { fieldnums, .. }
             | Self::VStrPlainInfo { fieldnums }
-            | Self::VStrConcatInfo { fieldnums }
-            | Self::VStrSliceInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums, .. }
+            | Self::VStrSliceInfo { fieldnums, .. }
             | Self::VUniPlainInfo { fieldnums }
-            | Self::VUniConcatInfo { fieldnums }
-            | Self::VUniSliceInfo { fieldnums } => Some(fieldnums),
+            | Self::VUniConcatInfo { fieldnums, .. }
+            | Self::VUniSliceInfo { fieldnums, .. } => Some(fieldnums),
             Self::Empty => None,
         }
     }
@@ -756,11 +785,11 @@ impl RdVirtualInfo {
             | Self::VRawBufferInfo { fieldnums, .. }
             | Self::VRawSliceInfo { fieldnums, .. }
             | Self::VStrPlainInfo { fieldnums }
-            | Self::VStrConcatInfo { fieldnums }
-            | Self::VStrSliceInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums, .. }
+            | Self::VStrSliceInfo { fieldnums, .. }
             | Self::VUniPlainInfo { fieldnums }
-            | Self::VUniConcatInfo { fieldnums }
-            | Self::VUniSliceInfo { fieldnums } => *fieldnums = new_fieldnums,
+            | Self::VUniConcatInfo { fieldnums, .. }
+            | Self::VUniSliceInfo { fieldnums, .. } => *fieldnums = new_fieldnums,
             Self::Empty => {}
         }
     }
@@ -772,20 +801,13 @@ impl RdVirtualInfo {
 /// after virtual materialization.
 ///
 /// Fields mirror PENDINGFIELDSTRUCT (lldescr / num / fieldnum / itemindex).
-/// `target` / `value` are pyre-only (SSA position before resume numbering);
-/// `descr_index` is a stable handle for serialization paths
-/// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`) that travel
-/// through layers without an `Arc<dyn Descr>` slot.
+/// `target` / `value` are pyre-only (SSA position before resume numbering).
 #[derive(Clone, Debug)]
 pub struct GuardPendingFieldEntry {
     /// resume.py:88 `lldescr`: the field/array descriptor itself. Carries
     /// `field_offset` / `field_size` / `field_type` via the trait, so the
     /// consumer never needs a precomputed cache.
     pub descr: Option<DescrRef>,
-    /// Stable u32 handle for serialization sinks
-    /// (`ExitPendingFieldLayout`, `PendingFieldLayoutSummary`).
-    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
-    pub descr_index: u32,
     /// resume.py:91 `itemindex` — for SETARRAYITEM_GC the constant array
     /// index, -1 for SETFIELD_GC.
     pub item_index: i32,

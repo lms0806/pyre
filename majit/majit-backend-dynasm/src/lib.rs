@@ -453,8 +453,22 @@ fn handle_fail_dispatch(
         return handle_fail_propagate_exception(frame_ptr);
     }
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-    handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
+    // Recover the descr identity through the global Weak-registry that
+    // `DynasmBackend::register_fail_descrs` populates in lockstep with
+    // its per-backend table.  Avoids casting `descr_raw` to
+    // `*const DynasmFailDescr` — only the trait surface is consumed.
+    // Synthetic test descrs (lib.rs:781 / :803) never register, so the
+    // miss path returns 0, matching the prior cast-based path's "no
+    // blackhole hook installed" exit.
+    let descr_arc = match guard::lookup_fail_descr_global(descr_raw) {
+        Some(arc) => arc,
+        None => return 0,
+    };
+    let descr_fd = match descr_arc.as_fail_descr() {
+        Some(fd) => fd,
+        None => return 0,
+    };
+    handle_fail_resume_guard(descr_fd, descr_raw, frame_ptr, green_key)
 }
 
 /// compile.py:626-656 `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.
@@ -599,17 +613,21 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 /// directly.  None of these are session-scope; the deviation is
 /// retained until that mechanism lands.
 fn handle_fail_resume_guard(
-    descr: &guard::DynasmFailDescr,
+    descr: &dyn majit_ir::FailDescr,
     descr_raw: usize,
     frame_ptr: *mut jitframe::JitFrame,
     _outer_green_key: u64,
 ) -> i64 {
-    let trace_id = <guard::DynasmFailDescr as majit_ir::FailDescr>::trace_id(descr);
-    let fail_index = descr.fail_index;
-    let n_fail_args = <guard::DynasmFailDescr as majit_ir::FailDescr>::fail_arg_types(descr).len();
+    let trace_id = descr.trace_id();
+    let fail_index = descr.fail_index_per_trace();
+    let n_fail_args = descr.fail_arg_types().len();
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
-        let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+        // PyPy `llmodel.py:422-424 _decode_pos` parity: read the slot
+        // from `descr.rd_locs[i]`.  Synthetic descrs without `rd_locs`
+        // fall back to identity slot indexing — same shape as the
+        // pre-Slice-MM table-miss path.
+        let slot = guard::decode_rd_loc_slot(descr, i).unwrap_or(i);
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
@@ -769,20 +787,6 @@ mod tests {
         ptr
     }
 
-    // Placeholder bridge body referenced by `set_bridge_addr` in
-    // `test_helper_trampoline_does_not_execute_bridge`.  `call_assembler_helper_trampoline`
-    // never invokes bridges (they're executed via patched guard jumps,
-    // not the helper), so this body is unreachable in the test — the
-    // descr value written here is arbitrary and its identity is never
-    // classified against a cpu's attachments.
-    extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
-        unsafe {
-            llmodel::set_latest_descr(jf, 0xFEEDBEEF);
-            llmodel::set_int_value(jf, 0, 321);
-        }
-        jf
-    }
-
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──
     // The old code let the helper return value flow into `mov rdx, rax; mov rcx, [rdx]`
     // which dereferenced an integer as a pointer. This test verifies the trampoline
@@ -813,16 +817,11 @@ mod tests {
         // without calling force. We do this by setting up a guard descr and
         // checking the trampoline reads fail_arg values correctly.
 
-        let descr = Arc::new(guard::DynasmFailDescr::new(
-            7,  // fail_index
-            99, // trace_id
-            vec![Type::Int, Type::Int],
-            false, // is_finish
-            true,  // is_resume_guard
-        ));
-        let descr_ptr = Arc::as_ptr(&descr) as i64;
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
+        guard::register_fail_descr_global(descr_ptr, &descr);
 
-        let jf = unsafe { alloc_test_jitframe(descr_ptr as usize, &[100, 200, 0, 0]) };
+        let jf = unsafe { alloc_test_jitframe(descr_ptr, &[100, 200, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
         // No blackhole registered → returns 0, no crash.
         assert_eq!(result, 0);
@@ -833,15 +832,13 @@ mod tests {
     fn test_helper_trampoline_does_not_execute_bridge() {
         // compile.py:701 parity: helper does NOT re-enter bridges.
         // Bridges are executed via patched guard jumps, not the helper.
-        let descr = Arc::new(guard::DynasmFailDescr::new(
-            3,
-            17,
-            vec![Type::Int],
-            false, // is_finish
-            true,  // is_resume_guard
-        ));
-        descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
-        let descr_ptr = Arc::as_ptr(&descr) as usize;
+        // Session 5f: `bridge_addr` moved off the descr to the backend
+        // side-table; the helper-trampoline path never queries that
+        // table, so this test simply confirms the trampoline returns
+        // the blackhole result (or 0) regardless of bridge presence.
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int]);
+        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
+        guard::register_fail_descr_global(descr_ptr, &descr);
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 99);

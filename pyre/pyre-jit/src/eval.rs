@@ -2139,7 +2139,11 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
     #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
+    majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::register_recovery_layout(
+        crate::call_jit::cranelift_recovery_layout_for_descr,
+    );
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
@@ -2812,7 +2816,7 @@ fn handle_fail(
     _green_key: u64,
     _trace_id: u64,
     _fail_index: u32,
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
     exit_layout: &CompiledExitLayout,
@@ -4232,8 +4236,8 @@ fn materialize_virtual_from_rd(
         //     right = decoder.decode_ref(self.fieldnums[1])
         //     string = decoder.concat_strings(left, right)
         //     decoder.virtuals_cache.set_ptr(index, string)
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
@@ -4296,8 +4300,8 @@ fn materialize_virtual_from_rd(
         //     length    = decoder.decode_int(self.fieldnums[2])
         //     string = decoder.slice_string(largerstr, start, length)
         //     decoder.virtuals_cache.set_ptr(index, string)
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
@@ -5584,21 +5588,11 @@ fn _prepare_next_section(
     }
 }
 
-/// Guard failure recovery: reconstruct virtual objects from their
-/// field values stored as extra fail_args after null (NONE) slots.
-///
-/// When the optimizer places a virtual in fail_args, it sets the
-/// resume.py:945/993 parity: virtual materialization via rd_virtuals.
-/// Called from Cranelift's guard failure handler via TLS callback.
-/// RPython uses rd_virtuals/rd_pendingfields for precise materialization.
-/// The backend callback itself stays a no-op; runtime restore goes through
-/// rebuild_from_resumedata + materialize_virtual_from_rd.
-fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) {
-    // RPython: materialization happens in rebuild_from_resumedata via
-    // getvirtual_ptr (resume.py:945) and _prepare_pendingfields (resume.py:993).
-    // The Cranelift callback is a no-op; decode_and_restore_guard_failure
-    // performs the real resume-data rebuild.
-}
+// `cranelift_resumedata_deopt` lives in `call_jit.rs` so it stays
+// outside `pyre-jit-trace`'s build-script translator file set
+// (build.rs:66 reads pyre-jit/src/eval.rs verbatim; `eval.rs` must
+// remain expressible in the translator's RPython subset, which the
+// downcast-driven on-demand decode implementation is not).
 
 /// virtual's slot to NONE and appends field values (ob_type, intval).
 /// On guard failure, we detect contiguous null Ref slots at the end
@@ -5670,35 +5664,55 @@ fn replay_pending_fields(
         if target_ptr == 0 {
             continue; // null target — skip
         }
-        // resume.py:1003-1007 _prepare_pendingfields parity:
+        // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
+        // RPython — captured directly off the Setfield_gc / Setarrayitem_gc op
+        // that produced the pending field (heap.py force_lazy_sets_for_guard).
+        let descr = pf
+            .descr
+            .as_ref()
+            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+        // resume.py:1003-1007 _prepare_pendingfields:
         //   if itemindex < 0: setfield(struct, fieldnum, descr)
         //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
         //
-        // resume.py:1509-1518 setfield / 1520-1530 setarrayitem:
-        //   descr.is_pointer_field() → bh_setfield_gc_r / bh_setarrayitem_gc_r
-        //   descr.is_float_field()   → bh_setfield_gc_f / bh_setarrayitem_gc_f
-        //   else                     → bh_setfield_gc_i / bh_setarrayitem_gc_i
-        let addr = if pf.is_array_item {
-            // setarrayitem: base + offset + item_index * item_size
+        // resume.py:1509-1518 setfield: descr.is_pointer_field()
+        //   → bh_setfield_gc_r; is_float_field() → bh_setfield_gc_f;
+        //   else → bh_setfield_gc_i.
+        // resume.py:1531-1541 setarrayitem_{int,ref,float}: dispatched by
+        //   resume.py:1009-1014 setarrayitem via arraydescr.is_array_of_pointers
+        //   / is_array_of_floats.
+        let (addr, value_type, value_size) = if pf.is_array_item {
+            let ad = descr
+                .as_array_descr()
+                .expect("setarrayitem pending field must carry an ArrayDescr");
             let item_index = pf.item_index.unwrap_or(0);
-            target_ptr as usize + pf.field_offset + item_index * pf.field_size
+            let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
+            (addr, ad.item_type(), ad.item_size())
         } else {
-            // setfield: base + offset
-            target_ptr as usize + pf.field_offset
+            let fd = descr
+                .as_field_descr()
+                .expect("setfield pending field must carry a FieldDescr");
+            let addr = target_ptr as usize + fd.offset();
+            (addr, fd.field_type(), fd.field_size())
         };
         unsafe {
-            match pf.field_type {
+            match value_type {
                 majit_ir::Type::Ref => {
-                    // bh_setfield_gc_r: store pointer
+                    // bh_setfield_gc_r / bh_setarrayitem_gc_r: store pointer.
+                    // Emit the write barrier on the target object so a young
+                    // ref stored into an existing old object is tracked by
+                    // the next minor collection (`rd_pendingfields` can
+                    // target pre-existing deadframe objects).
+                    majit_gc::gc_write_barrier(majit_ir::GcRef(target_ptr as usize));
                     std::ptr::write(addr as *mut usize, value_raw as usize);
                 }
                 majit_ir::Type::Float => {
-                    // bh_setfield_gc_f: store f64
+                    // bh_setfield_gc_f / bh_setarrayitem_gc_f: store f64.
                     std::ptr::write(addr as *mut u64, value_raw as u64);
                 }
                 majit_ir::Type::Int | majit_ir::Type::Void => {
-                    // bh_setfield_gc_i: store integer (size-aware)
-                    match pf.field_size {
+                    // bh_setfield_gc_i / bh_setarrayitem_gc_i: size-aware int.
+                    match value_size {
                         8 => std::ptr::write(addr as *mut i64, value_raw),
                         4 => std::ptr::write(addr as *mut i32, value_raw as i32),
                         2 => std::ptr::write(addr as *mut i16, value_raw as i16),
@@ -5710,12 +5724,8 @@ fn replay_pending_fields(
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] replay_pending_field: type={:?} offset={} size={} target={:#x} value={:#x}",
-                pf.field_type,
-                pf.field_offset,
-                pf.field_size,
-                target_ptr as usize,
-                value_raw as usize
+                "[jit] replay_pending_field: type={:?} size={} target={:#x} value={:#x}",
+                value_type, value_size, target_ptr as usize, value_raw as usize
             );
         }
     }
@@ -5761,16 +5771,148 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 /// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
 pub(crate) struct PyreBlackholeAllocator;
 
+/// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
+/// helper.  Pyre's three `bh_setfield_gc_{i,r,f}` impls share the same
+/// size-aware byte-write because pyre objects are raw Rust structs;
+/// the type-keyed dispatch in the trait keeps RPython's call-site
+/// shape (`cpu.bh_setfield_gc_i/r/f`). Offset 0 is valid for plain
+/// RPython structs; callers that materialize PyObject headers must avoid
+/// replaying a header-field descr instead of hiding it here.
+fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+    let field_offset = descr_info.offset;
+    if struct_ptr == 0 {
+        return;
+    }
+    unsafe {
+        let ptr = (struct_ptr as *mut u8).add(field_offset);
+        match descr_info.field_size {
+            8 => (ptr as *mut i64).write(value),
+            4 => (ptr as *mut i32).write(value as i32),
+            2 => (ptr as *mut i16).write(value as i16),
+            1 => ptr.write(value as u8),
+            _ => (ptr as *mut i64).write(value),
+        }
+    }
+}
+
+const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
+const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
+const LOWLEVEL_UNICODE_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET;
+
+fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usize) -> i64 {
+    let Some(items_size) = length.checked_mul(item_size) else {
+        return 0;
+    };
+    let Some(total_size) = base_size.checked_add(items_size) else {
+        return 0;
+    };
+    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
+        .expect("low-level string layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
+    }
+    ptr as i64
+}
+
+fn bh_lowlevel_string_len(string: i64) -> usize {
+    if string == 0 {
+        return 0;
+    }
+    unsafe { *((string as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize) }
+}
+
+fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
+    if item_size == 1 {
+        LOWLEVEL_STR_BASE_SIZE - 1
+    } else {
+        LOWLEVEL_UNICODE_BASE_SIZE
+    }
+}
+
+fn bh_read_lowlevel_string(string: i64, item_size: usize) -> Vec<i64> {
+    let len = bh_lowlevel_string_len(string);
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    let mut chars = Vec::with_capacity(len);
+    for index in 0..len {
+        let addr = unsafe { (string as *const u8).add(chars_offset + index * item_size) };
+        let value = unsafe {
+            match item_size {
+                1 => *addr as i64,
+                4 => *(addr as *const u32) as i64,
+                _ => *(addr as *const i64),
+            }
+        };
+        chars.push(value);
+    }
+    chars
+}
+
+fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: usize) {
+    if string == 0 {
+        return;
+    }
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    unsafe {
+        let addr = (string as *mut u8).add(chars_offset + index * item_size);
+        match item_size {
+            1 => addr.write(char as u8),
+            4 => (addr as *mut u32).write(char as u32),
+            _ => (addr as *mut i64).write(char),
+        }
+    }
+}
+
+fn bh_concat_lowlevel_strings(left: i64, right: i64, item_size: usize) -> i64 {
+    let mut chars = bh_read_lowlevel_string(left, item_size);
+    chars.extend(bh_read_lowlevel_string(right, item_size));
+    let (base_size, item_size) = if item_size == 1 {
+        (LOWLEVEL_STR_BASE_SIZE, 1)
+    } else {
+        (LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    };
+    let result = bh_alloc_lowlevel_string(chars.len(), base_size, item_size);
+    for (index, char) in chars.into_iter().enumerate() {
+        bh_write_lowlevel_char(result, index, char, item_size);
+    }
+    result
+}
+
+fn bh_slice_lowlevel_string(string: i64, start: i64, stop: i64, item_size: usize) -> i64 {
+    let chars = bh_read_lowlevel_string(string, item_size);
+    let len = chars.len();
+    let start = start.clamp(0, len as i64) as usize;
+    let stop = stop.clamp(start as i64, len as i64) as usize;
+    let slice = &chars[start..stop];
+    let (base_size, item_size) = if item_size == 1 {
+        (LOWLEVEL_STR_BASE_SIZE, 1)
+    } else {
+        (LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    };
+    let result = bh_alloc_lowlevel_string(slice.len(), base_size, item_size);
+    for (index, char) in slice.iter().copied().enumerate() {
+        bh_write_lowlevel_char(result, index, char, item_size);
+    }
+    result
+}
+
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
-    fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
-        // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
-        // delegates to the CPU; do not replace ArrayDescr with a
-        // kind/item-size side channel here.
-        bh_new_array_from_descr(length, arraydescr, clear)
+    fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1446 cpu.bh_new_array_clear(length, arraydescr)
+        bh_new_array_from_descr(length, arraydescr, /* clear */ true)
     }
 
-    fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
-        // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
+    fn bh_new_array(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1447 cpu.bh_new_array(length, arraydescr)
+        bh_new_array_from_descr(length, arraydescr, /* clear */ false)
+    }
+
+    fn bh_new(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1442 cpu.bh_new(typedescr)
         // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
         let sd = typedescr
             .as_size_descr()
@@ -5837,47 +5979,51 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn setfield_typed(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        _descr: u32,
-        field_offset: usize,
-        field_size: usize,
-    ) {
-        // resume.py:1509-1528 setfield — write field at byte offset.
-        // field_offset > 0: offset 0 is the ob_type header set by
-        // allocate_struct/allocate_with_vtable; never let resume data
-        // overwrite it.
-        if struct_ptr != 0 && field_offset > 0 {
-            unsafe {
-                let ptr = (struct_ptr as *mut u8).add(field_offset);
-                match field_size {
-                    8 => (ptr as *mut i64).write(value),
-                    4 => (ptr as *mut i32).write(value as i32),
-                    2 => (ptr as *mut i16).write(value as i16),
-                    1 => ptr.write(value as u8),
-                    _ => (ptr as *mut i64).write(value),
-                }
-            }
-        }
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
-    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+    }
+
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+    }
+
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_int_from_descr(array, index, value, descr);
     }
 
-    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_ref_from_descr(array, index, value, descr);
     }
 
-    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_float_from_descr(array, index, value, descr);
     }
 
     // resume.py:1520-1529: setinteriorfield dispatch by descr
     // llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f}
-    fn setinteriorfield_gc_i(
+    fn bh_setinteriorfield_gc_i(
         &self,
         array: i64,
         index: usize,
@@ -5895,24 +6041,56 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn setinteriorfield_gc_r(
+    fn bh_setinteriorfield_gc_r(
         &self,
         array: i64,
         index: usize,
         value: i64,
         descr: &majit_ir::DescrRef,
     ) {
-        self.setinteriorfield_gc_i(array, index, value, descr);
+        self.bh_setinteriorfield_gc_i(array, index, value, descr);
     }
 
-    fn setinteriorfield_gc_f(
+    fn bh_setinteriorfield_gc_f(
         &self,
         array: i64,
         index: usize,
         value: i64,
         descr: &majit_ir::DescrRef,
     ) {
-        self.setinteriorfield_gc_i(array, index, value, descr);
+        self.bh_setinteriorfield_gc_i(array, index, value, descr);
+    }
+
+    fn bh_newstr(&self, length: usize) -> i64 {
+        bh_alloc_lowlevel_string(length, LOWLEVEL_STR_BASE_SIZE, 1)
+    }
+
+    fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
+        bh_write_lowlevel_char(string, index, char, 1);
+    }
+
+    fn os_str_concat(&self, str1: i64, str2: i64) -> i64 {
+        bh_concat_lowlevel_strings(str1, str2, 1)
+    }
+
+    fn os_str_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        bh_slice_lowlevel_string(str, start, stop, 1)
+    }
+
+    fn bh_newunicode(&self, length: usize) -> i64 {
+        bh_alloc_lowlevel_string(length, LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    }
+
+    fn bh_unicodesetitem(&self, string: i64, index: usize, char: i64) {
+        bh_write_lowlevel_char(string, index, char, 4);
+    }
+
+    fn os_uni_concat(&self, str1: i64, str2: i64) -> i64 {
+        bh_concat_lowlevel_strings(str1, str2, 4)
+    }
+
+    fn os_uni_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        bh_slice_lowlevel_string(str, start, stop, 4)
     }
 
     /// resume.py:1452-1456 allocate_raw_buffer(func, size)
@@ -5930,9 +6108,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .bh_call_i(func, Some(&[size as i64]), None, None, &calldescr)
     }
 
-    /// resume.py:1543-1550 setrawbuffer_item
-    /// Concrete reader: descr-driven dispatch to cpu.bh_raw_store_f/i
-    fn setrawbuffer_item(
+    /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr).
+    fn bh_raw_store_f(
         &self,
         buffer: i64,
         offset: i64,
@@ -5940,24 +6117,23 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         descr: &majit_ir::ArrayDescrInfo,
     ) {
         let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
-        // resume.py:1544: assert not descr.is_array_of_pointers()
-        assert!(
-            !bh_descr.is_array_of_pointers(),
-            "raw buffer entry must not be pointer type"
-        );
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
-        if descr.item_type == 2 {
-            // resume.py:1545-1547: descr.is_array_of_floats()
-            //   newvalue = self.decode_float(fieldnum)
-            //   self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
-        } else {
-            // resume.py:1548-1550: else (int)
-            //   newvalue = self.decode_int(fieldnum)
-            //   self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_i(buffer, offset, value, &bh_descr);
-        }
+        backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
+    }
+
+    /// resume.py:1550 cpu.bh_raw_store_i(buffer, offset, value, descr).
+    fn bh_raw_store_i(
+        &self,
+        buffer: i64,
+        offset: i64,
+        value: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let (driver, _) = driver_pair();
+        let backend = driver.meta_interp().backend();
+        backend.bh_raw_store_i(buffer, offset, value, &bh_descr);
     }
 
     fn box_int(&self, value: i64) -> i64 {

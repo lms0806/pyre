@@ -10,9 +10,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 
 pub mod call_stub;
+pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
+pub mod rd_payload;
+pub mod resume_guard_descr;
+pub mod resume_value;
 pub mod synthetic_cpu;
+
+pub use finish_descrs::{
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
+    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
+    PropagateExceptionDescr, get_or_attach_done_with_this_frame_descr_multi,
+};
+pub use rd_payload::RdPayload;
+pub use resume_guard_descr::{
+    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
+    STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
+    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed, push_vector_info,
+    reset_fail_index_counter,
+};
+pub use resume_value::{
+    FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
+    ResumeValueSource, VirtualFieldSource, VirtualInfo,
+    resume_value_layout_summary_from_exit_value_source,
+};
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
@@ -45,15 +67,16 @@ pub struct RawExecResult {
     pub status: u64,
     /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
     pub descr_addr: usize,
-    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`, `compile.py:701`)
-    /// — the runtime descr Arc owning this exit.  Always set: routes
-    /// through `Backend::get_latest_descr_arc` rather than the
-    /// `fail_descr_addr` registry, so FINISH / `DoneWithThisFrame*` /
-    /// `ExitFrameWithExceptionDescrRef` singletons return their global
-    /// Arc identity instead of `None`.  Bridge consumers
-    /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
-    /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
-    pub descr_arc: Arc<dyn FailDescr>,
+    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
+    /// `compile.py:701`) — the runtime descr Arc owning this exit.
+    /// Always set: routes through `Backend::get_latest_descr_arc`
+    /// rather than the `fail_descr_addr` registry, so FINISH /
+    /// `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
+    /// singletons return their global Arc identity instead of `None`.
+    /// Bridge consumers (`start_bridge_tracing`,
+    /// `_trace_and_compile_from_bridge`) call `descr_arc.as_fail_descr()`
+    /// to read `rd_loop_token_clt` / `fail_index_per_trace` directly.
+    pub descr_arc: Arc<dyn Descr>,
 }
 
 /// Backend-neutral static metadata for a compiled trace.
@@ -111,7 +134,6 @@ pub enum ExitVirtualLayout {
         /// resume.py:615 self.descr — live SizeDescr for allocate_with_vtable.
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// info.py:318 _known_class — vtable pointer for allocate_with_vtable.
         known_class: Option<i64>,
         fields: Vec<(u32, ExitValueSourceLayout)>,
@@ -125,14 +147,16 @@ pub enum ExitVirtualLayout {
         /// resume.py:631 self.typedescr — live SizeDescr for allocate_struct.
         typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
         target_slot: Option<usize>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
     Array {
-        descr_index: u32,
+        /// `resume.py:646` `self.arraydescr` — live `ArrayDescr` for
+        /// `allocate_array`.  Identity-comparable via `Arc::ptr_eq`
+        /// (`history.py:125`).
+        arraydescr: Option<majit_ir::DescrRef>,
         /// resume.py:653: allocate_array(length, arraydescr, self.clear)
         clear: bool,
         /// resume.py:656: arraydescr element kind (0=ref, 1=int, 2=float)
@@ -141,7 +165,6 @@ pub enum ExitVirtualLayout {
     },
     /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
-        descr_index: u32,
         /// resume.py:739: self.arraydescr — live ArrayDescr for allocate_array.
         arraydescr: Option<majit_ir::DescrRef>,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr per field slot.
@@ -178,27 +201,22 @@ pub enum ExitVirtualLayout {
         chars: Vec<ExitValueSourceLayout>,
     },
     /// resume.py:781 VStrConcatInfo + resume.py:836 VUniConcatInfo.
-    /// decoder.concat_strings(left, right) = cic.funcptr_for_oopspec(
-    /// OS_STR_CONCAT)(left, right).
+    /// decoder.concat_strings(left, right) looks up OS_STR_CONCAT (or
+    /// OS_UNI_CONCAT) via `callinfocollection.funcptr_for_oopspec(...)`
+    /// at materialization (resume.py:1467-1468 / 1494-1495); the layout
+    /// carries no funcptr / calldescr.
     StrConcat {
         is_unicode: bool,
-        /// OS_STR_CONCAT or OS_UNI_CONCAT func pointer (resume.py:1468).
-        func: i64,
-        /// calldescr for OS_STR_CONCAT/OS_UNI_CONCAT. Carried so pyre's
-        /// bh_call_r can dispatch to the right calling convention.
-        calldescr: majit_ir::DescrRef,
         left: ExitValueSourceLayout,
         right: ExitValueSourceLayout,
     },
     /// resume.py:801 VStrSliceInfo + resume.py:856 VUniSliceInfo.
-    /// decoder.slice_string(str, start, length) =
-    /// cic.funcptr_for_oopspec(OS_STR_SLICE)(str, start, start + length).
+    /// decoder.slice_string(str, start, length) looks up OS_STR_SLICE
+    /// (or OS_UNI_SLICE) via callinfocollection at materialization
+    /// (resume.py:1477-1478 / 1504-1505); the layout carries no
+    /// funcptr / calldescr.
     StrSlice {
         is_unicode: bool,
-        /// OS_STR_SLICE or OS_UNI_SLICE func pointer (resume.py:1478).
-        func: i64,
-        /// calldescr for OS_STR_SLICE/OS_UNI_SLICE.
-        calldescr: majit_ir::DescrRef,
         str_src: ExitValueSourceLayout,
         start: ExitValueSourceLayout,
         length: ExitValueSourceLayout,
@@ -211,7 +229,6 @@ impl ExitVirtualLayout {
             Self::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 target_slot,
@@ -220,7 +237,6 @@ impl ExitVirtualLayout {
             } => Self::Object {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -233,7 +249,6 @@ impl ExitVirtualLayout {
             Self::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 target_slot,
                 fielddescrs,
@@ -241,7 +256,6 @@ impl ExitVirtualLayout {
             } => Self::Struct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(field_index, source)| {
@@ -253,12 +267,12 @@ impl ExitVirtualLayout {
                 descr_size: *descr_size,
             },
             Self::Array {
-                descr_index,
+                arraydescr,
                 clear,
                 kind,
                 items,
             } => Self::Array {
-                descr_index: *descr_index,
+                arraydescr: arraydescr.clone(),
                 clear: *clear,
                 kind: *kind,
                 items: items
@@ -271,12 +285,10 @@ impl ExitVirtualLayout {
                 base: base.shifted_virtuals(virtual_offset),
             },
             Self::ArrayStruct {
-                descr_index,
                 arraydescr,
                 fielddescrs,
                 element_fields,
             } => Self::ArrayStruct {
-                descr_index: *descr_index,
                 arraydescr: arraydescr.clone(),
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
@@ -316,28 +328,20 @@ impl ExitVirtualLayout {
             },
             Self::StrConcat {
                 is_unicode,
-                func,
-                calldescr,
                 left,
                 right,
             } => Self::StrConcat {
                 is_unicode: *is_unicode,
-                func: *func,
-                calldescr: calldescr.clone(),
                 left: left.shifted_virtuals(virtual_offset),
                 right: right.shifted_virtuals(virtual_offset),
             },
             Self::StrSlice {
                 is_unicode,
-                func,
-                calldescr,
                 str_src,
                 start,
                 length,
             } => Self::StrSlice {
                 is_unicode: *is_unicode,
-                func: *func,
-                calldescr: calldescr.clone(),
                 str_src: str_src.shifted_virtuals(virtual_offset),
                 start: start.shifted_virtuals(virtual_offset),
                 length: length.shifted_virtuals(virtual_offset),
@@ -346,88 +350,112 @@ impl ExitVirtualLayout {
     }
 }
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+/// `history.py:125` `id(descr)` parity — `Option<Arc<dyn Descr>>`
+/// identity compare via `Arc::ptr_eq`.  Backs the `ExitVirtualLayout`
+/// `PartialEq` so canonicalisation matches PyPy's `descr is
+/// other_descr` rather than relying on the pyre-only `descr_index`
+/// serialization handle.
+#[inline]
+fn opt_descr_ptr_eq(a: &Option<majit_ir::DescrRef>, b: &Option<majit_ir::DescrRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+// `PartialEq/Eq` parity: compare layout structurally + descr Arc
+// identity (`history.py:125`); `descr_index` is a serialization handle,
+// not identity.
 impl PartialEq for ExitVirtualLayout {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Object {
+                    descr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
                     known_class: a7,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
                     descr_size: a6,
-                    ..
                 },
                 Self::Object {
+                    descr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
                     known_class: b7,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
                     descr_size: b6,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 && a7 == b7,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+                    && a6 == b6
+                    && a7 == b7
+            }
             (
                 Self::Struct {
+                    typedescr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
                     descr_size: a6,
-                    ..
                 },
                 Self::Struct {
+                    typedescr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
                     descr_size: b6,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+                    && a6 == b6
+            }
             (
                 Self::Array {
-                    descr_index: a1,
+                    arraydescr: a_ad,
                     clear: a2,
                     kind: a3,
                     items: a4,
                 },
                 Self::Array {
-                    descr_index: b1,
+                    arraydescr: b_ad,
                     clear: b2,
                     kind: b3,
                     items: b4,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => opt_descr_ptr_eq(a_ad, b_ad) && a2 == b2 && a3 == b3 && a4 == b4,
             (
                 Self::ArrayStruct {
-                    descr_index: a1,
                     arraydescr: a_ad,
                     fielddescrs: a_fds,
                     element_fields: a2,
                 },
                 Self::ArrayStruct {
-                    descr_index: b1,
                     arraydescr: b_ad,
                     fielddescrs: b_fds,
                     element_fields: b2,
                 },
             ) => {
-                // virtualstate.py:295-305: arraydescr identity + per-fielddescr identity
-                a1 == b1
-                    && a_ad.as_ref().map(|d| d.index()) == b_ad.as_ref().map(|d| d.index())
+                // `virtualstate.py:295-305`: arraydescr identity + per-fielddescr identity
+                opt_descr_ptr_eq(a_ad, b_ad)
                     && a_fds.len() == b_fds.len()
                     && a_fds
                         .iter()
                         .zip(b_fds.iter())
-                        .all(|(a, b)| a.index() == b.index())
+                        .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
                     && a2 == b2
             }
             (
@@ -467,37 +495,29 @@ impl PartialEq for ExitVirtualLayout {
             (
                 Self::StrConcat {
                     is_unicode: a1,
-                    func: a2,
                     left: a3,
                     right: a4,
-                    ..
                 },
                 Self::StrConcat {
                     is_unicode: b1,
-                    func: b2,
                     left: b3,
                     right: b4,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => a1 == b1 && a3 == b3 && a4 == b4,
             (
                 Self::StrSlice {
                     is_unicode: a1,
-                    func: a2,
                     str_src: a3,
                     start: a4,
                     length: a5,
-                    ..
                 },
                 Self::StrSlice {
                     is_unicode: b1,
-                    func: b2,
                     str_src: b3,
                     start: b4,
                     length: b5,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => a1 == b1 && a3 == b3 && a4 == b4 && a5 == b5,
             _ => false,
         }
     }
@@ -505,32 +525,46 @@ impl PartialEq for ExitVirtualLayout {
 impl Eq for ExitVirtualLayout {}
 
 /// Backend-neutral deferred heap write recovered from an exit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `resume.py:88 PENDINGFIELDSTRUCT` parity — carries the live
+/// `lldescr` and the (target, value) tagged sources only.  Field
+/// metadata (offset / size / type) is *not* duplicated onto the
+/// layout: consumers (`pyre-jit::eval::replay_pending_fields`,
+/// `cranelift::compiler` guard recovery,
+/// `jitdriver::materialize_pending_fields`) call
+/// `descr.as_field_descr()` / `descr.as_array_descr()` and read
+/// `offset()` / `field_size()` / `field_type()` directly, mirroring
+/// `resume.py:1509-1518` and `resume.py:1531-1541`.
+#[derive(Debug, Clone)]
 pub struct ExitPendingFieldLayout {
-    pub descr_index: u32,
+    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
+    /// (`history.py:125`).
+    pub descr: Option<majit_ir::DescrRef>,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
     pub target: ExitValueSourceLayout,
     pub value: ExitValueSourceLayout,
-    /// Byte offset from start of struct (from FieldDescr).
-    pub field_offset: usize,
-    /// Size of the field in bytes.
-    pub field_size: usize,
-    /// Type of the value being stored.
-    pub field_type: majit_ir::Type,
 }
+
+impl PartialEq for ExitPendingFieldLayout {
+    fn eq(&self, other: &Self) -> bool {
+        opt_descr_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
+            && self.is_array_item == other.is_array_item
+            && self.target == other.target
+            && self.value == other.value
+    }
+}
+impl Eq for ExitPendingFieldLayout {}
 
 impl ExitPendingFieldLayout {
     pub fn shifted_virtuals(&self, virtual_offset: usize) -> Self {
         Self {
-            descr_index: self.descr_index,
+            descr: self.descr.clone(),
             item_index: self.item_index,
             is_array_item: self.is_array_item,
             target: self.target.shifted_virtuals(virtual_offset),
             value: self.value.shifted_virtuals(virtual_offset),
-            field_offset: self.field_offset,
-            field_size: self.field_size,
-            field_type: self.field_type,
         }
     }
 }
@@ -956,7 +990,7 @@ impl CompiledLoopToken {
 /// descrs are skipped by the post-compile walker) or whose owning
 /// `JitCellToken` has been dropped by memmgr.  Bridge-source paths
 /// consume the metainterp ResumeGuardDescr Arc directly (Unified-Descr
-/// Port Epic Session 6.7), so the chain resolves through the descr's
+/// directly), so the chain resolves through the descr's
 /// own `rd_loop_token_clt` slot.
 pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>> {
     descr
@@ -975,7 +1009,7 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
 /// (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
 /// which `compile.py:185` skips via `isinstance(descr, ResumeDescr)`)
 /// or when the owning JCT was evicted by memmgr.  Bridge-source paths
-/// consume the metainterp ResumeGuardDescr Arc directly (Session 6.7).
+/// consume the metainterp `AbstractFailDescr` Arc directly.
 pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
     descr_owning_clt(descr)?.upgrade_loop_token()
 }
@@ -1541,6 +1575,7 @@ pub trait Backend: Send {
         ops: &[Op],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
+        caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Register a freshly-compiled JitCellToken as still reachable from
@@ -1672,7 +1707,9 @@ pub trait Backend: Send {
     fn execute_token_raw(&self, token: &JitCellToken, args: &[Value]) -> RawExecResult {
         let frame = self.execute_token(token, args);
         let descr_arc = self.get_latest_descr_arc(&frame);
-        let descr: &dyn FailDescr = &*descr_arc;
+        let descr: &dyn FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc must return a FailDescr");
         let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
@@ -1825,18 +1862,6 @@ pub trait Backend: Send {
         None
     }
 
-    /// Query complete frame-stack layouts for all guards in a compiled loop.
-    ///
-    /// Returns `(fail_index, frame_stack)` pairs for each guard that has
-    /// recovery layout metadata. Backends that populate recovery layouts
-    /// at compile time can override this to expose the frame stacks.
-    fn compiled_guard_frame_stacks(
-        &self,
-        _token: &JitCellToken,
-    ) -> Option<Vec<(u32, Vec<ExitFrameLayout>)>> {
-        None
-    }
-
     /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
     fn update_terminal_exit_recovery_layout(
         &mut self,
@@ -1913,30 +1938,21 @@ pub trait Backend: Send {
 
     /// Owned Arc counterpart of `get_latest_descr`.
     ///
-    /// PRE-EXISTING-ADAPTATION (split-descr): `cpu.get_latest_descr(deadframe)`
-    /// in RPython (`history.py:125`, consumed at `pyjitpl.py:2890`) returns
-    /// the `ResumeGuardDescr` object the metainterp stamped — the same
-    /// object that owns `rd_numb` / `rd_consts` / `rd_loop_token` etc.,
-    /// kept alive by the GC across the deopt boundary.  Pyre runs a
-    /// *split-descr* model: the backend (dynasm `DynasmFailDescr` /
-    /// cranelift `CraneliftFailDescr`) and the metainterp
-    /// `ResumeGuardDescr` are distinct objects, with the metainterp
-    /// descr forwarded onto the backend descr via `meta_descr` for the
-    /// fields that flow through native code.  Consequently, this method
-    /// returns the *backend-side* `Arc<dyn FailDescr>`, not the
-    /// metainterp ResumeGuardDescr — close enough for descr-identity
-    /// routing (each backend descr is unique per guard, and
-    /// `meta_descr`/`fail_index_per_trace` chase upward to the
-    /// metainterp side) but not byte-for-byte the same object PyPy
-    /// reads in `pyjitpl.py:2890`.
-    ///
-    /// The split exists because pyre emits and registers the backend
-    /// descr at codegen time (it has to be reachable from native fault
-    /// stubs), whereas the metainterp ResumeGuardDescr lives on the
-    /// frontend op-record side; unifying them is the multi-session
-    /// goal that the descr-Arc routing convergence (Task #137 + Task
-    /// #235 + T-series) is approaching one slice at a time.
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr>;
+    /// `cpu.get_latest_descr(deadframe)` in RPython (`history.py:125`,
+    /// consumed at `pyjitpl.py:2890`) returns the metainterp
+    /// `AbstractFailDescr` object stamped on the originating guard's
+    /// `op.descr` — the same object that owns `rd_numb` / `rd_consts`
+    /// / `rd_loop_token` etc.  Backends return the metainterp Arc
+    /// reached through `meta_descr` when present; synthetic backend
+    /// descrs (FINISH / `PropagateExceptionDescr` /
+    /// `ExitFrameWithExceptionDescr` / external-JUMP) without a
+    /// metainterp counterpart fall back to the backend Arc upcast to
+    /// `Arc<dyn Descr>`.  Callers obtain `&dyn FailDescr` via
+    /// `descr_arc.as_fail_descr()` (`history.py:128 AbstractFailDescr`
+    /// is a sub-class of `AbstractDescr`, so the upcast is implicit on
+    /// the Python side; pyre exposes the supertrait `Descr` and the
+    /// sub-trait `FailDescr` separately).
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn Descr>;
 
     /// Resolve a raw fail-descr address to its owning `Arc<dyn FailDescr>`.
     ///
@@ -1967,7 +1983,7 @@ pub trait Backend: Send {
     /// lookup is therefore infallible.  Default panics so backends that
     /// receive C-ABI guard-fail callbacks must opt in explicitly;
     /// `SyntheticCpu` and `wasm` never reach this path.
-    fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> Arc<dyn FailDescr> {
+    fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> majit_ir::DescrRef {
         panic!(
             "Backend::fail_descr_arc_from_addr default invoked: backend wired into a runtime \
              guard-fail path must register every emitted FailDescr in an addr→Arc table and \

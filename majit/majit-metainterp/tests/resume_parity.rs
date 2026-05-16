@@ -1,6 +1,7 @@
 use majit_ir::Const;
 use majit_metainterp::resume::{
-    FrameInfo, FrameSlotSource, ReconstructedValue, ResumeData, VirtualFieldSource, VirtualInfo,
+    FrameInfo, FrameSlotSource, ReconstructedValue, ResumeData, ResumeDataExt, VirtualFieldSource,
+    VirtualInfo,
 };
 
 const TAG_CONST: i64 = 0;
@@ -34,7 +35,6 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
         }],
         virtuals: vec![VirtualInfo::VArray {
             arraydescr: None,
-            descr_index: 9,
             clear: false,
             items: vec![VirtualFieldSource::Constant(Const::Int(large_const))],
         }],
@@ -60,6 +60,8 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
 
 #[test]
 fn resume_py_public_roundtrip_recovers_virtualized_state() {
+    let expected_descr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(3, 0, 0));
     let rd = ResumeData {
         vable_array: Vec::new(),
         vref_array: Vec::new(),
@@ -74,9 +76,8 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             ],
         }],
         virtuals: vec![VirtualInfo::VirtualObj {
-            descr: None,
+            descr: Some(expected_descr.clone()),
             type_id: 1,
-            descr_index: 3,
             known_class: None,
             fields: vec![
                 (0, VirtualFieldSource::FailArg(1)),
@@ -86,7 +87,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             descr_size: 0,
         }],
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
-            descr_index: 5,
+            descr: None,
             target: FrameSlotSource::FailArg(0),
             value: FrameSlotSource::Constant(Const::Int(123)),
             item_index: Some(2),
@@ -108,7 +109,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
     assert_eq!(
         state.pending_fields,
         vec![majit_metainterp::resume::ResolvedPendingFieldWrite {
-            descr_index: 5,
+            descr: None,
             target: majit_metainterp::resume::MaterializedValue::Value(7),
             value: majit_metainterp::resume::MaterializedValue::Value(123),
             item_index: Some(2),
@@ -116,13 +117,18 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
     );
     match &state.virtuals[0] {
         majit_metainterp::resume::MaterializedVirtual::Obj {
+            descr,
             type_id,
-            descr_index,
             fields,
-            ..
         } => {
             assert_eq!(*type_id, 1);
-            assert_eq!(*descr_index, 3);
+            // `history.py:125 id(descr)` parity — Arc identity, not just
+            // a numeric `index()` (which can collide if reconstruction
+            // fabricates a different descr with the same index).
+            assert!(matches!(
+                descr.as_ref(),
+                Some(actual) if std::sync::Arc::ptr_eq(actual, &expected_descr)
+            ));
             assert_eq!(
                 fields,
                 &vec![
@@ -155,14 +161,13 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
         virtuals: vec![VirtualInfo::VirtualObj {
             descr: None,
             type_id: 1,
-            descr_index: 0,
             known_class: None,
             fields: vec![(0, VirtualFieldSource::FailArg(1))],
             fielddescrs: vec![],
             descr_size: 0,
         }],
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
-            descr_index: 0,
+            descr: None,
             target: FrameSlotSource::FailArg(0),
             value: FrameSlotSource::FailArg(2),
             item_index: None,

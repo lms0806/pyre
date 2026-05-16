@@ -39,6 +39,224 @@ pub const TAGCONST: u8 = 0;
 pub const TAGINT: u8 = 1;
 pub const TAGBOX: u8 = 2;
 pub const TAGVIRTUAL: u8 = 3;
+
+/// `resume.py` tag discriminator used by `ResumeValueSource` /
+/// `ResumeValueLayoutSummary` to record where a guard-time value
+/// comes from.  Moved here from `majit-metainterp::resume` so it can
+/// be referenced from `majit-backend` along with the rest of the
+/// Phase C-1 unified-descr type migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeValueKind {
+    FailArg,
+    Constant,
+    Virtual,
+    Uninitialized,
+    Unavailable,
+}
+
+/// Summary of a `ResumeValueSource` in serialization-friendly form.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade)
+/// alongside `ResumeValueKind` so backend-side resume readers can
+/// build summaries without depending on the metainterp crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeValueLayoutSummary {
+    pub kind: ResumeValueKind,
+    pub fail_arg_index: usize,
+    pub raw_fail_arg_position: Option<usize>,
+    /// RPython parity: `Const.value` raw bits (getint/getref_base/getfloatstorage
+    /// all project to `i64`).
+    pub constant: Option<i64>,
+    /// RPython parity: `Const.type` — paired with `constant` so the summary
+    /// round-trips back into a typed `ResumeValueSource::Constant(Const)`.
+    pub constant_type: Option<Type>,
+    pub virtual_index: Option<usize>,
+}
+
+/// `resume.py` virtual-info class discriminator used by `VirtualInfo`
+/// to record the variant kind without unfolding the enum.  Moved here
+/// from `majit-metainterp::resume` (Phase C-1 cascade) so the
+/// `ResumeData` chain can live in a backend-accessible crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeVirtualKind {
+    Object,
+    Struct,
+    Array,
+    ArrayStruct,
+    RawBuffer,
+    /// resume.py:763 VStrPlainInfo — virtual plain string.
+    StrPlain,
+    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
+    StrConcat,
+    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    StrSlice,
+    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
+    UniPlain,
+    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
+    UniConcat,
+    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    UniSlice,
+}
+
+/// Per-frame layout summary used by `ResumeLayoutSummary`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade) —
+/// all field types (`Type`, `ResumeValueKind`, `ResumeValueLayoutSummary`)
+/// live in `majit-ir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeFrameLayoutSummary {
+    pub trace_id: Option<u64>,
+    pub header_pc: Option<u64>,
+    pub source_guard: Option<(u64, u32)>,
+    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
+    pub jitcode_index: i32,
+    pub pc: u64,
+    pub slot_sources: Vec<ResumeValueKind>,
+    pub slot_layouts: Vec<ResumeValueLayoutSummary>,
+    pub slot_types: Option<Vec<Type>>,
+}
+
+/// Serialization-friendly summary of a `PendingFieldInfo`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade);
+/// dependencies (`DescrRef`, `ResumeValueKind`, `ResumeValueLayoutSummary`)
+/// are all in `majit-ir`.
+#[derive(Debug, Clone)]
+pub struct PendingFieldLayoutSummary {
+    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
+    /// (`history.py:125`).
+    pub descr: Option<crate::DescrRef>,
+    pub item_index: Option<usize>,
+    pub is_array_item: bool,
+    pub target_kind: ResumeValueKind,
+    pub value_kind: ResumeValueKind,
+    pub target: ResumeValueLayoutSummary,
+    pub value: ResumeValueLayoutSummary,
+}
+
+impl PartialEq for PendingFieldLayoutSummary {
+    fn eq(&self, other: &Self) -> bool {
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
+            && self.is_array_item == other.is_array_item
+            && self.target_kind == other.target_kind
+            && self.value_kind == other.value_kind
+            && self.target == other.target
+            && self.value == other.value
+    }
+}
+impl Eq for PendingFieldLayoutSummary {}
+
+/// `history.py:125 id(descr)` parity: `Option<DescrRef>` identity
+/// comparison via `Arc::ptr_eq`.
+#[inline]
+pub fn opt_descr_arc_ptr_eq(a: &Option<crate::DescrRef>, b: &Option<crate::DescrRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Serialization-friendly summary of a `VirtualInfo`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade).
+/// Carries the same shape as `VirtualInfo` but with
+/// `ResumeValueLayoutSummary` instead of `ResumeValueSource` field
+/// values — enables round-trip through backend-side resume layout
+/// builders without depending on `majit-metainterp`.
+#[derive(Debug, Clone)]
+pub enum ResumeVirtualLayoutSummary {
+    Object {
+        /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
+        descr: Option<crate::DescrRef>,
+        type_id: u32,
+        /// info.py:318 _known_class — vtable pointer.
+        known_class: Option<i64>,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<crate::FieldDescrInfo>,
+        descr_size: usize,
+    },
+    Struct {
+        /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
+        typedescr: Option<crate::DescrRef>,
+        type_id: u32,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<crate::FieldDescrInfo>,
+        descr_size: usize,
+    },
+    /// resume.py:643-684 AbstractVArrayInfo
+    Array {
+        /// resume.py:646: self.arraydescr
+        arraydescr: Option<crate::DescrRef>,
+        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
+        clear: bool,
+        items: Vec<ResumeValueLayoutSummary>,
+    },
+    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
+    ArrayStruct {
+        /// resume.py:739: self.arraydescr
+        arraydescr: Option<crate::DescrRef>,
+        /// resume.py:740: self.fielddescrs
+        fielddescrs: Vec<crate::DescrRef>,
+        element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
+    },
+    RawBuffer {
+        /// resume.py:694: self.func
+        func: i64,
+        size: usize,
+        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
+        offsets: Vec<i64>,
+        /// resume.py:697: self.descrs
+        descrs: Vec<crate::ArrayDescrInfo>,
+        /// resume.py:693: fieldnums (decoded)
+        values: Vec<ResumeValueLayoutSummary>,
+    },
+    /// `resume.py: VRawSliceInfo` — a slice into a virtual raw buffer.
+    RawSlice {
+        offset: i64,
+        parent: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:763 VStrPlainInfo` — virtual string (known characters).
+    StrPlain {
+        chars: Vec<ResumeValueLayoutSummary>,
+    },
+    /// `resume.py:781 VStrConcatInfo` — virtual string concat. OS_STR_CONCAT
+    /// funcptr is resolved at materialization via
+    /// `callinfocollection.funcptr_for_oopspec(...)` (resume.py:1467-1468),
+    /// not stored on the summary.
+    StrConcat {
+        left: ResumeValueLayoutSummary,
+        right: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:801 VStrSliceInfo` — virtual slice of a larger string.
+    /// OS_STR_SLICE funcptr resolved via callinfocollection at
+    /// materialization (resume.py:1477-1478).
+    StrSlice {
+        source: ResumeValueLayoutSummary,
+        start: ResumeValueLayoutSummary,
+        length: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:817 VUniPlainInfo` — unicode counterpart.
+    UniPlain {
+        chars: Vec<ResumeValueLayoutSummary>,
+    },
+    /// `resume.py:836 VUniConcatInfo` — unicode counterpart.
+    /// OS_UNI_CONCAT funcptr resolved via callinfocollection
+    /// (resume.py:1494-1495).
+    UniConcat {
+        left: ResumeValueLayoutSummary,
+        right: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:856 VUniSliceInfo` — unicode counterpart.
+    /// OS_UNI_SLICE funcptr resolved via callinfocollection
+    /// (resume.py:1504-1505).
+    UniSlice {
+        source: ResumeValueLayoutSummary,
+        start: ResumeValueLayoutSummary,
+        length: ResumeValueLayoutSummary,
+    },
+}
 const TAGMASK: u8 = 3;
 
 pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;

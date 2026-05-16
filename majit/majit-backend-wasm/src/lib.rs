@@ -321,6 +321,7 @@ impl majit_backend::Backend for WasmBackend {
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
                     is_finish: g.is_finish,
+                    meta_descr: g.meta_descr.clone(),
                 })
             })
             .collect();
@@ -373,6 +374,7 @@ impl majit_backend::Backend for WasmBackend {
         _ops: &[Op],
         _original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         Err(BackendError::Unsupported(
             "wasm backend: bridge compile not yet implemented".into(),
@@ -447,12 +449,23 @@ impl majit_backend::Backend for WasmBackend {
         data.fail_descr.as_ref()
     }
 
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
+        // `history.py:125` parity — when the optimizer stamped a
+        // metainterp `ResumeGuardDescr` / `DoneWithThisFrame*` /
+        // `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr` on
+        // `op.descr`, the wasm backend snapshotted it into
+        // `WasmFailDescr.meta_descr`.  Forward through that Arc so
+        // identity (`Arc::ptr_eq`) matches dynasm/cranelift; otherwise
+        // fall back to the backend Arc upcast (synthetic backend-only
+        // descrs).
         let data = frame
             .data
             .downcast_ref::<WasmFrameData>()
             .expect("not WasmFrameData");
-        Arc::clone(&data.fail_descr) as Arc<dyn FailDescr>
+        if let Some(meta) = data.fail_descr.meta_descr.as_ref() {
+            return Arc::clone(meta);
+        }
+        Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
