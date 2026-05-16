@@ -101,28 +101,63 @@ impl FieldEntry {
 /// Information about an operation's result, attached during optimization.
 ///
 /// info.py: AbstractInfo hierarchy — the base class for all optimization info.
-#[derive(Clone, Debug)]
+///
+/// `Ptr` carries `Rc<RefCell<PtrInfo>>` so the underlying info object has
+/// the same object-identity semantics as RPython's `_forwarded` slot:
+/// when two `_forwarded` slots are set to the same `Ptr(rc.clone())`, in-
+/// place mutations through one handle are observable through the other,
+/// matching PyPy's Python object identity (`info.py:865-894 get*ptrinfo`
+/// "return fw"). `IntBound` is similarly wrapped so `optimizer.py:99-113
+/// getintbound` mutations propagate.
+#[derive(Clone)]
 pub enum OpInfo {
     /// No information known.
     Unknown,
     /// Known integer bounds. info.py:1264 IntBound.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
-    IntBound(IntBound),
+    IntBound(std::rc::Rc<std::cell::RefCell<IntBound>>),
     /// Pointer info (non-null, known class, virtual, etc.).
     /// `PtrInfo::Constant(GcRef)` is the Ref constant carrier
     /// (info.py:706 ConstPtrInfo).
-    Ptr(PtrInfo),
+    Ptr(std::rc::Rc<std::cell::RefCell<PtrInfo>>),
     /// Known constant float value.
     /// info.py:851 FloatConstInfo — Float constant carrier.
     FloatConst(f64),
 }
 
+impl std::fmt::Debug for OpInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpInfo::Unknown => f.write_str("OpInfo::Unknown"),
+            OpInfo::IntBound(ib) => f
+                .debug_tuple("OpInfo::IntBound")
+                .field(&*ib.borrow())
+                .finish(),
+            OpInfo::Ptr(p) => f.debug_tuple("OpInfo::Ptr").field(&*p.borrow()).finish(),
+            OpInfo::FloatConst(v) => f.debug_tuple("OpInfo::FloatConst").field(v).finish(),
+        }
+    }
+}
+
 impl OpInfo {
+    /// Helper for constructing `OpInfo::Ptr` from owned `PtrInfo` —
+    /// wraps in a fresh `Rc<RefCell<>>` for the shared-identity storage.
+    pub fn ptr(info: PtrInfo) -> Self {
+        OpInfo::Ptr(std::rc::Rc::new(std::cell::RefCell::new(info)))
+    }
+
+    /// Helper for constructing `OpInfo::IntBound` from owned `IntBound`.
+    pub fn int_bound(b: IntBound) -> Self {
+        OpInfo::IntBound(std::rc::Rc::new(std::cell::RefCell::new(b)))
+    }
+
     pub fn is_constant(&self) -> bool {
-        matches!(
-            self,
-            OpInfo::FloatConst(_) | OpInfo::Ptr(PtrInfo::Constant(_))
-        ) || matches!(self, OpInfo::IntBound(b) if b.is_constant())
+        match self {
+            OpInfo::FloatConst(_) => true,
+            OpInfo::Ptr(p) => matches!(&*p.borrow(), PtrInfo::Constant(_)),
+            OpInfo::IntBound(b) => b.borrow().is_constant(),
+            OpInfo::Unknown => false,
+        }
     }
 
     /// Get the constant float value if this is a FloatConst.
@@ -133,14 +168,10 @@ impl OpInfo {
         }
     }
 
-    pub fn get_int_bound(&self) -> Option<&IntBound> {
-        match self {
-            OpInfo::IntBound(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    pub fn get_int_bound_mut(&mut self) -> Option<&mut IntBound> {
+    /// Returns the live `Rc` handle to the `IntBound` for the `IntBound`
+    /// variant. Mirrors RPython object identity: callers that retain the
+    /// handle observe in-place mutations through other holders.
+    pub fn get_int_bound(&self) -> Option<&std::rc::Rc<std::cell::RefCell<IntBound>>> {
         match self {
             OpInfo::IntBound(b) => Some(b),
             _ => None,
@@ -151,7 +182,7 @@ impl OpInfo {
     /// info.py: is_nonnull()
     pub fn is_nonnull(&self) -> bool {
         match self {
-            OpInfo::Ptr(ptr) => ptr.is_nonnull(),
+            OpInfo::Ptr(p) => p.borrow().is_nonnull(),
             _ => false,
         }
     }
@@ -159,18 +190,15 @@ impl OpInfo {
     /// Whether this info represents a virtual (allocation-removed) object.
     /// info.py: is_virtual()
     pub fn is_virtual(&self) -> bool {
-        matches!(self, OpInfo::Ptr(ptr) if ptr.is_virtual())
+        matches!(self, OpInfo::Ptr(p) if p.borrow().is_virtual())
     }
 
-    /// Get the PtrInfo if present.
-    pub fn get_ptr_info(&self) -> Option<&PtrInfo> {
-        match self {
-            OpInfo::Ptr(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    pub fn get_ptr_info_mut(&mut self) -> Option<&mut PtrInfo> {
+    /// Returns the live `Rc` handle to the `PtrInfo` for the `Ptr`
+    /// variant. Mirrors RPython object identity: callers that retain the
+    /// handle observe in-place mutations through other holders. Borrow
+    /// the returned handle (`handle.borrow()` / `handle.borrow_mut()`)
+    /// to access the inner `PtrInfo`.
+    pub fn get_ptr_info(&self) -> Option<&std::rc::Rc<std::cell::RefCell<PtrInfo>>> {
         match self {
             OpInfo::Ptr(p) => Some(p),
             _ => None,
@@ -384,8 +412,11 @@ impl EnsuredPtrInfo {
     /// through `optheap.const_infos`, not through the constant box's own
     /// info slot (info.py:738-752). The `ForwardedBox` variant returns
     /// `None` if the BoxRef's `_forwarded` slot does not currently hold
-    /// `Forwarded::Info(OpInfo::Ptr(_))`.
-    pub fn as_mut(&mut self) -> Option<std::cell::RefMut<'_, PtrInfo>> {
+    /// `Forwarded::Info(OpInfo::Ptr(_))`. The returned guard owns an `Rc`
+    /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
+    /// `RefCell` borrow — drop it before any sibling write to the same
+    /// box's `_forwarded` slot.
+    pub fn as_mut(&mut self) -> Option<crate::r#box::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
             EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
@@ -3150,7 +3181,7 @@ mod tests {
     #[test]
     fn test_opinfo_is_nonnull() {
         assert!(!OpInfo::Unknown.is_nonnull());
-        assert!(OpInfo::Ptr(PtrInfo::nonnull()).is_nonnull());
+        assert!(OpInfo::ptr(PtrInfo::nonnull()).is_nonnull());
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //!   `box.set_forwarded(constbox)`. We do not introduce a separate `Const`
 //!   variant: RPython stores everything in a single `_forwarded` slot.
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 
 use majit_ir::{Type, Value};
@@ -322,33 +322,66 @@ impl BoxRef {
 
     /// `optimizer.py:99-113 getptrinfo` BoxRef-native reader.
     ///
-    /// When `_forwarded` is `Info(OpInfo::Ptr(_))`, return the inner
-    /// `PtrInfo` as `Ref<'_, PtrInfo>`. All other states (`None`,
-    /// `Box(_)`, other `OpInfo` variants) return `None`.
+    /// When `_forwarded` is `Info(OpInfo::Ptr(rc))`, returns the inner
+    /// `PtrInfo` as a `PtrInfoBorrow` guard. The guard owns an `Rc` clone
+    /// of the live `Rc<RefCell<PtrInfo>>` and holds a shared `RefCell`
+    /// borrow into it. All other states (`None`, `Box(_)`, other
+    /// `OpInfo` variants) return `None`.
+    ///
+    /// Object identity: two boxes whose `_forwarded` slots carry clones
+    /// of the same `Rc` see in-place mutations through each other, just
+    /// like RPython `_forwarded` Python object identity.
     ///
     /// Does not walk the chain — the caller is responsible for advancing
     /// to the terminal BoxRef (e.g. via
     /// `OptContext::get_box_replacement_box`) before calling. This mirrors
     /// reading `box.get_forwarded()` directly in RPython.
-    pub fn ptr_info(&self) -> Option<Ref<'_, crate::optimizeopt::info::PtrInfo>> {
-        Ref::filter_map(self.0.forwarded.borrow(), |f| match f {
-            Forwarded::Info(info) => info.get_ptr_info(),
+    pub fn ptr_info(&self) -> Option<PtrInfoBorrow> {
+        let outer = self.0.forwarded.borrow();
+        let rc = match &*outer {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::Ptr(rc)) => Rc::clone(rc),
+            _ => return None,
+        };
+        drop(outer);
+        Some(PtrInfoBorrow::new(rc))
+    }
+
+    /// Live `Rc<RefCell<PtrInfo>>` handle. Use when callers need to
+    /// retain identity (e.g. `Rc::ptr_eq`-based `same_info`) or pass the
+    /// handle elsewhere without the borrow guard.
+    pub fn ptr_info_handle(
+        &self,
+    ) -> Option<Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>> {
+        match &*self.0.forwarded.borrow() {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::Ptr(rc)) => Some(Rc::clone(rc)),
             _ => None,
-        })
-        .ok()
+        }
     }
 
     /// `optimizer.py:99-113 getintbound` BoxRef-native reader.
     ///
-    /// When `_forwarded` is `Info(OpInfo::IntBound(_))`, return the inner
-    /// `IntBound` as `Ref<'_, IntBound>`. Other states return `None`.
-    /// Same caller-walks-the-chain contract as `ptr_info`.
-    pub fn int_bound(&self) -> Option<Ref<'_, crate::optimizeopt::intutils::IntBound>> {
-        Ref::filter_map(self.0.forwarded.borrow(), |f| match f {
-            Forwarded::Info(info) => info.get_int_bound(),
+    /// When `_forwarded` is `Info(OpInfo::IntBound(rc))`, returns an
+    /// `IntBoundBorrow` guard around the live `Rc<RefCell<IntBound>>`.
+    /// Other states return `None`.  Same caller-walks-the-chain contract
+    /// as `ptr_info`.
+    pub fn int_bound(&self) -> Option<IntBoundBorrow> {
+        let outer = self.0.forwarded.borrow();
+        let rc = match &*outer {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::IntBound(rc)) => Rc::clone(rc),
+            _ => return None,
+        };
+        drop(outer);
+        Some(IntBoundBorrow::new(rc))
+    }
+
+    /// Live `Rc<RefCell<IntBound>>` handle.
+    pub fn int_bound_handle(
+        &self,
+    ) -> Option<Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>> {
+        match &*self.0.forwarded.borrow() {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::IntBound(rc)) => Some(Rc::clone(rc)),
             _ => None,
-        })
-        .ok()
+        }
     }
 
     /// Mutable counterpart of `ptr_info`.
@@ -357,26 +390,33 @@ impl BoxRef {
     /// `box.get_forwarded()` in place — Python objects are reference types,
     /// so any `info.<method>(...)` call on the returned object mutates the
     /// `_forwarded` slot's contents directly. The Rust mirror exposes that
-    /// through a `RefMut<'_, PtrInfo>` that aliases the inner `RefCell`.
+    /// through a `PtrInfoBorrowMut` guard that exclusively borrows the
+    /// inner `Rc<RefCell<PtrInfo>>`.
     ///
-    /// Holds the `RefCell` borrow for the lifetime of the returned guard;
-    /// callers must drop the guard before any other access to
-    /// `self.0.forwarded`.
-    pub fn ptr_info_mut(&self) -> Option<RefMut<'_, crate::optimizeopt::info::PtrInfo>> {
-        RefMut::filter_map(self.0.forwarded.borrow_mut(), |f| match f {
-            Forwarded::Info(info) => info.get_ptr_info_mut(),
-            _ => None,
-        })
-        .ok()
+    /// Holds the inner `RefCell` borrow for the lifetime of the returned
+    /// guard; callers must drop the guard before any other access to the
+    /// same handle.  The outer `forwarded` `RefCell` is released as soon
+    /// as the `Rc` clone is captured, so other consumers can still take
+    /// non-conflicting borrows of `self.0.forwarded`.
+    pub fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
+        let outer = self.0.forwarded.borrow();
+        let rc = match &*outer {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::Ptr(rc)) => Rc::clone(rc),
+            _ => return None,
+        };
+        drop(outer);
+        Some(PtrInfoBorrowMut::new(rc))
     }
 
     /// Mutable counterpart of `int_bound`. Same contract as `ptr_info_mut`.
-    pub fn int_bound_mut(&self) -> Option<RefMut<'_, crate::optimizeopt::intutils::IntBound>> {
-        RefMut::filter_map(self.0.forwarded.borrow_mut(), |f| match f {
-            Forwarded::Info(info) => info.get_int_bound_mut(),
-            _ => None,
-        })
-        .ok()
+    pub fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
+        let outer = self.0.forwarded.borrow();
+        let rc = match &*outer {
+            Forwarded::Info(crate::optimizeopt::info::OpInfo::IntBound(rc)) => Rc::clone(rc),
+            _ => return None,
+        };
+        drop(outer);
+        Some(IntBoundBorrowMut::new(rc))
     }
 
     /// `Rc::as_ptr` raw pointer — for debug / logging only.
@@ -392,6 +432,151 @@ impl BoxRef {
 impl Clone for BoxRef {
     fn clone(&self) -> Self {
         Self(Rc::clone(&self.0))
+    }
+}
+
+/// Owning borrow guard for `BoxRef::ptr_info()`.
+///
+/// Carries an `Rc` clone of the live `Rc<RefCell<PtrInfo>>` together
+/// with a shared `RefCell` borrow into it.  `Deref<Target = PtrInfo>`
+/// gives ergonomic read-only access; callers needing identity can read
+/// `.handle()` to obtain the underlying `Rc` for `Rc::ptr_eq` checks.
+///
+/// SAFETY: The inner `Ref<'static, PtrInfo>` is constructed by widening
+/// a `Ref` whose true lifetime is bounded by `_rc` (the `Rc` clone we
+/// own).  Field declaration order ensures `inner` drops before `_rc`,
+/// so the `RefCell::release` runs while the allocation is still alive.
+pub struct PtrInfoBorrow {
+    inner: std::cell::Ref<'static, crate::optimizeopt::info::PtrInfo>,
+    _rc: Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>,
+}
+
+impl PtrInfoBorrow {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>) -> Self {
+        // SAFETY: see struct doc — _rc keeps the RefCell allocation
+        // alive for at least as long as Self exists.
+        let r: std::cell::Ref<'_, crate::optimizeopt::info::PtrInfo> = rc.borrow();
+        let r: std::cell::Ref<'static, crate::optimizeopt::info::PtrInfo> =
+            unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+
+    /// Return the underlying handle for identity / sharing.
+    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
+        Rc::clone(&self._rc)
+    }
+}
+
+impl std::ops::Deref for PtrInfoBorrow {
+    type Target = crate::optimizeopt::info::PtrInfo;
+    fn deref(&self) -> &crate::optimizeopt::info::PtrInfo {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for PtrInfoBorrow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.inner, f)
+    }
+}
+
+/// Mutable counterpart of `PtrInfoBorrow`.  Holds the inner `RefCell`
+/// exclusive borrow; conflicts with concurrent `PtrInfoBorrow` /
+/// `PtrInfoBorrowMut` on the same handle panic at runtime per
+/// `RefCell` semantics.
+pub struct PtrInfoBorrowMut {
+    inner: std::cell::RefMut<'static, crate::optimizeopt::info::PtrInfo>,
+    _rc: Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>,
+}
+
+impl PtrInfoBorrowMut {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>) -> Self {
+        // SAFETY: see `PtrInfoBorrow::new`.
+        let r: std::cell::RefMut<'_, crate::optimizeopt::info::PtrInfo> = rc.borrow_mut();
+        let r: std::cell::RefMut<'static, crate::optimizeopt::info::PtrInfo> =
+            unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+
+    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
+        Rc::clone(&self._rc)
+    }
+}
+
+impl std::ops::Deref for PtrInfoBorrowMut {
+    type Target = crate::optimizeopt::info::PtrInfo;
+    fn deref(&self) -> &crate::optimizeopt::info::PtrInfo {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PtrInfoBorrowMut {
+    fn deref_mut(&mut self) -> &mut crate::optimizeopt::info::PtrInfo {
+        &mut self.inner
+    }
+}
+
+/// Owning borrow guard for `BoxRef::int_bound()`.  Same shape as
+/// `PtrInfoBorrow` but parameterised on `IntBound`.
+pub struct IntBoundBorrow {
+    inner: std::cell::Ref<'static, crate::optimizeopt::intutils::IntBound>,
+    _rc: Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>,
+}
+
+impl IntBoundBorrow {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>) -> Self {
+        let r: std::cell::Ref<'_, crate::optimizeopt::intutils::IntBound> = rc.borrow();
+        let r: std::cell::Ref<'static, crate::optimizeopt::intutils::IntBound> =
+            unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+
+    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
+        Rc::clone(&self._rc)
+    }
+}
+
+impl std::ops::Deref for IntBoundBorrow {
+    type Target = crate::optimizeopt::intutils::IntBound;
+    fn deref(&self) -> &crate::optimizeopt::intutils::IntBound {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for IntBoundBorrow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.inner, f)
+    }
+}
+
+pub struct IntBoundBorrowMut {
+    inner: std::cell::RefMut<'static, crate::optimizeopt::intutils::IntBound>,
+    _rc: Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>,
+}
+
+impl IntBoundBorrowMut {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>) -> Self {
+        let r: std::cell::RefMut<'_, crate::optimizeopt::intutils::IntBound> = rc.borrow_mut();
+        let r: std::cell::RefMut<'static, crate::optimizeopt::intutils::IntBound> =
+            unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+
+    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
+        Rc::clone(&self._rc)
+    }
+}
+
+impl std::ops::Deref for IntBoundBorrowMut {
+    type Target = crate::optimizeopt::intutils::IntBound;
+    fn deref(&self) -> &crate::optimizeopt::intutils::IntBound {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for IntBoundBorrowMut {
+    fn deref_mut(&mut self) -> &mut crate::optimizeopt::intutils::IntBound {
+        &mut self.inner
     }
 }
 
@@ -727,7 +912,7 @@ mod tests {
     fn ptr_info_returns_inner_when_forwarded_is_ptr_info() {
         use crate::optimizeopt::info::PtrInfo;
         let a = BoxRef::new_resop(Type::Ref, 0);
-        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         let pi = a.ptr_info().expect("ptr_info should return Some");
         assert!(pi.is_nonnull());
     }
@@ -754,7 +939,7 @@ mod tests {
         // `_forwarded` carries OpInfo::IntBound; ptr_info() must reject it.
         use crate::optimizeopt::intutils::IntBound;
         let a = BoxRef::new_resop(Type::Int, 0);
-        a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(7)));
+        a.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(7)));
         assert!(a.ptr_info().is_none());
     }
 
@@ -762,7 +947,7 @@ mod tests {
     fn int_bound_returns_inner_when_forwarded_is_intbound() {
         use crate::optimizeopt::intutils::IntBound;
         let a = BoxRef::new_resop(Type::Int, 0);
-        a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(42)));
+        a.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
         let ib = a.int_bound().expect("int_bound should return Some");
         assert!(ib.is_constant());
         assert_eq!(ib.get_constant_int(), 42);
@@ -786,7 +971,7 @@ mod tests {
     fn int_bound_returns_none_for_ptrinfo_forwarded() {
         use crate::optimizeopt::info::PtrInfo;
         let a = BoxRef::new_resop(Type::Ref, 0);
-        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         assert!(a.int_bound().is_none());
     }
 
@@ -794,7 +979,7 @@ mod tests {
     fn ptr_info_mut_mutates_inner_in_place() {
         use crate::optimizeopt::info::PtrInfo;
         let a = BoxRef::new_resop(Type::Ref, 0);
-        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         {
             let mut pi = a.ptr_info_mut().expect("ptr_info_mut should return Some");
             pi.set_last_guard_pos(7);
@@ -809,7 +994,7 @@ mod tests {
     fn ptr_info_mut_returns_none_for_intbound_forwarded() {
         use crate::optimizeopt::intutils::IntBound;
         let a = BoxRef::new_resop(Type::Int, 0);
-        a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(7)));
+        a.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(7)));
         assert!(a.ptr_info_mut().is_none());
     }
 
@@ -817,7 +1002,7 @@ mod tests {
     fn int_bound_mut_mutates_inner_in_place() {
         use crate::optimizeopt::intutils::IntBound;
         let a = BoxRef::new_resop(Type::Int, 0);
-        a.set_forwarded_info(OpInfo::IntBound(IntBound::unbounded()));
+        a.set_forwarded_info(OpInfo::int_bound(IntBound::unbounded()));
         {
             let mut ib = a.int_bound_mut().expect("int_bound_mut should return Some");
             let _ = ib.make_eq_const(99);
@@ -833,7 +1018,7 @@ mod tests {
     fn int_bound_mut_returns_none_for_ptrinfo_forwarded() {
         use crate::optimizeopt::info::PtrInfo;
         let a = BoxRef::new_resop(Type::Ref, 0);
-        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         assert!(a.int_bound_mut().is_none());
     }
 }

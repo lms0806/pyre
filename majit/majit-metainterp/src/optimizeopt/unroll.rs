@@ -1769,8 +1769,9 @@ impl ExportedState {
 
         for (&opref, info) in &self.exported_infos {
             visit(opref);
-            if let crate::optimizeopt::info::OpInfo::Ptr(ptr_info) = info {
-                for child in ptr_info.visitor_walk_recursive() {
+            if let crate::optimizeopt::info::OpInfo::Ptr(rc) = info {
+                let children = rc.borrow().visitor_walk_recursive();
+                for child in children {
                     visit(child);
                 }
             }
@@ -1843,28 +1844,34 @@ impl ExportedState {
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
         keys.sort_by_key(|k| k.raw());
         for key in keys {
-            match &self.exported_infos[&key] {
-                // RPython ConstPtrInfo: GcRef constant stored directly in
-                // PtrInfo. Root the GcRef so GC keeps it alive.
-                OpInfo::Ptr(PtrInfo::Constant(gcref)) if !gcref.is_null() => {
-                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                    self.rooted_refs
-                        .push((key, ExportedGcRefField::InfoPtrInfoConstant, ss_idx));
-                }
-                // InstancePtrInfo.known_class: GcRef for the class pointer.
-                OpInfo::Ptr(PtrInfo::Instance(iinfo)) => {
-                    if let Some(gcref) = iinfo.known_class {
-                        if !gcref.is_null() {
-                            let ss_idx = majit_gc::shadow_stack::push(gcref);
-                            self.rooted_refs.push((
-                                key,
-                                ExportedGcRefField::InfoPtrInfoKnownClass,
-                                ss_idx,
-                            ));
+            if let OpInfo::Ptr(rc) = &self.exported_infos[&key] {
+                let info = rc.borrow();
+                match &*info {
+                    // RPython ConstPtrInfo: GcRef constant stored directly in
+                    // PtrInfo. Root the GcRef so GC keeps it alive.
+                    PtrInfo::Constant(gcref) if !gcref.is_null() => {
+                        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                        self.rooted_refs.push((
+                            key,
+                            ExportedGcRefField::InfoPtrInfoConstant,
+                            ss_idx,
+                        ));
+                    }
+                    // InstancePtrInfo.known_class: GcRef for the class pointer.
+                    PtrInfo::Instance(iinfo) => {
+                        if let Some(gcref) = iinfo.known_class {
+                            if !gcref.is_null() {
+                                let ss_idx = majit_gc::shadow_stack::push(gcref);
+                                self.rooted_refs.push((
+                                    key,
+                                    ExportedGcRefField::InfoPtrInfoKnownClass,
+                                    ss_idx,
+                                ));
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         // ── virtual_state GcRef fields ──
@@ -1931,9 +1938,10 @@ impl ExportedState {
                 .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
             {
                 let forwarded = b.get_forwarded();
-                if let crate::r#box::Forwarded::Info(opinfo) = &*forwarded {
-                    match opinfo {
-                        OpInfo::Ptr(PtrInfo::Constant(gcref)) if !gcref.is_null() => {
+                if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &*forwarded {
+                    let info = rc.borrow();
+                    match &*info {
+                        PtrInfo::Constant(gcref) if !gcref.is_null() => {
                             let ss_idx = majit_gc::shadow_stack::push(*gcref);
                             self.rooted_refs.push((
                                 dummy_key,
@@ -1941,7 +1949,7 @@ impl ExportedState {
                                 ss_idx,
                             ));
                         }
-                        OpInfo::Ptr(PtrInfo::Instance(iinfo)) => {
+                        PtrInfo::Instance(iinfo) => {
                             if let Some(gcref) = iinfo.known_class {
                                 if !gcref.is_null() {
                                     let ss_idx = majit_gc::shadow_stack::push(gcref);
@@ -2009,15 +2017,15 @@ impl ExportedState {
             match field {
                 ExportedGcRefField::InfoPtrInfoConstant => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
-                        *info = crate::optimizeopt::info::OpInfo::Ptr(PtrInfo::Constant(updated));
+                        *info = crate::optimizeopt::info::OpInfo::ptr(PtrInfo::Constant(updated));
                     }
                 }
                 ExportedGcRefField::InfoPtrInfoKnownClass => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
-                        if let crate::optimizeopt::info::OpInfo::Ptr(PtrInfo::Instance(iinfo)) =
-                            info
-                        {
-                            iinfo.known_class = Some(updated);
+                        if let crate::optimizeopt::info::OpInfo::Ptr(rc) = info {
+                            if let PtrInfo::Instance(iinfo) = &mut *rc.borrow_mut() {
+                                iinfo.known_class = Some(updated);
+                            }
                         }
                     }
                 }
@@ -2069,19 +2077,20 @@ impl ExportedState {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
                         && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
                     {
-                        let new_info = {
-                            let f = b.get_forwarded();
-                            if matches!(
-                                &*f,
-                                crate::r#box::Forwarded::Info(OpInfo::Ptr(PtrInfo::Constant(_)))
-                            ) {
-                                Some(OpInfo::Ptr(PtrInfo::Constant(updated)))
-                            } else {
-                                None
+                        // RPython object identity: mutate the live Rc<RefCell<PtrInfo>>
+                        // in place so any other handle sharing it sees the post-GC
+                        // address. Matches PyPy's `_forwarded` Python object reference
+                        // semantics — the cell stays, only its content updates.
+                        let rc = match &*b.get_forwarded() {
+                            crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
+                                if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
+                            {
+                                Some(rc.clone())
                             }
+                            _ => None,
                         };
-                        if let Some(info) = new_info {
-                            b.set_forwarded_info(info);
+                        if let Some(rc) = rc {
+                            *rc.borrow_mut() = PtrInfo::Constant(updated);
                         }
                     }
                 }
@@ -2089,21 +2098,18 @@ impl ExportedState {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
                         && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
                     {
-                        let new_info = {
-                            let f = b.get_forwarded();
-                            if let crate::r#box::Forwarded::Info(OpInfo::Ptr(PtrInfo::Instance(
-                                iinfo,
-                            ))) = &*f
+                        let rc = match &*b.get_forwarded() {
+                            crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
+                                if matches!(&*rc.borrow(), PtrInfo::Instance(_)) =>
                             {
-                                let mut new_iinfo = iinfo.clone();
-                                new_iinfo.known_class = Some(updated);
-                                Some(OpInfo::Ptr(PtrInfo::Instance(new_iinfo)))
-                            } else {
-                                None
+                                Some(rc.clone())
                             }
+                            _ => None,
                         };
-                        if let Some(info) = new_info {
-                            b.set_forwarded_info(info);
+                        if let Some(rc) = rc {
+                            if let PtrInfo::Instance(iinfo) = &mut *rc.borrow_mut() {
+                                iinfo.known_class = Some(updated);
+                            }
                         }
                     }
                 }
@@ -3607,13 +3613,13 @@ impl OptUnroll {
                 // ConstPtrInfo parity: RPython stores Ref constants as
                 // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
                 // at unroll.py:65-68 dispatches through `is_constant()`.
-                Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(gcref))),
+                Value::Ref(gcref) => Some(OpInfo::ptr(PtrInfo::Constant(gcref))),
                 // FloatConstInfo parity: unroll.py:97-98 handles
                 // `isinstance(preamble_info, info.FloatConstInfo)` with
                 // `op.set_forwarded(preamble_info._const)`.
                 Value::Float(f) => Some(OpInfo::FloatConst(f)),
                 // Int constants: RPython uses IntBound with lower==upper.
-                Value::Int(v) => Some(OpInfo::IntBound(
+                Value::Int(v) => Some(OpInfo::int_bound(
                     crate::optimizeopt::intutils::IntBound::from_constant(v),
                 )),
                 Value::Void => None,
@@ -3641,8 +3647,11 @@ impl OptUnroll {
         // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
         // lookup here cannot pull a bound for a ref/float box.
         let resolved_box = ctx.get_box_replacement_box(resolved);
-        if let Some(ptr_info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-            return Some(OpInfo::Ptr(ptr_info));
+        if let Some(handle) = resolved_box.as_ref().and_then(|b| b.ptr_info_handle()) {
+            // RPython object identity: re-export the same Rc handle so
+            // downstream `setinfo_from_preamble` sees the live cell, not
+            // a snapshot. Matches PyPy `_forwarded` reference passing.
+            return Some(OpInfo::Ptr(handle));
         }
         // PRE-EXISTING-ADAPTATION: read from `exported_int_bounds`
         // side table.  RPython's `IntBound` flows through
@@ -3657,7 +3666,7 @@ impl OptUnroll {
         // branch becomes redundant and the side-table parameter
         // disappears.
         if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned()) {
-            return Some(OpInfo::IntBound(bound));
+            return Some(OpInfo::int_bound(bound));
         }
         None
     }
@@ -5456,7 +5465,10 @@ mod tests {
 
         assert_eq!(
             match &exported.exported_infos[&OpRef::int_op(21)] {
-                crate::optimizeopt::info::OpInfo::IntBound(b) => Some((b.lower, b.upper)),
+                crate::optimizeopt::info::OpInfo::IntBound(b) => {
+                    let b = b.borrow();
+                    Some((b.lower, b.upper))
+                }
                 _ => None,
             },
             Some((10, 20))
