@@ -147,9 +147,12 @@ pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
 /// window) use this to discriminate GC-managed blocks from
 /// `std::alloc`-backed ones at dealloc time.
 pub type GcOwnsObjectHookFn = fn(addr: usize) -> bool;
+pub type GcCurrentObjectAddressHookFn = fn(addr: usize) -> usize;
 
 thread_local! {
     static GC_OWNS_OBJECT_HOOK: Cell<Option<GcOwnsObjectHookFn>> = const { Cell::new(None) };
+    static GC_CURRENT_OBJECT_ADDRESS_HOOK: Cell<Option<GcCurrentObjectAddressHookFn>> =
+        const { Cell::new(None) };
 }
 
 /// Install the GC-ownership predicate. Overwrites any previously-
@@ -163,6 +166,16 @@ pub fn clear_gc_owns_object_hook() {
     GC_OWNS_OBJECT_HOOK.with(|cell| cell.set(None));
 }
 
+/// Install the non-rooting current-address lookup hook.
+pub fn register_gc_current_object_address_hook(hook: GcCurrentObjectAddressHookFn) {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the current-address lookup hook on this thread.
+pub fn clear_gc_current_object_address_hook() {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| cell.set(None));
+}
+
 /// Whether `addr` lies inside the active backend's managed GC heap.
 /// Returns `false` when no hook is installed — callers treat that as
 /// "no GC owns this pointer" and fall through to their non-GC
@@ -172,6 +185,49 @@ pub fn clear_gc_owns_object_hook() {
 pub fn try_gc_owns_object(addr: *mut u8) -> bool {
     GC_OWNS_OBJECT_HOOK.with(|cell| match cell.get() {
         Some(f) => f(addr as usize),
+        None => false,
+    })
+}
+
+/// Return the current address for `addr` without registering it as a root.
+/// When no hook is installed, or the active GC does not know the object, the
+/// address is unchanged.
+#[inline]
+pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| match cell.get() {
+        Some(f) => f(addr as usize) as *mut u8,
+        None => addr,
+    })
+}
+
+/// Signature of the host-side write barrier callback. `obj` is the
+/// GC-managed object whose field is being updated with a possible young
+/// pointer. The backend decides whether `obj` is old enough to require
+/// remembering.
+pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
+
+thread_local! {
+    static GC_WRITE_BARRIER_HOOK: Cell<Option<GcWriteBarrierHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the write-barrier callback for this thread.
+pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
+    GC_WRITE_BARRIER_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the write-barrier callback on this thread.
+pub fn clear_gc_write_barrier_hook() {
+    GC_WRITE_BARRIER_HOOK.with(|cell| cell.set(None));
+}
+
+/// Run the active GC write barrier for `obj` when one is installed.
+#[inline]
+pub fn try_gc_write_barrier(obj: *mut u8) -> bool {
+    GC_WRITE_BARRIER_HOOK.with(|cell| match cell.get() {
+        Some(f) => {
+            f(obj);
+            true
+        }
         None => false,
     })
 }
@@ -231,6 +287,7 @@ mod tests {
 
     static LAST_ROOT_PTR: AtomicUsize = AtomicUsize::new(0);
     static REMOVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WRITE_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe fn mock_add_root(slot: *mut *mut u8) {
         LAST_ROOT_PTR.store(slot as usize, Ordering::Relaxed);
@@ -238,6 +295,11 @@ mod tests {
     fn mock_remove_root(slot: *mut *mut u8) {
         let _ = slot;
         REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mock_write_barrier(obj: *mut u8) {
+        let _ = obj;
+        WRITE_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
@@ -283,5 +345,20 @@ mod tests {
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
+    }
+
+    #[test]
+    fn write_barrier_hook_registers_invokes_and_clears() {
+        clear_gc_write_barrier_hook();
+        let obj = 0x1000usize as *mut u8;
+        assert!(!try_gc_write_barrier(obj));
+
+        WRITE_BARRIER_CALLS.store(0, Ordering::Relaxed);
+        register_gc_write_barrier_hook(mock_write_barrier);
+        assert!(try_gc_write_barrier(obj));
+        assert_eq!(WRITE_BARRIER_CALLS.load(Ordering::Relaxed), 1);
+
+        clear_gc_write_barrier_hook();
+        assert!(!try_gc_write_barrier(obj));
     }
 }

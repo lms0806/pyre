@@ -80,6 +80,27 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
     majit_gc::gc_remove_root(slot as *mut majit_ir::GcRef);
 }
 
+struct FrameLocalsRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl FrameLocalsRoot {
+    fn new(frame: &mut PyFrame) -> Self {
+        let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for FrameLocalsRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
 /// Bridge pyre-object's `is_managed_heap_object` query to
 /// `majit_gc::gc_owns_object`. Used by host-side allocators
 /// (`pyre_object::dealloc_items_block`) to discriminate
@@ -87,6 +108,31 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
 /// fallback blocks.
 fn pyre_object_gc_owns_object_trampoline(addr: usize) -> bool {
     majit_gc::gc_owns_object(addr)
+}
+
+fn pyre_object_gc_current_object_address_trampoline(addr: usize) -> usize {
+    majit_gc::gc_current_object_address(addr)
+}
+
+fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
+    majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
+}
+
+unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictobject::W_DictObject) };
+    let entries = unsafe { &mut *dict.entries };
+    for (key, value) in entries.iter_mut() {
+        f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    let items = unsafe { &mut *set.items };
+    for item in items.iter_mut() {
+        f(item as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
 }
 
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
@@ -499,11 +545,11 @@ thread_local! {
             &pyre_interpreter::gateway::BUILTIN_CODE_TYPE as *const _ as usize,
             builtin_code_tid,
         );
-        // Function carries 4 inline `PyObjectRef` fields (closure /
-        // defs_w / w_kw_defs / w_module) that the collector must walk
-        // — `object_subclass_with_gc_ptrs` records the offsets so
-        // mark traversal reaches them. `BUILTIN_FUNCTION_TYPE` is a
-        // separate static `PyType` for module-level builtins
+        // Function carries inline `PyObjectRef` fields (code / closure /
+        // defs_w / w_kw_defs / w_module / cached metadata) that the
+        // collector must walk — `object_subclass_with_gc_ptrs` records
+        // the offsets so mark traversal reaches them. `BUILTIN_FUNCTION_TYPE`
+        // is a separate static `PyType` for module-level builtins
         // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
         // instances are the same Rust struct, so the vtable map sends
         // both PyTypes to `function_tid`.
@@ -797,15 +843,14 @@ thread_local! {
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const _ as usize,
             w_bytearray_tid,
         );
-        // W_DictObject carries `entries: *mut Vec<...>` (raw heap),
-        // a `usize` length, and `dict_storage_proxy: *mut u8`. None
-        // of those are direct `PyObjectRef` fields (the (key, value)
-        // pairs live behind a raw `Vec` pointer), so registration is
-        // size-only. The Vec's PyObjectRefs reaching the GC is a
-        // pre-existing limitation common to set/dict storage.
-        let w_dict_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_DictObject carries `entries: *mut Vec<(PyObjectRef,
+        // PyObjectRef)>` behind a raw pointer. Register a custom trace
+        // hook so the GC updates those indirect key/value slots just as it
+        // updates inline object fields.
+        let w_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::dictobject::W_DictObject>(),
             object_tid,
+            dict_object_custom_trace,
         ));
         debug_assert_eq!(w_dict_tid, W_DICT_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -817,13 +862,13 @@ thread_local! {
             &pyre_object::DICT_TYPE as *const _ as usize,
             w_dict_tid,
         );
-        // W_SetObject carries `items: *mut Vec<PyObjectRef>` and a
-        // `usize` length. Same size-only registration shape as
-        // W_DictObject. Both `set` and `frozenset` PyTypes share the
-        // `W_SetObject` Rust struct so they map to the same tid.
-        let w_set_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_SetObject carries `items: *mut Vec<PyObjectRef>`. Register a
+        // custom trace hook so GC forwarding updates indirect element slots.
+        // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
+        let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
             object_tid,
+            set_object_custom_trace,
         ));
         debug_assert_eq!(w_set_tid, W_SET_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1179,6 +1224,10 @@ thread_local! {
         // dereference freed memory. See
         // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
+        // pyre's temporary mapdict side table mirrors PyPy fields that are
+        // normally traced by the translated GC. Walk its value slots
+        // explicitly until the table is folded into the object layout.
+        majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
         // Route pyre-object host-side allocators through the backend's
         // nursery. `set_gc_allocator` populated
         // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
@@ -1193,6 +1242,10 @@ thread_local! {
             pyre_object_gc_remove_root_trampoline,
         );
         pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
+        pyre_object::register_gc_current_object_address_hook(
+            pyre_object_gc_current_object_address_trampoline,
+        );
+        pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
         // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots
         // come from manual `pyre_object::gc_roots::pin_root` calls
@@ -1264,6 +1317,21 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         let gcref: &mut majit_ir::GcRef =
             unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
         visitor(gcref);
+    });
+}
+
+fn visit_pyobject_root(
+    slot: &mut pyre_object::PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let gcref: &mut majit_ir::GcRef =
+        unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
+    visitor(gcref);
+}
+
+fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
     });
 }
 
@@ -2897,13 +2965,16 @@ fn execute_assembler(
     }
 
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
-    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
-        green_key,
-        entry_pc,
-        &mut jit_state,
-        env,
-        || {},
-    );
+    let outcome = {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        driver.run_compiled_detailed_with_bridge_keyed(
+            green_key,
+            entry_pc,
+            &mut jit_state,
+            env,
+            || {},
+        )
+    };
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // JIT-overflow flag the backend probe records when it trips. The
@@ -3141,6 +3212,7 @@ fn bound_reached(
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
     let outcome = if driver.has_compiled_loop(green_key) {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
@@ -3373,13 +3445,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
-        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
-            green_key,
-            frame.next_instr(),
-            &mut jit_state,
-            &env,
-            || {},
-        );
+        let outcome = {
+            let _frame_locals_root = FrameLocalsRoot::new(frame);
+            driver.run_compiled_detailed_with_bridge_keyed(
+                green_key,
+                frame.next_instr(),
+                &mut jit_state,
+                &env,
+                || {},
+            )
+        };
         // rstack.stack_check_slowpath → _StackOverflow parity: drain
         // the JIT-overflow flag the backend probe records when it
         // trips during compiled execution at function entry.
@@ -3549,7 +3624,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             debug_first_arg_int(frame),
         );
     }
-    driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
+    {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
+    }
     None
 }
 

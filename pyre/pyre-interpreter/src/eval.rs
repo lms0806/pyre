@@ -161,6 +161,29 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 /// written once at frame setup) and the operand stack region
 /// (`nlocals+ncells..valuestackdepth`). Dead stack slots past
 /// `valuestackdepth` are skipped.
+unsafe fn walk_raw_function_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() || !crate::is_function(value) {
+            return;
+        }
+        let func = &mut *(value as *mut crate::function::Function);
+        visitor(&mut *(&mut func.code as *mut *const () as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_module as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_func_globals_obj as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_ann as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_doc as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_text_signature as *mut PyObjectRef as *mut majit_ir::GcRef));
+    }
+}
+
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     CURRENT_FRAME.with(|cf| {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
@@ -252,6 +275,24 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+                }
+                if !(*frame).w_globals.is_null() {
+                    let globals_ptr = (*frame).w_globals;
+                    let mirror = (&*globals_ptr).mirror_target();
+                    let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
+                        .values_mut()
+                        .iter_mut()
+                        .map(|value| value as *mut PyObjectRef)
+                        .collect();
+                    for value in value_slots {
+                        visitor(&mut *(value as *mut majit_ir::GcRef));
+                        walk_raw_function_roots(*value, visitor);
+                    }
+                    let mut mirror_slot = mirror;
+                    visitor(&mut *(&mut mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                    if mirror_slot != mirror {
+                        (&mut *globals_ptr).set_mirror_target(mirror_slot);
+                    }
                 }
                 let f = &*frame;
                 let next_frame = (*frame).f_backref;

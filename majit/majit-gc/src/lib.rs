@@ -830,6 +830,21 @@ pub fn gc_owns_object(addr: usize) -> bool {
     })
 }
 
+/// Return the current address for a managed object without treating it as a
+/// root. During a minor collection this follows an already-installed nursery
+/// forwarding pointer; otherwise it returns `addr` unchanged.
+pub fn gc_current_object_address(addr: usize) -> usize {
+    if addr == 0 || !gc_owns_object(addr) {
+        return addr;
+    }
+    let hdr = unsafe { header::header_of(addr) };
+    if unsafe { (*hdr).is_forwarded() } {
+        unsafe { header::GcHeader::forwarding_address(hdr) }
+    } else {
+        addr
+    }
+}
+
 /// Thread-local callbacks for registering/removing a Rust-stack slot
 /// as a GC root with the currently active backend (Task #141 option
 /// a). Used by host-side allocators whose callers need to keep a
@@ -875,6 +890,34 @@ pub fn gc_remove_root(slot: *mut GcRef) {
     ACTIVE_REMOVE_ROOT.with(|c| {
         if let Some(f) = c.get() {
             f(slot)
+        }
+    });
+}
+
+/// Thread-local callback that performs a host-side write barrier through
+/// the currently active backend GC.
+pub type WriteBarrierFn = fn(obj: GcRef);
+
+thread_local! {
+    static ACTIVE_WRITE_BARRIER: Cell<Option<WriteBarrierFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's write-barrier callback. Pass `None` to clear.
+pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
+    ACTIVE_WRITE_BARRIER.with(|c| c.set(hook));
+}
+
+/// Perform a write barrier through the active backend.
+///
+/// Calling convention: callers must invoke this before storing a GC reference
+/// into `obj`, matching [`GcAllocator::write_barrier`]. The active callback is
+/// thread-local and installed with [`set_active_write_barrier`] as a
+/// [`WriteBarrierFn`]; this is a no-op when no barrier is installed on the
+/// current thread.
+pub fn gc_write_barrier(obj: GcRef) {
+    ACTIVE_WRITE_BARRIER.with(|c| {
+        if let Some(f) = c.get() {
+            f(obj)
         }
     });
 }

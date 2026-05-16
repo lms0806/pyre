@@ -59,11 +59,78 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     if let Some(w_dict) = existing {
         return w_dict;
     }
+    // PyPy stores this in the mapdict "dict" SPECIAL slot. pyre's temporary
+    // mapdict adapter is an address-keyed side table; keep the holder
+    // GC-managed so a user-held old __dict__ remains traceable after
+    // _obj_setdict replaces the side-table entry.
     let w_dict = pyre_object::w_dict_new();
     INSTANCE_DICT.with(|table| {
         table.borrow_mut().insert(self_ref as usize, w_dict);
     });
     w_dict
+}
+
+fn current_owner_key(key: usize) -> usize {
+    pyre_object::gc_hook::try_gc_current_object_address(key as *mut u8) as usize
+}
+
+/// Walk roots held by pyre's temporary mapdict side tables.
+///
+/// PyPy stores the instance dict and weakref lifeline in mapdict SPECIAL slots,
+/// so the translated GC sees them as ordinary object fields. pyre keeps the
+/// same logical data in address-keyed side tables until mapdict is ported into
+/// the object layout; expose the value slots here so the backend GC can update
+/// them when nursery objects move.
+pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let dict_values = INSTANCE_DICT.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .map(|(&key, &dict)| (key, dict))
+            .collect::<Vec<_>>()
+    });
+    // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
+    // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
+    for (key, mut dict) in dict_values {
+        visitor(&mut dict);
+        let new_key = current_owner_key(key);
+        INSTANCE_DICT.with(|table| {
+            let mut table = table.borrow_mut();
+            if new_key == key {
+                if let Some(slot) = table.get_mut(&key) {
+                    *slot = dict;
+                }
+            } else if table.remove(&key).is_some() {
+                table.insert(new_key, dict);
+            }
+        });
+        unsafe {
+            pyre_object::w_dict_walk_entries_mut(dict, |slot| {
+                visitor(slot);
+            });
+        }
+    }
+    let weakref_values = WEAKREF_TABLE.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect::<Vec<_>>()
+    });
+    for (key, mut value) in weakref_values {
+        visitor(&mut value);
+        let new_key = current_owner_key(key);
+        WEAKREF_TABLE.with(|table| {
+            let mut table = table.borrow_mut();
+            if new_key == key {
+                if let Some(slot) = table.get_mut(&key) {
+                    *slot = value;
+                }
+            } else if table.remove(&key).is_some() {
+                table.insert(new_key, value);
+            }
+        });
+    }
 }
 
 /// objspace/std/mapdict.py:842-860 _obj_setdict.

@@ -253,4 +253,3 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         self.trace_store_attr(obj.opref, name, value.opref)
     }
 }
-

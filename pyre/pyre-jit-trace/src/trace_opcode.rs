@@ -5,12 +5,18 @@
 
 use crate::state::*;
 
+use std::borrow::Cow;
+
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
 };
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+
+extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
+    unsafe { function_get_defaults(func as PyObjectRef) as i64 }
+}
 
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
@@ -178,8 +184,8 @@ use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function,
-    decode_instruction_at, execute_opcode_step, function_get_globals, is_builtin_code, is_function,
-    range_iter_continues,
+    decode_instruction_at, execute_opcode_step, function_get_defaults, function_get_globals,
+    is_builtin_code, is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -194,6 +200,68 @@ use pyre_object::{
     PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
+
+fn trace_abort_error(reason: &'static str) -> PyError {
+    PyError::internal_trace_abort(reason)
+}
+
+fn is_trace_abort_error(err: &PyError) -> bool {
+    err.kind == pyre_interpreter::PyErrorKind::TraceAbort
+}
+
+fn positional_defaults_to_load(
+    callable: PyObjectRef,
+    code: &CodeObject,
+    nargs: usize,
+) -> Option<Vec<PyObjectRef>> {
+    let nparams = code.arg_count as usize;
+    if nargs >= nparams {
+        return None;
+    }
+
+    let defaults = unsafe { function_get_defaults(callable) };
+    if defaults.is_null() {
+        return None;
+    }
+
+    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
+    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+        unsafe { w_tuple_len(defaults) }
+    } else {
+        0
+    };
+    if ndefaults == 0 {
+        return None;
+    }
+
+    let first_default = nparams.saturating_sub(ndefaults);
+    if nargs < first_default {
+        return None;
+    }
+
+    let defaults_to_load = nparams - first_default;
+    let default_start = ndefaults - defaults_to_load;
+    let mut loaded = Vec::with_capacity(nparams - nargs);
+    for i in nargs..nparams {
+        let default_idx = default_start + (i - first_default);
+        loaded.push(unsafe { w_tuple_getitem(defaults, default_idx as i64) }.unwrap_or(PY_NULL));
+    }
+    Some(loaded)
+}
+
+fn fill_positional_defaults_for_trace_call<'a>(
+    callable: PyObjectRef,
+    code: &CodeObject,
+    args: &'a [PyObjectRef],
+) -> Cow<'a, [PyObjectRef]> {
+    let Some(defaults) = positional_defaults_to_load(callable, code, args.len()) else {
+        return Cow::Borrowed(args);
+    };
+    let mut full = Vec::with_capacity(args.len() + defaults.len());
+    full.extend_from_slice(args);
+    full.extend(defaults);
+    Cow::Owned(full)
+}
 
 fn const_step_one_slice_bounds(
     concrete_obj: PyObjectRef,
@@ -270,15 +338,6 @@ use crate::frame_layout::{
 };
 use crate::helpers::TraceHelperAccess;
 
-/// Build the red `frame` argument for PyPy-style recursive CALL_ASSEMBLER.
-///
-/// RPython `pyjitpl.py:3589-3609 direct_assembler_call` records the portal
-/// reds (`frame`, `ec`) directly. For the narrow fib-style case we can emit
-/// the callee `PyFrame` as ordinary trace IR; cases that need closure or
-/// debugdata setup keep the existing opaque helper fallback.
-///
-/// Returns `(frame, drop_needed)`. `drop_needed` is true only for the legacy
-/// arena helper path; trace-visible frames are GC-owned.
 fn emit_call_assembler_callee_frame(
     this: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -290,7 +349,10 @@ fn emit_call_assembler_callee_frame(
     is_self_recursive: bool,
     self_recursive_raw_int_arg: Option<OpRef>,
 ) -> Result<(OpRef, bool), PyError> {
-    if is_self_recursive && args.len() == 1 {
+    let needs_positional_defaults = is_self_recursive
+        && positional_defaults_to_load(concrete_callable, callee_code, args.len()).is_some();
+
+    if is_self_recursive && !needs_positional_defaults && args.len() == 1 {
         if let Some(raw_arg) = self_recursive_raw_int_arg {
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
@@ -323,12 +385,25 @@ fn emit_call_assembler_callee_frame(
     if args.len() == 1 {
         let (helper, helper_arg_types, helper_args) = if is_self_recursive {
             if let Some(raw_arg) = self_recursive_raw_int_arg {
-                let (helper, helper_arg_types) = one_arg_callee_frame_helper(Type::Int, true);
-                (helper, helper_arg_types, vec![this.frame(), raw_arg])
-            } else {
                 let (helper, helper_arg_types) =
-                    one_arg_callee_frame_helper(this.value_type(args[0]), true);
-                (helper, helper_arg_types, vec![this.frame(), args[0]])
+                    one_arg_callee_frame_helper(Type::Int, !needs_positional_defaults);
+                let helper_args = if needs_positional_defaults {
+                    vec![this.frame(), callable, raw_arg]
+                } else {
+                    vec![this.frame(), raw_arg]
+                };
+                (helper, helper_arg_types, helper_args)
+            } else {
+                let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                    this.value_type(args[0]),
+                    !needs_positional_defaults,
+                );
+                let helper_args = if needs_positional_defaults {
+                    vec![this.frame(), callable, args[0]]
+                } else {
+                    vec![this.frame(), args[0]]
+                };
+                (helper, helper_arg_types, helper_args)
             }
         } else {
             let (helper, helper_arg_types) =
@@ -349,11 +424,7 @@ fn emit_call_assembler_callee_frame(
     }
 
     if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(args.len()) {
-        let mut helper_args = if is_self_recursive {
-            vec![this.frame()]
-        } else {
-            vec![this.frame(), callable]
-        };
+        let mut helper_args = vec![this.frame(), callable];
         helper_args.extend_from_slice(args);
         let helper_arg_types = frame_callable_arg_types(args.len());
         let frame = ctx.call_ref_typed_with_effect(
@@ -3791,8 +3862,13 @@ impl MIFrame {
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
-        let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
-            Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
+        let concrete_frame_ptr = if !sym.concrete_vable_ptr.is_null() {
+            sym.concrete_vable_ptr as usize
+        } else {
+            self.concrete_frame_addr
+        };
+        let concrete_frame = if concrete_frame_ptr != 0 {
+            Some(unsafe { &*(concrete_frame_ptr as *const pyre_interpreter::pyframe::PyFrame) })
         } else {
             None
         };
@@ -3807,14 +3883,23 @@ impl MIFrame {
         // physical frame had been allocated with stack room beyond the
         // current symbolic depth. Read the physical frame length and
         // pad missing slots with the live concrete value (or NULL).
-        let physical_array_len = concrete_frame
-            .map(|f| f.locals_w().len())
+        let physical_array_len = ctx
+            .virtualizable_array_lengths()
+            .and_then(|lengths| lengths.first().copied())
+            .or_else(|| concrete_frame.map(|f| f.locals_w().len()))
             .unwrap_or_else(|| {
-                let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
-                let stack_depth = current_vsd
-                    .saturating_sub(sym.nlocals)
-                    .min(symbolic_stack_len);
-                sym.nlocals + stack_depth
+                if !sym.jitcode.is_null() {
+                    let code = unsafe { &*(*sym.jitcode).raw_code() };
+                    code.varnames.len()
+                        + pyre_interpreter::pyframe::ncells(code)
+                        + code.max_stackdepth as usize
+                } else {
+                    let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
+                    let stack_depth = current_vsd
+                        .saturating_sub(sym.nlocals)
+                        .min(symbolic_stack_len);
+                    sym.nlocals + stack_depth
+                }
             });
         let full_array_len = physical_array_len;
         // virtualizable.py:135-137 `lst[j] = reader.load_next_value_of_type(
@@ -4246,6 +4331,23 @@ impl MIFrame {
         let v = self.sym().concrete_value_at(abs_idx);
         if !v.is_null() {
             return Some(v.to_pyobj());
+        }
+        None
+    }
+
+    fn existing_ref_for_concrete(&self, concrete_obj: PyObjectRef) -> Option<OpRef> {
+        if concrete_obj.is_null() {
+            return None;
+        }
+        let s = self.sym();
+        let total_slots = s.nlocals + s.concrete_stack.len();
+        for abs_idx in 0..total_slots {
+            if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
+                let opref = *s.registers_r.get(abs_idx)?;
+                if opref != OpRef::NONE && self.value_type(opref) == Type::Ref {
+                    return Some(opref);
+                }
+            }
         }
         None
     }
@@ -4994,6 +5096,9 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
+                    if let Some(existing) = this.existing_ref_for_concrete(inner_self) {
+                        return existing;
+                    }
                     this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
                         let func_ref = ctx.record_op_with_descr(
@@ -5010,26 +5115,47 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
-                    let self_ref = recover_self(self);
-                    self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
-                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                    // Do not replace this with `list_append_value` until
+                    // guard-failure blackhole resume is complete.  A direct
+                    // trace-visible append/pop port looks closer to PyPy, but
+                    // currently corrupts semantics: `python3 pyre/check.py
+                    // --synthetic-only --synthetic-pattern list_append_pop.py`
+                    // reports wrong output on both dynasm and cranelift when
+                    // these aborts are removed.
+                    return Err(trace_abort_error(
+                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
-                    let concrete_len = unsafe { w_list_len(inner_self) };
-                    // Empty-list pop raises IndexError; let the generic
-                    // dispatcher handle that. Strategy-unknown lists also
-                    // fall through; `list_pop_value` mirrors the strategy
-                    // detection from `list_append_value`.
-                    if concrete_len > 0 {
-                        let self_ref = recover_self(self);
-                        return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
-                    }
+                    // Keep in sync with the append guard above. Removing this
+                    // abort caused `synth/list_append_pop` correctness
+                    // failures during the PyPy-parity audit.
+                    return Err(trace_abort_error(
+                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
                     let self_ref = recover_self(self);
                     return self.list_reverse_value(callable, self_ref, inner_self);
                 }
+            }
+            if !inner_func.is_null()
+                && !inner_self.is_null()
+                && unsafe { is_function(inner_func) }
+                && unsafe {
+                    !is_builtin_code(
+                        pyre_interpreter::getcode(inner_func) as pyre_object::PyObjectRef
+                    )
+                }
+            {
+                // Do not remove this abort until bound-method replay and
+                // guard-failure blackhole resume are aligned. Letting
+                // user-defined bound methods fall through to generic tracing
+                // currently corrupts `synth/class_attrs_methods` output on
+                // both dynasm and cranelift.
+                return Err(trace_abort_error(
+                    "abort tracing user-defined bound method call",
+                ));
             }
         }
 
@@ -5049,30 +5175,28 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    let c_arg = concrete_args.get(1).copied().unwrap_or(PY_NULL);
-                    self.list_append_value(args[0], args[1], concrete_args[0], c_arg)?;
-                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                    // Do not replace this with `list_append_value` until
+                    // guard-failure blackhole resume is complete.  A direct
+                    // trace-visible append/pop port looks closer to PyPy, but
+                    // currently corrupts semantics: `python3 pyre/check.py
+                    // --synthetic-only --synthetic-pattern list_append_pop.py`
+                    // reports wrong output on both dynasm and cranelift when
+                    // these aborts are removed.
+                    return Err(trace_abort_error(
+                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    let concrete_len = w_list_len(concrete_args[0]);
-                    if concrete_len > 0 {
-                        return self.list_pop_value(
-                            callable,
-                            args[0],
-                            concrete_args[0],
-                            concrete_len,
-                        );
-                    }
+                    // Keep in sync with the append guard above. Removing this
+                    // abort caused `synth/list_append_pop` correctness
+                    // failures during the PyPy-parity audit.
+                    return Err(trace_abort_error(
+                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 1
                     && canonical_list_method("reverse") == Some(concrete_callable)
@@ -5561,8 +5685,7 @@ impl MIFrame {
             this.implement_guard_value(ctx, callable, concrete_callable as i64);
         });
 
-        let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
-        for (_idx, arg) in concrete_args.iter().copied().enumerate() {
+        for (_idx, arg) in passed_concrete_args.iter().copied().enumerate() {
             if arg.is_null() {
                 return Err(PyError::type_error(
                     "pending inline frame lost concrete arg",
@@ -5574,18 +5697,22 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let _raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const CodeObject
-        };
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
         // tuple equality is lossless vs the derived u64 hash.
         let is_self_recursive = caller_code as usize == w_code as usize;
+        let concrete_args = fill_positional_defaults_for_trace_call(
+            concrete_callable,
+            unsafe {
+                &*pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef).cast::<CodeObject>()
+            },
+            passed_concrete_args,
+        );
+        let concrete_args = concrete_args.as_ref();
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
-            &concrete_args,
+            concrete_args,
             globals,
             caller_exec_ctx,
             closure,
@@ -5600,6 +5727,7 @@ impl MIFrame {
         let callee_globals = unsafe { function_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
             && callee_globals == caller_namespace
+            && concrete_args.len() == args.len()
             && callee_nlocals == args.len();
 
         let (callee_sym, drop_frame_opref) = if can_skip_traced_callee_frame {
@@ -5650,32 +5778,61 @@ impl MIFrame {
             sym.vable_w_globals = vable_w_globals;
             (sym, None)
         } else {
+            let default_oprefs: Vec<OpRef> = if concrete_args.len() > args.len() {
+                self.with_ctx(|_, ctx| {
+                    Ok::<_, PyError>(
+                        concrete_args[args.len()..]
+                            .iter()
+                            .map(|&default| ctx.const_ref(default as i64))
+                            .collect(),
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
+            let mut frame_args = args.to_vec();
+            frame_args.extend_from_slice(&default_oprefs);
+            if !default_oprefs.is_empty() {
+                let expected_defaults = unsafe { function_get_defaults(concrete_callable) };
+                self.with_ctx(|this, ctx| {
+                    let defaults = ctx.call_ref_typed_with_effect(
+                        trace_function_get_defaults as *const (),
+                        &[callable],
+                        &[Type::Ref],
+                        CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                    );
+                    this.implement_guard_value(ctx, defaults, expected_defaults as i64);
+                    Ok::<_, PyError>(())
+                })?;
+            }
             // Create symbolic OpRef for callee frame in trace
             let callee_frame_opref = self.with_ctx(|this, ctx| {
-                if args.len() == 1 {
-                    let (helper, helper_arg_types) =
-                        one_arg_callee_frame_helper(this.value_type(args[0]), is_self_recursive);
+                if frame_args.len() == 1 {
+                    let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                        this.value_type(frame_args[0]),
+                        is_self_recursive,
+                    );
                     if is_self_recursive {
                         ctx.call_ref_typed_with_effect(
                             helper,
-                            &[this.frame(), args[0]],
+                            &[this.frame(), frame_args[0]],
                             &helper_arg_types,
                             default_effect_info(),
                         )
                     } else {
                         ctx.call_ref_typed_with_effect(
                             helper,
-                            &[this.frame(), callable, args[0]],
+                            &[this.frame(), callable, frame_args[0]],
                             &helper_arg_types,
                             default_effect_info(),
                         )
                     }
                 } else if let Some(frame_helper) =
-                    (crate::callbacks::get().callee_frame_helper)(args.len())
+                    (crate::callbacks::get().callee_frame_helper)(frame_args.len())
                 {
                     let mut helper_args = vec![this.frame(), callable];
-                    helper_args.extend_from_slice(args);
-                    let helper_arg_types = frame_callable_arg_types(args.len());
+                    helper_args.extend_from_slice(&frame_args);
+                    let helper_arg_types = frame_callable_arg_types(frame_args.len());
                     ctx.call_ref_typed_with_effect(
                         frame_helper,
                         &helper_args,
@@ -5683,7 +5840,7 @@ impl MIFrame {
                         default_effect_info(),
                     )
                 } else {
-                    panic!("no frame helper for {} args", args.len());
+                    panic!("no frame helper for {} args", frame_args.len());
                 }
             });
 
@@ -5693,9 +5850,10 @@ impl MIFrame {
             sym.registers_r = Vec::with_capacity(sym.nlocals);
             sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
             for i in 0..sym.nlocals {
-                if i < args.len() {
-                    sym.registers_r.push(args[i]);
-                    sym.symbolic_local_types.push(self.value_type(args[i]));
+                if i < frame_args.len() {
+                    sym.registers_r.push(frame_args[i]);
+                    sym.symbolic_local_types
+                        .push(self.value_type(frame_args[i]));
                 } else {
                     sym.registers_r.push(OpRef::NONE);
                     sym.symbolic_local_types.push(Type::Ref);
@@ -5840,11 +5998,21 @@ impl MIFrame {
                     let caller_raw: (usize, usize) =
                         (unsafe { (*this.sym().jitcode).code } as usize, 0);
                     let is_self_recursive = callee_raw == caller_raw;
+                    let needs_positional_defaults = is_self_recursive
+                        && unsafe {
+                            let w_callee_code = pyre_interpreter::getcode(concrete_callable);
+                            let callee_code =
+                                &*pyre_interpreter::w_code_get_ptr(w_callee_code as PyObjectRef)
+                                    .cast::<CodeObject>();
+                            positional_defaults_to_load(concrete_callable, callee_code, args.len())
+                                .is_some()
+                        };
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper
                     // boxes at the boundary and the trace records a Ref.
                     let force_fn = if is_self_recursive
+                        && !needs_positional_defaults
                         && (crate::callbacks::get().recursive_force_cache_safe)(concrete_callable)
                     {
                         crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
@@ -6226,6 +6394,9 @@ impl MIFrame {
         // Valid raise/reraise paths seed `last_exc_box` directly; malformed
         // bytecode-level raises still surface as ordinary interpreter errors
         // and use the generic raised-exception path below.
+        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
+            return TraceAction::Abort;
+        }
         if let Err(ref err) = step_result {
             if !matches!(
                 instruction,
@@ -6711,6 +6882,9 @@ impl MIFrame {
         // exception in last_exc_value. Valid raise/reraise paths seed
         // `last_exc_box` directly; malformed bytecode-level raises still
         // use the generic raised-exception path below.
+        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
+            return InlineTraceStepAction::Trace(TraceAction::Abort);
+        }
         if let Err(ref err) = step_result {
             if !matches!(
                 instruction,

@@ -258,7 +258,6 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         self.trace_store_attr(obj.opref, name, value.opref)
     }
 }
-
 impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
