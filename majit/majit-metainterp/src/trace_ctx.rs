@@ -254,6 +254,17 @@ pub struct TraceCtx {
     /// 2834) to set the `FORCE_BRIDGE_SEGMENTING` bit on the loop
     /// token when bridge tracing aborts without an inlinable function.
     pub(crate) resumekey_original_loop_token: Option<std::sync::Arc<JitCellToken>>,
+    /// `pyjitpl.py:644-668 _do_getarrayitem_gc_any` debug sanity check
+    /// side table.  RPython's heapcache stores Box→Box and
+    /// `tobox.getint()` returns the cached box's runtime int.  pyre's
+    /// flat-OpRef array cache only stores symbolic OpRef→OpRef so a
+    /// reverse `tobox.getint()` is not available for op-result entries;
+    /// mirror the original load's concrete int here keyed by the
+    /// recorded opref's raw id, so the dispatch arm can replicate
+    /// `if resvalue != tobox.getint(): assert 0`.  Append-only:
+    /// recorded oprefs are unique per trace and stale entries are only
+    /// reachable via cache-hit paths whose cache entries are still live.
+    pub(crate) array_cache_concrete_int: std::collections::HashMap<u32, i64>,
 }
 
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
@@ -338,6 +349,25 @@ impl TraceCtx {
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle = &self.constants;
         self.heap_cache
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
+    }
+
+    /// Track the original concrete int of an array-load result for the
+    /// `pyjitpl.py:644-668 _do_getarrayitem_gc_any` sanity check.
+    /// RPython recovers it via `tobox.getint()` on the cached Box; pyre
+    /// keys this side table by the recorded opref's raw id so the
+    /// dispatch arm can compare the freshly executed load against the
+    /// original load's value on cache hit.
+    pub fn array_cache_track_concrete_int(&mut self, value: OpRef, concrete: i64) {
+        self.array_cache_concrete_int.insert(value.raw(), concrete);
+    }
+
+    /// Look up the concrete int previously associated with a cached
+    /// array-load opref via [`Self::array_cache_track_concrete_int`].
+    /// Returns `None` for entries that were never tracked (e.g. cache
+    /// values inserted by paths other than the dispatch sanity-check
+    /// store).
+    pub fn array_cache_lookup_concrete_int(&self, value: OpRef) -> Option<i64> {
+        self.array_cache_concrete_int.get(&value.raw()).copied()
     }
 
     /// heapcache.py:518-522 `getfield` parity.  Routes `obj` through
@@ -522,6 +552,7 @@ impl TraceCtx {
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
+            array_cache_concrete_int: std::collections::HashMap::new(),
         }
     }
 
@@ -581,6 +612,7 @@ impl TraceCtx {
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
+            array_cache_concrete_int: std::collections::HashMap::new(),
         }
     }
 

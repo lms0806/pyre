@@ -1677,11 +1677,14 @@ where
                 };
                 let (array_opref, array_addr) = self.read_ref_reg(array_reg);
                 let (index_opref, index_value) = self.read_int_reg(index_reg);
-                let opref = ctx.record_op_with_descr(
-                    OpCode::GetarrayitemGcI,
-                    &[array_opref, index_opref],
-                    descr,
-                );
+                let descr_index = descr.index();
+                // pyjitpl.py:640-673 `_do_getarrayitem_gc_any`: check
+                // `heapcache.getarrayitem(arraybox, indexbox, arraydescr)`
+                // before recording.  Cache hit short-circuits the record,
+                // counts `HEAPCACHED_OPS`, and returns the cached box;
+                // miss falls through to `execute_with_descr` + the
+                // `getarrayitem_now_known` cache store at line 671.
+                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
                 // Concrete eval: descriptor-aware sized load with sign
                 // extension chosen by `is_item_signed`.  Mirrors PyPy
                 // `llmodel.py:591 unpack_arraydescr_size + read_int_at_mem(
@@ -1720,7 +1723,92 @@ where
                         ),
                     }
                 };
-                self.set_int_reg(dst, Some(opref), Some(concrete));
+                let (opref, reg_concrete) = if let Some(cached_opref) = cached {
+                    // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
+                    // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
+                    ctx.profiler().count_ops(
+                        OpCode::GetarrayitemGcI,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
+                    );
+                    // pyjitpl.py:644-668 sanity check: compare the
+                    // freshly executed load (`resvalue`) against the
+                    // cached box's `tobox.getint()`.  On mismatch
+                    // `_record_helper` records a fallback op whose
+                    // return value is discarded; `assert 0` fires in
+                    // debug mode; the function still returns the
+                    // (stale) cached box.  `_record_helper` routes
+                    // through `heapcache.invalidate_caches`, but that
+                    // call short-circuits on GETARRAYITEM_GC_I
+                    // (`mark_escaped` does not escape the read,
+                    // `clear_caches_not_necessary` returns True), so
+                    // the heapcache state is intentionally left
+                    // untouched.  Pyre recovers `tobox.getint()`
+                    // either via the constant pool (ConstInt cached
+                    // oprefs) or via the dispatch-tracked
+                    // `array_cache_concrete_int` side table; untracked
+                    // op-result oprefs from non-dispatch callers fall
+                    // through without a check.
+                    let expected =
+                        ctx.array_cache_lookup_concrete_int(cached_opref)
+                            .or_else(|| match ctx.constants_get_value(cached_opref) {
+                                Some(majit_ir::Value::Int(n)) => Some(n),
+                                _ => None,
+                            });
+                    // Cache hit propagates the stale `tobox.getint()`
+                    // into the destination on mismatch — pyjitpl.py:669
+                    // returns `tobox` so the caller sees the cached
+                    // box's int, not `resvalue`.  Match that by
+                    // selecting `expected` (stale) when the assertion
+                    // fires, else the freshly executed int (which
+                    // equals expected in the no-mismatch arm).
+                    let stale = matches!(expected, Some(exp) if exp != concrete);
+                    if stale {
+                        // pyjitpl.py:2693-2694 `_record_helper` invalidates
+                        // before recording.  `clear_caches_not_necessary`
+                        // short-circuits for GETARRAYITEM_GC_I (no-side-
+                        // effect read), so the only remaining side effect
+                        // is `mark_escaped` escaping `array_opref` and
+                        // `index_opref` — match that structure here.
+                        ctx.heapcache_invalidate_caches_varargs(
+                            OpCode::GetarrayitemGcI,
+                            None,
+                            &[array_opref, index_opref],
+                        );
+                        let _ = ctx.record_op_with_descr(
+                            OpCode::GetarrayitemGcI,
+                            &[array_opref, index_opref],
+                            descr,
+                        );
+                        debug_assert!(
+                            false,
+                            "BC_GETARRAYITEM_GC_I sanity check failed: \
+                             cached={:?} concrete={}",
+                            expected, concrete,
+                        );
+                    }
+                    let reg_concrete = if stale {
+                        expected.expect("stale only set when expected is Some")
+                    } else {
+                        concrete
+                    };
+                    (cached_opref, reg_concrete)
+                } else {
+                    let opref = ctx.record_op_with_descr(
+                        OpCode::GetarrayitemGcI,
+                        &[array_opref, index_opref],
+                        descr,
+                    );
+                    // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
+                    ctx.heapcache_getarrayitem_now_known(
+                        array_opref,
+                        index_opref,
+                        descr_index,
+                        opref,
+                    );
+                    ctx.array_cache_track_concrete_int(opref, concrete);
+                    (opref, concrete)
+                };
+                self.set_int_reg(dst, Some(opref), Some(reg_concrete));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
                 let (vable_reg, array_idx, index_reg, dest) =
