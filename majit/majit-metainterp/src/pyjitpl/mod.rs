@@ -293,8 +293,9 @@ impl StoredExitLayout {
 /// via is_const/get_const (resume.py:157 getconst parity).
 /// Decode a raw virtualizable-slot `i64` from `VirtualizableInfo::read_all_boxes`
 /// into the typed `majit_ir::Value` the parallel virtualizable concrete
-/// shadow expects.  Mirrors `value_from_backend_constant_bits_typed` so the
-/// shadow never disagrees with the register-shadow encoding.
+/// shadow expects. Mirrors the inverse of `value_to_backend_constant_bits`
+/// (optimizeopt/optimizer.rs) so the shadow never disagrees with the
+/// register-shadow encoding.
 fn heap_value_for(ty: Type, bits: i64) -> Value {
     match ty {
         Type::Int => Value::Int(bits),
@@ -306,8 +307,7 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut std::collections::HashMap<u32, i64>,
-    constant_types: &mut std::collections::HashMap<u32, majit_ir::Type>,
+    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -322,8 +322,8 @@ fn snapshot_map_from_trace_snapshots(
     let mut pc_map = Vec::new();
     let mut next_const_idx = constants
         .keys()
-        .filter(|k| majit_ir::OpRef::raw_is_constant(**k))
-        .map(|k| majit_ir::OpRef::raw_const_index(*k))
+        .filter(|&&k| majit_ir::OpRef::raw_is_constant(k))
+        .map(|&k| majit_ir::OpRef::raw_const_index(k))
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
@@ -340,8 +340,9 @@ fn snapshot_map_from_trace_snapshots(
                 // history.py:182/220/261/307 + resoperation.py:719/727/739/
                 // 564-638: `box.type` lives on the Box. Pyre's typed
                 // OpRef variants carry it intrinsically; the explicit
-                // `fallback_tp` is the lockstep authority for residual
-                // `OpRef::Untyped` cases (legacy from_raw producers).
+                // `fallback_tp` is the lockstep authority for the
+                // narrow `OpRef::None` / Void-tagged corner case where
+                // `opref.ty()` returns `None`.
                 let tp = opref.ty().unwrap_or(*fallback_tp);
                 SnapshotBox::typed(*opref, tp)
             }
@@ -350,19 +351,15 @@ fn snapshot_map_from_trace_snapshots(
                 // Register in pool so is_const → true, get_const → (0, Ref),
                 // getconst → NULLREF. Do NOT short-circuit to OpRef::NONE.
                 // resume.py:157 getconst: find or allocate pool entry.
+                //
+                // history.py:220 box.type parity: `Value` carries the box
+                // class intrinsically, so the lockstep check between the
+                // raw bits and the type is reduced to a single
+                // `Value`-equality comparison.
+                let needle = heap_value_for(*tp, *val);
                 let existing = constants
                     .iter()
-                    .find(|(k, v)| {
-                        **v == *val
-                            && constant_types.get(k).copied().unwrap_or_else(|| {
-                                panic!(
-                                    "constant_types missing entry for raw={} though \
-                                     constants has it: both maps are populated in \
-                                     lockstep at line ~302",
-                                    *k
-                                )
-                            }) == *tp
-                    })
+                    .find(|(_, v)| **v == needle)
                     .map(|(k, _)| *k);
                 let opref = match existing {
                     // Re-mint via the typed factory rather than poking the
@@ -381,12 +378,7 @@ fn snapshot_map_from_trace_snapshots(
                     None => {
                         let opref = majit_ir::OpRef::const_typed(next_const_idx, *tp);
                         next_const_idx += 1;
-                        constants.insert(opref.raw(), *val);
-                        // Lockstep with the dedup loop (line ~332): the
-                        // search above reads `constant_types[k]` to filter
-                        // by type per `resume.py:158-183 getconst`. Writing
-                        // both maps together keeps the invariant.
-                        constant_types.insert(opref.raw(), *tp);
+                        constants.insert(opref.raw(), needle);
                         opref
                     }
                 };
@@ -622,9 +614,10 @@ pub(crate) struct CompiledEntry<M> {
     /// RPython `opencoder.py:249-273 TraceIterator.__init__` allocates
     /// fresh `InputArg` Python objects every iteration, so bridge
     /// inputargs are automatically disjoint from the parent loop's boxes
-    /// by Python `is` identity. In pyre `OpRef::from_raw(u32)` IS the identity, so
-    /// a bridge that re-uses the `[0..num_inputs)` range collides with
-    /// the parent loop's OpRefs. `next_global_opref` records the first
+    /// by Python `is` identity. In pyre the typed `OpRef::InputArg*(raw)`
+    /// variant tag plus `raw` together form the identity, so a bridge
+    /// that re-uses the `[0..num_inputs)` range collides with the
+    /// parent loop's OpRefs. `next_global_opref` records the first
     /// OpRef Phase 2 did *not* allocate; `compile_bridge` /
     /// `start_retrace_from_guard` read it to pick a disjoint
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
@@ -2677,7 +2670,8 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// On `StartedTracing`, the framework registers each value in `live_values`
     /// as an InputArg. The interpreter should then build its symbolic state
-    /// from the returned InputArg OpRefs (OpRef::from_raw(0), OpRef::from_raw(1), ...).
+    /// from the returned typed `OpRef::input_arg_int(0)`,
+    /// `OpRef::input_arg_int(1)`, ... slots.
     pub fn on_back_edge(&mut self, green_key: u64, live_values: &[i64]) -> BackEdgeAction {
         let typed_values: Vec<Value> = live_values.iter().copied().map(Value::Int).collect();
         self.on_back_edge_typed(green_key, (0, 0), None, None, &typed_values)
@@ -3703,8 +3697,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArg>,
         ops: &mut Vec<Op>,
-        constants: &mut HashMap<u32, i64>,
-        constant_types: &mut HashMap<u32, Type>,
+        constants: &mut HashMap<u32, majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
     ) {
@@ -3756,7 +3749,6 @@ impl<M: Clone> MetaInterp<M> {
             num_red_args,
             index_of_vable,
             constants,
-            constant_types,
         );
         // compile.py:425-461 `patch_new_loop_to_load_virtualizable_fields`
         // only touches `loop.inputargs`; it does not rewrite any LABEL/JUMP
@@ -4059,11 +4051,11 @@ impl<M: Clone> MetaInterp<M> {
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
         let trace_snapshots = preamble_data.base.snapshots().to_vec();
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
         // sees the post-GC addresses for any object that moved since the last
         // `get_or_insert_typed`.
         ctx.constants.refresh_from_gc();
-        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
+        let mut constants = ctx.constants.into_inner_typed();
 
         let trace_ops = preamble_data.base.operations().to_vec();
         if crate::majit_log_enabled() {
@@ -4098,7 +4090,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
-        unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
@@ -4118,11 +4109,11 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vable_map,
             snapshot_vref_map,
             snapshot_pc_map,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        // history.py:220 box.type parity: every Const Box pins its `.type`
+        // intrinsically, so the optimizer's seed-side `constant_types`
+        // table is just the per-entry type tag derived from `constants`.
+        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -4134,22 +4125,15 @@ impl<M: Clone> MetaInterp<M> {
         // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
         // holds the Phase 1 results.
         let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
-        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
                 &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
                 vable_config.clone(),
                 Some(&mut phase1_out),
-            );
-            // Capture Phase 2 constant types before unroll_opt is dropped.
-            for (k, v) in &unroll_opt.constant_types {
-                updated_constant_types.entry(*k).or_insert(*v);
-            }
-            result
+            )
         }));
-        constant_types = updated_constant_types;
         let mut retried_without_unroll = false;
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
@@ -4175,7 +4159,10 @@ impl<M: Clone> MetaInterp<M> {
                     {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
-                        simple_opt.constant_types = constant_types.clone();
+                        simple_opt.constant_types = retry_constants
+                            .iter()
+                            .map(|(&k, v)| (k, v.get_type()))
+                            .collect();
                         // history.py:_make_op parity — see the
                         // function-entry compile path below.
                         let inputarg_types: Vec<majit_ir::Type> =
@@ -4437,14 +4424,18 @@ impl<M: Clone> MetaInterp<M> {
             &mut inputargs,
             &mut compiled_ops,
             &mut constants,
-            &mut constant_types,
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
         );
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -4816,8 +4807,15 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        let mut constants = ctx.constants.snapshot();
-        let mut constant_types = ctx.constants.constant_types_snapshot();
+        let (mut constants, mut constant_types) = {
+            // history.py:220 box.type parity: ConstantPool stores typed
+            // `Value` intrinsically — the snapshot is already the
+            // canonical shape; the legacy `constant_types` view is a
+            // pure projection used by the bridge entry path.
+            let typed = ctx.constants.snapshot();
+            let types = ctx.constants.constant_types_snapshot();
+            (typed, types)
+        };
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -4826,11 +4824,24 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vable_boxes,
             snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        // Re-sync legacy `constant_types` view: snapshot_map_from_trace_snapshots
+        // may have minted fresh ConstInt/ConstFloat/ConstPtr entries.
+        for (&k, v) in &constants {
+            constant_types.entry(k).or_insert_with(|| v.get_type());
+        }
+        // Lower back to the legacy `i64` pool for the bridge compilation
+        // helpers below (compile_bridge / compile_entry_bridge consume the
+        // legacy backend shape directly).
+        let constants: HashMap<u32, i64> = constants
+            .iter()
+            .map(|(&k, v)| {
+                (
+                    k,
+                    crate::optimizeopt::optimizer::value_to_backend_constant_bits(v),
+                )
+            })
+            .collect();
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.cut_trace(cut_at);
@@ -5059,7 +5070,11 @@ impl<M: Clone> MetaInterp<M> {
             });
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
-            let constants = ctx.constants.snapshot();
+            // history.py:220 box.type parity: ConstantPool stores typed
+            // `Value` intrinsically — the snapshot is already the
+            // canonical shape; the legacy `constant_types` view is a
+            // pure projection used by `apply_partial_trace_into`.
+            let constants: HashMap<u32, majit_ir::Value> = ctx.constants.snapshot();
             let constant_types = ctx.constants.constant_types_snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
@@ -5135,7 +5150,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
-        unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
@@ -5144,11 +5158,10 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_vable_boxes,
             retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace.snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
+        // history.py:220 box.type parity: derive `constant_types` from
+        // the typed `Value` pool (each pool entry pins its box class).
+        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
@@ -5158,20 +5171,14 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
 
-        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
                 vable_config,
-            );
-            for (k, v) in &unroll_opt.constant_types {
-                updated_constant_types.entry(*k).or_insert(*v);
-            }
-            result
+            )
         }));
-        constant_types = updated_constant_types;
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
@@ -5199,9 +5206,16 @@ impl<M: Clone> MetaInterp<M> {
         // ops (JUMP excluded), matching RPython's partial_trace.operations.
         let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
-        // Merge constants from partial trace with new constants.
+        // Merge constants from partial trace with new constants. The
+        // partial trace was serialized in the legacy backend `i64` shape;
+        // promote each entry to a typed `Value` via its companion type
+        // tag (constant_types) — history.py:220 box.type parity.
         for (k, v) in partial.constants {
-            constants.entry(k).or_insert(v);
+            let tp = constant_types
+                .get(&k)
+                .copied()
+                .unwrap_or(majit_ir::Type::Int);
+            constants.entry(k).or_insert_with(|| heap_value_for(tp, v));
         }
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
@@ -5254,14 +5268,18 @@ impl<M: Clone> MetaInterp<M> {
             &mut inputargs,
             &mut combined_ops,
             &mut constants,
-            &mut constant_types,
             driver_descriptor.as_ref(),
             orig_vable_ptr_retrace,
         );
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -5612,10 +5630,10 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
-        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
+        let mut constants = ctx.constants.into_inner_typed();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -5624,7 +5642,7 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constant_types.clone();
+        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
@@ -5645,11 +5663,15 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vable_map,
             snapshot_vref_map,
             snapshot_pc_map,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        // history.py:220 box.type parity: derive the optimizer's
+        // `constant_types` from the typed-`Value` pool (the box class is
+        // pinned on every `Value`). Then re-stamp inputarg slot types
+        // (op-position slots for fresh inputargs are not in `constants`).
+        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        for (i, &tp) in inputarg_types.iter().enumerate() {
+            optimizer.constant_types.insert(i as u32, tp);
+        }
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (mod.rs:2261) can properly populate
@@ -5671,19 +5693,13 @@ impl<M: Clone> MetaInterp<M> {
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
-        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let result = optimizer.optimize_with_constants_and_inputs(
+            optimizer.optimize_with_constants_and_inputs(
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
-            );
-            for (k, v) in &optimizer.constant_types {
-                updated_constant_types.entry(*k).or_insert(*v);
-            }
-            result
+            )
         }));
-        constant_types = updated_constant_types;
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
@@ -5808,15 +5824,19 @@ impl<M: Clone> MetaInterp<M> {
             &mut inputargs,
             &mut optimized_ops,
             &mut constants,
-            &mut constant_types,
             driver_descriptor.as_ref(),
             orig_vable_ptr,
         );
 
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -6024,10 +6044,10 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
-        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
+        let mut constants = ctx.constants.into_inner_typed();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -6044,7 +6064,7 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constant_types.clone();
+        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py InputArg.type parity: each `InputArg` already carries
         // its type in the typed OpRef variant tag (`InputArg::opref()` calls
@@ -6060,11 +6080,15 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vable_map,
             snapshot_vref_map,
             snapshot_pc_map,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        // history.py:220 box.type parity: derive the optimizer's
+        // `constant_types` from the typed-`Value` pool (each `Value`
+        // pins its box class intrinsically).
+        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        // RPython Box.type parity: register inputarg types.
+        for ia in &trace.inputargs {
+            optimizer.constant_types.insert(ia.index, ia.tp);
+        }
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
@@ -6074,19 +6098,13 @@ impl<M: Clone> MetaInterp<M> {
         // the unrolled loop entry above.
         optimizer.set_pending_box_pool(trace.box_pool.clone());
 
-        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let result = optimizer.optimize_with_constants_and_inputs(
+            optimizer.optimize_with_constants_and_inputs(
                 &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
-            );
-            for (k, v) in &optimizer.constant_types {
-                updated_constant_types.entry(*k).or_insert(*v);
-            }
-            result
+            )
         }));
-        constant_types = updated_constant_types;
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
@@ -6175,14 +6193,18 @@ impl<M: Clone> MetaInterp<M> {
             &mut inputargs,
             &mut compiled_ops,
             &mut constants,
-            &mut constant_types,
             driver_descriptor.as_ref(),
             orig_vable_ptr_simple,
         );
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8111,7 +8133,19 @@ impl<M: Clone> MetaInterp<M> {
         // `getintbound` callsites; the pool must be plumbed through for
         // those readers to hit non-empty BoxRefs.
         optimizer.set_pending_box_pool(prepared.box_pool);
-        let mut constants = constants;
+        // history.py:220 box.type parity: promote the legacy `i64` pool
+        // to a typed `Value` map for the optimizer's intrinsic Const
+        // class identity.
+        let mut constants: HashMap<u32, majit_ir::Value> = constants
+            .iter()
+            .map(|(&k, &raw)| {
+                let tp = constant_types
+                    .get(&k)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int);
+                (k, heap_value_for(tp, raw))
+            })
+            .collect();
         optimizer.constant_types = constant_types.clone();
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
@@ -8193,11 +8227,15 @@ impl<M: Clone> MetaInterp<M> {
                         InputArg::from_type(tp, opref.raw())
                     })
                     .collect();
+                // retrace_needed serializes the legacy `i64` shape into
+                // PartialTrace; lower the typed pool back at the boundary.
+                let (retrace_bits, _retrace_types) =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    constants,
+                    retrace_bits,
                     es,
                 );
             }
@@ -8207,8 +8245,13 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
         let trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -8224,8 +8267,8 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8606,7 +8649,18 @@ impl<M: Clone> MetaInterp<M> {
         // earlier for the rationale. Both bridge entries (descriptor=None and
         // descriptor=Some) need the plumb so BoxRef readers stay primary.
         optimizer.set_pending_box_pool(prepared.box_pool);
-        let mut constants = constants;
+        // history.py:220 box.type parity: promote the legacy `i64` pool
+        // to a typed `Value` map.
+        let mut constants: HashMap<u32, majit_ir::Value> = constants
+            .iter()
+            .map(|(&k, &raw)| {
+                let tp = constant_types
+                    .get(&k)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int);
+                (k, heap_value_for(tp, raw))
+            })
+            .collect();
         optimizer.constant_types = constant_types.clone();
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
@@ -8722,11 +8776,15 @@ impl<M: Clone> MetaInterp<M> {
                             InputArg::from_type(tp, opref.raw())
                         })
                         .collect();
+                // retrace_needed serializes the legacy `i64` shape into
+                // PartialTrace; lower the typed pool back at the boundary.
+                let (retrace_bits, _retrace_types) =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    constants,
+                    retrace_bits,
                     es,
                 );
             }
@@ -8737,8 +8795,13 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
+        // Backend boundary: lower typed `Value` pool to the legacy
+        // `(i64, Type)` pair the backend's `set_constants` /
+        // `set_constant_types` API consumes.
+        let (backend_constants, backend_constant_types) =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+        let compiled_constants = backend_constants.clone();
+        let compiled_constant_types = backend_constant_types.clone();
         let bridge_trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -8746,8 +8809,8 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
+        self.backend.set_constants(backend_constants);
+        self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -12348,17 +12411,22 @@ impl<M: Clone> MetaInterp<M> {
     pub fn stop_tracking_virtualref(&mut self, i: usize) {
         let virtualbox = self.virtualref_boxes[i].0;
         let vrefbox = self.virtualref_boxes[i + 1].0;
-        // history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
-        // — upstream always records: `vrefs_after_residual_call` is only
-        // entered during an active trace.
+        // pyjitpl.py:3370 `self.history.record2(rop.VIRTUAL_REF_FINISH,
+        // vrefbox, virtualbox, None)` — the active history is the
+        // `MetaInterp.history` attribute and is never None when this
+        // method runs. Pyre's `MetaInterp.tracing` is the structural
+        // counterpart; treating it as Optional here is a pyre-only test
+        // fixture concession that contradicts upstream invariant.
+        // pyjitpl.py:3372 `self.virtualref_boxes[i+1] = CONST_NULL` is
+        // unconditional — the ref-typed null preserves the slot's Ref
+        // type for subsequent fail-arg type recovery and ref-typed
+        // guard processing (history.py:361
+        // `CONST_NULL = ConstPtr(ConstPtr.value)`).
         let ctx = self
             .tracing
             .as_mut()
-            .expect("stop_tracking_virtualref called outside an active trace");
+            .expect("stop_tracking_virtualref: MetaInterp.history is unconditional in upstream");
         ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
-        // `self.virtualref_boxes[i+1] = CONST_NULL` (pyjitpl.py:3402)
-        // — ref-typed null per `history.py:361 CONST_NULL =
-        // ConstPtr(ConstPtr.value)`.
         let null_const = ctx.const_null();
         self.virtualref_boxes[i + 1] = (null_const, 0);
     }
@@ -14576,7 +14644,7 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef::ref_op(0), fnaddr);
+        let funcbox = (JitArgKind::Ref, OpRef::input_arg_ref(0), fnaddr);
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok");
@@ -14643,7 +14711,7 @@ mod metainterp_static_data_tests {
             meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(fnaddr))]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef::ref_op(0), fnaddr as i64); // non-Const
+        let funcbox = (JitArgKind::Ref, OpRef::input_arg_ref(0), fnaddr as i64); // non-Const
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok — falls through to residual call, no ChangeFrame");

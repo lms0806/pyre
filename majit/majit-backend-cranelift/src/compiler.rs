@@ -15194,13 +15194,16 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
+        // resoperation.py:719 `InputArgInt.type = 'i'` parity: Label /
+        // IntAdd / Jump args that reference the inputarg slot are
+        // `InputArgInt` boxes, not `IntOp` results. The op-position
+        // raw-keyed `constants` HashMap (positions 100/101 below) is a
+        // PRE-EXISTING-ADAPTATION mirroring `make_constant`'s op-position
+        // inline-constant path; that part of the fixture is left alone.
+        let ia0 = OpRef::input_arg_int(0);
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
-                1,
-            ),
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
             mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
@@ -16556,7 +16559,7 @@ mod tests {
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18235,7 +18238,7 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcF, &[OpRef::input_arg_ref(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::float_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(90);
@@ -18264,7 +18267,7 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcPureR, &[OpRef::input_arg_ref(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(91);
@@ -18425,7 +18428,7 @@ mod tests {
                 ],
                 2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18615,7 +18618,7 @@ mod tests {
                 2,
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -19556,7 +19559,7 @@ mod tests {
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(1),
-            OpRef::int_op(3),
+            OpRef::float_op(3),
             OpRef::input_arg_int(0),
         ]));
         let ops = vec![
@@ -19577,7 +19580,7 @@ mod tests {
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::float_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -19757,7 +19760,7 @@ mod tests {
                 1,
                 make_call_assembler_descr(&deferred_target, vec![Type::Ref], Type::Ref),
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_246);
         backend
@@ -20276,9 +20279,9 @@ mod tests {
                 3,
                 int_field.clone(),
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
+            mk_op(OpCode::IntGt, &[OpRef::ref_op(3), OpRef::int_op(100)], 4),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut root_constants = HashMap::new();
@@ -20317,7 +20320,7 @@ mod tests {
             mk_op_with_descr(OpCode::NewWithVtable, &[], 3, int_size.clone()),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::int_op(3), OpRef::int_op(101)],
+                &[OpRef::ref_op(3), OpRef::int_op(101)],
                 OpRef::NONE.raw(),
                 int_field.clone(),
             ),
@@ -20326,7 +20329,7 @@ mod tests {
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
-                    OpRef::int_op(3),
+                    OpRef::ref_op(3),
                 ],
                 OpRef::NONE.raw(),
                 loop_descr,
@@ -20739,7 +20742,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::int_op(1),
+                    OpRef::ref_op(1),
                     OpRef::int_op(10001),
                     OpRef::int_op(10005),
                     OpRef::int_op(10003),
@@ -20748,7 +20751,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::ref_op(0), OpRef::int_op(1)],
+                &[OpRef::ref_op(0), OpRef::ref_op(1)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -20796,14 +20799,14 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::int_op(1),
+                    OpRef::ref_op(1),
                     OpRef::int_op(10000),
                     OpRef::input_arg_int(0),
                     OpRef::int_op(10001),
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1502);
@@ -20840,10 +20843,10 @@ mod tests {
             ),
             mk_op(
                 OpCode::CheckMemoryError,
-                &[OpRef::int_op(1)],
+                &[OpRef::ref_op(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1503);
@@ -21114,22 +21117,26 @@ mod tests {
             Mutex::new(TrackingGcState::default()),
         ))));
 
+        // Newstr.result_type() == Type::Ref (resoperation.rs:2724
+        // ref_!(Newstr,...))) — the str pointer references must use the
+        // Ref-typed OpRef variant.
+        let str0 = OpRef::ref_op(0);
         let ops = vec![
             Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[str0, OpRef::int_op(101), OpRef::int_op(200)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::int_op(0), OpRef::int_op(102), OpRef::int_op(201)],
+                &[str0, OpRef::int_op(102), OpRef::int_op(201)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::int_op(0), OpRef::int_op(103), OpRef::int_op(202)],
+                &[str0, OpRef::int_op(103), OpRef::int_op(202)],
             ),
-            Op::new(OpCode::Strgetitem, &[OpRef::int_op(0), OpRef::int_op(102)]),
-            Op::new(OpCode::Strlen, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
+            Op::new(OpCode::Strlen, &[str0]),
             Op::new(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
 
@@ -21157,28 +21164,33 @@ mod tests {
             Mutex::new(TrackingGcState::default()),
         ))));
 
+        // Newstr.result_type() == Type::Ref (resoperation.rs:2724
+        // ref_!(Newstr,...))) — pos 0 and pos 3 hold the two str
+        // pointers; both must reference back as Ref-typed OpRefs.
+        let src = OpRef::ref_op(0);
+        let dst = OpRef::ref_op(3);
         let ops = vec![
             Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[src, OpRef::int_op(101), OpRef::int_op(200)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::int_op(0), OpRef::int_op(102), OpRef::int_op(201)],
+                &[src, OpRef::int_op(102), OpRef::int_op(201)],
             ),
             Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Copystrcontent,
                 &[
-                    OpRef::int_op(0),
-                    OpRef::int_op(3),
+                    src,
+                    dst,
                     OpRef::int_op(101),
                     OpRef::int_op(101),
                     OpRef::int_op(100),
                 ],
             ),
-            Op::new(OpCode::Strgetitem, &[OpRef::int_op(3), OpRef::int_op(102)]),
+            Op::new(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
             Op::new(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
 
@@ -21203,17 +21215,18 @@ mod tests {
             Mutex::new(TrackingGcState::default()),
         ))));
 
+        // Newunicode.result_type() == Type::Ref (resoperation.rs:2725
+        // ref_!(...,Newunicode,...))) — references to the unicode
+        // pointer use the Ref-typed OpRef variant.
+        let buf = OpRef::ref_op(0);
         let ops = vec![
             Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Unicodesetitem,
-                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[buf, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(
-                OpCode::Unicodegetitem,
-                &[OpRef::int_op(0), OpRef::int_op(101)],
-            ),
-            Op::new(OpCode::Unicodelen, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
+            Op::new(OpCode::Unicodelen, &[buf]),
             Op::new(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
 

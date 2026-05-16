@@ -28,11 +28,11 @@ use crate::optimizeopt::{
 };
 use crate::resume::SnapshotBox;
 
-fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
+fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
     !opref.is_none() && constants.contains_key(&opref.raw())
 }
 
-fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
+fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
@@ -221,7 +221,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
@@ -238,7 +238,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> (Vec<Op>, usize) {
         self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
@@ -254,7 +254,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
@@ -275,7 +275,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
@@ -405,6 +405,9 @@ impl UnrollOptimizer {
             // build_short_preamble_from_exported_boxes can capture all
             // constants referenced by short preamble ops.
             if let Some(ref final_ctx) = opt_p1.final_ctx {
+                // history.py:220 box.type parity: every `Value` carries its
+                // Const class identity intrinsically; no companion type map
+                // needs threading alongside.
                 crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
                     final_ctx,
                     &mut consts_p1,
@@ -792,6 +795,8 @@ impl UnrollOptimizer {
         // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
+            // history.py:220 box.type parity: every `Value` carries its
+            // Const class identity intrinsically.
             crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
                 final_ctx,
                 &mut consts_p2,
@@ -1024,12 +1029,22 @@ impl UnrollOptimizer {
             // RPython unroll.py:497-504 `for produced_op in
             // exported_state.short_boxes` parity: consume the eagerly-derived
             // ProducedShortOp list stored on ExportedState at export time.
+            //
+            // history.py:220 box.type parity: `build_short_preamble_from_produced_boxes`
+            // still consumes the legacy `(i64, Type)` shape; lower the
+            // typed `Value` pool back at the call boundary.
+            let (consts_p1_bits, consts_p1_types) =
+                crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&consts_p1);
+            let mut loop_constant_types = self.constant_types.clone();
+            for (&k, &tp) in &consts_p1_types {
+                loop_constant_types.entry(k).or_insert(tp);
+            }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
                 &exported_short_boxes_produced,
-                &consts_p1,
-                &self.constant_types,
+                &consts_p1_bits,
+                &loop_constant_types,
             )
         });
         // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
@@ -1126,14 +1141,30 @@ impl UnrollOptimizer {
                         // box's `.type`. Carry that into duplicate used_box
                         // slots: typed parents produce a matching
                         // `InputArg{Int,Float,Ref}` alias.
-                        let tp = ub.ty().unwrap_or_else(|| {
-                            panic!(
-                                "duplicate short-preamble used_box {:?} has untyped variant; \
-                                 RPython label/inputarg boxes carry Int/Ref/Float type \
-                                 intrinsically (resoperation.py:1544 inputarg_from_tp)",
-                                ub
-                            )
-                        });
+                        //
+                        // history.py:220 `box.type` is the authoritative
+                        // source. Variant tag is the primary line-by-line
+                        // equivalent (resoperation.py:29
+                        // `AbstractValue.type`); legacy untyped paths fall
+                        // through to Phase 2's `final_ctx.opref_type` and
+                        // the recorder's `trace_inputarg_types`.
+                        let tp = ub
+                            .ty()
+                            .or_else(|| {
+                                opt_p2.final_ctx.as_ref().and_then(|ctx| ctx.opref_type(ub))
+                            })
+                            .or_else(|| {
+                                let raw = ub.raw() as usize;
+                                opt_p2.trace_inputarg_types.get(raw).copied()
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "duplicate short-preamble used_box {:?} has untyped variant; \
+                                     RPython label/inputarg boxes carry Int/Ref/Float type \
+                                     intrinsically (resoperation.py:1544 inputarg_from_tp)",
+                                    ub
+                                )
+                            });
                         if matches!(tp, Type::Void) {
                             panic!(
                                 "duplicate short-preamble used_box {:?} has void type; \
@@ -1458,8 +1489,10 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
-            let mut sorted_consts: Vec<_> =
-                consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+            let mut sorted_consts: Vec<_> = consts_p2
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect::<Vec<_>>();
             sorted_consts.sort_by_key(|(k, _)| *k);
             eprintln!("[jit] consts_p2: {:?}", sorted_consts);
         }
@@ -3102,9 +3135,7 @@ impl OptUnroll {
             // preamble const slot collides with the bridge's intra-pool
             // dedup (`get_or_insert_typed` returns the same typed OpRef
             // when value+type match) under variant-aware OpRef Eq
-            // (resoperation.rs:290) — `Untyped(idx)` from this loop and
-            // `ConstInt(idx)` from the bridge's `get_or_insert` would
-            // otherwise hash as separate keys for the same slot.
+            // (resoperation.rs:290).
             let typed_opref = match tp {
                 majit_ir::Type::Int | majit_ir::Type::Void => majit_ir::OpRef::const_int(idx),
                 majit_ir::Type::Ref => majit_ir::OpRef::const_ptr(idx),
@@ -3845,7 +3876,7 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, i64>,
+    constants: &std::collections::HashMap<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
@@ -3874,8 +3905,12 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
     // Test helper — caller provides only the body inputarg count, so seed
     // every slot as Ref (matches the common loop-body shape; fixtures that
     // need typed inputargs construct ctx directly).
+    //
+    // Slice 0.5: type lookup now resolves through `op.pos.ty()` (variant
+    // tag, post-Slice-P5/P6) at priority 0 of `opref_type` and
+    // `op.type_` at priority 2 — no longer through a `value_types`
+    // side table.
     let types = vec![Type::Ref; body_num_inputs];
-    let _ = (p1_ops, p2_ops);
     OptContext::with_inputarg_types(p1_ops.len() + p2_ops.len(), &types)
 }
 
@@ -3907,7 +3942,7 @@ fn assemble_peeled_trace_with_jump_args(
     inputarg_base: u32,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, i64>,
+    constants: &std::collections::HashMap<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[OpRef],
@@ -4013,24 +4048,15 @@ fn assemble_peeled_trace_with_jump_args(
         let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
-                match ctx.inputarg_type_at(i) {
-                    Some(tp) => OpRef::input_arg_typed(pos, tp),
-                    // resoperation.py:719/727/739 InputArg{Int,Ref,Float}.type
-                    // — upstream inputargs intrinsically carry a type tag.
-                    // A None here means `inputarg_types` was not seeded for
-                    // slot `i`, which is a structural bug in the optimizer
-                    // setup, not something to recover from with a guessed
-                    // default. Fail loud so the missing-seed bug surfaces
-                    // here instead of as a wrong-type guard fail downstream.
-                    None => panic!(
-                        "assemble_peeled_trace_with_jump_args: inputarg slot {} \
-                         has no type — `inputarg_types` must be populated by \
-                         setup_optimizations before peeling. Upstream invariant: \
-                         `box.type` always exists on InputArg* boxes \
-                         (history.py:220 / resoperation.py:719/727/739).",
-                        i
-                    ),
-                }
+                // history.py:220 box.type / resoperation.py:719/727/739
+                // InputArgInt/Float/Ref invariant: every label / inputarg
+                // carries a value-box class. RPython has no InputArgVoid;
+                // a missing type at this site is a structural bookkeeping
+                // bug. `inputarg_type_at_strict` panics on miss with the
+                // RPython-citation message rather than recovering into
+                // VoidOp / a guessed default.
+                let tp = ctx.inputarg_type_at_strict(i);
+                OpRef::input_arg_typed(pos, tp)
             })
             .collect();
         for op in &result {
@@ -4174,7 +4200,9 @@ fn assemble_peeled_trace_with_jump_args(
     // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
     // a stray Int tag. `op_index` filters Void ops so this OpRef never
-    // shadows a real Box-bearing op at the same raw position.
+    // shadows a real Box-bearing op at the same raw position, and
+    // variant-aware Hash matches when downstream consumers compare
+    // label_op.pos against Op-keyed maps.
     label_op.pos = OpRef::op_typed(label_pos, label_op.result_type());
     label_op.descr = loop_label_descr;
     result.extend(fallthrough_aliases);
@@ -4259,10 +4287,11 @@ fn assemble_peeled_trace_with_jump_args(
         // Void ops (SetfieldGc, guards, Jump) don't define values at
         // their position — mapping them creates phantom OpRefs.
         if op.pos.raw() != u32::MAX && op.result_type() != Type::Void {
-            // resoperation.py:564 IntOp.type / 567 RefOp.type / 570 FloatOp.type
-            // — the fresh result Box must carry the producing op's type tag
-            // so downstream readers (`opref_type` typed-first arm) see the
-            // correct `box.type` instead of a default-int guess.
+            // history.py:220 box.type / resoperation.py:567/589/615 IntOp /
+            // RefOp / FloatOp.type — the fresh result Box inherits the
+            // producing op's type tag so downstream readers (`opref_type`
+            // typed-first arm + variant-aware HashMap/HashSet lookups)
+            // see the correct `box.type` instead of a default-int guess.
             let fresh = OpRef::op_typed(next_body_pos, op.result_type());
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
             body_result_remap.insert(op.pos, fresh);
@@ -5428,7 +5457,8 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 2);
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
+            std::collections::HashMap::new();
         let (result, _) =
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
@@ -5474,8 +5504,13 @@ mod tests {
             Some((10, 20))
         );
 
-        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
-        let label_args = import_state(&[OpRef::int_op(0)], &exported, &mut optimizer, &mut ctx2);
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int]);
+        let label_args = import_state(
+            &[OpRef::input_arg_int(0)],
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
         assert_eq!(label_args, vec![OpRef::int_op(21)]);
         // unroll.py:93-96: IntBound IS imported with widen() and stored
         // directly on the box's _forwarded slot via setintbound.
@@ -5535,9 +5570,14 @@ mod tests {
             &mut ctx,
             None,
         );
+        // The fixture references both slots via `int_op(N)` (Int variant
+        // tag), so targetargs must agree under variant-aware OpRef Eq —
+        // a Ref-typed targetarg would trip the Box.type cross-type
+        // forward check in `replace_op`. Heap-field-cache mechanics are
+        // exercised independent of base type.
         let mut ctx2 =
-            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
+            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
+        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef::int_op(10), OpRef::int_op(11)]);
@@ -5562,6 +5602,10 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
+        // history.py:307 ConstPtr `type = 'r'`: a Ref-typed constant
+        // must use the const_ptr factory; const_int aliases ConstInt and
+        // breaks the Box class identity invariant under variant-aware
+        // OpRef Eq/Hash.
         ctx.seed_constant(OpRef::const_ptr(23), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
@@ -5587,9 +5631,10 @@ mod tests {
             &mut ctx,
             None,
         );
+        // Both label args resolve to Int op slots (12 / 11 = GetfieldGcPureI base / result).
         let mut ctx2 =
-            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
+            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
+        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
@@ -5644,9 +5689,11 @@ mod tests {
             &mut ctx,
             None,
         );
+        // CallLoopinvariantI produces an Int at int_op(11); slot 10 is the
+        // Int func-address constant base, so both label args are Int.
         let mut ctx2 =
-            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
+            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
+        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
 
@@ -5892,17 +5939,16 @@ mod tests {
             &mut ctx,
             None,
         );
-        // 3 Int-typed inputargs matching the producer's `OpRef::int_op`
-        // shape (the exported short box uses `int_op(12)/(13)/(14)/(30)`
-        // throughout, so the cross-type-forward guard requires Int
-        // targetargs too — `optimizer.py:432 set_forwarded` preserves
-        // Box.type per `history.py:220 BoxInt.type='i'`). Out-of-range
-        // raw OpRefs (raw 12/13/14, raw 30) are still valid handles via
-        // `value_types` / `peek_ptr_info_via_box` — `box_pool.get(idx)`
-        // returns `None` and the readers fall through to the empty-pool
-        // path used for opaque preamble OpRef handles.
-        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Int; 3]);
-        let targetargs = [OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
+        // IntAdd producer at int_op(30) consumes Int op slots, so the
+        // imported targetargs must be Int-typed too — generous pool keeps
+        // typed `OpRef::input_arg_int(K)` handles for any K the test walks.
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Int; 1024]);
+        let targetargs = [
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         let imported_result = ctx2.imported_short_pure_ops[0].result;
@@ -5990,8 +6036,8 @@ mod tests {
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::const_int(0).raw(), 2);
-        constants.insert(OpRef::const_int(1).raw(), 1);
+        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(2));
+        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -6053,7 +6099,7 @@ mod tests {
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::const_int(1).raw(), 1);
+        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -6156,8 +6202,8 @@ mod tests {
             ),
         ];
         let constants = std::collections::HashMap::from([
-            (OpRef::void_op(857).raw(), 2_i64),
-            (OpRef::const_int(0).raw(), 2_i64),
+            (OpRef::void_op(857).raw(), majit_ir::Value::Int(2)),
+            (OpRef::const_int(0).raw(), majit_ir::Value::Int(2)),
         ]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
@@ -6276,7 +6322,8 @@ mod tests {
             },
             Op::new(OpCode::Jump, &[OpRef::int_op(64)]),
         ];
-        let constants = std::collections::HashMap::from([(OpRef::const_int(0).raw(), 1_i64)]);
+        let constants =
+            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6426,7 +6473,8 @@ mod tests {
                 jump
             },
         ];
-        let constants = std::collections::HashMap::from([(OpRef::const_int(0).raw(), 1_i64)]);
+        let constants =
+            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6471,7 +6519,10 @@ mod tests {
             Op::new(OpCode::SetfieldGc, &[OpRef::ref_op(1), OpRef::int_op(0)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
-        let constants = std::collections::HashMap::from([(2_u32, 606_i64), (4_u32, 611_i64)]);
+        let constants = std::collections::HashMap::from([
+            (2_u32, majit_ir::Value::Int(606)),
+            (4_u32, majit_ir::Value::Int(611)),
+        ]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6508,7 +6559,8 @@ mod tests {
         // `label_arg.is_constant()` predicate.
         let const_extra = OpRef::const_int(7);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
-        let constants = std::collections::HashMap::from([(const_extra.raw(), 606_i64)]);
+        let constants =
+            std::collections::HashMap::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6540,7 +6592,7 @@ mod tests {
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::const_int(0).raw(), 1);
+        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(1));
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(200), OpRef::const_int(0)]);

@@ -1363,7 +1363,12 @@ mod tests {
     /// Helper: assign sequential positions to ops.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            // Type-tag op.pos via the result-type-aware factory so the
+            // OpRef variant carries `Box.type` (history.py:220 /
+            // resoperation.py:1693 parity). Argument OpRefs in these
+            // fixtures must use the matching typed factory at the same
+            // raw N to satisfy variant-aware Eq against `op.pos`.
+            op.pos = OpRef::op_typed(i as u32, op.result_type());
         }
     }
 
@@ -1525,6 +1530,9 @@ mod tests {
 
     #[test]
     fn test_call_pure_r_demoted() {
+        // CallPureR / CallR carry RPython `RefOp.type = 'r'` parity
+        // (resoperation.py:638): the result is a Ref-typed Box, and
+        // the function-pointer arg is also Ref-typed.
         let mut ops = vec![Op::new(OpCode::CallPureR, &[OpRef::ref_op(0)])];
         assign_positions(&mut ops);
 
@@ -1538,6 +1546,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
+        assert_eq!(result[0].pos.ty(), Some(Type::Ref));
     }
 
     #[test]
@@ -1747,6 +1756,11 @@ mod tests {
 
     #[test]
     fn test_call_pure_f_n_demoted() {
+        // CallPureF / CallF carry RPython `FloatOp.type = 'f'` parity
+        // (resoperation.py:589). CallPureN / CallN are void-result —
+        // `AbstractResOp.type = 'v'` (resoperation.py:260) — and pyre
+        // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
+        // `Some(Type::Void)`.
         let mut ops = vec![
             Op::new(OpCode::CallPureF, &[OpRef::float_op(0)]),
             Op::new(OpCode::CallPureN, &[OpRef::float_op(0)]),
@@ -1763,7 +1777,9 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
+        assert_eq!(result[0].pos.ty(), Some(Type::Float));
         assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[1].pos.ty(), Some(Type::Void));
     }
 
     #[test]
@@ -1805,8 +1821,9 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(100, 0xCAFE_i64); // func pointer must be a known constant
+        constants.insert(100u32, majit_ir::Value::Int(0xCAFE)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
+        opt.constant_types.insert(100, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1889,11 +1906,15 @@ mod tests {
         assign_positions(&mut ops);
 
         // Each func pointer must be a known constant for OptRewrite CSE.
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
+            std::collections::HashMap::new();
         for i in 0..20u32 {
-            constants.insert(i + 100, (i + 100) as i64);
+            constants.insert(i + 100, majit_ir::Value::Int((i + 100) as i64));
         }
         let mut opt = Optimizer::new();
+        for i in 0..20u32 {
+            opt.constant_types.insert(i + 100, majit_ir::Type::Int);
+        }
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1920,8 +1941,9 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 0xBEEF_i64); // func pointer must be a known constant
+        constants.insert(200u32, majit_ir::Value::Int(0xBEEF)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1945,10 +1967,12 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_000, 3i64);
-        constants.insert(10_001, 4i64);
+        constants.insert(10_000u32, majit_ir::Value::Int(3));
+        constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
+        opt.constant_types.insert(10_000, majit_ir::Type::Int);
+        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -1970,10 +1994,12 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_000, 3i64);
-        constants.insert(10_001, 5i64);
+        constants.insert(10_000u32, majit_ir::Value::Int(3));
+        constants.insert(10_001u32, majit_ir::Value::Int(5));
 
         let mut opt = Optimizer::new();
+        opt.constant_types.insert(10_000, majit_ir::Type::Int);
+        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2025,10 +2051,12 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_000, 3i64);
-        constants.insert(10_001, 4i64);
+        constants.insert(10_000u32, majit_ir::Value::Int(3));
+        constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
+        opt.constant_types.insert(10_000, majit_ir::Type::Int);
+        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2061,12 +2089,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)], descr);
         op.pos = OpRef::int_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2088,12 +2116,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::int_op(10)], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::ref_op(10)], descr);
         op.pos = OpRef::float_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2117,12 +2145,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::int_op(10)], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::ref_op(10)], descr);
         op.pos = OpRef::ref_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2371,7 +2399,7 @@ mod tests {
         ]);
         sb.note_known_constants_from_ctx(&ctx);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
-        let collected = sb.produced_ops();
+        let collected = sb.produced_ops(&mut ctx);
         assert_eq!(collected.len(), 1);
         assert!(matches!(
             collected[0].1.kind,
@@ -2443,7 +2471,7 @@ mod tests {
             OpRef::int_op(2),
         ]);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
-        let collected = sb.produced_ops();
+        let collected = sb.produced_ops(&mut ctx);
         assert_eq!(collected.len(), 1);
         assert!(matches!(
             collected[0].1.kind,
@@ -2488,7 +2516,7 @@ mod tests {
             OpRef::int_op(100),
         ]);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
-        let collected = sb.produced_ops();
+        let collected = sb.produced_ops(&mut ctx);
         assert_eq!(collected.len(), 1);
         assert!(matches!(
             collected[0].1.kind,
@@ -2542,7 +2570,7 @@ mod tests {
             OpRef::int_op(100),
         ]);
         rewrite.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
-        let collected = sb.produced_ops();
+        let collected = sb.produced_ops(&mut ctx);
         assert_eq!(collected.len(), 1);
         assert!(matches!(
             collected[0].1.kind,
@@ -2658,11 +2686,14 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::const_int(0).raw(), 0xCAFE_i64);
-        constants.insert(OpRef::const_int(1).raw(), 7_i64);
+        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(0xCAFE));
+        constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(7));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
 
         assert!(result.is_empty());
-        assert_eq!(constants.get(&ops[0].pos.raw()), Some(&42_i64));
+        assert_eq!(
+            constants.get(&ops[0].pos.raw()),
+            Some(&majit_ir::Value::Int(42))
+        );
     }
 }

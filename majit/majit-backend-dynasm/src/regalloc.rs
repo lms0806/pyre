@@ -1621,6 +1621,12 @@ pub struct RegAlloc<'a> {
     /// dispatch path consumes these; legacy opcode dispatch is a guard rail
     /// only if a plan entry is missing.
     j2_ops: Vec<LirOp>,
+    /// Per-trace counter feeding `OpRef::fresh_temp_var()` — RPython
+    /// `TempVar()` / `TempInt()` allocate a fresh Python object per
+    /// call (`x86/regalloc.py:470,514,521,605`,
+    /// `aarch64/regalloc.py:990`); pyre's flat-OpRef encoding needs a
+    /// counter to feed the unique raw payload reservation.
+    temp_var_counter: u32,
 }
 
 impl<'a> RegAlloc<'a> {
@@ -1655,7 +1661,19 @@ impl<'a> RegAlloc<'a> {
             final_jump_op_position: -1,
             j2_deopt_spill_args: Vec::new(),
             j2_ops: Vec::new(),
+            temp_var_counter: 0,
         }
+    }
+
+    /// RPython `TempVar()` / `TempInt()` 1:1 parity. Each call returns a
+    /// fresh `OpRef::TempVar` for use as a regalloc scratch box. Lifetime
+    /// is single-instruction: caller registers it in `longevity` for the
+    /// current `position`, calls `force_allocate_reg`, then
+    /// `possibly_free_var`.
+    pub fn fresh_temp_var(&mut self) -> OpRef {
+        let counter = self.temp_var_counter;
+        self.temp_var_counter += 1;
+        OpRef::fresh_temp_var(counter)
     }
 
     /// rpython/jit/metainterp/history.py:220 `box.type` parity.
@@ -1671,6 +1689,13 @@ impl<'a> RegAlloc<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
+        // history.py:182 / resoperation.py:29: `box.type` lives on the
+        // Box object itself; pyre's typed `OpRef` variants carry the
+        // matching type tag (ConstInt/InputArgInt/IntOp …) so the
+        // variant tag IS Box class identity. Delegate to the shared
+        // `OpTypeIndex` so the variant-tag fast path and side-table
+        // fallbacks stay in lockstep with `compile.rs` and the rest of
+        // the metainterp.
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
@@ -3475,11 +3500,10 @@ impl<'a> RegAlloc<'a> {
             self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
             let l1 = self.loc(arg1, Type::Int);
             self.possibly_free_var(arg2, Type::Int);
-            let tmp = OpRef::int_op(u32::MAX - 1);
-            if !self.longevity.contains(tmp) {
-                self.longevity
-                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-            }
+            // x86/regalloc.py:605 tmpvar = TempVar()
+            let tmp = self.fresh_temp_var();
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
             self.rm.force_allocate_reg(
                 tmp,
                 &[],
@@ -3669,12 +3693,11 @@ impl<'a> RegAlloc<'a> {
             let l1 = self.loc(arg1, Type::Int);
             // eax will be trash after the operation
             self.possibly_free_var(arg2, Type::Int);
-            // allocate temporary in eax (will be trashed by MUL)
-            let tmp = OpRef::int_op(u32::MAX - 1); // temp var
-            if !self.longevity.contains(tmp) {
-                self.longevity
-                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-            }
+            // x86/regalloc.py:605 tmpvar = TempVar() (allocated in eax,
+            // trashed by MUL)
+            let tmp = self.fresh_temp_var();
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
             self.rm.force_allocate_reg(
                 tmp,
                 &[],
@@ -3845,11 +3868,10 @@ impl<'a> RegAlloc<'a> {
         let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
         #[cfg(target_arch = "x86_64")]
         {
-            let tmp = OpRef::int_op(u32::MAX - 3);
-            if !self.longevity.contains(tmp) {
-                self.longevity
-                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-            }
+            // x86/regalloc.py:514 tmp_box = TempVar()
+            let tmp = self.fresh_temp_var();
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
             let loc_tmp = Loc::Reg(self.rm.force_allocate_reg(
                 tmp,
                 &[value],
@@ -3880,11 +3902,10 @@ impl<'a> RegAlloc<'a> {
         let y = self.loc(class, Type::Int);
         #[cfg(target_arch = "x86_64")]
         {
-            let tmp = OpRef::int_op(u32::MAX - 4);
-            if !self.longevity.contains(tmp) {
-                self.longevity
-                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-            }
+            // x86/regalloc.py:521 tmp_box = TempVar()
+            let tmp = self.fresh_temp_var();
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
             let loc_tmp = Loc::Reg(self.rm.force_allocate_reg(
                 tmp,
                 &[value],
@@ -3915,12 +3936,10 @@ impl<'a> RegAlloc<'a> {
             return self.consider_guard_no_args_j2(fail_args, i, output);
         };
         let loc = self.make_sure_var_in_reg(exception_class, Type::Ref, &[], None, false);
-        // x86/regalloc.py:470-471 TempVar for scratch register
-        let tmp = OpRef::int_op(u32::MAX - 2);
-        if !self.longevity.contains(tmp) {
-            self.longevity
-                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-        }
+        // x86/regalloc.py:470 box = TempVar()
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         let guard_args: Vec<OpRef> = args.to_vec();
         let loc1 = Loc::Reg(self.rm.force_allocate_reg(
             tmp,
@@ -3982,12 +4001,10 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:468 consider_guard_exception
     fn consider_guard_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &[], None, false);
-        // x86/regalloc.py:470-471 TempVar for scratch register
-        let tmp = OpRef::int_op(u32::MAX - 2);
-        if !self.longevity.contains(tmp) {
-            self.longevity
-                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-        }
+        // x86/regalloc.py:470 box = TempVar()
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         let args: Vec<OpRef> = op.args.iter().copied().collect();
         let loc1 = Loc::Reg(self.rm.force_allocate_reg(
             tmp,
@@ -5391,6 +5408,7 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         // aarch64/regalloc.py:964: force_allocate_reg(op, selected_reg=r.x0)
+        // x86/regalloc.py:1021: force_allocate_reg(op, selected_reg=ecx)
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
             &[],
@@ -5399,9 +5417,27 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
-        // aarch64/regalloc.py:965-966: t = TempInt(); force_allocate_reg(t, selected_reg=r.x1)
-        // Not strictly needed in dynasm (nursery bump uses x1 internally),
-        // but reserve it to match RPython's register contract.
+        // aarch64/regalloc.py:965-966: t = TempInt();
+        //   force_allocate_reg(t, selected_reg=r.x1)
+        // x86/regalloc.py:1025-1026: tmp_box = TempVar();
+        //   force_allocate_reg(tmp_box, selected_reg=edx)
+        // The nursery bump path needs the second register
+        // (`MALLOC_NURSERY_CLOBBER[1]`) reserved before `get_gcmap` so that
+        // the gcmap excludes it as a managed slot. The reservation also
+        // aligns the regalloc lifetime contract with RPython.
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py:968: sizeloc = size_box.getint()
         let size_val = self.const_value(op.arg(0));
         let arglocs = vec![Loc::Immed(ImmedLoc::new(size_val))];
@@ -5439,6 +5475,21 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
+        // aarch64/regalloc.py:965-966 / x86/regalloc.py:1025-1026:
+        //   t = TempInt() / TempVar(); reserve the second clobber register.
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         let size_val = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
         self.perform_with_gcmap(
             i,
@@ -5491,9 +5542,10 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
-        // aarch64/regalloc.py:990-993: reserve x1 as the malloc temp and
-        // exclude it from the gcmap before emitting malloc_cond_varsize_frame.
-        let tmp = OpRef::int_op(u32::MAX - 11);
+        // aarch64/regalloc.py:990 t = TempInt() — reserve x1 as the
+        // malloc temp and exclude it from the gcmap before emitting
+        // malloc_cond_varsize_frame.
+        let tmp = self.fresh_temp_var();
         self.longevity
             .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         self.rm.force_allocate_reg(
@@ -5546,7 +5598,8 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
-        let tmp = OpRef::int_op(u32::MAX - 11);
+        // aarch64/regalloc.py:990 t = TempInt()
+        let tmp = self.fresh_temp_var();
         self.longevity
             .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         self.rm.force_allocate_reg(

@@ -59,7 +59,7 @@ pub struct VirtualizableConfig {
     /// `0` means the legacy `[frame, vable_scalars..., array_items...]`
     /// layout; nonzero shifts every input-derived OpRef by that count.
     /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
-    /// extra reds occupy `OpRef::from_raw(1..1+vable_input_offset)`.
+    /// extra reds occupy `InputArg` slots `1..1+vable_input_offset`.
     pub vable_input_offset: usize,
 }
 
@@ -2480,6 +2480,10 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
+            // Slice P6a: type-tag op.pos so `opref_type` priority 0
+            // (`opref.ty()`) resolves via the variant tag without
+            // falling through to the inputarg-slot fallback (which
+            // collides with low op-position raws).
             op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
         }
     }
@@ -2958,7 +2962,7 @@ mod tests {
             array_lengths: vec![1],
             vable_input_offset: 0,
         });
-        let mut constants = HashMap::new();
+        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
@@ -3240,7 +3244,8 @@ mod tests {
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 42i64); // expected class ptr matches vtable
+        constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
@@ -3292,12 +3297,12 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()), // pos=1
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(1)],
+                &[OpRef::input_arg_ref(0), OpRef::ref_op(1)],
                 fd_ref.clone(),
             ), // pos=2
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::int_op(1), OpRef::int_op(100)],
+                &[OpRef::ref_op(1), OpRef::int_op(100)],
                 fd_int.clone(),
             ), // pos=3
             Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),      // pos=4
@@ -3698,7 +3703,8 @@ mod tests {
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 42i64); // class ptr constant
+        constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert_eq!(
             result.len(),
@@ -3855,7 +3861,7 @@ mod tests {
                 OpCode::VirtualRefR,
                 &[OpRef::input_arg_ref(0), OpRef::int_op(101)],
             ), // pos=1
-            Op::new(OpCode::CallN, &[OpRef::int_op(1)]),            // pos=2
+            Op::new(OpCode::CallN, &[OpRef::ref_op(1)]),            // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -4285,7 +4291,7 @@ mod tests {
         ops[2].pos = OpRef::void_op(3);
 
         let mut opt = Optimizer::default_pipeline();
-        let mut constants = HashMap::new();
+        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
@@ -4391,8 +4397,10 @@ mod tests {
 
         let mut opt = Optimizer::default_pipeline();
         let mut constants = HashMap::new();
-        constants.insert(100, 7);
-        constants.insert(101, 11);
+        constants.insert(100u32, majit_ir::Value::Int(7));
+        constants.insert(101u32, majit_ir::Value::Int(11));
+        opt.constant_types.insert(100, majit_ir::Type::Int);
+        opt.constant_types.insert(101, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: std::collections::HashSet<_> = result

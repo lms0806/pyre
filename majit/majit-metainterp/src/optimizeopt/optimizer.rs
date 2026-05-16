@@ -206,6 +206,28 @@ pub struct Optimizer {
     pending_box_pool: crate::r#box::BoxPool,
 }
 
+/// Lower a typed-`Value` constants pool back to the legacy
+/// `(HashMap<u32, i64>, HashMap<u32, Type>)` shape expected by the
+/// backend's `set_constants` / `set_constant_types` boundary.
+///
+/// history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
+/// `Box.type` at construction, so the lowering is total — every
+/// `Value` round-trips to a single `(i64, Type)` pair.
+pub(crate) fn lower_typed_constants_to_backend(
+    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+) -> (
+    std::collections::HashMap<u32, i64>,
+    std::collections::HashMap<u32, Type>,
+) {
+    let mut bits = std::collections::HashMap::with_capacity(constants.len());
+    let mut types = std::collections::HashMap::with_capacity(constants.len());
+    for (&k, v) in constants {
+        bits.insert(k, value_to_backend_constant_bits(v));
+        types.insert(k, v.get_type());
+    }
+    (bits, types)
+}
+
 fn type_for_backend_constant(
     raw_key: u32,
     ops: &[Op],
@@ -235,7 +257,16 @@ fn value_for_backend_constant(raw: i64, tp: Type) -> majit_ir::Value {
     match tp {
         Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
         Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
-        Type::Int | Type::Void => majit_ir::Value::Int(raw),
+        Type::Int => majit_ir::Value::Int(raw),
+        // history.py:220 / 261 / 307: every Const Box pins a non-Void
+        // `.type`. There is no `ConstVoid` class upstream, so a Void
+        // here means the resolver lost the type and is silently
+        // retagging the value — refuse rather than mint a spurious
+        // ConstInt(raw).
+        Type::Void => panic!(
+            "value_from_backend_constant_bits_typed: raw={raw:?} resolved to Type::Void; \
+             no ConstVoid class upstream (history.py:220)"
+        ),
     }
 }
 
@@ -260,12 +291,19 @@ fn opref_and_type_for_backend_constant(
     (opref, tp)
 }
 
-fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
+pub(crate) fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
     match value {
         majit_ir::Value::Int(v) => *v,
         majit_ir::Value::Ref(r) => r.0 as i64,
         majit_ir::Value::Float(f) => f.to_bits() as i64,
-        majit_ir::Value::Void => 0,
+        // history.py:220/261/307 — only ConstInt/ConstFloat/ConstPtr
+        // exist upstream; there is no `ConstVoid` class. A Void constant
+        // reaching the backend boundary indicates a bookkeeping bug;
+        // surface it instead of silently lowering to a zero Int payload.
+        majit_ir::Value::Void => panic!(
+            "value_to_backend_constant_bits: Value::Void has no constant lowering \
+             (no ConstVoid upstream)"
+        ),
     }
 }
 
@@ -287,7 +325,7 @@ fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
 
 pub(crate) fn sanitize_backend_constants_for_ops(
     ops: &[Op],
-    constants: &mut std::collections::HashMap<u32, i64>,
+    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -295,27 +333,19 @@ pub(crate) fn sanitize_backend_constants_for_ops(
 }
 
 /// Export newly-discovered constants from `OptContext` into the
-/// backend's `constants: HashMap<u32, i64>` value pool.
+/// optimizer's `constants: HashMap<u32, Value>` value pool. The
+/// backend boundary lowers the typed `Value` map back to its raw
+/// `i64` shape via `value_to_backend_constant_bits` when the
+/// `set_constants` call is made.
 ///
-/// PRE-EXISTING-ADAPTATION: RPython has no parallel "untyped backend
-/// constants" map — `box.type` is read directly from the Const Box at
-/// every consumption site (history.py:220, ConstInt/Float/Ptr have
-/// pinned types). pyre carries types via separate channels
-/// (`Op.type_`, `OpTypeIndex.constant_types`); this exporter therefore
-/// strips `Value` enum types into raw `i64` bits.
-///
-/// The lockstep panics in `ConstantPool::get_value` (constant_pool.rs)
-/// and the recorder dedup paths (`pyjitpl/mod.rs`, `trace_ctx.rs`) only
-/// guard the in-pool maps — backend consumers reach types via the
-/// separate `OpTypeIndex` channel, which itself documents a
-/// PRE-EXISTING-ADAPTATION (`majit-ir/src/op_type_index.rs:144-164`)
-/// for cranelift caller seeding gap. Convergence path: thread typed
-/// `Value` through the backend pool (`HashMap<u32, Value>` or parallel
-/// `constant_types: HashMap<u32, Type>`) so all consumers carry types
-/// in lockstep with values; closes the same blocker as op_type_index.
+/// history.py:220/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`
+/// each pin `.type` on the value object itself. Pyre mirrors that by
+/// keying the optimizer-level pool with `Value` directly, so type
+/// information rides alongside the bits without any external
+/// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut std::collections::HashMap<u32, i64>,
+    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(&ctx.new_operations);
 
@@ -338,13 +368,11 @@ pub(crate) fn merge_backend_constants_from_ctx(
             continue;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
-        constants
-            .entry(key)
-            .or_insert_with(|| value_to_backend_constant_bits(&value));
+        constants.entry(key).or_insert_with(|| value);
     }
     for (&const_idx, value) in &ctx.const_pool {
         let key = OptContext::const_ref_for_value(const_idx, value).raw();
-        constants.insert(key, value_to_backend_constant_bits(value));
+        constants.insert(key, value.clone());
     }
 }
 
@@ -415,13 +443,16 @@ impl Optimizer {
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull => majit_ir::Type::Ref,
             VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
+            // virtualstate.py:655 not_virtual leaves are int/ref/float —
+            // void-result ops are not value boxes (resoperation.py:260),
+            // so allocating an InputArg cell tagged Void here would mint
+            // an `OpRef::VoidOp` for what should be a value box.
+            VirtualStateInfo::Unknown(majit_ir::Type::Void) => panic!(
+                "import_virtual_state_value: Unknown(Void) leaf — VirtualState \
+                 leaves are int/ref/float (virtualstate.py:655)"
+            ),
             VirtualStateInfo::Unknown(tp) => *tp,
         };
-        // `alloc_op_position_typed(Void)` mints a `VoidOp(_)` variant —
-        // resoperation.py:260 `AbstractResOp.type = 'v'` parity. Past
-        // version routed Void through `alloc_op_position()` which
-        // returned `Untyped(_)`; that left a variant-Eq miss when a
-        // downstream lookup carried the canonical `VoidOp` discriminant.
         let opref = ctx.alloc_op_position_typed(tp);
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("[jit] import_virtual_state_value {opref:?} <= {info:?}");
@@ -591,14 +622,18 @@ impl Optimizer {
             }
             VirtualStateInfo::Unknown(_tp) => {
                 // virtualstate.py:655-683 make_inputargs parity: each
-                // NotVirtualStateInfo leaf is realized as an InputArg*
-                // whose `Box.type` is intrinsic to the variant tag
-                // (resoperation.py:719/727/739). No side-table write
-                // needed — `opref.ty()` is now authoritative.
+                // NotVirtualStateInfo leaf is realized as an InputArg* whose
+                // `Box.type` is intrinsic. Slice 0.5: type lookup now resolves
+                // through the variant tag of `opref` (typed via
+                // `OpRef::input_arg_typed` / `op_typed` upstream) at priority
+                // 0 of `opref_type`; the side-table seed is dead.
             }
         }
     }
 
+    #[allow(deprecated)] // P1.5 deprecation gate — Phase 2 import_state forwards
+    // synthetic positions for imported virtual fields.
+    // Slice P5 dependency for typed factory plumbing.
     pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
         // virtualstate.py:655-670 make_inputargs + 627-634 _enum parity:
         // label_args are laid out by recursive _enum traversal where each
@@ -700,20 +735,15 @@ impl Optimizer {
                 // RPython `box.type` (history.py:220) and matches the
                 // typed `OpRef::input_arg_typed` minted at trace start
                 // (pyre/pyre-jit-trace/src/trace.rs) under variant-aware Eq.
+                // opencoder.py:259 inputarg_from_tp(arg.type) parity:
+                // every inputarg always carries `box.type` (history.py:220);
+                // RPython has no InputArgVoid class. Strict accessor
+                // panics on missing/Void → exposes structural bookkeeping
+                // bugs instead of silently minting an InputArgVoid-shaped
+                // VoidOp variant.
                 let pos = ctx.inputarg_base + iv.inputarg_index as u32;
-                // resoperation.py:719/727/739 InputArg{Int,Float,Ref} class
-                // hierarchy fixes `box.type` at construction; a missing
-                // entry in `inputarg_types` is an invariant violation, not
-                // an Ref-fallback opportunity.
-                let tp = ctx.inputarg_type_at(iv.inputarg_index).unwrap_or_else(|| {
-                    panic!(
-                        "inputarg_type_at({}) returned None: \
-                             RPython InputArg* class fixes box.type at \
-                             construction (resoperation.py:719/727/739)",
-                        iv.inputarg_index
-                    )
-                });
-                let raw = OpRef::input_arg_typed(pos, tp);
+                let raw =
+                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(iv.inputarg_index));
                 let virtual_head = ctx.get_box_replacement(raw);
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
@@ -1778,17 +1808,18 @@ impl Optimizer {
 
     /// Run all optimization passes, with known constants pre-populated.
     ///
-    /// `constants` maps OpRef indices to raw backend bits. RPython keeps typed
-    /// Const boxes in the optimized trace; majit threads the same information
-    /// through this side table and recovers Int/Ref/Float from the producing
-    /// op's result type.
+    /// `constants` maps OpRef indices to typed `Value` payloads. RPython
+    /// keeps typed `ConstInt/ConstFloat/ConstPtr` boxes in the optimized
+    /// trace (history.py:220/261/307 — every Const pins `box.type`);
+    /// majit mirrors that by carrying `Value` directly here, so the
+    /// type is intrinsic to each pool entry.
     ///
     /// After optimization, newly-discovered constants (from constant folding)
     /// are written back into the map so the backend can resolve them.
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -1804,7 +1835,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
@@ -1825,14 +1856,14 @@ impl Optimizer {
     ///
     /// Optimizes a slice of ops whose `pos`/`args` reference OpRefs in a
     /// shifted namespace `[inputarg_base, …)`. The first fresh OpRef the
-    /// optimizer assigns to a non-void result is `OpRef::from_raw(start_next_pos)`.
+    /// optimizer assigns to a non-void result is `OpRef::int_op(start_next_pos)`.
     /// Phase 2 / bridges pass `inputarg_base = parent_high_water` and
     /// `start_next_pos = parent_high_water + num_inputs` so the iteration's
     /// OpRefs are disjoint from any parent trace's emitted ops.
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -1952,11 +1983,26 @@ impl Optimizer {
 
         sanitize_backend_constants_for_ops(ops, constants);
         // Pre-populate known constants so passes can see them.
-        // Use constant_types to distinguish Ref from Int (GC pointers
-        // are stored as i64 in the constants map).
-        for (&idx, &val) in constants.iter() {
-            let (opref, tp) = opref_and_type_for_backend_constant(idx, ops, &self.constant_types);
-            ctx.seed_constant(opref, value_for_backend_constant(val, tp));
+        //
+        // history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
+        // `Box.type` at construction. The `Value` payload carries the
+        // box class intrinsically, so the OpRef variant tag is recovered
+        // directly from the `Value`'s type tag without any external
+        // `constant_types` side table.
+        //
+        // The `constants` HashMap holds two keyspaces:
+        //   * idx with CONST_BIT set → constant-pool index; mint
+        //     `OpRef::const_*(pool_idx)` matching the `Value` variant.
+        //   * idx without CONST_BIT → inline-value-at-op-position slot;
+        //     mint `OpRef::*_op(idx)` matching the `Value` variant.
+        for (&idx, value) in constants.iter() {
+            let opref = if OpRef::raw_is_constant(idx) {
+                let pool_idx = OpRef::raw_const_index(idx);
+                OptContext::const_ref_for_value(pool_idx, value)
+            } else {
+                OptContext::op_ref_for_value(idx, value)
+            };
+            ctx.seed_constant(opref, value.clone());
         }
         // Advance next_const_idx past all seeded constant-namespace entries
         // so new allocations (intdiv, make_guards) don't collide with
@@ -2011,10 +2057,10 @@ impl Optimizer {
         // is restored at the end of the block.
         let imported_loop_state_taken = self.imported_loop_state.take();
         if let Some(ref exported_state) = imported_loop_state_taken {
-            // RPython preserves `Box.type` across iterations through the
-            // shared Box object; pyre encodes the type in the OpRef
-            // variant tag (resoperation.py:29), so end_args carry their
-            // type without a side-table write.
+            // Slice 0.5: post-Slice-P5 every `end_arg` OpRef from the
+            // exported state is typed via `OpRef::input_arg_typed` /
+            // `op_typed`, so its variant tag carries Box.type and the
+            // side-table refresh is dead.
             // opencoder.py:259 + unroll.py:479-504 parity: RPython's
             // TraceIterator allocates fresh InputArg Box objects for
             // each iteration, and `import_state` asserts
@@ -2041,20 +2087,13 @@ impl Optimizer {
             // variants for each Phase 2 source slot from `inputarg_types`
             // (history.py:220 box.type). Variant-aware Eq requires the
             // OpRef minted here to match the typed `OpRef::input_arg_typed`
-            // emitted at trace start (pyre/pyre-jit-trace/src/trace.rs);
-            // an `Untyped` variant here would silently break replacement /
-            // forwarding lookups against typed maps.
+            // emitted at trace start (pyre/pyre-jit-trace/src/trace.rs).
             let typed_inputargs: Vec<OpRef> = (0..n)
                 .map(|i| {
+                    // opencoder.py:259 inputarg_from_tp parity — strict
+                    // box.type lookup, no InputArgVoid fallback.
                     let pos = inputarg_base + i as u32;
-                    let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
-                        panic!(
-                            "inputarg_type_at({i}) returned None: \
-                             RPython InputArg* class fixes box.type at \
-                             construction (resoperation.py:719/727/739)"
-                        )
-                    });
-                    OpRef::input_arg_typed(pos, tp)
+                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
                 })
                 .collect();
             let source_set: std::collections::HashSet<OpRef> =
@@ -2070,19 +2109,13 @@ impl Optimizer {
                     // Cross-slot collision: target is another slot's source.
                     // Allocate fresh to avoid forwarding overwrite.
                     if target != source && source_set.contains(&target) {
-                        // The alias inherits `box.type` from `source`; tag the
-                        // OpRef variant when known so `opref_type` priority 0
-                        // resolves it. RPython Box always carries `box.type`
-                        // (history.py:220), so a None here would mean the
-                        // source slot has no resolvable type — impossible
-                        // under upstream invariants.
-                        // history.py:220 RPython Box always carries
-                        // `box.type` — a missing entry is an invariant
-                        // violation, not a Ref-fallback opportunity.
+                        // The alias inherits `box.type` from `source`. RPython
+                        // Box always carries `box.type` (history.py:220), so
+                        // a missing type here is an unrecoverable invariant
+                        // violation — panic in release as well as debug.
                         let tp = ctx.opref_type(source).unwrap_or_else(|| {
                             panic!(
-                                "cross-slot collision: source {:?} has no resolvable box.type \
-                                 (RPython invariant: every Box carries `.type` per history.py:220)",
+                                "cross-slot collision: source {:?} has no resolvable box.type (RPython invariant violated)",
                                 source,
                             )
                         });
@@ -2112,15 +2145,14 @@ impl Optimizer {
                     );
                 }
                 if !self.imported_virtuals.is_empty() {
-                    for i in 0..ctx.num_inputs as usize {
-                        let raw_pos = ctx.inputarg_base + i as u32;
-                        let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
-                            panic!(
-                                "inputarg_type_at({i}) returned None: \
-                                 RPython InputArg* class fixes box.type at \
-                                 construction (resoperation.py:719/727/739)"
-                            )
-                        });
+                    for slot in 0..ctx.num_inputs as usize {
+                        let raw_pos = ctx.inputarg_base + slot as u32;
+                        // history.py:220 box.type invariant: every InputArg
+                        // carries a `.type`. opencoder.py:259
+                        // `inputarg_from_tp(arg.type)` always types its
+                        // result; missing type is a bookkeeping bug, even
+                        // on this debug-log path.
+                        let tp = ctx.inputarg_type_at_strict(slot);
                         let raw = OpRef::input_arg_typed(raw_pos, tp);
                         eprintln!(
                             "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
@@ -2352,13 +2384,13 @@ impl Optimizer {
             // distinct identity.
             //
             // Case B — preamble inputarg position used by a non-self slot:
-            // when JUMP slot j carries OpRef::from_raw(k) and k < num_inputs, k != j,
-            // the export hands Phase 2 a `next_iteration_args[j] = OpRef::from_raw(k)`
+            // when JUMP slot j carries OpRef::int_op(k) and k < num_inputs, k != j,
+            // the export hands Phase 2 a `next_iteration_args[j] = OpRef::int_op(k)`
             // entry that collides with body inputarg slot k's own source
-            // position. import_state forwards both `OpRef::from_raw(j) → OpRef::from_raw(k)` and
-            // `OpRef::from_raw(k) → nia[k]`, and get_box_replacement walks the chain
-            // through OpRef::from_raw(k), making body inputarg j resolve to nia[k]
-            // instead of OpRef::from_raw(k). RPython avoids this with fresh-Box identity
+            // position. import_state forwards both `OpRef::int_op(j) → OpRef::int_op(k)` and
+            // `OpRef::int_op(k) → nia[k]`, and get_box_replacement walks the chain
+            // through OpRef::int_op(k), making body inputarg j resolve to nia[k]
+            // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
             // per phase; majit's flat OpRef space needs an explicit SameAs
             // alias so nia[j] points outside the body inputarg position range.
             {
@@ -2382,7 +2414,7 @@ impl Optimizer {
                     // Case B fires only when slot k (where `k = arg.raw()`, the
                     // position the current slot points at) holds a DIFFERENT
                     // OpRef. If slot k self-forwards (original_args[k] ==
-                    // OpRef::from_raw(k)), Phase 2 sets `forwarding[OpRef::from_raw(k)] = OpRef::from_raw(k)`
+                    // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
                     // which is a no-op in replace_op — no chain forms, so no
                     // aliasing is needed.
                     let target_slot = arg.raw() as usize;
@@ -2422,19 +2454,16 @@ impl Optimizer {
                             crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                 for field in &mut vinfo.fields {
                                     let orig_field = field.1;
-                                    // RPython Box type parity: the alias inherits
-                                    // `box.type` from the original field; tag the
-                                    // fresh OpRef variant accordingly so it
-                                    // resolves through `opref.ty()` priority 0.
-                                    // RPython Box always carries `box.type`
-                                    // (history.py:220), so a None here would
-                                    // mean an emitted virtual-field producer
-                                    // has no resolvable type — impossible
-                                    // under upstream invariants.
+                                    // RPython Box type parity: the alias
+                                    // inherits `box.type` from the original
+                                    // field. RPython Box always carries
+                                    // `box.type` (history.py:220), so a
+                                    // missing type here is an unrecoverable
+                                    // invariant violation — panic in release
+                                    // as well as debug.
                                     let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
                                         panic!(
-                                            "virtual-field alias: orig_field {:?} has no resolvable box.type \
-                                             (RPython invariant: every Box carries `.type` per history.py:220)",
+                                            "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
                                             orig_field,
                                         )
                                     });
@@ -2515,8 +2544,8 @@ impl Optimizer {
                 // RPython shortpreamble.py:255-259 parity: each label arg
                 // is `box.type`, where Box objects intrinsically carry one
                 // of i / r / f. There is no `void` Box because Box always
-                // wraps a runtime value. Look up the OpRef's type from
-                // `value_types` (maintained per op result type by emit()).
+                // wraps a runtime value. Pyre recovers the same type from
+                // the typed OpRef variant or the trace's inputarg/op metadata.
                 let raw_type = ctx
                     .opref_type(arg)
                     .unwrap_or_else(|| {
@@ -2525,30 +2554,21 @@ impl Optimizer {
                         )
                     });
                 if raw_type == majit_ir::Type::Void {
-                    // Upstream collision: a previously-virtual OpRef whose
-                    // position was reused as a Phase 2 constant slot — its
-                    // value_types entry is the constant op's Void result
-                    // type. Such an OpRef cannot legitimately become a
-                    // short-preamble InputArg in RPython (Box identity
-                    // would have produced a fresh ConstFloat/ConstInt and
-                    // never reach this loop). Skip rather than emitting a
-                    // bogus SameAsR(const0): the same-position constant
-                    // is reachable through `ctx.const_pool` / the
-                    // forwarded BoxRef chain, not via a SameAs.
-                    if crate::optimizeopt::majit_log_enabled() {
-                        eprintln!(
-                            "[unroll] preview_short_args: dropping {:?} \
-                             (Type::Void — Phase 2 constant-slot collision \
-                             with a Phase 1 virtual head OpRef)",
-                            arg
-                        );
-                    }
-                    continue;
+                    // shortpreamble.py:255-259 reads `box.type` from a
+                    // value Box and emits same_as_i/r/f. RPython has no
+                    // Void value Box here; reaching Void means Rust-side
+                    // OpRef/type bookkeeping lost Box identity and must not
+                    // silently drop the short-preamble inputarg.
+                    panic!(
+                        "preview short arg {arg:?} resolved to Type::Void; \
+                         short preamble inputargs must be int/ref/float value boxes \
+                         (shortpreamble.py:255-259)"
+                    );
                 }
                 short_boxes.add_short_input_arg(arg, raw_type);
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
-            let produced = short_boxes.produced_ops();
+            let produced = short_boxes.produced_ops(&mut ctx);
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
@@ -2610,15 +2630,10 @@ impl Optimizer {
             // under variant-aware Eq.
             let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
                 .map(|i| {
+                    // opencoder.py:259 inputarg_from_tp parity — strict
+                    // box.type lookup, no InputArgVoid fallback.
                     let pos = ctx.inputarg_base + i as u32;
-                    let tp = ctx.inputarg_type_at(i).unwrap_or_else(|| {
-                        panic!(
-                            "inputarg_type_at({i}) returned None: \
-                             RPython InputArg* class fixes box.type at \
-                             construction (resoperation.py:719/727/739)"
-                        )
-                    });
-                    OpRef::input_arg_typed(pos, tp)
+                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
                 })
                 .collect();
             crate::optimizeopt::unroll::export_state(
@@ -3029,7 +3044,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, i64>,
+        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -3043,7 +3058,7 @@ impl Optimizer {
         // TraceIterator.__init__` allocates fresh `InputArg` Python
         // objects per iteration so bridges carry Python `is` identity
         // distinct from the parent loop's boxes. Pyre's flat
-        // `OpRef::from_raw(u32)` lacks identity, so `compile_bridge` calls
+        // `OpRef::int_op(u32)` lacks identity, so `compile_bridge` calls
         // `prepare_bridge_trace_for_optimizer` (pyjitpl/mod.rs) which
         // walks the recorded ops through a fresh `TraceIterator` with
         // `start_fresh = bridge_inputarg_base`, allocating OpRefs in
@@ -3392,22 +3407,11 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) {
-        // Box.type parity: register the op's intrinsic result type on its
-        // OpRef BEFORE the pass chain runs. Without this, a pass that
-        // calls `replace_op(op.pos, other)` observes a stale `value_types`
-        // entry left over from Phase 1 (Phase 1 may have emitted a
-        // different-typed op at the same reused OpRef number). RPython
-        // has no equivalent stale-entry hazard because Box.type is stored
-        // on the Box object itself.
-        // Refresh value_types with the current op's result type before
-        // running pass callbacks. RPython's Box.type is fixed at Box
-        // creation, so this is either a first-time record (fresh pos)
-        // or a same-type no-op; a type-changing refresh would be a
-        // cross-phase OpRef-reuse bug, and surfacing it is the point of
-        // the invariant.
-        if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-            ctx.register_value_type(op.pos, op.result_type());
-        }
+        // Slice 0.5: Box.type lives intrinsically on `OpRef.ty()` (variant
+        // tag, history.py:220 + resoperation.py:1693 parity) and on
+        // `Op.type_` once the op lands in `new_operations`, so the
+        // side-table refresh that `register_value_type` used to perform
+        // is fully redundant.
 
         // Resolve forwarded arguments. PyPy `_emit_operation`
         // (optimizer.py:614-625) walks args via force_box at the entry to
@@ -3480,22 +3484,10 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    // Box.type parity: if Replace changed the opcode to one
-                    // with a different result type, the intrinsic type on
-                    // op.pos changes with it. Keep value_types aligned so
-                    // later passes and replace_op callers see the correct
-                    // type instead of the pre-replace one.
-                    // Replace may change the opcode. RPython's equivalent
-                    // (OptimizationResult.replace) keeps the box identity
-                    // so the result type must stay constant — a legitimate
-                    // replace here should produce an op with the same
-                    // result type as whatever was previously registered
-                    // for `op.pos`. Upgrade to `register_value_type` so a
-                    // type-changing replacement panics at the source
-                    // instead of silently retyping the OpRef.
-                    if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-                        ctx.register_value_type(op.pos, op.result_type());
-                    }
+                    // Slice 0.5: replace's new op carries `Op.type_` from
+                    // construction (Slice 0.1) and a typed `op.pos` so
+                    // downstream `op_at` lookups resolve it directly
+                    // without a side-table refresh.
                     current_op = op;
                 }
                 OptimizationResult::Restart(op) => {
@@ -3515,9 +3507,8 @@ impl Optimizer {
                         current_op.opcode,
                         op.opcode,
                     );
-                    if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-                        ctx.register_value_type(op.pos, op.result_type());
-                    }
+                    // Slice 0.5: Restart's new op carries `Op.type_` from
+                    // construction; no side-table refresh needed.
                     self.propagate_from_pass_range(0, end_pass, &op, ctx);
                     // Run any postprocess callbacks accumulated in the outer
                     // chain (passes that already returned PassOn for the
@@ -3681,14 +3672,9 @@ impl Optimizer {
                 op.pos,
                 op.args
             );
-            // RPython parity: the current ResOp already carries type 'i'.
-            // The op has `result_type() == Int` (asserted above), so
-            // registering the type here is either a first-time record (fresh
-            // pos) or a same-type no-op (the op was visited before). A
-            // different cached type means a Phase 1 op left a stale
-            // value_types entry at this reused pos — precisely the cross-type
-            // mutation the invariant guard is designed to surface.
-            ctx.register_value_type(op.pos, majit_ir::Type::Int);
+            // Slice 0.5: returns_bool ops are constructed Int-typed
+            // (asserted above) and `Op.type_ == Int` already provides the
+            // type to `opref_type` via the priority-2 op_at fast path.
             let op_pos_box = ctx
                 .ensure_box(op.pos)
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -4860,7 +4846,8 @@ mod tests {
         ops[3].pos = OpRef::int_op(6);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(1, 27);
+        constants.insert(1u32, majit_ir::Value::Int(27));
+        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         let positions: Vec<_> = result.iter().map(|op| op.pos).collect();
@@ -4898,7 +4885,8 @@ mod tests {
         ops[3].pos = OpRef::int_op(6);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(1, 27);
+        constants.insert(1u32, majit_ir::Value::Int(27));
+        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result[0].pos, OpRef::int_op(5));
@@ -4906,7 +4894,7 @@ mod tests {
         assert_eq!(result[2].pos, OpRef::int_op(7));
         assert_eq!(result[2].arg(0), OpRef::int_op(5));
         assert_eq!(constants.get(&5), None);
-        assert_eq!(constants.get(&8), Some(&123));
+        assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
     }
 
     #[test]
@@ -4924,8 +4912,10 @@ mod tests {
         ops[0].pos = OpRef::int_op(3);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(0, 40);
-        constants.insert(1, 5);
+        constants.insert(0u32, majit_ir::Value::Int(40));
+        constants.insert(1u32, majit_ir::Value::Int(5));
+        opt.constant_types.insert(0, Type::Int);
+        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
@@ -4944,9 +4934,12 @@ mod tests {
         ops[0].pos = OpRef::int_op(3);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(0, 40);
-        constants.insert(1, 5);
-        constants.insert(3, 1);
+        constants.insert(0u32, majit_ir::Value::Int(40));
+        constants.insert(1u32, majit_ir::Value::Int(5));
+        constants.insert(3u32, majit_ir::Value::Int(1));
+        opt.constant_types.insert(0, Type::Int);
+        opt.constant_types.insert(1, Type::Int);
+        opt.constant_types.insert(3, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
@@ -4965,7 +4958,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
         ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::int_op(3);
+        ops[1].pos = OpRef::void_op(3);
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5069,7 +5062,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::int_op(3);
+        ops[1].pos = OpRef::void_op(3);
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5135,7 +5128,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::int_op(3);
+        ops[1].pos = OpRef::void_op(3);
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5182,7 +5175,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::int_op(3);
+        ops[1].pos = OpRef::void_op(3);
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5229,10 +5222,10 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         ops[0].pos = OpRef::int_op(66);
-        ops[1].pos = OpRef::int_op(67);
+        ops[1].pos = OpRef::void_op(67);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::const_int(0).raw(), 472);
+        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: std::collections::HashSet<_> = result
@@ -5256,7 +5249,10 @@ mod tests {
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
         );
-        assert_eq!(constants.get(&OpRef::const_int(0).raw()), Some(&472));
+        assert_eq!(
+            constants.get(&OpRef::const_int(0).raw()),
+            Some(&majit_ir::Value::Int(472))
+        );
         assert!(
             !constants.contains_key(&68),
             "live New position must not collide with constant map {:?}",
@@ -5588,7 +5584,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let op = Op::new(OpCode::GuardNonnull, &[OpRef::int_op(10)]);
+        let op = Op::new(OpCode::GuardNonnull, &[OpRef::ref_op(10)]);
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
@@ -5600,12 +5596,12 @@ mod tests {
             op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.descr.is_some()
         }));
         // info.py:146-151: force_box emits the ORIGINAL box op, so the
-        // forced GuardNonnull keeps arg(0) = OpRef::int_op(10) (matches the virtual's
+        // forced GuardNonnull keeps arg(0) = OpRef::ref_op(10) (matches the virtual's
         // original identity). force_box_impl preserves `new_op.pos = opref`.
         assert!(
             ctx.new_operations
                 .iter()
-                .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) == OpRef::int_op(10))
+                .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) == OpRef::ref_op(10))
         );
     }
 
@@ -5635,14 +5631,14 @@ mod tests {
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::int_op(14)]);
-                    op.pos = OpRef::int_op(14);
+                    op.pos = OpRef::op_typed(14, op.result_type());
                     op
                 },
             },
         );
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
-        guard.pos = OpRef::void_op(15);
+        guard.pos = OpRef::op_typed(15, guard.result_type());
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;

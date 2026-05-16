@@ -356,7 +356,7 @@ impl MIFrame {
     /// `&[OpRef]` (the trace-side representation of green args after
     /// `make_three_lists` flattens by kind in jtransform). Each element
     /// must satisfy [`OpRef::is_constant`] — the constant-namespace
-    /// flag set by `OpRef::from_const`.
+    /// flag set by `OpRef::const_int` / `const_ptr` / `const_float`.
     ///
     /// Production callers land with S2.3 follow-up (the metainterp-side
     /// `opimpl_jit_merge_point` port). For now the helper is dead code

@@ -4629,7 +4629,7 @@ mod tests {
         // Warm up and start tracing. Pass a single live value so that
         // setup_tracing (pyjitpl.rs:1186) registers one inputarg via
         // recorder.record_input_arg — this gives the trace a valid
-        // `OpRef::from_raw(0)` inputarg that the GuardTrue below references.
+        // `OpRef::input_arg_int(0)` inputarg that the GuardTrue below references.
         // Without the inputarg, TraceIterator (opencoder.py:257-266)
         // correctly rejects a TAGBOX reference to an unseeded cache
         // slot (`_get(i)` asserts `res is not None`).
@@ -4748,7 +4748,7 @@ mod tests {
         let key = 42u64;
 
         // Warm up: first back_edge increments counter, second starts tracing.
-        // Pass one live value so OpRef::from_raw(0) = i0 is available.
+        // Pass one live value so input_arg_int(0) = i0 is available.
         assert!(matches!(
             driver.meta.on_back_edge(key, &[0]),
             BackEdgeAction::Interpret

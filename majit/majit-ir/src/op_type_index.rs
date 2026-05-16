@@ -8,11 +8,11 @@ use crate::value::{InputArg, Type};
 ///
 /// rpython/jit/metainterp/history.py:220 `ConstInt.type = INT`,
 /// rpython/jit/metainterp/resoperation.py:567 `IntOp.type = 'i'` —
-/// RPython reads `box.type` directly from the Box object. Pyre's
-/// `OpRef(u32)` wrapper carries no intrinsic type, so backend boundaries
-/// (compile.rs guard metadata, regalloc, assembler) need an explicit
-/// index. Single source of truth: `op.type_`, `inputarg.tp`,
-/// caller-supplied `constant_types` (resume.py ResumeDataLoopMemo).
+/// RPython reads `box.type` directly from the Box object. Pyre's typed
+/// `OpRef` variants carry that type tag for value boxes; this index is
+/// the compatibility boundary for raw/index-keyed consumers that still
+/// need to recover type from `op.type_`, `inputarg.tp`, or caller-supplied
+/// `constant_types` (resume.py ResumeDataLoopMemo).
 ///
 /// `inputarg_pos` and `op_pos` are stored as `Cow` so callers may
 /// either let `new` build them eagerly or share pre-built indexes that
@@ -220,7 +220,21 @@ impl<'a> OpTypeIndex<'a> {
 
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,
     /// inputargs, or `OpRef::NONE`.
+    ///
+    /// resoperation.py:29 `AbstractResOp` vs history.py:182 `AbstractValue`:
+    /// only `*Op` variants (Int/Float/Ref/VoidOp) are produced by a
+    /// `ResOperation`; `Const*` and `InputArg*` boxes have no producing
+    /// op. Filter on the variant tag so a flat-`OpRef(u32)` collision
+    /// (e.g. `InputArgInt(0)` sharing raw=0 with `IntOp(0)`) cannot
+    /// surface a producer record for an inputarg or a constant via
+    /// the raw-u32 position array.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
+        if !matches!(
+            opref,
+            OpRef::IntOp(_) | OpRef::FloatOp(_) | OpRef::RefOp(_) | OpRef::VoidOp(_)
+        ) {
+            return None;
+        }
         let idx = op_pos_lookup(&self.op_pos, opref.raw() as usize)?;
         Some(&self.ops[idx])
     }
@@ -231,6 +245,16 @@ impl<'a> OpTypeIndex<'a> {
     /// same OpRef with a different type.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
         let idx = op_pos_lookup(&self.inputarg_pos, opref.raw() as usize)?;
+        Some(self.inputargs[idx].tp)
+    }
+
+    /// Raw-keyed companion of `inputarg_type`. Used by callers that hold
+    /// the inputarg position as a `u32` (e.g. backend op-var indices) and
+    /// would otherwise need to mint a typed `OpRef` solely for the lookup.
+    /// The `inputarg_pos` position array uses `OpRef::raw()` (less the
+    /// inputarg base) internally, so the round-trip carries no information.
+    pub fn inputarg_type_raw(&self, raw: u32) -> Option<Type> {
+        let idx = op_pos_lookup(&self.inputarg_pos, raw as usize)?;
         Some(self.inputargs[idx].tp)
     }
 }

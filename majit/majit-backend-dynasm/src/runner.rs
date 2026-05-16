@@ -3413,7 +3413,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::int_op(1),
+                    OpRef::ref_op(1),
                     OpRef::int_op(10001),
                     OpRef::int_op(10007),
                     OpRef::int_op(10003),
@@ -3467,7 +3467,7 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::int_op(1),
+                    OpRef::ref_op(1),
                     OpRef::int_op(10001),
                     OpRef::input_arg_ref(0),
                     OpRef::int_op(10002),
@@ -3476,10 +3476,10 @@ mod tests {
             ),
             mk_op(
                 OpCode::GcLoadR,
-                &[OpRef::int_op(1), OpRef::int_op(10001), OpRef::int_op(10002)],
+                &[OpRef::ref_op(1), OpRef::int_op(10001), OpRef::int_op(10002)],
                 2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1503);
@@ -3555,6 +3555,9 @@ mod tests {
 
         let mut token = JitCellToken::new(1602);
         backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
+        // resoperation.py:719 InputArgInt — slot 0 is `InputArg::new_int(0)`,
+        // referenced via `OpRef::input_arg_int(0)`. Variant-aware Eq/Hash
+        // treats `IntOp(0)` and `InputArgInt(0)` as disjoint Box classes.
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.fail_args = Some(vec![OpRef::input_arg_int(0)].into());
         let ops = vec![
@@ -3674,7 +3677,7 @@ mod tests {
                 ));
                 call
             },
-            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -3774,7 +3777,7 @@ mod tests {
                 ));
                 call
             },
-            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -3959,7 +3962,7 @@ mod tests {
                 ));
                 call
             },
-            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -4187,7 +4190,7 @@ mod tests {
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_value,
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
         backend
             .compile_bridge(
@@ -4344,7 +4347,7 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             passthrough,
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -4395,7 +4398,7 @@ mod tests {
             1,
         );
         plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
-        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef::int_op(1)], 2);
+        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef::ref_op(1)], 2);
         call_asm.descr = Some(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
@@ -4462,7 +4465,7 @@ mod tests {
         plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
-            &[OpRef::int_op(2), OpRef::input_arg_ref(1)],
+            &[OpRef::ref_op(2), OpRef::input_arg_ref(1)],
             3,
         );
         call_asm.descr = Some(make_call_assembler_descr(
@@ -4474,7 +4477,7 @@ mod tests {
         let caller_ops = vec![
             plain_call,
             call_asm,
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
         let mut caller_token = JitCellToken::new(1607);
         backend

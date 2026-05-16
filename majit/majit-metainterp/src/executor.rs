@@ -54,9 +54,8 @@ impl TraceValues {
     pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
         // Index-keyed pool namespace probe (Slice P3 category E):
         // raw u32 keys carry the constant-namespace bit directly, so use
-        // the bit-helpers instead of round-tripping through
-        // `OpRef::from_raw(k)` which lands on the to-be-retired
-        // `OpRef::Untyped` variant.
+        // the bit-helpers rather than minting a typed `OpRef` solely
+        // for the namespace test.
         let max_op = map
             .keys()
             .filter(|&&k| !OpRef::raw_is_constant(k))

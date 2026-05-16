@@ -1668,7 +1668,7 @@ pub(crate) fn decode_values_with_layout(
 
 pub(crate) fn normalize_closing_jump_args(
     mut ops: Vec<Op>,
-    constants: &std::collections::HashMap<u32, i64>,
+    constants: &std::collections::HashMap<u32, majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<Op> {
     let Some(label_args) = ops
@@ -1769,8 +1769,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     num_red_args: usize,
     index_of_virtualizable: usize,
-    constants: &mut HashMap<u32, i64>,
-    constant_types: &mut HashMap<u32, Type>,
+    constants: &mut HashMap<u32, majit_ir::Value>,
 ) {
     // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -1905,9 +1904,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     // Allocate fresh const indices above the existing max.
     // Index-keyed pool namespace probe (Slice P3 category E):
     // raw u32 keys carry the constant-namespace bit directly, so use
-    // the bit-helpers instead of round-tripping through
-    // `OpRef::from_raw(k)` which lands on the to-be-retired
-    // `OpRef::Untyped` variant.
+    // the bit-helpers rather than minting a typed `OpRef` solely
+    // for the namespace test.
     let mut next_const_idx = constants
         .keys()
         .filter_map(|&k| OpRef::raw_is_constant(k).then(|| OpRef::raw_const_index(k)))
@@ -2031,12 +2029,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             // compile.py:453 — ConstInt(index) for the array subscript.
             let const_opref = OpRef::const_int(next_const_idx);
             next_const_idx += 1;
-            constants.insert(const_opref.raw(), index as i64);
-            // Lockstep with backend `set_constant_types`: typed-OpRef
-            // readers consult `v.ty()` priority-0, but raw-u32 keyed
-            // backend consumers (regalloc fail_args, GC rewrite) only
-            // see the `constants` map shape and need the side table.
-            constant_types.insert(const_opref.raw(), Type::Int);
+            constants.insert(const_opref.raw(), majit_ir::Value::Int(index as i64));
 
             let old_opref =
                 OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
@@ -2675,8 +2668,7 @@ mod tests {
             },
         ];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants = HashMap::new();
-        let mut constant_types = HashMap::new();
+        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2686,7 +2678,6 @@ mod tests {
             1,
             0,
             &mut constants,
-            &mut constant_types,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -2736,8 +2727,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants = HashMap::new();
-        let mut constant_types = HashMap::new();
+        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2747,7 +2737,6 @@ mod tests {
             1,
             0,
             &mut constants,
-            &mut constant_types,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);

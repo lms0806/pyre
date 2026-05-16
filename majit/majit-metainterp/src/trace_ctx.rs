@@ -653,7 +653,7 @@ impl TraceCtx {
 
     /// Return the concrete value for a constant OpRef, if it is a pooled constant.
     pub fn const_value(&self, opref: OpRef) -> Option<i64> {
-        self.constants.as_ref().get(&opref.raw()).copied()
+        self.constants.raw_bits(opref)
     }
 
     /// Constant-fold a pure field read on a constant object pointer.
@@ -1099,26 +1099,12 @@ impl TraceCtx {
     ///      concrete.
     pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
         if opref.is_constant() {
-            if let Some(raw) = self.constants.as_ref().get(&opref.raw()).copied() {
-                // Constants always have their type pinned by the
-                // pool's `get_or_insert*` paths (constant_pool.rs:101 /
-                // 134); a constant present in the pool with no recorded
-                // type is a structural bug.
-                let tp = self.constants.constant_type(opref).unwrap_or_else(|| {
-                    panic!(
-                        "constant_pool.constant_type missing for constant OpRef({}) (raw={}): \
-                         constant_pool.get_or_insert / get_or_insert_typed must populate \
-                         constant_types in lockstep",
-                        opref.raw(),
-                        raw
-                    )
-                });
-                return match tp {
-                    Type::Int => Value::Int(raw),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Void => Value::Void,
-                };
+            // history.py:220/261/307 box.type parity: `ConstantPool`
+            // stores typed `Value` directly — the variant tag carries
+            // the `Box.type` intrinsically, so no separate type lookup
+            // is required.
+            if let Some(value) = self.constants.get_value(opref) {
+                return value;
             }
         }
         if Some(opref) == self.standard_virtualizable_box() {
@@ -2259,6 +2245,9 @@ impl TraceCtx {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // test fixtures rebuild Op streams via OpRef::from_raw; production
+// trace_ctx path has 0 OpRef::from_raw callers (Untyped OpRef Retirement
+// Epic, Slice 2A — narrow the P1.5 gate from crate-level to mod-level).
 mod tests {
     use super::*;
     use crate::jit_state::JitState;

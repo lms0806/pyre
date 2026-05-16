@@ -12,17 +12,40 @@
 use std::collections::HashMap;
 
 use majit_gc::shadow_stack;
-use majit_ir::{GcRef, OpRef, Type};
+use majit_ir::{GcRef, OpRef, Type, Value};
+
+/// Encode a typed `Value` to the raw `i64` shape used by the legacy
+/// backend boundary (`set_constants(HashMap<u32, i64>)`).
+fn value_to_raw_bits(value: &Value) -> i64 {
+    match value {
+        Value::Int(v) => *v,
+        Value::Ref(r) => r.0 as i64,
+        Value::Float(f) => f.to_bits() as i64,
+        // history.py:220/261/307 — only ConstInt/ConstFloat/ConstPtr
+        // exist upstream; there is no `ConstVoid` class. A Void constant
+        // reaching the backend boundary indicates a bookkeeping bug;
+        // surface it instead of silently lowering to a zero Int payload.
+        Value::Void => panic!(
+            "value_to_raw_bits: Value::Void has no constant lowering (no ConstVoid upstream)"
+        ),
+    }
+}
 
 /// Constant pool for trace recording.
 ///
-/// Manages the mapping from constant-namespace OpRef to i64 values.
-/// Each `get_or_insert{,_typed}` call mints a fresh OpRef per
+/// Manages the mapping from constant-namespace OpRef to typed `Value`
+/// payloads. Each `get_or_insert{,_typed}` call mints a fresh OpRef per
 /// `history.py:220/261/307` ConstInt/ConstFloat/ConstPtr `__init__`
 /// fresh-allocation; value-equality between two constant OpRefs uses
 /// `same_constant` (history.py:204) — not OpRef identity. Resume
 /// serialization dedup (`resume.py:148-181 large_ints`/`refs`) is a
 /// separate concern that lives in `resume.rs`.
+///
+/// Storage shape: `HashMap<u32, Value>` mirrors RPython where each
+/// `ConstInt/ConstFloat/ConstPtr` Box carries `.type` intrinsically
+/// (history.py:220/261/307). The legacy split `(HashMap<u32, i64>,
+/// HashMap<u32, Type>)` is retired — type rides on the `Value` variant
+/// tag, eliminating the lockstep risk between value and type maps.
 ///
 /// gcreftracer.py parity: Ref-typed constants are pushed onto the GC
 /// shadow stack so that GC can trace and update them if objects move.
@@ -30,9 +53,8 @@ use majit_ir::{GcRef, OpRef, Type};
 /// from the shadow stack to pick up any GC-updated pointers.
 pub struct ConstantPool {
     /// Keyed by OpRef.0 (tagged constant value, i.e. index | CONST_BIT).
-    constants: HashMap<u32, i64>,
-    /// Type of each constant OpRef. Populated by `get_or_insert_typed`.
-    constant_types: HashMap<u32, Type>,
+    /// `Value` carries type intrinsically (history.py:220 box.type).
+    constants: HashMap<u32, Value>,
     /// Zero-based counter for allocating new constant indices.
     next_const_idx: u32,
     /// gcreftracer.py parity: (OpRef key, shadow stack index) for each
@@ -47,7 +69,6 @@ impl ConstantPool {
     pub fn new() -> Self {
         ConstantPool {
             constants: HashMap::new(),
-            constant_types: HashMap::new(),
             next_const_idx: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
@@ -62,16 +83,10 @@ impl ConstantPool {
     /// Per-value dedup belongs to the resume tagging memo
     /// (`resume.py:148-172 ResumeDataLoopMemo.large_ints`), which lives
     /// in `resume.rs` and is unaffected by this method.
-    ///
-    /// `constant_types` records `Type::Int` so callers that reconstruct
-    /// the OpRef as `Untyped` (via `OpRef::from_raw`) can still recover
-    /// the pinned type. Typed `ConstInt(idx)` variants resolve their
-    /// type from the variant tag at priority-0 in `constant_type`.
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
-        self.constants.insert(opref.raw(), value);
-        self.constant_types.insert(opref.raw(), Type::Int);
+        self.constants.insert(opref.raw(), Value::Int(value));
         opref
     }
 
@@ -90,22 +105,21 @@ impl ConstantPool {
             Type::Float => {
                 let opref = OpRef::const_float(self.next_const_idx);
                 self.next_const_idx += 1;
-                self.constants.insert(opref.raw(), value);
-                self.constant_types.insert(opref.raw(), Type::Float);
+                self.constants
+                    .insert(opref.raw(), Value::Float(f64::from_bits(value as u64)));
                 opref
             }
             Type::Int => {
                 let opref = OpRef::const_int(self.next_const_idx);
                 self.next_const_idx += 1;
-                self.constants.insert(opref.raw(), value);
-                self.constant_types.insert(opref.raw(), Type::Int);
+                self.constants.insert(opref.raw(), Value::Int(value));
                 opref
             }
             Type::Ref => {
                 let opref = OpRef::const_ptr(self.next_const_idx);
                 self.next_const_idx += 1;
-                self.constants.insert(opref.raw(), value);
-                self.constant_types.insert(opref.raw(), Type::Ref);
+                self.constants
+                    .insert(opref.raw(), Value::Ref(GcRef(value as usize)));
                 // gcreftracer.py: non-null Ref constants must be rooted
                 // on the shadow stack so the GC can update them when
                 // objects move. One root per ConstPtr mint mirrors
@@ -124,41 +138,36 @@ impl ConstantPool {
     ///
     /// Reads the typed OpRef variant tag (ConstInt/ConstFloat/ConstPtr per
     /// history.py:220/261/307) at priority-0 via `opref.ty()`. Falls back
-    /// to the `constant_types` side table for Untyped OpRefs (legacy
-    /// callers that reconstruct via `OpRef::from_raw`).
+    /// to the stored `Value` variant for Untyped OpRefs (legacy callers
+    /// that reconstruct via `OpRef::from_raw`).
     pub fn constant_type(&self, opref: OpRef) -> Option<Type> {
         opref
             .ty()
-            .or_else(|| self.constant_types.get(&opref.raw()).copied())
+            .or_else(|| self.constants.get(&opref.raw()).map(|v| v.get_type()))
     }
 
     /// pyjitpl.py:3572 executor.constant_from_op(a) parity:
     /// return the typed Value for a constant OpRef, or None if
     /// the OpRef is not a known constant.
-    pub fn get_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
-        let &raw = self.constants.get(&opref.raw())?;
-        // history.py:220/261/307: ConstInt/Float/Ptr Box.type is pinned at
-        // construction. Read the type from the typed OpRef variant tag
-        // (priority-0); fall back to the `constant_types` side table for
-        // Untyped OpRefs that legacy callers reconstruct via `OpRef::from_raw`.
-        let tp = opref
-            .ty()
-            .or_else(|| self.constant_types.get(&opref.raw()).copied())
-            .unwrap_or_else(|| {
-                panic!(
-                    "constant type missing for OpRef({}) (raw={}) — \
-                     get_or_insert / get_or_insert_typed must produce typed \
-                     variants or populate constant_types",
-                    opref.raw(),
-                    raw
-                )
-            });
-        Some(match tp {
-            Type::Int => majit_ir::Value::Int(raw),
-            Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
-            Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
-            Type::Void => majit_ir::Value::Void,
-        })
+    ///
+    /// In RPython every Const subclass guarantees its payload type
+    /// matches its class identity (`history.py:220 ConstInt.type = INT`,
+    /// `:261 ConstFloat.type = FLOAT`, `:307 ConstPtr.type = REF`). Mirror
+    /// that contract by checking the OpRef variant tag against the stored
+    /// `Value` variant: a mismatch indicates two pools were crossed (a
+    /// caller bug) and would otherwise return a Value carrying the wrong
+    /// type for the OpRef's class.
+    pub fn get_value(&self, opref: OpRef) -> Option<Value> {
+        let stored = self.constants.get(&opref.raw()).cloned()?;
+        debug_assert!(
+            opref.ty().map(|t| t == stored.get_type()).unwrap_or(true),
+            "ConstantPool::get_value: OpRef variant {:?} (type {:?}) does not match \
+             stored Value type {:?} — history.py:220/261/307 disjoint subclass invariant",
+            opref,
+            opref.ty(),
+            stored.get_type(),
+        );
+        Some(stored)
     }
 
     /// history.py:204 / :244 `Const.same_constant` — true when two
@@ -177,7 +186,6 @@ impl ConstantPool {
     /// it on a non-constant Box is a type error upstream. We mirror
     /// that contract by short-circuiting non-constants to `false` even
     /// when `a == b` (e.g. `OpRef::NONE == OpRef::NONE`).
-
     pub fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
         if !a.is_constant() || !b.is_constant() {
             return false;
@@ -185,21 +193,17 @@ impl ConstantPool {
         if a == b {
             return true;
         }
-        // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
-        // disjoint subclasses; same_constant returns false across them.
-        // Read each operand's type via the typed OpRef variant tag at
-        // priority-0; fall back to `constant_types` for Untyped operands.
-        let a_tp = a
-            .ty()
-            .or_else(|| self.constant_types.get(&a.raw()).copied());
-        let b_tp = b
-            .ty()
-            .or_else(|| self.constant_types.get(&b.raw()).copied());
-        if a_tp != b_tp {
+        // history.py:251 ConstInt.same_constant / :292 ConstFloat /
+        // :338 ConstPtr — each subclass's `same_constant` short-circuits
+        // to `false` when the operand is not an instance of the same
+        // subclass. ConstInt/ConstFloat/ConstPtr are disjoint Const
+        // subclasses (history.py:220/261/307). Read each operand's
+        // class identity from the typed OpRef variant tag.
+        if a.ty() != b.ty() {
             return false;
         }
-        let av = self.constants.get(&a.raw()).copied();
-        let bv = self.constants.get(&b.raw()).copied();
+        let av = self.constants.get(&a.raw());
+        let bv = self.constants.get(&b.raw());
         match (av, bv) {
             (Some(x), Some(y)) => x == y,
             _ => false,
@@ -214,8 +218,8 @@ impl ConstantPool {
     /// construction (`history.py:307 ConstPtr.type = REF`).
     pub(crate) fn refresh_from_gc(&mut self) {
         for &(opref_key, ss_idx) in &self.rooted_refs {
-            let current = shadow_stack::get(ss_idx).0 as i64;
-            self.constants.insert(opref_key, current);
+            let current = shadow_stack::get(ss_idx);
+            self.constants.insert(opref_key, Value::Ref(current));
         }
     }
 
@@ -235,68 +239,34 @@ impl ConstantPool {
         }
     }
 
-    /// Consume the pool and return the constants map.
+    /// Consume the pool and return the legacy raw-bits map.
+    ///
+    /// The raw-bits view is preserved for backend / parity-print
+    /// consumers that still operate on `HashMap<u32, i64>`.  Each
+    /// `Value` is lowered via `value_to_raw_bits`.
     pub fn into_inner(mut self) -> HashMap<u32, i64> {
         self.refresh_from_gc();
         let constants = std::mem::take(&mut self.constants);
         self.release_roots();
         constants
-    }
-
-    /// Consume the pool, returning both value and type maps.
-    pub fn into_inner_with_types(mut self) -> (HashMap<u32, i64>, HashMap<u32, Type>) {
-        self.refresh_from_gc();
-        let constants = std::mem::take(&mut self.constants);
-        let types = std::mem::take(&mut self.constant_types);
-        self.release_roots();
-        (constants, types)
-    }
-
-    /// Consume the pool, returning a typed `HashMap<u32, Value>` that
-    /// fuses the legacy `(raw, type)` pair into a single intrinsically-
-    /// typed value entry — matching RPython's `Const(value)` Box model
-    /// where ConstInt/ConstFloat/ConstPtr (history.py:220/261/307) each
-    /// carry their value as a typed instance attribute, not via a
-    /// separate type sidetable.
-    ///
-    /// Convergence path for the cross-crate `constant_types` retirement:
-    /// downstream consumers (pyjitpl, trace_ctx, parity, executor, backend)
-    /// migrate from `into_inner_with_types` to this typed accessor one at
-    /// a time. The legacy accessor stays in place until all consumers
-    /// migrate.
-    pub fn into_inner_typed(mut self) -> HashMap<u32, majit_ir::Value> {
-        self.refresh_from_gc();
-        let constants = std::mem::take(&mut self.constants);
-        let types = std::mem::take(&mut self.constant_types);
-        self.release_roots();
-        constants
             .into_iter()
-            .map(|(raw, bits)| {
-                // history.py:220/261/307 ConstInt/Float/Ptr pin type at
-                // construction — every entry MUST have a recorded type.
-                // Missing entry => producer didn't populate constant_types
-                // in lockstep with constants (writer-side bug); panic loud
-                // so the divergence is caught at the seed site.
-                let tp = types.get(&raw).copied().unwrap_or_else(|| {
-                    panic!(
-                        "into_inner_typed: constant_types missing entry for \
-                         constant OpRef(raw={raw}) — get_or_insert/get_or_insert_typed \
-                         must populate both maps in lockstep"
-                    )
-                });
-                let value = match tp {
-                    Type::Int => majit_ir::Value::Int(bits),
-                    Type::Float => majit_ir::Value::Float(f64::from_bits(bits as u64)),
-                    Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
-                    Type::Void => majit_ir::Value::Void,
-                };
-                (raw, value)
-            })
+            .map(|(k, v)| (k, value_to_raw_bits(&v)))
             .collect()
     }
 
-    /// Get a mutable reference to the inner constants map.
-    pub fn as_mut(&mut self) -> &mut HashMap<u32, i64> {
+    /// Consume the pool, returning the canonical typed `HashMap<u32,
+    /// Value>` — matching RPython's `Const(value)` Box model where
+    /// `ConstInt/ConstFloat/ConstPtr` (history.py:220/261/307) carry
+    /// their value as a typed instance attribute.
+    pub fn into_inner_typed(mut self) -> HashMap<u32, Value> {
+        self.refresh_from_gc();
+        let constants = std::mem::take(&mut self.constants);
+        self.release_roots();
+        constants
+    }
+
+    /// Get a mutable reference to the inner constants map (typed).
+    pub fn as_mut(&mut self) -> &mut HashMap<u32, Value> {
         &mut self.constants
     }
 
@@ -308,21 +278,45 @@ impl ConstantPool {
         self.next_const_idx = self.next_const_idx.max(raw_idx + 1);
     }
 
-    /// Get a shared reference to the inner constants map.
-    pub fn as_ref(&self) -> &HashMap<u32, i64> {
+    /// Get a shared reference to the inner constants map (typed).
+    pub fn as_ref(&self) -> &HashMap<u32, Value> {
         &self.constants
     }
 
-    /// Clone the constants map without consuming the pool.
-    /// Refreshes from GC first to pick up moved Ref pointers.
-    pub fn snapshot(&mut self) -> HashMap<u32, i64> {
+    /// Look up a constant's raw `i64` bits (legacy backend boundary).
+    /// Returns `None` if `opref` is not in the pool.
+    pub fn raw_bits(&self, opref: OpRef) -> Option<i64> {
+        self.constants.get(&opref.raw()).map(value_to_raw_bits)
+    }
+
+    /// Clone the constants map without consuming the pool, returning
+    /// the typed `Value` shape. Refreshes from GC first to pick up
+    /// moved Ref pointers.
+    pub fn snapshot(&mut self) -> HashMap<u32, Value> {
         self.refresh_from_gc();
         self.constants.clone()
     }
 
-    /// Clone the constant type map without consuming the pool.
+    /// Legacy raw-bits snapshot for callers that still operate on
+    /// `HashMap<u32, i64>`. Each entry is lowered via `value_to_raw_bits`.
+    /// Refreshes from GC first.
+    pub fn snapshot_raw(&mut self) -> HashMap<u32, i64> {
+        self.refresh_from_gc();
+        self.constants
+            .iter()
+            .map(|(&k, v)| (k, value_to_raw_bits(v)))
+            .collect()
+    }
+
+    /// Clone the per-OpRef `Type` map without consuming the pool, by
+    /// projecting each stored `Value`'s variant.  history.py:220/261/307
+    /// box.type parity — every Const Box pins its `.type` intrinsically,
+    /// so the projection is total.
     pub fn constant_types_snapshot(&self) -> HashMap<u32, Type> {
-        self.constant_types.clone()
+        self.constants
+            .iter()
+            .map(|(&k, v)| (k, v.get_type()))
+            .collect()
     }
 }
 
@@ -374,8 +368,7 @@ mod tests {
         let b_idx = pool.next_const_idx;
         pool.next_const_idx += 1;
         let b = OpRef::const_int(b_idx);
-        pool.constants.insert(b.raw(), 42);
-        pool.constant_types.insert(b.raw(), Type::Int);
+        pool.constants.insert(b.raw(), Value::Int(42));
         assert_ne!(a, b, "different idx slots must be != under variant Eq");
         assert!(
             pool.same_constant(a, b),

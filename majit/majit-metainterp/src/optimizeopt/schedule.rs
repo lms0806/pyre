@@ -797,8 +797,8 @@ impl VecScheduleState {
 
     /// Allocate a fresh typed OpRef for a newly created vector op. The
     /// caller supplies the op's result type (`opcode.result_type()`) so
-    /// the returned OpRef carries the proper `Int/Float/Ref/Void` variant
-    /// instead of the legacy `Untyped` namespace.
+    /// the returned OpRef carries the proper `Int/Float/Ref/Void`
+    /// variant tag.
     pub fn alloc_op_pos(&mut self, tp: Type) -> OpRef {
         let pos = OpRef::op_typed(self.next_pos, tp);
         self.next_pos += 1;

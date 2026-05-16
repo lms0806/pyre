@@ -735,36 +735,6 @@ pub fn call_assembler_execute_addr() -> usize {
     call_assembler_execute_trampoline as *const () as usize
 }
 
-// ── Pending CALL_ASSEMBLER targets ──
-// Cranelift: register_pending_call_assembler_target stores a CaDispatchEntry
-// with null code_ptr. When compile completes, code_ptr is updated atomically.
-// Dynasm: the target registry lives in runner.rs (CALL_ASSEMBLER_TARGETS).
-// This API delegates to it for pending target registration.
-
-/// Register a pending CALL_ASSEMBLER target (code not yet compiled).
-/// Matches Cranelift's register_pending_call_assembler_target API.
-///
-/// The actual registration happens via Backend::register_pending_target
-/// → DynasmBackend::register_pending_target (runner.rs), which inserts
-/// a 0 entry into CALL_ASSEMBLER_TARGETS. When compile_loop completes,
-/// it overwrites with the real code_addr.
-///
-/// This function is the direct-call equivalent for non-Backend callers.
-pub fn register_pending_call_assembler_target(
-    token_number: u64,
-    _inputarg_types: Vec<majit_ir::Type>,
-    num_inputs: usize,
-    _num_scalar_inputargs: usize,
-    index_of_virtualizable: i32,
-) {
-    // Delegate to the runner's CALL_ASSEMBLER_TARGETS registry.
-    runner::DynasmBackend::register_pending_call_assembler_target_static(
-        token_number,
-        num_inputs,
-        index_of_virtualizable,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

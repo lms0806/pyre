@@ -60,12 +60,26 @@ impl std::error::Error for VirtualStatesCantMatch {}
 ///   fail this check. The force_boxes=True path is handled separately in
 ///   generate_guards_for_entry (line 1229) BEFORE this function is called.
 pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> bool {
+    // history.py:182 / virtualstate.py:655 not_virtual leaves: every value
+    // box is int/ref/float. Void is never a value box class, so neither
+    // `expected = Void` nor `Unknown(Void)` should ever flow through.
+    if expected == Type::Void {
+        panic!(
+            "info_type_matches: expected=Type::Void has no value-box parity; \
+             void-result ops are not value boxes (resoperation.py:260)"
+        );
+    }
+    if let VirtualStateInfo::Unknown(Type::Void) = incoming {
+        panic!(
+            "info_type_matches: incoming Unknown(Void) — VirtualState leaves \
+             are int/ref/float (virtualstate.py:655)"
+        );
+    }
     match (expected, incoming) {
         // LEVEL_UNKNOWN on both: compare the explicit type tags.
         (Type::Int, VirtualStateInfo::Unknown(Type::Int))
         | (Type::Float, VirtualStateInfo::Unknown(Type::Float))
-        | (Type::Ref, VirtualStateInfo::Unknown(Type::Ref))
-        | (Type::Void, VirtualStateInfo::Unknown(Type::Void)) => true,
+        | (Type::Ref, VirtualStateInfo::Unknown(Type::Ref)) => true,
         (_, VirtualStateInfo::Unknown(_)) => false,
         // Int expected: incoming must be Int-typed constant or IntBounded.
         (Type::Int, VirtualStateInfo::IntBounded(_)) => true,
@@ -1946,11 +1960,14 @@ impl GuardRequirement {
                 // virtualstate.py:401: ResOperation(GUARD_VALUE,
                 // [box, self.constbox]). Preserve the Const object's type:
                 // ConstPtr must not be represented as ConstInt.
+                // history.py has no `ConstVoid` class — `LEVEL_CONSTANT`
+                // cannot be Void (mirrors the unreachable! in
+                // `_generate_guards` LEVEL_CONSTANT arm above).
                 let val_const = match expected_value {
                     Value::Int(v) => ctx.make_constant_int(*v),
                     Value::Float(f) => ctx.make_constant_float(*f),
                     Value::Ref(r) => ctx.make_constant_ref(*r),
-                    Value::Void => ctx.make_constant_int(0),
+                    Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
                 op.fail_args = Some(Default::default());

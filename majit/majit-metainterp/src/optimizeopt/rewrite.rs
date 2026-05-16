@@ -4375,6 +4375,8 @@ mod tests {
     #[test]
     fn test_ptr_eq_same_opref() {
         // PtrEq(x, x) -> 1
+        // resoperation.py:739 InputArgRef / 615 RefOp `type = 'r'`: ptr
+        // boxes carry the Ref variant tag, not Int.
         let mut ops = vec![
             Op::new(OpCode::SameAsR, &[]),                                 // op0: x
             Op::new(OpCode::PtrEq, &[OpRef::ref_op(0), OpRef::ref_op(0)]), // op1
@@ -4452,6 +4454,9 @@ mod tests {
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        // history.py:307 ConstPtr — Value::Ref must land on a Ref-tagged
+        // OpRef so the box class identity matches the resoperation.py:615
+        // RefOp mixin of the producer SameAsR.
         ctx.make_constant(OpRef::ref_op(0), Value::Ref(GcRef(100)));
         ctx.make_constant(OpRef::ref_op(1), Value::Ref(GcRef(200)));
 
@@ -4466,6 +4471,7 @@ mod tests {
     #[test]
     fn test_cast_ptr_to_int_passes_through() {
         // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
+        // arg0 is a Ref box (resoperation.py:615 RefOp `type = 'r'`).
         let mut ops = vec![
             Op::new(OpCode::SameAsR, &[]),                      // op0: x
             Op::new(OpCode::CastPtrToInt, &[OpRef::ref_op(0)]), // op1
@@ -4633,7 +4639,8 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 0i64);
+        constants.insert(200u32, majit_ir::Value::Int(0));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -4656,7 +4663,8 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, -1i64);
+        constants.insert(200u32, majit_ir::Value::Int(-1));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
@@ -4680,8 +4688,9 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        // Float constant as bits
-        constants.insert(200, (-1.0f64).to_bits() as i64);
+        // Float constant as Value::Float
+        constants.insert(200u32, majit_ir::Value::Float(-1.0));
+        opt.constant_types.insert(200, majit_ir::Type::Float);
         // Need float constant support in ctx — skip for now, just test no crash
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(!result.is_empty());
@@ -4701,7 +4710,8 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 0i64);
+        constants.insert(200u32, majit_ir::Value::Int(0));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
@@ -4723,7 +4733,8 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 1i64);
+        constants.insert(200u32, majit_ir::Value::Int(1));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),

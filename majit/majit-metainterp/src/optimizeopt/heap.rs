@@ -4047,7 +4047,12 @@ mod tests {
     /// on a missing donor.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            // Slice P6a: type-tag op.pos via the result-type-aware factory
+            // so the OpRef variant carries `Box.type` (history.py:220 +
+            // resoperation.py:1693) at priority 0 in `opref_type`. The
+            // intrinsic `op.type_` field set at `Op::new` is the
+            // authoritative source, surfaced via `Op::result_type`.
+            op.pos = OpRef::op_typed(i as u32, op.result_type());
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -4398,7 +4403,7 @@ mod tests {
         let idx = OpRef::int_op(50);
         let mut op = Op::with_descr(
             OpCode::GetarrayitemGcI,
-            &[OpRef::int_op(100), idx],
+            &[OpRef::ref_op(100), idx],
             d.clone(),
         );
         op.pos = OpRef::int_op(200);
@@ -4406,7 +4411,7 @@ mod tests {
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
         let pos100 = ctx
-            .ensure_box(OpRef::int_op(100))
+            .ensure_box(OpRef::ref_op(100))
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
 
@@ -4594,7 +4599,9 @@ mod tests {
         let d = descr(0);
         let mut ops = vec![
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(100)], d.clone()),
-            // pos=0 will be the GETFIELD result; setfield writes it back
+            // assign_positions stamps GETFIELD's pos as IntOp(0); the
+            // setfield's value arg must match that variant for the
+            // store-load elision to recognize identity.
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::input_arg_ref(100), OpRef::int_op(0)],
@@ -4934,34 +4941,41 @@ mod tests {
         let descr =
             majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, majit_ir::ArrayFlag::Pointer);
         let mut pass = OptHeap::new();
-        pass.cache_field(OpRef::int_op(100), &descr);
+        // history.py:182 PtrInfo applies to ref-typed boxes; the field
+        // descr is Type::Ref so the field source is ref-typed too.
+        pass.cache_field(OpRef::ref_op(100), &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::int_op(100),
-            OpRef::int_op(101),
+            OpRef::ref_op(100),
+            OpRef::ref_op(101),
         ]);
         // Register input args so produce_arg can resolve them.
-        sb.add_short_input_arg(OpRef::int_op(100), majit_ir::Type::Int);
-        sb.add_short_input_arg(OpRef::int_op(101), majit_ir::Type::Int);
+        sb.add_short_input_arg(OpRef::ref_op(100), majit_ir::Type::Ref);
+        sb.add_short_input_arg(OpRef::ref_op(101), majit_ir::Type::Ref);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
         let pos100 = ctx
-            .ensure_box(OpRef::int_op(100))
+            .ensure_box(OpRef::ref_op(100))
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&pos100, |info| {
-            info.setfield(descr.index(), OpRef::int_op(101));
+            info.setfield(descr.index(), OpRef::ref_op(101));
         })
         .unwrap();
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
-        let produced = sb.produced_ops();
+        let produced = sb.produced_ops(&mut ctx);
 
-        // Filter to heap-produced ops (exclude SameAsI from add_short_input_arg).
+        // Filter to heap-produced ops (exclude SameAs* from add_short_input_arg).
         let heap_ops: Vec<_> = produced
             .iter()
-            .filter(|(_, p)| p.preamble_op.opcode != OpCode::SameAsI)
+            .filter(|(_, p)| {
+                !matches!(
+                    p.preamble_op.opcode,
+                    OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+                )
+            })
             .collect();
         assert_eq!(heap_ops.len(), 1);
         assert_eq!(heap_ops[0].1.preamble_op.opcode, OpCode::GetfieldGcR);

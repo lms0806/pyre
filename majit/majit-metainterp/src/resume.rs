@@ -95,6 +95,15 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// (resoperation.py:38 `same_box`) and iteration follows first insertion
 /// order. A raw-position Vec would collapse `InputArgInt(0)` and
 /// `IntOp(0)`, which are distinct RPython Box objects.
+///
+/// Invariant: keys are never `Const*` OpRefs. Per `resume.py:204-205`
+/// `_number_boxes`, `isinstance(box, Const)` short-circuits to
+/// `self.getconst(box)` and the result is never written into
+/// `numb_state.liveboxes`. Only the `else` branch (line 207-223,
+/// non-Const Box) reaches `liveboxes[box] = tagged`. `insert` enforces
+/// this via `debug_assert!` so a const-keyed insertion fails loudly in
+/// debug builds rather than silently producing an out-of-RPython-shape
+/// numbering state.
 pub struct LiveboxMap {
     entries: IndexMap<majit_ir::OpRef, i16>,
 }
@@ -113,6 +122,13 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn insert(&mut self, opref: majit_ir::OpRef, value: i16) {
+        debug_assert!(
+            !opref.is_constant(),
+            "LiveboxMap::insert: Const* OpRef {:?} violates resume.py:204-223 \
+             `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
+             via `getconst(box)` and never enters numb_state.liveboxes",
+            opref
+        );
         self.entries.insert(opref, value);
     }
 
@@ -3343,8 +3359,7 @@ impl ResumeDataLoopMemo {
         // Iterate in insertion order (RPython dict iteration = insertion order).
         // resoperation.py:38 same_box parity: keys carry the typed OpRef
         // each entry was inserted with so virtual numbering preserves
-        // `box.type` (history.py:220) without round-tripping through
-        // `OpRef::from_raw` and collapsing variants to `Untyped`.
+        // `box.type` (history.py:220).
         let keys: Vec<(OpRef, i16)> = new_liveboxes.iter().collect();
         for (opref_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
@@ -3662,14 +3677,12 @@ impl ResumeDataLoopMemo {
                 //
                 // Typed OpRef variants (resoperation.py:719-739
                 // InputArg{Int,Ref,Float}, resoperation.py:564-638 *Op
-                // mixins) already carry the type intrinsically. The
-                // `livebox_types` HashMap is the legacy side-table that
-                // must agree with `opref.ty()` whenever the latter is
-                // populated — a divergence here would mean an Untyped
-                // OpRef leaked into the live set with a stale type
-                // annotation, which is the kind of encoder/decoder
-                // mismatch we want to fail-loud on (epic #171 will
-                // retire the side-table once Untyped is gone).
+                // mixins) carry the type intrinsically (variant tag IS
+                // RPython Box class identity). The `livebox_types`
+                // HashMap is a legacy side-table that must agree with
+                // `opref.ty()`; a divergence would indicate an
+                // encoder/decoder mismatch we want to fail-loud on
+                // (epic #171 will retire the side-table).
                 if let Some(intrinsic_tp) = opref.ty() {
                     debug_assert_eq!(
                         intrinsic_tp, box_type,
@@ -3830,9 +3843,8 @@ impl ResumeDataLoopMemo {
         // invariant; only the TAGVIRTUAL worklist push order matters.
         //
         // resoperation.py:38 same_box parity: iter() yields the typed
-        // OpRef each entry was inserted with, so consumers no longer
-        // need to round-trip through `OpRef::from_raw` to recover
-        // `box.type` (history.py:220).
+        // OpRef each entry was inserted with, so consumers can read
+        // `box.type` (history.py:220) directly via `opref.ty()`.
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by

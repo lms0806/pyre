@@ -426,7 +426,12 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         tp: Type::Int,
     }];
 
-    let class_constant = OpRef::const_int(10_000);
+    // history.py:307 `ConstPtr.type = 'r'` — vtable pointers are
+    // ref-typed Const boxes. Use the typed `OpRef::const_ptr` factory
+    // (raw = idx | CONST_BIT) so the variant tag matches the Box class
+    // identity, mirroring the `OpRef::const_int` pattern used in
+    // `test_guard_gc_type_lowers_to_typeid_check` above.
+    let class_constant = OpRef::const_ptr(0);
     let mut constants = HashMap::new();
     constants.insert(class_constant.raw(), 0xCAFEi64);
 

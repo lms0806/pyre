@@ -91,13 +91,12 @@ pub struct SnapshotFrame {
 pub enum SnapshotTagged {
     /// Value from deadframe fail_args slot.
     /// RPython: InputArgRef/InputArgInt carry type ('r'/'i'/'f') in
-    /// the Box class itself. Pyre stores the typed `OpRef` first so
-    /// the variant tag (InputArg{Int,Float,Ref} / IntOp/FloatOp/RefOp)
+    /// the Box class itself. Pyre stores the typed `OpRef` so the
+    /// variant tag (InputArg{Int,Float,Ref} / IntOp/FloatOp/RefOp)
     /// reaches `_number_boxes` (resume.py:210-216 `box.type == 'r' vs
-    /// 'i'`). The trailing `Type` is the lockstep authority for the
-    /// transitional `OpRef::Untyped` case (test fixtures, residual
-    /// from_raw consumers): production must keep both in sync, and
-    /// consumers prefer `opref.ty()` when it is `Some`.
+    /// 'i'`). The trailing `Type` is a redundant lockstep slot kept
+    /// for callers that need the type without re-deriving it via
+    /// `opref.ty()`.
     Box(majit_ir::OpRef, majit_ir::Type),
     /// Compile-time constant value with type.
     /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
@@ -607,11 +606,8 @@ mod tests {
     #[test]
     fn h3_0a_get_trace_preserves_box_pool_identity() {
         let mut rec = Trace::new();
-        let _i0 = rec.record_input_arg(Type::Int);
-        let _add = rec.record_op(
-            OpCode::IntAdd,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
-        );
+        let i0 = rec.record_input_arg(Type::Int);
+        let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         // Snapshot box pointers before consuming the recorder.
         let pre_box_at_1 = rec.box_for_position(1).unwrap().as_ptr();
         let trace = rec.get_trace();
@@ -1188,7 +1184,7 @@ mod tests {
         assert!(trace.is_loop());
 
         // Verify chain: each op references the previous op's result.
-        // i0 = OpRef::from_raw(0), first IntAdd = OpRef::from_raw(1), second = OpRef::from_raw(2), ...
+        // i0 = input_arg_int(0), first IntAdd = int_op(1), second = int_op(2), ...
         for (i, op) in trace.ops[..200].iter().enumerate() {
             assert_eq!(op.opcode, OpCode::IntAdd);
             if i > 0 {

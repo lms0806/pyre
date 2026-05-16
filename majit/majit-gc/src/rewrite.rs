@@ -481,8 +481,7 @@ impl RewriteState {
     /// `ConstInt(value)` at each call site without caching. Mirrors that
     /// — every call grows the constant pool by one entry in the shared
     /// high-bit constant namespace (same as the tracer's ConstantPool).
-    /// Mints `OpRef::ConstInt` (history.py:220 `ConstInt.type = 'i'`)
-    /// rather than the type-erased `from_const` Untyped variant.
+    /// Mints `OpRef::ConstInt` (history.py:220 `ConstInt.type = 'i'`).
     fn const_int(&mut self, value: i64) -> OpRef {
         let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;

@@ -171,9 +171,11 @@ impl TreeLoop {
     /// opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator over
     /// the recorded ops with fresh per-iteration boxes.
     ///
-    /// `start_index = 0` reproduces the legacy positional layout: inputargs
-    /// allocated at `[OpRef::from_raw(0), …, OpRef::from_raw(num_inputargs - 1))`, op results
-    /// at `[OpRef::from_raw(num_inputargs), …)`. Phase 2 / bridge callers that need
+    /// `start_index = 0` reproduces the canonical positional layout:
+    /// inputargs allocated at `OpRef::input_arg_typed(0..num_inputargs,
+    /// tp)` (typed by `inputarg_from_tp(arg.type)` per
+    /// opencoder.py:259-262), op results at op-namespace OpRefs
+    /// starting at `num_inputargs`. Phase 2 / bridge callers that need
     /// disjoint OpRef namespaces must construct `TraceIterator::new`
     /// directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
@@ -1857,7 +1859,7 @@ impl TraceCtx {
 
     /// Look up a constant value by its OpRef (>= 10_000).
     pub fn constant_value(&self, opref: OpRef) -> Option<i64> {
-        self.constants.as_ref().get(&opref.raw()).copied()
+        self.constants.raw_bits(opref)
     }
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards

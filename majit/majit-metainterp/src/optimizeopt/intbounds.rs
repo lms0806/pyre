@@ -3181,7 +3181,7 @@ mod tests {
 
     fn make_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::op_typed(pos, opcode.result_type());
+        op.pos = OpRef::op_typed(pos, op.result_type());
         op
     }
 
@@ -4214,7 +4214,8 @@ mod tests {
         // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 1i64);
+        constants.insert(200u32, majit_ir::Value::Int(1));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

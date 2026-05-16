@@ -13,9 +13,11 @@ use crate::value::{Const, GcRef, Type};
 /// result. Variant-tagged enum mirroring RPython's `AbstractValue` class
 /// hierarchy (resoperation.py:29 + history.py:182).
 ///
-/// Each typed variant carries the same raw u32 encoding used by the
-/// pre-Phase-3 tuple struct (`CONST_BIT` set for `Const*`, plain `pos`
-/// for `InputArg*` / `*Op`).
+/// Each typed variant carries the same raw u32 encoding shape (`CONST_BIT`
+/// set for `Const*`, plain `pos` for `InputArg*` / `*Op`). The variant
+/// tag IS the `box.type` (history.py:220 / resoperation.py:1693
+/// `opclasses[opnum].type`); flat-OpRef encoding picks up Box-class
+/// identity from the enum discriminant.
 ///
 /// `PartialEq` / `Eq` / `Hash` include the enum variant, not just `.raw()`.
 /// This keeps the disjoint RPython Box classes disjoint even when Pyre's
@@ -51,6 +53,17 @@ pub enum OpRef {
     /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …) carry no result
     /// type but still occupy an op position.
     VoidOp(u32),
+    /// Backend regalloc scratch box — RPython `TempVar()` /
+    /// `TempInt()` parity (`rpython/jit/backend/llsupport/regalloc.py`,
+    /// `x86/regalloc.py:470,514,521,605`,
+    /// `aarch64/regalloc.py:990`). Each call to
+    /// `RegAlloc::fresh_temp_var()` allocates a fresh `TempVar`
+    /// carrying a unique counter; the raw payload lives in the
+    /// reserved range `[SENTINEL_BASE, u32::MAX - 1]` so it does not
+    /// collide with constant-namespace or op-position OpRefs. Lifetime
+    /// is single-instruction: `force_allocate_reg` then
+    /// `possibly_free_var` within one `consider_*` body.
+    TempVar(u32),
 }
 
 impl OpRef {
@@ -59,10 +72,24 @@ impl OpRef {
     /// opencoder.py: TAGINT/TAGCONSTPTR/TAGCONSTOTHER/TAGBOX use 2-bit tags;
     /// here a single high bit suffices (op vs const).
     const CONST_BIT: u32 = 1 << 31;
-    /// Top of the u32 range reserved for sentinel OpRefs used by the
-    /// regalloc backend (temp register placeholders); kept disjoint from
-    /// the constant namespace so `is_constant()` returns false for them.
-    const SENTINEL_BASE: u32 = u32::MAX - 16;
+    /// Top of the u32 range reserved for `TempVar` (regalloc scratch)
+    /// OpRefs. RPython `TempVar()` (`backend/llsupport/regalloc.py:18-23`,
+    /// `__init__` body is `pass`, `__repr__` keys off `id(self)`) only
+    /// carries Python object identity, so collision is structurally
+    /// impossible upstream. pyre's flat-OpRef encoding cannot mint fresh
+    /// objects, so it reserves the high u32 strip `[SENTINEL_BASE,
+    /// u32::MAX - 1]` and assigns a unique counter per `fresh_temp_var()`
+    /// call (raw = `SENTINEL_BASE | counter`, counter in `[0, 0xFFFE]`).
+    /// The top sentinel `u32::MAX` is reserved for `OpRef::None`.
+    ///
+    /// Note: `SENTINEL_BASE & CONST_BIT != 0` — the raw payload of
+    /// every `TempVar` carries `CONST_BIT`. Disambiguation is done two
+    /// ways: variant-match `is_constant()` returns `false` on
+    /// `TempVar(_)`, and the raw-bit-helper `raw_is_constant()` further
+    /// rejects the sentinel strip via `raw < SENTINEL_BASE`. So the
+    /// two namespaces are NOT raw-bit disjoint, they are
+    /// variant-disjoint and range-disjoint.
+    const SENTINEL_BASE: u32 = 0xFFFF_0000;
 
     pub fn is_none(self) -> bool {
         matches!(self, Self::None)
@@ -83,15 +110,26 @@ impl OpRef {
             | Self::IntOp(x)
             | Self::FloatOp(x)
             | Self::RefOp(x)
-            | Self::VoidOp(x) => x,
+            | Self::VoidOp(x)
+            | Self::TempVar(x) => x,
         }
     }
 
     /// Mirrors RPython `AbstractValue.type` — the type embedded in the
-    /// variant tag.
+    /// variant tag for `Const{Int,Float,Ptr}`, `InputArg{Int,Float,Ref}`,
+    /// and the `{Int,Float,Ref,Void}Op` mixins (history.py:220 / 261 /
+    /// 307, resoperation.py:567 / 589 / 615 / 260). `None` returns
+    /// `None`.
+    ///
+    /// `TempVar` also returns `None`: RPython's `TempVar`
+    /// (`backend/llsupport/regalloc.py:18`) extends `AbstractResOpOrInputArg`
+    /// without a `.type` attribute, and `_check_type` at
+    /// `regalloc.py:405-407` exempts it via `isinstance(v, TempVar)`. A
+    /// `TempVar` reaching `.ty()` should fall through to the regalloc-side
+    /// `is_temp_var()` exemption rather than masquerade as an integer box.
     pub fn ty(self) -> Option<Type> {
         match self {
-            Self::None => None,
+            Self::None | Self::TempVar(_) => None,
             Self::ConstInt(_) | Self::InputArgInt(_) | Self::IntOp(_) => Some(Type::Int),
             Self::ConstFloat(_) | Self::InputArgFloat(_) | Self::FloatOp(_) => Some(Type::Float),
             Self::ConstPtr(_) | Self::InputArgRef(_) | Self::RefOp(_) => Some(Type::Ref),
@@ -119,7 +157,13 @@ impl OpRef {
     pub fn is_constant(self) -> bool {
         match self {
             Self::ConstInt(_) | Self::ConstFloat(_) | Self::ConstPtr(_) => true,
-            Self::None => false,
+            // `TempVar` lives in the reserved `[SENTINEL_BASE, u32::MAX - 1]`
+            // sentinel range. The raw payload DOES carry `CONST_BIT`
+            // (`SENTINEL_BASE = 0xFFFF_0000 = CONST_BIT | 0x7FFF_0000`), but
+            // variant-match returns `false` here, and the raw-bit helper
+            // `raw_is_constant()` further rejects the sentinel range via
+            // `raw < SENTINEL_BASE`.
+            Self::None | Self::TempVar(_) => false,
             Self::IntOp(x)
             | Self::RefOp(x)
             | Self::FloatOp(x)
@@ -160,8 +204,9 @@ impl OpRef {
     // ── Typed constructors mirroring RPython AbstractValue variants ──
     //
     // Each factory produces the matching enum variant carrying the
-    // pre-Phase-3 raw u32 encoding. These are the canonical OpRef
-    // construction entry points.
+    // raw u32 encoding. These are the canonical OpRef
+    // construction entry points; the variant tag IS the RPython Box
+    // class identity (history.py:182 / resoperation.py:29).
 
     /// history.py:220 `ConstInt` — `type = 'i'`. Index points into the
     /// integer constant pool.
@@ -252,6 +297,39 @@ impl OpRef {
         }
     }
 
+    /// RPython `TempVar()` / `TempInt()` parity
+    /// (`rpython/jit/backend/llsupport/regalloc.py:18-23`,
+    /// `x86/regalloc.py:470,514,521,605`,
+    /// `aarch64/regalloc.py:990`). Upstream `TempVar.__init__` is
+    /// `pass`, so each instance is a fresh Python object with unique
+    /// `id(self)` identity and collision is structurally impossible.
+    /// pyre's flat-OpRef encoding emulates that by minting a unique
+    /// `OpRef::TempVar(SENTINEL_BASE | counter)` per call.
+    ///
+    /// `counter` must fit in 16 bits (`[0, 0xFFFE]`), giving 65535
+    /// slots in the `[SENTINEL_BASE, u32::MAX - 1]` strip (with
+    /// `u32::MAX` reserved for `OpRef::None`). The per-trace counter
+    /// lives on `RegAlloc::temp_var_counter` and is incremented per
+    /// call. Realistic `consider_*` bodies allocate one or two
+    /// `TempVar()` each, well under the 65535 cap — but exhaustion
+    /// would silently collide upstream-impossible state, so we panic
+    /// loud to catch the bookkeeping bug.
+    pub fn fresh_temp_var(counter: u32) -> OpRef {
+        assert!(
+            counter < 0xFFFF,
+            "OpRef::fresh_temp_var counter exhausted (>= 0xFFFF); \
+             reserved range is [0, 0xFFFE], raw = SENTINEL_BASE | counter. \
+             RPython TempVar uses object identity so collision is impossible \
+             upstream — pyre's flat-encoding cap would alias TempVars at this point."
+        );
+        OpRef::TempVar(Self::SENTINEL_BASE | counter)
+    }
+
+    /// True if this OpRef is a `TempVar` regalloc scratch box.
+    pub fn is_temp_var(self) -> bool {
+        matches!(self, Self::TempVar(_))
+    }
+
     /// Re-encode this OpRef's variant with a fresh raw payload while
     /// preserving the type tag. Used by post-optimization remaps that
     /// renumber positions but keep RPython's `box.type` attached
@@ -272,9 +350,17 @@ impl OpRef {
             Self::FloatOp(_) => Self::FloatOp(new_raw),
             Self::RefOp(_) => Self::RefOp(new_raw),
             Self::VoidOp(_) => Self::VoidOp(new_raw),
+            Self::TempVar(_) => Self::TempVar(new_raw),
         }
     }
 }
+
+// `#[derive(PartialEq, Eq, Hash)]` on `OpRef` enforces RPython's
+// disjoint `Const` / `InputArg` / `ResOp` sub-hierarchies
+// (resoperation.py:29, history.py:182): two variants compare unequal
+// even when raw payloads coincide (`ConstInt(x) != ConstFloat(x) !=
+// IntOp(x)`). Mirrors `AbstractValue.same_box` (resoperation.py:38
+// `self is other`) and `ConstInt.same_constant` (history.py:244).
 
 /// AbstractValue parity: rpython/jit/metainterp/resoperation.py:29
 /// + history.py:182.
@@ -1176,7 +1262,14 @@ impl std::fmt::Display for Op {
 }
 
 /// Format a trace (list of ops) with optional constants for debugging.
-pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>) -> String {
+///
+/// Generic over the constants value type so both the optimizer-side
+/// typed `Value` pool and the backend-side legacy `i64` pool format
+/// uniformly through their `Debug` impls.
+pub fn format_trace<V: std::fmt::Debug>(
+    ops: &[Op],
+    constants: &std::collections::HashMap<u32, V>,
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for op in ops {
@@ -1193,8 +1286,8 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
             if i > 0 {
                 write!(out, ", ").unwrap();
             }
-            if let Some(&val) = constants.get(&arg.raw()) {
-                write!(out, "{val}").unwrap();
+            if let Some(val) = constants.get(&arg.raw()) {
+                write!(out, "{val:?}").unwrap();
             } else {
                 write!(out, "v{}", arg.raw()).unwrap();
             }
@@ -1213,8 +1306,8 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                if let Some(&val) = constants.get(&arg.raw()) {
-                    write!(out, "{val}").unwrap();
+                if let Some(val) = constants.get(&arg.raw()) {
+                    write!(out, "{val:?}").unwrap();
                 } else {
                     write!(out, "v{}", arg.raw()).unwrap();
                 }
@@ -3028,11 +3121,17 @@ mod tests {
 
     #[test]
     fn opref_typed_variants_disjoint_from_none() {
+        // Variant-aware Eq: `OpRef::None` and any typed variant are
+        // disjoint identities. RPython parity (resoperation.py:38
+        // same_box: self is other) — Python `None` vs a Box object are
+        // never identical.
         let none = OpRef::NONE;
-        let typed = OpRef::int_op(0);
-        assert_ne!(none, typed);
-        assert_ne!(typed, none);
+        assert!(none.is_none());
+        assert_ne!(none, OpRef::int_op(0));
+        assert_ne!(OpRef::int_op(0), none);
         assert_ne!(OpRef::int_op(0), OpRef::ref_op(0));
+        assert_ne!(OpRef::int_op(0), OpRef::float_op(0));
+        assert_ne!(OpRef::ref_op(0), OpRef::float_op(0));
     }
 
     // ── Metadata table coverage ──
@@ -4250,7 +4349,7 @@ mod tests {
     #[test]
     fn test_format_trace_empty() {
         let ops: Vec<Op> = vec![];
-        let constants = std::collections::HashMap::new();
+        let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
         assert!(output.is_empty());
     }
@@ -4395,7 +4494,7 @@ mod tests {
             fail_arg_types: None,
             rd_resume_position: -1,
         }];
-        let constants = std::collections::HashMap::new();
+        let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
         assert!(
             output.contains("descr=<"),
@@ -4521,7 +4620,7 @@ mod tests {
                 rd_resume_position: -1,
             },
         ];
-        let constants = std::collections::HashMap::new();
+        let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
         assert!(output.contains("GuardTrue(v0) [v0]"));
         assert!(output.contains("GuardFalse(v1) [v0, v1, v2]"));
@@ -4591,6 +4690,18 @@ mod tests {
     }
 
     #[test]
+    fn test_opref_ty_temp_var() {
+        // `regalloc.py:18 TempVar(AbstractResOpOrInputArg)` has no
+        // `.type` attribute; `_check_type` at `regalloc.py:405-407` skips
+        // it via `isinstance(v, TempVar)`. `OpRef::ty()` must mirror by
+        // returning `None` — projecting `Type::Int` would make a temp box
+        // indistinguishable from an `IntOp` to anyone holding only the
+        // OpRef.
+        assert_eq!(OpRef::fresh_temp_var(0).ty(), None);
+        assert_eq!(OpRef::fresh_temp_var(1).ty(), None);
+    }
+
+    #[test]
     fn test_abstract_value_is_constant() {
         assert!(AbstractValue::ConstInt(7).is_constant());
         assert!(AbstractValue::ConstFloat(7).is_constant());
@@ -4651,6 +4762,7 @@ mod tests {
             assert_ne!(OpRef::const_int(idx), OpRef::const_float(idx));
             assert_ne!(OpRef::const_int(idx), OpRef::const_ptr(idx));
             assert_ne!(OpRef::const_float(idx), OpRef::const_ptr(idx));
+            assert_eq!(OpRef::const_int(idx), OpRef::const_int(idx));
         }
     }
 
@@ -4663,6 +4775,7 @@ mod tests {
             assert_ne!(OpRef::input_arg_int(pos), OpRef::input_arg_float(pos));
             assert_ne!(OpRef::input_arg_int(pos), OpRef::input_arg_ref(pos));
             assert_ne!(OpRef::input_arg_float(pos), OpRef::input_arg_ref(pos));
+            assert_eq!(OpRef::input_arg_int(pos), OpRef::input_arg_int(pos));
         }
     }
 
@@ -4674,6 +4787,7 @@ mod tests {
             assert_ne!(OpRef::int_op(pos), OpRef::float_op(pos));
             assert_ne!(OpRef::int_op(pos), OpRef::ref_op(pos));
             assert_ne!(OpRef::float_op(pos), OpRef::ref_op(pos));
+            assert_eq!(OpRef::int_op(pos), OpRef::int_op(pos));
         }
     }
 

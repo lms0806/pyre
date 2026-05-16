@@ -119,7 +119,7 @@ mod tests {
     fn test_earlyforce_resolves_call_may_force_args() {
         let mut ops = vec![Op::new(
             OpCode::CallMayForceN,
-            &[OpRef::int_op(100), OpRef::int_op(101)],
+            &[OpRef::input_arg_ref(100), OpRef::input_arg_ref(101)],
         )];
         assign_positions(&mut ops);
 
@@ -139,7 +139,7 @@ mod tests {
     fn test_earlyforce_passthrough_non_call() {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::int_op(100), OpRef::int_op(101)],
+            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
         )];
         assign_positions(&mut ops);
 
@@ -157,7 +157,10 @@ mod tests {
 
     #[test]
     fn test_earlyforce_call_assembler_handled() {
-        let mut ops = vec![Op::new(OpCode::CallAssemblerI, &[OpRef::int_op(100)])];
+        let mut ops = vec![Op::new(
+            OpCode::CallAssemblerI,
+            &[OpRef::input_arg_ref(100)],
+        )];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -203,7 +206,7 @@ mod tests {
             OpCode::CallMayForceF,
             OpCode::CallMayForceN,
         ] {
-            let mut ops = vec![Op::new(opcode, &[OpRef::int_op(100)])];
+            let mut ops = vec![Op::new(opcode, &[OpRef::input_arg_ref(100)])];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();
@@ -222,7 +225,7 @@ mod tests {
         // SETFIELD_GC should NOT force args (earlyforce.py:18)
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
-            &[OpRef::int_op(100), OpRef::int_op(101)],
+            &[OpRef::input_arg_ref(100), OpRef::input_arg_int(101)],
         )];
         assign_positions(&mut ops);
 

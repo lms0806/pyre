@@ -363,12 +363,16 @@ impl PreambleOp {
     /// For HeapOp: reconstruct the getfield/getarrayitem with remapped args.
     /// For PureOp: reconstruct the pure op (promoting to CALL_PURE if call).
     /// For LoopInvariantOp: reconstruct as CALL_LOOPINVARIANT.
-    pub fn add_op_to_short(&self, sb: &mut ShortBoxes) -> Option<ProducedShortOp> {
+    pub fn add_op_to_short(
+        &self,
+        sb: &mut ShortBoxes,
+        ctx: &mut crate::optimizeopt::OptContext,
+    ) -> Option<ProducedShortOp> {
         let preamble_op = match &self.kind {
             PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
             PreambleOpKind::Heap => {
                 let mut op = self.op.clone();
-                let preamble_arg = sb.produce_arg(self.op.arg(0))?;
+                let preamble_arg = sb.produce_arg(ctx, self.op.arg(0))?;
                 if self.op.opcode.is_getfield() {
                     op.args = vec![preamble_arg].into();
                 } else {
@@ -384,7 +388,7 @@ impl PreambleOp {
                     .op
                     .args
                     .iter()
-                    .map(|&arg| sb.produce_arg(arg))
+                    .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
                 op.args = args.into_iter().collect();
@@ -404,7 +408,7 @@ impl PreambleOp {
                     .op
                     .args
                     .iter()
-                    .map(|&arg| sb.produce_arg(arg))
+                    .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
                 op.args = args.into_iter().collect();
@@ -453,8 +457,6 @@ pub struct ShortBoxes {
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py: boxes_in_production
     boxes_in_production: HashSet<OpRef>,
-    /// Fresh synthetic names for invented short-box aliases.
-    next_synthetic_pos: u32,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -466,11 +468,15 @@ enum PotentialShortOp {
 }
 
 impl PotentialShortOp {
-    fn add_op_to_short(&self, sb: &mut ShortBoxes) -> Option<ProducedShortOp> {
+    fn add_op_to_short(
+        &self,
+        sb: &mut ShortBoxes,
+        ctx: &mut crate::optimizeopt::OptContext,
+    ) -> Option<ProducedShortOp> {
         match self {
-            PotentialShortOp::Preamble(op) => op.add_op_to_short(sb),
+            PotentialShortOp::Preamble(op) => op.add_op_to_short(sb, ctx),
             PotentialShortOp::Compound(compound) => {
-                let produced = compound.flatten(sb, Vec::new());
+                let produced = compound.flatten(sb, ctx, Vec::new());
                 if produced.is_empty() {
                     None
                 } else {
@@ -488,24 +494,15 @@ impl PotentialShortOp {
                         if i == index {
                             continue;
                         }
-                        // resoperation.py:1316-1323 OpHelpers.same_as_for_type:
-                        //   if tp == 'i': return rop.SAME_AS_I
-                        //   elif tp == 'r': return rop.SAME_AS_R
-                        //   else: assert tp == 'f'; return rop.SAME_AS_F
-                        // Void is rejected by the trailing assert tp == 'f'.
-                        let alias = match compound.res.ty() {
-                            Some(majit_ir::Type::Int) => OpRef::int_op(sb.next_synthetic_pos),
-                            Some(majit_ir::Type::Ref) => OpRef::ref_op(sb.next_synthetic_pos),
-                            Some(majit_ir::Type::Float) => OpRef::float_op(sb.next_synthetic_pos),
-                            Some(majit_ir::Type::Void) | None => panic!(
-                                "compound short-preamble alias source {:?} has \
-                                 type {:?}; same_as_for_type requires Int/Ref/Float \
-                                 (resoperation.py:1316-1323)",
-                                compound.res,
-                                compound.res.ty(),
-                            ),
-                        };
-                        sb.next_synthetic_pos += 1;
+                        let tp = compound.res.ty().unwrap_or_else(|| {
+                            panic!(
+                                "compound short-preamble alias source {:?} has no \
+                                 variant tag; same_as_for_type requires Int/Ref/Float \
+                                 (shortpreamble.py:326-330)",
+                                compound.res
+                            )
+                        });
+                        let alias = ctx.alloc_op_position_typed(tp);
                         alt.preamble_op.pos = alias;
                         alt.invented_name = true;
                         alt.same_as_source = Some(compound.res);
@@ -531,7 +528,6 @@ impl ShortBoxes {
             known_constants: HashSet::new(),
             short_inputargs: Vec::new(),
             boxes_in_production: HashSet::new(),
-            next_synthetic_pos: 0,
             num_label_args,
         }
     }
@@ -541,16 +537,6 @@ impl ShortBoxes {
         for (idx, &arg) in label_args.iter().enumerate() {
             boxes.label_arg_positions.insert(arg, idx);
             boxes.short_inputargs.push(arg);
-            // Skip OpRef::NONE sentinels: they are placeholders for slots with
-            // no value (e.g. virtual fields the runtime PtrInfo did not yet
-            // populate at JUMP time). Including u32::MAX would saturate
-            // next_synthetic_pos and overflow on the first invented_name alloc.
-            // RPython Box identity sidesteps this — make_inputargs there returns
-            // only real Boxes.
-            if !arg.is_none() {
-                boxes.next_synthetic_pos =
-                    boxes.next_synthetic_pos.max(arg.raw().saturating_add(1));
-            }
         }
         boxes
     }
@@ -567,19 +553,11 @@ impl ShortBoxes {
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
+        // shortpreamble.py: known_constants is a set of Const Box objects.
+        // The CompoundOp alias counter is no longer ShortBoxes-internal
+        // (slice β routes minting through `ctx.alloc_op_position_typed`),
+        // so there is no `next_synthetic_pos` to bump past constant raws.
         self.known_constants.insert(opref);
-        // Constants live in the CONST_BIT namespace (raw payloads with the
-        // high bit set). Synthetic positions allocated below live in the
-        // body namespace (raw payloads without the high bit). Keep the two
-        // disjoint so a later `compound.res.with_raw(next_synthetic_pos)`
-        // cannot mint a typed `IntOp/RefOp/FloatOp(0x8...)` whose payload
-        // accidentally encodes a constant — the typed `is_constant()` arms
-        // do not match such payloads, so `replace_op` would treat the
-        // synthetic alias as a body OpRef and resize `forwarded` to its
-        // ~2 GB raw value.
-        if !opref.is_constant() {
-            self.next_synthetic_pos = self.next_synthetic_pos.max(opref.raw().saturating_add(1));
-        }
     }
 
     pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
@@ -604,7 +582,6 @@ impl ShortBoxes {
         if !self.potential_ops.contains_key(&result) {
             self.potential_order.push(result);
         }
-        self.next_synthetic_pos = self.next_synthetic_pos.max(result.raw().saturating_add(1));
         self.potential_ops.insert(result, pop);
     }
 
@@ -651,11 +628,15 @@ impl ShortBoxes {
     pub(crate) fn add_short_input_arg(&mut self, arg: OpRef, arg_type: majit_ir::Type) {
         // shortpreamble.py:255-259 parity: ShortInputArg's BoxType is the
         // intrinsic `box.type` (BoxInt → same_as_i, BoxRef → same_as_r,
-        // BoxFloat → same_as_f). The caller is responsible for filtering
-        // out positions whose `value_types` is `Void` (e.g. constant
-        // collisions); a `Void` reaching here panics in
-        // `OpCode::same_as_for_type`'s `unreachable!` arm with a clear
-        // RPython-parity violation message.
+        // BoxFloat → same_as_f). A `Void` reaching here is a parity
+        // violation: RPython has no Void value Box / InputArgVoid class.
+        if arg_type == majit_ir::Type::Void {
+            panic!(
+                "short preamble inputarg {arg:?} resolved to Type::Void; \
+                 ShortInputArg requires an int/ref/float value box \
+                 (shortpreamble.py:255-259)"
+            );
+        }
         let label_arg_idx = self.lookup_label_arg(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg]);
         same_as.pos = arg;
@@ -674,7 +655,11 @@ impl ShortBoxes {
         );
     }
 
-    fn produce_arg(&mut self, opref: OpRef) -> Option<OpRef> {
+    fn produce_arg(
+        &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
+        opref: OpRef,
+    ) -> Option<OpRef> {
         if let Some(existing) = self.produced_short_boxes.get(&opref) {
             return Some(existing.preamble_op.pos);
         }
@@ -686,7 +671,7 @@ impl ShortBoxes {
         }
         if self.potential_ops.contains_key(&opref) {
             return self
-                .materialize_one(opref)
+                .materialize_one(ctx, opref)
                 .map(|produced| produced.preamble_op.pos);
         }
         // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp))
@@ -720,7 +705,11 @@ impl ShortBoxes {
         index.unwrap_or(0)
     }
 
-    fn materialize_one(&mut self, result: OpRef) -> Option<ProducedShortOp> {
+    fn materialize_one(
+        &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
+        result: OpRef,
+    ) -> Option<ProducedShortOp> {
         if let Some(existing) = self.produced_short_boxes.get(&result) {
             return Some(existing.clone());
         }
@@ -729,7 +718,7 @@ impl ShortBoxes {
         }
         let candidate = self.potential_ops.get(&result)?.clone();
         self.boxes_in_production.insert(result);
-        let produced = candidate.add_op_to_short(self)?;
+        let produced = candidate.add_op_to_short(self, ctx)?;
         self.produced_short_boxes.insert(result, produced.clone());
         self.produced_order.push(result);
         self.boxes_in_production.remove(&result);
@@ -737,10 +726,13 @@ impl ShortBoxes {
     }
 
     /// shortpreamble.py: produced_short_boxes after add_op_to_short().
-    pub fn produced_ops(&mut self) -> Vec<(OpRef, ProducedShortOp)> {
+    pub fn produced_ops(
+        &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
+    ) -> Vec<(OpRef, ProducedShortOp)> {
         let keys = self.potential_order.clone();
         for key in keys {
-            let _ = self.materialize_one(key);
+            let _ = self.materialize_one(ctx, key);
         }
         self.produced_order
             .iter()
@@ -768,6 +760,7 @@ impl ShortBoxes {
     /// `self.potential_ops[box] = ShortInputArg(box, renamed)`).
     pub fn create_short_boxes(
         &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
         label_args: &[OpRef],
         label_arg_types: &[majit_ir::Type],
     ) -> Vec<ProducedShortOp> {
@@ -793,8 +786,11 @@ impl ShortBoxes {
         // create_short_boxes (majit threads passes externally).
 
         // shortpreamble.py:263-267: short_boxes = []; for shortop in potential_ops.values(): add_op_to_short
-        let mut short_boxes: Vec<ProducedShortOp> =
-            self.produced_ops().into_iter().map(|(_, op)| op).collect();
+        let mut short_boxes: Vec<ProducedShortOp> = self
+            .produced_ops(ctx)
+            .into_iter()
+            .map(|(_, op)| op)
+            .collect();
 
         // shortpreamble.py:272-280: walk const_short_boxes and try to
         // produce a struct preamble arg, then emit the getfield op.
@@ -805,7 +801,7 @@ impl ShortBoxes {
                 continue;
             }
             let struct_arg = getfield_op.arg(0);
-            let Some(preamble_arg) = self.produce_arg(struct_arg) else {
+            let Some(preamble_arg) = self.produce_arg(ctx, struct_arg) else {
                 continue;
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
@@ -874,11 +870,12 @@ impl ShortBoxes {
 /// `ShortBoxes::create_short_boxes` directly.
 pub fn create_short_boxes(
     short_boxes: &mut ShortBoxes,
+    ctx: &mut crate::optimizeopt::OptContext,
     label_args: &[OpRef],
     label_arg_types: &[majit_ir::Type],
     _optimizer_ops: &[Op],
 ) -> Vec<ProducedShortOp> {
-    short_boxes.create_short_boxes(label_args, label_arg_types)
+    short_boxes.create_short_boxes(ctx, label_args, label_arg_types)
 }
 
 /// Collector-side extended builder for extracting categorized preamble ops from
@@ -1047,22 +1044,23 @@ impl CompoundOp {
     pub fn flatten(
         &self,
         sb: &mut ShortBoxes,
+        ctx: &mut crate::optimizeopt::OptContext,
         mut produced: Vec<ProducedShortOp>,
     ) -> Vec<ProducedShortOp> {
         match self.one.as_ref() {
             PotentialShortOp::Compound(compound) => {
-                produced = compound.flatten(sb, produced);
+                produced = compound.flatten(sb, ctx, produced);
             }
             PotentialShortOp::Preamble(op) => {
-                if let Some(pop) = op.add_op_to_short(sb) {
+                if let Some(pop) = op.add_op_to_short(sb, ctx) {
                     produced.push(pop);
                 }
             }
         }
         match self.two.as_ref() {
-            PotentialShortOp::Compound(compound) => compound.flatten(sb, produced),
+            PotentialShortOp::Compound(compound) => compound.flatten(sb, ctx, produced),
             PotentialShortOp::Preamble(op) => {
-                if let Some(pop) = op.add_op_to_short(sb) {
+                if let Some(pop) = op.add_op_to_short(sb, ctx) {
                     produced.push(pop);
                 }
                 produced
@@ -1326,8 +1324,13 @@ impl ProducedShortOp {
         if self.invented_name {
             ctx.replace_op(source, result_opref);
         }
-        // RPython `Box.type` parity.
-        ctx.register_value_type(result_opref, opcode.result_type());
+        // `result_opref` is a typed synthetic alias minted by
+        // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
+        // — its variant carries `Box.type` from the chosen producer
+        // (history.py:802 `record_same_as` parity). Downstream type
+        // lookups read it directly via `OpRef::ty()` or the producing
+        // SAME_AS body op's `op.type_` once it lands in
+        // `new_operations`.
         let args = self
             .preamble_op
             .args
@@ -2764,12 +2767,10 @@ pub fn build_short_preamble_from_produced_boxes(
     loop_constant_types: &HashMap<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
-    // RPython parity: populate known_constants so produce_arg can resolve
-    // constant OpRefs in short op args. Without this, add_op_to_short
-    // fails for ops like GetfieldGcPure(constant_ptr) because
-    // produce_arg(constant_ptr) returns None.
-    //
-    // `loop_constants` (mod.rs:2940-2962) is two-source:
+    // shortpreamble.py:288 `produce_arg` parity: known_constants holds
+    // the actual `Const`/inline-constant box objects so produce_arg can
+    // return them by identity. `loop_constants` (mod.rs:2940-2962) is
+    // two-source:
     //   - const_pool entries — key is `OpRef::const_*(idx).raw()`, i.e.
     //     `idx | CONST_BIT`. Reconstruct the typed `Const*` OpRef.
     //   - self.constants entries (mod.rs:2956-2962, body-namespace ops
@@ -2779,11 +2780,32 @@ pub fn build_short_preamble_from_produced_boxes(
     //     downstream `produce_arg` lookups (which key on the
     //     operation's typed variant — `IntOp/FloatOp/RefOp`) hit.
     //     Wrapping these as `Const*` (via `const_typed`) would
-    //     OR `CONST_BIT` and break variant-aware identity.
+    //     OR `CONST_BIT` and break variant-aware identity
+    //     (history.py:182 box class identity).
     for &idx in loop_constants.keys() {
-        let tp = loop_constant_types[&idx];
+        // history.py:220 `ConstInt.type` invariant: every Const carries an
+        // intrinsic `.type`. `loop_constants` and `loop_constant_types`
+        // are populated in lockstep by the optimizer
+        // (optimizer.rs::backend_constants seeding); a missing type entry
+        // for an existing key is a structural bookkeeping bug, not a
+        // case to silently default. Sister site
+        // `build_short_preamble_struct_from_ops::const_type_for`
+        // (shortpreamble.rs:1855-1863) panics with the same message —
+        // keep the two readers consistent.
+        let tp = loop_constant_types.get(&idx).copied().unwrap_or_else(|| {
+            panic!(
+                "loop_constant_types missing entry for raw={} though loop_constants has it: \
+                 the two maps must be populated in lockstep (history.py:220 box.type)",
+                idx
+            )
+        });
+        // `const_typed` takes a pool index (history.py:220 `ConstInt(idx)`
+        // construction shape); the CONST_BIT live in `loop_constants` keys
+        // is a raw-namespace artifact and must be stripped before handing
+        // the index to the factory. `raw_const_index` is the canonical
+        // un-OR helper (resoperation.rs:191).
         let opref = if OpRef::raw_is_constant(idx) {
-            OpRef::const_typed(idx, tp)
+            OpRef::const_typed(OpRef::raw_const_index(idx), tp)
         } else {
             OpRef::op_typed(idx, tp)
         };
@@ -2821,7 +2843,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.opcode.result_type());
+            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
         }
     }
 
@@ -3229,7 +3251,8 @@ mod tests {
         );
         heap.pos = OpRef::int_op(21);
         sb.add_heap_op(heap);
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         assert_eq!(produced.len(), 2);
     }
 
@@ -3240,7 +3263,8 @@ mod tests {
         pure.pos = OpRef::int_op(20);
         sb.add_pure_op(pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         // The label arg OpRef::int_op(10) itself is produced (as ShortInputArg),
         // but the pure op depending on unknown OpRef::int_op(999) is rejected.
         assert!(
@@ -3257,7 +3281,8 @@ mod tests {
         pure.pos = OpRef::int_op(20);
         sb.add_pure_op(pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         assert_eq!(produced.len(), 1);
         let pure = produced
             .iter()
@@ -3286,7 +3311,8 @@ mod tests {
         pure.pos = OpRef::int_op(10);
         sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         assert_eq!(produced.len(), 2);
 
         let chosen = produced
@@ -3326,7 +3352,8 @@ mod tests {
         pure.pos = OpRef::int_op(20);
         sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         assert_eq!(produced.len(), 3);
 
         let chosen = produced
@@ -3362,7 +3389,8 @@ mod tests {
         heap.pos = OpRef::int_op(10);
         sb.add_heap_op(heap);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         assert_eq!(produced.len(), 2);
 
         let chosen = produced
@@ -3390,7 +3418,8 @@ mod tests {
         ovf.pos = OpRef::int_op(10);
         sb.add_potential_op(Some(0), ovf, PreambleOpKind::Pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         let mut builder =
             ShortPreambleBuilder::new(&[OpRef::int_op(10)], &produced, &[OpRef::int_op(10)]);
         let used = builder.add_op_to_short(OpRef::int_op(10)).unwrap();
@@ -3424,7 +3453,8 @@ mod tests {
         pure.pos = OpRef::int_op(20);
         sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
 
-        let produced = sb.produced_ops();
+        let mut __ctx = crate::optimizeopt::OptContext::new(0);
+        let produced = sb.produced_ops(&mut __ctx);
         let alias_result = produced
             .iter()
             .find(|(result, pop)| *result != OpRef::int_op(20) && pop.invented_name)

@@ -659,15 +659,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        // RPython resume.py:204: isinstance(box, Const)
+        // RPython resume.py:201-204:
+        //   box = box.get_box_replacement()
+        //   if isinstance(box, Const): ...
+        // Every subsequent box.type / getptrinfo / Const check operates on
+        // the **replaced** box; keep the same shape here so a single
+        // replacement up front feeds all downstream lookups.
+        let resolved = self.ctx.get_box_replacement(opref);
         // True Const = constant-namespace OpRef or PtrInfo::Constant.
         // NOT optimizer-known values from make_constant() on operation results.
-        if opref.is_constant() {
+        if resolved.is_constant() {
             return true;
         }
         // make_constant mirrors optimizer.py:432 as
         // `Forwarded::Box(constbox)`.
-        let idx = opref.raw() as usize;
+        let idx = resolved.raw() as usize;
         if let Some(b) = self.ctx.box_pool.get(idx) {
             if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                 if target.is_constant() {
@@ -729,11 +735,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // directly, but doing replacement first matches upstream order
         // and is robust against forwarding chains.
         let resolved = self.ctx.get_box_replacement(opref);
-        // Phase 1-5 OpRef enum carries box.type in the variant tag for
-        // typed positions; reading the tag on the resolved box is the
-        // line-by-line equivalent of upstream `box.type`
-        // (resoperation.py:29 / history.py:220). Untyped/None fall
-        // through to the legacy chain during the Slice 0.5 transition.
+        // OpRef enum carries box.type in the variant tag; reading the tag
+        // on the resolved box is the line-by-line equivalent of upstream
+        // `box.type` (resoperation.py:29 / history.py:220). `None` and
+        // Void variants fall through to the side-table chain.
         if let Some(tp) = resolved.ty() {
             if tp != majit_ir::Type::Void {
                 return tp;
@@ -1452,12 +1457,14 @@ impl OptContext {
             .map(|(i, &tp)| crate::r#box::BoxRef::new_inputarg(tp, Some(i as u32)))
             .collect();
         ctx.box_pool = seed.into();
-        // Mirror the production setup at `optimizer.rs:1859`
-        // `ctx.inputarg_types = self.trace_inputarg_types.clone()` — the
-        // typed-Box parity contract requires the field to be populated
-        // alongside the BoxRef pool so `inputarg_type_at(i)` returns
-        // `Some(tp)` matching `box.type` for slot i. Direct test callers
-        // bypass the Optimizer, so this helper must seed the field itself.
+        // Mirror the production wiring at `setup_optimizations`
+        // (optimizer.rs `ctx.inputarg_types = self.trace_inputarg_types
+        // .clone()`): seed `ctx.inputarg_types` in lockstep with the
+        // `box_pool` so the typed-Box parity contract holds — strict
+        // accessors like `inputarg_type_at_strict` (and `inputarg_type_at`)
+        // return `Some(tp)` matching `box.type` for slot i. Test fixtures
+        // that call `with_inputarg_types` no longer need to set
+        // `inputarg_types` separately.
         ctx.inputarg_types = inputarg_types.to_vec();
         ctx
     }
@@ -1859,6 +1866,36 @@ impl OptContext {
         raw
     }
 
+    /// RPython `box.type` invariant (history.py:220
+    /// `InputArg{Int,Ref,Float}.type`, resoperation.py:1693
+    /// `opclasses[opnum].type`): every emitted op's intrinsic
+    /// `Op.type_` must agree with both the producer's
+    /// `OpCode::result_type()` and the `OpRef.pos` variant tag.
+    /// Replaces the pre-Slice-0.5 `register_value_type`
+    /// debug-assertion site at the surviving emit/emit_extra
+    /// producer surfaces.
+    fn debug_assert_box_type_invariant(op: &Op) {
+        debug_assert_eq!(
+            op.type_,
+            op.opcode.result_type(),
+            "Op.type_ ({:?}) disagrees with opcode.result_type() ({:?}) at \
+             {:?} (opcode={:?}) — Slice 0.1 dual-source contract violation",
+            op.type_,
+            op.opcode.result_type(),
+            op.pos,
+            op.opcode,
+        );
+        if let Some(variant_tp) = op.pos.ty() {
+            debug_assert_eq!(
+                variant_tp, op.type_,
+                "OpRef variant tag ({:?}) disagrees with Op.type_ ({:?}) at \
+                 {:?} (opcode={:?}) — typed-factory mismatch \
+                 (history.py:220 / resoperation.py:1693 Box.type parity)",
+                variant_tp, op.type_, op.pos, op.opcode,
+            );
+        }
+    }
+
     /// Emit an operation to the output.
     ///
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
@@ -1974,11 +2011,13 @@ impl OptContext {
             }
         }
 
-        // Slice 0.5: dropping the redundant `register_value_type` write —
-        // the op is about to be pushed into `new_operations`, after which
-        // `op_at` resolves its intrinsic `op.type_` (resoperation.py:1693
-        // parity) and `opref_type` returns it via the primary fast path.
-        // The side-table entry would be dead code.
+        // Slice 0.5: the op is about to be pushed into `new_operations`,
+        // after which `op_at` resolves its intrinsic `op.type_`
+        // (resoperation.py:1693 parity) and `opref_type` returns it via
+        // the primary fast path. The pre-Slice-0.5 `register_value_type`
+        // side-table entry is gone; its Box.type invariant survives as
+        // `debug_assert_box_type_invariant` below.
+        Self::debug_assert_box_type_invariant(&op);
         self.new_operations.push(op);
         pos_ref
     }
@@ -1999,6 +2038,7 @@ impl OptContext {
         // 0.1 / resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
+        Self::debug_assert_box_type_invariant(&op);
         self.extra_operations_after
             .push_back((after_pass_idx + 1, op));
         pos_ref
@@ -2416,9 +2456,10 @@ impl OptContext {
             if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos) {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
-            // RPython PreambleOp carries Box.type intrinsically; pyre's
-            // imported replay encodes the type in the `result` OpRef
-            // variant tag (resoperation.py:29).
+            // RPython PreambleOp carries Box.type intrinsically. Slice 0.5:
+            // the replay `result` OpRef is typed via the upstream factory
+            // (`op_typed` per Slice P5/P6); priority 0 of `opref_type`
+            // resolves it from the variant tag without a side-table seed.
             let _ = result_type;
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
@@ -3251,6 +3292,50 @@ impl OptContext {
                 const_index,
             ));
         } else {
+            // Phantom-target upgrade: when the target slot is missing
+            // entirely or carries a *clean* `Type::Void` placeholder from
+            // a prior `ensure_box_at` (which stamps `new_resop(Void, _)`
+            // for unseen positions), re-mint it with the variant info
+            // carried by `new`. The chain walker keys the produced OpRef
+            // off `target.type_()` + `target.is_inputarg/is_resop()`
+            // (`get_box_replacement_impl` Box arm); without this upgrade
+            // `replace_op(_, IntOp(N))` followed by
+            // `get_box_replacement(_)` falls through to the
+            // source-variant-preserving Void branch and returns
+            // `<source>(N)` instead of `IntOp(N)` — losing target's
+            // class/type identity. RPython preserves target identity
+            // because `set_forwarded(box)` stores the actual Box object
+            // (`resoperation.py:53`); pyre needs the Box record to
+            // advertise the same variant `new` represents.
+            //
+            // Only upgrade when the existing slot has no live forwarding
+            // / Info — `Rc<Box>` holders elsewhere observe the old slot,
+            // so swapping the entry would silently desync them. A box
+            // with a non-None `_forwarded` is already participating in
+            // chain walking and must keep its identity.
+            let target_idx = new.raw() as usize;
+            let needs_upgrade = new.ty().is_some()
+                && self.box_pool.get(target_idx).map_or(true, |b| {
+                    b.type_() == majit_ir::Type::Void
+                        && matches!(&*b.get_forwarded(), crate::r#box::Forwarded::None)
+                });
+            if needs_upgrade {
+                let tp = new.ty().expect("checked above");
+                let upgraded = if matches!(
+                    new,
+                    OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+                ) {
+                    crate::r#box::BoxRef::new_inputarg(tp, Some(target_idx as u32))
+                } else {
+                    crate::r#box::BoxRef::new_resop(tp, target_idx as u32)
+                };
+                while self.box_pool.len() <= target_idx {
+                    let i = self.box_pool.len() as u32;
+                    self.box_pool
+                        .push(crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, i));
+                }
+                self.box_pool.set(target_idx, upgraded);
+            }
             let target = self
                 .ensure_box(new)
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -5123,7 +5208,11 @@ impl OptContext {
     /// assumptions about it.
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
-        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity.
+        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity. The
+        //    OpRef enum encodes `box.type` directly in the variant tag
+        //    (`ConstInt`/`InputArgInt`/`IntOp` → Int, etc.), so reading
+        //    the tag is the line-by-line equivalent of upstream `box.type`.
+        //    `OpRef::None` returns `None` here and falls through.
         if let Some(tp) = resolved.ty() {
             return Some(tp);
         }
@@ -5133,7 +5222,8 @@ impl OptContext {
             return Some(val.get_type());
         }
         // 2. Producing op's intrinsic `type_` (resoperation.py:1693
-        //    `opclasses[opnum].type` parity).
+        //    `opclasses[opnum].type` parity). Slice 0.1 populates this
+        //    at construction; this is the primary fast path post-Slice-0.5.
         if let Some(tp) = self.get_op_result_type(resolved) {
             return Some(tp);
         }
@@ -5237,6 +5327,55 @@ impl OptContext {
         } else {
             Some(tp)
         }
+    }
+
+    /// Strict counterpart to `inputarg_type_at`. Panics when the slot is
+    /// out of range, the type is `Void`, or `inputarg_types` was not
+    /// populated by `setup_optimizations`. Mirrors RPython's
+    /// `box.type` invariant (history.py:220) — every InputArg always
+    /// carries a `.type`, so a miss here is a structural bookkeeping
+    /// bug.
+    ///
+    /// Used by Slice P5 sites that mint `OpRef::input_arg_typed(...)`
+    /// for Phase 2 inputargs and have no legitimate untyped fallback.
+    pub fn inputarg_type_at_strict(&self, idx: usize) -> majit_ir::Type {
+        match self.inputarg_types.get(idx).copied() {
+            Some(majit_ir::Type::Void) => panic!(
+                "inputarg_type_at_strict: slot {idx} is Void; \
+                 RPython invariant violated (history.py:220 box.type)"
+            ),
+            Some(tp) => tp,
+            None => panic!(
+                "inputarg_type_at_strict: slot {idx} out of range \
+                 (inputarg_types.len() = {}); setup_optimizations did not \
+                 seed the parallel type vector",
+                self.inputarg_types.len()
+            ),
+        }
+    }
+
+    /// `Box.type` strict accessor. Panics when no source carries a type for
+    /// `opref`, matching `history.py:802 record_same_as(box.type)`'s
+    /// no-guess-on-miss policy: RPython Boxes always have an intrinsic type,
+    /// so a missing type is a structural bug.
+    ///
+    /// Use this whenever the call site previously read a HashMap with
+    /// `unwrap_or(Type::Int|Ref)` — those defaults silently absorbed bugs
+    /// that would have been audible under the upstream invariant.  Sites
+    /// that legitimately need a fallback (e.g. inputarg-stub harnesses,
+    /// out-of-process compile.rs paths without an `OptContext`) should
+    /// stay on `opref_type` and document the deviation.
+    #[track_caller]
+    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
+        self.opref_type(opref).unwrap_or_else(|| {
+            panic!(
+                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
+                 every OpRef must have a type via variant tag / constant / \
+                 producer op.type_ / inputarg slot. history.py:802 parity.",
+                opref,
+                self.get_box_replacement(opref),
+            )
+        })
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -6510,8 +6649,8 @@ mod boxref_forwarding_tests {
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
-        ctx.replace_op(OpRef::int_op(0), const_opref);
-        // The IntBound on old is gone (overwritten by Box(const_box)).
+        ctx.replace_op(OpRef::input_arg_int(0), const_opref);
+        // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => assert!(target.is_constant()),
@@ -7490,6 +7629,8 @@ mod ensure_ptr_info_arg0_tests {
     }
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
+        // history.py:182 GetfieldGc receiver is a Ref box; arg0 must
+        // carry the Ref variant tag (resoperation.py:615 RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], descr);
         op.pos = OpRef::int_op(1);
@@ -7497,6 +7638,7 @@ mod ensure_ptr_info_arg0_tests {
     }
 
     fn array_op() -> Op {
+        // ArraylenGc receiver is a Ref box.
         let descr: DescrRef = Arc::new(TestSizeDescr {
             index: 7,
             is_object: false,
@@ -7527,6 +7669,10 @@ mod ensure_ptr_info_arg0_tests {
     /// protection (info.py:719-720).
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
+        // optimizer.py:465-466 PyPy parity: even Value::Int seeded at the
+        // GetfieldGc receiver slot is interpreted as a ptr (ConstPtrInfo).
+        // The Box class is still Ref because the receiver position is Ref;
+        // the inner i64 value just happens to be tagged Int by the trace.
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::input_arg_ref(0), Value::Int(1));
         let op = field_op_with_parent(struct_parent_descr());

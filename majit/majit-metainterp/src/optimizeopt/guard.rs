@@ -1028,7 +1028,7 @@ mod tests {
     /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::int_op(base + i as u32);
+            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -1435,7 +1435,7 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::int_op(100), OpRef::int_op(200)],
                 );
-                op.pos = OpRef::int_op(0);
+                op.pos = OpRef::void_op(0);
                 op
             },
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
@@ -1446,7 +1446,8 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
-        constants.insert(200, 1i64);
+        constants.insert(200u32, majit_ir::Value::Int(1));
+        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

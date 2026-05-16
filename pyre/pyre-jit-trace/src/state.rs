@@ -2967,27 +2967,6 @@ impl PyreSym {
         self.execution_context = execution_context;
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn shift_virtualizable_input_indices(&mut self, extra_reds: u32) {
-        if extra_reds == 0 {
-            return;
-        }
-        let shift = |opref: &mut OpRef| {
-            if !opref.is_none() {
-                *opref = opref.with_raw(opref.raw() + extra_reds);
-            }
-        };
-        shift(&mut self.vable_last_instr);
-        shift(&mut self.vable_pycode);
-        shift(&mut self.vable_valuestackdepth);
-        shift(&mut self.vable_debugdata);
-        shift(&mut self.vable_lastblock);
-        shift(&mut self.vable_w_globals);
-        if let Some(base) = self.vable_array_base.as_mut() {
-            *base += extra_reds;
-        }
-    }
-
     /// Initialize symbolic tracking state. Called once when the owning
     /// MetaInterpFrame is pushed (trace.rs for root frame). Callee (inline)
     /// frames set symbolic state manually in perform_call
@@ -3441,11 +3420,10 @@ impl PyreJitState {
         sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
         // `become_active_vable_owner` calls `init_vable_indices(FIRST_VABLE_SCALAR_IDX)`
         // where `FIRST_VABLE_SCALAR_IDX = 1 + NUM_EXTRA_REDS` already accounts for
-        // the `ec` extra red.  An extra `shift_virtualizable_input_indices(1)`
-        // here would double-count, leaving e.g. `vable_pycode = OpRef::from_raw(4)` (= the
-        // valuestackdepth slot, type Int) instead of `OpRef::from_raw(3)` — the resume-time
-        // type assertion in `value_to_static_vable_bits` then catches the Int(1)
-        // value flowing into a Ref-typed slot.
+        // the `ec` extra red. Do not re-shift the slot indices here — doing so
+        // would double-count, leaving e.g. `vable_pycode` at the valuestackdepth
+        // slot (Type::Int) instead of the pycode slot (Type::Ref) and tripping
+        // the resume-time type assertion in `value_to_static_vable_bits`.
         sym.become_active_vable_owner();
         sym.nlocals = meta.num_locals;
         sym.valuestackdepth = meta.valuestackdepth;
@@ -8496,6 +8474,11 @@ mod tests {
             Type::Ref, // stack1
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
+        // Slots 0 (frame) and 1 (ec) are both Ref-typed per `input_types`
+        // — production `init_vable_indices` mints typed `InputArgRef`
+        // variants here (resoperation.py:739, state.rs:1428-1438), so
+        // variant-aware Eq (resoperation.rs:290) requires the matching
+        // `OpRef::input_arg_ref` shape.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.frame = OpRef::input_arg_ref(0);
         sym.execution_context = OpRef::input_arg_ref(1);
@@ -8700,10 +8683,15 @@ mod tests {
         input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
+        // Mint typed `OpRef::input_arg_*` matching each `input_types`
+        // slot — production `init_vable_indices` (state.rs:1428-1438
+        // `#[vable(inputarg, type = ...)]`) always selects `InputArgInt`
+        // / `InputArgRef` (resoperation.py:719/739) per the static-field
+        // tag, so variant-aware Eq (resoperation.rs:290) requires the
+        // matching variant here too.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
-        // vable static fields per pyframe.py declared types (state.rs:1428-1439).
         sym.vable_last_instr = OpRef::input_arg_int(1);
         sym.vable_pycode = OpRef::input_arg_ref(2);
         sym.vable_valuestackdepth = OpRef::input_arg_int(3);
