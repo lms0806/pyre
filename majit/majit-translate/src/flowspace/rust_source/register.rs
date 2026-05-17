@@ -714,6 +714,36 @@ fn try_resolve_use_path(
 /// so pass 2 reuses the same cascade logic (Python parity:
 /// `getattr(getattr(getattr(module, "foo"), "bar"), "Baz")` for
 /// `foo::bar::Baz`).
+/// Detect `impl ... for <external-rooted path>` so the impl arm can
+/// silent-skip per the conceded external-scope adaptation, rather
+/// than fall through to `extract_impl_target_path`'s general failure
+/// path (which fail-louds the truly-unmodeled self-type shapes —
+/// tuple, fn-pointer, slice, etc.).  Returns `true` when the
+/// self-type is a `Type::Path` rooted at `crate::` / `super::` /
+/// `self::` / `std::` / `core::` / `alloc::`, or a leading-`::`
+/// path.  Non-`Type::Path` self-types are NOT external — the walker
+/// has no model for them at all, which is the fail-loud case
+/// `extract_impl_target_path` reports.
+fn is_external_rooted_impl_self_type(self_ty: &syn::Type) -> bool {
+    let tp = match self_ty {
+        syn::Type::Path(tp) => tp,
+        _ => return false,
+    };
+    if tp.qself.is_some() {
+        return false;
+    }
+    if tp.path.leading_colon.is_some() {
+        return true;
+    }
+    let Some(first) = tp.path.segments.first() else {
+        return false;
+    };
+    matches!(
+        classify_use_root(&first.ident.to_string()),
+        UseRoot::External
+    )
+}
+
 fn extract_impl_target_path(self_ty: &syn::Type) -> Option<Vec<String>> {
     let tp = match self_ty {
         syn::Type::Path(tp) => tp,
@@ -763,35 +793,35 @@ fn is_lifetime_only_path_arguments(args: &syn::PathArguments) -> bool {
     }
 }
 
-/// Slice O25: an `Item::Impl`'s `generics` block is "lifetime-only"
-/// if every `GenericParam` is a `LifetimeParam` and the `where_clause`
-/// is either absent or contains only lifetime-bound predicates
-/// (`'a: 'b` shape). Type / const params reject because they need
-/// reification at impl-target time (separate future slice).
+/// Slice O25: an `Item::Impl` introduces no Python-side
+/// specialization axis iff every entry of `generics.params` is a
+/// `LifetimeParam`. Type / const params reject because they need
+/// reification at impl-target time (each `<T = …>` instantiation =
+/// distinct classdef per `description.py:228-249 cachedgraph`).
+///
+/// The `where_clause` is intentionally NOT inspected: when `params`
+/// already excludes type/const generics, every `WherePredicate`
+/// constrains either an existing lifetime or a concrete type, and
+/// upstream `classdesc.py:590-634 add_source_attribute` flat-stores
+/// `classdict[name] = Constant(value)` without any
+/// reification-equivalent check. Cases like
+/// `impl Foo where Foo: SomeTrait { fn bar(&self) }`,
+/// `impl Foo where Self: Send { fn bar(&self) }`, or HRTB-bearing
+/// `impl Foo where for<'a> &'a Foo: Trait { fn bar(&self) }` keep
+/// the self-type concrete, so the methods attach to `Foo`'s class
+/// dict identically to a bare `impl Foo { fn bar(&self) }`. The
+/// trait bounds are Rust-language constraints with no Python parity.
 ///
 /// Mirrors the parity rationale of [`is_lifetime_only_path_arguments`]:
 /// `impl<'a> Trait for Foo<'a> { fn bar(&self) }` produces methods
 /// on the same `Foo` classdict as the non-generic `impl Trait for Foo
 /// { fn bar(&self) }` would — the `'a` carries no semantic the Python
 /// flow analysis observes.
-fn is_lifetime_only_generics(generics: &syn::Generics) -> bool {
-    if !generics
+fn impl_generics_only_introduce_lifetimes(generics: &syn::Generics) -> bool {
+    generics
         .params
         .iter()
         .all(|p| matches!(p, syn::GenericParam::Lifetime(_)))
-    {
-        return false;
-    }
-    if let Some(where_clause) = &generics.where_clause {
-        if !where_clause
-            .predicates
-            .iter()
-            .all(|p| matches!(p, syn::WherePredicate::Lifetime(_)))
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Slice O20: recursive helper that walks `items` into the inline-mod
@@ -960,16 +990,37 @@ fn register_items_into_namespace<'a>(
             // `pyre-interpreter` codebase avoids such collisions so
             // the ban surfaces as no observable regression.
             //
-            // Type / const generic impls (`impl<T> Foo<T>`,
-            // `impl<E: Trait> X for E`) and external-rooted self-types
-            // (`impl Trait for crate::foo::Bar`) remain skipped —
-            // each is its own future slice (type-arg reification,
-            // cross-file resolution).
-            Item::Impl(item_impl) if is_lifetime_only_generics(&item_impl.generics) => {
-                let class_path = match extract_impl_target_path(&item_impl.self_ty) {
-                    Some(p) => p,
-                    None => continue,
-                };
+            // External-rooted self-types (`impl Trait for
+            // crate::foo::Bar`, including generic impl blocks on
+            // external roots) remain skipped — cross-file resolution is
+            // its own future slice. Local type / const generic impls
+            // (`impl<T> Foo<T>`, `impl<E: Trait> X for E`) fail loud
+            // below because type-arg reification is required before a
+            // method can attach to one concrete class dict.
+            // Concrete-self impls with
+            // `where` predicates (`impl Foo where Foo: SomeTrait`,
+            // `impl Foo where Self: Send`) DO pass: the params list
+            // introduces no specialization axis, so the methods
+            // attach to `Foo`'s class dict per `classdesc.py:590-634
+            // add_source_attribute`'s `classdict[name] =
+            // Constant(value)` flat assignment.
+            Item::Impl(item_impl) if is_external_rooted_impl_self_type(&item_impl.self_ty) => {
+                // PRE-EXISTING-ADAPTATION (external scope): see the
+                // outer walker's identical short-circuit.
+                let _ = item_impl;
+                continue;
+            }
+            Item::Impl(item_impl)
+                if impl_generics_only_introduce_lifetimes(&item_impl.generics) =>
+            {
+                let class_path = extract_impl_target_path(&item_impl.self_ty).ok_or_else(|| {
+                    AdapterError::Unsupported {
+                        reason: "inline `mod`: unsupported `impl` self-type \
+                                 (only path-shaped class identifiers with \
+                                 lifetime-only generics are modeled)."
+                            .to_string(),
+                    }
+                })?;
                 for impl_item in &item_impl.items {
                     if let syn::ImplItem::Fn(method) = impl_item {
                         let method_name = method.sig.ident.to_string();
@@ -987,6 +1038,14 @@ fn register_items_into_namespace<'a>(
                     }
                 }
             }
+            Item::Impl(_) => {
+                return Err(AdapterError::Unsupported {
+                    reason: "inline `mod`: `impl` block introduces \
+                             type / const generic parameters; walker \
+                             has no reification path."
+                        .to_string(),
+                });
+            }
             // Slice O23: collect `Item::Use` bindings into the
             // deferred queue. The pass-2 fixed-point loop retries
             // them after every iteration's class / fn registrations
@@ -995,7 +1054,8 @@ fn register_items_into_namespace<'a>(
             // Skip leading-`::` paths and paths rooted at well-known
             // external prefixes (`crate::`, `super::`, `self::`,
             // `std::`, `core::`, `alloc::`) — multi-file resolution
-            // is its own future slice.
+            // is its own future slice (PRE-EXISTING-ADAPTATION,
+            // outer-walker convergence path applies).
             Item::Use(item_use) => {
                 if item_use.leading_colon.is_some() {
                     continue;
@@ -1012,7 +1072,16 @@ fn register_items_into_namespace<'a>(
                     deferred_uses.push(du);
                 }
             }
-            _ => {}
+            _ => {
+                // PRE-EXISTING-ADAPTATION: same set of silently-skipped
+                // item kinds as the outer walker — `static mut`,
+                // `Item::Trait` / `TraitAlias`, `Item::Type`,
+                // `Item::Macro`, `Item::ForeignMod`, `Item::ExternCrate`,
+                // `Item::Union`, `Item::Verbatim`, plus the external
+                // `Item::Use` / no-body `Item::Mod` short-circuits
+                // handled in their own arms above. See the outer
+                // walker's catch-all docstring for per-kind reasoning.
+            }
         }
     }
     // Strict-parity (2026-05-11): pre-register every inner-mod fn's
@@ -1282,6 +1351,48 @@ fn register_items_into_namespace<'a>(
     let _ = deferred_fns;
     let _ = pending_inner_fns;
     let _ = pending_inner_methods;
+
+    // Strict-parity: same fail-loud contract as the outer walker —
+    // `deferred_uses` and `deferred_impls` residues mean walker-known
+    // local references that never reached a registered binding /
+    // class. External-rooted prefixes are filtered at intake, so
+    // anything left here is a local-rooted miss inside this inline
+    // mod's namespace.
+    if let Some(du) = deferred_uses.into_iter().next() {
+        let path = du.path_segments.join("::");
+        let suffix = if du.glob {
+            "::*".to_string()
+        } else if du
+            .path_segments
+            .last()
+            .is_some_and(|seg| seg != &du.binding_name)
+        {
+            format!(" as {}", du.binding_name)
+        } else {
+            String::new()
+        };
+        return Err(AdapterError::Unsupported {
+            reason: format!(
+                "unresolved local-rooted `use {path}{suffix}` inside \
+                 inline `mod`: walker found no registered binding for \
+                 the path's head segment after the fixed-point loop."
+            ),
+        });
+    }
+    if let Some(di) = deferred_impls.into_iter().next() {
+        return Err(AdapterError::Unsupported {
+            reason: format!(
+                "unresolved `impl ... for {}` target inside inline `mod` \
+                 after fixed-point loop: walker found no registered \
+                 `HostObject::Class` for the self-type path. Method \
+                 `{}::{}` cannot attach to a class that does not exist.",
+                di.class_path.join("::"),
+                di.class_path.join("::"),
+                di.method_name,
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -1573,20 +1684,49 @@ pub fn register_rust_module_at_with_source(
             // Slice O24 widens self-type to multi-segment paths
             // (`impl Trait for foo::Bar` cascades through the
             // inline-mod namespace dict). Slice O25 widens generics
-            // to lifetime-only (`impl<'a> Trait for Foo<'a>` —
-            // lifetimes have no Python parity, the impl-target class
-            // is identical to the non-generic shape).
+            // to lifetime-only-params (`impl<'a> Trait for Foo<'a>`,
+            // `impl Foo where Foo: SomeTrait`, etc. — lifetimes have
+            // no Python parity, the impl-target class is identical
+            // to the non-generic shape, and `where` predicates are
+            // Rust-language constraints with no
+            // `classdesc.py:590-634 add_source_attribute` analogue
+            // because they do not change classdef identity).
             //
-            // Type / const generic impls (`impl<T> Foo<T>`,
-            // `impl<E: Trait> X for E`) and external-rooted self-types
-            // (`impl Trait for crate::foo::Bar`) remain skipped —
-            // each is its own future slice (type-arg reification,
-            // cross-file resolution).
-            Item::Impl(item_impl) if is_lifetime_only_generics(&item_impl.generics) => {
-                let class_path = match extract_impl_target_path(&item_impl.self_ty) {
-                    Some(p) => p,
-                    None => continue,
-                };
+            // External-rooted self-types (`impl Trait for
+            // crate::foo::Bar`, including generic impl blocks on
+            // external roots) remain skipped — cross-file resolution is
+            // its own future slice. Local type / const generic impls
+            // (`impl<T> Foo<T>`, `impl<E: Trait> X for E`) fail loud
+            // below because type-arg reification is required before a
+            // method can attach to one concrete class dict.
+            Item::Impl(item_impl) if is_external_rooted_impl_self_type(&item_impl.self_ty) => {
+                // PRE-EXISTING-ADAPTATION (external scope):
+                // `impl Trait for crate::foo::Bar`,
+                // `impl Trait for ::leading::Anchor`,
+                // `impl Trait for std::collections::HashMap`, etc.
+                // need cross-file / external-crate registry
+                // resolution. Silent skip keeps the walker
+                // composable with source files that reference
+                // external types; the conceded scope is per
+                // Section 4 of the strict-parity audit.
+                let _ = item_impl;
+                continue;
+            }
+            Item::Impl(item_impl)
+                if impl_generics_only_introduce_lifetimes(&item_impl.generics) =>
+            {
+                let class_path = extract_impl_target_path(&item_impl.self_ty).ok_or_else(|| {
+                    AdapterError::Unsupported {
+                        reason: "unsupported `impl` self-type: walker can \
+                                 only extract a path-shaped class identifier \
+                                 (single or multi-segment ident path with \
+                                 lifetime-only generics). Tuple, \
+                                 function-pointer, reference, slice, array, \
+                                 trait-object self-types have no Python-side \
+                                 class equivalent in the flowspace model."
+                            .to_string(),
+                    }
+                })?;
                 for impl_item in &item_impl.items {
                     if let syn::ImplItem::Fn(method) = impl_item {
                         let method_name = method.sig.ident.to_string();
@@ -1608,6 +1748,32 @@ pub fn register_rust_module_at_with_source(
                         });
                     }
                 }
+            }
+            // Generic `impl<T> Foo<T>` / `impl<E: Trait> X for E` /
+            // `impl<const N: usize> Foo<N>` — type / const generic
+            // parameters introduced in `generics.params` require
+            // reification against a concrete instantiation (the
+            // annotator's `SomeInstance.classdef` choice per call
+            // site, mirroring upstream `MethodDesc.selfclassdef`).
+            // Walker has no analyzer-side specialization yet, so
+            // the methods cannot be attached to a single class
+            // dict. Fail-loud rather than silently drop the methods
+            // — local Rust source declaring such a block is not an
+            // external-scope adaptation, it is a walker-modeling
+            // gap. (Note: `impl Foo where Foo: SomeTrait { … }` is
+            // NOT this case — `params` is empty, the `where` clause
+            // only constrains concrete types, and the guard above
+            // already accepted it per `classdesc.py:590-634`.)
+            Item::Impl(_) => {
+                return Err(AdapterError::Unsupported {
+                    reason: "`impl` block introduces type / const \
+                             generic parameters: walker has no \
+                             reification path; method graphs cannot \
+                             be attached to a single class dict \
+                             without an annotator-side specialization \
+                             choice."
+                        .to_string(),
+                });
             }
             // Slice O23: `Item::Use` queues bindings for the pass-2
             // fixed-point loop. Mirrors Python `from x import y`:
@@ -1638,55 +1804,57 @@ pub fn register_rust_module_at_with_source(
                 }
             }
             _ => {
-                // PRE-EXISTING-ADAPTATION (Issue 2.3): walker
-                // coverage is incomplete vs upstream
-                // `module.__dict__`. Upstream Python module import
-                // populates the dict for every binding statement
-                // (`def`, `class`, top-level assignment,
-                // `from ... import ...`, nested `import`, …).
-                // Currently skipped:
+                // PRE-EXISTING-ADAPTATION: silently-skipped item
+                // kinds. Each carries a documented convergence path
+                // and explicit reasoning for why fail-loud would
+                // overreach beyond the strict-parity contract.
                 //
                 // - **`Item::Use` rooted at external prefixes**
                 //   (`crate::`, `super::`, `self::`, `std::`,
-                //   `core::`, `alloc::`, leading-`::`) — these need
-                //   cross-file / external-crate registry resolution
-                //   (which itself depends on per-module scoping —
-                //   see Issue 1.3). Local-rooted `use` (single-
-                //   segment alias / inline-mod cascade / group
-                //   expansion / glob) IS walked by Slice O23 —
-                //   bindings register via `module.__dict__[name] =
-                //   value` per upstream `flowcontext.py:847
-                //   w_globals.value[varname]`.
-                // - **External `Item::Mod`** (file-system `mod foo;`)
-                //   — file-system resolution is out of scope. Inline
-                //   `mod foo { ... }` blocks ARE walked by Slices
-                //   O19 / O20 (see the `Item::Mod` arm above).
-                // - **`Item::Impl` (generic impls /
-                //   external-rooted self-types)** — generic impls
-                //   (`impl<T> Foo<T>`, `impl<E: Trait> X for E`)
-                //   require generic-arg reification (its own future
-                //   slice). External-rooted self-types
-                //   (`impl Trait for crate::foo::Bar`,
-                //   `impl Trait for ::leading::Anchor`) need cross-
-                //   file / external-crate registry resolution
-                //   (multi-session, see Issue 1.3). Self-impl blocks
-                //   (`impl Foo { fn bar() {} }`, Slice O18) +
-                //   trait impls (`impl Trait for Foo { fn bar() {} }`,
-                //   Slice O22) + multi-segment local-rooted
-                //   self-types (`impl Trait for foo::Bar` where
-                //   `foo` is a registered inline-mod, Slice O24) ARE
-                //   walked — methods become `class.class_set(name,
-                //   …)` entries paralleling Python's `class Foo:
-                //   def bar(self): ...` populating
-                //   `Foo.__dict__["bar"]` per upstream
-                //   `classdesc.py:590-634 add_source_attribute`.
-                //   Trait identity is not consulted: closed-world
-                //   dispatch through `bookkeeper.py:431-442
-                //   getmethoddesc` keys on `(originclassdef, name,
-                //   …)`, not on the trait that defined the method.
+                //   `core::`, `alloc::`, leading-`::`) and
+                //   **External `Item::Mod`** (file-system
+                //   `mod foo;` with no body) need cross-file /
+                //   external-crate registry resolution that the
+                //   closed-world walker does not implement. Short-
+                //   circuited inside `Item::Use` / `Item::Mod`
+                //   above rather than reaching this arm.
                 //
-                // Each follow-up slice extends this dispatch match
-                // without changing the call sites.
+                // - **`Item::Static` with `static mut`** — runtime-
+                //   mutated module storage whose initial-value
+                //   snapshot would silently produce stale constfold
+                //   reads. Lookups fall through to
+                //   `Builder::resolve_path_constant`'s mint-or-fail,
+                //   the right shape for an opaque runtime-mutated
+                //   symbol. Promoting to fail-loud would block any
+                //   source file containing a live-store global from
+                //   walking at all.
+                //
+                // - **`Item::Trait` / `Item::TraitAlias`** — the
+                //   trait identity is not consulted in closed-world
+                //   dispatch (`bookkeeper.py:431-442 getmethoddesc`
+                //   keys on `(originclassdef, name, …)`). A trait
+                //   declaration's only walker-observable effect would
+                //   be registering an abstract HostObject; today's
+                //   `impl Trait for X` flattens the method onto X's
+                //   class dict regardless, so the trait carrier is
+                //   unused.
+                //
+                // - **`Item::Type`** — Rust type aliases collapse at
+                //   compile time. The flowspace model has no
+                //   compile-time fold stage, so the alias has no
+                //   runtime-observable binding.
+                //
+                // - **`Item::Macro`** — macros must expand before
+                //   the walker parses the file. A surviving
+                //   `Item::Macro` is by definition unexpanded; the
+                //   walker has no expander.
+                //
+                // - **`Item::ForeignMod` / `Item::ExternCrate` /
+                //   `Item::Union` / `Item::Verbatim`** — FFI, cross-
+                //   crate registry, overlay storage, and syn parse
+                //   verbatim respectively. Each needs its own slice
+                //   (multi-session); promoting to fail-loud would
+                //   block any source containing them from walking.
             }
         }
     }
@@ -1983,6 +2151,64 @@ pub fn register_rust_module_at_with_source(
     // `co_code` lazily.
     let _ = pending_fns;
     let _ = pending_methods;
+
+    // Strict-parity: a local-rooted `use foo::Bar` that never
+    // resolved through the fixed-point loop is a genuine import
+    // miss. External-rooted prefixes (`crate::`, `super::`, `self::`,
+    // `std::`, `core::`, `alloc::`, leading-`::`) are filtered at
+    // intake (UseRoot::External above), so anything left in
+    // `deferred_uses` is a local-rooted reference whose target
+    // failed to register. Upstream `pyopcode.py` IMPORT_FROM raises
+    // `ImportError` at import time when `getattr(foo, "Bar")` fails;
+    // Rust's compiler likewise rejects unresolved `use`. Surface the
+    // miss as `AdapterError::Unsupported` so registration does not
+    // silently complete with a missing namespace entry.
+    if let Some(du) = deferred_uses.into_iter().next() {
+        let path = du.path_segments.join("::");
+        let suffix = if du.glob {
+            "::*".to_string()
+        } else if du
+            .path_segments
+            .last()
+            .is_some_and(|seg| seg != &du.binding_name)
+        {
+            format!(" as {}", du.binding_name)
+        } else {
+            String::new()
+        };
+        return Err(AdapterError::Unsupported {
+            reason: format!(
+                "unresolved local-rooted `use {path}{suffix}`: walker \
+                 found no registered binding for the path's head segment \
+                 after the fixed-point loop. Either the target is \
+                 declared below an external-rooted boundary (filter at \
+                 intake), or no `pub` item with that name reached the \
+                 registry partition."
+            ),
+        });
+    }
+
+    // Strict-parity: an `impl … for X { ... }` block whose target `X`
+    // never resolved to a registered `HostObject::Class` would
+    // otherwise drop every method graph silently. Closed-world Rust
+    // source declares its impl targets locally, so a non-resolving
+    // target means the metadata-only carrier is missing — a
+    // registration miss, not a documented external-scope adaptation.
+    if let Some(di) = deferred_impls.into_iter().next() {
+        return Err(AdapterError::Unsupported {
+            reason: format!(
+                "unresolved `impl ... for {}` target after fixed-point \
+                 loop: walker found no registered `HostObject::Class` \
+                 for the self-type path. Methods `{}::{}` (and any \
+                 siblings in the same impl block) cannot be added to a \
+                 class dict that does not exist.",
+                di.class_path.join("::"),
+                di.class_path.join("::"),
+                di.method_name,
+            ),
+        });
+    }
+
     Ok(module_id)
 }
 
@@ -3890,31 +4116,81 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_item_impl_skips_generic_blocks() {
-        // Slice O22 scope: generic impls (`impl<T> Foo<T>`,
-        // `impl<E: Trait> X for E`) and where-clause impls are out of
-        // scope (generic-arg reification is a future slice). The
-        // walker silently skips them; downstream resolution falls
-        // through to the resolver's mint-or-fail path. Self-impl
-        // (Slice O18) and trait impl (Slice O22) on a single bare
-        // self-type with no generics ARE walked — see
-        // `register_rust_module_item_impl_trait_for_class_populates_class_dict`.
+    fn register_rust_module_item_impl_rejects_generic_blocks() {
+        // Type / const generic impls (`impl<T> Foo<T>`,
+        // `impl<E: Trait> X for E`, `impl<const N: usize> Foo<N>`)
+        // need annotator-side specialization (a
+        // `SomeInstance.classdef` choice per call site, mirroring
+        // upstream `MethodDesc.selfclassdef`) before their methods
+        // can attach to a single class dict. Local Rust source
+        // declaring such a block is a walker-modeling gap, not an
+        // external-scope adaptation; surface the gap as
+        // `AdapterError::Unsupported` rather than silently dropping
+        // the method graph. (Concrete-self impls with `where`
+        // predicates do NOT belong here — see
+        // `register_rust_module_item_impl_accepts_where_clause_on_concrete_self`.)
         let src = "
-            struct ParityProbeGenericSkipStruct;
-            impl<T> ParityProbeGenericSkipStruct {
+            struct ParityProbeGenericRejectStruct;
+            impl<T> ParityProbeGenericRejectStruct {
                 fn generic_helper() -> i64 { 3 }
             }
         ";
-        let file = syn::parse_file(src).expect("skip fixture parses");
-        let module_id = register_rust_module(&file).expect("walker succeeds");
-        let class = match module_globals_lookup(module_id, "ParityProbeGenericSkipStruct") {
+        let file = syn::parse_file(src).expect("generic-impl fixture parses");
+        match register_rust_module(&file) {
+            Err(AdapterError::Unsupported { reason }) => {
+                assert!(
+                    reason.contains("type / const generic"),
+                    "expected generic-impl rejection, got: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(generic impl), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_item_impl_accepts_where_clause_on_concrete_self() {
+        // An `impl` block whose `generics.params` introduces no
+        // type / const parameter must be accepted even when a
+        // `where` clause is present, because the predicates only
+        // constrain concrete types and lifetimes — no Python-side
+        // specialization axis is introduced. Upstream
+        // `classdesc.py:590-634 add_source_attribute` flat-stores
+        // `classdict[name] = Constant(value)` without inspecting
+        // bounds, so the methods attach to `Foo`'s class dict
+        // identically to a bare `impl Foo { fn helper(&self) }`.
+        //
+        // Two shapes covered: `impl Self-only where Self: Trait`
+        // (self-impl) and `impl Trait for Foo where Foo: OtherTrait`
+        // (trait-impl). Both have empty `generics.params`, only the
+        // where-clause carries the trait bound.
+        let src = "
+            trait ParityProbeWhereMarker {}
+            struct ParityProbeWhereStruct;
+            impl ParityProbeWhereMarker for ParityProbeWhereStruct {}
+            impl ParityProbeWhereStruct where Self: ParityProbeWhereMarker {
+                fn self_impl_helper() -> i64 { 7 }
+            }
+            trait ParityProbeWhereTrait { fn trait_helper(&self) -> i64; }
+            impl ParityProbeWhereTrait for ParityProbeWhereStruct
+            where ParityProbeWhereStruct: ParityProbeWhereMarker {
+                fn trait_helper(&self) -> i64 { 9 }
+            }
+        ";
+        let file = syn::parse_file(src).expect("where-clause fixture parses");
+        let module_id =
+            register_rust_module(&file).expect("walker accepts concrete-self where-clauses");
+        let class = match module_globals_lookup(module_id, "ParityProbeWhereStruct") {
             Some(ConstValue::HostObject(h)) => h,
-            _ => unreachable!(),
+            other => panic!("expected ParityProbeWhereStruct in module dict, got {other:?}"),
         };
-        assert!(
-            class.class_get("generic_helper").is_none(),
-            "generic impl skipped"
-        );
+        match class.class_get("self_impl_helper") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected self_impl_helper in class dict, got {other:?}"),
+        }
+        match class.class_get("trait_helper") {
+            Some(ConstValue::HostObject(host)) => assert!(host.is_user_function()),
+            other => panic!("expected trait_helper in class dict, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4328,9 +4604,11 @@ mod tests {
     #[test]
     fn register_rust_module_item_impl_admits_lifetime_only_where_clause() {
         // Slice O25: `where 'a: 'b` (lifetime-bound predicates) is
-        // admitted alongside lifetime-only `generics.params`. Type /
-        // const where-clauses still reject because they imply
-        // type-arg reification (separate future slice).
+        // admitted alongside lifetime-only `generics.params`. The
+        // walker no longer rejects non-lifetime where predicates by
+        // themselves; only type / const parameters introduced in
+        // `generics.params` create a specialization axis that needs
+        // reification.
         let src = "
             struct ParityProbeLtWhereStruct;
             trait ParityProbeLtWhereTrait { fn lt_where_method(&self) -> i64; }
@@ -4363,6 +4641,9 @@ mod tests {
             struct ParitySkipExtSelfTyStruct;
             impl crate::ParitySkipExtSelfTyStruct {
                 fn ext_method() -> i64 { 1 }
+            }
+            impl<T> crate::ParitySkipGenericExternal<T> {
+                fn generic_ext_method() -> i64 { 3 }
             }
             impl ::leading::AnchorTy {
                 fn leading_method() -> i64 { 2 }
