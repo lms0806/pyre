@@ -365,9 +365,12 @@ pub fn lower_indirect_calls(
             } => (trait_root, method_name),
             _ => unreachable!("site filter mismatch"),
         };
-        let receiver = *args
+        let receiver_var = args
             .first()
             .expect("dyn-Trait method call must have a receiver arg");
+        let receiver = graph
+            .value_id_of(receiver_var)
+            .expect("dyn-Trait receiver must have a backing ValueId");
         // RPython rclass.py:371-377 (condensed into a single op).
         let funcptr = rclass::class_get_method_ptr(
             graph,
@@ -402,10 +405,11 @@ pub fn lower_indirect_calls(
         };
         // The original Call op is now at index `oi + 1` because
         // `class_get_method_ptr` inserted `VtableMethodPtr` at `oi`.
+        let funcptr_var = graph.must_variable(funcptr);
         graph.blocks[bid].operations[oi + 1] = SpaceOperation {
             result,
             kind: OpKind::IndirectCall {
-                funcptr,
+                funcptr: funcptr_var,
                 args,
                 graphs,
                 result_ty,
@@ -760,11 +764,12 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
+        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: crate::model::CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
+                args: vec![receiver_var],
                 result_ty: ValueType::Void,
             },
             true,
@@ -873,11 +878,12 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
+        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("bar", Some("Foo".to_string())),
-                args: vec![receiver],
+                args: vec![receiver_var],
                 result_ty: ValueType::Void,
             },
             true,

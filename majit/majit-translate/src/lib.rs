@@ -49,7 +49,9 @@ mod test_support;
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
-pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
+pub use flatten::{
+    FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph, flatten_with_types,
+};
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
@@ -1635,10 +1637,15 @@ mod tests {
 
         // Step 3: flatten the rewritten graph
         let types = rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&types);
-        let regallocs =
-            crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
-        let flattened = flatten_with_types(&result.graph, &types, &regallocs);
+        // Hydrate per-value `concretetype` slots on the graph
+        // (pyre's `Variable.concretetype` analogue) so downstream
+        // consumers can read kinds via `graph.concretetype(v)`
+        // without a side-table lookup.
+        let mut result = result;
+        crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
+        let flattened = flatten::flatten_graph(&result.graph, &mut regallocs);
         eprintln!(
             "load_fast graph ops: {:?}",
             load_fast_graph.block(load_fast_graph.startblock).operations

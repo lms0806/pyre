@@ -49,7 +49,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     // Resolve from ops with explicit type info
     for block in &graph.blocks {
         // Resolve inputargs (Phi nodes) from annotations
-        for &vid in &block.inputargs {
+        for vid in block.inputarg_value_ids(graph) {
             if state.get(vid) == &ConcreteType::Unknown {
                 let vtype = annotations.types.get(&vid).unwrap_or(&ValueType::Unknown);
                 let concrete = valuetype_to_concrete(vtype);
@@ -163,8 +163,16 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         // keys need `cast_ptr_to_int` insertion in
                         // jtransform, not a type override in the
                         // rtyper.
-                        changed |= maybe_seed_concrete_type(&mut state, *lhs, ConcreteType::Signed);
-                        changed |= maybe_seed_concrete_type(&mut state, *rhs, ConcreteType::Signed);
+                        let lhs_vid = graph
+                            .value_id_of(lhs)
+                            .expect("BinOp.lhs has backing ValueId");
+                        let rhs_vid = graph
+                            .value_id_of(rhs)
+                            .expect("BinOp.rhs has backing ValueId");
+                        changed |=
+                            maybe_seed_concrete_type(&mut state, lhs_vid, ConcreteType::Signed);
+                        changed |=
+                            maybe_seed_concrete_type(&mut state, rhs_vid, ConcreteType::Signed);
                         if let Some(result) = op.result {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
@@ -179,14 +187,14 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                             // to `float_add` (etc.) and insert
                             // `cast_int_to_float` for mixed int/float
                             // operands, keeping IR/regalloc consistent.
-                            let lhs_float = *state.get(*lhs) == ConcreteType::Float;
-                            let rhs_float = *state.get(*rhs) == ConcreteType::Float;
+                            let lhs_float = *state.get(lhs_vid) == ConcreteType::Float;
+                            let rhs_float = *state.get(rhs_vid) == ConcreteType::Float;
                             let any_float = lhs_float || rhs_float;
                             let both_numeric = matches!(
-                                *state.get(*lhs),
+                                *state.get(lhs_vid),
                                 ConcreteType::Signed | ConcreteType::Float
                             ) && matches!(
-                                *state.get(*rhs),
+                                *state.get(rhs_vid),
                                 ConcreteType::Signed | ConcreteType::Float
                             );
                             // Mirror jtransform's float-rewrite set
@@ -228,13 +236,16 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         operand,
                         ..
                     } if is_int_unop(opname) => {
+                        let operand_vid = graph
+                            .value_id_of(operand)
+                            .expect("UnaryOp.operand has backing ValueId");
                         changed |=
-                            maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
+                            maybe_seed_concrete_type(&mut state, operand_vid, ConcreteType::Signed);
                         if let Some(result) = op.result {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
                             // returns Float (`float_neg`).
-                            let operand_float = *state.get(*operand) == ConcreteType::Float;
+                            let operand_float = *state.get(operand_vid) == ConcreteType::Float;
                             if operand_float && opname == "neg" {
                                 if state.get(result) != &ConcreteType::Float {
                                     state.set(result, ConcreteType::Float);
@@ -269,8 +280,11 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         // would surface as `cast_int_to_float/r>f`
                         // at the assembler.  Re-seed Signed here so
                         // pass 2 converges to the same operand kind.
+                        let operand_vid = graph
+                            .value_id_of(operand)
+                            .expect("UnaryOp.operand has backing ValueId");
                         changed |=
-                            maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
+                            maybe_seed_concrete_type(&mut state, operand_vid, ConcreteType::Signed);
                     }
                     OpKind::UnaryOp {
                         op: opname,
@@ -278,10 +292,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         ..
                     } if is_identity_unop(opname) => {
                         if let Some(result) = op.result {
-                            let operand_ty = state.get(*operand).clone();
+                            let operand_vid = graph
+                                .value_id_of(operand)
+                                .expect("UnaryOp.operand has backing ValueId");
+                            let operand_ty = state.get(operand_vid).clone();
                             let result_ty = state.get(result).clone();
                             changed |= maybe_seed_concrete_type(&mut state, result, operand_ty);
-                            changed |= maybe_seed_concrete_type(&mut state, *operand, result_ty);
+                            changed |= maybe_seed_concrete_type(&mut state, operand_vid, result_ty);
                         }
                     }
                     _ => {}
@@ -318,11 +335,11 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     // every reachable value.
     let mut seen: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     for block in &graph.blocks {
-        for v in &block.inputargs {
-            seen.insert(*v);
+        for v in block.inputarg_value_ids(graph) {
+            seen.insert(v);
         }
         for op in &block.operations {
-            for v in crate::inline::op_value_refs(&op.kind) {
+            for v in crate::inline::op_value_refs(&op.kind, Some(graph)) {
                 seen.insert(v);
             }
             if let Some(r) = op.result {
@@ -331,13 +348,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         }
         for link in &block.exits {
             for arg in &link.args {
-                if let crate::model::LinkArg::Value(v) = arg {
-                    seen.insert(*v);
+                if let Some(v) = arg.as_value(graph) {
+                    seen.insert(v);
                 }
             }
             for arg in link.last_exception.iter().chain(link.last_exc_value.iter()) {
-                if let crate::model::LinkArg::Value(v) = arg {
-                    seen.insert(*v);
+                if let Some(v) = arg.as_value(graph) {
+                    seen.insert(v);
                 }
             }
         }
@@ -366,7 +383,6 @@ pub fn resolve_rewritten_types(
     original_types: &TypeResolutionState,
     rewritten_graph: &FunctionGraph,
     annotations: &AnnotationState,
-    stamped_kinds: &HashMap<ValueId, ConcreteType>,
 ) -> TypeResolutionState {
     let post_result_types = authoritative_result_types(rewritten_graph);
     let post_resolve = resolve_types(rewritten_graph, annotations);
@@ -374,7 +390,6 @@ pub fn resolve_rewritten_types(
         original_types,
         post_resolve,
         post_result_types,
-        stamped_kinds,
     )
 }
 
@@ -408,27 +423,29 @@ fn link_is_raise_like(link: &Link) -> bool {
 
 fn convert_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        let _ = maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, src));
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+        let _ = maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, graph, src));
     }
 }
 
 fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        let _ = maybe_seed_concrete_type(state, *value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        let _ = maybe_seed_concrete_type(state, value, ConcreteType::Signed);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        let _ = maybe_seed_concrete_type(state, *value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        let _ = maybe_seed_concrete_type(state, value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(state, src)
+            link_arg_concrete_type(state, graph, src)
         };
         let _ = maybe_seed_concrete_type(state, *dst, src_ty);
     }
@@ -437,16 +454,32 @@ fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, li
 fn converge_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         match src {
-            LinkArg::Value(src) => {
-                let src_ty = state.get(*src).clone();
+            LinkArg::Value(var) => {
+                // After the Variable cutover, `as_value(graph) == None`
+                // means the link references a `Variable` the graph
+                // never registered — malformed link metadata.  Silently
+                // skipping convergence would let the dual-gate baseline
+                // pass with degraded types and hide the producer bug;
+                // mirror the `legacy_annotator::link_arg_type`
+                // expect-style contract instead.
+                let src_vid = src.as_value(graph).unwrap_or_else(|| {
+                    panic!(
+                        "converge_link: LinkArg::Value references Variable \
+                         {var:?} that is not registered on the graph — \
+                         malformed link.args"
+                    )
+                });
+                let src_ty = state.get(src_vid).clone();
                 let dst_ty = state.get(*dst).clone();
                 changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-                changed |= maybe_seed_concrete_type(state, *src, dst_ty);
+                changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
             }
             LinkArg::Const(value) => {
-                changed |= maybe_seed_concrete_type(state, *dst, const_value_to_concrete(value));
+                changed |=
+                    maybe_seed_concrete_type(state, *dst, const_value_to_concrete(&value.value));
             }
         }
     }
@@ -459,35 +492,66 @@ fn converge_raise_link(
     link: &Link,
 ) -> bool {
     let mut changed = false;
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        changed |= maybe_seed_concrete_type(state, *value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= maybe_seed_concrete_type(state, value, ConcreteType::Signed);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        changed |= maybe_seed_concrete_type(state, *value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= maybe_seed_concrete_type(state, value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(state, src)
+            link_arg_concrete_type(state, graph, src)
         };
         changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-        if let LinkArg::Value(src_vid) = src {
+        // For LinkArg::Value, propagate the dst kind back to the src
+        // Variable.  `as_value(graph) == None` after the Variable
+        // cutover means malformed link metadata (the LinkArg::Const
+        // arm exits early); fail loud rather than silently skip the
+        // back-propagation.
+        if let LinkArg::Value(var) = src {
+            let src_vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "converge_raise_link: LinkArg::Value references Variable \
+                     {var:?} that is not registered on the graph — \
+                     malformed link.args"
+                )
+            });
             let dst_ty = state.get(*dst).clone();
-            changed |= maybe_seed_concrete_type(state, *src_vid, dst_ty);
+            changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
         }
     }
     changed
 }
 
-fn link_arg_concrete_type(state: &TypeResolutionState, src: &LinkArg) -> ConcreteType {
+fn link_arg_concrete_type(
+    state: &TypeResolutionState,
+    graph: &FunctionGraph,
+    src: &LinkArg,
+) -> ConcreteType {
     match src {
-        LinkArg::Value(src) => state.get(*src).clone(),
-        LinkArg::Const(value) => const_value_to_concrete(value),
+        // After the Variable cutover an unregistered LinkArg::Value
+        // is malformed metadata — fail loud rather than degrading to
+        // `Unknown` which would let the dual-gate baseline pass with
+        // missing kinds and mask producer bugs.  Mirrors the
+        // `legacy_annotator::link_arg_type` contract.
+        LinkArg::Value(var) => {
+            let vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "link_arg_concrete_type: LinkArg::Value references Variable \
+                     {var:?} that is not registered on the graph — \
+                     malformed link.args"
+                )
+            });
+            state.get(vid).clone()
+        }
+        LinkArg::Const(value) => const_value_to_concrete(&value.value),
     }
 }
 
@@ -636,11 +700,12 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let v = graph
             .push_op(
                 entry,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new("obj", None),
                     ty: ValueType::Ref,
                     pure: false,
@@ -694,13 +759,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -739,13 +806,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "bitxor".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -774,12 +843,13 @@ mod tests {
                 true,
             )
             .unwrap();
+        let value_var = graph.must_variable(value);
         let alias = graph
             .push_op(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value,
+                    operand: value_var,
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -798,12 +868,13 @@ mod tests {
         let mut graph = FunctionGraph::new("same_as_int");
         let entry = graph.startblock;
         let value = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let value_var = graph.must_variable(value);
         let alias = graph
             .push_op(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value,
+                    operand: value_var,
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -826,11 +897,12 @@ mod tests {
         let mut graph = FunctionGraph::new("rewritten_call_result");
         let entry = graph.startblock;
         let funcptr = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        let funcptr_var = graph.must_variable(funcptr);
         let result = graph
             .push_op(
                 entry,
                 OpKind::CallResidual {
-                    funcptr: CallFuncPtr::Value(funcptr),
+                    funcptr: CallFuncPtr::Value(funcptr_var),
                     descriptor: CallDescriptor::known(EffectInfo::default()),
                     args_i: vec![],
                     args_r: vec![],
@@ -847,12 +919,7 @@ mod tests {
         let mut original = TypeResolutionState::new();
         original.set(result, ConcreteType::Void);
 
-        let types = resolve_rewritten_types(
-            &original,
-            &graph,
-            &annotations,
-            &std::collections::HashMap::new(),
-        );
+        let types = resolve_rewritten_types(&original, &graph, &annotations);
 
         assert_eq!(types.get(result), &ConcreteType::GcRef);
     }
@@ -875,13 +942,15 @@ mod tests {
         let (target, phi_args) = graph.create_block_with_args(1);
         let phi = phi_args[0];
         graph.set_goto(entry, target, vec![src]);
+        let phi_var = graph.must_variable(phi);
+        let one_var = graph.must_variable(one);
         let result = graph
             .push_op(
                 target,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: phi,
-                    rhs: one,
+                    lhs: phi_var,
+                    rhs: one_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -929,13 +998,14 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![
                 Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );

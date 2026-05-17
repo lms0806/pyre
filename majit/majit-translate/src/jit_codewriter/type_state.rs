@@ -76,22 +76,16 @@ use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 
-/// Concrete low-level type. RPython `Repr.lowleveltype` collapsed to the
-/// four kinds the jit_codewriter needs (Signed / GcRef / Float / Void)
-/// plus `Unknown` for pre-resolution slots.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConcreteType {
-    /// Signed integer (RPython `Signed` / i64).
-    Signed,
-    /// GC reference (RPython `Ptr(GcStruct)`).
-    GcRef,
-    /// Float (RPython `Float` / f64).
-    Float,
-    /// Void (RPython `Void`).
-    Void,
-    /// Unknown / unresolved.
-    Unknown,
-}
+/// Re-export the canonical [`ConcreteType`] from [`crate::model`].
+///
+/// The kind enum used to live here as a side-table value type;
+/// after the medium-term parity push it lives on each backing
+/// `Variable.concretetype` cell stored in
+/// [`FunctionGraph::value_variables`] (mirroring upstream
+/// `Variable.concretetype` line-for-line).  The alias keeps existing
+/// imports working while consumers migrate to reading
+/// `graph.concretetype(v)`.
+pub use crate::model::ConcreteType;
 
 /// Returned by [`TypeResolutionState::get`] for slots that have not
 /// been populated.  Pyre's adapter returns this `Unknown` sentinel
@@ -114,6 +108,18 @@ const UNKNOWN: ConcreteType = ConcreteType::Unknown;
 /// shaped (`get` / `set` / `try_get` / `contains` / `iter`) to mirror
 /// `var.concretetype` / `setattr` / `hasattr` patterns; the Vec is
 /// an implementation detail.
+///
+/// **Long-term role** — this struct is the build-time scratch buffer
+/// used by jtransform / legacy-resolve while they compute per-value
+/// kinds.  The authoritative store after the rtyper handoff is each
+/// backing `Variable.concretetype` cell on
+/// [`FunctionGraph::value_variables`]: [`apply_to_graph`] writes
+/// every non-Unknown slot through `graph.set_concretetype`, after
+/// which downstream consumers read kinds via `graph.concretetype(v)`.
+///
+/// Collapsed to the four-way `Signed` / `GcRef` / `Float` / `Void` axis
+/// used by the JIT codewriter, per `rpython/jit/metainterp/history.py:45-71
+/// getkind`.
 #[derive(Debug, Default, Clone)]
 pub struct TypeResolutionState {
     slots: Vec<ConcreteType>,
@@ -169,6 +175,16 @@ impl TypeResolutionState {
         self.slots[id.0] = ct;
     }
 
+    /// Read the per-`ValueId` slice directly — exposed so callers
+    /// that just need an indexable view (e.g. liveness /
+    /// assembler kind lookups) can avoid going through the
+    /// HashMap-shaped `get` accessor.  The slice is indexed by
+    /// `ValueId.0`; an out-of-range index denotes "not yet
+    /// populated", same as `Unknown`.
+    pub fn as_slice(&self) -> &[ConcreteType] {
+        &self.slots
+    }
+
     /// Iterate populated slots in ascending `ValueId` order.  Stable
     /// ordering is load-bearing for `cutover::compare_real_against_legacy`
     /// (`cutover.rs:408`) whose "first divergence" message must be
@@ -183,6 +199,76 @@ impl TypeResolutionState {
                 Some((ValueId(idx), ct))
             }
         })
+    }
+}
+
+/// Bulk-write every entry of a transitional [`TypeResolutionState`]
+/// into each `ValueId`'s backing Variable via
+/// `graph.set_concretetype` (which writes through to
+/// `Variable.concretetype`).  After this call
+/// `graph.concretetype(v) == types.get(v)` for every `v` covered by
+/// the transitional table; values absent from `types` keep their
+/// existing kind (`Unknown` for fresh allocations).
+///
+/// Mirrors RPython's "rtyper finishes, every Variable now has
+/// `.concretetype`" handoff — pyre's scratch table is the staging
+/// area and `apply_to_graph` is the commit.
+pub fn apply_to_graph(types: &TypeResolutionState, graph: &mut FunctionGraph) {
+    // `iter()` already filters out `Unknown` slots so the graph
+    // keeps its existing per-value kind for unpopulated entries —
+    // the rtyper-finishes handoff only stamps positively-classified
+    // slots, mirroring upstream's `setconcretetype` only writing
+    // when a concretetype actually resolved.
+    for (v, ty) in types.iter() {
+        graph.set_concretetype(v, ty.clone());
+    }
+}
+
+/// Rebind each ValueId's backing
+/// [`crate::flowspace::model::Variable`] to the upstream-typed
+/// Variable in `value_to_var`, so subsequent
+/// `graph.concretetype(v)` reads route through the rtyper's
+/// `Variable.concretetype` directly.
+///
+/// **Long-term parity path** — this is the path the codewriter
+/// will use once every value has a backing flowspace `Variable`:
+/// the kind comes from `Variable.concretetype` (set by the
+/// `RPythonTyper`) projected through [`crate::model::getkind`],
+/// matching upstream's
+/// `getkind(v.concretetype)` access pattern bit for bit.  No
+/// transitional [`TypeResolutionState`] needed.
+///
+/// Variables whose `concretetype` is still `None` (rtyper hasn't
+/// processed them yet) leave the graph slot untouched —
+/// equivalent to RPython's "no `.concretetype` attribute" window
+/// before `setconcretetype` runs.  Pyre's
+/// [`crate::model::ConcreteType::Unknown`] sentinel covers that
+/// state.
+pub fn apply_from_flowspace_variables(
+    graph: &mut FunctionGraph,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
+) {
+    for (vid, var) in value_to_var.iter() {
+        // Honour the docstring contract above: a source `Variable`
+        // whose `concretetype` is still `None` represents the pre-
+        // `setconcretetype` window in RPython, where the graph slot
+        // must remain untouched.  `bind_variable` is defensive about
+        // this (it only copies a `Some` concretetype onto the
+        // placeholder), but invoking it with an untyped source still
+        // registers a spurious `variable_to_vid[var.id()] -> vid`
+        // entry that subsequent `value_id_of(&var)` lookups would
+        // resolve unexpectedly.  Skip the call outright so the
+        // docstring claim holds bit-for-bit.
+        if var.concretetype().is_none() {
+            continue;
+        }
+        // `bind_variable` merges the rtyper Variable's `concretetype`
+        // onto the existing placeholder in `value_variables[vid]`,
+        // preserving Variable identity across every graph slot that
+        // holds the placeholder (Block.inputargs, op operands,
+        // Link.args, exitswitch, last_exception, last_exc_value).
+        // Mirrors upstream `v.concretetype = T` attribute aliasing.
+        graph.bind_variable(*vid, var.clone());
     }
 }
 
@@ -209,28 +295,23 @@ impl TypeResolutionState {
 ///    on each rewritten op. Authoritative for op-result kinds (since
 ///    the rewriter declares them), so it wins over `original`'s
 ///    operand inferences.
-/// 4. `stamped` — jtransform's `synth_kinds` map: kinds the rewriter
-///    explicitly stamped on synthesized values during lowering
-///    (e.g. `cast_ptr_to_int`'s int-typed result). Wins outright
-///    because the rewriter knows the ground truth.
 ///
-/// Precedence: `stamped` > `post_result` > `post_resolve` > `original`.
-/// `original` only fills in slots that `post_result` doesn't claim,
-/// matching RPython's "single authoritative `op.result.concretetype`"
-/// invariant: a stale pre-rewrite operand kind never overrides a
-/// freshly-declared post-rewrite result kind.
+/// Precedence: `post_result` > `post_resolve` > `original`.  `original`
+/// only fills in slots that `post_result` doesn't claim, matching
+/// RPython's "single authoritative `op.result.concretetype`" invariant:
+/// a stale pre-rewrite operand kind never overrides a freshly-declared
+/// post-rewrite result kind.
 ///
-/// Survives the rtyper cutover (Slice 3): once the real `RPythonTyper`
-/// path produces `original` / `post_resolve`, this function still
-/// reconciles them with `post_result` / `stamped`. Slice 3 relocated
-/// this body from `translator/rtyper/legacy_resolve.rs:360-382` to
-/// keep the legacy graph-walk (`resolve_types`) callable separately
-/// from the merge logic.
+/// jtransform-stamped values are not a separate layer: they were
+/// written straight to each backing `Variable.concretetype` cell via
+/// `graph.set_concretetype` during the transform pass (mirroring
+/// RPython's inline `v.concretetype = T` writes), so they are already
+/// observable via `post_resolve` (which reads them out of the graph)
+/// and via `post_result` (declared on the rewritten op).
 pub fn merge_synth_kinds(
     original: &TypeResolutionState,
     post_resolve: TypeResolutionState,
     post_result: HashMap<ValueId, ConcreteType>,
-    stamped: &HashMap<ValueId, ConcreteType>,
 ) -> TypeResolutionState {
     let mut merged = post_resolve;
 
@@ -246,13 +327,57 @@ pub fn merge_synth_kinds(
     for (value, kind) in post_result {
         merged.set(value, kind);
     }
-    // (3) Synth kinds (jtransform-stamped) override everything — the
-    // rewriter declares these at lowering time with full ground truth.
-    for (&value, kind) in stamped {
-        merged.set(value, kind.clone());
-    }
 
     merged
+}
+
+/// Direct-to-graph variant of [`merge_synth_kinds`].
+///
+/// Same precedence stack (`post_result > post_resolve > original`) but
+/// writes the per-value result straight through to each backing
+/// `Variable.concretetype` cell via `graph.set_concretetype` instead of
+/// building a transitional [`TypeResolutionState`].  Production callers
+/// go through this entry so the graph IS the merge target — no
+/// intermediate side table to thread downstream.  Skips Unknown writes
+/// so the canonical-exceptblock stamp performed elsewhere
+/// (`augment_canonical_exceptblock_on_graph`) is not clobbered.
+pub fn merge_synth_kinds_into_graph(
+    graph: &mut crate::model::FunctionGraph,
+    original: &TypeResolutionState,
+    post_resolve: &TypeResolutionState,
+    post_result: &HashMap<ValueId, ConcreteType>,
+) {
+    use crate::model::ConcreteType;
+    // Precedence per the signature docstring is
+    // `post_result > post_resolve > original`, so `post_resolve` is the
+    // base layer and `post_result` writes last.  Apply order matches
+    // precedence inverted — write the lowest-precedence layer first,
+    // then upper layers override:
+    //
+    //   (0) `post_resolve` — base layer; subsequent writes may
+    //       override.  Higher precedence than `original` because
+    //       `original` skips entries that `post_result` will
+    //       overwrite anyway, and otherwise carries
+    //       operand-inference kinds.
+    for (value, kind) in post_resolve.iter() {
+        if !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(value, kind.clone());
+        }
+    }
+    //   (1) `original` operand inferences fill unresolved slots, but
+    //       skip `post_result`-claimed values so step (2) wins
+    //       unambiguously.
+    for (value, kind) in original.iter() {
+        if !post_result.contains_key(&value) && !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(value, kind.clone());
+        }
+    }
+    //   (2) Op-result kinds — highest precedence; last write wins.
+    for (value, kind) in post_result {
+        if !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(*value, kind.clone());
+        }
+    }
 }
 
 /// `ValueType` → `ConcreteType` projection used by both
@@ -351,28 +476,14 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Value
     result
 }
 
-/// Build value kind map from type resolution state.
-///
-/// RPython: `getkind(v.concretetype)` — in RPython, types live directly
-/// on variables. In majit, we extract them from TypeResolutionState.
-///
-/// Used by both `perform_all_register_allocations()` (before flatten)
-/// and `flatten_with_types()` (populates SSARepr.value_kinds).
-pub fn build_value_kinds(types: &TypeResolutionState) -> HashMap<ValueId, crate::flatten::RegKind> {
-    use crate::flatten::RegKind;
-    types
-        .iter()
-        .filter_map(|(vid, ct)| {
-            let kind = match ct {
-                ConcreteType::Signed => RegKind::Int,
-                ConcreteType::GcRef => RegKind::Ref,
-                ConcreteType::Float => RegKind::Float,
-                _ => return None,
-            };
-            Some((vid, kind))
-        })
-        .collect()
-}
+// `build_value_kinds` retired — the regalloc / flatten / assemble
+// pipeline now reads kinds straight off `graph.concretetype(v)`
+// (which routes to each `ValueId`'s backing
+// `Variable.concretetype` cell, the upstream-orthodox source).
+// Per-`ValueId` `RegKind` projections
+// happen at the use site via `regalloc::perform_register_allocation`'s
+// internal `concretetype_to_regkind`, matching RPython's
+// `getkind(v.concretetype)` access pattern bit for bit.
 
 #[cfg(test)]
 mod tests {
@@ -392,17 +503,16 @@ mod tests {
 
     #[test]
     fn merge_synth_kinds_post_resolve_starts_as_base() {
-        // No original / post_result / stamped overrides — the merged
-        // state is just `post_resolve`.
+        // No original / post_result overrides — the merged state is
+        // just `post_resolve`.
         let post_resolve = state_from(&[
             (ValueId(1), ConcreteType::Signed),
             (ValueId(2), ConcreteType::Float),
         ]);
         let original = TypeResolutionState::new();
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Signed);
         assert_eq!(merged.get(ValueId(2)), &ConcreteType::Float);
     }
@@ -414,9 +524,8 @@ mod tests {
         let post_resolve = TypeResolutionState::new();
         let original = state_from(&[(ValueId(7), ConcreteType::Signed)]);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(7)), &ConcreteType::Signed);
     }
 
@@ -428,9 +537,8 @@ mod tests {
         let mut original = TypeResolutionState::new();
         original.set(ValueId(7), ConcreteType::Unknown);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert!(
             !merged.contains(ValueId(7)),
             "Unknown originals must not seed the merged state"
@@ -444,9 +552,8 @@ mod tests {
         let post_resolve = state_from(&[(ValueId(1), ConcreteType::Signed)]);
         let original = state_from(&[(ValueId(1), ConcreteType::Signed)]);
         let post_result = map_from(&[(ValueId(1), ConcreteType::Float)]);
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Float);
     }
 
@@ -458,39 +565,23 @@ mod tests {
         let post_resolve = TypeResolutionState::new();
         let original = state_from(&[(ValueId(1), ConcreteType::GcRef)]);
         let post_result = map_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Signed);
     }
 
     #[test]
-    fn merge_synth_kinds_stamped_overrides_everything() {
-        // stamped is jtransform's ground truth — wins over post_result
-        // (and therefore over post_resolve / original).
-        let post_resolve = state_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let original = state_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let post_result = map_from(&[(ValueId(1), ConcreteType::Float)]);
-        let stamped = map_from(&[(ValueId(1), ConcreteType::GcRef)]);
-
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
-        assert_eq!(merged.get(ValueId(1)), &ConcreteType::GcRef);
-    }
-
-    #[test]
     fn merge_synth_kinds_full_precedence_chain() {
-        // Four ValueIds, each contributed by a different source —
+        // Three ValueIds, each contributed by a different source —
         // confirm each source's lane reaches the merged state.
         let post_resolve = state_from(&[(ValueId(1), ConcreteType::Float)]);
         let original = state_from(&[(ValueId(2), ConcreteType::Signed)]);
         let post_result = map_from(&[(ValueId(3), ConcreteType::GcRef)]);
-        let stamped = map_from(&[(ValueId(4), ConcreteType::Signed)]);
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Float);
         assert_eq!(merged.get(ValueId(2)), &ConcreteType::Signed);
         assert_eq!(merged.get(ValueId(3)), &ConcreteType::GcRef);
-        assert_eq!(merged.get(ValueId(4)), &ConcreteType::Signed);
     }
 
     #[test]

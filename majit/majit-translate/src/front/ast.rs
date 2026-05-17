@@ -2023,10 +2023,11 @@ fn allocate_loop_header_phis(
             )
             .expect("OpKind::Input always produces a result");
         graph.name_value(phi_vid, name.clone());
-        graph.block_mut(header_entry).inputargs.push(phi_vid);
+        graph.push_inputarg(header_entry, phi_vid);
+        let entry_arg = LinkArg::value(graph, entry_vid);
         graph.block_mut(pre_loop_block).exits[0]
             .args
-            .push(LinkArg::from(entry_vid));
+            .push(entry_arg);
         ctx.bind_local_id(name.clone(), phi_vid, header_entry);
         ctx.local_value_types.insert(name.clone(), value_type);
         header_phi_names.push(name);
@@ -2045,9 +2046,9 @@ fn allocate_loop_header_phis(
 fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
     let header_block = graph.block(header);
     header_block
-        .inputargs
-        .iter()
-        .filter_map(|&iarg_vid| {
+        .inputarg_value_ids(graph)
+        .into_iter()
+        .filter_map(|iarg_vid| {
             header_block
                 .operations
                 .iter()
@@ -2395,6 +2396,7 @@ impl<'a> GraphBuildContext<'a> {
     }
 }
 
+#[derive(Clone)]
 struct LocalBindingSnapshot {
     local_type_roots: HashMap<String, String>,
     local_type_strings: HashMap<String, String>,
@@ -2528,10 +2530,11 @@ fn lazy_install_local_at_current_block(
     // ctx state.
     {
         let block = graph.block(current_block);
+        let block_inputarg_vids = block.inputarg_value_ids(graph);
         for op in &block.operations {
             if let (Some(result), OpKind::Input { name: op_name, .. }) = (op.result, &op.kind)
                 && op_name == name
-                && block.inputargs.contains(&result)
+                && block_inputarg_vids.contains(&result)
             {
                 return Some(result);
             }
@@ -2694,7 +2697,7 @@ fn lazy_install_local_at_current_block(
         )?
     };
     graph.name_value(new_vid, name.to_string());
-    graph.block_mut(current_block).inputargs.push(new_vid);
+    graph.push_inputarg(current_block, new_vid);
     ctx.bind_local_id(name.to_string(), new_vid, current_block);
     ctx.local_value_types
         .insert(name.to_string(), value_type.clone());
@@ -2756,7 +2759,12 @@ fn lazy_install_local_at_current_block(
             "rollback expected Input op for {name:?} at the operations tail",
         );
         let popped_inputarg = block.inputargs.pop();
-        debug_assert_eq!(popped_inputarg, Some(new_vid));
+        debug_assert_eq!(
+            popped_inputarg
+                .as_ref()
+                .and_then(|var| graph.value_id_of(var)),
+            Some(new_vid),
+        );
         match prior_ctx_lvi {
             Some((vid, def_block)) => {
                 ctx.bind_local_id(name.to_string(), vid, def_block);
@@ -2790,9 +2798,8 @@ fn lazy_install_local_at_current_block(
     }
 
     for (pred_block, exit_idx, pred_vid) in pred_link_args {
-        graph.block_mut(pred_block).exits[exit_idx]
-            .args
-            .push(crate::model::LinkArg::Value(pred_vid));
+        let arg = crate::model::LinkArg::value(graph, pred_vid);
+        graph.block_mut(pred_block).exits[exit_idx].args.push(arg);
     }
 
     Some(new_vid)
@@ -2813,7 +2820,7 @@ fn value_id_defined_in_block(
     block_id: BlockId,
 ) -> bool {
     let block = graph.block(block_id);
-    if block.inputargs.contains(&vid) {
+    if block.inputarg_value_ids(graph).contains(&vid) {
         return true;
     }
     block.operations.iter().any(|op| op.result == Some(vid))
@@ -2907,7 +2914,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, "self".to_string());
-                    graph.block_mut(entry).inputargs.push(vid);
+                    graph.push_inputarg(entry, vid);
                     // RPython `LOAD_FAST` parity: record the receiver
                     // binding so a body `Expr::Path` reference to
                     // `self` within the entry block reuses this
@@ -2968,7 +2975,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, name.clone());
-                    graph.block_mut(entry).inputargs.push(vid);
+                    graph.push_inputarg(entry, vid);
                     // RPython `LOAD_FAST` parity: record the parameter
                     // binding so a body `Expr::Path` reference within
                     // the entry block reuses this `ValueId` instead of
@@ -3488,6 +3495,283 @@ fn lower_stmt_inner(
 
 // ── Expression lowering (block-splitting for control flow) ───────
 
+/// Lower an `if` / `if let` / `if … else if …` expression.
+///
+/// Extracted out of [`lower_expr`] so the recursive descent through an
+/// `else if` chain runs on a small stack frame: [`lower_expr`]'s frame
+/// has to reserve space for every match-arm's locals at once (it
+/// dispatches over the full [`syn::Expr`] surface) and overflows the
+/// default 2 MB thread stack at ~17 nested arms; this helper only
+/// carries the `If`-arm locals so the frame shrinks by roughly an
+/// order of magnitude.  The same shape PyPy's bytecode walker has —
+/// `flowspace/flowcontext.py` keeps each opcode handler in its own
+/// frame rather than one mega-frame for the dispatch loop.
+fn lower_if_expr(
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
+    if_expr: &syn::ExprIf,
+    options: &AstGraphOptions,
+    ctx: &mut GraphBuildContext,
+) -> Result<Lowered, FlowingError> {
+    // ── if-let desugaring ──
+    // `if let pat = scrutinee { then } else { else }` is exact
+    // syntactic sugar for `match scrutinee { pat => then, _ =>
+    // else }` (Rust Reference, "If let expressions"). We build
+    // the synthetic `Expr::Match` AST and recurse so the
+    // existing `Expr::Match` lowering (the path immediately
+    // below at `syn::Expr::Match(m)`) handles the pattern
+    // dispatch — keeps a single match-emit codepath rather than
+    // duplicating the merge / phi / arm-entry logic.
+    //
+    // Without this desugar, `if_expr.cond` would be lowered as
+    // a regular expression and trip the catch-all `Expr::Let`
+    // arm below, emitting `OpKind::Abort { Let }`. That stub
+    // makes any function carrying an `if let` un-portal-able
+    // (Phase G G.4.4 path A.1) since a BH resume could land on
+    // it and crash on "unknown bhimpl_*".
+    if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
+        let then_expr = syn::Expr::Block(syn::ExprBlock {
+            attrs: vec![],
+            label: None,
+            block: if_expr.then_branch.clone(),
+        });
+        let else_expr: syn::Expr = match &if_expr.else_branch {
+            Some((_, else_branch)) => (**else_branch).clone(),
+            None => syn::parse_quote!({}),
+        };
+        let then_arm = syn::Arm {
+            attrs: vec![],
+            pat: (*let_expr.pat).clone(),
+            guard: None,
+            fat_arrow_token: Default::default(),
+            body: Box::new(then_expr),
+            comma: Some(Default::default()),
+        };
+        let else_arm = syn::Arm {
+            attrs: vec![],
+            pat: syn::parse_quote!(_),
+            guard: None,
+            fat_arrow_token: Default::default(),
+            body: Box::new(else_expr),
+            comma: None,
+        };
+        let synthetic = syn::Expr::Match(syn::ExprMatch {
+            attrs: vec![],
+            match_token: Default::default(),
+            expr: let_expr.expr.clone(),
+            brace_token: Default::default(),
+            arms: vec![then_arm, else_arm],
+        });
+        return lower_expr(graph, block, &synthetic, options, ctx);
+    }
+
+    // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
+    // cond raises `FlowingError`, halting the walk.  A child
+    // that closed its path (`if return_early { ... } else ...`)
+    // also has no truth value — propagate via `get_value!`.
+    let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
+
+    let mut then_block = graph.create_block();
+    let mut else_block = graph.create_block();
+
+    // Cat 2.1 Slice 2 / Stage A1: capture the locals frame as it
+    // was when `*block` closed via `set_branch` so a later
+    // cross-block read in the merge block can thread back
+    // through either arm's `Link.args` even when the arm itself
+    // rebinds nothing.  Stored on `Block.framestate` (per-block,
+    // captured at close time) — both exits of one set_branch
+    // share the same pre-branch snapshot, so the per-edge
+    // duplication of Slice 2 collapses into a single field.
+    // RPython parity: `flowspace/flowcontext.py:38
+    // SpamBlock.framestate`.
+    let pre_branch_snapshot = ctx.getstate(0);
+    graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
+    graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
+
+    // Stage B1: capture the pre-branch ctx state BEFORE
+    // lowering the then-arm so the else-arm can re-enter
+    // `*block`'s scope.  RPython parity:
+    // `flowspace/flowcontext.py:407-408 record_block(block)`
+    // calls `setstate(block.framestate)` at every block
+    // entry; pyre snapshots the analogue `LocalBindingSnapshot`
+    // here and restores it before the else-arm.  Without this
+    // restore the else-arm sees the then-arm's mutations to
+    // `ctx.local_value_ids` / `local_value_types` etc.
+    let pre_branch_ctx = LocalBindingSnapshot::capture(ctx);
+
+    // Lower then branch — collect result value
+    let then_lowered = lower_stmt_list_with_tail_value(
+        graph,
+        &mut then_block,
+        &if_expr.then_branch.stmts,
+        options,
+        ctx,
+    )?;
+    // Cat 2.1 Slice 2: snapshot then-arm's locals state BEFORE
+    // else-arm lowering mutates `ctx.local_value_ids`.  Used
+    // only if then-arm is open (will `set_goto` to merge); a
+    // closed arm's snapshot is unused.
+    let then_exit_snapshot = ctx.getstate(0);
+    // Capture the full ctx as well so we can restore the surviving
+    // arm's `local_value_ids` / `local_value_types` if the other arm
+    // closes (return/raise/break).  Without this, e.g.
+    // `if cond { x = 1; } else { return 0; } x` would leave
+    // `ctx.local_value_ids["x"]` at the pre-branch state and the
+    // post-merge `x` read would lower to the wrong SSA value.
+    let then_exit_ctx = LocalBindingSnapshot::capture(ctx);
+
+    // Stage B1: restore pre-branch ctx state before lowering
+    // the else-arm so its `LOAD_FAST`-style reads see the
+    // pre-If bindings, not the then-arm's rebinds.
+    pre_branch_ctx.restore(ctx);
+
+    // Lower else branch.  When the else-branch is itself a chained
+    // `if` (`if … else if …`), recurse through [`lower_if_expr`]
+    // directly rather than going back through [`lower_expr`].  syn's
+    // AST nests each `else if` as `else_branch: Some(Expr::If(_))`,
+    // so a long chain would otherwise drive [`lower_expr`]'s ~70KB
+    // match-frame N levels deep and exhaust the 2 MB default stack.
+    let mut else_lowered = Lowered::no_value();
+    if let Some((_, else_branch)) = &if_expr.else_branch {
+        else_lowered = match else_branch.as_ref() {
+            syn::Expr::If(else_if_expr) => {
+                lower_if_expr(graph, &mut else_block, else_if_expr, options, ctx)?
+            }
+            _ => lower_expr(graph, &mut else_block, else_branch, options, ctx)?,
+        };
+    }
+    let else_exit_snapshot = ctx.getstate(0);
+    // Companion ctx capture for the else-arm — same rationale as
+    // `then_exit_ctx`.
+    let else_exit_ctx = LocalBindingSnapshot::capture(ctx);
+
+    // RPython `flowspace/flowcontext.py` merges via Link: a
+    // branch whose path is closed (`return`/`raise`/`break`)
+    // does not `goto` the merge — the `is_open` check below
+    // already skips it.  A phi inputarg is introduced when both
+    // arms *produced a value*, mirroring the old all-or-nothing
+    // shape; arity is kept consistent by skipping the closed
+    // arm's goto so only the open arm sends a `vec![value]` to
+    // the one-inputarg merge block.
+    let then_value = then_lowered.value;
+    let else_value = else_lowered.value;
+    let then_open = graph.block(then_block).is_open();
+    let else_open = graph.block(else_block).is_open();
+    let want_phi = then_value.is_some() && else_value.is_some();
+
+    let (merge_block, phi_result) = if want_phi {
+        let (merge, phi_args) = graph.create_block_with_args(1);
+        if then_open {
+            graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
+            graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
+        }
+        if else_open {
+            graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
+            graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
+        }
+        (merge, Some(phi_args[0]))
+    } else {
+        let merge = graph.create_block();
+        if then_open {
+            graph.set_goto(then_block, merge, vec![]);
+            graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
+        }
+        if else_open {
+            graph.set_goto(else_block, merge, vec![]);
+            graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
+        }
+        (merge, None)
+    };
+
+    // FrameState::union-driven merge when both arms reach the
+    // merge block.  Routes through `FrameState::union` for
+    // explicit per-slot classification per RPython
+    // `flowspace/framestate.py:105-128 union`:
+    //   - One-sided None → None-kill (`framestate.py:110-111`):
+    //     the slot is dropped from `ctx` so post-merge reads
+    //     of that name surface as undefined-local.
+    //   - CarryThrough (same vid both arms): kept; the merged
+    //     entry's `value_type` may have widened from `Unknown`
+    //     to a concrete kind via the wildcard rule and the
+    //     source `OpKind`'s `ty` is retagged below to keep
+    //     `graph_value_type` in agreement with the framestate.
+    //   - NeedsPhi (disagreeing vids): eager phi install at
+    //     union time per `framestate.py:113-114 union`'s
+    //     fresh `Variable()` semantics —
+    //     `lazy_install_local_at_current_block` allocates the
+    //     merge-block inputarg, threads per-arm vids onto
+    //     each predecessor's goto args, and rebinds ctx so
+    //     post-merge reads of the name resolve to the new
+    //     phi vid without re-driving the lazy installer.
+    if then_open && else_open {
+        let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
+            "AST frontend: union is total — entries domain has no UnionError, \
+                 stack / last_exception / blocklist / next_offset are vestigial \
+                 (framestate.py:78 None-return reachable only post-Z4 walker)",
+        );
+        for (slot_idx, slot) in merged.entries.iter().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
+                ctx.local_value_ids.remove(&name);
+                ctx.local_value_types.remove(&name);
+            }
+        }
+        for (slot_idx, slot_vid) in merged
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.map(|vid| (i, vid)))
+        {
+            let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
+            let is_fresh_phi = then_vid != Some(slot_vid);
+            if is_fresh_phi {
+                let name = ctx.local_first_bind_order[slot_idx].clone();
+                let _ = lazy_install_local_at_current_block(
+                    graph,
+                    ctx,
+                    merge_block,
+                    &name,
+                    Some(slot_vid),
+                );
+            }
+        }
+    } else if then_open {
+        // The else-arm closed (return/raise/break) so the post-merge
+        // ctx must reflect the then-arm's `local_value_ids`/
+        // `local_value_types` rebinds.  At this point ctx still
+        // holds the else-arm's terminal state (or the pre-branch
+        // state if there was no else); restore the then-arm
+        // snapshot we captured before the pre-branch restore.
+        then_exit_ctx.restore(ctx);
+    } else if else_open {
+        // Symmetric case — then-arm closed, else-arm is the only
+        // reaching predecessor of the merge block.  `ctx` still
+        // holds the else-arm's terminal bindings via the chain of
+        // `lower_*` mutations, but be explicit so any future
+        // rearrangement of the lowering order does not silently
+        // break this contract.
+        else_exit_ctx.restore(ctx);
+    }
+
+    *block = merge_block;
+    // If NEITHER arm remains open, the merge block is
+    // unreachable — mark the enclosing path as closed so the
+    // caller stops lowering into it.  RPython parity:
+    // `flowspace/flowcontext.py` never keeps a merge block
+    // reachable when all incoming links closed with
+    // `FlowSignal::Return` / `Raise`.
+    if !then_open && !else_open {
+        Ok(Lowered::path_closed())
+    } else {
+        Ok(Lowered {
+            value: phi_result,
+            path_closed: false,
+        })
+    }
+}
+
 /// Lower an expression, potentially splitting blocks for control flow.
 ///
 /// RPython equivalent: FlowContext.handle_bytecode() + guessbool().
@@ -3565,6 +3849,8 @@ fn lower_expr(
                 // RPython: getinteriorfield_gc — arr[i].field as a single op.
                 let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                 let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                let base_var = graph.must_variable(base);
+                let index_var = graph.must_variable(index);
                 let field_name = member_name(&field.member);
                 let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                 // Element struct type is the field owner for interiorfield descriptors.
@@ -3584,8 +3870,8 @@ fn lower_expr(
                 let result = graph.push_op(
                     *block,
                     OpKind::InteriorFieldRead {
-                        base,
-                        index,
+                        base: base_var,
+                        index: index_var,
                         field: crate::model::FieldDescriptor::new(field_name, elem_type),
                         item_ty,
                         array_type_id,
@@ -3598,6 +3884,7 @@ fn lower_expr(
                 })
             } else {
                 let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                let base_var = graph.must_variable(base);
                 let field_name = member_name(&field.member);
                 let field_type_string =
                     field_type_string_from_expr(&field.base, &field.member, ctx);
@@ -3608,7 +3895,7 @@ fn lower_expr(
                 let result = graph.push_op(
                     *block,
                     OpKind::FieldRead {
-                        base,
+                        base: base_var,
                         field: crate::model::FieldDescriptor::new(
                             field_name,
                             receiver_type_root(&field.base, ctx),
@@ -3629,14 +3916,16 @@ fn lower_expr(
         syn::Expr::Index(idx) => {
             let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
             let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+            let base_var = graph.must_variable(base);
+            let index_var = graph.must_variable(index);
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
                 .unwrap_or(ValueType::Unknown);
             let result = graph.push_op(
                 *block,
                 OpKind::ArrayRead {
-                    base,
-                    index,
+                    base: base_var,
+                    index: index_var,
                     item_ty,
                     nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                     array_type_id,
@@ -3663,6 +3952,9 @@ fn lower_expr(
                         // RPython: setinteriorfield_gc — arr[i].field = value.
                         let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                         let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                        let base_var = graph.must_variable(base);
+                        let index_var = graph.must_variable(index);
+                        let value_var = graph.must_variable(value);
                         let field_name = member_name(&field.member);
                         let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                         let elem_type = array_type_id
@@ -3678,10 +3970,10 @@ fn lower_expr(
                         graph.push_op(
                             *block,
                             OpKind::InteriorFieldWrite {
-                                base,
-                                index,
+                                base: base_var,
+                                index: index_var,
                                 field: crate::model::FieldDescriptor::new(field_name, elem_type),
-                                value,
+                                value: value_var,
                                 item_ty,
                                 array_type_id,
                             },
@@ -3689,18 +3981,20 @@ fn lower_expr(
                         );
                     } else {
                         let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                        let base_var = graph.must_variable(base);
+                        let value_var = graph.must_variable(value);
                         let field_name = member_name(&field.member);
                         let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                             .unwrap_or(ValueType::Unknown);
                         graph.push_op(
                             *block,
                             OpKind::FieldWrite {
-                                base,
+                                base: base_var,
                                 field: crate::model::FieldDescriptor::new(
                                     field_name,
                                     receiver_type_root(&field.base, ctx),
                                 ),
-                                value,
+                                value: value_var,
                                 ty,
                             },
                             false,
@@ -3710,6 +4004,9 @@ fn lower_expr(
                 syn::Expr::Index(idx) => {
                     let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                     let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                    let base_var = graph.must_variable(base);
+                    let index_var = graph.must_variable(index);
+                    let value_var = graph.must_variable(value);
                     let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                     let item_ty =
                         array_item_value_type_from_array_type_id(array_type_id.as_deref())
@@ -3717,9 +4014,9 @@ fn lower_expr(
                     graph.push_op(
                         *block,
                         OpKind::ArrayWrite {
-                            base,
-                            index,
-                            value,
+                            base: base_var,
+                            index: index_var,
+                            value: value_var,
                             item_ty,
                             nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                             array_type_id,
@@ -3810,11 +4107,13 @@ fn lower_expr(
             } else {
                 ValueType::Unknown
             };
+            let args_vars: Vec<crate::flowspace::model::Variable> =
+                args.iter().map(|v| graph.must_variable(*v)).collect();
             let result = graph.push_op(
                 *block,
                 OpKind::Call {
                     target,
-                    args,
+                    args: args_vars,
                     result_ty,
                 },
                 true,
@@ -3869,11 +4168,13 @@ fn lower_expr(
                         .map(type_string_to_value_type)
                 })
                 .unwrap_or(ValueType::Unknown);
+            let args_vars: Vec<crate::flowspace::model::Variable> =
+                args.iter().map(|v| graph.must_variable(*v)).collect();
             let result = graph.push_op(
                 *block,
                 OpKind::Call {
                     target,
-                    args,
+                    args: args_vars,
                     result_ty,
                 },
                 true,
@@ -3889,289 +4190,7 @@ fn lower_expr(
         // Creates: then_block, else_block, merge_block
         // If both branches produce a value, merge_block gets an inputarg
         // (Phi node) that receives the value from each branch via Link args.
-        syn::Expr::If(if_expr) => {
-            // ── if-let desugaring ──
-            // `if let pat = scrutinee { then } else { else }` is exact
-            // syntactic sugar for `match scrutinee { pat => then, _ =>
-            // else }` (Rust Reference, "If let expressions"). We build
-            // the synthetic `Expr::Match` AST and recurse so the
-            // existing `Expr::Match` lowering (the path immediately
-            // below at `syn::Expr::Match(m)`) handles the pattern
-            // dispatch — keeps a single match-emit codepath rather than
-            // duplicating the merge / phi / arm-entry logic.
-            //
-            // Without this desugar, `if_expr.cond` would be lowered as
-            // a regular expression and trip the catch-all `Expr::Let`
-            // arm below, emitting `OpKind::Abort { Let }`. That stub
-            // makes any function carrying an `if let` un-portal-able
-            // (Phase G G.4.4 path A.1) since a BH resume could land on
-            // it and crash on "unknown bhimpl_*".
-            if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
-                let then_expr = syn::Expr::Block(syn::ExprBlock {
-                    attrs: vec![],
-                    label: None,
-                    block: if_expr.then_branch.clone(),
-                });
-                let else_expr: syn::Expr = match &if_expr.else_branch {
-                    Some((_, else_branch)) => (**else_branch).clone(),
-                    None => syn::parse_quote!({}),
-                };
-                let then_arm = syn::Arm {
-                    attrs: vec![],
-                    pat: (*let_expr.pat).clone(),
-                    guard: None,
-                    fat_arrow_token: Default::default(),
-                    body: Box::new(then_expr),
-                    comma: Some(Default::default()),
-                };
-                let else_arm = syn::Arm {
-                    attrs: vec![],
-                    pat: syn::parse_quote!(_),
-                    guard: None,
-                    fat_arrow_token: Default::default(),
-                    body: Box::new(else_expr),
-                    comma: None,
-                };
-                let synthetic = syn::Expr::Match(syn::ExprMatch {
-                    attrs: vec![],
-                    match_token: Default::default(),
-                    expr: let_expr.expr.clone(),
-                    brace_token: Default::default(),
-                    arms: vec![then_arm, else_arm],
-                });
-                return lower_expr(graph, block, &synthetic, options, ctx);
-            }
-
-            // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
-            // cond raises `FlowingError`, halting the walk.  A child
-            // that closed its path (`if return_early { ... } else ...`)
-            // also has no truth value — propagate via `get_value!`.
-            let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
-
-            let mut then_block = graph.create_block();
-            let mut else_block = graph.create_block();
-
-            // Cat 2.1 Slice 2 / Stage A1: capture the locals frame as it
-            // was when `*block` closed via `set_branch` so a later
-            // cross-block read in the merge block can thread back
-            // through either arm's `Link.args` even when the arm itself
-            // rebinds nothing.  Stored on `Block.framestate` (per-block,
-            // captured at close time) — both exits of one set_branch
-            // share the same pre-branch snapshot, so the per-edge
-            // duplication of Slice 2 collapses into a single field.
-            // RPython parity: `flowspace/flowcontext.py:38
-            // SpamBlock.framestate`.
-            let pre_branch_snapshot = ctx.getstate(0);
-            graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
-            graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
-
-            // Stage B1: capture the pre-branch ctx state BEFORE
-            // lowering the then-arm so the else-arm can re-enter
-            // `*block`'s scope.  RPython parity:
-            // `flowspace/flowcontext.py:407-408 record_block(block)`
-            // calls `setstate(block.framestate)` at every block
-            // entry; pyre snapshots the analogue `LocalBindingSnapshot`
-            // here and restores it before the else-arm.  Without this
-            // restore the else-arm sees the then-arm's mutations to
-            // `ctx.local_value_ids` / `local_value_types` etc.
-            let pre_branch_ctx = LocalBindingSnapshot::capture(ctx);
-
-            // Lower then branch — collect result value
-            let then_lowered = lower_stmt_list_with_tail_value(
-                graph,
-                &mut then_block,
-                &if_expr.then_branch.stmts,
-                options,
-                ctx,
-            )?;
-            // Cat 2.1 Slice 2: snapshot then-arm's locals state BEFORE
-            // else-arm lowering mutates `ctx.local_value_ids`.  Used
-            // only if then-arm is open (will `set_goto` to merge); a
-            // closed arm's snapshot is unused.
-            let then_exit_snapshot = ctx.getstate(0);
-
-            // Stage B1: restore pre-branch ctx state before lowering
-            // the else-arm so its `LOAD_FAST`-style reads see the
-            // pre-If bindings, not the then-arm's rebinds.
-            pre_branch_ctx.restore(ctx);
-
-            // Lower else branch
-            let mut else_lowered = Lowered::no_value();
-            if let Some((_, else_branch)) = &if_expr.else_branch {
-                else_lowered = lower_expr(graph, &mut else_block, else_branch, options, ctx)?;
-            }
-            let else_exit_snapshot = ctx.getstate(0);
-
-            // RPython `flowspace/flowcontext.py` merges via Link: a
-            // branch whose path is closed (`return`/`raise`/`break`)
-            // does not `goto` the merge — the `is_open` check below
-            // already skips it.  A phi inputarg is introduced when both
-            // arms *produced a value*, mirroring the old all-or-nothing
-            // shape; arity is kept consistent by skipping the closed
-            // arm's goto so only the open arm sends a `vec![value]` to
-            // the one-inputarg merge block.
-            let then_value = then_lowered.value;
-            let else_value = else_lowered.value;
-            let then_open = graph.block(then_block).is_open();
-            let else_open = graph.block(else_block).is_open();
-            let want_phi = then_value.is_some() && else_value.is_some();
-
-            let (merge_block, phi_result) = if want_phi {
-                let (merge, phi_args) = graph.create_block_with_args(1);
-                if then_open {
-                    graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
-                    graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
-                }
-                if else_open {
-                    graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
-                    graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
-                }
-                (merge, Some(phi_args[0]))
-            } else {
-                let merge = graph.create_block();
-                if then_open {
-                    graph.set_goto(then_block, merge, vec![]);
-                    graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
-                }
-                if else_open {
-                    graph.set_goto(else_block, merge, vec![]);
-                    graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
-                }
-                (merge, None)
-            };
-
-            // FrameState::union-driven merge when both arms reach the
-            // merge block.  Routes through `FrameState::union` for
-            // explicit per-slot classification per RPython
-            // `flowspace/framestate.py:105-128 union`:
-            //   - One-sided None → None-kill (`framestate.py:110-111`):
-            //     the slot is dropped from `ctx` so post-merge reads
-            //     of that name surface as undefined-local.
-            //   - CarryThrough (same vid both arms): kept; the merged
-            //     entry's `value_type` may have widened from `Unknown`
-            //     to a concrete kind via the wildcard rule and the
-            //     source `OpKind`'s `ty` is retagged below to keep
-            //     `graph_value_type` in agreement with the framestate.
-            //   - NeedsPhi (disagreeing vids): eager phi install at
-            //     union time per `framestate.py:113-114 union`'s
-            //     fresh `Variable()` semantics —
-            //     `lazy_install_local_at_current_block` allocates the
-            //     merge-block inputarg, threads per-arm vids onto
-            //     each predecessor's goto args, and rebinds ctx so
-            //     post-merge reads of the name resolve to the new
-            //     phi vid without re-driving the lazy installer.
-            //
-            // `FrameState::union` returns `Option<FrameState>` per
-            // `framestate.py:78-89`'s `try/except UnionError: return
-            // None` envelope.  Pyre's `entries` carry `Option<ValueId>`
-            // not `Option<Hlvalue>`, so the `framestate.py:117/126
-            // UnionError` paths (SpecTag mismatch, FlowSignal-type
-            // mismatch) cannot be raised against `entries`.  They
-            // remain reachable on the stack / exception projections
-            // once the Z4 walker populates them; until then the union
-            // is total on the AST frontend and the `.expect(...)`
-            // below documents that invariant.  Per-slot type
-            // unification across arms is annotator-side per upstream
-            // `framestate.py:union` (Hlvalue identity only) — there
-            // is no concrete-kind disagreement at union time.
-            if then_open && else_open {
-                // `framestate.py:78` returns `None` from `union` on
-                // any per-projection `UnionError`.  The AST-frontend's
-                // entries domain (ValueId-identity) is total; the
-                // stack / last_exception / blocklist / next_offset
-                // projections are vestigially empty / None / 0, so
-                // `union` is currently infallible at this call site.
-                // The `expect` documents the invariant — when Z4
-                // walker activates the four vestigial projections,
-                // this site needs the upstream `flowcontext.py:431-
-                // 436 mergeblock` candidate-loop fallback (allocate
-                // a fresh SpamBlock when no candidate unioned).
-                let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
-                    "AST frontend: union is total — entries domain has no UnionError, \
-                         stack / last_exception / blocklist / next_offset are vestigial \
-                         (framestate.py:78 None-return reachable only post-Z4 walker)",
-                );
-                // Carry-through Unknown→concrete widening at the
-                // Type unification across arms is annotator-side per
-                // upstream `framestate.py:union` (Hlvalue identity
-                // only) — no per-slot value_type retag at union time.
-                // The prior carry-through retag block was a
-                // NEW-DEVIATION dependent on the retired
-                // `FrameStateEntry::value_type` field; it has been
-                // removed in Path-Z Slice 2.3.  Convergence: when
-                // pyre's annotator (`crate::annotator`) runs over
-                // AST-frontend graphs, `Variable.annotation` /
-                // `Variable.concretetype` carries the unified type
-                // and downstream consumers read from there.
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    if slot.is_some() {
-                        continue;
-                    }
-                    // None-kill: name present on at most one side —
-                    // drop from ctx so post-merge reads do not return
-                    // a stale binding.  `local_first_bind_order` /
-                    // `local_first_bind_seen` are graph-wide
-                    // append-only and stay untouched (the slot index
-                    // remains valid; future snapshots push `None` for
-                    // it).  Resolve `slot_idx → name` via
-                    // `local_first_bind_order` per the framestate
-                    // positional-zip invariant.
-                    if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
-                        ctx.local_value_ids.remove(&name);
-                        ctx.local_value_types.remove(&name);
-                    }
-                }
-
-                // Eager phi install for every fresh-phi slot.
-                // `flowspace/framestate.py:113-114 union` returns a
-                // fresh `Variable()` whenever per-slot vids
-                // disagree; pyre's `union` already allocated
-                // the fresh ValueId, so we drive the lazy installer
-                // with `Some(slot.value_id)` to emit the Input op +
-                // inputarg + predecessor link args using the same
-                // vid the merged state already refers to.
-                // Carry-through slots agreed on a single vid so no
-                // fresh phi is emitted (`framestate.py:108-109 if w1
-                // == w2: return w1`); first post-merge read of those
-                // names still drives the lazy installer's same-block
-                // reuse path.
-                for (slot_idx, slot_vid) in merged
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-                {
-                    let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
-                    let is_fresh_phi = then_vid != Some(slot_vid);
-                    if is_fresh_phi {
-                        let name = ctx.local_first_bind_order[slot_idx].clone();
-                        let _ = lazy_install_local_at_current_block(
-                            graph,
-                            ctx,
-                            merge_block,
-                            &name,
-                            Some(slot_vid),
-                        );
-                    }
-                }
-            }
-
-            *block = merge_block;
-            // If NEITHER arm remains open, the merge block is
-            // unreachable — mark the enclosing path as closed so the
-            // caller stops lowering into it.  RPython parity:
-            // `flowspace/flowcontext.py` never keeps a merge block
-            // reachable when all incoming links closed with
-            // `FlowSignal::Return` / `Raise`.
-            if !then_open && !else_open {
-                Ok(Lowered::path_closed())
-            } else {
-                Ok(Lowered {
-                    value: phi_result,
-                    path_closed: false,
-                })
-            }
-        }
+        syn::Expr::If(if_expr) => lower_if_expr(graph, block, if_expr, options, ctx),
 
         // ── return ──
         syn::Expr::Return(ret) => {
@@ -4507,12 +4526,13 @@ fn lower_expr(
                         let result_ty = graph_value_type(graph, operand)
                             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref))
                             .unwrap_or(ValueType::Int);
+                        let operand_var = graph.must_variable(operand);
                         return Ok(Lowered {
                             value: graph.push_op(
                                 *block,
                                 OpKind::UnaryOp {
                                     op: "invert".into(),
-                                    operand,
+                                    operand: operand_var,
                                     result_ty,
                                 },
                                 true,
@@ -4542,12 +4562,13 @@ fn lower_expr(
                     }
                 }
                 let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                let operand_var = graph.must_variable(operand);
                 let cond = graph
                     .push_op(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
-                            operand,
+                            operand: operand_var,
                             result_ty: ValueType::Bool,
                         },
                         true,
@@ -4617,12 +4638,13 @@ fn lower_expr(
                 });
             }
             let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::UnaryOp {
                         op: unary_op_name(&u.op).into(),
-                        operand,
+                        operand: operand_var,
                         result_ty: ValueType::Unknown,
                     },
                     true,
@@ -4667,12 +4689,13 @@ fn lower_expr(
                 let is_and = matches!(bin.op, syn::BinOp::And(_));
 
                 let lhs_raw = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+                let lhs_raw_var = graph.must_variable(lhs_raw);
                 let cond = graph
                     .push_op(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
-                            operand: lhs_raw,
+                            operand: lhs_raw_var,
                             result_ty: ValueType::Bool,
                         },
                         true,
@@ -4815,12 +4838,14 @@ fn lower_expr(
             let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
             let op_name = binary_op_name(&bin.op);
             let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
+            let lhs_var = graph.must_variable(lhs);
+            let rhs_var = graph.must_variable(rhs);
             let value = graph.push_op(
                 *block,
                 OpKind::BinOp {
                     op: op_name.into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty,
                 },
                 true,
@@ -4890,12 +4915,13 @@ fn lower_expr(
             // so each opname routes through the rtyper directly; the
             // adapter at `flowspace_adapter.rs::normalize_unary_op_name`
             // passes them through unchanged.
+            let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::UnaryOp {
                         op,
-                        operand,
+                        operand: operand_var,
                         result_ty,
                     },
                     true,
@@ -4939,7 +4965,22 @@ fn lower_expr(
             // loop breaks at the first unsupported construct, matching
             // upstream's all-or-nothing flowgraph semantics.
             let mut arm_entries: Vec<BlockId> = Vec::with_capacity(m.arms.len());
-            let mut arm_tails: Vec<(BlockId, Option<ValueId>, FrameState)> =
+            // Each arm carries (tail, value, exit_framestate,
+            // exit_local_bindings).  The trailing
+            // `LocalBindingSnapshot` is the per-arm version of the
+            // `then_exit_ctx` / `else_exit_ctx` captures in
+            // [`lower_if_expr`]: when exactly one arm survives the
+            // merge (siblings all closed via `return` / `raise` /
+            // `break` / `panic!`), the post-merge `ctx` must
+            // restore to that arm's bindings rather than the
+            // pre-match snapshot, so post-merge reads of the
+            // surviving arm's rebinds resolve to the correct SSA
+            // values.  This is the if-let path's regression carrier
+            // — `if let pat = scrut { x = 1; } else { return 0; } x`
+            // desugars to a 2-arm match where only the open arm
+            // contributes bindings, and the bound `x` must be
+            // visible past the merge.
+            let mut arm_tails: Vec<(BlockId, Option<ValueId>, FrameState, LocalBindingSnapshot)> =
                 Vec::with_capacity(m.arms.len());
             for arm in &m.arms {
                 let entry = graph.create_block();
@@ -4962,6 +5003,7 @@ fn lower_expr(
                 // snapshot and falls back to the legacy naked-`Input`
                 // emit, which loses the per-arm rebind information.
                 let arm_exit_snapshot = ctx.getstate(0);
+                let arm_exit_locals = LocalBindingSnapshot::capture(ctx);
                 saved_locals.restore(ctx);
                 let arm_lowered = arm_lowered_result?;
                 // A closed arm (body is `return x` / `break` / `panic!`
@@ -4972,7 +5014,7 @@ fn lower_expr(
                 // sibling walks continue irrespective of this arm's
                 // closure.
                 arm_entries.push(entry);
-                arm_tails.push((tail, arm_lowered.value, arm_exit_snapshot));
+                arm_tails.push((tail, arm_lowered.value, arm_exit_snapshot, arm_exit_locals));
             }
 
             // Merge gets a Phi inputarg iff every arm that actually
@@ -4985,7 +5027,7 @@ fn lower_expr(
             // inputarg arity), so in that case we emit no phi at all.
             let all_open_arms_have_value = arm_tails
                 .iter()
-                .all(|(tail, r, _)| !graph.block(*tail).is_open() || r.is_some());
+                .all(|(tail, r, _, _)| !graph.block(*tail).is_open() || r.is_some());
             let (merge, merge_phi) = if all_open_arms_have_value {
                 let (m_block, phi_args) = graph.create_block_with_args(1);
                 (m_block, Some(phi_args[0]))
@@ -5000,13 +5042,18 @@ fn lower_expr(
             // locals state.  Parity port of Expr::If's both-open-arm
             // merge generalised to N arms — see the union block below
             // for the per-slot semantics.
-            let mut open_arm_snapshots: Vec<FrameState> = Vec::new();
-            for (tail, result, exit_snapshot) in &arm_tails {
+            //
+            // Pair each framestate with the corresponding
+            // `LocalBindingSnapshot` so the post-loop single-open-arm
+            // branch can restore exactly that arm's ctx bindings
+            // (per the carrier-comment above the `arm_tails` decl).
+            let mut open_arm_snapshots: Vec<(FrameState, LocalBindingSnapshot)> = Vec::new();
+            for (tail, result, exit_snapshot, exit_locals) in &arm_tails {
                 if !graph.block(*tail).is_open() {
                     continue;
                 }
                 any_open = true;
-                open_arm_snapshots.push(exit_snapshot.clone());
+                open_arm_snapshots.push((exit_snapshot.clone(), exit_locals.clone()));
                 let goto_args = if all_open_arms_have_value {
                     // Safe: the filter above guarantees every open arm's
                     // `result` is `Some`.
@@ -5039,7 +5086,12 @@ fn lower_expr(
                         );
                     }
                 }
-                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+                let scrutinee_var = graph.must_variable(scrutinee);
+                graph.set_control_flow_metadata(
+                    *block,
+                    Some(ExitSwitch::Value(scrutinee_var)),
+                    exits,
+                );
             } else if let Some(arm_exitcases) = switch_exitcases {
                 // RPython `flatten.py:278-308` switch shape:
                 // `exitswitch` is the scrutinee and each primitive arm
@@ -5055,7 +5107,12 @@ fn lower_expr(
                         );
                     }
                 }
-                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+                let scrutinee_var = graph.must_variable(scrutinee);
+                graph.set_control_flow_metadata(
+                    *block,
+                    Some(ExitSwitch::Value(scrutinee_var)),
+                    exits,
+                );
             } else if m.arms.len() == 1 {
                 graph.set_goto(*block, arm_entries[0], vec![]);
             } else {
@@ -5156,8 +5213,8 @@ fn lower_expr(
                 // flowcontext-walker rewrite materialises intermediate
                 // SpamBlocks per fold step, the chain becomes load-
                 // bearing without further infrastructure changes.
-                let mut acc = open_arm_snapshots[0].clone();
-                for arm in &open_arm_snapshots[1..] {
+                let mut acc = open_arm_snapshots[0].0.clone();
+                for (arm, _) in &open_arm_snapshots[1..] {
                     // Same `expect` rationale as the `Expr::If` site:
                     // AST-frontend `union` is total today (entries
                     // ValueId-identity, vestigial empty/None for the
@@ -5173,7 +5230,7 @@ fn lower_expr(
                     );
                 }
                 let merged = acc;
-                let first_arm = &open_arm_snapshots[0];
+                let first_arm = &open_arm_snapshots[0].0;
                 // Type unification across arms is annotator-side per
                 // upstream `framestate.py:union` (Hlvalue identity
                 // only).  The prior carry-through retag block was a
@@ -5215,6 +5272,21 @@ fn lower_expr(
                         );
                     }
                 }
+            } else if open_arm_snapshots.len() == 1 {
+                // Companion of `lower_if_expr`'s `then_exit_ctx` /
+                // `else_exit_ctx` restore for the case where exactly
+                // one arm reaches the merge.  Without this restore,
+                // ctx still holds the pre-match snapshot (because
+                // every arm called `saved_locals.restore(ctx)` after
+                // its body walk), and post-merge reads of the
+                // surviving arm's rebinds would resolve to the wrong
+                // (stale) SSA values.  The if-let desugar at the top
+                // of [`lower_if_expr`] funnels patterns like
+                // `if let pat = scrut { x = 1; } else { return 0; } x`
+                // through this match path, so the regression carrier
+                // is `Expr::Match` — restore here keeps the post-`x`
+                // read on the surviving open arm's binding.
+                open_arm_snapshots[0].1.clone().restore(ctx);
             }
 
             *block = merge;
@@ -5676,36 +5748,28 @@ fn lower_expr(
             }
             let continuation = graph.create_block();
             let continuation_arg = graph.alloc_value();
-            graph
-                .block_mut(continuation)
-                .inputargs
-                .push(continuation_arg);
+            graph.push_inputarg(continuation, continuation_arg);
             // RPython `flowcontext.py:130-133` — fresh prevblock-side
             // `Variable('last_exception')` + `Variable('last_exc_value')`.
             let last_exception = graph.alloc_value();
             let last_exc_value = graph.alloc_value();
             let exc_block = graph.exceptblock;
             graph.set_goto(*block, continuation, vec![inner]);
+            let normal_link = Link::new(graph, vec![inner], continuation, None);
+            let exc_link = Link::new(
+                graph,
+                vec![last_exception, last_exc_value],
+                exc_block,
+                Some(exception_exitcase()),
+            )
+            .extravars(
+                Some(LinkArg::value(graph, last_exception)),
+                Some(LinkArg::value(graph, last_exc_value)),
+            );
             graph.set_control_flow_metadata(
                 *block,
                 Some(ExitSwitch::LastException),
-                vec![
-                    // RPython `flowcontext.py:141` `Link(vars=[], egg, case=None)`
-                    // for the normal fall-through.
-                    Link::new(vec![inner], continuation, None),
-                    // RPython `flowcontext.py:141-143` `link = Link(vars, egg, case)`
-                    // + `link.extravars(last_exception=..., last_exc_value=...)`
-                    // with `case is Exception`.
-                    Link::new(
-                        vec![last_exception, last_exc_value],
-                        exc_block,
-                        Some(exception_exitcase()),
-                    )
-                    .extravars(
-                        Some(LinkArg::from(last_exception)),
-                        Some(LinkArg::from(last_exc_value)),
-                    ),
-                ],
+                vec![normal_link, exc_link],
             );
             *block = continuation;
             Ok(Lowered::value(continuation_arg))
@@ -5843,12 +5907,14 @@ fn lower_expr(
                                     } else {
                                         "eq"
                                     };
+                                    let lhs_var = graph.must_variable(lhs);
+                                    let rhs_var = graph.must_variable(rhs);
                                     graph.push_op(
                                         *block,
                                         OpKind::BinOp {
                                             op: op_name.into(),
-                                            lhs,
-                                            rhs,
+                                            lhs: lhs_var,
+                                            rhs: rhs_var,
                                             result_ty: ValueType::Unknown,
                                         },
                                         true,
@@ -7339,7 +7405,7 @@ fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueT
 fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
     for target_block in &graph.blocks {
         let Some(arg_index) = target_block
-            .inputargs
+            .inputarg_value_ids(graph)
             .iter()
             .position(|&inputarg| inputarg == value)
         else {
@@ -7352,10 +7418,15 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
                     continue;
                 }
                 let source_ty = match link.args.get(arg_index)? {
-                    LinkArg::Value(source) => match graph_result_value_type(graph, *source) {
-                        Some(ty) => ty,
-                        None => continue,
-                    },
+                    arg @ LinkArg::Value(_) => {
+                        let Some(source) = arg.as_value(graph) else {
+                            continue;
+                        };
+                        match graph_result_value_type(graph, source) {
+                            Some(ty) => ty,
+                            None => continue,
+                        }
+                    }
                     // RPython `flowspace/model.py:Constant.concretetype`
                     // — `Link.args` may carry constants whose lltype is
                     // determined by the constant's Python class; the
@@ -7365,7 +7436,7 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
                     // Unknown, which the rtyper backfills with GcRef
                     // and forces synthetic casts at int/float
                     // operations downstream.
-                    LinkArg::Const(c) => match const_value_value_type(c) {
+                    LinkArg::Const(c) => match const_value_value_type(&c.value) {
                         Some(ty) => ty,
                         None => continue,
                     },
@@ -9664,8 +9735,9 @@ mod tests {
         // eagerly by the iterative fold's fresh-phi step (the
         // disagreeing-vid branch of 2-way `union`).
         let phi_block = graph.blocks.iter().find(|block| {
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| block.inputargs.contains(&r))
+                op.result.is_some_and(|r| inputarg_vids.contains(&r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -9745,8 +9817,9 @@ mod tests {
         // inputarg — that's the merge-block phi the lazy installer
         // allocates when the post-match `x` read fires.
         let phi_block = graph.blocks.iter().find(|block| {
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| block.inputargs.contains(&r))
+                op.result.is_some_and(|r| inputarg_vids.contains(&r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -9822,9 +9895,10 @@ mod tests {
             if block.inputargs.is_empty() {
                 continue;
             }
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             let has_i_input = block.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "i")
-                    && op.result.is_some_and(|r| block.inputargs.contains(&r))
+                    && op.result.is_some_and(|r| inputarg_vids.contains(&r))
             });
             if !has_i_input {
                 continue;
@@ -11323,7 +11397,8 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(
             entry.exits[0].args,
-            vec![crate::model::LinkArg::from(
+            vec![crate::model::LinkArg::value(
+                &func.graph,
                 entry.operations[0].result.expect("const result"),
             )],
         );
@@ -11346,7 +11421,10 @@ mod tests {
         // RPython `flowcontext.py` emits a fresh Variable on the
         // prevblock side for `return None`; the returnblock's own
         // inputarg stays distinct.
-        let returnblock_arg = func.graph.block(func.graph.returnblock).inputargs[0];
+        let returnblock_arg = func
+            .graph
+            .block(func.graph.returnblock)
+            .inputarg_value_ids(&func.graph)[0];
         // Upstream `flowspace/model.py:171-180` keeps the void return shape
         // in Block.exits: a single Link([fresh_void], graph.returnblock)
         // with exitswitch=None.
@@ -11356,7 +11434,7 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(entry.exits[0].args.len(), 1);
         assert_ne!(
-            entry.exits[0].args[0].as_value(),
+            entry.exits[0].args[0].as_value(&func.graph),
             Some(returnblock_arg),
             "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
              not reuse the returnblock's own inputarg"
@@ -11942,9 +12020,10 @@ mod tests {
         // filtered out (None-killed: not in pre-loop snapshot).
         assert_eq!(header_phi_names, vec!["x".to_string()]);
 
+        let header_inputarg_vids = graph.block(header_entry).inputarg_value_ids(&graph);
+        assert_eq!(header_inputarg_vids.len(), 1);
+        let phi_vid = header_inputarg_vids[0];
         let header = graph.block(header_entry);
-        assert_eq!(header.inputargs.len(), 1);
-        let phi_vid = header.inputargs[0];
         assert_eq!(header.operations.len(), 1);
         let phi_op = &header.operations[0];
         match &phi_op.kind {
@@ -11959,7 +12038,7 @@ mod tests {
         let pre_exit = &graph.block(pre_loop_block).exits[0];
         assert_eq!(
             pre_exit.args,
-            vec![LinkArg::Value(pre_x)],
+            vec![LinkArg::value(&graph, pre_x)],
             "forward-edge link arg for `x` must carry the pre-loop vid"
         );
 
@@ -12078,11 +12157,14 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
+        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. }
+                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12140,11 +12222,14 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
+        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. }
+                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12207,11 +12292,12 @@ mod tests {
         // inner loop headers).
         let mut loop_headers_with_outer = 0;
         for header in &graph.blocks {
+            let header_inputarg_vids = header.inputarg_value_ids(&graph);
             let has_outer_phi = header.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "outer")
                     && op
                         .result
-                        .map(|r| header.inputargs.contains(&r))
+                        .map(|r| header_inputarg_vids.contains(&r))
                         .unwrap_or(false)
             });
             if !has_outer_phi {
@@ -12324,9 +12410,13 @@ mod tests {
         // `x`.  Today the loop header carries one because the AST
         // scan collapses both `let x` bindings into the same name.
         let any_x_phi = graph.blocks.iter().any(|b| {
+            let inputarg_vids = b.inputarg_value_ids(&graph);
             b.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "x")
-                    && op.result.map(|r| b.inputargs.contains(&r)).unwrap_or(false)
+                    && op
+                        .result
+                        .map(|r| inputarg_vids.contains(&r))
+                        .unwrap_or(false)
             })
         });
         assert!(
@@ -12517,10 +12607,7 @@ mod tests {
         let pred_link: Option<(BlockId, ValueId)> = graph.blocks.iter().find_map(|b| {
             b.exits.iter().find_map(|exit| {
                 if exit.target == returnblock_id {
-                    let arg_vid = match &exit.args[0] {
-                        crate::model::LinkArg::Value(v) => *v,
-                        _ => return None,
-                    };
+                    let arg_vid = exit.args[0].as_value(&graph)?;
                     Some((b.id, arg_vid))
                 } else {
                     None
@@ -12530,14 +12617,15 @@ mod tests {
         let (post_loop_id, ret_value_vid) =
             pred_link.expect("returnblock must have one closing predecessor");
         let post_loop_block = graph.block(post_loop_id);
-        let is_inputarg = post_loop_block.inputargs.contains(&ret_value_vid);
+        let post_loop_vids = post_loop_block.inputarg_value_ids(&graph);
+        let is_inputarg = post_loop_vids.contains(&ret_value_vid);
         assert!(
             is_inputarg,
             "post-loop block must own `y` as an inputarg threaded back to \
              pre-loop; got naked-`Input` fallback (vid {:?} not in \
              inputargs {:?}). graph:\n{}",
             ret_value_vid,
-            post_loop_block.inputargs,
+            post_loop_vids,
             graph.dump()
         );
         // Audit Cat 2-1 also stamps continue + body_tail framestate
@@ -12551,9 +12639,10 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| {
+                let inputarg_vids = b.inputarg_value_ids(&graph);
                 let owns_count_phi = b.operations.iter().any(|op| {
                     matches!(&op.kind, OpKind::Input { name, .. } if name == "count")
-                        && op.result.is_some_and(|r| b.inputargs.contains(&r))
+                        && op.result.is_some_and(|r| inputarg_vids.contains(&r))
                 });
                 let pred_count = graph
                     .blocks

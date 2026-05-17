@@ -11,34 +11,146 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::flatten::{FlatOp, Label, SSARepr};
+use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
 use crate::model::ValueId;
+use crate::regalloc::RegAllocResult;
 
 /// Compute liveness for a flattened function.
 ///
 /// RPython: `liveness.py::compute_liveness(ssarepr)`.
 ///
 /// Modifies the flattened ops in place: each `FlatOp::Live` marker
-/// gets its `live_values` set populated with all values alive at that
-/// point in the instruction sequence.
+/// gets its `live_values` set populated with all [`Register`]s alive
+/// at that point in the instruction sequence.
+///
+/// `regallocs` supplies the [`ValueId`]→`(kind, color)` mapping used
+/// to convert FlatOp::Op operand [`ValueId`]s to [`Register`]s for
+/// the alive set — RPython works directly on Registers because
+/// `serialize_op` already projects `Variable`→`Register` via
+/// `getcolor`; pyre keeps `SpaceOperation` slots as `ValueId` for now,
+/// so the conversion happens here at the liveness boundary.
 /// RPython liveness.py:19-23.
-pub fn compute_liveness(flattened: &mut SSARepr) {
-    let mut label2alive: HashMap<Label, HashSet<ValueId>> = HashMap::new();
+///
+/// `graph` is required: every `FlatOp::Op` operand's kind reads
+/// through `graph.concretetype(v)` (the upstream
+/// `Variable.concretetype` source of truth), so a `None` here would
+/// silently strip operand uses from the alive set — that regressed
+/// `main`-shaped parity before this API became graph-only.
+pub fn compute_liveness(
+    flattened: &mut SSARepr,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    graph: &crate::model::FunctionGraph,
+) {
+    let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
-    // Iterate to fixpoint (RPython: while _compute_liveness_must_continue)
     loop {
-        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive) {
+        if !compute_liveness_pass_with_graph(
+            &mut flattened.insns,
+            &mut label2alive,
+            regallocs,
+            Some(graph),
+        ) {
             break;
         }
     }
-    // RPython liveness.py:23: remove_repeated_live(ssarepr)
     remove_repeated_live(&mut flattened.insns);
+}
+
+/// Resolve a [`ValueId`] from a `FlatOp::Op` operand to its
+/// [`Register`].
+///
+/// **Structural divergence (TODO)**: PyPy `liveness.py:67` walks
+/// instructions whose register operands are already
+/// [`Register`] / `ListOfKind` because `flatten_list()`
+/// (`flatten.py:355-371`) projected `Variable` → `Register` at
+/// flatten time.  Pyre's `FlatOp::Op` still carries
+/// [`crate::model::SpaceOperation`] with [`ValueId`] slots, so the
+/// liveness pass has to redo the `getcolor` lookup here.  The fix
+/// is to migrate `SpaceOperation` slots to `Register` so liveness
+/// can read the kind off the operand directly; until that lands
+/// this helper preserves the same `(kind, color)` answer.
+///
+/// **RPython invariant** (`flatten.py:382` `getcolor`): every
+/// `Variable` has a single `(kind, color)` via
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  When `graph` is
+/// supplied (production path) the lookup reads kind via
+/// `graph.concretetype(v)` and color via `RegAllocResult::color_for`,
+/// projecting through the backing Variable; a miss panics — PyPy
+/// would never fall back to other classes.  Without `graph` (test
+/// fixtures with no kind source), the helper returns `None`
+/// because the new Variable-keyed `coloring` map cannot be queried
+/// by `ValueId` directly without the projection through
+/// `graph.variable(v)`.
+fn value_to_register_with_graph(
+    v: ValueId,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    graph: Option<&crate::model::FunctionGraph>,
+) -> Option<Register> {
+    let Some(graph) = graph else {
+        // Test fixtures pass empty regallocs without a graph; with no
+        // kind source and no Variable projection there is no register
+        // to surface.  Production callers always supply `graph`.
+        return None;
+    };
+    use crate::model::ConcreteType;
+    let declared = graph.concretetype(v);
+    let kind = match declared {
+        ConcreteType::Signed => Some(RegKind::Int),
+        ConcreteType::GcRef => Some(RegKind::Ref),
+        ConcreteType::Float => Some(RegKind::Float),
+        ConcreteType::Void | ConcreteType::Unknown => None,
+    };
+    if let Some(kind) = kind {
+        let ra = regallocs.get(&kind).unwrap_or_else(|| {
+            panic!(
+                "value_to_register: graph declared kind {kind:?} for {v:?} \
+                 but regallocs map is missing the entry",
+            )
+        });
+        let color = ra.color_for(graph, v).unwrap_or_else(|| {
+            let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                .iter()
+                .filter(|k| **k != kind)
+                .filter(|k| {
+                    regallocs
+                        .get(*k)
+                        .is_some_and(|ra| ra.contains_value(graph, v))
+                })
+                .copied()
+                .collect();
+            panic!(
+                "value_to_register: graph declared kind {kind:?} for {v:?} \
+                 but regallocs[{kind:?}] has no coloring (other classes with a \
+                 coloring: {other_classes:?})",
+            )
+        });
+        return Some(Register::new(kind, color));
+    }
+    // Void / Unknown — fall through to KINDS scan via Variable
+    // projection.
+    let mut found: Option<Register> = None;
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        if let Some(ra) = regallocs.get(&kind) {
+            if let Some(color) = ra.color_for(graph, v) {
+                if let Some(prev) = found {
+                    panic!(
+                        "value_to_register: ValueId {v:?} colored in multiple regalloc \
+                         classes ({:?} and {kind:?}) — RPython `getkind` must give \
+                         exactly one",
+                        prev.kind,
+                    );
+                }
+                found = Some(Register::new(kind, color));
+            }
+        }
+    }
+    found
 }
 
 /// RPython liveness.py:82-116: remove_repeated_live.
 ///
 /// Merges consecutive `-live-` markers into a single one (union of
-/// all live values). Labels between them are preserved.
+/// all live registers). Labels between them are preserved.
 fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
     let mut result: Vec<FlatOp> = Vec::new();
     let mut i = 0;
@@ -48,13 +160,12 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
             i += 1;
             continue;
         }
-        // Collect consecutive Live + Label runs
         let mut labels = Vec::new();
-        let mut merged_live: HashSet<ValueId> = HashSet::new();
+        let mut merged_live: HashSet<Register> = HashSet::new();
         while i < ops.len() {
             match &ops[i] {
                 FlatOp::Live { live_values } => {
-                    merged_live.extend(live_values.iter());
+                    merged_live.extend(live_values.iter().copied());
                     i += 1;
                 }
                 FlatOp::Label(_) => {
@@ -64,10 +175,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
                 _ => break,
             }
         }
-        // Emit labels first, then the merged -live-
         result.extend(labels);
-        let mut merged: Vec<ValueId> = merged_live.into_iter().collect();
-        merged.sort_by_key(|v| v.0);
+        // Stable order so the final bytecode encoding is reproducible.
+        let mut merged: Vec<Register> = merged_live.into_iter().collect();
+        merged.sort_by_key(|r| (r.kind as u8, r.index));
         result.push(FlatOp::Live {
             live_values: merged,
         });
@@ -82,14 +193,36 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 ///
 /// Walks backward through the instruction sequence. At each `-live-`
 /// marker, expands it to include all values alive at that point.
-fn compute_liveness_pass(
+/// Reads each `FlatOp::Op` operand's kind via `graph.concretetype(v)`
+/// and color via `RegAllocResult::color_for(graph, v)` — both routed
+/// through the backing `Variable` so the lookup matches upstream
+/// `flatten.py:382 getcolor` line-for-line.
+fn compute_liveness_pass_with_graph(
     ops: &mut [FlatOp],
-    label2alive: &mut HashMap<Label, HashSet<ValueId>>,
+    label2alive: &mut HashMap<Label, HashSet<Register>>,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> bool {
-    let mut alive: HashSet<ValueId> = HashSet::new();
+    let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
 
-    // Walk backward through instructions
+    // `def_value` and `use_value` route a `FlatOp::Op`-side
+    // [`ValueId`] through `graph.variable(v)` + regalloc to its
+    // [`Register`] before joining the alive set.  Void /
+    // unallocated values are silently dropped (RPython's
+    // `flatten.py:325 if v.concretetype is not lltype.Void` makes
+    // the same filter at flatten time).
+    let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
+        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
+            alive.remove(&r);
+        }
+    };
+    let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
+        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
+            alive.insert(r);
+        }
+    };
+
     for i in (0..ops.len()).rev() {
         match &ops[i] {
             FlatOp::Label(label) => {
@@ -102,39 +235,35 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::Live { live_values } => {
-                // RPython liveness.py:44-52: -live- markers are expanded
-                // to include all values currently alive at this point.
-                // Also union any explicitly-forced values from jtransform.
-                for v in live_values {
-                    alive.insert(*v);
+                // RPython liveness.py:44-52: `-live-` markers are
+                // expanded to the full set of [`Register`]s alive at
+                // this point.  Pre-seeded values (e.g. forced by
+                // jtransform) merge in here.
+                for r in live_values {
+                    alive.insert(*r);
                 }
-                // Expand: replace this Live marker with all alive values.
                 ops[i] = FlatOp::Live {
                     live_values: alive.iter().copied().collect(),
                 };
             }
             FlatOp::EndOfBlock => {
-                // RPython `liveness.py:55-57`: `'---'` resets the alive
-                // set so the next block starts a fresh liveness region.
                 alive.clear();
             }
             FlatOp::Unreachable => {
-                // The real `unreachable` opcode (`blackhole.py:962-964
-                // bhimpl_unreachable`) ends the trace path with an
-                // `AssertionError`. RPython treats it as a regular
-                // operand-less opcode and goes through `liveness.py:59+`
-                // with an empty arg list, leaving the alive set
-                // unchanged. The trailing `EndOfBlock` (`flatten.py:292-293`
-                // always emits the pair) is what resets it.
+                // Same liveness semantics as `EndOfBlock`: the
+                // instruction stream past this point cannot execute,
+                // so registers that are only live in the dead tail
+                // must NOT leak backward into earlier `-live-`
+                // markers.  Without this clear, regalloc / resume
+                // would over-pin those slots for no observable use.
+                alive.clear();
             }
             FlatOp::Op(inner_op) => {
-                // Result is defined here — remove from alive
                 if let Some(result) = inner_op.result {
-                    alive.remove(&result);
+                    def_value(&mut alive, result);
                 }
-                // Operands are used here — add to alive
-                for vid in crate::inline::op_value_refs(&inner_op.kind) {
-                    alive.insert(vid);
+                for vid in crate::inline::op_value_refs(&inner_op.kind, graph) {
+                    use_value(&mut alive, vid);
                 }
             }
             FlatOp::Jump(label) => {
@@ -156,9 +285,8 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::GotoIfNot { cond, target } => {
-                let cond = *cond;
                 let target = *target;
-                alive.insert(cond);
+                alive.insert(*cond);
                 if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
                 }
@@ -186,56 +314,48 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::Move { dst, src } => {
-                // `src` may be a Variable or a Constant (upstream
-                // `getcolor` at flatten.py:382-384 returns the Constant
-                // as-is); Constants contribute no live range.
+                // `flatten.py:333` — `int_copy %src -> %dst`.
+                // Backward: dst is defined, register source is used,
+                // constant source contributes nothing.
                 alive.remove(dst);
-                if let Some(v) = src.as_value() {
-                    alive.insert(v);
+                if let crate::flatten::RegOrConst::Reg(r) = src {
+                    alive.insert(*r);
                 }
             }
             FlatOp::Push(src) => {
-                // RPython `flatten.py:329` `%s_push` — reads `v` into
-                // tmpreg. Backwards: treat as a pure use of `src`.
-                //
-                // Only Variables reach this arm: upstream
-                // `reorder_renaming_list` at `flatten.py:395-414` only
-                // triggers a push when no progress is possible, which
-                // requires every `to[i]` Register to appear in `frm`;
-                // Constants are structurally distinct from Registers
-                // (Python `==`), so a Constant `frm[i]` is always
-                // consumed in a non-cycle step and never lands in the
-                // cycle-break save slot.
+                // `flatten.py:329` — `int_push %src` reads `src` into
+                // the per-kind tmpreg.  Backward: a pure use of src.
                 alive.insert(*src);
             }
             FlatOp::Pop(dst) => {
-                // RPython `flatten.py:331` `%s_pop` — writes tmpreg
-                // into `w`. Backwards: treat as a pure def of `dst`.
+                // `flatten.py:331` — `int_pop -> %dst` writes tmpreg
+                // into dst.  Backward: a pure def of dst.
                 alive.remove(dst);
             }
             FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
+                // Register operand carries (kind, color); the alive
+                // set is Register-keyed so the def removes the
+                // matching slot directly without any ValueId bridge.
                 alive.remove(dst);
             }
             FlatOp::Reraise => {}
             FlatOp::IntReturn(v) | FlatOp::RefReturn(v) | FlatOp::FloatReturn(v) => {
-                // RPython blackhole `bhimpl_*_return(a)` reads `a` and
-                // leaves the frame.  Backward walk: the return value is
-                // alive at this point; after it (forward) nothing is.
+                // Backward: the return value is alive at this point;
+                // after it (forward) nothing is.  RegOrConst::Reg
+                // contributes its Register to the alive set;
+                // Constants don't.
                 alive.clear();
-                if let Some(value) = v.as_value() {
-                    alive.insert(value);
+                if let crate::flatten::RegOrConst::Reg(r) = v {
+                    alive.insert(*r);
                 }
             }
             FlatOp::VoidReturn => {
-                // `bhimpl_void_return()` has no args.  Nothing alive
-                // after the return.
                 alive.clear();
             }
             FlatOp::Raise(v) => {
-                // `bhimpl_raise(excvalue)` reads the evalue and raises.
                 alive.clear();
-                if let Some(value) = v.as_value() {
-                    alive.insert(value);
+                if let crate::flatten::RegOrConst::Reg(r) = v {
+                    alive.insert(*r);
                 }
             }
         }
@@ -380,6 +500,11 @@ mod tests {
         // v1 = ConstInt(42)
         // v2 = BinOp(v0, v1)
         // Return v2
+        let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
+        let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
+        graph.set_next_value(3);
+        let lhs_var = graph.must_variable(ValueId(0));
+        let rhs_var = graph.must_variable(ValueId(1));
         let mut flat = SSARepr {
             name: "test".into(),
             insns: vec![
@@ -399,20 +524,25 @@ mod tests {
                     result: Some(ValueId(2)),
                     kind: OpKind::BinOp {
                         op: "add".into(),
-                        lhs: ValueId(0),
-                        rhs: ValueId(1),
+                        lhs: lhs_var,
+                        rhs: rhs_var,
                         result_ty: ValueType::Int,
                     },
                 }),
             ],
             num_values: 3,
             num_blocks: 1,
-            value_kinds: std::collections::HashMap::new(),
             insns_pos: None,
         };
 
-        // Should not panic
-        compute_liveness(&mut flat);
+        // Should not panic.  Phase 3 added the `regallocs` parameter
+        // for the FlatOp::Op `ValueId → Register` bridge; pass an
+        // empty map since this fixture has no inputargs that exercise
+        // the conversion.  The graph is required so liveness can
+        // project each operand `ValueId` through its backing
+        // `Variable.concretetype` — supply a fresh FunctionGraph that
+        // covers ValueId(0..=2).
+        compute_liveness(&mut flat, &regallocs, &graph);
     }
 
     #[test]

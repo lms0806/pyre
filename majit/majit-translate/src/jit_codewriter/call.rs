@@ -2529,13 +2529,24 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         _ => Some(Type::Ref),
     };
     if !start.inputargs.is_empty() {
+        // Walk the raw `inputargs` list, not the
+        // `inputarg_value_ids(graph)` projection — the latter drops
+        // entries whose reverse `Variable → ValueId` bridge is
+        // missing, which would shorten the descriptor vec and
+        // surface as a bogus arity mismatch in `getcalldescr()`.
+        // Treat unresolved slots conservatively as `Type::Ref`
+        // (the same default the wildcard arm uses below).
         return start
             .inputargs
             .iter()
-            .filter_map(|&arg_id| {
-                let ty = start.operations.iter().find_map(|op| match &op.kind {
-                    crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => Some(ty),
-                    _ => None,
+            .filter_map(|arg| {
+                let ty = graph.value_id_of(arg).and_then(|arg_id| {
+                    start.operations.iter().find_map(|op| match &op.kind {
+                        crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => {
+                            Some(ty)
+                        }
+                        _ => None,
+                    })
                 });
                 ty.map(map_ty).unwrap_or(Some(Type::Ref))
             })
@@ -4491,10 +4502,11 @@ fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
 /// 3. Phi/link source chain (limited depth)
 /// 4. None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
+    graph: &crate::model::FunctionGraph,
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
     value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
-    phi_sources: &HashMap<crate::model::ValueId, LinkArg>,
+    phi_sources: &HashMap<crate::model::ValueId, Option<LinkArg>>,
     cc: &CallControl,
 ) -> Option<String> {
     fn producer_array_identity(
@@ -4547,19 +4559,25 @@ fn resolve_array_identity(
     }
     // 3. Phi/link: RPython concretetype propagates through block boundaries.
     // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
-    let mut source = LinkArg::Value(*base);
+    let mut source = LinkArg::value(graph, *base);
     for _ in 0..4 {
         match &source {
-            LinkArg::Value(vid) => {
-                if let Some(identity) = producer_array_identity(*vid, value_producers, cc) {
+            LinkArg::Value(var) => {
+                let Some(vid) = graph.value_id_of(var) else {
+                    break;
+                };
+                if let Some(identity) = producer_array_identity(vid, value_producers, cc) {
                     return Some(identity);
                 }
-                let Some(next) = phi_sources.get(vid) else {
+                // `None` entries mark inputargs merged from multiple
+                // predecessors — stop chasing and fall back to the
+                // `item_ty`-only path so the descr stays conservative.
+                let Some(Some(next)) = phi_sources.get(&vid) else {
                     break;
                 };
                 source = next.clone();
             }
-            LinkArg::Const(value) => return const_array_identity(value),
+            LinkArg::Const(value) => return const_array_identity(&value.value),
         }
     }
     None
@@ -4689,12 +4707,34 @@ fn collect_readwrite_effects(
     // `flowspace/model.py:244 renamevariables` walks `for link in
     // self.exits: link.args`), so resolve_array_identity can trace through
     // control-flow merges of any exit fan-out.
-    let mut phi_sources: HashMap<crate::model::ValueId, LinkArg> = HashMap::new();
+    // Build the phi-sources map by walking each exit link's args
+    // against the unfiltered `Block.inputargs` list rather than the
+    // `inputarg_value_ids` projection — the latter drops entries when
+    // a Variable has no reverse `ValueId` mapping yet, which would
+    // shift every later `link.args[i]` onto the wrong destination
+    // slot and corrupt phi provenance.  RPython parity:
+    // `flowspace/model.py:244 renamevariables` walks `link.args`
+    // and `link.target.inputargs` positionally; missing-mapping
+    // entries are simply skipped here, never re-indexed.
+    // Conservative phi-source map: an inputarg with exactly one
+    // incoming edge gets `Some(src)`; an inputarg merged from two or
+    // more predecessors is demoted to `None` so `resolve_array_identity`
+    // stops chasing provenance and falls back to the existing
+    // `array_type_id` / item-type-only path.  Without this demotion the
+    // last-writer-wins insert would make the array descr selection
+    // depend on HashMap iteration order, which can stamp the wrong
+    // effect bits on cross-block merges.
+    let mut phi_sources: HashMap<crate::model::ValueId, Option<LinkArg>> = HashMap::new();
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
-                for (ia, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    phi_sources.insert(*ia, src.clone());
+                for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                    if let Some(ia) = graph.value_id_of(target_arg) {
+                        phi_sources
+                            .entry(ia)
+                            .and_modify(|entry| *entry = None)
+                            .or_insert_with(|| Some(src.clone()));
+                    }
                 }
             }
         }
@@ -4744,14 +4784,24 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
-                    // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                    // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY).
+                    // When the reverse `Variable → ValueId` bridge is missing,
+                    // stay conservative — `resolve_array_identity` already
+                    // documents `None` as the "fall back to item_ty-only
+                    // keying" path, so propagate that instead of panicking.
+                    let resolved_id = graph
+                        .value_id_of(base)
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -4792,13 +4842,21 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
+                        .value_id_of(base)
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -4843,13 +4901,21 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
+                        .value_id_of(base)
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -4912,13 +4978,21 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
+                        .value_id_of(base)
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -5530,8 +5604,15 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
 fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
     use crate::model::LinkArg;
 
-    let except_value = graph.block(graph.exceptblock).inputargs.get(1).copied();
-    let Some(except_value) = except_value else {
+    // Read the exceptblock's `evalue` slot from the unfiltered
+    // `inputargs` so a missing reverse ValueId mapping does not shift
+    // index 1 onto the wrong Variable.  Same correctness concern as
+    // the `phi_sources` zip above.
+    let exceptblock_args = &graph.block(graph.exceptblock).inputargs;
+    let Some(except_value) = exceptblock_args
+        .get(1)
+        .and_then(|arg| graph.value_id_of(arg))
+    else {
         return false;
     };
 
@@ -5539,13 +5620,16 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         crate::tool::algo::unionfind::UnionFind::<crate::model::ValueId, ()>::new(|_| ());
     for block in &graph.blocks {
         for link in &block.exits {
-            for (arg, &target_arg) in link
-                .args
-                .iter()
-                .zip(graph.block(link.target).inputargs.iter())
-            {
-                if let LinkArg::Value(value) = arg {
-                    families.union(*value, target_arg);
+            // Zip link args against the target block's raw `inputargs`
+            // (Variable identities) so unresolved entries are skipped
+            // in place, never re-indexed.
+            let target_inputargs = &graph.block(link.target).inputargs;
+            for (arg, target_arg) in link.args.iter().zip(target_inputargs.iter()) {
+                let Some(target_vid) = graph.value_id_of(target_arg) else {
+                    continue;
+                };
+                if let Some(value) = arg.as_value(graph) {
+                    families.union(value, target_vid);
                 }
             }
         }
@@ -5555,7 +5639,11 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         .blocks
         .iter()
         .flat_map(|block| block.exits.iter())
-        .filter_map(|link| link.last_exc_value.as_ref().and_then(|arg| arg.as_value()))
+        .filter_map(|link| {
+            link.last_exc_value
+                .as_ref()
+                .and_then(|arg| arg.as_value(graph))
+        })
         .any(|value| families.find_rep(value) == except_rep)
 }
 
@@ -5919,7 +6007,7 @@ mod tests {
         SpaceOperation {
             result: None,
             kind: OpKind::IndirectCall {
-                funcptr: ValueId(0),
+                funcptr: crate::flowspace::model::Variable::new(),
                 args: vec![],
                 graphs,
                 result_ty: ValueType::Void,
@@ -6191,22 +6279,23 @@ mod tests {
         let entry = g.startblock;
         let continuation = g.create_block();
         let continuation_arg = g.alloc_value();
-        g.block_mut(continuation).inputargs.push(continuation_arg);
+        g.push_inputarg(continuation, continuation_arg);
         let last_exception = g.alloc_value();
         let last_exc_value = g.alloc_value();
         g.set_control_flow_metadata(
             entry,
             Some(ExitSwitch::LastException),
             vec![
-                Link::new(vec![continuation_arg], continuation, None),
+                Link::new(&g, vec![continuation_arg], continuation, None),
                 Link::new(
+                    &g,
                     vec![last_exception, last_exc_value],
                     g.exceptblock,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&g, last_exception)),
+                    Some(LinkArg::value(&g, last_exc_value)),
                 ),
             ],
         );
@@ -6487,8 +6576,13 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("forcer");
         let frame = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(frame);
-        graph.push_op(graph.startblock, OpKind::VableForce { base: frame }, false);
+        graph.push_inputarg(graph.startblock, frame);
+        let frame_var = graph.must_variable(frame);
+        graph.push_op(
+            graph.startblock,
+            OpKind::VableForce { base: frame_var },
+            false,
+        );
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["forcer"]);
         cc.register_function_graph(path, graph);
@@ -6604,10 +6698,11 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -6617,9 +6712,9 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: base, // dummy
+                value: base_var.clone(), // dummy
                 ty: ValueType::Int,
             },
             false,
@@ -6660,18 +6755,23 @@ mod tests {
     #[test]
     fn resolve_array_identity_follows_phi_chain_to_constant_link_arg() {
         let cc = CallControl::new();
+        let mut graph = FunctionGraph::new("phi_chain_test");
+        graph.set_next_value(3);
         let base = ValueId(1);
         let forwarded = ValueId(2);
         let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
-        let mut phi_sources: HashMap<ValueId, LinkArg> = HashMap::new();
-        phi_sources.insert(base, LinkArg::Value(forwarded));
+        let mut phi_sources: HashMap<ValueId, Option<LinkArg>> = HashMap::new();
+        phi_sources.insert(base, Some(LinkArg::value(&graph, forwarded)));
         phi_sources.insert(
             forwarded,
-            LinkArg::Const(crate::flowspace::model::ConstValue::List(vec![])),
+            Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
+                vec![],
+            ))),
         );
 
         assert_eq!(
             resolve_array_identity(
+                &graph,
                 &base,
                 &Option::<String>::None,
                 &value_producers,
@@ -6689,12 +6789,13 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("cache", Some("Obj".into())),
-                value: base,
+                value: base_var,
                 ty: ValueType::Int,
             },
             false,
@@ -6782,12 +6883,13 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var.clone(),
                 field: field.clone(),
                 ty: ValueType::Int,
                 pure: false,
@@ -6797,9 +6899,9 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: field.clone(),
-                value: base,
+                value: base_var,
                 ty: ValueType::Int,
             },
             false,
@@ -6850,12 +6952,14 @@ mod tests {
         let mut graph = FunctionGraph::new("divider");
         let a = graph.alloc_value();
         let b = graph.alloc_value();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         graph.push_op(
             graph.startblock,
             OpKind::BinOp {
                 op: "int_floordiv".to_string(),
-                lhs: a,
-                rhs: b,
+                lhs: a_var,
+                rhs: b_var,
                 result_ty: ValueType::Int,
             },
             true,

@@ -41,10 +41,11 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // <result_type>` unconditionally; pyre mirrors that by seeding the
     // annotator state up front.
     if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
-        if let Some(&etype) = exceptblock.inputargs.first() {
+        let exceptblock_vids = exceptblock.inputarg_value_ids(graph);
+        if let Some(&etype) = exceptblock_vids.first() {
             state.set(etype, ValueType::Int);
         }
-        if let Some(&evalue) = exceptblock.inputargs.get(1) {
+        if let Some(&evalue) = exceptblock_vids.get(1) {
             state.set(evalue, ValueType::Ref);
         }
     }
@@ -55,17 +56,17 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // `return None` placeholder values here; normal non-void returns
     // are inferred from the incoming Link args.
     if let Some(returnblock) = graph.blocks.get(graph.returnblock.0)
-        && let Some(&ret) = returnblock.inputargs.first()
+        && let Some(&ret) = returnblock.inputarg_value_ids(graph).first()
     {
         for block in &graph.blocks {
             for link in &block.exits {
                 if link.target != graph.returnblock {
                     continue;
                 }
-                if let Some(LinkArg::Value(src)) = link.args.first()
-                    && is_synthetic_return_void_value(graph, *src)
+                if let Some(src) = link.args.first().and_then(|a| a.as_value(graph))
+                    && is_synthetic_return_void_value(graph, src)
                 {
-                    state.set(*src, ValueType::Void);
+                    state.set(src, ValueType::Void);
                     state.set(ret, ValueType::Void);
                 }
             }
@@ -85,7 +86,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             // Propagate annotations through ops in this block
             for op in &block.operations {
                 if let Some(result) = op.result {
-                    let inferred = infer_op_type(&op.kind, &state);
+                    let inferred = infer_op_type(&op.kind, &state, graph);
                     let current = state.get(result).clone();
                     let merged = union_type(&current, &inferred);
                     if merged != current {
@@ -120,39 +121,56 @@ fn link_is_raise_like(link: &Link) -> bool {
 fn follow_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        changed |= merge_value_type(state, *dst, link_arg_type(state, src));
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+        changed |= merge_value_type(state, *dst, link_arg_type(state, graph, src));
     }
     changed
 }
 
 fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        changed |= merge_value_type(state, *value, ValueType::Ref);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= merge_value_type(state, value, ValueType::Ref);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        changed |= merge_value_type(state, *value, ValueType::Int);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= merge_value_type(state, value, ValueType::Int);
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ValueType::Int
         } else if Some(src) == link.last_exc_value.as_ref() {
             ValueType::Ref
         } else {
-            link_arg_type(state, src)
+            link_arg_type(state, graph, src)
         };
         changed |= merge_value_type(state, *dst, src_ty);
     }
     changed
 }
 
-fn link_arg_type(state: &AnnotationState, src: &LinkArg) -> ValueType {
+fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) -> ValueType {
     match src {
-        LinkArg::Value(src) => state.get(*src).clone(),
-        LinkArg::Const(value) => const_value_type(value),
+        // After the Variable cutover, `as_value(graph)` returning
+        // `None` means the link references a `Variable` the graph
+        // never registered — i.e. malformed graph metadata.  Silently
+        // degrading to `Unknown` would mask that and could let the
+        // legacy-baseline dual-gate comparison pass with degraded
+        // types; fail loud so the producer's contract violation
+        // surfaces here.
+        LinkArg::Value(var) => {
+            let vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "link_arg_type: LinkArg::Value references Variable {var:?} \
+                     that is not registered on the graph — malformed link.args"
+                )
+            });
+            state.get(vid).clone()
+        }
+        LinkArg::Const(value) => const_value_type(&value.value),
     }
 }
 
@@ -193,7 +211,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 
 fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
     for block in &graph.blocks {
-        if block.inputargs.contains(&value) {
+        if block.inputarg_value_ids(graph).contains(&value) {
             return false;
         }
         if block.operations.iter().any(|op| op.result == Some(value)) {
@@ -207,7 +225,7 @@ fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool
 ///
 /// RPython equivalent: annotator dispatch (e.g., `annotate_int_add`
 /// returns `SomeInteger()`).
-fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
+fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
@@ -243,10 +261,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
-                state
-                    .types
-                    .get(operand)
-                    .cloned()
+                graph
+                    .value_id_of(operand)
+                    .and_then(|vid| state.types.get(&vid).cloned())
                     .unwrap_or(ValueType::Unknown)
             }
         }
@@ -266,10 +283,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
-                state
-                    .types
-                    .get(operand)
-                    .cloned()
+                graph
+                    .value_id_of(operand)
+                    .and_then(|vid| state.types.get(&vid).cloned())
                     .unwrap_or(ValueType::Int)
             }
         }
@@ -320,7 +336,7 @@ fn kind_char_to_value_type(kind: char) -> ValueType {
 
 fn infer_call_result_type(
     target: &crate::model::CallTarget,
-    _args: &[ValueId],
+    _args: &[crate::flowspace::model::Variable],
     _state: &AnnotationState,
 ) -> ValueType {
     if crate::call::is_int_arithmetic_target(target) {
@@ -371,11 +387,12 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let v = graph
             .push_op(
                 entry,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new("x", None),
                     ty: ValueType::Int,
                     pure: false,
@@ -395,12 +412,14 @@ mod tests {
         let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         let result = graph
             .push_op(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["w_int_add"]),
-                    args: vec![a, b],
+                    args: vec![a_var, b_var],
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -420,12 +439,14 @@ mod tests {
         let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         let result = graph
             .push_op(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["crate", "math", "w_int_add"]),
-                    args: vec![a, b],
+                    args: vec![a_var, b_var],
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -475,13 +496,14 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![
                 Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );
@@ -498,11 +520,12 @@ mod tests {
         let mut graph = FunctionGraph::new("float_return");
         let entry = graph.startblock;
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let result = graph
             .push_op(
                 entry,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new("floatval", None),
                     ty: ValueType::Float,
                     pure: false,
@@ -513,7 +536,7 @@ mod tests {
         graph.set_return(entry, Some(result));
 
         let state = annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputargs[0];
+        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
         assert_eq!(state.get(result), &ValueType::Float);
         assert_eq!(state.get(ret), &ValueType::Float);
     }
@@ -525,7 +548,7 @@ mod tests {
         graph.set_return(entry, None);
 
         let state = annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputargs[0];
+        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
         assert_eq!(state.get(ret), &ValueType::Void);
     }
 }

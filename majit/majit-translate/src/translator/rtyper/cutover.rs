@@ -77,60 +77,45 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
 /// GcRef / Void).
 ///
-/// Mapping follows RPython's JIT `history.getkind(TYPE)`
-/// (`rpython/jit/metainterp/history.py:46-71`):
-/// `Void -> void`, primitive float -> float, `SingleFloat -> int`,
-/// machine-word primitives and raw pointers -> int, GC pointers -> ref.
-/// `SignedLongLong` / `UnsignedLongLong` follow PyPy's target-size
-/// check: they are float kind only when they are wider than `Signed`
-/// (32-bit targets); on 64-bit targets they collapse to int kind.
-/// Unsupported container/non-pointer shapes return
-/// `Err(TyperError::missing_rtype_operation(..))`, mirroring
-/// `history.py:70 raise NotImplementedError("type %s not supported")`
-/// while routing the failure through the `specialize_legacy_graph`
-/// `Result<...>` channel rather than unwinding direct callers.
+/// `Result`-routing wrapper around [`crate::model::getkind`] for
+/// the `specialize_legacy_graph` callback channel.
+///
+/// `getkind` itself panics on the `NotImplementedError` cases
+/// (longlonglong / longfloat / non-pointer aggregates / InteriorPtr
+/// on a Variable's concretetype) — the upstream `history.py:62,70
+/// raise NotImplementedError` shape.  Pyre's legacy specialize
+/// callers want those failures routed through `Result<…, TyperError>`
+/// instead so a single unported rtype path doesn't unwind the whole
+/// `transform_graph_to_jitcode` driver; this wrapper catches the
+/// `getkind: …not supported…` payload only and re-raises everything
+/// else (so an assertion or logic bug inside `getkind` is NOT
+/// silently rebranded as a missing-rtype error in the dual gate).
 pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
-    match ll {
-        LowLevelType::Void => Ok(ConcreteType::Void),
-        LowLevelType::Signed
-        | LowLevelType::Unsigned
-        | LowLevelType::Bool
-        | LowLevelType::Char
-        | LowLevelType::UniChar
-        | LowLevelType::SingleFloat
-        | LowLevelType::Address => Ok(ConcreteType::Signed),
-        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
-            Ok(longlong_getkind_concrete())
-        }
-        LowLevelType::Float => Ok(ConcreteType::Float),
-        LowLevelType::Ptr(ptr) => {
-            if ptr._gckind() == GcKind::Raw {
-                Ok(ConcreteType::Signed)
+    let ll_clone = ll.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::model::getkind(&ll_clone)
+    }));
+    match result {
+        Ok(kind) => Ok(kind),
+        Err(payload) => {
+            // `crate::model::getkind` raises its NotImplementedError-
+            // equivalent via `panic!("getkind: type … not supported …")`.
+            // Match that exact prefix + substring; resume_unwind anything
+            // else so we don't disguise real bugs as missing rtype ops.
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if msg.starts_with("getkind:") && msg.contains("not supported") {
+                Err(TyperError::missing_rtype_operation(format!(
+                    "lowleveltype_to_concrete: type {ll:?} not supported \
+                     (history.py:70 raise NotImplementedError)"
+                )))
             } else {
-                Ok(ConcreteType::GcRef)
+                std::panic::resume_unwind(payload)
             }
         }
-        LowLevelType::SignedLongLongLong
-        | LowLevelType::UnsignedLongLongLong
-        | LowLevelType::LongFloat
-        | LowLevelType::Func(_)
-        | LowLevelType::Struct(_)
-        | LowLevelType::Array(_)
-        | LowLevelType::FixedSizeArray(_)
-        | LowLevelType::Opaque(_)
-        | LowLevelType::ForwardReference(_)
-        | LowLevelType::InteriorPtr(_) => Err(TyperError::missing_rtype_operation(format!(
-            "lowleveltype_to_concrete: type {ll:?} not supported \
-             (history.py:70 raise NotImplementedError)"
-        ))),
-    }
-}
-
-fn longlong_getkind_concrete() -> ConcreteType {
-    if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
-        ConcreteType::Float
-    } else {
-        ConcreteType::Signed
     }
 }
 
@@ -271,6 +256,15 @@ pub enum DualGateOutcome {
         /// orthodox post-jtransform merge consumes instead of the
         /// per-graph `legacy_annotator::annotate(graph)` recompute.
         real_annotations: AnnotationState,
+        /// `ValueId → flowspace::Variable` mapping built by the
+        /// flowspace adapter.  Each Variable carries the
+        /// `RPythonTyper`-set `concretetype` inline (`flowspace/
+        /// model.py:280`), so codewriter callers rebind each slot to
+        /// the upstream-typed Variable via
+        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
+        /// `graph.concretetype(v)` then reads its `concretetype`
+        /// cell directly.
+        real_value_to_var: ValueIdToVariable,
     },
     /// Real path failed on a known-unported feature — the gate
     /// cannot validate this graph yet but the failure is *not* a
@@ -331,10 +325,10 @@ pub fn dual_gate_check_with_registry(
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph_with_registry(legacy_graph, call_registry)
+        specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
-    let (real_state, real_annotations) = match result {
-        Ok(Ok(pair)) => pair,
+    let (real_state, real_annotations, real_value_to_var) = match result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => {
             let msg = format!("{e}");
             if is_known_unported(&msg) {
@@ -396,6 +390,7 @@ pub fn dual_gate_check_with_registry(
     Ok(DualGateOutcome::Match {
         real_state,
         real_annotations,
+        real_value_to_var,
     })
 }
 
@@ -723,12 +718,12 @@ pub fn populate_call_registry_from_call_graphs(
 fn signature_for_graph(graph: &LegacyGraph) -> Signature {
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
+        .inputarg_value_ids(graph)
+        .into_iter()
         .enumerate()
         .map(|(idx, vid)| {
             graph
-                .value_name(*vid)
+                .value_name(vid)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
@@ -865,12 +860,12 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
     let graph = &func.graph;
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
+        .inputarg_value_ids(graph)
+        .into_iter()
         .enumerate()
         .map(|(idx, vid)| {
             graph
-                .value_name(*vid)
+                .value_name(vid)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
@@ -977,7 +972,7 @@ pub(crate) fn specialize_legacy_graph_with_seed_annotations(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
     specialize_legacy_graph_with_registry_seed(legacy, Some(seed_annotations), &registry)
-        .map(|(state, _)| state)
+        .map(|(state, _, _)| state)
 }
 
 #[cfg(test)]
@@ -995,7 +990,7 @@ pub(crate) fn dual_gate_check_with_registry_seed(
         )
     }));
     match result {
-        Ok(Ok((real_state, real_annotations))) => {
+        Ok(Ok((real_state, real_annotations, real_value_to_var))) => {
             // Test-side regression diff against legacy — keeps anchor
             // tests honest until the orthodox `RPythonAnnotator::
             // processblock` port produces the same shape.
@@ -1022,6 +1017,7 @@ pub(crate) fn dual_gate_check_with_registry_seed(
                 Ok(DualGateOutcome::Match {
                     real_state,
                     real_annotations,
+                    real_value_to_var,
                 })
             } else {
                 Err(divergences.join("; "))
@@ -1065,6 +1061,22 @@ pub fn specialize_legacy_graph_with_registry(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<(TypeResolutionState, AnnotationState), TyperError> {
+    let (state, annotations, _value_to_var) =
+        specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)?;
+    Ok((state, annotations))
+}
+
+/// `specialize_legacy_graph_with_registry` extended return shape that
+/// also surfaces the [`ValueIdToVariable`] map produced by the
+/// flowspace adapter.  Codewriter callers rebind each slot's backing
+/// Variable from the map via
+/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
+/// — the long-term parity path that retires the transitional
+/// `merge_synth_kinds` 4-source merge.
+pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
+    legacy: &LegacyGraph,
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
     specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)
 }
 
@@ -1081,7 +1093,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     legacy: &LegacyGraph,
     seed_annotations: Option<&AnnotationState>,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(TypeResolutionState, AnnotationState), TyperError> {
+) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
     // Slice 3 v2 — RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1292,7 +1304,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // annotator carries the result of the bookkeeper-driven annotation
     // fixed-point.
     let real_annotations = read_annotations_from_value_to_var(&value_to_var);
-    Ok((state, real_annotations))
+    Ok((state, real_annotations, value_to_var))
 }
 
 /// Project per-session `Variable.annotation` SomeValue lattice nodes onto
@@ -1363,6 +1375,31 @@ mod tests {
         crate::model::Link::new_mixed(args, returnblock_id, None)
     }
 
+    /// Test helper — project ValueIds to their backing Variables on
+    /// the graph so a `Block { inputargs: ..., .. }` struct literal
+    /// can carry the upstream-orthodox `Vec<Variable>` shape.
+    /// Auto-grows the graph via `set_next_value` when ValueIds past
+    /// the canonical 3 slots are referenced so each has a backing
+    /// Variable registered in `variable_to_vid`.
+    fn block_inputargs(
+        graph: &mut LegacyGraph,
+        vids: &[ValueId],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        if let Some(max) = vids.iter().map(|v| v.0).max() {
+            if max >= graph.next_value() {
+                graph.set_next_value(max + 1);
+            }
+        }
+        vids.iter()
+            .map(|v| {
+                graph
+                    .variable(*v)
+                    .expect("block_inputargs: set_next_value must have minted a Variable")
+                    .clone()
+            })
+            .collect()
+    }
+
     #[test]
     fn lowleveltype_to_concrete_signed_family_collapses_to_signed() {
         for ll in [
@@ -1406,7 +1443,13 @@ mod tests {
 
     #[test]
     fn lowleveltype_to_concrete_longlong_follows_target_word_size() {
-        let expected = longlong_getkind_concrete();
+        // history.py:55-58 — `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
+        //   if supports_longlong and TYPE is not lltype.LongFloat: return 'float'`
+        let expected = if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
+            ConcreteType::Float
+        } else {
+            ConcreteType::Signed
+        };
         for ll in [LowLevelType::SignedLongLong, LowLevelType::UnsignedLongLong] {
             assert_eq!(
                 lowleveltype_to_concrete(&ll).expect("supported lltype"),
@@ -1459,11 +1502,11 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1471,7 +1514,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1499,11 +1542,11 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_float");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1511,7 +1554,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1547,11 +1590,11 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_ref");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1559,7 +1602,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1798,18 +1841,18 @@ fn id(x: &Foo) -> &Foo { x }
         let mut graph = LegacyGraph::new("not_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "not".into(),
-                    operand: ValueId(1),
+                    operand: graph.must_variable(ValueId(1)),
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1817,7 +1860,7 @@ fn id(x: &Foo) -> &Foo { x }
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1853,18 +1896,18 @@ fn id(x: &Foo) -> &Foo { x }
         let mut graph = LegacyGraph::new("deref_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "deref".into(),
-                    operand: ValueId(1),
+                    operand: graph.must_variable(ValueId(1)),
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1872,7 +1915,7 @@ fn id(x: &Foo) -> &Foo { x }
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1960,19 +2003,21 @@ fn fib(n: i64) -> i64 {
         annotations.set(ValueId(1), ValueType::Int);
 
         let mut graph = LegacyGraph::new("guard_passthrough");
+        let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
+        let v1_var = graph.must_variable(ValueId(1));
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs,
             operations: vec![crate::model::SpaceOperation {
                 result: None,
                 kind: crate::model::OpKind::GuardValue {
-                    value: ValueId(1),
+                    value: v1_var,
                     kind_char: 'i',
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1980,7 +2025,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2012,7 +2057,7 @@ fn fib(n: i64) -> i64 {
         let mut graph = LegacyGraph::new("unported_call");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::Call {
@@ -2020,13 +2065,13 @@ fn fib(n: i64) -> i64 {
                         trait_root: "MyTrait".into(),
                         method_name: "do_it".into(),
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![graph.must_variable(ValueId(1))],
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2034,7 +2079,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2081,20 +2126,20 @@ fn fib(n: i64) -> i64 {
         let mut graph = LegacyGraph::new("call_resolved");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![graph.must_variable(ValueId(1))],
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             dead: false,
@@ -2102,7 +2147,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2131,11 +2176,11 @@ fn fib(n: i64) -> i64 {
         let mut callee_graph = LegacyGraph::new("foo");
         let foo_start = Block {
             id: callee_graph.startblock,
-            inputargs: vec![ValueId(10)],
+            inputargs: block_inputargs(&mut callee_graph, &[ValueId(10)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(10))],
+                vec![LinkArg::value(&callee_graph, ValueId(10))],
                 callee_graph.returnblock,
             )],
             dead: false,
@@ -2143,7 +2188,7 @@ fn fib(n: i64) -> i64 {
         };
         let foo_return = Block {
             id: callee_graph.returnblock,
-            inputargs: vec![ValueId(10)],
+            inputargs: block_inputargs(&mut callee_graph, &[ValueId(10)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2167,7 +2212,7 @@ fn fib(n: i64) -> i64 {
             pygraph,
         );
 
-        let (state, _annotations) =
+        let (state, _annotations, _value_to_var) =
             specialize_legacy_graph_with_registry_seed(&graph, Some(&annotations), &registry)
                 .expect("Slice A.4 cache pre-fill must let the leaf Call resolve end-to-end");
         // Slice A.4 closes the loop:

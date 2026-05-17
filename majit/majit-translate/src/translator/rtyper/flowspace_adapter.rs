@@ -105,7 +105,7 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// remain fail-loud.
 fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
     for block in &graph.blocks {
-        if block.inputargs.contains(&value) {
+        if block.inputarg_value_ids(graph).contains(&value) {
             return false;
         }
         if block.operations.iter().any(|op| op.result == Some(value)) {
@@ -187,9 +187,10 @@ pub(crate) fn build_value_to_variable_map(
     let mut map: ValueIdToVariable = HashMap::new();
     for block in &legacy.blocks {
         // Class 1a — block-inputarg definitions.
-        for &vid in &block.inputargs {
-            map.entry(vid)
-                .or_insert_with(|| seed_variable(vid, annotations));
+        let inputarg_vids = block.inputarg_value_ids(legacy);
+        for vid in &inputarg_vids {
+            map.entry(*vid)
+                .or_insert_with(|| seed_variable(*vid, annotations));
         }
 
         // Per-block name → inputarg-Variable lookup for `OpKind::Input`
@@ -208,7 +209,7 @@ pub(crate) fn build_value_to_variable_map(
         for op in &block.operations {
             if let OpKind::Input { name, .. } = &op.kind {
                 if let Some(result) = op.result {
-                    if block.inputargs.contains(&result) {
+                    if inputarg_vids.contains(&result) {
                         if let Some(var) = map.get(&result) {
                             name_to_inputarg_var
                                 .entry(name.as_str())
@@ -236,25 +237,35 @@ pub(crate) fn build_value_to_variable_map(
             map.insert(result, var);
         }
         // Class 3 — exitswitch-referenced values.
-        if let Some(crate::model::ExitSwitch::Value(vid)) = &block.exitswitch {
-            map.entry(*vid)
-                .or_insert_with(|| seed_variable(*vid, annotations));
+        if let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch {
+            if let Some(vid) = legacy.value_id_of(var) {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
+            }
         }
         // Class 2 — link-side sentinels.
         for link in &block.exits {
             for arg in &link.args {
-                if let LinkArg::Value(vid) = arg {
-                    map.entry(*vid)
-                        .or_insert_with(|| seed_variable(*vid, annotations));
+                if let Some(vid) = arg.as_value(legacy) {
+                    map.entry(vid)
+                        .or_insert_with(|| seed_variable(vid, annotations));
                 }
             }
-            if let Some(LinkArg::Value(vid)) = &link.last_exception {
-                map.entry(*vid)
-                    .or_insert_with(|| seed_variable(*vid, annotations));
+            if let Some(vid) = link
+                .last_exception
+                .as_ref()
+                .and_then(|a| a.as_value(legacy))
+            {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
             }
-            if let Some(LinkArg::Value(vid)) = &link.last_exc_value {
-                map.entry(*vid)
-                    .or_insert_with(|| seed_variable(*vid, annotations));
+            if let Some(vid) = link
+                .last_exc_value
+                .as_ref()
+                .and_then(|a| a.as_value(legacy))
+            {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
             }
         }
     }
@@ -563,6 +574,25 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 /// a Slice 1b followup commit. The error message names the specific
 /// variant so Slice 4's dual-gate failure cleanly identifies which
 /// followup needs to land.
+/// Project an operand `Variable` to its backing `ValueId` on `graph`,
+/// or surface the missing bridge as a `TyperError` so the dual-gate
+/// classifies the producer bug instead of unwinding the adapter.
+fn operand_value_id(
+    graph: &crate::model::FunctionGraph,
+    var: &Variable,
+    op: &SpaceOperation,
+    role: &str,
+) -> Result<ValueId, TyperError> {
+    graph.value_id_of(var).ok_or_else(|| {
+        TyperError::message(format!(
+            "translate_op: undefined operand ValueId for Variable {var:?} as {role} of {} \
+             (result {:?}) — graph.value_id_of returned None",
+            opkind_variant_name(&op.kind),
+            op.result,
+        ))
+    })
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<ValueId, Hlvalue>,
@@ -573,6 +603,7 @@ pub fn translate_op(
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    graph: &crate::model::FunctionGraph,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
@@ -614,8 +645,10 @@ pub fn translate_op(
             rhs,
             ..
         } => {
-            let l = lookup_operand(value_map, *lhs, op, "lhs")?;
-            let r = lookup_operand(value_map, *rhs, op, "rhs")?;
+            let lhs_vid = operand_value_id(graph, lhs, op, "lhs")?;
+            let rhs_vid = operand_value_id(graph, rhs, op, "rhs")?;
+            let l = lookup_operand(value_map, lhs_vid, op, "lhs")?;
+            let r = lookup_operand(value_map, rhs_vid, op, "rhs")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_binop_name(opname)?,
@@ -639,7 +672,8 @@ pub fn translate_op(
             operand,
             ..
         } => {
-            let v = lookup_operand(value_map, *operand, op, "operand")?;
+            let operand_vid = operand_value_id(graph, operand, op, "operand")?;
+            let v = lookup_operand(value_map, operand_vid, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
@@ -658,7 +692,8 @@ pub fn translate_op(
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getattr",
@@ -672,8 +707,10 @@ pub fn translate_op(
         OpKind::FieldWrite {
             base, field, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setattr",
@@ -695,8 +732,10 @@ pub fn translate_op(
         // resolved type, lowering to `getarrayitem_gc_*` /
         // `setarrayitem_gc_*` bytecodes.
         OpKind::ArrayRead { base, index, .. } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getitem",
@@ -707,9 +746,12 @@ pub fn translate_op(
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setitem",
@@ -731,8 +773,10 @@ pub fn translate_op(
         OpKind::InteriorFieldRead {
             base, index, field, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -754,9 +798,12 @@ pub fn translate_op(
             value,
             ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -814,7 +861,8 @@ pub fn translate_op(
                 .enumerate()
                 .map(|(i, v)| {
                     let role = format!("args[{i}]");
-                    lookup_operand(value_map, *v, op, &role)
+                    let vid = operand_value_id(graph, v, op, &role)?;
+                    lookup_operand(value_map, vid, op, &role)
                 })
                 .collect();
             let arg_hls = arg_hls?;
@@ -1210,13 +1258,14 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<(ValueId, Hlvalue)
 /// (`cutover.rs:441`).
 fn link_arg_to_hlvalue(
     arg: &LinkArg,
+    graph: &FunctionGraph,
     value_map: &HashMap<ValueId, Hlvalue>,
     source_block_id: BlockId,
     target_block_id: BlockId,
     arg_index: usize,
 ) -> Result<Hlvalue, TyperError> {
-    match arg {
-        LinkArg::Value(vid) => value_map.get(vid).cloned().ok_or_else(|| {
+    match arg.as_value(graph) {
+        Some(vid) => value_map.get(&vid).cloned().ok_or_else(|| {
             TyperError::message(format!(
                 "translate_op: undefined operand {vid:?} as Link.args[{arg_index}] entry \
                  (source block {source_block_id:?} -> target block {target_block_id:?}) — \
@@ -1224,7 +1273,17 @@ fn link_arg_to_hlvalue(
                  defined as a block inputarg or op result)"
             ))
         }),
-        LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+        None => match arg {
+            // `LinkArg::Const` now carries the full upstream-orthodox
+            // `Constant` (id + value + concretetype) directly — no need
+            // to round-trip through `constant_from_constvalue` and
+            // mint a fresh id.
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
+            LinkArg::Value(_) => Err(TyperError::message(format!(
+                "translate_op: Link.args[{arg_index}] LinkArg::Value Variable not registered \
+                 on graph (source block {source_block_id:?} -> target block {target_block_id:?})"
+            ))),
+        },
     }
 }
 
@@ -1238,22 +1297,32 @@ fn link_arg_to_hlvalue(
 /// a per-link map instead of requiring a block-local definition.
 fn link_extravar_to_hlvalue(
     arg: &LinkArg,
+    graph: &FunctionGraph,
     value_map: &mut HashMap<ValueId, Hlvalue>,
     value_to_var: &mut ValueIdToVariable,
     annotations: &AnnotationState,
 ) -> Result<Hlvalue, TyperError> {
-    match arg {
-        LinkArg::Value(vid) => {
-            if let Some(existing) = value_map.get(vid).cloned() {
+    match arg.as_value(graph) {
+        Some(vid) => {
+            if let Some(existing) = value_map.get(&vid).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(*vid, annotations);
-            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            let var = seed_variable(vid, annotations);
+            value_to_var.entry(vid).or_insert_with(|| var.clone());
             let hlvalue = Hlvalue::Variable(var);
-            value_map.insert(*vid, hlvalue.clone());
+            value_map.insert(vid, hlvalue.clone());
             Ok(hlvalue)
         }
-        LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+        None => match arg {
+            // `LinkArg::Const` now carries the full upstream-orthodox
+            // `Constant` (id + value + concretetype) directly — no need
+            // to round-trip through `constant_from_constvalue` and
+            // mint a fresh id.
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
+            LinkArg::Value(_) => Err(TyperError::message(
+                "link_extravar_to_hlvalue: extravar Variable not registered on graph".to_string(),
+            )),
+        },
     }
 }
 
@@ -1299,8 +1368,9 @@ pub(crate) fn derive_subject_inputcells(
             input_ty_by_result.insert(result, ty);
         }
     }
-    let mut cells = Vec::with_capacity(startblock.inputargs.len());
-    for (idx, vid) in startblock.inputargs.iter().enumerate() {
+    let startblock_vids = startblock.inputarg_value_ids(legacy);
+    let mut cells = Vec::with_capacity(startblock_vids.len());
+    for (idx, vid) in startblock_vids.iter().enumerate() {
         // 1. Explicit SomeValue seed (test fixtures and any caller
         //    that wants to bypass the ValueType projection).
         if let Some(seed) = seed_annotations {
@@ -1464,19 +1534,19 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             if link.target != legacy.returnblock {
                 continue;
             }
-            let Some(LinkArg::Value(vid)) = link.args.first() else {
+            let Some(vid) = link.args.first().and_then(|a| a.as_value(legacy)) else {
                 continue;
             };
-            if !is_synthetic_return_void_value(legacy, *vid) {
+            if !is_synthetic_return_void_value(legacy, vid) {
                 continue;
             }
             let var = Variable::new();
             if let Some(shell) = valuetype_to_someshell(&crate::model::ValueType::Void) {
                 *var.annotation.borrow_mut() = Some(Rc::new(shell));
             }
-            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            value_to_var.entry(vid).or_insert_with(|| var.clone());
             synthetic_void_hlvalues
-                .entry(*vid)
+                .entry(vid)
                 .or_insert(Hlvalue::Variable(var));
         }
     }
@@ -1497,8 +1567,9 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             continue;
         }
         let mut local_inputs: HashMap<ValueId, Variable> = HashMap::new();
-        let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_block.inputargs.len());
-        for &vid in &legacy_block.inputargs {
+        let legacy_inputarg_vids = legacy_block.inputarg_value_ids(legacy);
+        let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_inputarg_vids.len());
+        for vid in legacy_inputarg_vids {
             let var = seed_variable(vid, annotations);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             local_inputs.insert(vid, var.clone());
@@ -1533,7 +1604,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         .blocks
         .iter()
         .find(|b| b.id == legacy.returnblock)
-        .and_then(|b| b.inputargs.first().copied())
+        .and_then(|b| b.inputarg_value_ids(legacy).first().copied())
         .map(|vid| {
             let var = seed_variable(vid, annotations);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
@@ -1559,7 +1630,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
     if let Some(legacy_exceptblock) = legacy.blocks.iter().find(|b| b.id == legacy.exceptblock) {
         if legacy_exceptblock.inputargs.len() == 2 {
             let mut except_inputargs = Vec::with_capacity(2);
-            for &vid in &legacy_exceptblock.inputargs {
+            for vid in legacy_exceptblock.inputarg_value_ids(legacy) {
                 let var = seed_variable(vid, annotations);
                 value_to_var.entry(vid).or_insert_with(|| var.clone());
                 except_inputargs.push(Hlvalue::Variable(var));
@@ -1611,7 +1682,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             if let (Some(result), OpKind::Input { name, ty: _ }) =
                 (legacy_op.result, &legacy_op.kind)
             {
-                if legacy_block.inputargs.contains(&result) {
+                if legacy_block.inputarg_value_ids(legacy).contains(&result) {
                     if let Some(existing) = value_map.get(&result).cloned() {
                         name_to_value.entry(name.clone()).or_insert(existing);
                     }
@@ -1627,7 +1698,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 if let Some(name) = legacy.value_name(vid) {
                     name_to_value.insert(name.to_string(), hlvalue);
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
                 continue;
             }
 
@@ -1683,7 +1754,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
                 continue;
             }
 
@@ -1694,7 +1765,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                     value_map.insert(result, Hlvalue::Variable(var));
                 }
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
             if let Some(result) = legacy_op.result {
                 if let Some(name) = legacy.value_name(result) {
                     if let Some(value) = value_map.get(&result).cloned() {
@@ -1715,6 +1786,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|arg| {
                     link_extravar_to_hlvalue(
                         arg,
+                        legacy,
                         &mut link_value_map,
                         &mut value_to_var,
                         annotations,
@@ -1727,6 +1799,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|arg| {
                     link_extravar_to_hlvalue(
                         arg,
+                        legacy,
                         &mut link_value_map,
                         &mut value_to_var,
                         annotations,
@@ -1747,6 +1820,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|(idx, arg)| {
                     link_arg_to_hlvalue(
                         arg,
+                        legacy,
                         &link_value_map,
                         legacy_block.id,
                         legacy_link.target,
@@ -1770,19 +1844,28 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         // Translate exitswitch.
         let translated_exitswitch = match &legacy_block.exitswitch {
             None => None,
-            Some(ExitSwitch::Value(vid)) => Some(value_map.get(vid).cloned().ok_or_else(|| {
-                // Inline counterpart of `lookup_operand` for the
-                // block.exitswitch path (no enclosing
-                // SpaceOperation). Required substring
-                // `"undefined operand ValueId"` is preserved
-                // verbatim for `is_known_unported`
-                // (`cutover.rs:441`).
-                TyperError::message(format!(
-                    "translate_op: undefined operand {vid:?} as block.exitswitch — \
+            Some(ExitSwitch::Value(var)) => {
+                let vid = legacy.value_id_of(var).ok_or_else(|| {
+                    TyperError::message(format!(
+                        "translate_op: undefined operand ValueId for Variable {var:?} \
+                         as block.exitswitch — adapter invariant broken (every \
+                         referenced Variable must have a backing ValueId in legacy graph)"
+                    ))
+                })?;
+                Some(value_map.get(&vid).cloned().ok_or_else(|| {
+                    // Inline counterpart of `lookup_operand` for the
+                    // block.exitswitch path (no enclosing
+                    // SpaceOperation). Required substring
+                    // `"undefined operand ValueId"` is preserved
+                    // verbatim for `is_known_unported`
+                    // (`cutover.rs:441`).
+                    TyperError::message(format!(
+                        "translate_op: undefined operand {vid:?} as block.exitswitch — \
                          adapter invariant broken (every referenced ValueId must be \
                          defined as a block inputarg or op result)"
-                ))
-            })?),
+                    ))
+                })?)
+            }
             Some(ExitSwitch::LastException) => Some(Hlvalue::Constant(c_last_exception())),
         };
 
@@ -1816,12 +1899,47 @@ mod tests {
     };
     use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
 
+    /// Test helper — project ValueIds to backing Variables for
+    /// `Block { inputargs: ..., .. }` literals.  Auto-grows the
+    /// graph via `set_next_value` when ValueIds past the canonical 3
+    /// slots are referenced so each has a backing Variable.
+    fn block_inputargs(
+        graph: &mut LegacyGraph,
+        vids: &[ValueId],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        if let Some(max) = vids.iter().map(|v| v.0).max() {
+            if max >= graph.next_value() {
+                graph.set_next_value(max + 1);
+            }
+        }
+        vids.iter()
+            .map(|v| {
+                graph
+                    .variable(*v)
+                    .expect("block_inputargs: set_next_value must have minted a Variable")
+                    .clone()
+            })
+            .collect()
+    }
+
     /// Helper: empty `PyreCallRegistry` for tests that don't exercise
     /// the Slice A.2/A.3 Call resolution path.  The registry's
     /// bookkeeper is freshly minted because translate_op tests don't
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> PyreCallRegistry {
         PyreCallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
+
+    /// Helper: a fresh `FunctionGraph` with backing Variables pre-allocated
+    /// for `ValueId(0..=high)`.  Used by `translate_op` arms whose
+    /// `OpKind` operand fields now hold a `Variable` and need to be
+    /// projected back to their `ValueId` via `graph.value_id_of`.
+    fn translate_op_test_graph(high: usize) -> crate::model::FunctionGraph {
+        let mut g = crate::model::FunctionGraph::new("translate_op_fixture");
+        if high >= g.next_value() {
+            g.set_next_value(high + 1);
+        }
+        g
     }
 
     #[test]
@@ -1966,7 +2084,7 @@ mod tests {
         let mut graph = LegacyGraph::new("test");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![input],
+            inputargs: block_inputargs(&mut graph, &[input]),
             operations: vec![SpaceOperation {
                 result: Some(result),
                 kind: OpKind::ConstInt(0),
@@ -2032,7 +2150,7 @@ mod tests {
         let mut graph = LegacyGraph::new("dedup_test");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 SpaceOperation {
                     result: Some(ValueId(2)),
@@ -2079,7 +2197,7 @@ mod tests {
         let mut graph = LegacyGraph::new("rebind_alias");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 // Leading definition: result IS the inputarg.
                 SpaceOperation {
@@ -2126,7 +2244,7 @@ mod tests {
         let mut graph = LegacyGraph::new("const_inline");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 SpaceOperation {
                     result: Some(ValueId(2)),
@@ -2180,7 +2298,8 @@ mod tests {
                 ty: ValueType::Int,
             },
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Input must translate to skip");
         assert!(
             result.is_empty(),
@@ -2223,9 +2342,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(entry).inputargs.push(x_vid);
-        graph.block_mut(entry).inputargs.push(y_vid);
-        graph.block_mut(entry).inputargs.push(z_vid);
+        graph.push_inputarg(entry, x_vid);
+        graph.push_inputarg(entry, y_vid);
+        graph.push_inputarg(entry, z_vid);
 
         let cells = derive_subject_inputcells(&graph, None)
             .expect("typed Input ops must project to definite SomeValue cells");
@@ -2252,7 +2371,7 @@ mod tests {
         let mut graph = LegacyGraph::new("subject");
         let entry = graph.startblock;
         let orphan = graph.alloc_value();
-        graph.block_mut(entry).inputargs.push(orphan);
+        graph.push_inputarg(entry, orphan);
         let err = derive_subject_inputcells(&graph, None)
             .expect_err("inputarg without matching Input op must surface as TyperError");
         let msg = format!("{err}");
@@ -2276,7 +2395,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(entry).inputargs.push(vid);
+        graph.push_inputarg(entry, vid);
         let err = derive_subject_inputcells(&graph, None)
             .expect_err("ValueType::Unknown has no SomeValue projection");
         let msg = format!("{err}");
@@ -2293,7 +2412,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstInt(7),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ConstInt must translate to skip");
         assert!(
             result.is_empty(),
@@ -2309,7 +2429,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstFloat(0),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ConstFloat must translate to skip");
         assert!(result.is_empty());
     }
@@ -2328,17 +2449,18 @@ mod tests {
         value_map.insert(ValueId(2), rhs_var.clone());
         value_map.insert(ValueId(3), result_var.clone());
 
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(1),
-                rhs: ValueId(2),
+                lhs: graph.must_variable(ValueId(1)),
+                rhs: graph.must_variable(ValueId(2)),
                 result_ty: ValueType::Int,
             },
         };
-        let translated =
-            translate_op(&op, &value_map, &empty_call_registry()).expect("BinOp arm must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "add", "opname passes through unchanged");
@@ -2353,16 +2475,17 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(100);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(99), // not in value_map
-                rhs: ValueId(2),
+                lhs: graph.must_variable(ValueId(99)), // not in value_map
+                rhs: graph.must_variable(ValueId(2)),
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("undefined BinOp operand must surface invariant break");
         let msg = format!("{err}");
         assert!(msg.contains("undefined operand"));
@@ -2381,23 +2504,24 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let registry = empty_call_registry();
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["a", "b"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                 },
-                args: vec![ValueId(1)],
+                args: vec![graph.must_variable(ValueId(1))],
                 result_ty: ValueType::Int,
             },
         };
-        let registry = empty_call_registry();
-        registry.get_or_register(
-            FunctionPathKey::from_segments(["a", "b"]),
-            Signature::new(vec!["x".into()], None, None),
-        );
-        let translated =
-            translate_op(&op, &value_map, &registry).expect("Call::FunctionPath must lower");
+        let translated = translate_op(&op, &value_map, &registry, &graph)
+            .expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "simple_call");
@@ -2422,17 +2546,18 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::SyntheticTransparentCtor {
                     name: "Point".into(),
                 },
-                args: vec![ValueId(1)],
+                args: vec![graph.must_variable(ValueId(1))],
                 result_ty: ValueType::Ref,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
@@ -2455,16 +2580,20 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new())); // receiver
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new())); // arg
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new())); // result
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::method("push", Some("Vec".into())),
-                args: vec![ValueId(1), ValueId(2)],
+                args: vec![
+                    graph.must_variable(ValueId(1)),
+                    graph.must_variable(ValueId(2)),
+                ],
                 result_ty: ValueType::Int,
             },
         };
-        let translated =
-            translate_op(&op, &value_map, &empty_call_registry()).expect("Call::Method must lower");
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[1].opname, "simple_call");
@@ -2502,6 +2631,7 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
@@ -2509,11 +2639,11 @@ mod tests {
                     trait_root: "MyTrait".into(),
                     method_name: "do_it".into(),
                 },
-                args: vec![ValueId(1)],
+                args: vec![graph.must_variable(ValueId(1))],
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
         assert!(
@@ -2536,16 +2666,17 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::IndirectCall {
-                funcptr: ValueId(1),
-                args: vec![ValueId(2)],
+                funcptr: graph.must_variable(ValueId(1)),
+                args: vec![graph.must_variable(ValueId(2))],
                 graphs: None,
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("IndirectCall must surface rpbc.rs invariant break");
         let msg = format!("{err}");
         assert!(
@@ -2566,16 +2697,17 @@ mod tests {
         value_map.insert(ValueId(1), base_var.clone());
         value_map.insert(ValueId(2), result_var.clone());
 
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::FieldRead {
-                base: ValueId(1),
+                base: graph.must_variable(ValueId(1)),
                 field: crate::model::FieldDescriptor::new("f", Some("Owner".into())),
                 ty: ValueType::Int,
                 pure: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("FieldRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2595,16 +2727,17 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
-                base: ValueId(1),
+                base: graph.must_variable(ValueId(1)),
                 field: crate::model::FieldDescriptor::new("g", Some("Owner".into())),
-                value: ValueId(2),
+                value: graph.must_variable(ValueId(2)),
                 ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("FieldWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2630,17 +2763,18 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::ArrayRead {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2654,18 +2788,19 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::ArrayWrite {
-                base: ValueId(1),
-                index: ValueId(2),
-                value: ValueId(3),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
+                value: graph.must_variable(ValueId(3)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2683,17 +2818,18 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::InteriorFieldRead {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 item_ty: ValueType::Int,
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldRead arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
@@ -2721,18 +2857,19 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::InteriorFieldWrite {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: ValueId(3),
+                value: graph.must_variable(ValueId(3)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldWrite arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
@@ -2749,12 +2886,13 @@ mod tests {
         // context (op variant + arg role) added by the verbose-mode
         // groundwork pass.
         let value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(100);
         let op = SpaceOperation {
             result: Some(ValueId(100)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(99),
-                rhs: ValueId(0),
+                lhs: graph.must_variable(ValueId(99)),
+                rhs: graph.must_variable(ValueId(0)),
                 result_ty: ValueType::Int,
             },
         };
@@ -2795,11 +2933,11 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_return");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2807,7 +2945,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2875,11 +3013,11 @@ mod tests {
         let mut graph = LegacyGraph::new("with_return_var");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2887,7 +3025,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2934,7 +3072,7 @@ mod tests {
         let mut graph = LegacyGraph::new("const_link_arg");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::ConstInt(7),
@@ -2942,7 +3080,7 @@ mod tests {
             exitswitch: None,
             // Return ValueId(2), the ConstInt define.
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2950,7 +3088,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(3)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(3)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2996,29 +3134,33 @@ mod tests {
         annotations.set(ValueId(11), ValueType::Ref);
 
         let mut graph = LegacyGraph::new("canraise_with_extravars");
+        graph.set_next_value(12); // pre-allocate up to ValueId(11) for extravars
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1), ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1), ValueId(2)]),
             operations: vec![SpaceOperation {
                 result: Some(ValueId(3)),
                 kind: OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: ValueId(1),
-                    rhs: ValueId(2),
+                    lhs: graph.must_variable(ValueId(1)),
+                    rhs: graph.must_variable(ValueId(2)),
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: Some(crate::model::ExitSwitch::LastException),
             exits: vec![
-                link_to_returnblock(vec![LinkArg::Value(ValueId(3))], graph.returnblock),
+                link_to_returnblock(vec![LinkArg::value(&graph, ValueId(3))], graph.returnblock),
                 crate::model::Link::new_mixed(
-                    vec![LinkArg::Value(ValueId(10)), LinkArg::Value(ValueId(11))],
+                    vec![
+                        LinkArg::value(&graph, ValueId(10)),
+                        LinkArg::value(&graph, ValueId(11)),
+                    ],
                     graph.exceptblock,
                     Some(crate::model::exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::Value(ValueId(10))),
-                    Some(LinkArg::Value(ValueId(11))),
+                    Some(LinkArg::value(&graph, ValueId(10))),
+                    Some(LinkArg::value(&graph, ValueId(11))),
                 ),
             ],
             framestate: None,
@@ -3026,7 +3168,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(4)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(4)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -3035,7 +3177,7 @@ mod tests {
         };
         let exceptblock = Block {
             id: graph.exceptblock,
-            inputargs: vec![ValueId(10), ValueId(11)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(10), ValueId(11)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -3075,9 +3217,11 @@ mod tests {
         annotations.set(ValueId(2), ValueType::Int);
 
         let mut graph = LegacyGraph::new("unported_op");
+        let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
+        let arg_var = graph.must_variable(ValueId(1));
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs,
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::Call {
@@ -3085,13 +3229,13 @@ mod tests {
                         trait_root: "MyTrait".into(),
                         method_name: "do_it".into(),
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![arg_var],
                     result_ty: ValueType::Int,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -3099,7 +3243,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(3)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(3)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
