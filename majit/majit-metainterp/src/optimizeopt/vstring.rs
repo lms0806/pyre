@@ -510,7 +510,7 @@ impl OptString {
                                 _chars: vec![None; len as usize],
                             }),
                             last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         }),
                     );
                 }
@@ -827,7 +827,7 @@ impl OptString {
                         _is_virtual: true,
                     }),
                     last_guard_pos: -1,
-                    cached_vinfo: std::cell::RefCell::new(None),
+                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                 }),
             );
             return OptimizationResult::Remove;
@@ -872,7 +872,7 @@ impl OptString {
                     length: -1,
                     variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
                     last_guard_pos: -1,
-                    cached_vinfo: std::cell::RefCell::new(None),
+                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                 }),
             );
             return OptimizationResult::Remove;
@@ -1456,7 +1456,7 @@ mod tests {
                 length,
                 variant: VStringVariant::Plain(VStringPlainInfo { _chars: chars }),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
     }
@@ -1478,7 +1478,7 @@ mod tests {
                     _is_virtual: true,
                 }),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
     }
@@ -1496,7 +1496,7 @@ mod tests {
                 length: -1,
                 variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
     }
@@ -2149,7 +2149,7 @@ mod tests {
                 length: -1,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -2232,7 +2232,7 @@ mod tests {
                 length: -1,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         // targetbox: non-virtual
@@ -2301,7 +2301,7 @@ mod tests {
                 length: -1,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -2343,7 +2343,7 @@ mod tests {
                 length: -1,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 

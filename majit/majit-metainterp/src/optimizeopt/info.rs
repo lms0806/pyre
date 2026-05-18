@@ -11,6 +11,22 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// info.py:487-492 line-by-line:
+///
+/// ```python
+/// def reasonable_array_index(index):
+///     """Check a given constant array index or array size for sanity.
+///     In case of invalid loops or very large arrays, we shouldn't try
+///     to optimize them."""
+///     return index >= 0 and index <= 150000
+/// ```
+///
+/// Used by `virtualize.py:28` (NEW_ARRAY size gate) and
+/// `info.py:561` (per-element initialization gate).
+pub fn reasonable_array_index(index: i64) -> bool {
+    index >= 0 && index <= 150000
+}
+
 /// shortpreamble.py:11-49: PreambleOp
 ///
 /// Wrapper stored in PtrInfo._fields during Phase 2 import.
@@ -281,10 +297,10 @@ pub struct StrPtrInfo {
     pub last_guard_pos: i32,
     /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` — inherited
     /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py:50,55).
-    /// Same semantics as the sibling Virtual/VirtualArray/... variants:
-    /// `make_virtual_info` dedups across finish() calls by comparing
-    /// fieldnums (resume.py:309-314).
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
+    /// inheritance contract; `make_virtual_info` dedups across finish()
+    /// calls by comparing fieldnums (resume.py:309-314).
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
@@ -698,7 +714,6 @@ impl PtrInfo {
             descr: None,
             known_class: Some(class_ptr),
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -709,7 +724,6 @@ impl PtrInfo {
             descr,
             known_class,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -719,7 +733,6 @@ impl PtrInfo {
         PtrInfo::Struct(StructPtrInfo {
             descr,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -741,9 +754,8 @@ impl PtrInfo {
             known_class,
             ob_type_descr: None,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         })
     }
 
@@ -754,7 +766,7 @@ impl PtrInfo {
             clear,
             items: vec![OpRef::NONE; length],
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         })
     }
 
@@ -763,9 +775,8 @@ impl PtrInfo {
         PtrInfo::VirtualStruct(VirtualStructInfo {
             descr,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         })
     }
 
@@ -917,39 +928,54 @@ impl PtrInfo {
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
             }
             PtrInfo::Instance(info) => {
-                // info.py:336-353 InstancePtrInfo.make_guards.
+                // info.py:336-353 InstancePtrInfo.make_guards line-by-line.
                 //
-                // Upstream branches on `optimizer.cpu.remove_gctypeptr`:
-                //   True  (rclass typeptr removed; typeid via gctypelayout)
-                //     known_class: GUARD_NONNULL_CLASS
-                //     descr-only:  GUARD_NONNULL + GUARD_SUBCLASS
-                //   False (typeptr retained at obj[0]):
-                //     known_class: GUARD_NONNULL + GUARD_IS_OBJECT + GUARD_CLASS
-                //     descr-only:  GUARD_NONNULL + GUARD_IS_OBJECT + GUARD_SUBCLASS
+                //   def make_guards(self, op, short, optimizer):
+                //       if self._known_class is not None:
+                //           if not optimizer.cpu.remove_gctypeptr:
+                //               short.append(GUARD_NONNULL[op])
+                //               short.append(GUARD_IS_OBJECT[op])
+                //               short.append(GUARD_CLASS[op, self._known_class])
+                //           else:
+                //               short.append(GUARD_NONNULL_CLASS[op, self._known_class])
+                //       elif self.descr is not None:
+                //           short.append(GUARD_NONNULL[op])
+                //           if not optimizer.cpu.remove_gctypeptr:
+                //               short.append(GUARD_IS_OBJECT[op])
+                //           short.append(GUARD_SUBCLASS[op, ConstInt(descr.get_vtable())])
+                //       else:
+                //           AbstractStructPtrInfo.make_guards(...)
                 //
-                // Pyre's PyObject keeps `ob_type` at offset 0 (pyobject.rs:50)
-                // AND uses a separate GC header for typeid; many PyObjects
-                // (INSTANCE_TYPE, INT_TYPE, …) are static singletons with no
-                // GC header. The False-branch's GUARD_IS_OBJECT reads
-                // `obj - GcHeader::SIZE` (codegen.rs:797-802); applying it
-                // to a static PyObject SIGBUSes. Pyre therefore behaves as
-                // if `remove_gctypeptr=True` for the optimizer's guard
-                // generation, deferring the False-branch port until the GC
-                // layout migration retires static PyObjects (epic tracked
-                // separately, alongside heap-only object lifecycle).
+                // `ctx.remove_gctypeptr` is the `optimizer.cpu.remove_gctypeptr`
+                // analogue (llmodel.py:55 — translator config
+                // `gcremovetypeptr`). Pyre defaults to True because its
+                // PyObject layout has static singletons (INSTANCE_TYPE,
+                // INT_TYPE, …) with no GC header, and the False-branch
+                // GUARD_IS_OBJECT reads `obj - GcHeader::SIZE`
+                // (codegen.rs:797-802) which SIGBUSes on those statics.
+                // The False branch is still emitted line-by-line so a
+                // backend that flips `remove_gctypeptr=false` (e.g. a
+                // future heap-only PyObject layout) gets the upstream
+                // guard sequence without further changes.
                 if let Some(cls) = &info.known_class {
-                    // info.py:344-345 True branch: GUARD_NONNULL_CLASS
                     let class_ref = alloc_const(ctx, Value::Ref(*cls));
-                    short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+                    if !ctx.remove_gctypeptr {
+                        short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                        short.push(Op::new(OpCode::GuardIsObject, &[op]));
+                        short.push(Op::new(OpCode::GuardClass, &[op, class_ref]));
+                    } else {
+                        short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+                    }
                 } else if let Some(descr) = &info.descr {
-                    // info.py:347 + :350 True branch: GUARD_NONNULL +
-                    // GUARD_SUBCLASS[op, ConstInt(descr.get_vtable())].
                     let vtable = descr
                         .as_size_descr()
                         .map(|sd| sd.vtable() as i64)
                         .unwrap_or(0);
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
                     short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                    if !ctx.remove_gctypeptr {
+                        short.push(Op::new(OpCode::GuardIsObject, &[op]));
+                    }
                     short.push(Op::new(OpCode::GuardSubclass, &[op, vtable_const]));
                 } else {
                     // info.py:353 fall-through with neither class nor
@@ -1278,16 +1304,49 @@ impl PtrInfo {
         &self,
     ) -> Option<&std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>> {
         match self {
-            PtrInfo::Virtual(v) => Some(&v.cached_vinfo),
-            PtrInfo::VirtualStruct(v) => Some(&v.cached_vinfo),
-            PtrInfo::VirtualArray(v) => Some(&v.cached_vinfo),
-            PtrInfo::VirtualArrayStruct(v) => Some(&v.cached_vinfo),
-            PtrInfo::VirtualRawBuffer(v) => Some(&v.cached_vinfo),
-            PtrInfo::VirtualRawSlice(v) => Some(&v.cached_vinfo),
+            PtrInfo::Virtual(v) => Some(&v.avpi.cached_vinfo),
+            PtrInfo::VirtualStruct(v) => Some(&v.avpi.cached_vinfo),
+            PtrInfo::VirtualArray(v) => Some(&v.avpi.cached_vinfo),
+            PtrInfo::VirtualArrayStruct(v) => Some(&v.avpi.cached_vinfo),
+            PtrInfo::VirtualRawBuffer(v) => Some(&v.avpi.cached_vinfo),
+            PtrInfo::VirtualRawSlice(v) => Some(&v.avpi.cached_vinfo),
             // info.py:124-128 + vstring.py:50,55 — StrPtrInfo inherits
             // _cached_vinfo from AbstractVirtualPtrInfo.
-            PtrInfo::Str(v) => Some(&v.cached_vinfo),
+            PtrInfo::Str(v) => Some(&v.avpi.cached_vinfo),
             _ => None,
+        }
+    }
+
+    /// info.py:180-188 `AbstractStructPtrInfo.init_fields` parity helper.
+    ///
+    /// RPython does NOT cache fielddescrs; it queries
+    /// `descr.get_all_fielddescrs()` on demand at each consumer site.
+    /// Pyre's cached `field_descrs` field on Virtual/Instance/Struct/
+    /// VirtualStruct variants is the deviation tracked by Task #202.
+    /// This helper provides the descr-derived view for callers that
+    /// want to opt into the cache-free read path during migration; it
+    /// allocates a fresh `Vec<DescrRef>` per call (the Arc upcast from
+    /// `Arc<dyn FieldDescr>` to `Arc<dyn Descr>` requires per-element
+    /// `Arc::clone + as` since trait upcasting on `Arc` isn't free).
+    ///
+    /// Returns an empty Vec for variants without a SizeDescr
+    /// (VirtualArray, VirtualRawBuffer, etc.) or when the descr's
+    /// `all_fielddescrs()` returns the empty default.
+    pub fn all_fielddescrs_from_descr(&self) -> Vec<DescrRef> {
+        let sd = match self {
+            PtrInfo::Virtual(v) => v.descr.as_size_descr(),
+            PtrInfo::VirtualStruct(v) => v.descr.as_size_descr(),
+            PtrInfo::Instance(v) => v.descr.as_ref().and_then(|d| d.as_size_descr()),
+            PtrInfo::Struct(v) => v.descr.as_size_descr(),
+            _ => None,
+        };
+        match sd {
+            Some(sd) => sd
+                .all_fielddescrs()
+                .iter()
+                .map(|fd| std::sync::Arc::clone(fd) as std::sync::Arc<dyn majit_ir::Descr>)
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1317,12 +1376,14 @@ impl PtrInfo {
             // resume.py can pair `fielddescrs` and `fieldnums` 1:1 again.
             PtrInfo::Virtual(info) => {
                 let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
-                Some(visitor.visit_virtual(&info.descr, &indices, &info.field_descrs))
+                let fielddescrs = self.all_fielddescrs_from_descr();
+                Some(visitor.visit_virtual(&info.descr, &indices, &fielddescrs))
             }
             // info.py:369-372 StructPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualStruct(info) => {
                 let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
-                Some(visitor.visit_vstruct(&info.descr, &indices, &info.field_descrs))
+                let fielddescrs = self.all_fielddescrs_from_descr();
+                Some(visitor.visit_vstruct(&info.descr, &indices, &fielddescrs))
             }
             // info.py:598-599 ArrayPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualArray(info) => Some(visitor.visit_varray(&info.descr, info.clear)),
@@ -1400,13 +1461,20 @@ impl PtrInfo {
             }
         };
 
+        // Descr-derived view of the full fielddescr slot list, used by both
+        // the constant-fold path and the per-field SETFIELD_GC emission in the
+        // Virtual/VirtualStruct match arms below. Computed once so the call
+        // sites don't need to re-borrow `self` while `vinfo` is borrowed.
+        let cached_fielddescrs = self.all_fielddescrs_from_descr();
+
         // RPython info.py:140-145: immutable virtual filled with constants
         // → constant fold to a compile-time constant pointer.
         if self.is_immutable_and_filled_with_constants(ctx) {
             if let Some(ref alloc_fn) = ctx.constant_fold_alloc {
-                let (descr, fields, field_descrs) = match self {
-                    PtrInfo::Virtual(v) => (&v.descr, &v.fields, &v.field_descrs),
-                    PtrInfo::VirtualStruct(v) => (&v.descr, &v.fields, &v.field_descrs),
+                let field_descrs = &cached_fielddescrs;
+                let (descr, fields) = match self {
+                    PtrInfo::Virtual(v) => (&v.descr, &v.fields),
+                    PtrInfo::VirtualStruct(v) => (&v.descr, &v.fields),
                     _ => unreachable!(),
                 };
                 let obj_size = descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
@@ -1463,7 +1531,6 @@ impl PtrInfo {
                 let preserved = PtrInfo::Struct(StructPtrInfo {
                     descr: vinfo.descr.clone(),
                     fields: Vec::new(),
-                    field_descrs: vinfo.field_descrs.clone(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::New, &[]);
@@ -1491,7 +1558,7 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
-                    let descr = lookup_field_descr(&vinfo.field_descrs, field_idx);
+                    let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                     debug_assert!(
                         descr.is_some(),
                         "force_box: field_idx={} has value but no descriptor \
@@ -1516,7 +1583,6 @@ impl PtrInfo {
                     descr: Some(vinfo.descr.clone()),
                     known_class: vinfo.known_class,
                     fields: Vec::new(),
-                    field_descrs: vinfo.field_descrs.clone(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -1542,7 +1608,7 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
-                    let descr = lookup_field_descr(&vinfo.field_descrs, field_idx);
+                    let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                     let descr = descr.expect(
                         "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                     );
@@ -1737,7 +1803,7 @@ impl PtrInfo {
                             offset: slice.offset,
                             parent: OpRef::NONE,
                             last_guard_pos: slice.last_guard_pos,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         }),
                     );
                 }
@@ -1813,7 +1879,7 @@ impl PtrInfo {
                             length: sinfo_full.length,
                             variant: VStringVariant::Ptr, // non-virtual
                             last_guard_pos: sinfo_full.last_guard_pos,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         }),
                     );
                 }
@@ -2071,54 +2137,70 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:180-188 `AbstractStructPtrInfo.init_fields`.
+    ///
+    /// ```python
+    /// def init_fields(self, descr, index):
+    ///     if self._fields is None:
+    ///         self.descr = descr
+    ///         self._fields = [None] * len(descr.get_all_fielddescrs())
+    ///     if index >= len(self._fields):
+    ///         self.descr = descr  # a more precise descr
+    ///         extra_len = len(descr.get_all_fielddescrs()) - len(self._fields)
+    ///         self._fields = self._fields + [None] * extra_len
+    /// ```
+    ///
+    /// RPython tracks `_fields` length to detect when a subclass with
+    /// more fields shows up and the local descr should be upgraded to
+    /// the more-precise one. Pyre's `fields` is sparse-by-position so
+    /// the length tracker is the descr's own `all_fielddescrs().len()`.
     pub fn init_fields(&mut self, descr: DescrRef, index: usize) {
         let Some(size_descr) = descr.as_size_descr() else {
             return;
         };
-        let all_fielddescrs: Vec<DescrRef> = size_descr
-            .all_fielddescrs()
-            .iter()
-            .map(|field_descr| field_descr.clone() as DescrRef)
-            .collect();
+        let new_len = size_descr.all_fielddescrs().len();
         match self {
             PtrInfo::Instance(v) => {
-                if v.field_descrs.is_empty() {
-                    v.descr = Some(descr);
-                    v.field_descrs = all_fielddescrs;
-                } else if index >= v.field_descrs.len() {
-                    v.descr = Some(descr);
-                    v.field_descrs
-                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
+                let cur_len = v
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_size_descr())
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                if v.descr.is_none() || index >= cur_len {
+                    if cur_len == 0 || new_len > cur_len {
+                        v.descr = Some(descr);
+                    }
                 }
             }
             PtrInfo::Struct(v) => {
-                if v.field_descrs.is_empty() {
+                let cur_len = v
+                    .descr
+                    .as_size_descr()
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
-                    v.field_descrs = all_fielddescrs;
-                } else if index >= v.field_descrs.len() {
-                    v.descr = descr;
-                    v.field_descrs
-                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::Virtual(v) => {
-                if v.field_descrs.is_empty() {
+                let cur_len = v
+                    .descr
+                    .as_size_descr()
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
-                    v.field_descrs = all_fielddescrs;
-                } else if index >= v.field_descrs.len() {
-                    v.descr = descr;
-                    v.field_descrs
-                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::VirtualStruct(v) => {
-                if v.field_descrs.is_empty() {
+                let cur_len = v
+                    .descr
+                    .as_size_descr()
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
-                    v.field_descrs = all_fielddescrs;
-                } else if index >= v.field_descrs.len() {
-                    v.descr = descr;
-                    v.field_descrs
-                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             _ => {}
@@ -2198,7 +2280,6 @@ impl PtrInfo {
                     descr: None,
                     known_class: None,
                     fields: vec![(field_idx, FieldEntry::Preamble(pop))],
-                    field_descrs: Vec::new(),
                     last_guard_pos: -1,
                 });
             }
@@ -2563,11 +2644,12 @@ impl PtrInfo {
     /// GETFIELD read so the bridge can re-populate the optimizer's field cache.
     pub fn produce_short_preamble_ops(&self, structbox: OpRef) -> Vec<Op> {
         let mut result = Vec::new();
+        let field_descrs = self.all_fielddescrs_from_descr();
         // Fields are accessed per-variant below
         if let PtrInfo::Virtual(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    let descr = lookup_field_descr(&v.field_descrs, field_idx)
+                    let descr = lookup_field_descr(&field_descrs, field_idx)
                         .expect("produce_short_preamble_ops: virtual field descr missing");
                     result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
                 }
@@ -2576,13 +2658,55 @@ impl PtrInfo {
         if let PtrInfo::VirtualStruct(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    let descr = lookup_field_descr(&v.field_descrs, field_idx)
+                    let descr = lookup_field_descr(&field_descrs, field_idx)
                         .expect("produce_short_preamble_ops: virtual struct field descr missing");
                     result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
                 }
             }
         }
         result
+    }
+}
+
+/// info.py:124-128 `AbstractVirtualPtrInfo` line-by-line shared state.
+///
+/// ```python
+/// class AbstractVirtualPtrInfo(NonNullPtrInfo):
+///     _attrs_ = ('_cached_vinfo', 'descr', '_is_virtual')
+///     _cached_vinfo = None
+/// ```
+///
+/// Every concrete virtual-flavoured PtrInfo (Virtual, VirtualStruct,
+/// VirtualArray, VirtualArrayStruct, VirtualRawBuffer, VirtualRawSlice,
+/// Str) inherits `_cached_vinfo` from `AbstractVirtualPtrInfo`. Pyre
+/// embeds this shared struct as `pub avpi: AbstractVirtualPtrInfo` in
+/// each concrete variant so the inheritance contract is structural,
+/// not per-variant copy-paste.
+///
+/// `descr` and `_is_virtual` are NOT lifted here:
+///   - `descr` is variant-specific (SizeDescr for Virtual, ArrayDescr
+///     for VirtualArray, etc.) — RPython's `_attrs_` is a hint to the
+///     translator's slot allocator, not a parity constraint on the
+///     storage *type*. Each pyre variant keeps its own typed `descr`.
+///   - `_is_virtual` collapses into the pyre enum tag itself
+///     (`PtrInfo::Virtual(_)` IS the truthy carrier of `_is_virtual`);
+///     no separate slot is needed.
+///
+/// `make_virtual_info` (resume.py:307-315) reads `cached_vinfo` to
+/// dedup RdVirtualInfo allocations across multiple finish() calls
+/// referencing the same virtual. `RefCell` provides interior
+/// mutability so the immutable-receiver accessor can populate the
+/// cache on first miss.
+#[derive(Clone, Debug, Default)]
+pub struct AbstractVirtualPtrInfo {
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+}
+
+impl AbstractVirtualPtrInfo {
+    pub fn new() -> Self {
+        Self {
+            cached_vinfo: std::cell::RefCell::new(None),
+        }
     }
 }
 
@@ -2620,15 +2744,12 @@ pub struct VirtualInfo {
     /// Field values: `(field_descr_index, value_opref)`.
     /// **Invariant**: never contains typeptr (offset 0) — see struct-level docs.
     pub fields: Vec<(u32, OpRef)>,
-    /// Original field descriptors, in parent-local slot order.
-    pub field_descrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py `_cached_vinfo` — cached RdVirtualInfo for resume data
-    /// dedup (resume.py:309-314). RefCell for interior mutability so
-    /// the immutable-receiver `make_virtual_info` trait method can
-    /// populate the cache on first miss.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` inherited
+    /// state. Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
+    /// inheritance — see the shared-struct doc above.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// A virtual array.
@@ -2642,8 +2763,8 @@ pub struct VirtualArrayInfo {
     pub items: Vec<OpRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// A non-virtual object with cached field info.
@@ -2659,8 +2780,6 @@ pub struct InstancePtrInfo {
     /// RPython stores both normal Boxes and PreambleOp sentinels in the
     /// same list. Rust mirrors this with `Vec<(u32, FieldEntry)>`.
     pub fields: Vec<(u32, FieldEntry)>,
-    /// Original field descriptors, in parent-local slot order.
-    pub field_descrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2674,8 +2793,6 @@ pub struct StructPtrInfo {
     pub descr: DescrRef,
     /// info.py:175 _fields — cached field values (same as InstancePtrInfo).
     pub fields: Vec<(u32, FieldEntry)>,
-    /// Original field descriptors, in parent-local slot order.
-    pub field_descrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2703,12 +2820,10 @@ pub struct VirtualStructInfo {
     pub descr: DescrRef,
     /// Field values: (field_index, value, optional original field descriptor).
     pub fields: Vec<(u32, OpRef)>,
-    /// Original field descriptors, in parent-local slot order, used for force.
-    pub field_descrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// A virtual array of structs (interior field access pattern).
@@ -2727,8 +2842,8 @@ pub struct VirtualArrayStructInfo {
     pub fielddescrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// info.py:RawSlicePtrInfo — alias view into a parent virtual raw buffer.
@@ -2751,8 +2866,8 @@ pub struct VirtualRawSliceInfo {
     pub parent: OpRef,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 /// info.py:386 RawBufferPtrInfo — pointer info for virtual raw memory.
@@ -2774,8 +2889,8 @@ pub struct VirtualRawBufferInfo {
     /// info.py:420: calldescr for CALL_I(func, size) raw malloc.
     /// Saved from the original CALL_I op during virtualization.
     pub calldescr: Option<DescrRef>,
-    /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
+    /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
+    pub avpi: AbstractVirtualPtrInfo,
 }
 
 impl VirtualRawBufferInfo {
@@ -2788,7 +2903,7 @@ impl VirtualRawBufferInfo {
             buffer: RawBuffer::new(),
             last_guard_pos: -1,
             calldescr,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         }
     }
 
@@ -2907,7 +3022,7 @@ mod tests {
                 _chars: vec![None, None],
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert!(plain.is_virtual());
 
@@ -2922,7 +3037,7 @@ mod tests {
                 lgtop: OpRef::int_op(3),
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert!(slice.is_virtual());
 
@@ -2937,7 +3052,7 @@ mod tests {
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert!(concat.is_virtual());
 
@@ -2948,7 +3063,7 @@ mod tests {
             length: -1,
             variant: VStringVariant::Ptr,
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert!(!ptr.is_virtual());
     }
@@ -2973,7 +3088,7 @@ mod tests {
                 ],
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
 
         assert_eq!(
@@ -3012,7 +3127,7 @@ mod tests {
                     ],
                 }),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -3027,7 +3142,7 @@ mod tests {
                 lgtop: OpRef::int_op(21),
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
         assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
@@ -3044,7 +3159,7 @@ mod tests {
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         let pos2 = ctx
             .ensure_box(OpRef::int_op(2))
@@ -3060,7 +3175,7 @@ mod tests {
                     _chars: vec![Some(OpRef::int_op(11)), Some(OpRef::int_op(12))],
                 }),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 

@@ -469,6 +469,27 @@ impl OptPure {
         self.pure_from_args(opcode, &[arg0], result);
     }
 
+    /// pure.py: pure_from_args1(opnum, arg0, op, descr=...) — same as
+    /// pure_from_args1 but keys the pure cache on `descr_identity`
+    /// (Arc::as_ptr) so distinct descrs don't collide on the same
+    /// (opcode, arg0) pair. Used for opcodes like ARRAYLEN_GC where
+    /// the array descr discriminates which array's length is stored
+    /// (virtualize.py:220).
+    pub fn pure_from_args1_with_descr(
+        &mut self,
+        opcode: OpCode,
+        arg0: OpRef,
+        result: OpRef,
+        descr: majit_ir::DescrRef,
+    ) {
+        let key = PureOpKey {
+            opcode,
+            args: vec![arg0],
+            descr_identity: Some(majit_ir::descr::descr_identity(&descr)),
+        };
+        self.cache.insert(key, result);
+    }
+
     /// pure.py: pure_from_args2(opnum, arg0, arg1, op)
     /// Specialized version for binary operations.
     pub fn pure_from_args2(&mut self, opcode: OpCode, arg0: OpRef, arg1: OpRef, result: OpRef) {
@@ -955,9 +976,14 @@ impl Optimization for OptPure {
 
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
-        // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships).
-        for (opcode, arg0, result) in ctx.pending_pure_from_args.drain(..) {
-            self.pure_from_args1(opcode, arg0, result);
+        // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
+        // and virtualize pass (ARRAYLEN_GC with array descr keying per
+        // virtualize.py:220).
+        for (opcode, arg0, result, descr) in ctx.pending_pure_from_args.drain(..) {
+            match descr {
+                Some(d) => self.pure_from_args1_with_descr(opcode, arg0, result, d),
+                None => self.pure_from_args1(opcode, arg0, result),
+            }
         }
         // optimizer.py: pure_from_args2 parity — consume binary registrations
         // (INSTANCE_PTR_EQ/NE swapped-args from rewrite.py:565,571).

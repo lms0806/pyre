@@ -129,6 +129,12 @@ pub struct UnrollOptimizer {
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
     pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
+    /// optimizer.cpu`. Propagated to the inner phase-1/phase-2
+    /// `Optimizer.cls_of_box_fn` so virtualstate match can read the
+    /// runtime typeptr via `cpu.cls_of_box(runtime_box)` at
+    /// virtualstate.py:601/:608/:620.
+    pub cls_of_box_fn: Option<fn(i64) -> i64>,
 }
 
 impl UnrollOptimizer {
@@ -138,6 +144,16 @@ impl UnrollOptimizer {
             target_tokens: Vec::new(),
             retraced_count: 0,
             constant_types: std::collections::HashMap::new(),
+            // unroll.py:215/265 reads
+            // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
+            // Production callers (pyjitpl/mod.rs:4109,5170) override
+            // these via `warm_state.retrace_limit()` /
+            // `.max_retrace_guards()` before driving the optimizer,
+            // matching the upstream MemoryManager hookup. These
+            // fallback defaults (5/15) are only consulted by test
+            // fixtures that bypass pyjitpl — they match the
+            // `rpython/jit/metainterp/optimizeopt/test/test_util.py`
+            // `n = 5` / `n = 15` test values.
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
@@ -154,6 +170,7 @@ impl UnrollOptimizer {
             next_global_opref: 0,
             callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
+            cls_of_box_fn: None,
         }
     }
 
@@ -330,6 +347,7 @@ impl UnrollOptimizer {
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.constant_types = self.constant_types.clone();
             opt_p1.callinfocollection = self.callinfocollection.clone();
+            opt_p1.cls_of_box_fn = self.cls_of_box_fn;
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -587,6 +605,7 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.callinfocollection = self.callinfocollection.clone();
+        opt_p2.cls_of_box_fn = self.cls_of_box_fn;
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
@@ -2809,7 +2828,11 @@ impl OptUnroll {
         runtime_boxes: Option<&[OpRef]>,
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        optimizer.disable_guard_replacement();
+        // optimizer.py:317 `with self.optimizer.cant_replace_guards():`
+        // line-by-line — save current `can_replace_guards`, set False
+        // for the guarded section, restore on exit. Nested scopes
+        // preserve the outer False via the saved oldval.
+        let oldval = optimizer.cant_replace_guards();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.jump_to_existing_trace_impl(
                 jump_args,
@@ -2822,7 +2845,7 @@ impl OptUnroll {
                 pre_vs,
             )
         }));
-        optimizer.enable_guard_replacement();
+        optimizer.restore_can_replace_guards(oldval);
         match result {
             Ok(vs) => vs,
             Err(payload) => std::panic::resume_unwind(payload),

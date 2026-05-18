@@ -524,8 +524,12 @@ pub struct OptContext {
     pub pending_for_guard: Vec<Op>,
     /// optimizer.py: pure_from_args1 parity — reverse-pure relationships
     /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
-    /// Each entry: (opcode, arg0, result) meaning pure(opcode, arg0) = result.
-    pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef)>,
+    /// Each entry: (opcode, arg0, result, descr) meaning
+    /// pure((opcode, arg0), descr) = result. `descr` is `None` for
+    /// the common case (no descr); `Some(DescrRef)` matches upstream
+    /// `pure_from_args(rop.OPNUM, [arg], result, descr=op.getdescr())`
+    /// (e.g. virtualize.py:220 ARRAYLEN_GC keying on the array descr).
+    pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef, Option<majit_ir::DescrRef>)>,
     /// optimizer.py: pure_from_args2 parity — binary reverse-pure relationships
     /// registered by rewrite pass (INSTANCE_PTR_EQ/NE swapped-args). Consumed
     /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
@@ -622,6 +626,42 @@ pub struct OptContext {
     /// resume.py parity: RPython guards always get a snapshot via
     /// capture_resumedata; pyre tracks the nearest valid position.
     pub last_seen_snapshot_pos: Option<i32>,
+    /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
+    /// optimizer.cpu`. Propagated from `Optimizer.cls_of_box_fn` at
+    /// `setup_optimizations` time; consumed by virtualstate match for
+    /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620).
+    /// Storage hook; the public `cls_of_box(opref)` method walks the
+    /// OpRef chain to extract the concrete pointer and invokes this fn.
+    pub cls_of_box_fn: Option<fn(i64) -> i64>,
+    /// llmodel.py:55 `self.remove_gctypeptr =
+    /// translator.config.translation.gcremovetypeptr`. model.py:26
+    /// default is `False`; PyPy x86 enables `--gcremovetypeptr` which
+    /// flips this to `True` so the GC header carries the typeid and
+    /// `obj[0]` no longer holds the rclass typeptr.
+    ///
+    /// Pyre's PyObject layout keeps `ob_type` at offset 0 BUT many
+    /// static singletons (INSTANCE_TYPE, INT_TYPE, …) carry no GC
+    /// header — `GUARD_IS_OBJECT` reads `obj - GcHeader::SIZE` and
+    /// SIGBUSes on them. The pyre default matches the `True` branch
+    /// (skip GUARD_IS_OBJECT, emit GUARD_NONNULL_CLASS as a single
+    /// op). Consumed by `info.py:338/:348 InstancePtrInfo.make_guards`
+    /// (info.rs port at `InstancePtrInfo::make_guards`).
+    pub remove_gctypeptr: bool,
+    /// optimizer.py:84-92 `Optimization.last_emitted_operation` — set
+    /// to the just-emitted op (or `REMOVED` sentinel) by the base
+    /// class's `_emit_operation`, read by callers like
+    /// `optimize_GUARD_NO_EXCEPTION` (rewrite.py:712-718) to check
+    /// whether the preceding op was dropped. The slot is updated on
+    /// every emit across all passes, so a remove in pass N is visible
+    /// to pass N+1.
+    ///
+    /// Pyre folds the REMOVED sentinel into a `bool` and lifts the
+    /// slot from per-pass storage (where it was OptRewrite-local) to
+    /// `OptContext` so the cross-pass scope matches the upstream
+    /// base-class contract. Set by `propagate_from_pass_range` on
+    /// `OptimizationResult::Remove`, reset on every successful
+    /// `emit_operation` (see `Optimizer::emit_operation`).
+    pub last_op_removed: bool,
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
@@ -808,6 +848,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         let info = resolved_box
             .as_ref()
             .and_then(|b| self.ctx.peek_ptr_info(b))?;
+        let fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
@@ -817,8 +858,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 // slots as `None`. Preserve that shape so `fieldnums` aligns
                 // 1:1 with `descr.get_all_fielddescrs()` for `_cached_vinfo`
                 // reuse at resume.py:307-315.
-                field_oprefs: vi
-                    .field_descrs
+                field_oprefs: fielddescrs
                     .iter()
                     .enumerate()
                     .map(|(fi, _)| {
@@ -833,8 +873,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: None,
-                field_oprefs: vi
-                    .field_descrs
+                field_oprefs: fielddescrs
                     .iter()
                     .enumerate()
                     .map(|(fi, _)| {
@@ -1415,6 +1454,9 @@ impl OptContext {
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),
+            cls_of_box_fn: None,
+            remove_gctypeptr: true,
+            last_op_removed: false,
         }
     }
 
@@ -1540,6 +1582,9 @@ impl OptContext {
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),
+            cls_of_box_fn: None,
+            remove_gctypeptr: true,
+            last_op_removed: false,
         }
     }
 
@@ -2859,7 +2904,7 @@ impl OptContext {
                 // the previous iteration's virtual variant across.
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             };
             if new_info.lenbound.is_none() {
                 new_info.lenbound = Some(crate::optimizeopt::intutils::IntBound::nonnegative());
@@ -3162,7 +3207,24 @@ impl OptContext {
     /// Register reverse-pure: pure(opcode, result) = arg0.
     /// Consumed by OptPure at flush time.
     pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
-        self.pending_pure_from_args.push((opcode, result, arg0));
+        self.pending_pure_from_args
+            .push((opcode, result, arg0, None));
+    }
+
+    /// optimizer.py: pure_from_args1 parity with explicit descr keying.
+    /// Mirrors upstream `pure_from_args(opnum, [arg], result, descr=...)`
+    /// — descr discriminates the pure cache slot so cross-descr
+    /// collisions (e.g. ARRAYLEN_GC across distinct array descrs at
+    /// virtualize.py:220) don't collapse onto the same key.
+    pub fn register_pure_from_args1_with_descr(
+        &mut self,
+        opcode: OpCode,
+        result: OpRef,
+        arg0: OpRef,
+        descr: majit_ir::DescrRef,
+    ) {
+        self.pending_pure_from_args
+            .push((opcode, result, arg0, Some(descr)));
     }
 
     /// info.py:557 pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
@@ -4176,7 +4238,7 @@ impl OptContext {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
-                        field_descrs: Vec::new(),
+
                         last_guard_pos: -1,
                     })
                 });
@@ -4191,7 +4253,7 @@ impl OptContext {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
-                        field_descrs: Vec::new(),
+
                         last_guard_pos: -1,
                     })
                 });
@@ -4210,7 +4272,7 @@ impl OptContext {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
-                        field_descrs: Vec::new(),
+
                         last_guard_pos: -1,
                     })
                 });
@@ -4229,7 +4291,7 @@ impl OptContext {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
-                        field_descrs: Vec::new(),
+
                         last_guard_pos: -1,
                     })
                 });
@@ -5498,6 +5560,229 @@ impl OptContext {
         terminal.ptr_info_handle().map(PtrInfoHandle::Live)
     }
 
+    /// virtualstate.py:48-55 `GenerateGuardState.get_runtime_field(box, descr)`
+    /// parity.
+    ///
+    /// ```python
+    /// def get_runtime_field(self, box, descr):
+    ///     struct = box.getref_base()
+    ///     if descr.is_pointer_field():
+    ///         return InputArgRef(self.cpu.bh_getfield_gc_r(struct, descr))
+    ///     elif descr.is_float_field():
+    ///         return InputArgFloat(self.cpu.bh_getfield_gc_f(struct, descr))
+    ///     else:
+    ///         return InputArgInt(self.cpu.bh_getfield_gc_i(struct, descr))
+    /// ```
+    ///
+    /// Walks `runtime_box` to its `Value::Ref(gcref)` payload and reads
+    /// the typed value at `gcref.raw() + descr.offset()` using
+    /// `FieldDescr.field_size()` / `is_field_signed()` (the same
+    /// (offset, size, sign) triple `Cpu::bh_getfield_gc_i` consumes on
+    /// the backend — compiler.rs:14570). Wraps the read in a freshly
+    /// allocated const OpRef matching `InputArg*` parity. Returns
+    /// `None` when the OpRef does not resolve to a concrete Ref, when
+    /// the descr is not a FieldDescr, or when the runtime pointer is
+    /// null (matching the backend's `if addr == 0 { return 0 }` guard
+    /// at compiler.rs:6371).
+    pub fn get_runtime_field(
+        &mut self,
+        runtime_box: OpRef,
+        descr: &majit_ir::descr::DescrRef,
+    ) -> Option<OpRef> {
+        let raw = match self.get_constant(runtime_box)? {
+            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
+            _ => return None,
+        };
+        let fd = descr.as_field_descr()?;
+        let offset = fd.offset() as i64;
+        let ptr = (raw as usize).wrapping_add(offset as usize);
+        if raw == 0 {
+            return None;
+        }
+        match fd.field_type() {
+            Type::Ref => {
+                let val = unsafe { (ptr as *const usize).read_unaligned() };
+                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+            }
+            Type::Float => {
+                let val = unsafe { (ptr as *const f64).read_unaligned() };
+                Some(self.make_constant_float(val))
+            }
+            Type::Int => {
+                let size = fd.field_size();
+                let sign = fd.is_field_signed();
+                let val = unsafe {
+                    match (size, sign) {
+                        (1, true) => (ptr as *const i8).read_unaligned() as i64,
+                        (1, false) => (ptr as *const u8).read_unaligned() as i64,
+                        (2, true) => (ptr as *const i16).read_unaligned() as i64,
+                        (2, false) => (ptr as *const u16).read_unaligned() as i64,
+                        (4, true) => (ptr as *const i32).read_unaligned() as i64,
+                        (4, false) => (ptr as *const u32).read_unaligned() as i64,
+                        _ => (ptr as *const i64).read_unaligned(),
+                    }
+                };
+                Some(self.make_constant_int(val))
+            }
+            _ => None,
+        }
+    }
+
+    /// virtualstate.py:39-47 `GenerateGuardState.get_runtime_item(box, descr, i)`
+    /// parity.
+    ///
+    /// ```python
+    /// def get_runtime_item(self, box, descr, i):
+    ///     array = box.getref_base()
+    ///     if descr.is_array_of_pointers():
+    ///         return InputArgRef(self.cpu.bh_getarrayitem_gc_r(array, i, descr))
+    ///     elif descr.is_array_of_floats():
+    ///         return InputArgFloat(self.cpu.bh_getarrayitem_gc_f(array, i, descr))
+    ///     else:
+    ///         return InputArgInt(self.cpu.bh_getarrayitem_gc_i(array, i, descr))
+    /// ```
+    ///
+    /// Reads `array_ptr + base_size + i * itemsize` per
+    /// `ArrayDescr.base_size()` / `ArrayDescr.itemsize()` matching the
+    /// backend `Cpu::bh_getarrayitem_gc_*` (compiler.rs:14611). Wraps
+    /// the read in a freshly allocated const OpRef.
+    pub fn get_runtime_item(
+        &mut self,
+        runtime_box: OpRef,
+        descr: &majit_ir::descr::DescrRef,
+        i: usize,
+    ) -> Option<OpRef> {
+        let raw = match self.get_constant(runtime_box)? {
+            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
+            _ => return None,
+        };
+        let ad = descr.as_array_descr()?;
+        let base_size = ad.base_size() as i64;
+        let itemsize = ad.item_size() as i64;
+        let offset = base_size + (i as i64) * itemsize;
+        let ptr = (raw as usize).wrapping_add(offset as usize);
+        match ad.item_type() {
+            Type::Ref => {
+                let val = unsafe { (ptr as *const usize).read_unaligned() };
+                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+            }
+            Type::Float => {
+                let val = unsafe { (ptr as *const f64).read_unaligned() };
+                Some(self.make_constant_float(val))
+            }
+            Type::Int => {
+                let size = itemsize as usize;
+                let sign = ad.is_item_signed();
+                let val = unsafe {
+                    match (size, sign) {
+                        (1, true) => (ptr as *const i8).read_unaligned() as i64,
+                        (1, false) => (ptr as *const u8).read_unaligned() as i64,
+                        (2, true) => (ptr as *const i16).read_unaligned() as i64,
+                        (2, false) => (ptr as *const u16).read_unaligned() as i64,
+                        (4, true) => (ptr as *const i32).read_unaligned() as i64,
+                        (4, false) => (ptr as *const u32).read_unaligned() as i64,
+                        _ => (ptr as *const i64).read_unaligned(),
+                    }
+                };
+                Some(self.make_constant_int(val))
+            }
+            _ => None,
+        }
+    }
+
+    /// virtualstate.py:57-67 `GenerateGuardState.get_runtime_interiorfield(box, descr, i)`
+    /// parity.
+    ///
+    /// ```python
+    /// def get_runtime_interiorfield(self, box, descr, i):
+    ///     struct = box.getref_base()
+    ///     if descr.is_pointer_field():
+    ///         return InputArgRef(self.cpu.bh_getinteriorfield_gc_r(struct, i, descr))
+    ///     elif descr.is_float_field():
+    ///         return InputArgFloat(self.cpu.bh_getinteriorfield_gc_f(struct, i, descr))
+    ///     else:
+    ///         return InputArgInt(self.cpu.bh_getinteriorfield_gc_i(struct, i, descr))
+    /// ```
+    ///
+    /// Reads at `struct_ptr + array.base_size() + i * array.item_size()
+    /// + field.offset()` per `InteriorFieldDescr.array_descr()` +
+    /// `field_descr()`. Matches the backend Cpu::bh_getinteriorfield_gc_*
+    /// shape (struct + element_index + interior-field).
+    pub fn get_runtime_interiorfield(
+        &mut self,
+        runtime_box: OpRef,
+        descr: &majit_ir::descr::DescrRef,
+        i: usize,
+    ) -> Option<OpRef> {
+        let raw = match self.get_constant(runtime_box)? {
+            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
+            _ => return None,
+        };
+        let ifd = descr.as_interior_field_descr()?;
+        let ad = ifd.array_descr();
+        let fd = ifd.field_descr();
+        let element_offset = (ad.base_size() as i64) + (i as i64) * (ad.item_size() as i64);
+        let offset = element_offset + (fd.offset() as i64);
+        let ptr = (raw as usize).wrapping_add(offset as usize);
+        match fd.field_type() {
+            Type::Ref => {
+                let val = unsafe { (ptr as *const usize).read_unaligned() };
+                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+            }
+            Type::Float => {
+                let val = unsafe { (ptr as *const f64).read_unaligned() };
+                Some(self.make_constant_float(val))
+            }
+            Type::Int => {
+                let size = fd.field_size();
+                let sign = fd.is_field_signed();
+                let val = unsafe {
+                    match (size, sign) {
+                        (1, true) => (ptr as *const i8).read_unaligned() as i64,
+                        (1, false) => (ptr as *const u8).read_unaligned() as i64,
+                        (2, true) => (ptr as *const i16).read_unaligned() as i64,
+                        (2, false) => (ptr as *const u16).read_unaligned() as i64,
+                        (4, true) => (ptr as *const i32).read_unaligned() as i64,
+                        (4, false) => (ptr as *const u32).read_unaligned() as i64,
+                        _ => (ptr as *const i64).read_unaligned(),
+                    }
+                };
+                Some(self.make_constant_int(val))
+            }
+            _ => None,
+        }
+    }
+
+    /// model.py:199-201 `cpu.cls_of_box(box)` parity.
+    ///
+    /// Walks the OpRef to its constant `Value::Ref(gcref)` payload (the
+    /// pyre equivalent of `box.getref_base()`) and reads the typeptr
+    /// from offset 0 via the plumbed `cls_of_box` fn pointer
+    /// (`pyjitpl/mod.rs:733 default_cls_of_box`). Returns `None` when:
+    /// (a) the OpRef does not resolve to a concrete `Value::Ref`, or
+    /// (b) the hook is absent (synthetic fixtures), or
+    /// (c) the gcref is null.
+    ///
+    /// virtualstate.py:601/:608/:620 call this directly on the runtime
+    /// box at trace-end virtualstate match; the result is then
+    /// `same_constant`-compared with the expected `known_class`. The
+    /// gcref read happens BEFORE the optimizer-tracked PtrInfo lookup
+    /// because in RPython `runtime_box` is always a concrete InputArg*
+    /// carrying a raw pointer, independent of optimizer state.
+    pub fn cls_of_box(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
+        let raw = match self.get_constant(opref)? {
+            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
+            _ => return None,
+        };
+        let hook = self.cls_of_box_fn?;
+        let typeptr = hook(raw);
+        if typeptr == 0 {
+            None
+        } else {
+            Some(majit_ir::GcRef(typeptr as usize))
+        }
+    }
+
     /// info.py:880 `getptrinfo(op).get_known_class(cpu)` parity.
     ///
     /// Routes the OpRef through `get_box_replacement_box` to obtain a
@@ -6182,7 +6467,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             })
         } else if op.opcode == OpCode::Unicodelen {
             // optimizer.py:492-493: unicodelen → StrPtrInfo(mode_unicode)
@@ -6193,7 +6478,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             })
         } else {
             // optimizer.py:494-495: assert False, "operations %s unsupported"
@@ -6249,7 +6534,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             },
         )));
     }
@@ -7104,9 +7389,8 @@ mod boxref_forwarding_tests {
             known_class: None,
             ob_type_descr: None,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         ctx.set_ptr_info(&b, info);
         assert!(ctx.peek_ptr_info(&b).is_some_and(|i| i.is_virtual()));
@@ -7500,7 +7784,7 @@ mod constant_ptr_info_tests {
                 offset: 8,
                 parent,
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -8136,9 +8420,8 @@ mod opt_box_env_tests {
                 known_class: Some(GcRef(0x1234)),
                 ob_type_descr: None,
                 fields: Vec::new(),
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 

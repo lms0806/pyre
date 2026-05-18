@@ -58,9 +58,6 @@ enum Nullness {
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
 pub struct OptRewrite {
-    /// Tracks whether the last non-guard op was removed by the optimizer.
-    /// Used to eliminate redundant GuardNoException after removed calls.
-    last_op_removed: bool,
     /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
     bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
@@ -76,7 +73,6 @@ pub struct OptRewrite {
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            last_op_removed: false,
             bool_result_cache: std::collections::HashMap::new(),
             loop_invariant_results: std::collections::HashMap::new(),
             loop_invariant_producer: std::collections::HashMap::new(),
@@ -1813,7 +1809,7 @@ impl OptRewrite {
         let arg2 = op.arg(2);
         if let Some(1) = ctx.get_constant_int(arg2) {
             ctx.replace_op(op.pos, op.arg(1));
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return true;
         }
         false
@@ -1836,7 +1832,7 @@ impl OptRewrite {
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:780-781: if not b2.is_constant(): return False
@@ -1851,7 +1847,7 @@ impl OptRewrite {
         // rewrite.py:785-788: x % 1 → 0
         if val == 1 {
             ctx.make_constant(op.pos, Value::Int(0));
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:789-796: x % power_of_two → x & (power_of_two - 1)
@@ -1862,7 +1858,7 @@ impl OptRewrite {
             let mut and_op = Op::new(OpCode::IntAnd, &[arg1, mask]);
             and_op.pos = op.pos;
             ctx.emit_extra(ctx.current_pass_idx, and_op);
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:797-805: intdiv.modulo_operations fallback
@@ -1875,7 +1871,7 @@ impl OptRewrite {
             ctx,
         );
         ctx.replace_op(op.pos, result_ref);
-        self.last_op_removed = true;
+        ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
 
@@ -1896,7 +1892,7 @@ impl OptRewrite {
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
             ctx.make_constant(op.pos, Value::Int(0));
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:730-741: non-constant divisor (shift optimization)
@@ -1915,7 +1911,7 @@ impl OptRewrite {
                         let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shiftvar]);
                         rshift_op.pos = op.pos;
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
-                        self.last_op_removed = true;
+                        ctx.last_op_removed = true;
                         return Some(OptimizationResult::Remove);
                     }
                 }
@@ -1929,7 +1925,7 @@ impl OptRewrite {
                 let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
                 neg_op.pos = op.pos;
                 ctx.emit_extra(ctx.current_pass_idx, neg_op);
-                self.last_op_removed = true;
+                ctx.last_op_removed = true;
                 return Some(OptimizationResult::Remove);
             }
         }
@@ -1940,7 +1936,7 @@ impl OptRewrite {
         // rewrite.py:752-755: x // 1 → x
         if val == 1 {
             ctx.replace_op(op.pos, arg1);
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:756-757: x // power_of_two → x >> shift
@@ -1950,7 +1946,7 @@ impl OptRewrite {
             let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shift_const]);
             rshift_op.pos = op.pos;
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
-            self.last_op_removed = true;
+            ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:758-766: intdiv.division_operations fallback
@@ -1963,7 +1959,7 @@ impl OptRewrite {
             ctx,
         );
         ctx.replace_op(op.pos, result_ref);
-        self.last_op_removed = true;
+        ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
 
@@ -2533,7 +2529,7 @@ impl Optimization for OptRewrite {
         // Track last_op_removed for GuardNoException optimization.
         // Reset for non-guard ops (guards don't count as "the last op").
         if !op.opcode.is_guard() {
-            self.last_op_removed = false;
+            ctx.last_op_removed = false;
         }
 
         // Try boolean inverse/reflex rewrites for comparisons
@@ -2696,7 +2692,7 @@ impl Optimization for OptRewrite {
             // ── Conditional calls ──
             OpCode::CondCallN => {
                 if let Some(0) = ctx.get_constant_int(op.arg(0)) {
-                    self.last_op_removed = true;
+                    ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
                 }
                 if let Some(c) = ctx.get_constant_int(op.arg(0)) {
@@ -2704,11 +2700,11 @@ impl Optimization for OptRewrite {
                         let mut call_op = Op::new(OpCode::CallN, &op.args[1..]);
                         call_op.pos = op.pos;
                         call_op.descr = op.descr.clone();
-                        self.last_op_removed = false;
+                        ctx.last_op_removed = false;
                         return OptimizationResult::Replace(call_op);
                     }
                 }
-                self.last_op_removed = false;
+                ctx.last_op_removed = false;
                 OptimizationResult::PassOn
             }
             // rewrite.py:483-494: optimize_COND_CALL_VALUE_I/R
@@ -2718,7 +2714,7 @@ impl Optimization for OptRewrite {
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
                 if nullness == Nullness::Nonnull {
                     ctx.replace_op(op.pos, op.arg(0));
-                    self.last_op_removed = true;
+                    ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
                 }
                 // rewrite.py:490-493: INFO_NULL → demote to CALL_PURE
@@ -2731,10 +2727,10 @@ impl Optimization for OptRewrite {
                     let mut call_op = Op::new(call_opcode, &op.args[1..]);
                     call_op.pos = op.pos;
                     call_op.descr = op.descr.clone();
-                    self.last_op_removed = false;
+                    ctx.last_op_removed = false;
                     return OptimizationResult::Replace(call_op);
                 }
-                self.last_op_removed = false;
+                ctx.last_op_removed = false;
                 OptimizationResult::PassOn
             }
 
@@ -2802,9 +2798,20 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            // ── Guard no exception after removed call ──
+            // rewrite.py:712-718 optimize_GUARD_NO_EXCEPTION:
+            //
+            //     def optimize_GUARD_NO_EXCEPTION(self, op):
+            //         if self.last_emitted_operation is REMOVED:
+            //             return  # the prior op was a CALL_PURE that
+            //                     # was killed; kill the guard too
+            //         return self.emit(op)
+            //
+            // `last_emitted_operation` is set by every pass's emit
+            // (optimizer.py:84-92), so the flag reflects the
+            // PREVIOUS op's fate regardless of which pass dropped it.
+            // pyre's ctx.last_op_removed is the cross-pass equivalent.
             OpCode::GuardNoException => {
-                if self.last_op_removed {
+                if ctx.last_op_removed {
                     return OptimizationResult::Remove;
                 }
                 OptimizationResult::PassOn
@@ -2815,19 +2822,14 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // ── rewrite.py: INT_SIGNEXT(x, n) where bounds already fit ──
-            // If x is already known to fit in n bytes, the signext is a no-op.
-            OpCode::IntSignext => {
-                // args: [value, num_bytes]
-                if let Some(nbytes) = ctx.get_constant_int(op.arg(1)) {
-                    if nbytes == 8 {
-                        // signext to 8 bytes is always a no-op on 64-bit
-                        ctx.replace_op(op.pos, op.arg(0));
-                        return OptimizationResult::Remove;
-                    }
-                }
-                OptimizationResult::PassOn
-            }
+            // INT_SIGNEXT belongs on `OptIntBounds`, not `OptRewrite`.
+            // rewrite.py has no `optimize_INT_SIGNEXT`; the handler lives
+            // at intbounds.py:450-466 (optimize + postprocess). pyre's
+            // intbounds.rs:1760 already implements the full upstream
+            // logic (is_within_range check), so this `OptRewrite` arm
+            // is redundant — its weaker `nbytes == 8` shortcut admits a
+            // strict subset of intbounds's removals. Removed for
+            // line-by-line dispatch-shape parity.
 
             // rewrite.py:676-698: optimize_CALL_PURE_I
             // Dispatch based on oopspecindex to specialized handlers.
@@ -2912,7 +2914,7 @@ impl Optimization for OptRewrite {
                         };
                         let cached_result = ctx.get_box_replacement(cached_result);
                         ctx.replace_op(op.pos, cached_result);
-                        self.last_op_removed = true;
+                        ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
                     // Cache miss: demote and record result
@@ -2929,7 +2931,7 @@ impl Optimization for OptRewrite {
                 let mut new_op = Op::new(call_opcode, &op.args);
                 new_op.pos = op.pos;
                 new_op.descr = op.descr.clone();
-                self.last_op_removed = false;
+                ctx.last_op_removed = false;
                 OptimizationResult::Emit(new_op)
             }
 
@@ -2992,18 +2994,22 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // rewrite.py:388-395: optimize_record_exact_value
+            // rewrite.py:397-401: optimize_record_exact_value
             //   box = op.getarg(0)
             //   expectedconstbox = op.getarg(1)
             //   assert isinstance(expectedconstbox, Const)
             //   self.make_constant(box, expectedconstbox)
+            //
+            // `make_constant` walks the forwarding chain internally
+            // (optimizer.py:412 `box = get_box_replacement(box)`), so
+            // upstream passes `op.getarg(0)` raw without a prior
+            // `get_box_replacement` resolution. Pyre matches.
             OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
-                let box_ref = ctx.get_box_replacement(op.arg(0));
                 let val = ctx.get_constant(op.arg(1)).expect(
-                    "rewrite.py:391 — RECORD_EXACT_VALUE expectedconstbox \
+                    "rewrite.py:400 — RECORD_EXACT_VALUE expectedconstbox \
                      must be a Const",
                 );
-                ctx.make_constant(box_ref, val);
+                ctx.make_constant(op.arg(0), val);
                 OptimizationResult::Remove
             }
 
@@ -3059,7 +3065,9 @@ impl Optimization for OptRewrite {
     }
 
     fn setup(&mut self) {
-        self.last_op_removed = false;
+        // ctx.last_op_removed is initialised by OptContext::new() and
+        // maintained cross-pass by propagate_from_pass_range +
+        // emit_operation — no per-pass setup needed.
         self.bool_result_cache.clear();
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();

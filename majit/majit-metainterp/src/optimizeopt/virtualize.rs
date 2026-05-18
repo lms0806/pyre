@@ -350,7 +350,7 @@ impl OptVirtualize {
             offset,
             parent,
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
             .ensure_box(source_op.pos)
@@ -409,19 +409,20 @@ impl OptVirtualize {
 
     fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.descr.clone().expect("NEW_WITH_VTABLE needs descr");
-        // virtualize.py:208: known_class = ConstInt(op.getdescr().get_vtable())
-        let known_class = descr
-            .as_size_descr()
-            .map(|sd| majit_ir::GcRef(sd.vtable()))
-            .filter(|gc| !gc.is_null());
+        // virtualize.py:208 `known_class = ConstInt(op.getdescr().get_vtable())`
+        // — no null filter; ConstInt(0) flows downstream as the
+        // known_class. info.py:763-772 ConstPtrInfo.get_known_class
+        // handles the nonnull check inside, so the upstream contract
+        // is "always carry the vtable value; let consumers interpret
+        // null as 'no known class' at read time".
+        let known_class = descr.as_size_descr().map(|sd| majit_ir::GcRef(sd.vtable()));
         let vinfo = VirtualInfo {
             descr,
             known_class,
             ob_type_descr: None,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
             .ensure_box(op.pos)
@@ -435,9 +436,8 @@ impl OptVirtualize {
         let vinfo = VirtualStructInfo {
             descr,
             fields: Vec::new(),
-            field_descrs: Vec::new(),
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
             .ensure_box(op.pos)
@@ -449,7 +449,9 @@ impl OptVirtualize {
     fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let size_ref = op.arg(0);
         if let Some(size) = ctx.get_constant_int(size_ref) {
-            if size >= 0 && size <= 1024 {
+            // virtualize.py:28-29 `if not info.reasonable_array_index(size):`
+            // — defined at info.py:487-492 with upper bound 150000.
+            if crate::optimizeopt::info::reasonable_array_index(size) {
                 let descr = op.descr.clone().expect("NEW_ARRAY needs descr");
                 // virtualize.py:30-32: arraydescr.is_array_of_structs()
                 let is_struct = descr
@@ -474,7 +476,7 @@ impl OptVirtualize {
                         fielddescrs,
                         element_fields,
                         last_guard_pos: -1,
-                        cached_vinfo: std::cell::RefCell::new(None),
+                        avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
                     let b = ctx
                         .ensure_box(op.pos)
@@ -487,7 +489,7 @@ impl OptVirtualize {
                         clear: matches!(op.opcode, OpCode::NewArrayClear),
                         items,
                         last_guard_pos: -1,
-                        cached_vinfo: std::cell::RefCell::new(None),
+                        avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
                     let b = ctx
                         .ensure_box(op.pos)
@@ -497,8 +499,15 @@ impl OptVirtualize {
                 return OptimizationResult::Remove;
             }
         }
-        // virtualize.py:220: self.pure_from_args(rop.ARRAYLEN_GC, [op], arg, descr=op.getdescr())
-        ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos, size_ref);
+        // virtualize.py:220 `self.pure_from_args(rop.ARRAYLEN_GC, [op],
+        // arg, descr=op.getdescr())` — array descr discriminates the
+        // pure-cache key so the reverse ARRAYLEN→size fold doesn't
+        // collide across distinct array types.
+        if let Some(descr) = op.descr.clone() {
+            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, op.pos, size_ref, descr);
+        } else {
+            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos, size_ref);
+        }
         OptimizationResult::PassOn
     }
 
@@ -578,7 +587,14 @@ impl OptVirtualize {
                             return Some(OptimizationResult::Remove);
                         }
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
+                        debug_assert!(
+                            (field_idx as usize)
+                                < vinfo
+                                    .descr
+                                    .as_size_descr()
+                                    .map(|sd| sd.all_fielddescrs().len())
+                                    .unwrap_or(0)
+                        );
                         debug_assert_no_typeptr_in_virtual_fields(
                             &vinfo.fields,
                             "optimize_setfield_gc::Virtual",
@@ -587,7 +603,14 @@ impl OptVirtualize {
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
+                        debug_assert!(
+                            (field_idx as usize)
+                                < vinfo
+                                    .descr
+                                    .as_size_descr()
+                                    .map(|sd| sd.all_fielddescrs().len())
+                                    .unwrap_or(0)
+                        );
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::Virtualizable(vstate) => {
@@ -1348,18 +1371,15 @@ impl OptVirtualize {
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
-        let field_descrs = vec![
-            make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
-            make_vref_field_descr(VREF_FORCED_FIELD_INDEX),
-        ];
+        // info.py:175-188 stores no fielddescr side-list; the SizeDescr
+        // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
         let vinfo = VirtualInfo {
             descr: vref_descr,
             known_class,
             ob_type_descr: None,
             fields,
-            field_descrs,
             last_guard_pos: -1,
-            cached_vinfo: std::cell::RefCell::new(None),
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
             .ensure_box(op.pos)
@@ -2085,6 +2105,10 @@ impl FieldDescr for VRefFieldDescr {
 }
 
 fn make_vref_field_descr(index: u32) -> DescrRef {
+    make_vref_field_descr_typed(index)
+}
+
+fn make_vref_field_descr_typed(index: u32) -> Arc<VRefFieldDescr> {
     let (offset, field_type) = match index {
         // `virtualref.py:17` registers `virtual_token` and `forced` both
         // as `llmemory.GCREF` slots; the rtyper writes them through
@@ -2118,6 +2142,20 @@ fn make_vref_field_descr(index: u32) -> DescrRef {
 #[derive(Debug)]
 struct VRefSizeDescr;
 
+/// virtualref.py:17 registers JitVirtualRef with two fields:
+/// `virtual_token` (slot 0) and `forced` (slot 1). Mirror that here so
+/// `SizeDescr::all_fielddescrs()` returns the descriptor-order pair —
+/// `info::all_fielddescrs_from_descr` consumes this view at force-box
+/// and visitor-dispatch sites (info.rs:1340).
+static VREF_ALL_FIELDDESCRS: std::sync::LazyLock<Vec<Arc<dyn majit_ir::FieldDescr>>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            make_vref_field_descr_typed(VREF_VIRTUAL_TOKEN_FIELD_INDEX)
+                as Arc<dyn majit_ir::FieldDescr>,
+            make_vref_field_descr_typed(VREF_FORCED_FIELD_INDEX) as Arc<dyn majit_ir::FieldDescr>,
+        ]
+    });
+
 impl Descr for VRefSizeDescr {
     fn index(&self) -> u32 {
         VREF_SIZE_DESCR_INDEX
@@ -2147,6 +2185,9 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     }
     fn is_immutable(&self) -> bool {
         false
+    }
+    fn all_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
+        &VREF_ALL_FIELDDESCRS
     }
 }
 
@@ -3093,14 +3134,16 @@ mod tests {
             panic!("expected Virtual ptr info, got {info:?}");
         };
         assert_eq!(vinfo.fields, vec![(0, OpRef::int_op(100))]);
-        assert_eq!(vinfo.field_descrs.len(), 1);
-        assert_eq!(
-            vinfo.field_descrs[0]
-                .as_field_descr()
-                .expect("field descr")
-                .index_in_parent(),
-            0
-        );
+        // info.py:188 keeps no cached fielddescr list — `descr.get_all_fielddescrs()`
+        // is the authoritative view. Round-trip the size descr the same way
+        // production consumers (info.rs all_fielddescrs_from_descr) do.
+        let fielddescrs = vinfo
+            .descr
+            .as_size_descr()
+            .expect("Virtual carries a SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(fielddescrs.len(), 1);
+        assert_eq!(fielddescrs[0].index_in_parent(), 0);
     }
 
     #[test]

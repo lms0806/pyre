@@ -204,6 +204,33 @@ pub struct Optimizer {
     /// retrace helpers without recorder). Production parity paths route
     /// optimizer info through BoxRef `_forwarded`.
     pending_box_pool: crate::r#box::BoxPool,
+    /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
+    /// optimizer.cpu`. Reads the runtime typeptr (object class) at
+    /// offset 0 of a Ref payload. Used at trace-end virtualstate match
+    /// time to evaluate `cpu.cls_of_box(runtime_box)` precondition for
+    /// KnownClass guard generation (virtualstate.py:601 / :608 / :620).
+    ///
+    /// Plumbed from `MetaInterp.cls_of_box` (`pyjitpl/mod.rs:1764`)
+    /// at the Optimizer construction site. Optional because synthetic
+    /// fixtures that never run a real CPU may leave it unset; the
+    /// virtualstate match falls back to `get_known_class` in that case.
+    pub cls_of_box_fn: Option<fn(i64) -> i64>,
+    /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
+    /// set of OpRefs the optimizer has emitted (or that
+    /// `replace_guard_op` substituted in place of an emitted op).
+    /// Populated at:
+    /// - `emit_operation` after `ctx.emit` (optimizer.py:674
+    ///   `self._emittedoperations[op] = None` inside _emit_operation).
+    /// - `replace_guard_op` after swapping the new op into
+    ///   `new_operations` (optimizer.py:747).
+    ///
+    /// Read by `as_operation(opref, required_opnum)` (optimizer.py:369-377)
+    /// which returns the opref iff it has been emitted *and* its opcode
+    /// matches the optional `required_opnum`. Used by callers that need
+    /// to verify an OpRef refers to an actually-emitted op before
+    /// reasoning about descriptor-shared guards or other emit-bound
+    /// metadata.
+    pub emitted_operations: std::collections::HashSet<OpRef>,
 }
 
 /// Lower a typed-`Value` constants pool back to the legacy
@@ -501,6 +528,7 @@ impl Optimizer {
                     let _ = (field_descrs, known_class, field_idx);
                     imported_fields.push((*field_idx, field_ref));
                 }
+                let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info_for(
                     opref,
                     crate::optimizeopt::info::PtrInfo::Virtual(
@@ -509,9 +537,8 @@ impl Optimizer {
                             known_class: *known_class,
                             ob_type_descr: ob_type_descr.clone(),
                             fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         },
                     ),
                 );
@@ -529,7 +556,7 @@ impl Optimizer {
                             clear: false,
                             items: imported_items,
                             last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         },
                     ),
                 );
@@ -544,15 +571,15 @@ impl Optimizer {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
                     imported_fields.push((*field_idx, field_ref));
                 }
+                let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info_for(
                     opref,
                     crate::optimizeopt::info::PtrInfo::VirtualStruct(
                         crate::optimizeopt::info::VirtualStructInfo {
                             descr: descr.clone(),
                             fields: imported_fields,
-                            field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         },
                     ),
                 );
@@ -584,7 +611,7 @@ impl Optimizer {
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
-                            cached_vinfo: std::cell::RefCell::new(None),
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                         },
                     ),
                 );
@@ -659,7 +686,6 @@ impl Optimizer {
             head: OpRef,
             size_descr: majit_ir::DescrRef,
             fields: Vec<(u32, OpRef)>,
-            field_descrs: Vec<majit_ir::DescrRef>,
             kind: ImportedVirtualKind,
             head_load_descr_index: Option<u32>,
         }
@@ -735,7 +761,6 @@ impl Optimizer {
                 let virtual_head = ctx.get_box_replacement(raw);
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
-                let mut field_descrs = Vec::new();
                 for (descr, field_info) in &iv.fields {
                     let field_ref = Self::import_virtual_state_from_label_args(
                         field_info,
@@ -762,13 +787,12 @@ impl Optimizer {
                         .map(|field_descr| field_descr.index_in_parent() as u32)
                         .unwrap_or_else(|| descr.index());
                     fields.push((field_idx, field_ref));
-                    field_descrs.push(descr.clone());
+                    let _ = descr; // descr threading handled via SizeDescr.all_fielddescrs()
                 }
                 entries.push(VirtualEntry {
                     head: virtual_head,
                     size_descr: iv.size_descr.clone(),
                     fields,
-                    field_descrs,
                     kind: iv.kind.clone(),
                     head_load_descr_index: iv.head_load_descr_index,
                 });
@@ -843,9 +867,8 @@ impl Optimizer {
                                     known_class: *known_class,
                                     ob_type_descr: None,
                                     fields: entry.fields,
-                                    field_descrs: entry.field_descrs,
                                     last_guard_pos: -1,
-                                    cached_vinfo: std::cell::RefCell::new(None),
+                                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                                 },
                             ),
                         );
@@ -859,9 +882,8 @@ impl Optimizer {
                                 crate::optimizeopt::info::VirtualStructInfo {
                                     descr: entry.size_descr,
                                     fields: entry.fields,
-                                    field_descrs: entry.field_descrs,
                                     last_guard_pos: -1,
-                                    cached_vinfo: std::cell::RefCell::new(None),
+                                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                                 },
                             ),
                         );
@@ -952,6 +974,7 @@ impl Optimizer {
                     })
                     .collect();
                 let opref_box = ctx.get_box_replacement_box(opref);
+                let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 if let Some(b) = &opref_box {
                     ctx.set_ptr_info(
                         b,
@@ -961,9 +984,8 @@ impl Optimizer {
                                 known_class: *known_class,
                                 ob_type_descr: ob_type_descr.clone(),
                                 fields: imported_fields,
-                                field_descrs: field_descrs.clone(),
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                             },
                         ),
                     );
@@ -996,7 +1018,7 @@ impl Optimizer {
                                 clear: false,
                                 items: imported_items,
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                             },
                         ),
                     );
@@ -1027,6 +1049,7 @@ impl Optimizer {
                     })
                     .collect();
                 let opref_box = ctx.get_box_replacement_box(opref);
+                let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 if let Some(b) = &opref_box {
                     ctx.set_ptr_info(
                         b,
@@ -1034,9 +1057,8 @@ impl Optimizer {
                             crate::optimizeopt::info::VirtualStructInfo {
                                 descr: descr.clone(),
                                 fields: imported_fields,
-                                field_descrs: field_descrs.clone(),
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                             },
                         ),
                     );
@@ -1081,7 +1103,7 @@ impl Optimizer {
                                 fielddescrs: fielddescrs.clone(),
                                 element_fields: imported_elements,
                                 last_guard_pos: -1,
-                                cached_vinfo: std::cell::RefCell::new(None),
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                             },
                         ),
                     );
@@ -1156,6 +1178,8 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             pending_box_pool: crate::r#box::BoxPool::new(),
+            cls_of_box_fn: None,
+            emitted_operations: std::collections::HashSet::new(),
         }
     }
 
@@ -1228,8 +1252,50 @@ impl Optimizer {
 
     /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
     /// Replace a previously emitted guard with a new one.
+    ///
+    /// optimizer.py:747: `self._emittedoperations[new_op] = None` —
+    /// the new guard takes over the emit identity, so it must enter
+    /// the emit set even though it was substituted post-hoc rather
+    /// than directly emitted via `_emit_operation`.
     pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
+        let new_pos = new_guard.pos;
         self.replaces_guard.insert(old_pos, new_guard);
+        self.emitted_operations.insert(new_pos);
+    }
+
+    /// optimizer.py:369-377 `as_operation(op, required_opnum=-1)`:
+    ///
+    /// ```python
+    /// def as_operation(self, op, required_opnum=-1):
+    ///     if isinstance(op, AbstractResOp):
+    ///         if required_opnum != -1 and op.opnum != required_opnum:
+    ///             return None
+    ///         if op in self._emittedoperations:
+    ///             return op
+    ///     return None
+    /// ```
+    ///
+    /// Returns `Some(opref)` iff the opref refers to an actually-emitted
+    /// op (in `self.emitted_operations`) and its opcode matches
+    /// `required_opnum` (or `required_opnum` is `None` meaning "any
+    /// opcode"). Callers verify identity before reasoning about
+    /// emit-bound metadata.
+    pub fn as_operation(
+        &self,
+        opref: OpRef,
+        required_opnum: Option<majit_ir::OpCode>,
+        ctx: &OptContext,
+    ) -> Option<OpRef> {
+        if let Some(required) = required_opnum {
+            if ctx.op_at(opref).map(|op| op.opcode) != Some(required) {
+                return None;
+            }
+        }
+        if self.emitted_operations.contains(&opref) {
+            Some(opref)
+        } else {
+            None
+        }
     }
 
     // RPython optimizer.py:722-752 store_final_boxes_in_guard and
@@ -1262,13 +1328,48 @@ impl Optimizer {
         self.pendingfields.len()
     }
 
-    /// optimizer.py: cant_replace_guards()
-    /// Temporarily disable guard replacement (e.g., during bridge compilation).
+    /// optimizer.py:299 + :899-909 `cant_replace_guards()` returns a
+    /// `CantReplaceGuards` context manager whose `__enter__` saves
+    /// `self.optimizer.can_replace_guards` into `self.oldval` and sets
+    /// the flag to False; `__exit__` restores from `self.oldval`.
+    ///
+    /// pyre returns the previously-set value as a `bool` token. Callers
+    /// pair this with a manual restore (typically in a panic-safe
+    /// scope so the flag is restored even on unwind). This matches the
+    /// upstream save-old-then-set-false semantics exactly — including
+    /// the nested case where an outer scope has already set the flag
+    /// to False and the inner restore must preserve that.
+    ///
+    /// ```text
+    /// let oldval = optimizer.cant_replace_guards();
+    /// // ... guarded section ...
+    /// optimizer.restore_can_replace_guards(oldval);
+    /// ```
+    pub fn cant_replace_guards(&mut self) -> bool {
+        let oldval = self.can_replace_guards;
+        self.can_replace_guards = false;
+        oldval
+    }
+
+    /// Pair with `cant_replace_guards` — restores the saved oldval.
+    /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
+    pub fn restore_can_replace_guards(&mut self, oldval: bool) {
+        self.can_replace_guards = oldval;
+    }
+
+    /// **Legacy flat setter** kept for tests that exercise the flag
+    /// outside the cant_replace_guards save/restore pattern. New
+    /// production callers should use `cant_replace_guards()` +
+    /// `restore_can_replace_guards(oldval)` so nested scopes preserve
+    /// the outer value. Test-only entry; production unroll path
+    /// already migrated to the save/restore pair.
+    #[cfg(test)]
     pub fn disable_guard_replacement(&mut self) {
         self.can_replace_guards = false;
     }
 
-    /// Re-enable guard replacement.
+    /// Companion to `disable_guard_replacement` — test-only.
+    #[cfg(test)]
     pub fn enable_guard_replacement(&mut self) {
         self.can_replace_guards = true;
     }
@@ -1890,6 +1991,12 @@ impl Optimizer {
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
         ctx.callinfocollection = self.callinfocollection.clone();
+        // virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
+        // optimizer.cpu`. Propagate the runtime typeptr-read hook so
+        // virtualstate match (KnownClass arms) can fall back to
+        // `cpu.cls_of_box(runtime_box)` when the optimizer-tracked
+        // PtrInfo has no `known_class` recorded.
+        ctx.cls_of_box_fn = self.cls_of_box_fn;
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
@@ -3512,6 +3619,11 @@ impl Optimizer {
                     // optimizer.py:573-575: op removed → no postprocess.
                     ctx.pending_mark_last_guard = None;
                     ctx.pending_guard_class_postprocess = None;
+                    // optimizer.py:84-92 `last_emitted_operation = REMOVED`
+                    // — broadcast the removal so subsequent passes
+                    // (e.g. `optimize_GUARD_NO_EXCEPTION`,
+                    // rewrite.py:712-718) can observe the drop.
+                    ctx.last_op_removed = true;
                     return;
                 }
                 OptimizationResult::PassOn => {
@@ -3669,6 +3781,17 @@ impl Optimizer {
             ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
+        // optimizer.py:674 `self._emittedoperations[op] = None` — record
+        // the freshly emitted op so `as_operation` can later confirm it
+        // is in the emit set before downstream callers reason about
+        // descriptor-sharing or other emit-bound state.
+        self.emitted_operations.insert(emitted);
+        // optimizer.py:84-92 `_emit_operation` clears the REMOVED
+        // sentinel on each successful emit. Cross-pass readers
+        // (rewrite.py:712-718 `optimize_GUARD_NO_EXCEPTION`) see the
+        // flag transition from true (prior Remove) → false (this
+        // emit).
+        ctx.last_op_removed = false;
         // optimizer.py:603-611: after emit, promote IntBound→Const.
         //   op = self.get_box_replacement(op)
         //   if op.type == 'i':
@@ -5507,9 +5630,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef::int_op(11))],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         ctx.replace_op(OpRef::int_op(11), OpRef::int_op(20));
@@ -5521,9 +5643,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: Vec::new(),
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -5554,8 +5675,14 @@ mod tests {
     fn test_emit_operation_materializes_virtual_args_directly() {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
-        let descr = make_size_descr(16);
-        let field_descr: DescrRef = std::sync::Arc::new(TestDescr(0));
+        let test_descr = std::sync::Arc::new(TestDescr(0));
+        let field_descr_typed: std::sync::Arc<dyn majit_ir::FieldDescr> = test_descr;
+        // Bake the field descriptor into the SizeDescr so the descr-derived
+        // `all_fielddescrs_from_descr` view (info.rs) returns it for force_box.
+        let descr: DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0, 16, 0)
+                .with_all_fielddescrs(vec![field_descr_typed]),
+        );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
         let b10 = ctx
             .ensure_box(OpRef::int_op(10))
@@ -5565,9 +5692,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, OpRef::int_op(11))],
-                field_descrs: vec![field_descr.clone()],
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 

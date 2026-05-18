@@ -827,16 +827,19 @@ impl ShortBoxes {
         short_boxes
     }
 
-    /// shortpreamble.py: create_short_inputargs(label_args)
-    /// Build the input args for the short preamble from label args.
-    /// Returns OpRefs for each label arg that has a producer, or the
-    /// original label arg if no producer exists.
-    pub fn create_short_inputargs(&self, label_args: &[OpRef]) -> Vec<OpRef> {
-        if self.short_inputargs.is_empty() {
-            label_args.to_vec()
-        } else {
-            self.short_inputargs.clone()
-        }
+    /// shortpreamble.py:343-344 `create_short_inputargs(label_args)`:
+    ///
+    /// ```python
+    /// def create_short_inputargs(self, label_args):
+    ///     return self.short_inputargs
+    ///     # ... rest of function is dead code after this early return
+    /// ```
+    ///
+    /// Unconditionally returns `self.short_inputargs`. The pyre fallback
+    /// to `label_args.to_vec()` on empty was a NEW-DEVIATION — empty
+    /// short_inputargs is the legitimate empty-loop case in upstream.
+    pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<OpRef> {
+        self.short_inputargs.clone()
     }
 
     /// shortpreamble.py: add_potential_op(op, pop)

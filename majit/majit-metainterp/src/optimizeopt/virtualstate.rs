@@ -20,7 +20,7 @@
 /// position-numbered enum_forced_boxes dedup (virtualstate.py:196, 274,
 /// 352) prevents revisiting it.
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -40,6 +40,44 @@ impl VirtualStatesCantMatch {
             msg: msg.to_string(),
         }
     }
+}
+
+/// virtualstate.py:24-37 `GenerateGuardState` line-by-line port.
+///
+/// ```python
+/// class GenerateGuardState(object):
+///     def __init__(self, optimizer=None, guards=None, renum=None,
+///                  bad=None, force_boxes=False):
+///         self.optimizer = optimizer
+///         self.cpu = optimizer.cpu
+///         if guards is None:
+///             guards = []
+///         self.extra_guards = guards
+///         if renum is None:
+///             renum = {}
+///         self.renum = renum
+///         if bad is None:
+///             bad = {}
+///         self.bad = bad
+///         self.force_boxes = force_boxes
+/// ```
+///
+/// Pyre packs the per-`generate_guards` state into one struct instead
+/// of threading 4-5 separate parameters through the recursion. The
+/// `optimizer` + `cpu` slot is realised as `ctx: &mut OptContext`
+/// (the `cls_of_box_fn` hook + `get_runtime_field/item/interiorfield`
+/// helpers live on `OptContext`). `extra_guards` is the output buffer
+/// owned by the caller. `renum` tracks position aliasing per
+/// virtualstate.py:84-94. `bad` tracks the per-node "did this node
+/// fail to match" set per virtualstate.py:86/:98 (Python object
+/// identity → raw pointer identity here). `force_boxes` mirrors
+/// virtualstate.py:37 directly.
+pub(crate) struct GenerateGuardState<'a> {
+    pub ctx: &'a mut OptContext,
+    pub extra_guards: &'a mut Vec<GuardRequirement>,
+    pub renum: HashMap<i32, i32>,
+    pub bad: HashSet<*const VirtualStateInfoNode>,
+    pub force_boxes: bool,
 }
 
 impl std::fmt::Display for VirtualStatesCantMatch {
@@ -360,7 +398,7 @@ impl VirtualStateInfo {
                     ..
                 },
             ) => {
-                if d1.index() != d2.index() {
+                if descr_identity(d1) != descr_identity(d2) {
                     return false;
                 }
                 // Class must match (both None or same pointer)
@@ -397,7 +435,7 @@ impl VirtualStateInfo {
                     ..
                 },
             ) => {
-                if d1.index() != d2.index() || i1.len() != i2.len() {
+                if descr_identity(d1) != descr_identity(d2) || i1.len() != i2.len() {
                     return false;
                 }
                 i1.iter().zip(i2.iter()).all(|(a, b)| a.is_compatible(b))
@@ -416,7 +454,7 @@ impl VirtualStateInfo {
                     ..
                 },
             ) => {
-                if d1.index() != d2.index() {
+                if descr_identity(d1) != descr_identity(d2) {
                     return false;
                 }
                 for (idx, info) in f1 {
@@ -448,14 +486,14 @@ impl VirtualStateInfo {
                 },
             ) => {
                 // virtualstate.py:294-304: arraydescr identity + fielddescrs length + fielddescrs identity
-                if d1.index() != d2.index() || ef1.len() != ef2.len() {
+                if descr_identity(d1) != descr_identity(d2) || ef1.len() != ef2.len() {
                     return false;
                 }
                 if fd1.len() != fd2.len() {
                     return false;
                 }
                 for (a, b) in fd1.iter().zip(fd2.iter()) {
-                    if a.index() != b.index() {
+                    if descr_identity(a) != descr_identity(b) {
                         return false;
                     }
                 }
@@ -1199,13 +1237,27 @@ impl VirtualState {
         other: &VirtualState,
         boxes: &[OpRef],
         runtime_boxes: Option<&[OpRef]>,
-        ctx: &OptContext,
+        ctx: &mut OptContext,
         force_boxes: bool,
     ) -> Result<Vec<GuardRequirement>, ()> {
         if self.state.len() != other.state.len() {
             return Err(());
         }
-        let mut guards = Vec::new();
+        // virtualstate.py:24-37 `GenerateGuardState.__init__` constructs
+        // the per-call state container: `optimizer`, `cpu`,
+        // `extra_guards`, `renum`, `bad`, `force_boxes`. pyre packs
+        // these into `GenerateGuardState` and threads it through the
+        // recursive entry helpers — matching the upstream `state`
+        // parameter shape exactly. `extra_guards` is the output buffer;
+        // `renum`/`bad` are populated during recursion.
+        let mut guards: Vec<GuardRequirement> = Vec::new();
+        let mut state = GenerateGuardState {
+            ctx,
+            extra_guards: &mut guards,
+            renum: HashMap::new(),
+            bad: HashSet::new(),
+            force_boxes,
+        };
         // virtualstate.py:24-37 `GenerateGuardState.renum` and :84-94
         // `AbstractVirtualStateInfo.generate_guards` alias-consistency:
         //
@@ -1224,8 +1276,8 @@ impl VirtualState {
         // `HashMap` instance is threaded through every recursive call
         // (virtualstate.py:174-176 struct field, :260-261 array item,
         // :325-326 interior field) so nested virtual nodes share the
-        // alias namespace with their top-level parents.
-        let mut renum: HashMap<i32, i32> = HashMap::new();
+        // alias namespace with their top-level parents. Now lives on
+        // `state.renum` (GenerateGuardState struct field).
 
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
             let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
@@ -1236,14 +1288,11 @@ impl VirtualState {
                 incoming,
                 box_opref,
                 runtime_box,
-                ctx,
-                force_boxes,
-                &mut renum,
-                &mut guards,
+                &mut state,
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                     let runtime_value =
-                        runtime_box.and_then(|runtime_box| ctx.get_constant(runtime_box));
+                        runtime_box.and_then(|runtime_box| state.ctx.get_constant(runtime_box));
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
                     );
@@ -1274,23 +1323,30 @@ impl VirtualState {
     /// PtrInfo, so the parent's `info.fields[descr_idx]` / `info.items[i]`
     /// OpRef serves as both `box` and `runtime_box`.
     ///
-    /// **PRE-EXISTING-ADAPTATION** (not a pure port): RPython's
+    /// Nested struct/array recursion: RPython's
     /// `GenerateGuardState.get_runtime_field` / `get_runtime_item` /
     /// `get_runtime_interiorfield` (virtualstate.py:39-67) call
     /// `cpu.bh_getfield_gc_*` / `bh_getarrayitem_gc_*` /
     /// `bh_getinteriorfield_gc_*` to read the *concrete* value off the
-    /// runtime object and wrap it in a fresh `InputArg*`. pyre has no
-    /// equivalent concrete-read hook at virtualstate-match time
-    /// (`Cpu::bh_getfield_gc_*` exists on the backend trait but is not
-    /// plumbed through `OptContext`), so the inner OpRef is reused as a
-    /// proxy. Nested guard emission is therefore gated on the optimizer
-    /// having already recorded PtrInfo for the inner OpRef, not on a
-    /// concrete heap read — equivalent only when a SETFIELD/GETFIELD
-    /// already populated `info.fields`/`info.items`. NONE-placeholder
-    /// slots (`info.rs:755`) propagate as `runtime_box=None` so the
-    /// `runtime_box.is_some()` gates on NonNull / IntBounded arms
+    /// runtime object and wrap it in a fresh `InputArg*`. The pyre port
+    /// (`OptContext::get_runtime_field`, mod.rs) walks `runtime_box` to
+    /// its `Value::Ref(gcref)` payload and reads at
+    /// `gcref.raw() + descr.offset()` using the FieldDescr's
+    /// size/sign/type triple — direct ptr arithmetic matching the
+    /// backend `Cpu::bh_getfield_gc_*` implementation
+    /// (compiler.rs:14570). The read is wrapped in a freshly allocated
+    /// const-pool OpRef so the recursive `runtime_box` parameter carries
+    /// a concrete value distinct from the compile-time `fieldbox`.
+    ///
+    /// NONE-placeholder slots (`info.rs:755`) propagate as
+    /// `runtime_box=None` so downstream NonNull / IntBounded arms
     /// (:1474, :1500) reject the case, matching RPython's
     /// `if fieldbox is None` skip at virtualstate.py:174.
+    ///
+    /// `get_runtime_field` returns `None` when the parent's
+    /// `runtime_box` is not a concrete Ref or when the descr is not a
+    /// FieldDescr — the recursive `runtime_box` is then `None` and
+    /// downstream guards that need a concrete pointer fail-fast.
     ///
     /// See `peek_parent_field_oprefs` and the per-variant
     /// Virtual/VStruct/VArray/VArrayStruct match arms.
@@ -1303,24 +1359,29 @@ impl VirtualState {
         incoming: &VirtualStateInfoNode,
         box_opref: OpRef,
         runtime_box: Option<OpRef>,
-        ctx: &OptContext,
-        force_boxes: bool,
-        renum: &mut HashMap<i32, i32>,
-        guards: &mut Vec<GuardRequirement>,
+        state: &mut GenerateGuardState,
     ) -> Result<(), ()> {
         // virtualstate.py:83 `assert self.position != -1`. Pyre assigns
         // positions in `enum_top_level`; sentinel -1 means a node was
-        // never enumerated, which is a constructor bug.
+        // never enumerated, which is a constructor bug. RPython's
+        // `assert` is always-on (no debug gate); pyre matches with
+        // `assert!` rather than `debug_assert!` so release builds also
+        // fail-fast on the constructor bug.
         let exp_pos = expected.position.get();
         let inc_pos = incoming.position.get();
-        debug_assert!(
+        assert!(
             exp_pos >= 0,
             "expected entry {arg_idx} has unassigned position (enum_top_level not run?)"
         );
         // virtualstate.py:84-94: alias check + dedup. A matching prior
         // entry short-circuits the recursion (already proven compatible).
-        match renum.get(&exp_pos).copied() {
+        // virtualstate.py:86 `state.bad[self] = state.bad[other] = None`
+        // — the per-node identity is recorded so debug_print can flag
+        // failing nodes.
+        match state.renum.get(&exp_pos).copied() {
             Some(prev) if prev != inc_pos => {
+                state.bad.insert(expected as *const _);
+                state.bad.insert(incoming as *const _);
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                     eprintln!(
                         "[jit][jte] renum alias mismatch arg_idx={arg_idx} expected.position={exp_pos} \
@@ -1331,7 +1392,7 @@ impl VirtualState {
             }
             Some(_) => return Ok(()),
             None => {
-                renum.insert(exp_pos, inc_pos);
+                state.renum.insert(exp_pos, inc_pos);
             }
         }
         let expected_info = &expected.info;
@@ -1339,7 +1400,7 @@ impl VirtualState {
         // virtualstate.py:523-524: force_boxes + Virtual incoming
         // → _generate_virtual_guards (check class compatibility only).
         // virtualstate.py:523-524: force_boxes + incoming virtual, expected non-virtual
-        if force_boxes && incoming_info.is_virtual() && !expected_info.is_virtual() {
+        if state.force_boxes && incoming_info.is_virtual() && !expected_info.is_virtual() {
             return match expected_info {
                 VirtualStateInfo::Constant(_) => Err(()),
                 VirtualStateInfo::KnownClass { class_ptr } => {
@@ -1359,7 +1420,7 @@ impl VirtualState {
         // virtualstate.py:520-530: _generate_virtual_guards —
         // force_boxes + expected virtual, incoming non-virtual (forced box).
         // The forced box's known class must match the virtual's class.
-        if force_boxes && expected_info.is_virtual() && !incoming_info.is_virtual() {
+        if state.force_boxes && expected_info.is_virtual() && !incoming_info.is_virtual() {
             if let VirtualStateInfo::KnownClass { class_ptr } = incoming_info {
                 let expected_class = match expected_info {
                     VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref(),
@@ -1399,7 +1460,22 @@ impl VirtualState {
             }
         }
 
-        match (expected_info, incoming_info) {
+        // virtualstate.py:96-101 try/except VirtualStatesCantMatch wrapper.
+        // If `_generate_guards` raises, RPython marks `self` and `other`
+        // in `state.bad` so debug_print can flag the failing nodes:
+        //
+        //     try:
+        //         self._generate_guards(other, op, runtime_op, state)
+        //     except VirtualStatesCantMatch as e:
+        //         state.bad[self] = state.bad[other] = None
+        //         ...
+        //         raise e
+        //
+        // pyre returns Err(()) instead of raising; the wrapper below
+        // populates `state.bad` on Err before propagating. Per-arm
+        // pointer-identity keys (`expected as *const _`) match Python
+        // object-identity dict keying.
+        let result = match (expected_info, incoming_info) {
             // virtualstate.py:387-389: Unknown target accepts anything of
             // the same type (the isinstance check above already enforced
             // the type agreement).
@@ -1413,10 +1489,10 @@ impl VirtualState {
                 // Merely having a runtime box is not enough; RPython checks
                 // `self.constbox.same_constant(runtime_box.constbox())`.
                 if runtime_box
-                    .and_then(|runtime_box| ctx.get_constant(runtime_box))
+                    .and_then(|runtime_box| state.ctx.get_constant(runtime_box))
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
-                    guards.push(GuardRequirement::GuardValue {
+                    state.extra_guards.push(GuardRequirement::GuardValue {
                         arg_index: arg_idx,
                         box_opref,
                         expected_value: val.clone(),
@@ -1437,12 +1513,19 @@ impl VirtualState {
             //
             // Every "with runtime guard" branch additionally requires
             // `self.known_class.same_constant(cpu.cls_of_box(runtime_box))`
-            // (:601-602, :608-609, :620-621). pyre's `ctx.get_known_class`
-            // is the cls_of_box equivalent (mod.rs:5280): for Ref
-            // constants it reads typeptr at offset 0 via
-            // PtrInfo::get_known_class (info.rs:824-851). Without that
-            // match, RPython raises VirtualStatesCantMatch — pyre maps
-            // that to Err(()).
+            // (:601-602, :608-609, :620-621). The pyre port reads the
+            // runtime class via `ctx.cls_of_box(runtime_box)`
+            // (mod.rs `cls_of_box` method — walks the OpRef to a
+            // `Value::Ref(gcref)` and invokes the plumbed
+            // `default_cls_of_box` hook on `gcref.raw()`). The
+            // optimizer-tracked `get_known_class` is consulted first
+            // to honour `_known_class` slots set by earlier ops
+            // (info.py:763-772 `_known_class` accessor parity),
+            // then we fall back to the runtime concrete read so the
+            // bridge case where the runtime box is a concrete Ref
+            // without any optimizer-tracked PtrInfo still gets a
+            // class verdict. Without any match, RPython raises
+            // VirtualStatesCantMatch — pyre maps that to Err(()).
             (
                 VirtualStateInfo::KnownClass { class_ptr: c1 },
                 VirtualStateInfo::KnownClass { class_ptr: c2 },
@@ -1452,17 +1535,23 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
-                let Some(runtime_cls) = ctx.get_known_class(rb) else {
+                let Some(runtime_cls) = state
+                    .ctx
+                    .get_known_class(rb)
+                    .or_else(|| state.ctx.cls_of_box(rb))
+                else {
                     return Err(());
                 };
                 if &runtime_cls != class_ptr {
                     return Err(());
                 }
-                guards.push(GuardRequirement::GuardNonnullClass {
-                    arg_index: arg_idx,
-                    box_opref,
-                    expected_class: *class_ptr,
-                });
+                state
+                    .extra_guards
+                    .push(GuardRequirement::GuardNonnullClass {
+                        arg_index: arg_idx,
+                        box_opref,
+                        expected_class: *class_ptr,
+                    });
                 Ok(())
             }
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::NonNull) => {
@@ -1470,13 +1559,17 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
-                let Some(runtime_cls) = ctx.get_known_class(rb) else {
+                let Some(runtime_cls) = state
+                    .ctx
+                    .get_known_class(rb)
+                    .or_else(|| state.ctx.cls_of_box(rb))
+                else {
                     return Err(());
                 };
                 if &runtime_cls != class_ptr {
                     return Err(());
                 }
-                guards.push(GuardRequirement::GuardClass {
+                state.extra_guards.push(GuardRequirement::GuardClass {
                     arg_index: arg_idx,
                     box_opref,
                     expected_class: *class_ptr,
@@ -1509,7 +1602,7 @@ impl VirtualState {
             (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:578-584: runtime_box gate
                 if runtime_box.is_some() {
-                    guards.push(GuardRequirement::GuardNonnull {
+                    state.extra_guards.push(GuardRequirement::GuardNonnull {
                         arg_index: arg_idx,
                         box_opref,
                     });
@@ -1535,7 +1628,7 @@ impl VirtualState {
             (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:493-498: runtime_box gate
                 if runtime_box.is_some() {
-                    guards.push(GuardRequirement::GuardBounds {
+                    state.extra_guards.push(GuardRequirement::GuardBounds {
                         arg_index: arg_idx,
                         box_opref,
                         bounds: bounds.clone(),
@@ -1574,7 +1667,13 @@ impl VirtualState {
                     ..
                 },
             ) => {
-                if ed.index() != id.index() {
+                // virtualstate.py:214-216 VirtualStateInfo._generalization_of_structpart:
+                // `known_class.same_constant(other.known_class)`. The descr
+                // identity check is pyre-additional (descr carries typedescr-
+                // like struct identity); RPython relies on known_class +
+                // fielddescrs `is` checks alone. Object identity (Arc::as_ptr)
+                // per virtualstate.py:159 `is not` shape.
+                if descr_identity(ed) != descr_identity(id) {
                     return Err(());
                 }
                 match (ekc, ikc) {
@@ -1586,15 +1685,13 @@ impl VirtualState {
                 // assert opinfo.is_virtual() AND isinstance(opinfo,
                 // AbstractStructPtrInfo). pyre's Virtual variant carries
                 // the per-virtual-field OpRef vector at `info.fields`.
-                let parent_fields = Self::peek_parent_field_oprefs(
-                    ctx,
-                    box_opref,
-                    runtime_box,
-                    |info| match info {
-                        PtrInfo::Virtual(v) => Some(v.fields.clone()),
-                        _ => None,
-                    },
-                );
+                let parent_fields =
+                    Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
+                        match info {
+                            PtrInfo::Virtual(v) => Some(v.fields.clone()),
+                            _ => None,
+                        }
+                    });
                 Self::generate_guards_recurse_positional_fields(
                     arg_idx,
                     efd,
@@ -1602,10 +1699,9 @@ impl VirtualState {
                     ef,
                     if_,
                     parent_fields.as_deref(),
-                    ctx,
-                    force_boxes,
-                    renum,
-                    guards,
+                    runtime_box,
+                    None,
+                    state,
                 )
             }
 
@@ -1623,7 +1719,10 @@ impl VirtualState {
                     field_descrs: ifd,
                 },
             ) => {
-                if ed.index() != id.index() {
+                // virtualstate.py:228-230 VStructStateInfo._generalization_of_structpart:
+                // `self.typedescr is other.typedescr`. Object identity
+                // (Arc::as_ptr).
+                if descr_identity(ed) != descr_identity(id) {
                     return Err(());
                 }
                 // virtualstate.py:309-310 (VStructStateInfo path):
@@ -1631,15 +1730,13 @@ impl VirtualState {
                 // `opinfo._fields[descr.get_index()]` per field. pyre's
                 // VirtualStruct stores the per-virtual-field OpRef vector
                 // identically to Virtual.
-                let parent_fields = Self::peek_parent_field_oprefs(
-                    ctx,
-                    box_opref,
-                    runtime_box,
-                    |info| match info {
-                        PtrInfo::VirtualStruct(s) => Some(s.fields.clone()),
-                        _ => None,
-                    },
-                );
+                let parent_fields =
+                    Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
+                        match info {
+                            PtrInfo::VirtualStruct(s) => Some(s.fields.clone()),
+                            _ => None,
+                        }
+                    });
                 Self::generate_guards_recurse_positional_fields(
                     arg_idx,
                     efd,
@@ -1647,10 +1744,9 @@ impl VirtualState {
                     ef,
                     if_,
                     parent_fields.as_deref(),
-                    ctx,
-                    force_boxes,
-                    renum,
-                    guards,
+                    runtime_box,
+                    None,
+                    state,
                 )
             }
 
@@ -1668,7 +1764,9 @@ impl VirtualState {
                     ..
                 },
             ) => {
-                if ed.index() != id.index() || ei.len() != ii.len() {
+                // virtualstate.py:244 `self.arraydescr is not other.arraydescr`.
+                // Object identity (Arc::as_ptr).
+                if descr_identity(ed) != descr_identity(id) || ei.len() != ii.len() {
                     return Err(());
                 }
                 // virtualstate.py:251-256: `opinfo = getptrinfo(box)`,
@@ -1676,8 +1774,10 @@ impl VirtualState {
                 // state.get_runtime_item(runtime_box, arraydescr, i)`.
                 // pyre's VirtualArray stores `_items` as a dense `Vec<OpRef>`.
                 let parent_items: Option<Vec<OpRef>> = if runtime_box.is_some() {
-                    ctx.get_box_replacement_box(box_opref)
-                        .and_then(|b| ctx.getptrinfo(&b))
+                    state
+                        .ctx
+                        .get_box_replacement_box(box_opref)
+                        .and_then(|b| state.ctx.getptrinfo(&b))
                         .and_then(|info| match info {
                             PtrInfo::VirtualArray(a) => Some(a.items.clone()),
                             _ => None,
@@ -1701,20 +1801,24 @@ impl VirtualState {
                         .as_ref()
                         .and_then(|items| items.get(i).copied())
                         .filter(|opref| !opref.is_none());
-                    let (recurse_box, recurse_runtime) = match inner {
-                        Some(opref) => (opref, Some(opref)),
-                        None => (OpRef::NONE, None),
+                    // virtualstate.py:253-256: `fieldbox_runtime =
+                    // state.get_runtime_item(runtime_box, arraydescr, i)`
+                    // when both `runtime_box` and the parent's `_items[i]`
+                    // are set. `get_runtime_item` reads at
+                    // `array_ptr + base_size + i * itemsize` per
+                    // `ArrayDescr.base_size()` / `item_size()`.
+                    let recurse_runtime = match (runtime_box, inner) {
+                        (Some(rb), Some(_)) => state.ctx.get_runtime_item(rb, ed, i),
+                        _ => None,
                     };
+                    let recurse_box = inner.unwrap_or(OpRef::NONE);
                     Self::generate_guards_for_entry_recursive(
                         arg_idx,
                         ec,
                         ic,
                         recurse_box,
                         recurse_runtime,
-                        ctx,
-                        force_boxes,
-                        renum,
-                        guards,
+                        state,
                     )?;
                 }
                 Ok(())
@@ -1735,7 +1839,9 @@ impl VirtualState {
                     element_fields: ief,
                 },
             ) => {
-                if ed.index() != id.index() || eef.len() != ief.len() {
+                // virtualstate.py:295 `self.arraydescr is not other.arraydescr`.
+                // Object identity (Arc::as_ptr).
+                if descr_identity(ed) != descr_identity(id) || eef.len() != ief.len() {
                     return Err(());
                 }
                 if efd.len() != ifd.len() {
@@ -1766,7 +1872,7 @@ impl VirtualState {
                     // stores `element_fields[elem_idx]` as a per-element
                     // `(descr_idx, OpRef)` vector mirroring `_items`.
                     let parent_fields =
-                        Self::peek_parent_field_oprefs(ctx, box_opref, runtime_box, |info| {
+                        Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
                             match info {
                                 PtrInfo::VirtualArrayStruct(a) => {
                                     a.element_fields.get(elem_idx).cloned()
@@ -1781,10 +1887,17 @@ impl VirtualState {
                         e_fields,
                         i_fields,
                         parent_fields.as_deref(),
-                        ctx,
-                        force_boxes,
-                        renum,
-                        guards,
+                        runtime_box,
+                        // virtualstate.py:316 `for descr in self.fielddescrs:
+                        //     ... fieldbox_runtime = state.get_runtime_interiorfield(
+                        //         runtime_box, descr, i)` — the array element
+                        // index `i` is the outer loop variable. pyre's
+                        // `expected_field_descrs[j]` is an InteriorFieldDescr
+                        // built from `ArrayDescr.get_all_interiorfielddescrs()`
+                        // (virtualize.rs:462-466), so the recurse helper
+                        // routes through `ctx.get_runtime_interiorfield`.
+                        Some(elem_idx),
+                        state,
                     )?;
                 }
                 Ok(())
@@ -1792,7 +1905,15 @@ impl VirtualState {
 
             // Fundamentally incompatible: VirtualStatesCantMatch.
             _ => Err(()),
+        };
+        if result.is_err() {
+            // virtualstate.py:98: `state.bad[self] = state.bad[other] = None`.
+            // Pointer-identity keys match Python object-identity dict
+            // keys for the per-node "did this node fail" set.
+            state.bad.insert(expected as *const _);
+            state.bad.insert(incoming as *const _);
         }
+        result
     }
 
     /// virtualstate.py:155-176 AbstractVirtualStructStateInfo._generate_guards
@@ -1822,10 +1943,17 @@ impl VirtualState {
         expected_fields: &[(u32, Rc<VirtualStateInfoNode>)],
         incoming_fields: &[(u32, Rc<VirtualStateInfoNode>)],
         parent_field_oprefs: Option<&[(u32, OpRef)]>,
-        ctx: &OptContext,
-        force_boxes: bool,
-        renum: &mut HashMap<i32, i32>,
-        guards: &mut Vec<GuardRequirement>,
+        parent_runtime_box: Option<OpRef>,
+        // virtualstate.py:295-326 VArrayStructStateInfo path: when
+        // `Some(i)`, each `expected_field_descrs[j]` is an
+        // `InteriorFieldDescr` and the concrete heap read goes through
+        // `ctx.get_runtime_interiorfield(runtime_box, descr, i)`
+        // (virtualstate.py:321-322). When `None`, the Virtual / VStruct
+        // path applies: each descr is a `FieldDescr` and the read goes
+        // through `ctx.get_runtime_field(runtime_box, descr)`
+        // (virtualstate.py:163-164).
+        element_idx: Option<usize>,
+        state: &mut GenerateGuardState,
     ) -> Result<(), ()> {
         // virtualstate.py:155: len check, raises "field descrs don't match".
         if expected_field_descrs.len() != incoming_field_descrs.len() {
@@ -1869,21 +1997,12 @@ impl VirtualState {
             // virtualstate.py:161-167: when both the parent's `runtime_box`
             // and its `opinfo._fields[descr.get_index()]` are available,
             // thread the inner field's `fieldbox` AND `fieldbox_runtime`
-            // into the recursion.
-            //
-            // **PRE-EXISTING-ADAPTATION** (structural, not a "pure" port):
-            // RPython's `state.get_runtime_field(runtime_box, descr)`
-            // (virtualstate.py:48-55) calls `cpu.bh_getfield_gc_*` to
-            // read the *concrete* field value off the runtime object and
-            // wraps it in a fresh `InputArg*`. pyre has no equivalent
-            // concrete-read hook at virtualstate-match time, so the
-            // helper reuses the compile-time inner OpRef as both `box`
-            // and `runtime_box` and relies on `get_known_class(opref)`
-            // reading optimizer-tracked PtrInfo (mod.rs:5174). The
-            // upshot: nested guard emission is gated on whether the
-            // optimizer recorded info for the inner OpRef, not on a
-            // concrete runtime read — equivalent only when the optimizer
-            // already observed the producing SETFIELD/GETFIELD.
+            // into the recursion. The `fieldbox` (compile-time abstract
+            // value) comes from `opinfo._fields[idx]`; `fieldbox_runtime`
+            // is a *separate* concrete heap read via
+            // `state.get_runtime_field(runtime_box, descr)`
+            // (virtualstate.py:48-55) — calls `cpu.bh_getfield_gc_*` on
+            // the parent's runtime pointer.
             //
             // virtualstate.py:72-76 + :161-167: when the parent's
             // `opinfo._fields[descr.get_index()]` is `None`, RPython
@@ -1897,10 +2016,24 @@ impl VirtualState {
                 .and_then(|f| f.iter().find(|(idx, _)| *idx == descr_idx))
                 .map(|(_, opref)| *opref)
                 .filter(|opref| !opref.is_none());
-            let (recurse_box, recurse_runtime) = match inner_box_opref {
-                Some(inner) => (inner, Some(inner)),
-                None => (OpRef::NONE, None),
+            // virtualstate.py:163-166 / :321-322: only call the
+            // concrete read when both `runtime_box` and `fieldbox`
+            // (the optimizer-tracked inner OpRef) are present.
+            // Dispatch on `element_idx`: VArrayStruct (Some(elem))
+            // uses `get_runtime_interiorfield(rb, descr, elem)`,
+            // Virtual/VStruct (None) uses `get_runtime_field(rb, descr)`.
+            let recurse_runtime = match (parent_runtime_box, inner_box_opref) {
+                (Some(prb), Some(_)) => match element_idx {
+                    Some(elem) => {
+                        state
+                            .ctx
+                            .get_runtime_interiorfield(prb, &expected_field_descrs[i], elem)
+                    }
+                    None => state.ctx.get_runtime_field(prb, &expected_field_descrs[i]),
+                },
+                _ => None,
             };
+            let recurse_box = inner_box_opref.unwrap_or(OpRef::NONE);
             // virtualstate.py:171-173: both fieldstate[i] None → skip;
             // expected None vs incoming Some → still skip (RPython only
             // recurses when expected is set); expected Some vs incoming
@@ -1915,10 +2048,7 @@ impl VirtualState {
                         i,
                         recurse_box,
                         recurse_runtime,
-                        ctx,
-                        force_boxes,
-                        renum,
-                        guards,
+                        state,
                     )?;
                 }
             }
@@ -2435,6 +2565,7 @@ fn export_single_value_inner(
     // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
     let opref_box = ctx.get_box_replacement_box(opref);
     if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
                 // RPython parity: heaptracker.py:66-67 excludes typeptr from
@@ -2456,7 +2587,7 @@ fn export_single_value_inner(
                     known_class: vinfo.known_class,
                     ob_type_descr: vinfo.ob_type_descr.clone(),
                     fields,
-                    field_descrs: vinfo.field_descrs.clone(),
+                    field_descrs: info_fielddescrs,
                 };
             }
             PtrInfo::VirtualArray(vinfo) => {
@@ -2484,7 +2615,7 @@ fn export_single_value_inner(
                 return VirtualStateInfo::VStruct {
                     descr: vinfo.descr.clone(),
                     fields,
-                    field_descrs: vinfo.field_descrs.clone(),
+                    field_descrs: info_fielddescrs,
                 };
             }
             PtrInfo::VirtualArrayStruct(vinfo) => {
@@ -2789,7 +2920,7 @@ mod tests {
             crate::optimizeopt::info::PtrInfo::known_class(GcRef(0x100), false),
         );
         let guards = s1
-            .generate_guards(&s2, &boxes, Some(&boxes), &ctx, false)
+            .generate_guards(&s2, &boxes, Some(&boxes), &mut ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 2);
         // Unknown incoming → GUARD_NONNULL_CLASS (:603).
@@ -2812,14 +2943,26 @@ mod tests {
         let mut ctx = OptContext::new(128);
         let matching_runtime = ctx.make_constant_int(7);
         let guards = expected
-            .generate_guards(&incoming, &boxes, Some(&[matching_runtime]), &ctx, false)
+            .generate_guards(
+                &incoming,
+                &boxes,
+                Some(&[matching_runtime]),
+                &mut ctx,
+                false,
+            )
             .unwrap();
         assert_eq!(guards.len(), 1);
 
         let mismatching_runtime = ctx.make_constant_int(8);
         assert!(
             expected
-                .generate_guards(&incoming, &boxes, Some(&[mismatching_runtime]), &ctx, false)
+                .generate_guards(
+                    &incoming,
+                    &boxes,
+                    Some(&[mismatching_runtime]),
+                    &mut ctx,
+                    false
+                )
                 .is_err()
         );
     }
@@ -2868,9 +3011,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -2907,9 +3049,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -2970,9 +3111,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, inner_field_value)],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         ctx.set_ptr_info(
@@ -2980,9 +3120,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, inner_field_value)],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -3045,9 +3184,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, OpRef::NONE), (8, field_value)],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
 
@@ -3107,9 +3245,8 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
-                field_descrs: Vec::new(),
                 last_guard_pos: -1,
-                cached_vinfo: std::cell::RefCell::new(None),
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
