@@ -138,11 +138,143 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
     }
 }
 
-/// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` — process-
-/// scoped shared trampoline materialised lazily on first use.  PyPy
-/// builds the four kinds (fixed/var/str/unicode) at `setup_once`; pyre
-/// starts with the fixed-size kind which is the only `dynasm_nursery_slowpath`
-/// caller in the x86 emit path.
+/// `x86/assembler.py:1130 _call_footer_shadowstack` parity (free-fn
+/// variant for use outside of an `Assembler386` borrow — used by
+/// `emit_call_footer_raw`, which the standalone propagate / malloc
+/// slowpath trampolines reach for).  Subtracts `2 * WORD` from the
+/// shadow-stack top, undoing the `gen_shadowstack_header` push that
+/// the trace prologue emitted.
+pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
+    let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+    dynasm!(asm ; .arch x64
+        ; mov Rq(scratch), QWORD rst
+        ; sub QWORD [Rq(scratch)], 16
+    );
+}
+
+/// `x86/assembler.py:1093 _call_footer` parity (free-fn variant).
+/// Restores the callee-save set established by `_call_header` and
+/// returns the jitframe pointer in `rax`.  Must be entered with `rsp`
+/// at trace-body alignment (i.e. the same value the trace's
+/// `_call_header` left after its `SUB rsp, FRAME_FIXED_SIZE`).
+pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
+    emit_footer_shadowstack_raw(asm);
+    dynasm!(asm ; .arch x64 ; mov rax, rbp);
+    // Win64: 8 callee-save GPRs × 8 = 64 bytes.  PyPy's
+    // `arch.py:43` notes "never use r13 on Win64", but pyre's
+    // `genop_call_assembler` uses r13 as a scratch that survives
+    // a `free()` call (no other unused callee-save reg is live
+    // enough at that point), so pyre adds r13 to the saved set —
+    // filling the slot that was 8-byte padding under PyPy's
+    // "5 regs + r14/r15 in shadow store + 12 pad" layout.
+    #[cfg(target_os = "windows")]
+    dynasm!(asm ; .arch x64
+        ; mov rbx, [rsp + 0]
+        ; mov rsi, [rsp + 8]
+        ; mov rdi, [rsp + 16]
+        ; mov r12, [rsp + 24]
+        ; mov r14, [rsp + 32]
+        ; mov r15, [rsp + 40]
+        ; mov rbp, [rsp + 48]
+        ; mov r13, [rsp + 56]
+        ; add rsp, 64
+    );
+    #[cfg(not(target_os = "windows"))]
+    dynasm!(asm ; .arch x64
+        ; mov rbx, [rsp + 0]
+        ; mov r12, [rsp + 8]
+        ; mov r13, [rsp + 16]
+        ; mov r14, [rsp + 24]
+        ; mov r15, [rsp + 32]
+        ; mov rbp, [rsp + 40]
+        ; add rsp, 48
+    );
+    dynasm!(asm ; .arch x64 ; ret);
+}
+
+/// `assembler.py:328 _build_propagate_exception_path` parity —
+/// pure builder.  Caching/ownership is the caller's responsibility:
+/// `X86CpuExt::ensure_propagate_exception_path` (`x86/cpu_ext.rs`)
+/// stores the resulting address in its `propagate_exception_path`
+/// field, matching PyPy's `self.propagate_exception_path` attribute
+/// on `Assembler386`.
+///
+/// **Calling convention (matches PyPy line 328-345):**
+/// - Entry: reached only via `JMP` (not `CALL`) from a slowpath that
+///   has already restored `rsp` to the trace body's alignment level
+///   (i.e. the same value the trace's `_call_header` left after its
+///   SUB).  `rbp` = jitframe (possibly reloaded after a GC move).
+///   No other register conventions are assumed: every callee-save
+///   was already restored by the slowpath's `_pop_all_regs_from_frame`,
+///   and the live trace-body values were spilled to the jitframe.
+/// - Exit: `_call_footer` semantics — restores callee-save GPRs
+///   from `[rsp+...]`, sets `rax = rbp` (jitframe pointer return),
+///   adds the prologue's SUB back, and `RET`s to the function that
+///   originally entered the trace (PyPy: the C JIT shim;
+///   pyre: the same role via `Asm::_call_header`/`_call_footer`).
+///
+/// `propagate_exception_descr` is read from `cpu_handle` and baked
+/// as an i64 immediate into `[rbp + JF_DESCR_OFS]`.  Caller must
+/// guarantee the descr is installed (`MetaInterp::finish_setup`,
+/// `pyjitpl.py:2283`) before invoking this builder; the build asserts
+/// otherwise.  PyPy itself would silently bake 0 in this case (and
+/// fail at `handle_fail` dispatch time); pyre prefers a build-time
+/// fail-fast for the same invariant.
+///
+/// Returns `(buffer, entry_addr)`.  The caller (`X86CpuExt`) owns the
+/// `ExecutableBuffer` for the lifetime of the per-CPU stash so the RX
+/// page is unmapped when the CPU drops — matches PyPy's `asmmemmgr`,
+/// which roots helper buffers on the CPU.
+pub(crate) fn build_propagate_exception_path(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+) -> (ExecutableBuffer, usize) {
+    let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
+    let propagate_descr = cpu_handle
+        .read()
+        .unwrap()
+        .descr_ptrs()
+        .propagate_exception_descr as i64;
+    assert!(
+        propagate_descr != 0,
+        "build_propagate_exception_path: cpu_handle.propagate_exception_descr \
+         must be installed (pyjitpl.py:2283) before the trampoline is built \
+         on this CPU"
+    );
+    // assembler.py:1826-1843 `_store_and_reset_exception(self.mc, eax)`:
+    // read pos_exc_value into RAX, clear both globals.  On real OOM
+    // pos_exc_value is typically already NULL — the propagate descr's
+    // `handle_fail` raises MemoryError directly — but mirror the
+    // structure regardless.
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    dynasm!(asm ; .arch x64
+        ; mov rax, QWORD exc_value_addr
+        // Use R11 (X86_64_SCRATCH_REG) so RCX is free for the descr.
+        ; mov r11, [rax]
+        ; mov QWORD [rax], 0
+        ; mov rax, QWORD exc_type_addr
+        ; mov QWORD [rax], 0
+        // assembler.py:335-337 — MOV [jf_guard_exc], pos_exc_value
+        ; mov [rbp + JF_GUARD_EXC_OFS], r11
+        // assembler.py:338-340 — MOV [jf_descr], propagate_descr
+        ; mov rcx, QWORD propagate_descr
+        ; mov [rbp + JF_DESCR_OFS], rcx
+    );
+    // assembler.py:342 `self._call_footer()` — restore callee-save,
+    // set rax = rbp, ADD rsp, prologue_size, RET.
+    emit_call_footer_raw(&mut asm);
+    let buffer = asm.finalize().expect("propagate_exception_path: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
+/// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
+/// pure builder.  Caching/ownership is the caller's responsibility:
+/// `X86CpuExt::ensure_malloc_slowpath_fixed` (`x86/cpu_ext.rs`)
+/// stores the resulting address in its `malloc_slowpath_fixed`
+/// field, matching PyPy's `self.malloc_slowpath` attribute on
+/// `Assembler386`.
 ///
 /// **Calling convention (matches PyPy line 233-243):**
 /// - Entry: `rbp` = jitframe, `rcx` = old `nursery_head`,
@@ -162,13 +294,26 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
 /// `edx` is the runtime size carrier and the caller's regalloc has
 /// already spilled any live value out of both before the call via
 /// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
-static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-pub(crate) fn malloc_slowpath_fixed_addr() -> usize {
-    *MALLOC_SLOWPATH_FIXED.get_or_init(build_malloc_slowpath_fixed)
-}
-
-fn build_malloc_slowpath_fixed() -> usize {
+///
+/// On OOM (`rax == 0` after the helper call) the trampoline tail-jumps
+/// to `propagate_path` — the standalone `_build_propagate_exception_path`
+/// trampoline returned by `build_propagate_exception_path`.  Caller
+/// (`X86CpuExt::ensure_malloc_slowpath_fixed`) builds the propagate
+/// path first and threads its address here, matching PyPy's
+/// `setup_once` ordering.
+///
+/// Returns `(buffer, entry_addr)`.  Same ownership rule as
+/// `build_propagate_exception_path` — the caller (`X86CpuExt`) holds
+/// the `ExecutableBuffer` so the RX page lives as long as the CPU.
+pub(crate) fn build_malloc_slowpath_fixed(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    propagate_path: usize,
+) -> (ExecutableBuffer, usize) {
+    // `cpu_handle` is still threaded through for symmetry with PyPy
+    // (where `_build_malloc_slowpath` reads several `self.cpu`-rooted
+    // attrs).  The propagate descr itself is now baked once into the
+    // standalone propagate trampoline, not re-baked here.
+    let _ = cpu_handle;
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
@@ -274,6 +419,35 @@ fn build_malloc_slowpath_fixed() -> usize {
         dynasm!(asm ; .arch x64 ; =>skip_wb);
     }
 
+    // assembler.py:300-322 OOM propagate path — when
+    // `dynasm_nursery_slowpath` returns NULL the underlying
+    // `libc::calloc` ran out of memory.  PyPy emits the test+branch
+    // inside `_build_malloc_slowpath` and tail-JMPs to the standalone
+    // `propagate_exception_path` (line 322).  Pyre threads the
+    // propagate path's address in via `propagate_path` and follows
+    // the same structure: `ADD rsp, 8` to drop the trampoline's
+    // own CALL return address, then JMP to the propagate trampoline.
+    //
+    // dynasm-rs has no direct rel32-JMP-to-absolute-imm encoding, so
+    // we materialise the 64-bit immediate into the scratch reg (R11,
+    // not in PyPy's ECX/EDX-clobber set) and `jmp r11`.  RBP/RCX/RDX
+    // values matter to the propagate path's `_store_and_reset_exception`
+    // + `_call_footer`, and R11 is dead by this point.
+    let success = asm.new_dynamic_label();
+    let propagate_path_imm = propagate_path as i64;
+    dynasm!(asm ; .arch x64
+        ; test rax, rax
+        ; jnz =>success
+        // assembler.py:321 `ADD esp, WORD` — pop the trampoline's
+        // own CALL return address so `_call_footer` in the propagate
+        // trampoline sees rsp at the trace's body alignment (the
+        // same value the trace's `_call_header` left after its SUB).
+        ; add rsp, 8
+        ; mov r11, QWORD propagate_path_imm
+        ; jmp r11
+    );
+
+    dynasm!(asm ; .arch x64 ; =>success);
     // assembler.py:304 `MOV_rr(ecx, eax)` — deliver the helper return
     // value through ECX so it survives `pop_all` (which restores RAX
     // from the save area).  RAX is still valid at this point because
@@ -287,11 +461,7 @@ fn build_malloc_slowpath_fixed() -> usize {
 
     let buffer = asm.finalize().expect("malloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
-    // The helper code must stay mapped for the lifetime of the process.
-    // PyPy uses the shared `asmmemmgr` for the same role; pyre leaks the
-    // ExecutableBuffer so the underlying VirtualAlloc page is retained.
-    std::mem::forget(buffer);
-    ptr
+    (buffer, ptr)
 }
 
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
@@ -546,6 +716,12 @@ pub struct Assembler386<'a> {
     /// machine-code buffer* (i.e. pre-`rawstart`); `patch_stack_checks`
     /// adds `rawstart` to obtain the absolute address.
     frame_depth_to_patch: Vec<usize>,
+    /// `x86/assembler.py:63` `self.malloc_slowpath` parity — entry
+    /// pointer of the per-CPU fixed-size malloc slowpath helper,
+    /// resolved by `X86CpuExt::ensure_malloc_slowpath_fixed`
+    /// and passed in at construction time so the emit path bakes
+    /// it as a 64-bit immediate without re-touching the backend.
+    malloc_slowpath_fixed: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -635,6 +811,7 @@ impl<'a> Assembler386<'a> {
         classptr_to_subclass_range: HashMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
+        malloc_slowpath_fixed: usize,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -678,6 +855,7 @@ impl<'a> Assembler386<'a> {
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
+            malloc_slowpath_fixed,
         }
     }
 
@@ -1266,49 +1444,57 @@ impl<'a> Assembler386<'a> {
     ///   ; fallthrough = real overflow → return rbp as jf_ptr
     /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
-        // x86/assembler.py:_call_header parity. PyPy iterates
-        // `self.cpu.CALLEE_SAVE_REGISTERS` and saves each into the
-        // FRAME_FIXED_SIZE stack area allocated by `SUB esp, FRAME_FIXED_SIZE*WORD`.
+        // x86/assembler.py:1052 _call_header parity. PyPy reserves the
+        // whole frame in a single `SUB esp, FRAME_FIXED_SIZE * WORD` and
+        // stores `CALLEE_SAVE_REGISTERS` plus `ebp` at fixed offsets.
+        // The Pyre variant uses the same shape (single SUB + offset
+        // stores) without the PASS_ON_MY_FRAME scratch area or vmprof
+        // slots that PyPy reserves but never populates here.
         //
-        // Pyre uses an inline push-based prologue to keep the rest of the
-        // dynasm-based codegen unchanged; the saved set must still match
-        // PyPy's CALLEE_SAVE_REGISTERS per platform:
-        //   - x86_64 (System V): [ebx, r12, r13, r14, r15]
-        //   - x86_64 (Win64):    [ebx, esi, edi, r12, r14, r15]
-        // plus ebp, which is saved separately in both flavors.
+        // Saved set per platform (matches PyPy's CALLEE_SAVE_REGISTERS):
+        //   - x86_64 (System V): rbx, r12, r13, r14, r15 plus rbp
+        //   - x86_64 (Win64):    rbx, rsi, rdi, r12, r14, r15 plus rbp
         //
-        // The extra saves go into a SUB-reserved stack slot so the body's
-        // rsp parity (mod 16 == 8 after prologue) is unchanged and the
-        // per-call adjustments in `emit_win64_call_adjust` /
-        // `abi_reserved_call_area_size` keep working.
-        dynasm!(self.mc
-            ; .arch x64
-            ; push rbp
-            ; push r12               // save r12 (used by genop_call_assembler)
-        );
+        // Layout (lowest address first, all offsets relative to the new
+        // rsp after the SUB):
+        //   Win64:  [+0 rbx, +8 rsi, +16 rdi, +24 r12, +32 r14, +40 r15,
+        //            +48 rbp, +56 r13]   → SUB 64 (8 slots; body rsp at
+        //            8 mod 16 since function entry rsp was 8 mod 16 too)
+        //   SysV:   [+0 rbx, +8 r12, +16 r13, +24 r14, +32 r15, +40 rbp]
+        //            → SUB 48 (6 slots; body rsp at 8 mod 16)
+        //
+        // `r12` carries the caller's `rbp` (saved jf_ptr) across nested
+        // `genop_call_assembler` reentries, so it must be preserved
+        // alongside the rest of the callee-save set.  Win64 also saves
+        // `r13` even though PyPy's `arch.py:43` skips it ("never use
+        // r13"): pyre's `genop_call_assembler` does use r13 as a
+        // scratch reg that must survive `free()`, so r13 occupies the
+        // previously-padding slot at +56 and is restored by every
+        // `_call_footer`/`emit_call_footer_raw` variant.
         #[cfg(target_os = "windows")]
         dynasm!(self.mc
             ; .arch x64
-            // Win64 extra callee-save: rbx, rsi, rdi, r14, r15.  48 bytes
-            // (5 saves * 8 = 40 + 8 padding to keep mod 16 alignment).
-            ; sub rsp, 48
-            ; mov [rsp + 0], rbx
-            ; mov [rsp + 8], rsi
+            ; sub rsp, 64
+            ; mov [rsp + 0],  rbx
+            ; mov [rsp + 8],  rsi
             ; mov [rsp + 16], rdi
-            ; mov [rsp + 24], r14
-            ; mov [rsp + 32], r15
+            ; mov [rsp + 24], r12
+            ; mov [rsp + 32], r14
+            ; mov [rsp + 40], r15
+            ; mov [rsp + 48], rbp
+            ; mov [rsp + 56], r13
             ; mov rbp, rcx
         );
         #[cfg(not(target_os = "windows"))]
         dynasm!(self.mc
             ; .arch x64
-            // System V x86_64 extra callee-save: rbx, r13, r14, r15.
-            // 32 bytes (4 saves * 8 = 32, already 16-aligned).
-            ; sub rsp, 32
-            ; mov [rsp + 0], rbx
-            ; mov [rsp + 8], r13
-            ; mov [rsp + 16], r14
-            ; mov [rsp + 24], r15
+            ; sub rsp, 48
+            ; mov [rsp + 0],  rbx
+            ; mov [rsp + 8],  r12
+            ; mov [rsp + 16], r13
+            ; mov [rsp + 24], r14
+            ; mov [rsp + 32], r15
+            ; mov [rsp + 40], rbp
             ; mov rbp, rdi
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -1351,34 +1537,41 @@ impl<'a> Assembler386<'a> {
                     ; mov QWORD [Rq(scratch)], 0
                     ; mov Rq(scratch), QWORD propagate_descr
                     ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
-                    // Overflow fallthrough: return rbp as jf_ptr.
-                    // Restore the extra callee-save regs the prologue
-                    // saved before the SUB-reserved slot, then pop r12/rbp.
+                    // Overflow fallthrough: return rbp as jf_ptr.  Mirrors
+                    // `_call_footer` without `gen_footer_shadowstack` —
+                    // `gen_shadowstack_header` runs after this stack-check
+                    // path, so no shadow-stack entry has been pushed yet.
                     ; mov rax, rbp
                 );
+                // Win64: r13 restored from the +56 slot — see
+                // `_call_header` for why pyre saves r13 even though
+                // PyPy's `arch.py:43` does not.
                 #[cfg(target_os = "windows")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rbx, [rsp + 0]
                     ; mov rsi, [rsp + 8]
                     ; mov rdi, [rsp + 16]
-                    ; mov r14, [rsp + 24]
-                    ; mov r15, [rsp + 32]
-                    ; add rsp, 48
+                    ; mov r12, [rsp + 24]
+                    ; mov r14, [rsp + 32]
+                    ; mov r15, [rsp + 40]
+                    ; mov rbp, [rsp + 48]
+                    ; mov r13, [rsp + 56]
+                    ; add rsp, 64
                 );
                 #[cfg(not(target_os = "windows"))]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rbx, [rsp + 0]
-                    ; mov r13, [rsp + 8]
-                    ; mov r14, [rsp + 16]
-                    ; mov r15, [rsp + 24]
-                    ; add rsp, 32
+                    ; mov r12, [rsp + 8]
+                    ; mov r13, [rsp + 16]
+                    ; mov r14, [rsp + 24]
+                    ; mov r15, [rsp + 32]
+                    ; mov rbp, [rsp + 40]
+                    ; add rsp, 48
                 );
                 dynasm!(self.mc
                     ; .arch x64
-                    ; pop r12
-                    ; pop rbp
                     ; ret
                     ; =>continue_label
                 );
@@ -1682,42 +1875,11 @@ impl<'a> Assembler386<'a> {
     // ----------------------------------------------------------------
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
+    /// Thin wrapper around the free-fn `emit_call_footer_raw` so the
+    /// backend-owned malloc trampoline can emit byte-identical epilogue
+    /// sequences when exiting through `propagate_exception_descr`.
     fn _call_footer(&mut self) {
-        // x86/assembler.py:_call_footer parity. PyPy iterates
-        // `cpu.CALLEE_SAVE_REGISTERS` in reverse and restores from
-        // the FRAME_FIXED_SIZE area, then ADD esp, FRAME_FIXED_SIZE*WORD;
-        // RET.  Pyre mirrors the platform-specific save set established
-        // in `_call_header`.
-        self.gen_footer_shadowstack();
-        dynasm!(self.mc
-            ; .arch x64
-            ; mov rax, rbp
-        );
-        #[cfg(target_os = "windows")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; mov rbx, [rsp + 0]
-            ; mov rsi, [rsp + 8]
-            ; mov rdi, [rsp + 16]
-            ; mov r14, [rsp + 24]
-            ; mov r15, [rsp + 32]
-            ; add rsp, 48
-        );
-        #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc
-            ; .arch x64
-            ; mov rbx, [rsp + 0]
-            ; mov r13, [rsp + 8]
-            ; mov r14, [rsp + 16]
-            ; mov r15, [rsp + 24]
-            ; add rsp, 32
-        );
-        dynasm!(self.mc
-            ; .arch x64
-            ; pop r12                // restore r12
-            ; pop rbp
-            ; ret
-        );
+        emit_call_footer_raw(&mut self.mc);
     }
 
     /// x86/assembler.py:254 `_push_all_regs_to_jitframe` parity. Writes
@@ -1945,12 +2107,7 @@ impl<'a> Assembler386<'a> {
     /// One in-memory subtract — no need to load the current top into a
     /// register, decrement, and store back.
     fn gen_footer_shadowstack(&mut self) {
-        let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD rst
-            ; sub QWORD [Rq(scratch)], 16
-        );
+        emit_footer_shadowstack_raw(&mut self.mc);
     }
 
     /// assembler.py:993 push_gcmap.
@@ -3832,6 +3989,12 @@ impl<'a> Assembler386<'a> {
                 // moved jitframe's gcmap published — a stale gcmap that
                 // a subsequent collecting call would walk.
                 self.reload_frame_if_necessary();
+                // assembler.py:300-322 OOM propagate parity — the
+                // jitframe helper returns NULL on `libc::calloc` /
+                // `gc.alloc_nursery_*` failure; surface that through
+                // `propagate_exception_descr` rather than letting the
+                // caller proceed with a null jitframe.
+                self.emit_propagate_exception_if_zero(0);
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if result_reg.value != 0 {
@@ -3884,6 +4047,13 @@ impl<'a> Assembler386<'a> {
                 // gcmap, otherwise the clear would target the freed
                 // nursery copy.
                 self.reload_frame_if_necessary();
+                // assembler.py:300-322 OOM propagate parity — the
+                // varsize helper now returns NULL on `libc::calloc`
+                // / `gc.alloc_varsize` failure; route that through
+                // `propagate_exception_descr` rather than letting the
+                // caller store a near-zero garbage pointer into the
+                // result slot.
+                self.emit_propagate_exception_if_zero(0);
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -4320,15 +4490,6 @@ impl<'a> Assembler386<'a> {
         );
         self._call_footer();
         dynasm!(self.mc ; .arch x64 ; =>skip);
-    }
-
-    /// `CallMallocNursery` OOM check: helper returns the payload in
-    /// `rcx` or zero on `libc::calloc` failure (PyPy emits this inside
-    /// `_build_malloc_slowpath` at assembler.py:300-322; pyre's
-    /// process-shared trampoline has no access to per-cpu
-    /// `propagate_exception_descr`, so it goes at the call site).
-    fn emit_call_site_oom_propagate(&mut self) {
-        self.emit_propagate_exception_if_zero(crate::regloc::ECX.value);
     }
 
     /// `_store_and_reset_exception`: result = pos_exc_value; clear both
@@ -7222,21 +7383,11 @@ impl<'a> Assembler386<'a> {
         } else {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
-        let helper_addr = malloc_slowpath_fixed_addr() as i64;
+        let helper_addr = self.malloc_slowpath_fixed as i64;
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD helper_addr
             ; call rax
         );
-        // assembler.py:300-322 OOM check — the trampoline's underlying
-        // `dynasm_nursery_slowpath` falls back to `libc::calloc`, which
-        // can return NULL under host OOM; the trampoline preserves that
-        // NULL through to the caller in ECX.  PyPy emits this `TEST/JZ
-        // propagate` inside the trampoline; pyre cannot, because the
-        // process-shared `MALLOC_SLOWPATH_FIXED` trampoline has no
-        // access to the per-cpu `propagate_exception_descr` attachment.
-        // Emit the call-site equivalent here, mirroring the
-        // `CheckMemoryError` path (assembler.rs:3863).
-        self.emit_call_site_oom_propagate();
         // assembler.py:304 — helper returns the payload in ECX
         // (`MOV_rr(ecx, eax)` inside the trampoline) so the value
         // survives the trampoline's `pop_all_regs([ECX, EDX])`.  The
@@ -7246,6 +7397,15 @@ impl<'a> Assembler386<'a> {
         // regalloc change picks a different `result_reg`, copy it
         // from RCX (not RAX, which was restored to its pre-call
         // value by the trampoline's pop_all).
+        //
+        // OOM propagation: assembler.py:300-322 emits the `TEST/JZ
+        // propagate_exception_path` *inside* the slowpath itself, and
+        // pyre's `build_malloc_slowpath_fixed` now mirrors that —
+        // when the underlying `dynasm_nursery_slowpath` returns NULL
+        // the trampoline does the `_store_and_reset_exception`,
+        // writes `jf_descr = propagate_exception_descr` and runs
+        // `_call_footer` to exit the trace.  No call-site OOM check is
+        // needed; if the trampoline ever returns here it succeeded.
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value != crate::regloc::ECX.value {
                 let rv = r.value;

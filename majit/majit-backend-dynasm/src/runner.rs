@@ -14,12 +14,16 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
+#[cfg(target_arch = "x86_64")]
+use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 
 /// Global CALL_ASSEMBLER target registry.
 ///
@@ -307,8 +311,13 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
             .map(|gc| gc.alloc_nursery(total_size as usize - gc_hdr).0 as u64)
     });
     let ptr = result.unwrap_or_else(|| unsafe {
+        // `libc::calloc` returns NULL on real host OOM; preserve that
+        // NULL through to the trampoline's `TEST rax, rax; JZ propagate`
+        // (assembler.py:300-302).  Adding `gc_hdr` unconditionally
+        // masked OOM as a "valid" near-zero pointer and let the JIT
+        // continue past the failure.
         let raw = libc::calloc(1, total_size as usize) as u64;
-        raw + gc_hdr as u64
+        if raw == 0 { 0 } else { raw + gc_hdr as u64 }
     });
     if crate::majit_log_enabled() {
         eprintln!("[dynasm][nursery-frame] total_size={total_size} payload=0x{ptr:x}");
@@ -354,8 +363,14 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     result.unwrap_or_else(|| {
         let total = base_size as usize + item_size as usize * length as usize + gc_hdr;
         unsafe {
+            // `libc::calloc` returns NULL on real OOM; the previous
+            // unconditional `raw + gc_hdr` masked failure as a tiny
+            // non-zero "valid" payload pointer and let the JIT continue
+            // past the failure.  Mirror `dynasm_nursery_slowpath`'s
+            // OOM-null preservation so the caller's TEST/JZ propagate
+            // path can fire on real OOM.
             let raw = libc::calloc(1, total) as u64;
-            raw + gc_hdr as u64
+            if raw == 0 { 0 } else { raw + gc_hdr as u64 }
         }
     })
 }
@@ -636,6 +651,15 @@ pub struct DynasmBackend {
     /// source descr to its bridge `CompiledCode`; this table is the
     /// indirection that lets us do that without polluting the descr.
     bridge_addr_by_descr: Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
+    /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
+    /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
+    /// `self.propagate_exception_path` at `assembler.py:63,344` and
+    /// `aarch64/assembler.py:577`).  PyPy's assembler is one-per-CPU;
+    /// pyre's `Asm` is per-`compile_loop`/`compile_bridge`, so the
+    /// per-CPU stash lives here instead.  See
+    /// `crate::x86::cpu_ext::X86CpuExt` /
+    /// `crate::aarch64::cpu_ext::Aarch64CpuExt`.
+    arch_cpu_ext: ArchCpuExt,
 }
 
 impl DynasmBackend {
@@ -707,6 +731,7 @@ impl DynasmBackend {
             )),
             fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            arch_cpu_ext: ArchCpuExt::new(),
         }
     }
 
@@ -743,23 +768,44 @@ impl DynasmBackend {
     /// only unit/integration tests that skip the metainterp call
     /// this to get a populated cpu before running `compile_loop`.
     pub fn attach_default_test_descrs(&mut self) {
-        // `compile.py:665-674 make_and_attach_done_descrs` parity:
-        // attach the class-distinct DoneWithThisFrameDescr* /
-        // ExitFrameWithExceptionDescrRef the metainterp would mint
-        // through `MetaInterp::new`.  Backend-only tests that skip the
-        // metainterp call this to land the same descrs the runtime
-        // classifier expects.
+        // `compile.py:665-674 make_and_attach_done_descrs` +
+        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr`
+        // parity: attach the class-distinct DoneWithThisFrameDescr* /
+        // ExitFrameWithExceptionDescrRef plus a PropagateExceptionDescr
+        // stand-in that the metainterp would mint through
+        // `MetaInterp::new` / `MetaInterpStaticData.finish_setup`.
+        // Backend-only tests that skip the metainterp call this to land
+        // the same descrs the runtime classifier expects — and so that
+        // `X86CpuExt::ensure_propagate_exception_path` can bake a
+        // non-zero descr pointer into the propagate trampoline
+        // (matching PyPy's `setup_once` ordering, which builds
+        // trampolines after `finish_setup` has installed every CPU
+        // descr).
         let void: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new());
         let int: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrInt::new());
         let r: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
         let float: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new());
         let exit_exc: majit_ir::DescrRef =
             Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new());
+        // `compile.py:712 PropagateExceptionDescr` parity: backend-only
+        // tests still need the same descr class identity that production
+        // `MetaInterpStaticData.finish_setup` installs.
+        let propagate: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
         <Self as Backend>::set_done_with_this_frame_descr_void(self, void);
         <Self as Backend>::set_done_with_this_frame_descr_int(self, int);
         <Self as Backend>::set_done_with_this_frame_descr_ref(self, r);
         <Self as Backend>::set_done_with_this_frame_descr_float(self, float);
         <Self as Backend>::set_exit_frame_with_exception_descr_ref(self, exit_exc);
+        <Self as Backend>::set_propagate_exception_descr(self, propagate);
+        // `pyjitpl.py:2297 self.cpu.setup_once()` parity — production
+        // reaches `cpu.setup_once()` via `MetaInterpStaticData::_setup_once`
+        // (`pyjitpl.py:2292-2303`) on first JIT entry, AFTER every descr
+        // setter has run.  Backend-only tests bypass the metainterp gate,
+        // so call `setup_once` here directly once the descrs are in place
+        // — analogous to PyPy test helpers that explicitly call
+        // `cpu.setup_once()` after manual descr attachment (e.g.
+        // `rpython/jit/backend/ppc/test/test_regalloc_3.py:10`).
+        <Self as Backend>::setup_once(self);
     }
 
     /// Active vtable_offset for the assembler to consume during codegen.
@@ -1509,6 +1555,20 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
+        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // builds the per-CPU malloc / propagate trampolines, but the
+        // pyre `Backend::setup_once` hook isn't yet wired into every
+        // tracing entry (`force_start_tracing` builds the trace ctx
+        // inline rather than going through `setup_tracing`).  Ensure
+        // the trampoline is materialised lazily on the first
+        // `compile_loop`/`compile_bridge` instead — idempotent and
+        // cheap after the cache hit, matching PyPy's "build once per
+        // CPU" semantics without requiring every trace-start path to
+        // remember to call `_setup_once`.
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -1519,6 +1579,8 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_fixed,
             inputargs,
             &prepared_ops,
         );
@@ -1643,10 +1705,34 @@ impl Backend for DynasmBackend {
             .exit_frame_with_exception_descr_ref = Some(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
-        self.descr_attachments
-            .write()
-            .unwrap()
-            .propagate_exception_descr = Some(descr);
+        // x86/assembler.py:328 `_build_propagate_exception_path` parity:
+        // PyPy bakes `propagate_exception_descr` into the per-CPU
+        // propagate trampoline at setup time.  Pyre defers the bake to
+        // `X86CpuExt::ensure_propagate_exception_path` (x86/cpu_ext.rs),
+        // which reads the descr pointer directly from
+        // `descr_attachments` and embeds it in the helper.
+        //
+        // The metainterp wiring re-installs the descr several times
+        // during init (`attach_descrs_to_cpu`, `register_jitdriver_sd`,
+        // and `attach_default_test_descrs` for backend-only tests).
+        // The common case is the *same* `Arc<Descr>` arriving twice —
+        // idempotent, no observable effect.  Tests that mint a fresh
+        // `PropagateExceptionDescr` on every call also reach this
+        // setter; allow the overwrite so the second install does not
+        // panic.  The remaining risk — a *different* descr being
+        // installed *after* the trampoline has baked the previous
+        // pointer as an immediate — is a strictly post-`compile_loop`
+        // hazard; in production the descr is set exactly once before
+        // any compile fires, so this path never executes there.
+        let mut attachments = self.descr_attachments.write().unwrap();
+        if attachments
+            .propagate_exception_descr
+            .as_ref()
+            .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
+        {
+            return;
+        }
+        attachments.propagate_exception_descr = Some(descr);
     }
 
     fn compile_bridge(
@@ -1678,6 +1764,20 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
+        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // builds the per-CPU malloc / propagate trampolines, but the
+        // pyre `Backend::setup_once` hook isn't yet wired into every
+        // tracing entry (`force_start_tracing` builds the trace ctx
+        // inline rather than going through `setup_tracing`).  Ensure
+        // the trampoline is materialised lazily on the first
+        // `compile_loop`/`compile_bridge` instead — idempotent and
+        // cheap after the cache hit, matching PyPy's "build once per
+        // CPU" semantics without requiring every trace-start path to
+        // remember to call `_setup_once`.
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -1688,6 +1788,8 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_fixed,
             inputargs,
             &prepared_ops,
         );
@@ -2936,7 +3038,28 @@ impl Backend for DynasmBackend {
         Self::try_find_descr(token, trace_id, fail_index).is_some()
     }
 
-    fn setup_once(&mut self) {}
+    /// `pyjitpl.py:2297 self.cpu.setup_once()` parity, dispatched by
+    /// `MetaInterpStaticData::_setup_once` under the
+    /// `globaldata.initialized` gate (`pyjitpl.py:2292-2303`).  All
+    /// per-CPU descrs (notably `propagate_exception_descr` via
+    /// `set_propagate_exception_descr`) must already be installed
+    /// when this runs; the helpers we materialise here bake those
+    /// descr pointers as immediates and assert non-zero on build.
+    ///
+    /// PyPy's `llsupport/assembler.py:97 setup_once` builds the
+    /// propagate trampoline + every `_build_malloc_slowpath` variant
+    /// (`fixed` / `varsize` / `str` / `unicode`).  Pyre's x86 path so
+    /// far implements only `fixed`; varsize/str/unicode are inlined
+    /// at the per-callsite emitter and remain to port.
+    fn setup_once(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.arch_cpu_ext
+                .ensure_propagate_exception_path(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        }
+    }
     fn finish_once(&mut self) {}
 }
 
