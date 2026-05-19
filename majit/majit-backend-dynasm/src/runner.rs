@@ -1785,14 +1785,21 @@ impl Backend for DynasmBackend {
         // during init (`attach_descrs_to_cpu`, `register_jitdriver_sd`,
         // and `attach_default_test_descrs` for backend-only tests).
         // The common case is the *same* `Arc<Descr>` arriving twice —
-        // idempotent, no observable effect.  Tests that mint a fresh
-        // `PropagateExceptionDescr` on every call also reach this
-        // setter; allow the overwrite so the second install does not
-        // panic.  The remaining risk — a *different* descr being
-        // installed *after* the trampoline has baked the previous
-        // pointer as an immediate — is a strictly post-`compile_loop`
-        // hazard; in production the descr is set exactly once before
-        // any compile fires, so this path never executes there.
+        // idempotent, no observable effect — so a pointer-equal
+        // `Arc` returns immediately.
+        //
+        // PyPy's lifecycle binds `propagate_exception_descr` before
+        // `cpu.setup_once()` (`pyjitpl.py:2273-2283` precedes
+        // `pyjitpl.py:2292-2303`) and never swaps it afterwards.
+        // Pyre upholds the same invariant: a *different* `Arc`
+        // arriving after the propagate / malloc trampolines have
+        // already baked the previous descr pointer would leave
+        // already-compiled loops/bridges writing the orphaned pointer
+        // into `jf_descr` on OOM, missing the propagate-exception
+        // dispatch.  Rather than patch the baked immediates (PyPy
+        // never does so), refuse the swap with a clear assert.  The
+        // pre-bake path (no trampoline yet) keeps overwriting freely
+        // — the next `ensure_*_path` will bake the fresh pointer.
         let mut attachments = self.descr_attachments.write().unwrap();
         if attachments
             .propagate_exception_descr
@@ -1801,6 +1808,13 @@ impl Backend for DynasmBackend {
         {
             return;
         }
+        assert!(
+            !self.arch_cpu_ext.has_propagate_dependent_caches(),
+            "set_propagate_exception_descr called with a fresh Arc after \
+             per-CPU propagate/malloc trampolines have already baked the \
+             previous descr pointer; bind propagate_exception_descr once \
+             before backend.setup_once() (pyjitpl.py:2273-2283 ordering)"
+        );
         attachments.propagate_exception_descr = Some(descr);
     }
 
@@ -3117,6 +3131,24 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         }
     }
+
+    /// `backend/<arch>/__init__.py` parity — pyre's dynasm backend
+    /// spans x86 and aarch64; the active target_arch picks the name.
+    fn backend_name(&self) -> &'static str {
+        #[cfg(target_arch = "x86_64")]
+        {
+            "x86"
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64"
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            "dynasm"
+        }
+    }
+
     fn finish_once(&mut self) {}
 }
 

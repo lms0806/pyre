@@ -1017,6 +1017,32 @@ impl WarmEnterState {
         self.jitlog.as_ref()
     }
 
+    /// pyjitpl.py:2295 `self.jitlog.setup_once()` parity (per-warmstate
+    /// adaptation).
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy owns one `JitLogger` on
+    /// `MetaInterpStaticData` (`rlib/rjitlog/rjitlog.py:347-354`) and
+    /// `setup_once` re-reads `PYPYLOG` and writes a header.  Pyre's
+    /// `Logger` is owned per-`WarmEnterState` instead, so the global
+    /// jitlog hook is decomposed into a per-warmstate call that the
+    /// `MetaInterp` driving this warmstate runs just before
+    /// `MetaInterpStaticData::_setup_once`.  `Logger::from_env`
+    /// already runs at construction (the `new` / `with_jitlog`
+    /// constructors above), so this hook is the late opportunity to
+    /// install one if the warmstate was built before the env was
+    /// set.  Idempotent — only fills the slot when it is still
+    /// `None`.
+    ///
+    /// Called from `MetaInterp::bound_reached` /
+    /// `MetaInterp::force_start_tracing` so the lifecycle order
+    /// (jitlog → debug_print → cpu.setup_once → vector_ext →
+    /// profiler) matches PyPy for this warmstate.
+    pub fn ensure_jitlog_initialised(&mut self) {
+        if self.jitlog.is_none() {
+            self.jitlog = Logger::from_env();
+        }
+    }
+
     /// warmstate.py: trace_eagerness parameter (integer).
     pub fn trace_eagerness(&self) -> u32 {
         self.trace_eagerness

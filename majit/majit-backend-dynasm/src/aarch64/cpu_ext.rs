@@ -19,4 +19,14 @@ impl Aarch64CpuExt {
     pub(crate) fn new() -> Self {
         Self
     }
+
+    /// Cross-arch stub matching `X86CpuExt::has_propagate_dependent_caches`.
+    /// aarch64 doesn't cache propagate / malloc trampolines yet (the
+    /// sequences are inlined per call site), so no baked immediate
+    /// can go stale.  When aarch64 grows per-CPU trampolines, mirror
+    /// the x86 query so `set_propagate_exception_descr` can enforce
+    /// the same attach-once invariant.
+    pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
+        false
+    }
 }

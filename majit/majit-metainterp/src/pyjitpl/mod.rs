@@ -1843,10 +1843,13 @@ impl<M: Clone> MetaInterp<M> {
         // onto the backend so FINISH fast-path pointer identity works
         // against the same `Arc` the metainterp reads back.
         let MetaInterp {
-            ref staticdata,
+            ref mut staticdata,
             ref mut backend,
             ..
         } = this;
+        std::sync::Arc::get_mut(staticdata)
+            .expect("MetaInterpStaticData must be uniquely owned during MetaInterp::new")
+            .jit_starting_line = format!("JIT starting ({})", backend.backend_name());
         staticdata.attach_descrs_to_cpu(backend);
         this
     }
@@ -1912,6 +1915,31 @@ impl<M: Clone> MetaInterp<M> {
     /// thread it explicitly.
     pub fn finish_setup_descrs(&self) {
         self.staticdata.finish_setup_descrs();
+    }
+
+    /// `pyjitpl.py:2273-2283 finish_setup_descrs_for_jitdrivers` —
+    /// create the shared `PropagateExceptionDescr`, attach it to the
+    /// cpu, and bind `propagate_exc_descr` / `portal_finishtoken` /
+    /// `portal_calldescr` on every registered jitdriver.
+    ///
+    /// Real entry points (`JitDriver::register_descriptor`,
+    /// `MetaInterpStaticData::set_result_type`) call the underlying
+    /// staticdata method themselves; this wrapper is the public
+    /// surface for integration-test fixtures that build a
+    /// `MetaInterp` without the registration plumbing.  Idempotent —
+    /// re-running picks the same `Arc` by identity.
+    pub fn finish_setup_descrs_for_jitdrivers(&mut self) {
+        let MetaInterp {
+            staticdata,
+            backend,
+            ..
+        } = self;
+        let sd_mut = std::sync::Arc::get_mut(staticdata).expect(
+            "MetaInterp::finish_setup_descrs_for_jitdrivers: staticdata Arc \
+             must still have refcount 1; call before any tracing session \
+             clones it",
+        );
+        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical
@@ -2422,6 +2450,17 @@ impl<M: Clone> MetaInterp<M> {
                 .expect("ensure_default_driver_sd: staticdata has other owners")
                 .jitdrivers_sd
                 .push(crate::jitdriver::JitDriverStaticData::new(vec![], vec![]));
+            // `pyjitpl.py:2273-2283` `finish_setup_descrs_for_jitdrivers`
+            // — `register_jitdriver_sd` runs this tail step on every
+            // jitdriver insertion (mod.rs:14418).  The default driver
+            // pushed above bypasses `register_jitdriver_sd`, so wire up
+            // `portal_finishtoken` / `propagate_exc_descr` /
+            // `portal_calldescr` here for the assert in `_setup_once`
+            // that demands populated jitdriver slots before tracing.
+            // Idempotent — any previously-attached descrs (if a test
+            // also called `finish_setup_descrs_for_jitdrivers` itself)
+            // are re-used by `Arc` identity.
+            self.finish_setup_descrs_for_jitdrivers();
         }
         0
     }
@@ -2757,6 +2796,24 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // pyjitpl.py:2884 `compile_and_run_once` invokes `_setup_once`
+        // before every trace start.  pyre routes back-edge traces
+        // through `bound_reached`, but function-entry traces enter
+        // here, so the same gate must fire to materialise per-CPU
+        // trampolines (`cpu.setup_once`), profiler `start`, and the
+        // jitlog header before the first trace records anything.
+        // Idempotent — `globaldata.initialized` short-circuits after
+        // the first call.
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
+        // `WarmEnterState` rather than `MetaInterpStaticData`, so the
+        // `pyjitpl.py:2295 self.jitlog.setup_once()` step is driven
+        // here against this MetaInterp's own warmstate.  Idempotent
+        // — `ensure_jitlog_initialised` only fills the slot when it
+        // is still `None`.
+        self.warm_state.ensure_jitlog_initialised();
+        self.staticdata._setup_once(&mut self.backend);
+
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -2890,6 +2947,12 @@ impl<M: Clone> MetaInterp<M> {
         // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
         // back-edge entry routes through `bound_reached`, so the
         // gate fires here.  Idempotent.
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
+        // `WarmEnterState`, not on `MetaInterpStaticData`; drive the
+        // per-warmstate `setup_once` step here before the staticdata
+        // hook runs (matches PyPy's `jitlog → ...` order).
+        self.warm_state.ensure_jitlog_initialised();
         self.staticdata._setup_once(&mut self.backend);
 
         if self.tracing.is_some() {
@@ -13806,6 +13869,15 @@ pub struct MetaInterpStaticData {
     /// bump.  Each fetch_add is `Relaxed` — counters have no causal
     /// dependency on each other.
     pub profiler: crate::jitprof::JitProfiler,
+    /// pyjitpl.py:2217 `self.jit_starting_line = 'JIT starting (%s)' %
+    /// backendmodule`.  RPython captures the backend module name (eg.
+    /// `'x86'`, `'aarch64'`) at MetaInterp construction and
+    /// `_setup_once` `debug_print`s it once on the first warmup.
+    ///
+    /// Pyre stores the formatted line during `MetaInterp::new`, after
+    /// the backend exists, instead of deriving it by Python module
+    /// reflection.
+    pub jit_starting_line: String,
 }
 
 /// pyjitpl.py:2357-2373 `class MetaInterpGlobalData`.
@@ -14478,24 +14550,121 @@ impl MetaInterpStaticData {
         }
     }
 
-    /// pyjitpl.py:2292-2303 `_setup_once` — guarded by
-    /// `globaldata.initialized` so it runs exactly once per CPU after
-    /// `finish_setup` has installed every descr (`pyjitpl.py:2255`,
-    /// `pyjitpl.py:2283`).  Dispatches `cpu.setup_once()`
-    /// (`pyjitpl.py:2297 self.cpu.setup_once()`), which is the call
-    /// that materialises the per-CPU malloc / propagate trampolines
-    /// in PyPy (`llsupport/assembler.py:97 setup_once`).
+    /// pyjitpl.py:2292-2303 `_setup_once`.
     ///
-    /// Pyre invokes this from the metainterp's back-edge entry
-    /// `MetaInterp::bound_reached` (pyre analogue of
-    /// `pyjitpl.py:2889 compile_and_run_once`).
+    /// PyPy:
+    /// ```python
+    /// def _setup_once(self):
+    ///     if not self.globaldata.initialized:
+    ///         self.jitlog.setup_once()
+    ///         debug_print(self.jit_starting_line)
+    ///         self.cpu.setup_once()
+    ///         if self.cpu.vector_ext:
+    ///             self.cpu.vector_ext.setup_once(self.cpu.assembler)
+    ///         if not self.profiler.initialized:
+    ///             self.profiler.start()
+    ///             self.profiler.initialized = True
+    ///         self.globaldata.initialized = True
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre owns the jitlog `Logger` on
+    /// `WarmEnterState`, not on `MetaInterpStaticData` as PyPy does
+    /// on `self.jitlog`.  The PyPy `setup_once` step `self.jitlog
+    /// .setup_once()` therefore cannot run from here — it would need
+    /// a list of registered warmstates that pyre doesn't keep, and
+    /// the per-warmstate `Option<Logger>` is initialised eagerly by
+    /// `WarmEnterState::new` / `with_jitlog` constructors anyway.
+    /// Callers that wrap `_setup_once` (`force_start_tracing`,
+    /// `bound_reached`) drive `WarmEnterState::ensure_jitlog_initialised`
+    /// against their own warmstate just before invoking this hook,
+    /// which preserves the lifecycle ordering (jitlog → debug_print
+    /// → cpu.setup_once → vector_ext → profiler) for the single
+    /// warmstate they own.
+    ///
+    /// Each remaining hook is dispatched in the same order as upstream:
+    ///
+    /// 1. `debug_print(self.jit_starting_line)` — prints the stored
+    ///    line when `MAJIT_LOG` is set, matching PyPy's `PYPYLOG`-gated
+    ///    `debug_print`.
+    /// 2. `cpu.setup_once()` — backends materialise per-CPU
+    ///    trampolines (x86 `_build_propagate_exception_path` /
+    ///    `_build_malloc_slowpath`).
+    /// 3. `cpu.vector_ext.setup_once(cpu.assembler)` — pyre dispatches
+    ///    through the `Backend::vector_ext_setup_once` trait hook;
+    ///    every current backend is a no-op (no `vector_ext`), but
+    ///    the call site is in place for when a backend grows one.
+    /// 4. `if not profiler.initialized: profiler.start(); initialized
+    ///    = True` — `_setup_once` owns the one-shot guard; `start()`
+    ///    itself always resets counters (`jitprof.py:55-64`).
+    ///
+    /// Pyre invokes this from `MetaInterp::bound_reached` (analogue
+    /// of `pyjitpl.py:2889 compile_and_run_once`) and from
+    /// `MetaInterp::force_start_tracing` for the function-entry trace
+    /// path.
     pub fn _setup_once(&self, backend: &mut BackendImpl) {
         let mut gd = self.globaldata.lock().unwrap();
         if gd.initialized {
             return;
         }
+        // `pyjitpl.py:2273-2283` `finish_setup_descrs_for_jitdrivers`
+        // runs before `_setup_once` — in PyPy the call sits earlier in
+        // `finish_setup` so by the time `pyjitpl.py:2884
+        // compile_and_run_once` triggers the `globaldata.initialized`
+        // dispatch, `propagate_exception_descr` is already on the cpu
+        // and every jitdriver has its `propagate_exc_descr`/`portal_*`
+        // slots populated.  Pyre keeps the same invariant: real entry
+        // points (`MetaInterpStaticData::register_jitdriver_sd_*`,
+        // `set_result_type`) drive that method, and test fixtures that
+        // construct a `MetaInterp` without going through registration
+        // must call `finish_setup_descrs_for_jitdrivers` explicitly
+        // before tracing starts.  Panicking here exposes the missing
+        // setup at the call site instead of letting the per-CPU
+        // propagate trampoline bake a NULL descr immediate.
+        assert!(
+            self.propagate_exception_descr.is_some(),
+            "_setup_once: finish_setup_descrs_for_jitdrivers must run \
+             before the first trace start (pyjitpl.py:2273-2283 \
+             precedes pyjitpl.py:2292-2303)"
+        );
+        assert!(
+            self.jitdrivers_sd.iter().all(|jd| {
+                jd.portal_finishtoken.is_some()
+                    && jd.propagate_exc_descr.is_some()
+                    && jd.portal_calldescr.is_some()
+            }),
+            "_setup_once: every registered jitdriver must have \
+             portal_finishtoken, propagate_exc_descr, and portal_calldescr \
+             before the first trace start (pyjitpl.py:2274-2281; \
+             warmspot.py:1013-1017)"
+        );
+        self.debug_print_jit_starting_line();
         backend.setup_once();
+        backend.vector_ext_setup_once();
+        if !self
+            .profiler
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.profiler.start();
+            self.profiler
+                .initialized
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         gd.initialized = true;
+    }
+
+    /// pyjitpl.py:2296 `debug_print(self.jit_starting_line)` parity.
+    ///
+    /// RPython's `debug_print` fires only when `PYPYLOG` is set; the
+    /// pyre equivalent gates on `MAJIT_LOG` (the env var the rest of
+    /// the backend already reads).  The stored line is populated at
+    /// construction time to match PyPy's `jit_starting_line` attribute
+    /// (`pyjitpl.py:2217`).
+    fn debug_print_jit_starting_line(&self) {
+        if !crate::majit_log_enabled() {
+            return;
+        }
+        eprintln!("{}", self.jit_starting_line);
     }
 
     /// pyjitpl.py:2305-2323 `get_name_from_address(addr)`.
@@ -14696,6 +14865,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64;
         let action = meta.force_start_tracing(
             0,
@@ -14731,6 +14901,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
@@ -14764,6 +14935,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
@@ -14784,6 +14956,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2493-2496: result_type == VOID + resultbox is None
         // → raise DoneWithThisFrameVoid().
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let result = meta.finishframe(None, true);
         assert!(matches!(
             result,
@@ -14802,6 +14975,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let resultbox_ref = meta.trace_ctx().expect("active trace").const_int(0xc0ffee);
@@ -14817,6 +14991,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2499-2500.
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let result = meta.finishframe(Some((JitArgKind::Ref, 0, OpRef::ref_op(101), 0xfeed)), true);
         assert!(matches!(
             result,
@@ -14829,6 +15004,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2501-2502.
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let bits = f64::to_bits(2.5) as i64;
         let result = meta.finishframe(
             Some((JitArgKind::Float, 0, OpRef::float_op(102), bits)),
@@ -14854,6 +15030,7 @@ mod metainterp_static_data_tests {
         let jitcode = builder.finish();
         jitcode.set_jitdriver_sd(0);
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let driver = crate::jitdriver::JitDriverStaticData {
             index: None,
             vars: vec![],
@@ -14906,6 +15083,7 @@ mod metainterp_static_data_tests {
         builder.load_const_f_value(0, 0);
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let result = meta.perform_call(
             jitcode,
             &[
@@ -14961,6 +15139,7 @@ mod metainterp_static_data_tests {
         let callee = std::sync::Arc::new(builder_callee.finish());
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         // Push caller, then advance caller.pc to the post-call
         // position the way the bytecode dispatch loop would (the
         // opimpl reads operand bytes and bumps `pc` past the entire
@@ -14994,6 +15173,7 @@ mod metainterp_static_data_tests {
         let callee = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.perform_call(caller, &[], None).unwrap_err();
         // Mutate the caller's register 0 so we can detect any
         // accidental write triggered by the void return.
@@ -15025,6 +15205,7 @@ mod metainterp_static_data_tests {
         let mainjitcode = std::sync::Arc::new(mainjitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         // Pre-populate framestack with a stale frame to verify reset.
         meta.perform_call(mainjitcode.clone(), &[], None)
             .unwrap_err();
@@ -15054,6 +15235,7 @@ mod metainterp_static_data_tests {
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15085,6 +15267,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let initial = meta.portal_call_depth;
 
         // Push a non-portal frame: counter unchanged.
@@ -15140,6 +15323,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
@@ -15170,6 +15354,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
@@ -15201,6 +15386,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         // descr declares [Int, Ref, Int, Ref] (declaration order).
@@ -15247,6 +15433,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
@@ -15322,6 +15509,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15373,6 +15561,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15459,6 +15648,7 @@ mod metainterp_static_data_tests {
         use crate::executor;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let descr = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int],
             result_type: majit_ir::Type::Float,
@@ -15497,6 +15687,7 @@ mod metainterp_static_data_tests {
         use crate::executor;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         // Pre-set a stale class-const flag and a stale TLS value: the
         // executor must overwrite both.
         meta.class_of_last_exc_is_const = true;
@@ -15603,6 +15794,7 @@ mod metainterp_static_data_tests {
         // after the count_ops call, so we still observe both bumps.
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let descr_view = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
             result_type: majit_ir::Type::Int,
@@ -15636,6 +15828,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15687,6 +15880,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2745-2755 — last_exc_value = llexception;
         //                       class_of_last_exc_is_const = constant.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         assert_eq!(meta.last_exc_value, 0);
         assert!(!meta.class_of_last_exc_is_const);
 
@@ -15704,6 +15898,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2739-2743 — pyre callers pass the lowered
         // exception pointer directly; execute_raised forwards.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.execute_raised(0xc0ffee, false);
         assert_eq!(meta.last_exc_value, 0xc0ffee);
         assert!(!meta.class_of_last_exc_is_const);
@@ -15715,6 +15910,7 @@ mod metainterp_static_data_tests {
         // pyre's `count` routes every Counters.ABORT_* into
         // `loops_aborted` (reason-keyed split is a future expansion).
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let stats_before = meta.get_stats();
         meta.aborted_tracing(counters::ABORT_ESCAPE);
         let stats_after = meta.get_stats();
@@ -15727,6 +15923,7 @@ mod metainterp_static_data_tests {
         // pre-set the abort fires the trace-too-long hook and
         // clears both fields.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.aborted_tracing_jitdriver = Some(7);
         meta.aborted_tracing_greenkey = Some(0xfeed);
         meta.aborted_tracing(0);
@@ -15737,6 +15934,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn aborted_tracing_does_not_touch_jitdriver_when_unset() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         assert!(meta.aborted_tracing_jitdriver.is_none());
         meta.aborted_tracing(0);
         assert!(meta.aborted_tracing_jitdriver.is_none());
@@ -15752,6 +15950,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15773,6 +15972,7 @@ mod metainterp_static_data_tests {
         // remove.  Single-frame stack short-circuits.
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.force_start_tracing(0, (0, 0), None, &[]);
 
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
@@ -15794,6 +15994,7 @@ mod metainterp_static_data_tests {
         // ConstInt(resvalue) is returned in place of the op.
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15870,6 +16071,7 @@ mod metainterp_static_data_tests {
     fn do_recursive_call_panics_when_portal_runner_adr_is_zero() {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr_view = StubCallDescr {
@@ -15900,6 +16102,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr_view = StubCallDescr {
@@ -15937,6 +16140,7 @@ mod metainterp_static_data_tests {
         // assembler_call).
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -15983,6 +16187,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16031,6 +16236,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let action = meta.force_start_tracing(
             0,
@@ -16085,6 +16291,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16128,6 +16335,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16173,6 +16381,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16220,6 +16429,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16254,6 +16464,7 @@ mod metainterp_static_data_tests {
     fn clear_exception_resets_last_exc_value_to_zero() {
         // pyjitpl.py:2757-2758 — `self.last_exc_value = lltype.nullptr(...)`
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0xbeef;
         meta.clear_exception();
         assert_eq!(meta.last_exc_value, 0);
@@ -16263,6 +16474,7 @@ mod metainterp_static_data_tests {
     fn finishframe_clears_last_exc_value_per_pyjitpl_2481() {
         // pyjitpl.py:2481 — `self.last_exc_value = lltype.nullptr(...)`.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0xc0ffee;
         let _ = meta.finishframe(None, true);
         assert_eq!(meta.last_exc_value, 0);
@@ -16273,6 +16485,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:1882-1886 — ovf_flag → GUARD_OVERFLOW + pc=label, return None
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.force_start_tracing(0, (0, 0), None, &[]);
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         // Already tracing returns AlreadyTracing — that's fine, the
@@ -16304,6 +16517,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:1888-1890 — !ovf_flag → GUARD_NO_OVERFLOW, return resbox
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16326,6 +16540,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:3394-3395 — last_exc_value == 0 → GUARD_NO_EXCEPTION.
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0;
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -16348,6 +16563,7 @@ mod metainterp_static_data_tests {
         // followed by finishframe_exception().
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         // Override cls_of_box so we can inject a known typeptr without
         // dereferencing a raw pointer.
         meta.cls_of_box = Some(|_| 0xc1a55);
@@ -16398,6 +16614,7 @@ mod metainterp_static_data_tests {
         // ConstPtr equivalent (trace_ctx.rs:583).
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.cls_of_box = Some(|_| 0xc1a55);
         meta.last_exc_value = 0xfeed;
         meta.class_of_last_exc_is_const = true;
@@ -16446,6 +16663,7 @@ mod metainterp_static_data_tests {
     fn finishframe_exception_jumps_to_current_frame_catch_handler() {
         let (jitcode, target) = make_catch_exception_jitcode();
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         {
             let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
             sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
@@ -16471,6 +16689,7 @@ mod metainterp_static_data_tests {
         let callee = std::sync::Arc::new(crate::jitcode::JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         {
             let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
             sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
@@ -16496,6 +16715,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn finishframe_exception_jumps_to_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
         jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 3, 0];
         let jitcode = std::sync::Arc::new(jitcode);
@@ -16515,6 +16735,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn finishframe_exception_skips_live_prefix_before_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
         jitcode.body_mut().code = vec![
             crate::jitcode::insns::BC_LIVE,
@@ -16548,6 +16769,7 @@ mod metainterp_static_data_tests {
         // surfaces the same shape via the `ExitFrameWithExceptionRef`
         // signal variant.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0xfeed;
         let jitcode = std::sync::Arc::new(crate::jitcode::JitCodeBuilder::new().finish());
         meta.framestack
@@ -16579,6 +16801,7 @@ mod metainterp_static_data_tests {
         let callee_jitcode = std::sync::Arc::new(callee_jitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.framestack
             .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 0));
         meta.framestack
@@ -16620,6 +16843,7 @@ mod metainterp_static_data_tests {
         let callee_jitcode = std::sync::Arc::new(callee_jitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.cls_of_box = Some(|_| 0xcafef00d);
         meta.last_exc_value = 0xbeef;
 
@@ -16669,6 +16893,7 @@ mod metainterp_static_data_tests {
     #[should_panic(expected = "MetaInterp.assert_no_exception")]
     fn assert_no_exception_panics_when_value_set() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0xdead;
         meta.assert_no_exception();
     }
@@ -16681,6 +16906,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut portal = JitCodeBuilder::new().finish();
         portal.replace_jitdriver_sd(Some(0));
         let portal = std::sync::Arc::new(portal);
@@ -16710,6 +16936,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let plain = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         meta.perform_call(plain.clone(), &[], None).unwrap_err();
@@ -16731,6 +16958,7 @@ mod metainterp_static_data_tests {
         let mainjitcode = std::sync::Arc::new(mainjitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         // Pre-pollute the counter to verify the reset.
         meta.portal_call_depth = 42;
         meta.initialize_state_from_start(mainjitcode, &[]);
@@ -16740,6 +16968,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn is_main_jitcode_returns_false_for_non_portal_jitcode() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
         jc.replace_jitdriver_sd(None);
         assert!(!meta.is_main_jitcode(&jc));
@@ -16767,6 +16996,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn is_main_jitcode_returns_true_for_recursive_portal_jitcode() {
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = true;
         let idx = {
@@ -16791,6 +17021,7 @@ mod metainterp_static_data_tests {
         // ConstInt(jd_no), ConstInt(unique_id), None)
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16818,6 +17049,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2459 — history.record1(rop.LEAVE_PORTAL_FRAME, ConstInt(jd_no), None)
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16845,6 +17077,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -16892,6 +17125,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = true;
         let idx = {
@@ -16942,6 +17176,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = false;
         let idx = {
@@ -16977,6 +17212,7 @@ mod metainterp_static_data_tests {
         // Without an active TraceCtx the named entry must not panic and
         // must not record anything.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.enter_portal_frame(0, 0);
         meta.leave_portal_frame(0);
     }
@@ -16988,6 +17224,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.perform_call(jitcode, &[], None).unwrap_err();
         assert_eq!(meta.framestack.len(), 1);
         meta.reset_framestack_for_failure();
@@ -17003,6 +17240,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.perform_call(jitcode, &[], None).unwrap_err();
         assert_eq!(meta.framestack.len(), 1);
         meta.popframe(true);
@@ -17149,6 +17387,7 @@ mod metainterp_static_data_tests {
 
         let callcontrol = CallControl::new();
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.finish_setup(&codewriter, &callcontrol);
 
         assert_eq!(meta.staticdata.liveness_info, expected);
@@ -17166,6 +17405,7 @@ mod metainterp_static_data_tests {
         use majit_translate::jit_codewriter::codewriter::CodeWriter;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
         meta.finish_setup(&CodeWriter::new(), &CallControl::new());
     }
@@ -17207,6 +17447,7 @@ mod metainterp_static_data_tests {
         let expected = asm.all_liveness().to_vec();
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.install_canonical_liveness(&asm);
 
         assert_eq!(meta.staticdata.liveness_info, expected);
@@ -17250,6 +17491,7 @@ mod metainterp_static_data_tests {
         use majit_translate::jit_codewriter::assembler::Assembler;
 
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
         meta.install_canonical_liveness(&Assembler::new());
     }
@@ -17259,6 +17501,7 @@ mod metainterp_static_data_tests {
         // call.py:46-47 `jd.index = idx` — index written back into the
         // descriptor at registration time, not left None.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
         let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         let idx = {
             let MetaInterp {
@@ -17504,6 +17747,7 @@ mod tests {
     #[test]
     fn test_front_target_inputarg_types_uses_saved_front_label_contract() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 7;
         let trace_id = 11;
         let token = std::sync::Arc::new(JitCellToken::new(3));
@@ -17662,6 +17906,7 @@ mod tests {
     #[test]
     fn test_guard_resume_getters_return_stored_exit_layout_metadata() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 19;
         let trace_id = 23;
         let fail_index = 5;
@@ -17760,6 +18005,7 @@ mod tests {
     #[test]
     fn test_handle_async_forcing_prepares_rd_virtuals_from_exit_layout() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 29;
         let trace_id = 31;
         let fail_index = 7;
@@ -17897,6 +18143,7 @@ mod tests {
     #[test]
     fn test_handle_async_forcing_falls_back_to_previous_token_backend_exit_layout() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 30;
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(
@@ -18143,6 +18390,7 @@ mod tests {
     #[test]
     fn guard_exit_getters_fall_back_to_previous_token_backend_layouts() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 77;
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(
@@ -18227,6 +18475,7 @@ mod tests {
     #[test]
     fn guard_failure_recovery_uses_previous_token_backend_exit_layout() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 88;
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(
@@ -18324,6 +18573,7 @@ mod tests {
     #[test]
     fn test_start_retrace_from_guard_uses_previous_token_backend_resume_data() {
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 89;
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(
@@ -18531,6 +18781,7 @@ mod tests {
 
     fn finish_trace_for_parity_preserves_captured_snapshots() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(17)]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
@@ -18586,6 +18837,7 @@ mod tests {
         let obj = TraceEntryObj { arr: &array };
 
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         meta.set_vable_ptr((&obj as *const TraceEntryObj).cast());
         // Even if the interpreter cache claims a different length, the heap
@@ -18598,6 +18850,7 @@ mod tests {
     #[test]
     fn initialize_virtualizable_appends_read_boxes_to_red_only_trace_entry() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = std::sync::Arc::new(test_vable_info_static_only());
         meta.set_virtualizable_info(info.clone());
 
@@ -18631,6 +18884,7 @@ mod tests {
     #[test]
     fn opimpl_getfield_vable_int_reads_standard_box_without_heap_op() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
         start_tracing_with_virtualizable(
@@ -18650,6 +18904,7 @@ mod tests {
     #[test]
     fn opimpl_setfield_vable_int_synchronizes_standard_virtualizable() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
         start_tracing_with_virtualizable(
@@ -18680,6 +18935,7 @@ mod tests {
     #[test]
     fn opimpl_getarrayitem_vable_int_reads_standard_box_without_heap_op() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
         let adesc = info.array_item_descr(0);
@@ -18705,6 +18961,7 @@ mod tests {
     #[test]
     fn opimpl_arraylen_vable_returns_cached_standard_length() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
         let adesc = info.array_item_descr(0);
@@ -18724,6 +18981,7 @@ mod tests {
     #[test]
     fn opimpl_getfield_vable_int_nonstandard_falls_back_to_heap_op() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -18760,6 +19018,7 @@ mod tests {
     #[test]
     fn opimpl_getarrayitem_vable_int_nonstandard_falls_back_to_heap_ops() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_with_array(),
@@ -18797,6 +19056,7 @@ mod tests {
     #[test]
     fn opimpl_hint_force_virtualizable_standard_emits_store_back_only_once() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -18816,6 +19076,7 @@ mod tests {
     #[test]
     fn opimpl_hint_force_virtualizable_ignores_nonstandard_virtualizable() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -18836,6 +19097,7 @@ mod tests {
     #[test]
     fn do_jit_force_virtual_preserves_standard_concrete_value() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -18876,6 +19138,7 @@ mod tests {
     #[test]
     fn load_fields_from_virtualizable_reloads_heap_values_into_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -18896,6 +19159,7 @@ mod tests {
     #[test]
     fn direct_assembler_call_uses_greenkey_token_in_descr() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
             .jitdrivers_sd
@@ -18903,6 +19167,11 @@ mod tests {
                 vec![("code", Type::Int)],
                 vec![("frame", Type::Int)],
             ));
+        // Wire portal_finishtoken/propagate_exc_descr/portal_calldescr
+        // onto the manually-pushed driver — `register_jitdriver_sd`
+        // does this for the regular path; idempotent on the
+        // already-attached cpu-side descrs.
+        meta.finish_setup_descrs_for_jitdrivers();
         let green_key = crate::green_key_hash(&[55]);
         let mut token = majit_backend::JitCellToken::new(4242);
         token.virtualizable_arg_index = None;
@@ -18972,6 +19241,7 @@ mod tests {
         }
 
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         {
             let staticdata = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
             let mut jd =
@@ -19040,6 +19310,7 @@ mod tests {
     #[test]
     fn hint_force_virtualizable_state_is_reset_between_traces() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
@@ -19066,6 +19337,7 @@ mod tests {
     #[test]
     fn standard_vable_access_consumes_forced_virtualizable_state() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
         start_tracing_with_virtualizable(
@@ -19090,6 +19362,7 @@ mod tests {
     #[test]
     fn compiled_virtualizable_trace_does_not_use_raw_heap_ops() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
         let adesc = info.array_item_descr(0);
@@ -19172,6 +19445,7 @@ mod tests {
     #[test]
     fn optimizer_vable_config_requires_standard_virtualizable_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
         meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         assert!(
@@ -19190,6 +19464,7 @@ mod tests {
     #[test]
     fn optimizer_vable_config_matches_registered_virtualizable_when_boxes_active() {
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
         start_tracing_with_virtualizable(
             &mut meta,
@@ -19227,6 +19502,7 @@ mod tests {
         // Parity with test_on_compile: after_compile hook fires with green_key,
         // num_ops_before, num_ops_after.
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         meta.set_on_compile_loop(move |green_key, ops_before, ops_after| {
@@ -19266,6 +19542,7 @@ mod tests {
         // Parity with test_on_abort: on_compile_error fires when compilation fails.
         // We can test this by installing a hook and verifying it captures the error.
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let error_events: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = error_events.clone();
         meta.set_on_compile_error(move |green_key, msg| {
@@ -19289,6 +19566,7 @@ mod tests {
         // Parity with JitHookInterface: multiple different hooks can be registered
         // independently and all fire for their respective events.
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
 
         let compile_count = Arc::new(Mutex::new(0u32));
         let trace_start_count = Arc::new(Mutex::new(0u32));
@@ -19366,6 +19644,7 @@ mod tests {
         // Parity with test_on_compile: verify that the hook receives the correct
         // green key and that op counts reflect the actual trace.
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
         meta.set_on_compile_loop(move |gk, before, after| {
@@ -19407,6 +19686,7 @@ mod tests {
         // Parity with test_on_compile_bridge: after_compile_bridge hook fires
         // when a bridge is compiled.
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         meta.set_on_compile_bridge(move |gk, fi, nops| {
@@ -19474,6 +19754,7 @@ mod tests {
     fn test_on_guard_failure_hook() {
         // Parity with test_get_stats: guard failure hook fires with correct args.
         let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
         let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = failure_events.clone();
         meta.set_on_guard_failure(move |gk, fi, fc| {
@@ -19583,6 +19864,7 @@ mod tests {
     fn test_on_trace_abort_hook_with_permanent_flag() {
         // Parity with test_abort_quasi_immut: on_abort receives the permanent flag.
         let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
         let abort_events: Arc<Mutex<Vec<(u64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = abort_events.clone();
         meta.set_on_trace_abort(move |gk, permanent| {

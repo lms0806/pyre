@@ -12,7 +12,7 @@
 //! relationship between any two counter updates, and we only ever publish
 //! totals via [`JitProfiler::snapshot`] which itself is `Relaxed`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
 
@@ -93,9 +93,52 @@ pub struct JitProfiler {
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
     /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
     pub calls: AtomicUsize,
+    /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
+    /// self.profiler.initialized: self.profiler.start(); ...
+    /// initialized = True`.  RPython keeps this flag separate from
+    /// `Profiler.start()`: `start()` always resets counters, while
+    /// `_setup_once` decides whether to call it.
+    pub initialized: AtomicBool,
 }
 
 impl JitProfiler {
+    /// jitprof.py:55-61 `Profiler.start`.
+    ///
+    /// Not idempotent by design: upstream `Profiler.start()` resets
+    /// `self.counters` and `self.calls` every time it is called.  The
+    /// one-shot guard lives at the caller (`pyjitpl.py:2300-2302`
+    /// `_setup_once`: `if not self.profiler.initialized: ...`), not
+    /// inside `start()`.
+    pub fn start(&self) {
+        for field in [
+            &self.tracing,
+            &self.backend,
+            &self.ops,
+            &self.heapcached_ops,
+            &self.recorded_ops,
+            &self.guards,
+            &self.opt_ops,
+            &self.opt_guards,
+            &self.opt_guards_shared,
+            &self.opt_forcings,
+            &self.opt_vectorize_try,
+            &self.opt_vectorized,
+            &self.abort_too_long,
+            &self.abort_bridge,
+            &self.abort_bad_loop,
+            &self.abort_escape,
+            &self.abort_force_quasiimmut,
+            &self.abort_segmented_trace,
+            &self.force_virtualizables,
+            &self.nvirtuals,
+            &self.nvholes,
+            &self.nvreused,
+            &self.calls,
+        ] {
+            field.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
     ///
     /// ```python
