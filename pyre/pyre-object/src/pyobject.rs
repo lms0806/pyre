@@ -558,9 +558,15 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
     }
 }
 
+/// `pypy/objspace/std/dictmultiobject.py` makes both `W_DictObject` and
+/// `W_ModuleDictObject` subclasses of `W_DictMultiObject`, so user-level
+/// `isinstance(obj, dict)` is true for both.  Pyre exposes each layout
+/// behind a distinct static `PyType` tag (so the Rust runtime can pick
+/// the right cast), but `is_dict` reports the user-visible answer and
+/// returns true for either.
 #[inline]
 pub unsafe fn is_dict(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &DICT_TYPE) }
+    unsafe { py_type_check(obj, &DICT_TYPE) || crate::dictmultiobject::is_module_dict(obj) }
 }
 
 #[inline]

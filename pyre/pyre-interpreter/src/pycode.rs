@@ -54,6 +54,19 @@ pub struct W_CodeObject {
     /// - FLATPYCALL | co_argcount: simple user function
     /// - HOPELESS: has *args/**kwargs/kwonly/too many params
     pub fast_natural_arity: u16,
+    /// `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
+    ///
+    /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
+    /// (`celldict.py:292,321,335,353`).  Stores a weak reference to
+    /// the `GlobalCache` resolved on the first miss, so subsequent
+    /// hits bypass the `mstrategy.get_global_cache(varname)` string
+    /// lookup.
+    ///
+    /// Owned via `Box::into_raw`; allocated once at construction sized
+    /// to `code.names.len()`, never resized.  `null` when `code_ptr`
+    /// is null or unaligned (test fixtures, gateway builtins).
+    pub globals_caches:
+        *mut Vec<Option<std::rc::Weak<std::cell::RefCell<pyre_object::celldict::GlobalCache>>>>,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
@@ -125,12 +138,31 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
+    // The `(code_ptr as usize) % align != 0` check is inlined into both
+    // branches rather than extracted into a `let valid_code = ...` shared
+    // binding: the let-binding form drops the `cast_ptr_to_int` emission
+    // for `(code_ptr as usize)` inside the codewriter, leaving an
+    // unwired `int_mod/ri>i` opname in the jitcode (Task #141).
     let fast_natural_arity = if code_ptr.is_null()
         || (code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() != 0
     {
         crate::gateway::HOPELESS
     } else {
         compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
+    };
+    // `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
+    let globals_caches = if code_ptr.is_null()
+        || (code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() != 0
+    {
+        std::ptr::null_mut()
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        let names_len = code_ref.names.len();
+        let mut v: Vec<
+            Option<std::rc::Weak<std::cell::RefCell<pyre_object::celldict::GlobalCache>>>,
+        > = Vec::with_capacity(names_len);
+        v.resize_with(names_len, || None);
+        Box::into_raw(Box::new(v))
     };
     let obj = Box::new(W_CodeObject {
         ob_header: PyObject {
@@ -141,6 +173,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         w_globals: std::ptr::null_mut(),
         hidden_applevel,
         fast_natural_arity,
+        globals_caches,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -356,6 +389,74 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
     }
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     code.exceptiontable.to_vec()
+}
+
+/// `celldict.py:292 cache_wref = pycode._globals_caches[nameindex]` —
+/// read slot `nameindex` and upgrade the weakref to a strong
+/// `Rc<RefCell<GlobalCache>>` (returning `None` when the slot is
+/// unset, the weak target is gone, or `code_ptr` is invalid).
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_globals_caches_get(
+    obj: PyObjectRef,
+    nameindex: usize,
+) -> Option<std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>> {
+    if obj.is_null() {
+        return None;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.globals_caches.is_null() {
+        return None;
+    }
+    let vec = unsafe { &*code.globals_caches };
+    vec.get(nameindex)
+        .and_then(|slot| slot.as_ref())
+        .and_then(|w| w.upgrade())
+}
+
+/// `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`
+/// — store `Rc::downgrade(cache)` in slot `nameindex`.  No-op when
+/// `code_ptr` is invalid or `nameindex` is out of range.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_globals_caches_set(
+    obj: PyObjectRef,
+    nameindex: usize,
+    cache: &std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.globals_caches.is_null() {
+        return;
+    }
+    let vec = unsafe { &mut *code.globals_caches };
+    if let Some(slot) = vec.get_mut(nameindex) {
+        *slot = Some(std::rc::Rc::downgrade(cache));
+    }
+}
+
+/// Number of `_globals_caches` slots — equals `len(co_names_w)` at
+/// construction time.  Returns 0 for code objects built from null
+/// or unaligned `code_ptr`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
+    if obj.is_null() {
+        return 0;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.globals_caches.is_null() {
+        return 0;
+    }
+    unsafe { (*code.globals_caches).len() }
 }
 
 /// Check if an object is a code object.

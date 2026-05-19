@@ -18,6 +18,22 @@ pub fn make_function_from_code_obj(
     code_obj: PyObjectRef,
     globals: *mut DictStorage,
 ) -> PyObjectRef {
+    make_function_from_code_obj_with_globals_obj(code_obj, globals, pyre_object::PY_NULL)
+}
+
+/// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
+/// function's `w_func_globals = self.w_globals` directly from the
+/// running frame's dict object.  This entry point accepts the
+/// already-resolved canonical PyObjectRef (`w_globals_obj`) alongside
+/// the legacy raw storage pointer so the freshly-created function
+/// inherits the frame's exact `__globals__` identity rather than
+/// going through `function_new_impl`'s lazy `dict_storage_to_dict`
+/// fallback (which might allocate a fresh sibling W_DictObject).
+pub fn make_function_from_code_obj_with_globals_obj(
+    code_obj: PyObjectRef,
+    globals: *mut DictStorage,
+    w_globals_obj: PyObjectRef,
+) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     // `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the
@@ -35,7 +51,13 @@ pub fn make_function_from_code_obj(
     // straightened out, we keep `name = code.qualname` and only
     // freeze the qualified name into the dedicated `w_qualname` slot
     // here so `__code__` replacement no longer alters `__qualname__`.
-    let func = function_new(code_obj as *const (), code.qualname.to_string(), globals);
+    let func = crate::function::function_new_with_globals_obj(
+        code_obj as *const (),
+        code.qualname.to_string(),
+        globals,
+        w_globals_obj,
+        pyre_object::PY_NULL,
+    );
     let qualname_obj = pyre_object::w_str_new(code.qualname.as_ref());
     unsafe { crate::function::function_set_qualname(func, qualname_obj) };
     func
@@ -56,6 +78,7 @@ pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) ->
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_load_name_from_namespace(
+    frame_ptr: i64,
     namespace_ptr: i64,
     name_ptr: i64,
     name_len: i64,
@@ -68,7 +91,55 @@ pub extern "C" fn jit_load_name_from_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    dict_storage_get(namespace, name).unwrap_or(std::ptr::null_mut()) as i64
+    if let Some(v) = dict_storage_get(namespace, name) {
+        return v as i64;
+    }
+    // Globals miss: `pyopcode.py:958-967 _load_global` falls back to
+    // `self.get_builtin().getdictvalue(space, varname)`.  The frame's
+    // picked builtin (`pyframe.py:115 self.builtin =
+    // space.builtin.pick_builtin(w_globals)`) is the authoritative
+    // builtin reference; mid-execution `__builtins__` rebind would
+    // change the picked module without touching
+    // `namespace["__builtins__"]`'s raw entry, so the extern must
+    // route through `frame.w_builtin` rather than re-reading the dict
+    // slot.
+    let (w_builtin, w_globals_obj) = if frame_ptr != 0 {
+        unsafe {
+            let p = frame_ptr as *const u8;
+            let b = *(p.add(crate::pyframe::PYFRAME_W_BUILTIN_OFFSET) as *const PyObjectRef);
+            let g = *(p.add(crate::pyframe::PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const PyObjectRef);
+            (b, g)
+        }
+    } else {
+        (std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    // `pyframe.py:128-132 get_w_globals` returns the W_DictObject directly.
+    // pyre threads `w_globals_obj` from the eager frame slot in preference
+    // to the legacy `namespace.mirror_target()` lookup so the JIT extern
+    // sees the same identity as the interpreter path without one extra
+    // pointer indirection.
+    let mirror = if !w_globals_obj.is_null() {
+        w_globals_obj
+    } else {
+        namespace.mirror_target()
+    };
+    if !mirror.is_null() && unsafe { pyre_object::dictmultiobject::is_module_dict(mirror) } {
+        if let Some(v) =
+            unsafe { crate::eval::load_global_via_cache_extern(mirror, w_builtin, name) }
+        {
+            return v as i64;
+        }
+    } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        // `_load_global` builtin fallback also fires on non-module-dict
+        // globals (e.g. exec/eval with a plain `dict` for globals).
+        let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if !w_builtin_dict.is_null() {
+            if let Ok(Some(v)) = crate::baseobjspace::finditem_str(w_builtin_dict, name) {
+                return v as i64;
+            }
+        }
+    }
+    std::ptr::null_mut::<()>() as i64
 }
 
 #[majit_macros::dont_look_inside]

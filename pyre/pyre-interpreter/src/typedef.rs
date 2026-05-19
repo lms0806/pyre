@@ -303,11 +303,27 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("tuple", init_tuple_type, object_type) as usize,
         );
 
-        // dict — PyPy: dictobject.py, bases=(object,)
+        // dict — PyPy: dictmultiobject.py, bases=(object,)
+        let dict_type = new_typeobject_with_base("dict", init_dict_type, object_type);
+        reg.insert(&DICT_TYPE as *const PyType as usize, dict_type as usize);
+        // `pypy/objspace/std/dictmultiobject.py:67
+        // allocate_instance(W_ModuleDictObject, space.w_dict)` —
+        // module dicts surface as Python's `dict`.  Register the
+        // sibling `MODULE_DICT_TYPE` static under the same dict
+        // W_TypeObject so `type(g) is dict` and
+        // `isinstance(g, dict)` hold on `W_ModuleDictObject`
+        // instances even though they carry a different Rust
+        // layout / GC type id.
         reg.insert(
-            &DICT_TYPE as *const PyType as usize,
-            new_typeobject_with_base("dict", init_dict_type, object_type) as usize,
+            &pyre_object::dictmultiobject::MODULE_DICT_TYPE as *const PyType as usize,
+            dict_type as usize,
         );
+        unsafe {
+            pyre_object::set_instantiate(
+                &pyre_object::dictmultiobject::MODULE_DICT_TYPE,
+                dict_type,
+            );
+        }
 
         // mappingproxy — `pypy/objspace/std/dictproxyobject.py:103`
         // `W_DictProxyObject.typedef = TypeDef('mappingproxy', ...)`,
@@ -1068,8 +1084,10 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let src = args[1];
         unsafe {
             if pyre_object::is_dict(src) {
-                let d = &*(src as *const pyre_object::dictobject::W_DictObject);
-                for &(k, v) in &*d.entries {
+                // `w_dict_items` dispatches through `is_module_dict`
+                // so `dict(some_module.__dict__)` and `dict(**module_dict)`
+                // walk the strategy storage when given a module dict.
+                for (k, v) in pyre_object::w_dict_items(src) {
                     pyre_object::w_dict_store(backing, k, v);
                 }
             }
@@ -1815,11 +1833,10 @@ fn init_str_type(ns: &mut DictStorage) {
                 // 1-arg dict form: maketrans({ord_or_char: replacement, ...})
                 let src = args[0];
                 unsafe {
-                    let entries = &*((src as *const pyre_object::dictobject::W_DictObject)
-                        .as_ref()
-                        .unwrap()
-                        .entries);
-                    for &(k, v) in entries {
+                    // `w_dict_items` dispatches through `is_module_dict`
+                    // so `str.maketrans(some_module.__dict__)` walks the
+                    // strategy storage when handed a W_ModuleDictObject.
+                    for (k, v) in pyre_object::w_dict_items(src) {
                         let ord_key = if pyre_object::is_int(k) {
                             k
                         } else if pyre_object::is_str(k) {
@@ -2131,22 +2148,15 @@ fn init_dict_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "clear",
             |args| {
+                // `pypy/objspace/std/dictmultiobject.py:1374
+                // W_DictMultiObject.descr_clear` — empties every entry
+                // regardless of key type by dispatching through the
+                // strategy's `clear` (`celldict.py:162-164` for
+                // module dicts).  `w_dict_clear` does the dispatch.
                 if !args.is_empty() {
                     let d = crate::type_methods::resolve_dict_backing(args[0]);
                     if !d.is_null() {
-                        let keys: Vec<_> = unsafe { pyre_object::w_dict_items(d) }
-                            .into_iter()
-                            .filter_map(|(k, _)| {
-                                if unsafe { pyre_object::is_str(k) } {
-                                    Some(unsafe { pyre_object::w_str_get_value(k).to_string() })
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        for key in &keys {
-                            unsafe { pyre_object::w_dict_delitem_str(d, key) };
-                        }
+                        unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
                     }
                 }
                 Ok(pyre_object::w_none())

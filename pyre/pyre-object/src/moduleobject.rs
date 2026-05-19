@@ -76,10 +76,10 @@ impl crate::lltype::GcType for W_ModuleObject {
 ///   be null only for tests and the anonymous default Module.
 pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
     let name_box = crate::lltype::malloc_raw(name.to_string());
-    let w_dict = crate::dictobject::w_dict_new_with_dict_storage(dict_ptr);
+    let w_dict = crate::dictmultiobject::w_dict_new_with_dict_storage(dict_ptr);
     if !name.is_empty() {
         unsafe {
-            crate::dictobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
+            crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
         }
     }
     crate::lltype::malloc_typed(W_ModuleObject {
@@ -130,7 +130,7 @@ pub fn w_module_new_aliasing_dict(
     // resolves it through the W_DictObject).
     if !name.is_empty() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
         unsafe {
-            crate::dictobject::w_dict_setitem_str(
+            crate::dictmultiobject::w_dict_setitem_str(
                 w_dict_object,
                 "__name__",
                 crate::w_str_new(name),
@@ -196,7 +196,7 @@ pub unsafe fn w_module_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     if !crate::is_dict(module.w_dict) {
         return std::ptr::null_mut();
     }
-    crate::dictobject::w_dict_get_dict_storage_proxy(module.w_dict)
+    crate::dictmultiobject::w_dict_get_dict_storage_proxy(module.w_dict)
 }
 
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).
@@ -229,7 +229,7 @@ pub unsafe fn w_module_alias_getitem_str(obj: PyObjectRef, name: &str) -> Option
     if !crate::is_dict(module.w_dict) {
         return None;
     }
-    crate::dictobject::w_dict_getitem_str(module.w_dict, name)
+    crate::dictmultiobject::w_dict_getitem_str(module.w_dict, name)
 }
 
 /// Check if an object is a module.

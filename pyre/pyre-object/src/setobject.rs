@@ -56,7 +56,7 @@ pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
 /// follows the same rules as dict key equality (int / bool / str / tuple
 /// / frozenset, with pointer identity as a fallback for everything else).
 unsafe fn set_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
-    crate::dictobject::dict_keys_equal(a, b)
+    crate::dictmultiobject::dict_keys_equal(a, b)
 }
 
 fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {

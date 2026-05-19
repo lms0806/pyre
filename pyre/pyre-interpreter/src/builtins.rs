@@ -665,6 +665,27 @@ pub fn new_builtin_dict_storage() -> DictStorage {
     namespace
 }
 
+/// `pypy/objspace/std/dictmultiobject.py:60-69
+/// allocate_and_init_instance(module=True)` parity — allocate the
+/// builtins module dict as a `W_ModuleDictObject` backed by
+/// `ModuleDictStrategy` (`celldict.py:28`).  Seeds the same entries
+/// `install_default_builtins` populates on a `DictStorage`, then
+/// transfers them into the strategy storage; the temporary
+/// `DictStorage` drops at function exit and the W_ModuleDictObject
+/// owns the live builtins.
+pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
+    crate::typedef::init_typeobjects();
+    let mut seed = DictStorage::new();
+    install_default_builtins(&mut seed);
+    let w_dict = pyre_object::w_module_dict_new();
+    for (key, &value) in seed.entries() {
+        if !value.is_null() {
+            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
+        }
+    }
+    w_dict
+}
+
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
@@ -1082,12 +1103,14 @@ fn type_descr_new_with_metaclass(
             }
         }
 
-        // Convert dict to DictStorage
+        // Convert dict to DictStorage.  `w_dict_items` dispatches
+        // through `is_module_dict`, so the rare `__build_class__`
+        // case where the namespace is a W_ModuleDictObject still
+        // walks correctly.
         let mut class_ns = Box::new(crate::DictStorage::new());
         class_ns.fix_ptr();
         if unsafe { is_dict(w_namespace_dict) } {
-            let d = unsafe { &*(w_namespace_dict as *const pyre_object::dictobject::W_DictObject) };
-            for &(k, v) in unsafe { &*d.entries } {
+            for (k, v) in unsafe { pyre_object::w_dict_items(w_namespace_dict) } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
                     crate::dict_storage_store(&mut class_ns, key, v);
@@ -1149,10 +1172,10 @@ fn type_descr_new_with_metaclass(
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
 
         // __set_name__ protocol — CPython: type_new_set_names
-        // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor
+        // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
+        // `w_dict_items` dispatches through `is_module_dict`.
         if unsafe { is_dict(w_namespace_dict) } {
-            let d = unsafe { &*(w_namespace_dict as *const pyre_object::dictobject::W_DictObject) };
-            let entries: Vec<(PyObjectRef, PyObjectRef)> = unsafe { (*d.entries).clone() };
+            let entries = unsafe { pyre_object::w_dict_items(w_namespace_dict) };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
@@ -2525,6 +2548,24 @@ fn exec_or_eval(
     impl Drop for GlobalsBinding {
         fn drop(&mut self) {
             unsafe { self.detach() }
+            // `pypy/interpreter/pyopcode.py:771-776 EXEC_STMT` runs the
+            // frame on the user-supplied dict directly — there is no
+            // temp storage to release because the dict object IS the
+            // canonical store.  Pyre's pre-Phase-5-cutover model
+            // allocates a temp `DictStorage` and mirrors writes back
+            // into the user dict via `mirror_target`; functions defined
+            // during `exec` capture `w_func_globals = temp_storage_ptr`,
+            // so dropping the `Box<DictStorage>` here would dangle the
+            // captures and surface as a use-after-free on the next
+            // `g["reader"]()` invocation.  Leak the Box until the full
+            // `LegacyGlobalsBox` retirement lands (Phase 5d remaining
+            // slice — frame.w_globals becomes a PyObjectRef so the
+            // captured globals identity IS the backing dict and no
+            // temp is needed).  Memory cost is one DictStorage per
+            // exec invocation, which is bounded by program lifetime.
+            if let Some(storage) = self.owned.take() {
+                let _ = Box::into_raw(storage);
+            }
         }
     }
 
@@ -2940,7 +2981,7 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
                 if pyre_object::is_dict(w_dict) {
-                    for (name, _) in pyre_object::dictobject::w_dict_str_entries(w_dict) {
+                    for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries(w_dict) {
                         names.push(name);
                     }
                 } else if let Ok(keys_iter) = crate::baseobjspace::iter(w_dict) {

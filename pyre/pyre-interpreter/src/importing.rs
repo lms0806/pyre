@@ -4160,12 +4160,22 @@ fn init_copyreg(ns: &mut DictStorage) {
 
 /// Try to load a builtin module by name.
 ///
-/// PyPy equivalent: find_module() → C_BUILTIN path →
-/// getbuiltinmodule() → Module.__init__ + startup()
+/// PyPy equivalent: `find_module()` → C_BUILTIN path →
+/// `getbuiltinmodule()` → `Module.__init__` + `startup()`.
+///
+/// PyPy `pypy/objspace/std/dictmultiobject.py:60-69` allocates a
+/// `W_ModuleDictObject` for every module via
+/// `allocate_and_init_instance(module=True)`.  Pyre mirrors that here
+/// by running the legacy `init_fn(&mut DictStorage)` against a
+/// temporary `DictStorage`, then folding the populated entries into a
+/// fresh `W_ModuleDictObject` whose `ModuleDictStrategy` (from
+/// `celldict.py:28`) is the post-Phase-5 canonical store.  The
+/// temporary storage drops at function exit; the module's `w_dict`
+/// is the `W_ModuleDictObject`.
 fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let init_fn = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
 
-    let mut namespace = Box::new(DictStorage::new());
+    let mut namespace = DictStorage::new();
     namespace.fix_ptr();
 
     // Set __name__ (PyPy: Module.__init__ sets __name__)
@@ -4175,14 +4185,30 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     // Run module-specific initializer (PyPy: interpleveldefs)
     init_fn(&mut namespace);
 
-    let ns_ptr = Box::into_raw(namespace);
-    // PyPy `module.py:77 Module.getdict()` parity: reuse the canonical
-    // W_DictObject paired with this storage (`dict_storage_to_dict`
-    // lazy mirror_target registration); avoid allocating a sibling
-    // W_DictObject through `w_module_new` that would shadow the
-    // canonical identity.
-    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
-    let module = pyre_object::w_module_new_aliasing_dict(name, ns_ptr as *mut u8, canonical);
+    // Fold the legacy DictStorage population into the upstream
+    // `W_ModuleDictObject` carrier.  `init_fn` continues to take
+    // `&mut DictStorage` so the ~20 builtin moduledef.rs init
+    // functions remain untouched in this slice; the storage drops at
+    // function exit and the W_ModuleDictObject owns the live state.
+    let w_dict = pyre_object::w_module_dict_new();
+    for (key, &value) in namespace.entries() {
+        if !value.is_null() {
+            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
+        }
+    }
+    let module = pyre_object::w_module_new_aliasing_dict(name, std::ptr::null_mut(), w_dict);
+    // `pypy/interpreter/baseobjspace.py:647` installs the self
+    // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
+    // so user code can reach the builtins module through
+    // `import builtins; builtins.__builtins__`.  The pyre split
+    // between EC.builtins_module (used by LOAD_GLOBAL fallback) and
+    // the import-time module (returned here) is a known pre-existing
+    // adaptation; install the self-reference on the imported flavour
+    // so `import builtins; builtins.__builtins__ is builtins` holds
+    // for user code regardless of the split.
+    if name == "builtins" {
+        unsafe { pyre_object::w_dict_setitem_str(w_dict, "__builtins__", module) };
+    }
     Some(module)
 }
 
@@ -4571,10 +4597,17 @@ fn load_source_module(
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
     //
-    // Reuse the canonical W_DictObject paired with the storage
-    // (`dict_storage_to_dict` lazy mirror_target registration) so the
-    // module's `w_dict` is the same identity that `function.__globals__`
-    // and `globals()` will return for code executing in this module.
+    // `dict_storage_to_dict(ns_ptr)` now constructs a W_ModuleDictObject
+    // (PyPy `dictmultiobject.py:60-69 allocate_and_init_instance(
+    // module=True)` shape) with `dict_storage_proxy = ns_ptr` and
+    // registers it as `DictStorage.mirror_target`, so `module.w_dict`,
+    // `function.__globals__`, and `globals()` all converge on the same
+    // W_ModuleDictObject identity.  Forward writes via the module dict
+    // fan out to the DictStorage; back-mirror updates the strategy
+    // storage in step — the frame-side `*mut DictStorage` carrier
+    // stays valid until Phase 5e migrates `PyFrame.w_globals` to
+    // `PyObjectRef`.  The simpler builtin module loader path (no
+    // frame globals dependency) already uses `W_ModuleDictObject`.
     let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
     let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
     set_sys_module(modulename, module);
@@ -4627,8 +4660,8 @@ fn load_package(
     let path_list = pyre_object::w_list_new(vec![path_str]);
     unsafe {
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
-            pyre_object::dictobject::w_dict_setitem_str(w_dict, "__path__", path_list);
-            pyre_object::dictobject::w_dict_setitem_str(
+            pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, "__path__", path_list);
+            pyre_object::dictmultiobject::w_dict_setitem_str(
                 w_dict,
                 "__package__",
                 pyre_object::w_str_new(modulename),
@@ -4658,13 +4691,23 @@ fn load_part(
     // the fully-qualified name.
     let full_is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(modulename));
     if full_is_builtin {
-        let m = load_builtin_module(modulename).ok_or_else(|| crate::PyError {
-            kind: crate::PyErrorKind::ImportError,
-            message: format!("builtin module '{modulename}' failed to initialize"),
-            exc_object: std::ptr::null_mut(),
-            attach_tb: true,
-            reraise_lasti: -1,
-        })?;
+        // `pypy/interpreter/module.py:18 Module.__init__` keeps a single
+        // `Module` per imported module name; `space.builtin` IS the
+        // module returned by `import builtins`.  Pyre's
+        // `ExecutionContext::get_builtin()` lazily caches the Module
+        // wrapping `self.builtins_module` — route the "builtins" case
+        // through it so identity equality holds against `space.builtin`.
+        let m = if modulename == "builtins" && !execution_context.is_null() {
+            unsafe { (*execution_context).get_builtin() }
+        } else {
+            load_builtin_module(modulename).ok_or_else(|| crate::PyError {
+                kind: crate::PyErrorKind::ImportError,
+                message: format!("builtin module '{modulename}' failed to initialize"),
+                exc_object: std::ptr::null_mut(),
+                attach_tb: true,
+                reraise_lasti: -1,
+            })?
+        };
         set_sys_module(modulename, m);
         return Ok(Some(m));
     }
@@ -4688,14 +4731,20 @@ fn load_part(
         #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
-            // PyPy: getbuiltinmodule() path
-            let m = load_builtin_module(partname).ok_or_else(|| crate::PyError {
-                kind: crate::PyErrorKind::ImportError,
-                message: format!("builtin module '{modulename}' failed to initialize"),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
-            })?;
+            // Same builtins-identity path as the full_is_builtin branch
+            // above: route `import builtins` through `EC.get_builtin()`
+            // so `import builtins is space.builtin` holds.
+            let m = if partname == "builtins" && !execution_context.is_null() {
+                unsafe { (*execution_context).get_builtin() }
+            } else {
+                load_builtin_module(partname).ok_or_else(|| crate::PyError {
+                    kind: crate::PyErrorKind::ImportError,
+                    message: format!("builtin module '{modulename}' failed to initialize"),
+                    exc_object: std::ptr::null_mut(),
+                    attach_tb: true,
+                    reraise_lasti: -1,
+                })?
+            };
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
             m
@@ -4924,7 +4973,9 @@ pub fn import_from(
                         // module from sys.modules.
                         if let Some(submod) = check_sys_modules(&fullname) {
                             unsafe {
-                                pyre_object::dictobject::w_dict_setitem_str(w_dict, name, submod);
+                                pyre_object::dictmultiobject::w_dict_setitem_str(
+                                    w_dict, name, submod,
+                                );
                             }
                             return Ok(submod);
                         }

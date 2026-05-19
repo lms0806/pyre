@@ -278,7 +278,6 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 }
                 if !(*frame).w_globals.is_null() {
                     let globals_ptr = (*frame).w_globals;
-                    let mirror = (&*globals_ptr).mirror_target();
                     let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
                         .values_mut()
                         .iter_mut()
@@ -288,10 +287,21 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                         visitor(&mut *(value as *mut majit_ir::GcRef));
                         walk_raw_function_roots(*value, visitor);
                     }
-                    let mut mirror_slot = mirror;
-                    visitor(&mut *(&mut mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-                    if mirror_slot != mirror {
-                        (&mut *globals_ptr).set_mirror_target(mirror_slot);
+                    // `pyframe.py:50 self.w_globals = pycode.w_globals`
+                    // stores the W_DictObject identity directly.  Pyre
+                    // mirrors that on the eager `frame.w_globals_obj`
+                    // slot (per `pyframe.rs PYFRAME_W_GLOBALS_OBJ_OFFSET`);
+                    // tracing that slot keeps the W_DictObject (and
+                    // through `W_ModuleDictObject`'s own custom trace,
+                    // its strategy + storage chain) reachable across
+                    // minor collections.  `set_mirror_target` write-back
+                    // is no longer required because the slot lives on
+                    // the frame itself.
+                    let w_globals_obj_slot = &mut (*frame).w_globals_obj as *mut PyObjectRef;
+                    visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
+                    let live_obj = (*frame).w_globals_obj;
+                    if !live_obj.is_null() {
+                        (&mut *globals_ptr).set_mirror_target(live_obj);
                     }
                 }
                 let f = &*frame;
@@ -842,7 +852,22 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn make_function(&mut self, code_obj: Self::Value) -> Result<Self::Value, PyError> {
-        Ok(make_function_from_code_obj(code_obj, self.get_w_globals()))
+        // `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps
+        // `func.w_func_globals = self.w_globals` from the running
+        // frame's dict object directly.  Pyre resolves the same
+        // canonical sibling via `get_w_globals_obj()` and threads it
+        // through `make_function_from_code_obj_with_globals_obj` so
+        // the freshly-created function's `__globals__` identity IS
+        // the frame's view — no lazy `dict_storage_to_dict` second
+        // resolution that could surface a different W_DictObject.
+        let w_globals_obj = self.get_w_globals_obj();
+        Ok(
+            crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
+                code_obj,
+                self.get_w_globals(),
+                w_globals_obj,
+            ),
+        )
     }
 
     fn call_callable(
@@ -938,7 +963,7 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// `*mut DictStorage` fast path and route through
     /// `space.getitem(w_locals_object, name)` directly per PyPy
     /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
-    fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+    fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
         let w_locals_object = self.get_w_locals_object();
         if !w_locals_object.is_null() {
             let key = unsafe { pyre_object::w_str_new(name) };
@@ -951,7 +976,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 }
                 Err(err) => return Err(err),
             }
-            return self.load_global_value(name);
+            return self.load_global_value(name, nameindex);
         }
         let w_locals = self.get_w_locals();
         if !w_locals.is_null() {
@@ -960,7 +985,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 return Ok(value);
             }
         }
-        self.load_global_value(name)
+        self.load_global_value(name, nameindex)
     }
 
     /// PyPy: STORE_NAME writes to locals (class body) or globals.
@@ -968,7 +993,12 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// Non-dict mapping locals route through
     /// `space.setitem(w_locals_object, name, value)` matching
     /// `pyopcode.py:STORE_NAME` `space.setitem(w_locals, ...)`.
-    fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
+    fn store_name_value(
+        &mut self,
+        name: &str,
+        _nameindex: usize,
+        value: Self::Value,
+    ) -> Result<(), PyError> {
         let w_locals_object = self.get_w_locals_object();
         if !w_locals_object.is_null() {
             let key = unsafe { pyre_object::w_str_new(name) };
@@ -983,7 +1013,12 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// pypy/interpreter/pyopcode.py:567 STORE_GLOBAL — bypasses w_locals
     /// and writes directly into w_globals so `exec("global x; x = 1", g, l)`
     /// lands `x` in `g` even when `l != g`.
-    fn store_global_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
+    fn store_global_value(
+        &mut self,
+        name: &str,
+        _nameindex: usize,
+        value: Self::Value,
+    ) -> Result<(), PyError> {
         let ns = unsafe { &mut *self.get_w_globals() };
         dict_storage_store(ns, name, value);
         Ok(())
@@ -996,20 +1031,53 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// (`pyframe.py:115-116` + `pypy/module/__builtin__/moduledef.py:89`),
     /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
     /// because the empty dict is the picked builtin.
-    fn load_global_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+    fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
         let ns = unsafe { &*self.get_w_globals() };
         if let Some(value) = crate::dict_storage_get(ns, name) {
             return Ok(value);
         }
-        // pyopcode.py:921 `w_value = self.get_builtin().getdictvalue
-        // (self.space, varname)`.  PyPy walks `module.w_dict` for the
-        // str key — pyre routes through `space.finditem_str` on the
-        // picked Module's `w_dict` so that a dict-subclass `__builtins__`
-        // (`moduledef.py:102-103`) honours the subclass `__getitem__`
-        // override.  For normal Modules backed by storage this hits the
-        // same hash index via `w_dict_getitem_str` → storage-proxy
-        // read-through, matching `module.getdictvalue`.
-        if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
+        // `pyopcode.py:918-927 _load_global` — fall back to
+        // `self.get_builtin().getdictvalue(space, varname)`.  Pyre's
+        // path consults the `GlobalCache` (`celldict.py:214 get_global_cache`)
+        // on the globals' backing W_ModuleDictObject so a repeated
+        // LOAD_GLOBAL miss reuses the cached builtin entry instead of
+        // re-walking `__builtins__.w_dict` every iteration.
+        // `pyframe.py:128-132 get_w_globals` returns the W_DictObject
+        // directly; pyre's `w_globals_obj` slot (eagerly resolved at
+        // frame construction per `pyframe.py:98 __init__`) carries
+        // that identity without a `dict_storage_to_dict` indirection
+        // each call.
+        let w_globals_obj = self.get_w_globals_obj();
+        // `celldict.py:285-291 _LOAD_GLOBAL_cached`: when
+        // `debugdata.w_globals is not pycode.w_globals` the entire
+        // cached path is bypassed via `_load_global_fallback` — both
+        // the per-pycode `_globals_caches[nameindex]` slot AND the
+        // strategy-level `get_global_cache(varname)` install are
+        // skipped, because both would attach a cache to a module that
+        // is not the one being executed.  pyre's identity check is
+        // `pycode.w_globals == frame.w_globals` (raw `*mut DictStorage`
+        // pointer equality, matching PyPy's `is` on the wrapped dict).
+        let pycode_matches_frame: bool = unsafe {
+            let cw = crate::pycode::w_code_get_w_globals(self.pycode as PyObjectRef);
+            !cw.is_null() && std::ptr::eq(cw, self.get_w_globals())
+        };
+        if pycode_matches_frame
+            && !w_globals_obj.is_null()
+            && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals_obj) }
+        {
+            let cache_hit: Option<PyObjectRef> = unsafe {
+                load_global_via_cache(
+                    w_globals_obj,
+                    self.w_builtin,
+                    name,
+                    self.pycode as PyObjectRef,
+                    nameindex,
+                )
+            }?;
+            if let Some(value) = cache_hit {
+                return Ok(value);
+            }
+        } else if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
             if !w_dict.is_null() {
                 if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
@@ -1032,6 +1100,145 @@ impl StackOpcodeHandler for PyFrame {
         self.locals_w_mut().swap(top_idx, other_idx);
         Ok(())
     }
+}
+
+/// `celldict.py:279-329 _LOAD_GLOBAL_cached` slow-path: consult the
+/// W_ModuleDictObject's `mstrategy.get_global_cache` for `name`,
+/// chaining through `cache.builtincache` to the `__builtins__` Module
+/// on a globals miss.  Returns `None` when the name is absent from
+/// both globals and builtins.
+///
+/// Public extern alias so `runtime_ops::jit_load_name_from_namespace`
+/// can reuse this cache path on a globals miss.
+///
+/// # Safety
+/// `w_module_dict` must be a valid W_ModuleDictObject; `w_builtin`
+/// may be null or a valid Module; `name` is the requested str key.
+pub unsafe fn load_global_via_cache_extern(
+    w_module_dict: PyObjectRef,
+    w_builtin: PyObjectRef,
+    name: &str,
+) -> Option<PyObjectRef> {
+    // JIT extern path: discard `space.finditem_str`'s `PyError` because
+    // the C-ABI signature has no error channel.  For the builtins dict
+    // (the only call site that can raise here in practice), `finditem_str`
+    // only raises on a non-dict mapping with custom `__getitem__` — never
+    // for the W_DictObject / W_ModuleDictObject backing real builtins.
+    match load_global_via_cache(w_module_dict, w_builtin, name, std::ptr::null_mut(), 0) {
+        Ok(v) => v,
+        Err(_) => None,
+    }
+}
+
+/// `celldict.py:279-329 _LOAD_GLOBAL_cached`.  When `pycode` is
+/// non-null, `pycode._globals_caches[nameindex]` is consulted before
+/// `mstrategy.get_global_cache(name)`; on the slow path, the resolved
+/// `cache.ref` (`celldict.py:321/353`) is installed into the slot.
+///
+/// Returns `Ok(Some(value))` on cache hit (globals or chained builtin),
+/// `Ok(None)` on full miss, `Err(_)` when `space.finditem_str` raises
+/// during the builtins fallback (`baseobjspace.py:45-49
+/// W_Root.getdictvalue` → `space.finditem_str`).
+unsafe fn load_global_via_cache(
+    w_module_dict: PyObjectRef,
+    w_builtin: PyObjectRef,
+    name: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<Option<PyObjectRef>, PyError> {
+    use pyre_object::celldict::{GlobalCache, unwrap_cell};
+    use pyre_object::dictmultiobject::W_ModuleDictObject;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    // `celldict.py:292-313`: per-name slot fast path.  Read the slot,
+    // upgrade the weakref; if the cache is alive, follow cell → builtincache
+    // → builtins w_dict before falling through to the strategy lookup.
+    if !pycode.is_null() {
+        if let Some(cache) = crate::pycode::w_code_globals_caches_get(pycode, nameindex) {
+            // `celldict.py:295-313`: fast-path layout —
+            //
+            //     w_value = cache.getvalue(self.space)
+            //     if w_value is not None:
+            //         return w_value
+            //     if cache.valid:
+            //         builtincache = cache.builtincache
+            //         if builtincache is not None:
+            //             w_value = builtincache.getvalue(self.space)
+            //             if w_value is not None:
+            //                 return w_value
+            //             # builtin getdictvalue + _load_global_failed
+            //
+            // The builtins fallback is GATED on `builtincache is not None`.
+            // Under pyre's honor__builtins__=True equivalence the
+            // `builtincache` attach is dead, so the slot path just
+            // returns early on a cell hit and otherwise falls through to
+            // the slow path (`# either no cache or an invalid cache`),
+            // which calls `_load_global` whose own fallback chain reads
+            // the frame's picked builtin via `space.finditem_str`.
+            let (cell_opt, valid, bc_opt) = {
+                let c = cache.borrow();
+                (c.cell, c.valid, c.builtincache.clone())
+            };
+            if let Some(v) = cell_opt {
+                return Ok(Some(unwrap_cell(v)));
+            }
+            if valid && let Some(bc) = bc_opt {
+                let bcell = bc.borrow().cell;
+                if let Some(v) = bcell {
+                    return Ok(Some(unwrap_cell(v)));
+                }
+                // `celldict.py:307-313`: the `_load_global_failed`
+                // branch is inside `if builtincache is not None` — only
+                // reachable when a real builtincache is installed.
+                // Under honor=True this scope is dead; included for
+                // strict line-by-line shape parity should
+                // honor__builtins__ ever flip False.
+                if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                    let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+                    if !w_builtin_dict.is_null() {
+                        return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+                    }
+                }
+            }
+        }
+    }
+    let raw = &mut *(w_module_dict as *mut W_ModuleDictObject);
+    if raw.mstrategy.is_null() || raw.dstorage.is_null() {
+        return Ok(None);
+    }
+    // `celldict.py:315-322`: the slow-path install just routes through
+    // `w_globals.get_global_cache(varname)` and writes
+    // `pycode._globals_caches[nameindex] = cache.ref`.
+    //
+    // Under pyre's permanent `honor__builtins__=True` (frame picks its
+    // own builtin per `pyframe.py:115`), the cache carries no
+    // `builtincache` — that branch is dead in
+    // `ModuleDictStrategy::get_global_cache` per its line-by-line port
+    // of `celldict.py:224 not space.config.objspace.honor__builtins__`.
+    let strategy = &mut *raw.mstrategy;
+    let storage = &*raw.dstorage;
+    let cache = strategy.get_global_cache(storage, name);
+    // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
+    if !pycode.is_null() {
+        crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
+    }
+    // `_LOAD_GLOBAL_cached` lines 296-298: cache.getvalue hit.
+    let cell_opt = cache.borrow().cell;
+    if let Some(v) = cell_opt {
+        return Ok(Some(unwrap_cell(v)));
+    }
+    // `_load_global_fallback` → `_load_global` (`pyopcode.py:958-967`):
+    // when globals miss, route through `self.get_builtin().getdictvalue(
+    // space, varname)` which resolves via `space.finditem_str` per
+    // `baseobjspace.py:45-49 W_Root.getdictvalue`.  The caller threads
+    // its frame's picked builtin in as `w_builtin`.
+    if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+        let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+        if !w_builtin_dict.is_null() {
+            return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+        }
+    }
+    Ok(None)
 }
 
 thread_local! {
@@ -2078,9 +2285,13 @@ impl OpcodeStepExecutor for PyFrame {
         let dict = PyFrame::peek_at(self, i - 1);
         unsafe {
             if pyre_object::is_dict(source) {
-                let src = &*(source as *const pyre_object::dictobject::W_DictObject);
-                let entries = &*src.entries;
-                for &(k, v) in entries {
+                // `w_dict_items` already dispatches through
+                // `is_module_dict`, so a `**module_dict` unpack walks
+                // the strategy storage for `W_ModuleDictObject` and
+                // the entries Vec for `W_DictObject`.  PyPy
+                // `pypy/objspace/std/dictmultiobject.py:descr_update`
+                // iterates `self.items()` regardless of strategy.
+                for (k, v) in pyre_object::w_dict_items(source) {
                     pyre_object::w_dict_store(dict, k, v);
                 }
             }
@@ -2095,9 +2306,7 @@ impl OpcodeStepExecutor for PyFrame {
         let dict = PyFrame::peek_at(self, i - 1);
         unsafe {
             if pyre_object::is_dict(source) {
-                let src = &*(source as *const pyre_object::dictobject::W_DictObject);
-                let entries = &*src.entries;
-                for &(k, v) in entries {
+                for (k, v) in pyre_object::w_dict_items(source) {
                     pyre_object::w_dict_store(dict, k, v);
                 }
             }
@@ -2196,11 +2405,22 @@ impl OpcodeStepExecutor for PyFrame {
             })?;
             return Ok(());
         }
-        let mut ns = self.get_w_locals();
-        if ns.is_null() {
-            ns = self.get_w_globals();
-        }
-        let found = unsafe { crate::dict_storage_delete(&mut *ns, name) };
+        let w_locals = self.get_w_locals();
+        let w_globals_obj = self.get_w_globals_obj();
+        let found: bool = if !w_locals.is_null() {
+            // No `get_w_locals_obj` accessor yet — locals DictStorage
+            // doesn't have a canonical W_DictObject sibling for routing.
+            unsafe { crate::dict_storage_delete(&mut *w_locals, name) }
+        } else if w_globals_obj.is_null() {
+            let ns = self.get_w_globals();
+            unsafe { crate::dict_storage_delete(&mut *ns, name) }
+        } else {
+            // Globals fallback: route through `w_dict_delitem_str` on
+            // the canonical W_DictObject so the W_ModuleDictObject
+            // strategy and mirror `DictStorage` stay coherent via
+            // `maybe_sync_dict_storage_delete`.
+            unsafe { pyre_object::w_dict_delitem_str(w_globals_obj, name) }
+        };
         if !found {
             return Err(PyError::new(
                 PyErrorKind::NameError,
@@ -2214,11 +2434,18 @@ impl OpcodeStepExecutor for PyFrame {
     // pypy/interpreter/pyopcode.py:901-903 DELETE_GLOBAL —
     //   `self.space.delitem(self.get_w_globals(), w_varname)`.
     // `space.delitem` on a dict raises `KeyError(w_varname)` when the
-    // key is missing; pyre's storage-direct path mirrors that without
-    // translating the failure into a NameError.
+    // key is missing; pyre routes through `w_dict_delitem_str` on the
+    // canonical W_DictObject so the W_ModuleDictObject's strategy and
+    // its mirror `DictStorage` stay coherent via
+    // `maybe_sync_dict_storage_delete`.
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
-        let ns = self.get_w_globals();
-        let found = unsafe { crate::dict_storage_delete(&mut *ns, name) };
+        let w_globals_obj = self.get_w_globals_obj();
+        let found: bool = if w_globals_obj.is_null() {
+            let ns = self.get_w_globals();
+            unsafe { crate::dict_storage_delete(&mut *ns, name) }
+        } else {
+            unsafe { pyre_object::w_dict_delitem_str(w_globals_obj, name) }
+        };
         if !found {
             return Err(PyError::key_error(format!("'{name}'")));
         }
@@ -3135,8 +3362,8 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
-            let y = *(*frame.w_globals).get("y").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
+            let y = w_dict_getitem_str(frame.w_globals_obj, "y").unwrap();
             assert_eq!(w_int_get_value(x), 5);
             assert_eq!(w_int_get_value(y), 25);
         }
@@ -3149,7 +3376,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
         }
     }
@@ -3184,7 +3411,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let r = *(*frame.w_globals).get("r").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "r").unwrap();
             assert_eq!(w_int_get_value(r), 6);
         }
     }
@@ -3328,7 +3555,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             assert_eq!(w_int_get_value(s), 45);
         }
     }
@@ -3340,7 +3567,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             assert_eq!(w_int_get_value(s), 4_498_500);
         }
     }
@@ -3360,8 +3587,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4500);
         }
@@ -3380,8 +3607,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_501_500);
         }
@@ -3401,9 +3628,9 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
-            let lst = *(*frame.w_globals).get("lst").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
+            let lst = w_dict_getitem_str(frame.w_globals_obj, "lst").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_498_500);
             assert_eq!(w_int_get_value(w_list_getitem(lst, 0).unwrap()), 2999);
@@ -3422,8 +3649,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4095);
         }
@@ -3441,8 +3668,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), -4_501_500);
         }
@@ -3460,8 +3687,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 1_498_500);
         }
@@ -3479,8 +3706,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 8_994);
         }
@@ -3498,8 +3725,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 2_250_000);
         }
@@ -3519,8 +3746,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3542,8 +3769,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3565,8 +3792,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3586,8 +3813,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3607,8 +3834,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3630,8 +3857,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3651,8 +3878,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3671,8 +3898,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 12_000);
         }
@@ -3691,8 +3918,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6_000);
         }
@@ -3712,8 +3939,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3735,8 +3962,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6000);
         }
@@ -3756,8 +3983,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3775,8 +4002,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6426);
         }
@@ -3794,8 +4021,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 11568);
         }
@@ -3817,8 +4044,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -3838,9 +4065,9 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
-            let lst = *(*frame.w_globals).get("lst").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
+            let lst = w_dict_getitem_str(frame.w_globals_obj, "lst").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_498_500);
             assert_eq!(w_int_get_value(w_list_getitem(lst, -1).unwrap()), 2999);
@@ -3860,8 +4087,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 15_000);
         }
@@ -3881,8 +4108,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let i = *(*frame.w_globals).get("i").unwrap();
-            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let i = w_dict_getitem_str(frame.w_globals_obj, "i").unwrap();
+            let acc = w_dict_getitem_str(frame.w_globals_obj, "acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_501_500);
         }
@@ -3895,7 +4122,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             assert_eq!(w_int_get_value(s), 35);
         }
     }
@@ -3907,7 +4134,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             // 0 + 2 + 4 + 6 + 8 = 20
             assert_eq!(w_int_get_value(s), 20);
         }
@@ -3920,7 +4147,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             assert_eq!(w_int_get_value(s), 42);
         }
     }
@@ -3932,7 +4159,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = w_dict_getitem_str(frame.w_globals_obj, "s").unwrap();
             // 0 + 1 + 2 + 3 + 4 = 10
             assert_eq!(w_int_get_value(s), 10);
         }
@@ -3947,7 +4174,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert_eq!(w_int_get_value(x), 3);
         }
     }
@@ -3959,7 +4186,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert_eq!(w_int_get_value(x), 5);
         }
     }
@@ -3971,8 +4198,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = frame.execute_frame(None, None);
         unsafe {
-            let a = *(*frame.w_globals).get("a").unwrap();
-            let b = *(*frame.w_globals).get("b").unwrap();
+            let a = w_dict_getitem_str(frame.w_globals_obj, "a").unwrap();
+            let b = w_dict_getitem_str(frame.w_globals_obj, "b").unwrap();
             assert_eq!(w_int_get_value(a), 3);
             assert_eq!(w_int_get_value(b), 7);
         }
@@ -3985,7 +4212,7 @@ while i < 3000:
         let source = "x = [1, 2, 3]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert!(is_list(x));
             assert_eq!(w_list_len(x), 3);
             assert_eq!(w_int_get_value(w_list_getitem(x, 0).unwrap()), 1);
@@ -3999,8 +4226,8 @@ while i < 3000:
         let source = "a, b = 1, 2";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let a = *(*frame.w_globals).get("a").unwrap();
-            let b = *(*frame.w_globals).get("b").unwrap();
+            let a = w_dict_getitem_str(frame.w_globals_obj, "a").unwrap();
+            let b = w_dict_getitem_str(frame.w_globals_obj, "b").unwrap();
             assert_eq!(w_int_get_value(a), 1);
             assert_eq!(w_int_get_value(b), 2);
         }
@@ -4011,7 +4238,7 @@ while i < 3000:
         let source = "lst = [10, 20, 30]\nx = lst[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert_eq!(w_int_get_value(x), 20);
         }
     }
@@ -4021,7 +4248,7 @@ while i < 3000:
         let source = "lst = [1, 2, 3]\nlst[0] = 99\nx = lst[0]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert_eq!(w_int_get_value(x), 99);
         }
     }
@@ -4031,7 +4258,7 @@ while i < 3000:
         let source = "d = {1: 10, 2: 20}\nx = d[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = w_dict_getitem_str(frame.w_globals_obj, "x").unwrap();
             assert_eq!(w_int_get_value(x), 10);
         }
     }
@@ -4043,7 +4270,7 @@ while i < 3000:
         let source = "def double(x):\n    return x * 2\nresult = double(21)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -4058,7 +4285,7 @@ def add_squares(a, b):
 result = add_squares(3, 4)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 25);
         }
     }
@@ -4073,7 +4300,7 @@ def factorial(n):
 result = factorial(5)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 120);
         }
     }
@@ -4089,7 +4316,7 @@ f.x = 42
 result = f.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -4104,7 +4331,7 @@ f.b = 20
 result = f.a + f.b";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 30);
         }
     }
@@ -4119,7 +4346,7 @@ f.x = 2
 result = f.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 2);
         }
     }
@@ -4136,7 +4363,7 @@ g.x = 20
 result = f.x + g.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 30);
         }
     }
@@ -4149,7 +4376,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("exec failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result), "1 in [1,2,3] should be True");
         }
     }
@@ -4159,7 +4386,7 @@ result = f.x + g.x";
         let source = "result = 4 not in [1, 2, 3]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -4185,7 +4412,7 @@ result = f.x + g.x";
         let source = "x = 42\nresult = f'val={x}'";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_str_get_value(result), "val=42");
         }
     }
@@ -4196,7 +4423,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.w_globals).get("result").unwrap();
+                let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert!(is_list(result), "slice result should be list");
                 assert_eq!(w_list_len(result), 2);
                 assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
@@ -4238,7 +4465,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("f-string exec failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_str_get_value(result), "10 + 20 = 30");
         }
     }
@@ -4249,7 +4476,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("string contains failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -4260,7 +4487,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("tuple contains failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -4271,7 +4498,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("not in failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -4282,7 +4509,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("is not None failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -4293,7 +4520,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("negative slice failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(is_list(result));
             assert_eq!(w_list_len(result), 3);
         }
@@ -4308,7 +4535,7 @@ result = add(add(1, 2), add(3, 4))";
         let (res, frame) = run_exec_frame(source);
         res.expect("nested call failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 10);
         }
     }
@@ -4325,7 +4552,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         res.expect("while+break failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 5);
         }
     }
@@ -4336,7 +4563,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         res.expect("inplace add failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 15);
         }
     }
@@ -4351,7 +4578,7 @@ for c in 'hello':
         let (res, frame) = run_exec_frame(source);
         res.expect("string iteration failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_str_get_value(result), "hello");
         }
     }
@@ -4367,7 +4594,7 @@ result = count";
         let (res, frame) = run_exec_frame(source);
         res.expect("enumerate style failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -4383,7 +4610,7 @@ for i in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         res.expect("nested for failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             // 1*10 + 1*20 + 2*10 + 2*20 + 3*10 + 3*20 = 10+20+20+40+30+60 = 180
             assert_eq!(w_int_get_value(result), 180);
         }
@@ -4401,7 +4628,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.w_globals).get("result").unwrap();
+                let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_int_get_value(result), 42);
             },
             Err(e) => panic!("try/except failed: {} ({:?})", e.message, e.kind),
@@ -4419,7 +4646,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("fib failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 55);
         }
     }
@@ -4447,7 +4674,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("negative index failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 30);
         }
     }
@@ -4458,7 +4685,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("boolean and failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(!crate::baseobjspace::is_true(r));
         }
     }
@@ -4469,7 +4696,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.w_globals).get("result").unwrap();
+                let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert!(w_bool_get_value(r));
             },
             Err(e) => eprintln!("chained comparison: {}", e.message),
@@ -4488,7 +4715,7 @@ except ZeroDivisionError:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.w_globals).get("result").unwrap();
+                let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_int_get_value(r), 99);
             },
             Err(e) => panic!("specific except failed: {} ({:?})", e.message, e.kind),
@@ -4575,7 +4802,7 @@ finally:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.w_globals).get("result").unwrap();
+                let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_int_get_value(r), 11);
             },
             Err(e) => panic!("try/finally failed: {} ({:?})", e.message, e.kind),
@@ -4595,7 +4822,7 @@ result = result + 10
         let (res, frame) = run_exec_frame(source);
         res.expect("multiple except failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 11);
         }
     }
@@ -4612,7 +4839,7 @@ for x in [1, 2, 3, 4, 5]:
         let (res, frame) = run_exec_frame(source);
         res.expect("for+continue failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             // 1 + 2 + 4 + 5 = 12 (skips 3)
             assert_eq!(w_int_get_value(r), 12);
         }
@@ -4628,7 +4855,7 @@ result = greet('world')
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.w_globals).get("result").unwrap();
+                let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_str_get_value(r), "hello");
             },
             Err(e) => {
@@ -4644,7 +4871,7 @@ result = greet('world')
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.w_globals).get("result").unwrap();
+                let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert!(is_list(result));
                 // After += [3], x should have 3 elements
                 assert_eq!(w_list_len(result), 3);
@@ -4663,7 +4890,7 @@ result = total";
         let (res, frame) = run_exec_frame(source);
         res.expect("for loop failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 15);
         }
     }
@@ -4677,7 +4904,7 @@ for c in 'abc':
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.w_globals).get("result").unwrap();
+                let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_int_get_value(result), 3);
             },
             Err(e) => {
@@ -4693,7 +4920,7 @@ for c in 'abc':
         let (res, frame) = run_exec_frame(source);
         res.expect("multiple assign failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 84);
         }
     }
@@ -4710,7 +4937,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.w_globals).get("result").unwrap();
+                let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert_eq!(w_int_get_value(r), 15);
             },
             Err(e) => panic!("closure failed: {} ({:?})", e.message, e.kind),
@@ -4723,7 +4950,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("tuple unpack failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 6);
         }
     }
@@ -4734,7 +4961,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("dict access failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 30);
         }
     }
@@ -4745,7 +4972,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("string len failed");
         unsafe {
-            let r = *(*frame.w_globals).get("result").unwrap();
+            let r = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(r), 5);
         }
     }
@@ -4795,7 +5022,7 @@ for x in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.w_globals).get("result").unwrap();
+                let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
                 assert!(is_list(result));
                 assert_eq!(w_list_len(result), 3);
                 assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
@@ -4812,7 +5039,7 @@ for x in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         res.expect("globals() failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -4827,7 +5054,7 @@ result = f(2, 3)";
         let (res, frame) = run_exec_frame(source);
         res.expect("locals() in function failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 10);
         }
     }
@@ -4843,7 +5070,7 @@ result = C.snap['y'] + globals()['x']";
         let (res, frame) = run_exec_frame(source);
         res.expect("locals() in class failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -4860,7 +5087,7 @@ result = m(41)";
         let (res, frame) = run_exec_frame(source);
         res.expect("bound method lookup failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -4876,8 +5103,8 @@ m = c.add";
         let (res, frame) = run_exec_frame(source);
         res.expect("bound method lookup setup failed");
         unsafe {
-            let c_obj = *(*frame.w_globals).get("c").unwrap();
-            let m_obj = *(*frame.w_globals).get("m").unwrap();
+            let c_obj = w_dict_getitem_str(frame.w_globals_obj, "c").unwrap();
+            let m_obj = w_dict_getitem_str(frame.w_globals_obj, "m").unwrap();
             assert!(pyre_object::is_method(m_obj));
             assert!(std::ptr::eq(pyre_object::w_method_get_self(m_obj), c_obj));
         }
@@ -4893,7 +5120,7 @@ result = len(xs)";
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin type method lookup failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }
@@ -4908,7 +5135,7 @@ result = c.f([1, 2, 3])";
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin function descriptor semantics failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -4955,12 +5182,12 @@ except AttributeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin_function typedef overrides failed");
         unsafe {
-            let _doc_value = *(*frame.w_globals).get("doc_value").unwrap();
-            let self_is_none = *(*frame.w_globals).get("self_is_none").unwrap();
-            let repr_result = *(*frame.w_globals).get("repr_result").unwrap();
-            let new_err = *(*frame.w_globals).get("new_err").unwrap();
-            let set_err = *(*frame.w_globals).get("set_err").unwrap();
-            let del_err = *(*frame.w_globals).get("del_err").unwrap();
+            let _doc_value = w_dict_getitem_str(frame.w_globals_obj, "doc_value").unwrap();
+            let self_is_none = w_dict_getitem_str(frame.w_globals_obj, "self_is_none").unwrap();
+            let repr_result = w_dict_getitem_str(frame.w_globals_obj, "repr_result").unwrap();
+            let new_err = w_dict_getitem_str(frame.w_globals_obj, "new_err").unwrap();
+            let set_err = w_dict_getitem_str(frame.w_globals_obj, "set_err").unwrap();
+            let del_err = w_dict_getitem_str(frame.w_globals_obj, "del_err").unwrap();
             assert!(w_bool_get_value(self_is_none));
             assert_eq!(w_str_get_value(repr_result), "<built-in function len>");
             assert_eq!(
@@ -4994,9 +5221,9 @@ manual_result = len(manual)";
         let (res, frame) = run_exec_frame(source);
         res.expect("set constructor parity failed");
         unsafe {
-            let is_subtype = *(*frame.w_globals).get("is_subtype").unwrap();
-            let result = *(*frame.w_globals).get("result").unwrap();
-            let manual_result = *(*frame.w_globals).get("manual_result").unwrap();
+            let is_subtype = w_dict_getitem_str(frame.w_globals_obj, "is_subtype").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
+            let manual_result = w_dict_getitem_str(frame.w_globals_obj, "manual_result").unwrap();
             assert!(w_bool_get_value(is_subtype));
             assert_eq!(w_int_get_value(result), 3);
             assert_eq!(w_int_get_value(manual_result), 2);
@@ -5016,9 +5243,9 @@ result = len(sub)";
         let (res, frame) = run_exec_frame(source);
         res.expect("frozenset constructor parity failed");
         unsafe {
-            let same = *(*frame.w_globals).get("same").unwrap();
-            let is_subtype = *(*frame.w_globals).get("is_subtype").unwrap();
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let same = w_dict_getitem_str(frame.w_globals_obj, "same").unwrap();
+            let is_subtype = w_dict_getitem_str(frame.w_globals_obj, "is_subtype").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert!(w_bool_get_value(same));
             assert!(w_bool_get_value(is_subtype));
             assert_eq!(w_int_get_value(result), 3);
@@ -5064,10 +5291,11 @@ except TypeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("set/frozenset arity enforcement failed");
         unsafe {
-            let init_err = *(*frame.w_globals).get("init_err").unwrap();
-            let init_direct_err = *(*frame.w_globals).get("init_direct_err").unwrap();
-            let frozen_err = *(*frame.w_globals).get("frozen_err").unwrap();
-            let frozen_new_err = *(*frame.w_globals).get("frozen_new_err").unwrap();
+            let init_err = w_dict_getitem_str(frame.w_globals_obj, "init_err").unwrap();
+            let init_direct_err =
+                w_dict_getitem_str(frame.w_globals_obj, "init_direct_err").unwrap();
+            let frozen_err = w_dict_getitem_str(frame.w_globals_obj, "frozen_err").unwrap();
+            let frozen_new_err = w_dict_getitem_str(frame.w_globals_obj, "frozen_new_err").unwrap();
             assert!(
                 !w_str_get_value(init_err).is_empty(),
                 "set([1], 2) should raise TypeError"
@@ -5115,8 +5343,8 @@ except TypeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("layout safety check failed");
         unsafe {
-            let err = *(*frame.w_globals).get("err").unwrap();
-            let frozen_err = *(*frame.w_globals).get("frozen_err").unwrap();
+            let err = w_dict_getitem_str(frame.w_globals_obj, "err").unwrap();
+            let frozen_err = w_dict_getitem_str(frame.w_globals_obj, "frozen_err").unwrap();
             assert!(
                 !w_str_get_value(err).is_empty(),
                 "set.__new__(int) should raise TypeError"
@@ -5140,8 +5368,8 @@ bound = C.pick
 result = bound()";
         let (res, frame) = run_exec_frame(source);
         res.expect("metaclass descriptor lookup failed");
-        let result = unsafe { *(*frame.w_globals).get("result").unwrap() };
-        let c_obj = unsafe { *(*frame.w_globals).get("C").unwrap() };
+        let result = unsafe { w_dict_getitem_str(frame.w_globals_obj, "result").unwrap() };
+        let c_obj = unsafe { w_dict_getitem_str(frame.w_globals_obj, "C").unwrap() };
         assert!(std::ptr::eq(result, c_obj));
     }
 
@@ -5158,7 +5386,7 @@ result = C.value";
         let (res, frame) = run_exec_frame(source);
         res.expect("__prepare__ lookup failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -5173,8 +5401,8 @@ g = f.__globals__
 code = f.__code__";
         let (res, frame) = run_exec_frame(source);
         res.expect("function dunder lookup failed");
-        let globals = unsafe { *(*frame.w_globals).get("g").unwrap() };
-        let code = unsafe { *(*frame.w_globals).get("code").unwrap() };
+        let globals = unsafe { w_dict_getitem_str(frame.w_globals_obj, "g").unwrap() };
+        let code = unsafe { w_dict_getitem_str(frame.w_globals_obj, "code").unwrap() };
         unsafe {
             let x = pyre_object::w_dict_lookup(globals, pyre_object::w_str_new("x")).unwrap();
             assert_eq!(w_int_get_value(x), 7);
@@ -5201,7 +5429,7 @@ except TypeError:
         let (res, frame) = run_exec_frame(source);
         res.expect("vars() exception path failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }
@@ -5217,7 +5445,7 @@ except TypeError:
         let (res, frame) = run_exec_frame(source);
         res.expect("type() exception path failed");
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = w_dict_getitem_str(frame.w_globals_obj, "result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }

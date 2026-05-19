@@ -184,7 +184,7 @@ pub fn dict_view_iterator_type_for_kind(kind: DictViewKind) -> &'static PyType {
 /// Mirrors `dictmultiobject.py:807-822 W_BaseIteratorImplementation` —
 /// `self.len = w_dict.length()` set at iter() time.
 pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
-    let startlen = unsafe { crate::dictobject::w_dict_len(w_dict) };
+    let startlen = unsafe { crate::dictmultiobject::w_dict_len(w_dict) };
     let tp = dict_view_iterator_type_for_kind(kind);
     crate::lltype::malloc_typed(W_DictViewIterator {
         ob_header: PyObject {

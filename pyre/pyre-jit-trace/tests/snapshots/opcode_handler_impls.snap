@@ -636,20 +636,41 @@ impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
 }
 
 impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
-    fn load_name_value(&mut self, name: &str) -> Result<Self::Value, pyre_interpreter::PyError> {
+    fn load_name_value(
+        &mut self,
+        name: &str,
+        _nameindex: usize,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let ns = self.sym().concrete_namespace;
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
+            let frame = self.trace_frame();
             let globals = self.trace_globals_ptr();
             let opref = self.with_trace_ctx(|ctx| {
-                crate::helpers::emit_trace_load_name_from_namespace(ctx, globals, name)
+                crate::helpers::emit_trace_load_name_from_namespace(ctx, frame, globals, name)
             });
+            // `pyopcode.py:958-967 _load_global`: concrete value at
+            // trace time must mirror the extern's full fallback chain
+            // — globals first, then frame.get_builtin().getdictvalue.
+            // Reading `dict_storage_get(ns, name)` alone produces a
+            // null concrete for any builtin hit, which would let
+            // downstream record_known_result mis-fold the result.
             let result_concrete = if ns.is_null() {
                 crate::state::ConcreteValue::Null
             } else {
                 unsafe {
-                    let obj = pyre_interpreter::dict_storage_get(&*ns, name)
+                    let mut obj = pyre_interpreter::dict_storage_get(&*ns, name)
                         .unwrap_or(std::ptr::null_mut());
+                    if obj.is_null() {
+                        let frame_ptr = self.concrete_frame_addr as i64;
+                        let name_bytes = name.as_bytes();
+                        obj = crate::helpers::jit_load_name_from_namespace(
+                            frame_ptr,
+                            ns as i64,
+                            name_bytes.as_ptr() as i64,
+                            name_bytes.len() as i64,
+                        ) as pyre_object::PyObjectRef;
+                    }
                     crate::state::ConcreteValue::from_pyobj(obj)
                 }
             };
@@ -692,6 +713,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
     fn store_name_value(
         &mut self,
         name: &str,
+        _nameindex: usize,
         value: Self::Value,
     ) -> Result<(), pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;

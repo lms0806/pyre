@@ -1037,19 +1037,21 @@ pub fn register_build_class() {
 pub fn install_dict_storage_hooks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        pyre_object::dictobject::register_dict_storage_store_hook(|ns_ptr, name, value| unsafe {
-            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-            crate::dict_storage_store(ns, name, value);
-        });
-        pyre_object::dictobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
+        pyre_object::dictmultiobject::register_dict_storage_store_hook(
+            |ns_ptr, name, value| unsafe {
+                let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+                crate::dict_storage_store(ns, name, value);
+            },
+        );
+        pyre_object::dictmultiobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
             let ns = &mut *(ns_ptr as *mut crate::DictStorage);
             ns.remove(name);
         });
-        pyre_object::dictobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
+        pyre_object::dictmultiobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
             let ns = &*(ns_ptr as *const crate::DictStorage);
             crate::dict_storage_get(ns, name)
         });
-        pyre_object::dictobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
+        pyre_object::dictmultiobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
             let ns = &*(ns_ptr as *const crate::DictStorage);
             ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
         });
@@ -1466,11 +1468,13 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         {
             let w_metaclass =
                 unsafe { pyre_object::w_dict_lookup(last, pyre_object::w_str_new("metaclass")) };
-            // Collect extra kwargs (not metaclass, not __pyre_kw__)
+            // Collect extra kwargs (not metaclass, not __pyre_kw__).
+            // `w_dict_items` already dispatches `is_module_dict` so a
+            // class statement with `**module_dict` (rare but valid)
+            // walks the strategy.
             let extra = pyre_object::w_dict_new();
             unsafe {
-                let d = &*(last as *const pyre_object::dictobject::W_DictObject);
-                for &(k, v) in &*d.entries {
+                for (k, v) in pyre_object::w_dict_items(last) {
                     if pyre_object::is_str(k) {
                         let key = pyre_object::w_str_get_value(k);
                         if key != "metaclass" && key != "__pyre_kw__" {
@@ -1558,12 +1562,14 @@ fn build_class_inner(
     // __prepare__ may return a dict subclass (e.g. EnumDict).
     // dict subclass instances created by w_instance_new store entries in
     // ATTR_TABLE, not in W_DictObject.entries. We handle both cases.
+    // `w_dict_items` dispatches through `is_module_dict`, so the
+    // rare `__prepare__` returning a W_ModuleDictObject still walks
+    // correctly.  Both branches share the same shape; collapse them
+    // around the dispatching surface.
     let mut class_ns = Box::new(DictStorage::new());
     if let Some(w_prepared_dict) = w_namespace {
         if unsafe { pyre_object::is_dict(w_prepared_dict) } {
-            let dict =
-                unsafe { &*(w_prepared_dict as *const pyre_object::dictobject::W_DictObject) };
-            for &(key, value) in unsafe { &*dict.entries } {
+            for (key, value) in unsafe { pyre_object::w_dict_items(w_prepared_dict) } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
                     crate::dict_storage_store(
                         &mut class_ns,
@@ -1577,8 +1583,7 @@ fn build_class_inner(
         if unsafe { pyre_object::is_instance(w_prepared_dict) } {
             let backing = crate::type_methods::resolve_dict_backing(w_prepared_dict);
             if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
-                let dict = unsafe { &*(backing as *const pyre_object::dictobject::W_DictObject) };
-                for &(key, value) in unsafe { &*dict.entries } {
+                for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
                     if !value.is_null() && unsafe { pyre_object::is_str(key) } {
                         crate::dict_storage_store(
                             &mut class_ns,

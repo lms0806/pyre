@@ -189,28 +189,51 @@ pub trait LocalOpcodeHandler: SharedOpcodeHandler {
 }
 
 pub trait NamespaceOpcodeHandler: SharedOpcodeHandler {
-    fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError>;
-    fn load_name_checked_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
-        let value = self.load_name_value(name)?;
+    /// `pyopcode.py:559 LOAD_NAME` / `:561 LOAD_GLOBAL` — `nameindex`
+    /// is the `co_names` index decoded from the bytecode operand,
+    /// passed through so `pycode._globals_caches[nameindex]`
+    /// (`celldict.py:292`) can be consulted without re-resolving from
+    /// `name`.  PyFrame uses it; JIT trace `MIFrame` ignores it.
+    fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError>;
+    fn load_name_checked_value(
+        &mut self,
+        name: &str,
+        nameindex: usize,
+    ) -> Result<Self::Value, PyError> {
+        let value = self.load_name_value(name, nameindex)?;
         self.guard_nonnull_value(value)?;
         Ok(value)
     }
-    fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError>;
+    fn store_name_value(
+        &mut self,
+        name: &str,
+        nameindex: usize,
+        value: Self::Value,
+    ) -> Result<(), PyError>;
     /// PyPy STORE_GLOBAL writes to `w_globals` (`pyopcode.py:567 STORE_GLOBAL`).
     /// Default mirrors STORE_NAME so implementations that conflate the two
     /// namespaces (e.g. JIT trace `MIFrame`) keep their existing behaviour;
     /// PyFrame overrides to bypass `w_locals` and write directly to globals.
-    fn store_global_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
-        self.store_name_value(name, value)
+    fn store_global_value(
+        &mut self,
+        name: &str,
+        nameindex: usize,
+        value: Self::Value,
+    ) -> Result<(), PyError> {
+        self.store_name_value(name, nameindex, value)
     }
     /// PyPy LOAD_GLOBAL skips `w_locals` (`pyopcode.py:558 LOAD_GLOBAL`).
     /// Default mirrors LOAD_NAME for the conflating implementations;
     /// PyFrame overrides to read from `w_globals` only.
-    fn load_global_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
-        self.load_name_value(name)
+    fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
+        self.load_name_value(name, nameindex)
     }
-    fn load_global_checked_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
-        let value = self.load_global_value(name)?;
+    fn load_global_checked_value(
+        &mut self,
+        name: &str,
+        nameindex: usize,
+    ) -> Result<Self::Value, PyError> {
+        let value = self.load_global_value(name, nameindex)?;
         self.guard_nonnull_value(value)?;
         Ok(value)
     }
@@ -488,9 +511,10 @@ pub fn opcode_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
 pub fn opcode_store_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
+    nameindex: usize,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
-    handler.store_name_value(name, value)
+    handler.store_name_value(name, nameindex, value)
 }
 
 /// pypy/interpreter/pyopcode.py:567 STORE_GLOBAL — writes the TOS into
@@ -498,25 +522,28 @@ pub fn opcode_store_name<H: NamespaceOpcodeHandler + ?Sized>(
 pub fn opcode_store_global<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
+    nameindex: usize,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
-    handler.store_global_value(name, value)
+    handler.store_global_value(name, nameindex, value)
 }
 
 pub fn opcode_load_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
+    nameindex: usize,
 ) -> Result<(), PyError> {
-    let value = handler.load_name_checked_value(name)?;
+    let value = handler.load_name_checked_value(name, nameindex)?;
     handler.push_value(value)
 }
 
 pub fn opcode_load_global<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
+    nameindex: usize,
     push_null: bool,
 ) -> Result<(), PyError> {
-    let value = handler.load_global_checked_value(name)?;
+    let value = handler.load_global_checked_value(name, nameindex)?;
     handler.push_value(value)?;
     if push_null {
         let null = handler.null_value()?;
@@ -744,32 +771,37 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_store_fast_store_fast(self, idx1, idx2).map_err(Into::into)
     }
 
-    fn store_name(&mut self, name: &str) -> Result<(), Self::Error>
+    fn store_name(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_store_name(self, name).map_err(Into::into)
+        opcode_store_name(self, name, nameindex).map_err(Into::into)
     }
 
-    fn store_global(&mut self, name: &str) -> Result<(), Self::Error>
+    fn store_global(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_store_global(self, name).map_err(Into::into)
+        opcode_store_global(self, name, nameindex).map_err(Into::into)
     }
 
-    fn load_name(&mut self, name: &str) -> Result<(), Self::Error>
+    fn load_name(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_load_name(self, name).map_err(Into::into)
+        opcode_load_name(self, name, nameindex).map_err(Into::into)
     }
 
-    fn load_global(&mut self, name: &str, push_null: bool) -> Result<(), Self::Error>
+    fn load_global(
+        &mut self,
+        name: &str,
+        nameindex: usize,
+        push_null: bool,
+    ) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_load_global(self, name, push_null).map_err(Into::into)
+        opcode_load_global(self, name, nameindex, push_null).map_err(Into::into)
     }
 
     fn pop_top(&mut self) -> Result<(), Self::Error>
@@ -1507,19 +1539,19 @@ where
 
         Instruction::StoreName { namei } => {
             let idx = u32_as_usize(namei.get(op_arg));
-            executor.store_name(code.names[idx].as_ref())?;
+            executor.store_name(code.names[idx].as_ref(), idx)?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreGlobal { namei } => {
             let idx = u32_as_usize(namei.get(op_arg));
-            executor.store_global(code.names[idx].as_ref())?;
+            executor.store_global(code.names[idx].as_ref(), idx)?;
             Ok(StepResult::Continue)
         }
 
         Instruction::LoadName { namei } => {
             let idx = u32_as_usize(namei.get(op_arg));
-            executor.load_name(code.names[idx].as_ref())?;
+            executor.load_name(code.names[idx].as_ref(), idx)?;
             Ok(StepResult::Continue)
         }
 
@@ -1527,7 +1559,7 @@ where
             let raw = u32_as_usize(namei.get(op_arg));
             let name_idx = raw >> 1;
             let push_null = (raw & 1) != 0;
-            executor.load_global(code.names[name_idx].as_ref(), push_null)?;
+            executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
             Ok(StepResult::Continue)
         }
 

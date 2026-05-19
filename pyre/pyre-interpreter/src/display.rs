@@ -149,11 +149,16 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             } else {
                 format!("({})", parts.join(", "))
             }
-        } else if std::ptr::eq(tp, &pyre_object::pyobject::DICT_TYPE as *const PyType) {
-            let d = &*(obj as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*d.entries;
+        } else if unsafe { pyre_object::is_dict(obj) } {
+            // `pypy/objspace/std/dictmultiobject.py:130-150 descr_repr`
+            // iterates `self.iteritems()`, which dispatches to the
+            // strategy on both `W_DictObject` and `W_ModuleDictObject`.
+            // `w_dict_items` already routes through `is_module_dict`,
+            // so reach for the unified surface instead of casting
+            // through the W_DictObject layout.
+            let entries = pyre_object::w_dict_items(obj);
             let mut parts = Vec::with_capacity(entries.len());
-            for &(k, v) in entries {
+            for (k, v) in entries {
                 parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
             }
             format!("{{{}}}", parts.join(", "))

@@ -1,0 +1,1915 @@
+//! W_DictMultiObject family — Python `dict` types.
+//!
+//! PyPy equivalent: `pypy/objspace/std/dictmultiobject.py`.
+//!
+//! Hosts the `W_DictMultiObject` Rust trait + concrete subclasses
+//! `W_DictObject` (regular dict, `:313-325`) and `W_ModuleDictObject`
+//! (module / globals dict backed by `ModuleDictStrategy` per
+//! `pypy/objspace/std/celldict.py:28`).  The Phase 5 cutover lifted
+//! pyre's `DictStorage`-based module-dict path out of
+//! `pyre-interpreter/executioncontext.rs` and into a sibling
+//! `celldict.rs` so the upstream strategy-per-W_Root model holds.
+//!
+//! Supports arbitrary PyObjectRef keys (int, str, etc.) with
+//! equality comparison via `dict_keys_equal` (routed through the
+//! `dict_eq_hook::EQ_W_HOOK` trampoline → `baseobjspace::eq_w`).
+//!
+//! ## Phase C-3 strategy dispatch status
+//!
+//! All eight W_DictMultiObject accessors route through
+//! `w_dict_get_strategy(obj).method(obj, ...)` polymorphic dispatch
+//! (PyPy's `w_dict.get_strategy().method(w_dict, ...)` shape):
+//!
+//! - `w_dict_setitem_str` → `dictmultiobject.py:111-112`
+//! - `w_dict_getitem_str` → `:103-105`
+//! - `w_dict_clear` → `:148-152` (`descr_clear`)
+//! - `w_dict_items` → `:117-121`
+//! - `w_dict_store` → `:97-99 setitem`
+//! - `w_dict_lookup` → `:93-95 getitem`
+//! - `w_dict_delitem` → `:101-102`
+//! - `w_dict_len` → `:107-109 length`
+//!
+//! ## Phase C field-deletion status (PRE-EXISTING-ADAPTATION queue)
+//!
+//! - `W_DictObject.len` field: JIT inline-length cache via
+//!   `DICT_LEN_OFFSET`.  PyPy delegates to `strategy.length(self)`
+//!   per `dictmultiobject.py:107-109`; pyre's strategy already
+//!   consults this slot, so retiring the field means moving the
+//!   counter to the strategy-side storage and updating the
+//!   `DICT_LEN_OFFSET` consumers in `pyre-jit-trace`.
+//!
+//! - `W_DictObject.dict_storage_proxy` + `W_ModuleDictObject.dict_storage_proxy`:
+//!   NEW-DEVIATION back-mirror pointers to a legacy `DictStorage`.
+//!   Retirement gated on the `PyFrame.w_globals` migration from
+//!   `*mut DictStorage` to `PyObjectRef` (Phase C-1).  Once frames
+//!   use W_DictObject directly, no back-mirror is needed.
+//!
+//! - `pyre-interpreter::DictStorage` struct: legacy str-keyed
+//!   storage carried by `PyFrame.w_globals`.  Final retirement
+//!   depends on the above two items.
+
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use crate::pyobject::*;
+
+/// `pypy/objspace/std/dictmultiobject.py:45-53 W_DictMultiObject(W_Root)`
+/// abstract base — both `W_DictObject` (regular dicts) and
+/// `W_ModuleDictObject` (module/global dicts) inherit from it.
+///
+/// ```python
+/// class W_DictMultiObject(W_Root):
+///     """ Abstract base class that does not store a strategy. """
+///     __slots__ = ['space', 'dstorage']
+///
+///     def get_strategy(self):
+///         raise NotImplementedError("abstract method")
+///
+///     def set_strategy(self, strategy):
+///         raise NotImplementedError("abstract method")
+/// ```
+///
+/// Pyre's `space` field is implicit (no `ObjSpace` shim per-dict);
+/// `dstorage` lives on each concrete subclass as the appropriate type
+/// (`*mut Vec<(PyObjectRef, PyObjectRef)>` for W_DictObject,
+/// `*mut ModuleDictStorage` for W_ModuleDictObject).  The trait
+/// surfaces the abstract `get_strategy` / `set_strategy` for static
+/// trait-dispatch sites; runtime polymorphic dispatch (i.e. when only
+/// a `PyObjectRef` is in hand) goes through the free function
+/// [`w_dict_get_strategy`].
+pub trait W_DictMultiObject {
+    /// `dictmultiobject.py:49-50 W_DictMultiObject.get_strategy`
+    /// abstract method, overridden by `W_DictObject` (`:321-322`) and
+    /// `W_ModuleDictObject` (`:338-339`).  Each concrete subclass
+    /// returns its strategy slot.
+    fn get_strategy(&self) -> &dyn crate::dictstrategy::DictStrategy;
+
+    /// `dictmultiobject.py:52-53 W_DictMultiObject.set_strategy`
+    /// abstract method, overridden by `W_DictObject` (`:324-325`) and
+    /// `W_ModuleDictObject` (`:341-342`).  Pyre limits the setter to
+    /// `&'static dyn DictStrategy` (the singleton dispatch surface);
+    /// W_ModuleDictObject strategy promotion to ObjectDictStrategy
+    /// continues to go through `w_module_dict_switch_to_object_strategy`
+    /// per `celldict.py:173-186`.
+    fn set_strategy(&mut self, strategy: &'static dyn crate::dictstrategy::DictStrategy);
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:313-325 W_DictObject(W_DictMultiObject)`
+/// — the regular-dict concrete subclass.  PyPy slots are
+/// `['dstrategy']` on top of W_DictMultiObject's `['space', 'dstorage']`;
+/// pyre carries the same logical slots plus pre-existing-adaptations
+/// for the legacy DictStorage bridge.
+///
+/// Layout: `[ob_header | dstorage | len | dict_storage_proxy | dstrategy]`
+///
+/// Slots:
+/// - `dstorage`: erased ObjectDictStrategy storage —
+///   `Vec<(PyObjectRef, PyObjectRef)>` matches PyPy's
+///   `r_dict(space.eq_w, space.hash_w)` storage (`:1209-1212`).  Keys
+///   compared by `dict_keys_equal` which routes through the registered
+///   `dict_eq_hook::EQ_W_HOOK` trampoline → `baseobjspace::eq_w`.
+/// - `len`: NEW-DEVIATION JIT inline-length cache so `bool(dict)` and
+///   `len(dict)` lower to a single field-load via `DICT_LEN_OFFSET`.
+///   PyPy delegates length to `strategy.length(self)`; pyre's cache
+///   keeps the strategy method correct (it reads this slot) but the
+///   field itself is not in upstream and would be retired alongside
+///   `dict_storage_proxy` once the JIT field-load can target a
+///   strategy-side counter.
+/// - `dict_storage_proxy`: NEW-DEVIATION back-mirror pointer to a
+///   legacy `DictStorage` allocation.  Non-null only when a frame's
+///   `w_globals` (or a module's `w_dict`) was constructed from raw
+///   `DictStorage` and lifted via `dict_storage_to_dict`; mutations
+///   then fan out to the storage as well as the local `dstorage`.
+///   Retirement is gated on the PyFrame.w_globals migration (Phase
+///   C-1) — once `PyFrame.w_globals` is `PyObjectRef` directly, no
+///   storage-side mirror is needed.
+/// - `dstrategy`: PyPy `:315 __slots__ = ['dstrategy']`.  Reference
+///   to the active strategy singleton; `space.fromcache(StrategyCls)`
+///   returns the same instance per space, so pyre stores a `&'static
+///   dyn DictStrategy` (fat pointer).  New dicts start in
+///   `OBJECT_DICT_STRATEGY`; promotion is `w_dict_set_strategy`
+///   per `:324-325 set_strategy`.
+#[repr(C)]
+pub struct W_DictObject {
+    pub ob_header: PyObject,
+    /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py:47`).
+    /// Erased ObjectDictStrategy storage — pyre uses
+    /// `Vec<(PyObjectRef, PyObjectRef)>` matching PyPy's
+    /// `r_dict(space.eq_w, space.hash_w)` shape per `:1209-1212`.
+    pub dstorage: *mut Vec<(PyObjectRef, PyObjectRef)>,
+    pub len: usize,
+    pub dict_storage_proxy: *mut u8,
+    pub dstrategy: &'static dyn crate::dictstrategy::DictStrategy,
+}
+
+/// Field offset of `len` within `W_DictObject`, for JIT field access.
+pub const DICT_LEN_OFFSET: usize = std::mem::offset_of!(W_DictObject, len);
+
+/// GC type id assigned to `W_DictObject` at JitDriver init time.
+pub const W_DICT_GC_TYPE_ID: u32 = 29;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_DictObject>();
+
+impl crate::lltype::GcType for W_DictObject {
+    const TYPE_ID: u32 = W_DICT_GC_TYPE_ID;
+    const SIZE: usize = W_DICT_OBJECT_SIZE;
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:313-325 W_DictObject(W_DictMultiObject)`
+/// inheritance — `get_strategy`/`set_strategy` overrides read/write
+/// the `dstrategy` slot directly.
+impl W_DictMultiObject for W_DictObject {
+    #[inline]
+    fn get_strategy(&self) -> &dyn crate::dictstrategy::DictStrategy {
+        self.dstrategy
+    }
+
+    #[inline]
+    fn set_strategy(&mut self, strategy: &'static dyn crate::dictstrategy::DictStrategy) {
+        self.dstrategy = strategy;
+    }
+}
+
+#[inline]
+fn dict_write_barrier(obj: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:321-322 W_DictObject.get_strategy`
+/// (the regular-dict subclass returns its `dstrategy` slot directly).
+///
+/// `pypy/objspace/std/dictmultiobject.py:49-50 W_DictMultiObject.get_strategy`
+/// abstract method, overridden by `W_DictObject` (`:321-322`) and
+/// `W_ModuleDictObject` (`:338-339`).  Polymorphic dispatch: returns
+/// the strategy live in the dict's slot — `dstrategy` for regular
+/// dicts (currently always `OBJECT_DICT_STRATEGY`), or `mstrategy`
+/// (the per-allocation `ModuleDictStrategy`) for module dicts.
+///
+/// The `&'static` lifetime is sound because pyre's strategy
+/// allocations (`malloc_raw` + `Box::leak` pattern for
+/// `ModuleDictStrategy`) live for the program duration, matching the
+/// strategy-singleton model of PyPy `space.fromcache(StrategyCls)`.
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
+/// `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_dict_get_strategy(
+    obj: PyObjectRef,
+) -> &'static dyn crate::dictstrategy::DictStrategy {
+    if is_module_dict(obj) {
+        let strat_ptr = (*(obj as *const W_ModuleDictObject)).mstrategy;
+        return &*strat_ptr;
+    }
+    let dict = &*(obj as *const W_DictObject);
+    dict.dstrategy
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:52-53 W_DictMultiObject.set_strategy`
+/// abstract method, overridden by `W_DictObject` (`:324-325`) and
+/// `W_ModuleDictObject` (`:341-342`).  Polymorphic dispatch: writes
+/// the strategy slot of whichever subclass `obj` points to.
+///
+/// W_ModuleDictObject's `mstrategy` slot is typed `*mut
+/// ModuleDictStrategy` (concrete) rather than `&'static dyn
+/// DictStrategy` (erased); the panic here mirrors
+/// `<W_ModuleDictObject as W_DictMultiObject>::set_strategy` —
+/// pyre's promotion path is `w_module_dict_switch_to_object_strategy`
+/// per `celldict.py:173-186`, not a direct mstrategy swap, so this
+/// gateway only ever sees regular W_DictObjects today.
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
+/// `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_dict_set_strategy(
+    obj: PyObjectRef,
+    strategy: &'static dyn crate::dictstrategy::DictStrategy,
+) {
+    if is_module_dict(obj) {
+        panic!(
+            "w_dict_set_strategy: W_ModuleDictObject strategy swap is not the canonical \
+             path; use w_module_dict_switch_to_object_strategy (celldict.py:173-186)"
+        );
+    }
+    let dict = &mut *(obj as *mut W_DictObject);
+    dict.dstrategy = strategy;
+}
+
+/// Allocate a new empty dict.
+pub fn w_dict_new() -> PyObjectRef {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    alloc_dict_object(
+        W_DictObject {
+            ob_header: PyObject {
+                ob_type: &DICT_TYPE as *const PyType,
+                w_class: get_instantiate(&DICT_TYPE),
+            },
+            dstorage: entries,
+            len: 0,
+            dict_storage_proxy: std::ptr::null_mut(),
+            dstrategy: &crate::dictstrategy::OBJECT_DICT_STRATEGY,
+        },
+        false,
+    )
+}
+
+/// Allocate a dict for a pyre-side address-keyed side table.
+///
+/// These tables are not part of the translated object graph yet, so the dict
+/// holder itself must keep a stable raw address. The table walker traces the
+/// entries through [`w_dict_walk_entries_mut`] instead.
+pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    crate::lltype::malloc_typed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_TYPE),
+        },
+        dstorage: entries,
+        len: 0,
+        dict_storage_proxy: std::ptr::null_mut(),
+        dstrategy: &crate::dictstrategy::OBJECT_DICT_STRATEGY,
+    }) as PyObjectRef
+}
+
+/// Visit the raw `entries` vector's key/value slots with mutable access.
+///
+/// Used by pyre-side side table walkers whose dict object is not itself
+/// GC-managed but whose contained PyObjectRef values still need relocation.
+pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    for (key, value) in entries.iter_mut() {
+        visitor(key);
+        visitor(value);
+    }
+}
+
+/// Allocate a dict backed by a `DictStorage` (for `globals()` and similar
+/// live dict views). Mutations to this dict also update the backing storage.
+pub fn w_dict_new_with_dict_storage(ns: *mut u8) -> PyObjectRef {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    alloc_dict_object(
+        W_DictObject {
+            ob_header: PyObject {
+                ob_type: &DICT_TYPE as *const PyType,
+                w_class: get_instantiate(&DICT_TYPE),
+            },
+            dstorage: entries,
+            len: 0,
+            dict_storage_proxy: ns,
+            dstrategy: &crate::dictstrategy::OBJECT_DICT_STRATEGY,
+        },
+        true,
+    )
+}
+
+fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+    } else {
+        crate::gc_hook::try_gc_alloc(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+    };
+    match raw.filter(|p| !p.is_null()) {
+        Some(raw) => unsafe {
+            std::ptr::write(raw as *mut W_DictObject, value);
+            raw as PyObjectRef
+        },
+        None => crate::lltype::malloc_typed(value) as PyObjectRef,
+    }
+}
+
+// ── W_ModuleDictObject ──────────────────────────────────────────────
+//
+// `pypy/objspace/std/dictmultiobject.py:328-350 W_ModuleDictObject`:
+//
+//     class W_ModuleDictObject(W_DictMultiObject):
+//         """ a dict object for a module, that is not expected to
+//         change. It stores the strategy as a quasi-immutable
+//         field. """
+//         __slots__ = ['mstrategy']
+//         _immutable_fields_ = ['mstrategy?']
+//
+//         def __init__(self, space, strategy, storage):
+//             W_DictMultiObject.__init__(self, space, storage)
+//             self.mstrategy = strategy
+//
+//         def get_strategy(self):
+//             return self.mstrategy
+//
+//         def set_strategy(self, strategy):
+//             self.mstrategy = strategy
+//
+// Carries an owned `ModuleDictStorage` and a per-allocation
+// `ModuleDictStrategy` (PyPy reuses one strategy instance per space;
+// pyre allocates one strategy per W_ModuleDictObject for simplicity
+// until the `space` shim grows a strategy cache).
+
+/// Static `PyType` tag for `W_ModuleDictObject`.  Distinct from
+/// `DICT_TYPE` so `py_type_check` can tell module dicts apart from
+/// regular dicts inside the Rust runtime — but PyPy presents both as
+/// `space.w_dict` to user code (`dictmultiobject.py:67
+/// allocate_instance(W_ModuleDictObject, space.w_dict)`).  The
+/// `TYPEOBJECT_CACHE` registration at
+/// `pyre-interpreter/typedef.rs:300-303` maps `MODULE_DICT_TYPE` to
+/// the same `dict` W_TypeObject as `DICT_TYPE`, so `type(g) is dict`
+/// and `isinstance(g, dict)` hold on `W_ModuleDictObject` instances
+/// even though they carry a different Rust layout / GC type id.
+pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
+
+#[repr(C)]
+pub struct W_ModuleDictObject {
+    pub ob_header: PyObject,
+    /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py:47`).
+    /// Owned via `malloc_raw` (`Box::into_raw`).  Authoritative while
+    /// `object_storage` is null (ModuleDictStrategy mode); after
+    /// `switch_to_object_strategy` it is cleared and not consulted.
+    pub dstorage: *mut crate::celldict::ModuleDictStorage,
+    /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
+    /// Owned via `malloc_raw`.
+    pub mstrategy: *mut crate::celldict::ModuleDictStrategy,
+    /// `dstorage` after a `switch_to_object_strategy`
+    /// (`celldict.py:173-186`).  Null while the dict is in
+    /// ModuleDictStrategy mode; non-null once a non-str key forces the
+    /// strategy swap.  The single Vec holds the unified (PyObjectRef,
+    /// PyObjectRef) entries that PyPy keeps inside the new
+    /// `ObjectDictStrategy` storage after the switch — `dstorage`'s
+    /// entries are drained into this Vec in their original insertion
+    /// order so `items()` / `popitem()` LIFO parity is preserved
+    /// across mixed-key inserts.
+    pub object_storage: *mut Vec<(PyObjectRef, PyObjectRef)>,
+    /// Optional sibling-storage mirror.  When non-null, every
+    /// `w_module_dict_*` write fans out to this `DictStorage` via
+    /// `maybe_sync_dict_storage_*` hooks; reads fall back here on a
+    /// local miss.  Used by `dict_storage_to_dict` so the frame-side
+    /// `*mut DictStorage`-typed `PyFrame.w_globals` continues to
+    /// observe `STORE_GLOBAL` and `module.__dict__[k] = v` writes
+    /// uniformly.  PRE-EXISTING-ADAPTATION until Phase 5e migrates
+    /// `PyFrame.w_globals` to `PyObjectRef`; mirrors the
+    /// `dict_storage_proxy` pattern on W_DictObject (line 35).
+    pub dict_storage_proxy: *mut u8,
+}
+
+/// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
+/// the first free id after the foreign-pytype loop in
+/// `pyre/pyre-jit/src/eval.rs` registers NONE_TYPE (43),
+/// NOTIMPLEMENTED_TYPE (44), ELLIPSIS_TYPE (45), CODE_TYPE (46)
+/// and PYTRACEBACK_TYPE (47).
+pub const W_MODULE_DICT_GC_TYPE_ID: u32 = 48;
+
+/// Fixed payload size used by `gct_fv_gc_malloc`.
+pub const W_MODULE_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleDictObject>();
+
+impl crate::lltype::GcType for W_ModuleDictObject {
+    const TYPE_ID: u32 = W_MODULE_DICT_GC_TYPE_ID;
+    const SIZE: usize = W_MODULE_DICT_OBJECT_SIZE;
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:328-342 W_ModuleDictObject(W_DictMultiObject)`
+/// inheritance — `get_strategy`/`set_strategy` overrides read/write
+/// the `mstrategy` slot (a per-allocation `ModuleDictStrategy`).
+/// The `&'static` lifetime on the returned strategy reference is
+/// sound because pyre's `ModuleDictStrategy` is malloc_raw'd and
+/// lives for the W_ModuleDictObject's full lifetime (which itself
+/// outlives any caller currently in scope).
+impl W_DictMultiObject for W_ModuleDictObject {
+    #[inline]
+    fn get_strategy(&self) -> &dyn crate::dictstrategy::DictStrategy {
+        unsafe { &*self.mstrategy }
+    }
+
+    /// W_ModuleDictObject's set_strategy is only ever invoked by
+    /// the PyPy-side strategy promotion path (e.g. via
+    /// `dictmultiobject.py:341-342`) which would swap mstrategy for
+    /// another `ModuleDictStrategy`.  Pyre's promotion to
+    /// ObjectDictStrategy goes through the dedicated
+    /// `w_module_dict_switch_to_object_strategy` helper per
+    /// `celldict.py:173-186` and does not touch mstrategy directly;
+    /// this trait method is therefore unreachable today and panics
+    /// rather than silently mis-typing the slot.
+    fn set_strategy(&mut self, _strategy: &'static dyn crate::dictstrategy::DictStrategy) {
+        panic!(
+            "W_ModuleDictObject::set_strategy is not the canonical swap path; \
+             use w_module_dict_switch_to_object_strategy (celldict.py:173-186)"
+        );
+    }
+}
+
+/// Allocate a fresh `W_ModuleDictObject` whose storage is empty and
+/// whose strategy carries a fresh `VersionTag`.  Mirrors
+/// `dictmultiobject.py:57-69 allocate_and_init_instance(module=True)`
+/// path:
+///
+/// ```python
+/// if module:
+///     strategy = ModuleDictStrategy(space)
+///     storage = strategy.get_empty_storage()
+///     w_obj = space.allocate_instance(W_ModuleDictObject, space.w_dict)
+///     W_ModuleDictObject.__init__(w_obj, space, strategy, storage)
+///     return w_obj
+/// ```
+pub fn w_module_dict_new() -> PyObjectRef {
+    w_module_dict_new_with_storage_proxy(std::ptr::null_mut())
+}
+
+/// `w_module_dict_new` variant pairing the W_ModuleDictObject with a
+/// legacy `DictStorage` mirror.  Writes through the W_ModuleDictObject
+/// fan out to `ns` via the storage proxy hooks; reads fall back to
+/// `ns` on a local miss.  Used by `dict_storage_to_dict` so source
+/// modules surface as W_ModuleDictObject while the frame-side
+/// `PyFrame.w_globals = *mut DictStorage` carrier still works.
+pub fn w_module_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
+    let strategy = crate::lltype::malloc_raw(crate::celldict::ModuleDictStrategy::new());
+    let storage = unsafe { crate::lltype::malloc_raw((*strategy).get_empty_storage()) };
+    crate::lltype::malloc_typed(W_ModuleDictObject {
+        ob_header: PyObject {
+            // `dictmultiobject.py:67 space.allocate_instance(...,
+            // space.w_dict)` — module dicts present as `dict` to
+            // user code (registered via TYPEOBJECT_CACHE on the
+            // interpreter side); the Rust static tag distinguishes
+            // the layout internally.
+            ob_type: &MODULE_DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&MODULE_DICT_TYPE),
+        },
+        dstorage: storage,
+        mstrategy: strategy,
+        object_storage: std::ptr::null_mut(),
+        dict_storage_proxy: ns,
+    }) as PyObjectRef
+}
+
+/// Predicate: dict is in ObjectDictStrategy mode (post-switch).  When
+/// true, `object_storage` is authoritative and `dstorage` is empty +
+/// not consulted.  Mirrors `W_DictMultiObject.get_strategy()` returning
+/// `ObjectDictStrategy` vs `ModuleDictStrategy` (`dictmultiobject.py:326`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
+    !(*(obj as *const W_ModuleDictObject))
+        .object_storage
+        .is_null()
+}
+
+/// Read-only view of the unified object_storage Vec; returns `None`
+/// when the dict is still in ModuleDictStrategy mode.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+#[inline]
+unsafe fn w_module_dict_object_storage<'a>(
+    obj: PyObjectRef,
+) -> Option<&'a Vec<(PyObjectRef, PyObjectRef)>> {
+    let raw = &*(obj as *const W_ModuleDictObject);
+    if raw.object_storage.is_null() {
+        None
+    } else {
+        Some(&*raw.object_storage)
+    }
+}
+
+/// Mutable view of the unified object_storage Vec; requires the dict
+/// to already be in object-strategy mode.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject` for which
+/// `w_module_dict_is_object_strategy(obj)` holds.
+#[inline]
+unsafe fn w_module_dict_object_storage_mut<'a>(
+    obj: PyObjectRef,
+) -> &'a mut Vec<(PyObjectRef, PyObjectRef)> {
+    let raw = &mut *(obj as *mut W_ModuleDictObject);
+    debug_assert!(!raw.object_storage.is_null());
+    &mut *raw.object_storage
+}
+
+/// `pypy/objspace/std/celldict.py:173-186 switch_to_object_strategy`:
+///
+/// ```python
+/// def switch_to_object_strategy(self, w_dict):
+///     space = self.space
+///     d = self.unerase(w_dict.dstorage)
+///     strategy = space.fromcache(ObjectDictStrategy)
+///     d_new = strategy.unerase(strategy.get_empty_storage())
+///     for key, cell in d.iteritems():
+///         d_new[_wrapkey(space, key)] = unwrap_cell(self.space, cell)
+///     if self.caches is not None:
+///         for cache in self.caches.itervalues():
+///             cache.cell = None
+///             cache.valid = False
+///         self.caches = None
+///     w_dict.set_strategy(strategy)
+///     w_dict.dstorage = strategy.erase(d_new)
+/// ```
+///
+/// Drains all str entries from `dstorage` into a fresh
+/// `object_storage` Vec, preserving insertion order (PyPy's
+/// `iteritems` over an RPython dict yields insertion order), clears
+/// `dstorage`, and bumps `mstrategy.version` so any quasi-immutable
+/// JIT cache keyed on the previous version invalidates.  After this
+/// call, all reads / writes route through `object_storage` regardless
+/// of key type — matching PyPy's `ObjectDictStrategy` semantics.
+///
+/// **PRE-EXISTING-ADAPTATION** vs `celldict.py:185-186`:
+/// PyPy actually swaps the strategy (`w_dict.set_strategy(strategy)`)
+/// and replaces `w_dict.dstorage` with the new `strategy.erase(d_new)`
+/// payload.  Pyre carries TWO storages (`dstorage` + `object_storage`)
+/// and flips a flag (`object_storage` non-null) to route reads/writes
+/// to the new container.  Functionally equivalent: after the switch,
+/// `dstorage` is cleared and never consulted; `object_storage` is the
+/// authoritative payload, exactly mirroring the post-`set_strategy`
+/// PyPy state.
+///
+/// **Why it diverges**: full structural parity requires a
+/// `DictStrategy` trait + concrete `ObjectDictStrategy` /
+/// `UnicodeDictStrategy` ports (see `dictmultiobject.py:236-1369`)
+/// so `set_strategy` can replace both the dispatch object and the
+/// erased storage type uniformly.  That hierarchy is a multi-session
+/// epic (750+ LOC across 4 strategies, 200+ call sites in
+/// `dictmultiobject.py` consuming `w_dict.get_strategy()` and
+/// `space.fromcache(<Strategy>)`).
+///
+/// **Convergence path**: when the strategy hierarchy ports land,
+/// drop `object_storage` and replace this two-slot carrier with a
+/// single `dstorage: *mut dyn DictStorageErased` whose concrete
+/// type is dictated by `mstrategy`'s runtime tag.
+///
+/// No-op when already in object-strategy mode.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
+    let raw = &mut *(obj as *mut W_ModuleDictObject);
+    if !raw.object_storage.is_null() {
+        return;
+    }
+    let strategy = &mut *raw.mstrategy;
+    let storage = &mut *raw.dstorage;
+    let mut new_storage: Vec<(PyObjectRef, PyObjectRef)> = strategy
+        .getiterkeys(storage)
+        .zip(strategy.getitervalues(storage))
+        .map(|(k, v)| (crate::celldict::_wrapkey(k), v))
+        .collect();
+    new_storage.reserve(1);
+    raw.object_storage = crate::lltype::malloc_raw(new_storage);
+    storage.clear();
+    // `celldict.py:180-184`: every live GlobalCache becomes invalid
+    // because the strategy is being swapped out; the JIT must
+    // recompile any trace keyed on the prior version.
+    strategy.invalidate_caches();
+    strategy.mutated();
+}
+
+/// `dictmultiobject.py:21-31 _never_equal_to_string`:
+///
+/// ```python
+/// def _never_equal_to_string(space, w_lookup_type):
+///     return (space.is_w(w_lookup_type, space.w_NoneType) or
+///             space.is_w(w_lookup_type, space.w_int) or
+///             space.is_w(w_lookup_type, space.w_bool) or
+///             space.is_w(w_lookup_type, space.w_float))
+/// ```
+///
+/// True when `key`'s type guarantees the key can never `==` any Python
+/// string, so a still-ModuleDictStrategy dict can skip the strategy
+/// switch and report absence directly.  For all other non-str types
+/// (e.g. user-defined classes with custom `__eq__`/`__hash__`), the
+/// caller must `switch_to_object_strategy` and re-dispatch the lookup
+/// on the unified ObjectDictStrategy storage.
+///
+/// # Safety
+/// `key` must be a valid PyObjectRef.
+#[inline]
+unsafe fn _never_equal_to_string(key: PyObjectRef) -> bool {
+    crate::is_none(key) || crate::is_int(key) || crate::is_bool(key) || crate::is_float(key)
+}
+
+/// `is W_ModuleDictObject` predicate.  Disambiguates `W_ModuleDictObject`
+/// from `W_DictObject` even though both surface as Python's `dict`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_module_dict(obj: PyObjectRef) -> bool {
+    py_type_check(obj, &MODULE_DICT_TYPE)
+}
+
+/// `dictmultiobject.py:326 W_DictObject.get_strategy` / `:339
+/// W_ModuleDictObject.get_strategy` — read the owning strategy.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_module_dict_get_strategy(
+    obj: PyObjectRef,
+) -> *mut crate::celldict::ModuleDictStrategy {
+    (*(obj as *const W_ModuleDictObject)).mstrategy
+}
+
+/// Read the owning storage pointer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_module_dict_get_storage(
+    obj: PyObjectRef,
+) -> *mut crate::celldict::ModuleDictStorage {
+    (*(obj as *const W_ModuleDictObject)).dstorage
+}
+
+/// `dictmultiobject.py:111-112 W_DictMultiObject.setitem_str`
+/// dispatched through ModuleDictStrategy (`celldict.py:76-78`):
+///
+/// ```python
+/// def setitem_str(self, key, w_value):
+///     self.get_strategy().setitem_str(self, key, w_value)
+/// ```
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_setitem_str(obj: PyObjectRef, key: &str, w_value: PyObjectRef) {
+    w_module_dict_setitem_str_internal(obj, key, w_value, /*fire_proxy=*/ true);
+}
+
+/// `w_module_dict_setitem_str` variant that skips the
+/// `dict_storage_proxy` forward hook.  Used by `DictStorage::insert`'s
+/// `mirror_target` back-write to avoid recursion when the DictStorage
+/// IS the mirror's own proxy target.
+pub unsafe fn w_module_dict_setitem_str_no_proxy(
+    obj: PyObjectRef,
+    key: &str,
+    w_value: PyObjectRef,
+) {
+    w_module_dict_setitem_str_internal(obj, key, w_value, /*fire_proxy=*/ false);
+}
+
+unsafe fn w_module_dict_setitem_str_internal(
+    obj: PyObjectRef,
+    key: &str,
+    w_value: PyObjectRef,
+    fire_proxy: bool,
+) {
+    let proxy = if fire_proxy {
+        (*(obj as *const W_ModuleDictObject)).dict_storage_proxy
+    } else {
+        std::ptr::null_mut()
+    };
+    if w_module_dict_is_object_strategy(obj) {
+        // Post-switch: ObjectDictStrategy holds str keys as wrapped
+        // PyStr entries in the same unified Vec.  Walk by str-eq.
+        let entries = w_module_dict_object_storage_mut(obj);
+        for entry in entries.iter_mut() {
+            if crate::is_str(entry.0) && crate::w_str_get_value(entry.0) == key {
+                entry.1 = w_value;
+                let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                strategy.mutated();
+                maybe_sync_dict_storage_store(proxy, crate::w_str_new(key), w_value);
+                return;
+            }
+        }
+        entries.push((crate::w_str_new(key), w_value));
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
+        maybe_sync_dict_storage_store(proxy, crate::w_str_new(key), w_value);
+        return;
+    }
+    {
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        strategy.setitem_str(storage, key, w_value);
+    }
+    maybe_sync_dict_storage_store(proxy, crate::w_str_new(key), w_value);
+}
+
+/// `celldict.py:143-145 getitem_str`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        for &(k, v) in entries.iter() {
+            if crate::is_str(k) && crate::w_str_get_value(k) == key {
+                return Some(v);
+            }
+        }
+        if !proxy.is_null() {
+            if let Some(v) = maybe_lookup_dict_storage(proxy, key) {
+                return Some(v);
+            }
+        }
+        return None;
+    }
+    {
+        let strategy = &*(*(obj as *const W_ModuleDictObject)).mstrategy;
+        let storage = &*(*(obj as *const W_ModuleDictObject)).dstorage;
+        if let Some(v) = strategy.getitem_str(storage, key) {
+            return Some(v);
+        }
+    }
+    if !proxy.is_null() {
+        if let Some(v) = maybe_lookup_dict_storage(proxy, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `celldict.py:106-126 delitem` (str path).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_delitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    w_module_dict_delitem_str_internal(obj, key, /*fire_proxy=*/ true)
+}
+
+/// `w_module_dict_delitem_str` variant that skips the
+/// `dict_storage_proxy` delete fan-out — used by
+/// `DictStorage::remove`'s `mirror_target` back-write to avoid loop.
+pub unsafe fn w_module_dict_delitem_str_no_proxy(
+    obj: PyObjectRef,
+    key: &str,
+) -> Option<PyObjectRef> {
+    w_module_dict_delitem_str_internal(obj, key, /*fire_proxy=*/ false)
+}
+
+unsafe fn w_module_dict_delitem_str_internal(
+    obj: PyObjectRef,
+    key: &str,
+    fire_proxy: bool,
+) -> Option<PyObjectRef> {
+    let proxy = if fire_proxy {
+        (*(obj as *const W_ModuleDictObject)).dict_storage_proxy
+    } else {
+        std::ptr::null_mut()
+    };
+    if w_module_dict_is_object_strategy(obj) {
+        let entries = w_module_dict_object_storage_mut(obj);
+        if let Some(idx) = entries
+            .iter()
+            .position(|(k, _)| crate::is_str(*k) && crate::w_str_get_value(*k) == key)
+        {
+            let removed = entries.remove(idx).1;
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+            maybe_sync_dict_storage_delete(proxy, key);
+            return Some(removed);
+        }
+        if !proxy.is_null() && maybe_lookup_dict_storage(proxy, key).is_some() {
+            maybe_sync_dict_storage_delete(proxy, key);
+            return Some(crate::PY_NULL);
+        }
+        return None;
+    }
+    let removed = {
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        strategy.delitem_str(storage, key)
+    };
+    if removed.is_some() {
+        maybe_sync_dict_storage_delete(proxy, key);
+        return removed;
+    }
+    if !proxy.is_null() && maybe_lookup_dict_storage(proxy, key).is_some() {
+        maybe_sync_dict_storage_delete(proxy, key);
+        return Some(crate::PY_NULL);
+    }
+    None
+}
+
+/// `celldict.py:128-129 length`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        return entries.len();
+    }
+    let strategy = &*(*(obj as *const W_ModuleDictObject)).mstrategy;
+    let storage = &*(*(obj as *const W_ModuleDictObject)).dstorage;
+    strategy.length(storage)
+}
+
+/// Compare two dict keys for equality.
+///
+/// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` —
+/// the storage is `r_dict(space.eq_w, space.hash_w)` so every key
+/// lookup routes through `space.eq_w` (`baseobjspace.py:823-825`),
+/// which honours user-defined `__eq__`.  pyre-object cannot depend on
+/// pyre-interpreter, so we go through the `dict_eq_hook::EQ_W_HOOK`
+/// trampoline registered at `pyre-jit::eval` init.  When the hook is
+/// not installed (pyre-object lib tests, snapshot tools) we fall back
+/// to the limited-type builtin equality below — sufficient for the
+/// hashable-builtin smoke tests but not for arbitrary user types.
+pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    if let Some(result) = unsafe { crate::dict_eq_hook::try_eq_w(a, b) } {
+        return result;
+    }
+    // Mixed numeric: bool ↔ int (Python: True == 1 and False == 0).
+    let a_is_bool = crate::is_bool(a);
+    let b_is_bool = crate::is_bool(b);
+    let a_is_int = crate::is_int(a);
+    let b_is_int = crate::is_int(b);
+    if (a_is_int || a_is_bool) && (b_is_int || b_is_bool) {
+        let av = if a_is_bool {
+            crate::w_bool_get_value(a) as i64
+        } else {
+            crate::w_int_get_value(a)
+        };
+        let bv = if b_is_bool {
+            crate::w_bool_get_value(b) as i64
+        } else {
+            crate::w_int_get_value(b)
+        };
+        return av == bv;
+    }
+    // Str keys
+    if crate::is_str(a) && crate::is_str(b) {
+        return crate::w_str_get_value(a) == crate::w_str_get_value(b);
+    }
+    // Bytes keys — compare byte contents.
+    if crate::bytesobject::is_bytes(a) && crate::bytesobject::is_bytes(b) {
+        return crate::bytesobject::w_bytes_data(a) == crate::bytesobject::w_bytes_data(b);
+    }
+    // Tuple keys — element-wise compare via dict_keys_equal recursively.
+    if crate::is_tuple(a) && crate::is_tuple(b) {
+        let la = crate::w_tuple_len(a);
+        let lb = crate::w_tuple_len(b);
+        if la != lb {
+            return false;
+        }
+        for i in 0..la {
+            let ea = crate::w_tuple_getitem(a, i as i64).unwrap_or(std::ptr::null_mut());
+            let eb = crate::w_tuple_getitem(b, i as i64).unwrap_or(std::ptr::null_mut());
+            if !dict_keys_equal(ea, eb) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // frozenset / set: element-wise containment via the same equality.
+    if crate::is_frozenset(a) && crate::is_frozenset(b) {
+        let ai = crate::w_set_items(a);
+        let bi = crate::w_set_items(b);
+        if ai.len() != bi.len() {
+            return false;
+        }
+        return ai
+            .iter()
+            .all(|&x| bi.iter().any(|&y| dict_keys_equal(x, y)));
+    }
+    false
+}
+
+/// Get a value by PyObjectRef key.
+///
+/// When `dict_storage_proxy` is attached, the storage is treated as
+/// authoritative for str keys: lookup checks the storage FIRST, so a
+/// transient proxy dict whose `entries` Vec carries a stale snapshot
+/// (`dict_storage_to_dict` materialisation, `w_module_new`
+/// pre-population that was later mutated by a STORE_GLOBAL on the
+/// shared storage) returns the live value rather than the cached
+/// stale one.  Non-str keys live only in the dstorage Vec because
+/// `DictStorage` is str-keyed by construction.
+///
+/// PyPy parity: `pypy/interpreter/module.py:77 Module.getdict()`
+/// returns the live `W_DictMultiObject` whose state IS the module's
+/// dict — there is no stale snapshot to worry about because there is
+/// only one map.  Pyre's split (dstorage Vec + DictStorage) mirrors
+/// the same single-source-of-truth shape only when the storage side
+/// wins for the key types it represents.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+/// `pypy/objspace/std/dictmultiobject.py:93-95 W_DictMultiObject.getitem`
+/// — `w_dict.get_strategy().getitem(w_dict, w_key)`.  Dispatches
+/// through the polymorphic strategy slot so module dicts go through
+/// `ModuleDictStrategy::getitem` and regular dicts through
+/// `ObjectDictStrategy::getitem` (which honours W_DictObject's
+/// `dict_storage_proxy` storage-first contract via
+/// `w_dict_lookup_object_strategy`).
+pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
+    w_dict_get_strategy(obj).getitem(obj, key)
+}
+
+/// Internal helper: `ObjectDictStrategy::getitem` body for pyre's
+/// W_DictObject — storage-first lookup for str keys when the
+/// `dict_storage_proxy` is attached (storage owns the live value for
+/// the keys it represents), else linear scan of the dstorage Vec by
+/// `dict_keys_equal`.  Called only from the strategy trait impl to
+/// avoid recursion through `w_dict_lookup`.  Retires alongside
+/// `dict_storage_proxy` when Phase C-1 lands.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_lookup_object_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    let dict = &*(obj as *const W_DictObject);
+    if !dict.dict_storage_proxy.is_null() && crate::is_str(key) {
+        if let Some(v) =
+            maybe_lookup_dict_storage(dict.dict_storage_proxy, crate::w_str_get_value(key))
+        {
+            return Some(v);
+        }
+    }
+    let entries = &*dict.dstorage;
+    for &(ref k, v) in entries {
+        if dict_keys_equal(*k, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
+/// W_ModuleDictObject — `celldict.py:131-141`:
+///   * post-`switch_to_object_strategy` path: walk unified entries
+///     Vec via `dict_keys_equal`.
+///   * str fast path on fresh ModuleDictStrategy: route to
+///     `w_module_dict_getitem_str`.
+///   * non-str + never-eq-str: fast-return None.
+///   * non-str otherwise: promote then walk entries.
+/// Called only from the strategy trait impl to avoid recursion
+/// through `w_dict_lookup`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_lookup_inner(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        for &(k, v) in entries.iter() {
+            if dict_keys_equal(k, key) {
+                return Some(v);
+            }
+        }
+        return None;
+    }
+    if crate::is_str(key) {
+        return w_module_dict_getitem_str(obj, crate::w_str_get_value(key));
+    }
+    if _never_equal_to_string(key) {
+        return None;
+    }
+    w_module_dict_switch_to_object_strategy(obj);
+    let entries = w_module_dict_object_storage(obj)?;
+    for &(k, v) in entries.iter() {
+        if dict_keys_equal(k, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Set a value by PyObjectRef key.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+/// `pypy/objspace/std/dictmultiobject.py:97-99 W_DictMultiObject.setitem`
+/// — `w_dict.get_strategy().setitem(w_dict, w_key, w_value)`.
+/// Dispatches through the polymorphic strategy slot so module dicts
+/// go through `ModuleDictStrategy::setitem` and regular dicts through
+/// `ObjectDictStrategy::setitem` (which honours W_DictObject's
+/// `dict_storage_proxy` storage-sync contract via
+/// `w_dict_store_object_strategy`).
+pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    w_dict_get_strategy(obj).setitem(obj, key, value)
+}
+
+/// Internal helper: `ObjectDictStrategy::setitem` body for pyre's
+/// W_DictObject — walks the dstorage Vec by `dict_keys_equal`,
+/// updates the matching entry or pushes a new one, fires the GC
+/// write barrier, and syncs the change into the
+/// `dict_storage_proxy` back-mirror.  Called only from the strategy
+/// trait impl to avoid recursion through `w_dict_store`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_store_object_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    for entry in entries.iter_mut() {
+        if dict_keys_equal(entry.0, key) {
+            entry.1 = value;
+            dict_write_barrier(obj);
+            maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
+            return;
+        }
+    }
+    entries.push((key, value));
+    dict.len += 1;
+    dict_write_barrier(obj);
+    maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
+}
+
+/// Internal helper: `ModuleDictStrategy::setitem` body for pyre's
+/// W_ModuleDictObject — `celldict.py:41-67`:
+///   * str keys on a fresh ModuleDictStrategy → `setitem_str`
+///   * non-str keys OR already-promoted → `switch_to_object_strategy`
+///     and write into the unified dstorage Vec, syncing str keys
+///     back to the proxy.
+/// Called only from the strategy trait impl to avoid recursion
+/// through `w_dict_store`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    if crate::is_str(key) && !w_module_dict_is_object_strategy(obj) {
+        return w_module_dict_setitem_str(obj, crate::w_str_get_value(key), value);
+    }
+    if !w_module_dict_is_object_strategy(obj) {
+        w_module_dict_switch_to_object_strategy(obj);
+    }
+    let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
+    let entries = w_module_dict_object_storage_mut(obj);
+    for entry in entries.iter_mut() {
+        if dict_keys_equal(entry.0, key) {
+            entry.1 = value;
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+            if crate::is_str(key) {
+                maybe_sync_dict_storage_store(proxy, key, value);
+            }
+            return;
+        }
+    }
+    entries.push((key, value));
+    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+    strategy.mutated();
+    if crate::is_str(key) {
+        maybe_sync_dict_storage_store(proxy, key, value);
+    }
+}
+
+/// Write a str-keyed assignment back to the dict's backing DictStorage,
+/// if any. Declared in pyre-interpreter and re-exported via an `extern`
+/// hook registered at startup to avoid a circular dependency.
+unsafe fn maybe_sync_dict_storage_store(ns_ptr: *mut u8, key: PyObjectRef, value: PyObjectRef) {
+    if ns_ptr.is_null() || !crate::is_str(key) {
+        return;
+    }
+    if let Some(hook) = DICT_STORAGE_STORE_HOOK
+        .load(std::sync::atomic::Ordering::Acquire)
+        .as_ref()
+    {
+        let name = crate::w_str_get_value(key);
+        hook(ns_ptr, name, value);
+    }
+}
+
+/// Mirror of `maybe_sync_dict_storage_store` for deletions.  When a dict
+/// with a backing storage drops a str-keyed entry, propagate the
+/// deletion so storage-keyed lookups (LOAD_GLOBAL builtins fallback)
+/// stop seeing the stale entry.  PyPy keeps everything in one
+/// `W_DictMultiObject` so this asymmetry is pyre-only.
+unsafe fn maybe_sync_dict_storage_delete(ns_ptr: *mut u8, key_str: &str) {
+    if ns_ptr.is_null() {
+        return;
+    }
+    if let Some(hook) = DICT_STORAGE_DELETE_HOOK
+        .load(std::sync::atomic::Ordering::Acquire)
+        .as_ref()
+    {
+        hook(ns_ptr, key_str);
+    }
+}
+
+/// Storage-proxy read-through.  PyPy keeps every dict-backed lookup
+/// inside the same `W_DictMultiObject`, so reads see entries
+/// regardless of which interpreter side wrote them.  Pyre splits the
+/// dict's `entries` Vec from the `DictStorage` proxy, so a dict whose
+/// authoritative state lives in the storage (`Module.w_dict` over
+/// `space.builtin`'s storage, `globals()` view) must surface storage
+/// entries on read.  Returns `None` when no proxy is attached or the
+/// hook is unregistered.
+unsafe fn maybe_lookup_dict_storage(ns_ptr: *mut u8, key_str: &str) -> Option<PyObjectRef> {
+    if ns_ptr.is_null() {
+        return None;
+    }
+    let ptr = DICT_STORAGE_LOOKUP_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    (*ptr)(ns_ptr, key_str)
+}
+
+type NamespaceStoreHook = unsafe fn(*mut u8, &str, PyObjectRef);
+type NamespaceDeleteHook = unsafe fn(*mut u8, &str);
+type NamespaceLookupHook = unsafe fn(*mut u8, &str) -> Option<PyObjectRef>;
+type NamespaceItemsHook = unsafe fn(*mut u8) -> Vec<(String, PyObjectRef)>;
+
+struct AtomicHookPtr(std::sync::atomic::AtomicPtr<NamespaceStoreHook>);
+
+impl AtomicHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceStoreHook) {
+        // Leak a boxed function pointer so the pointer lives for the entire
+        // process lifetime; this matches PyPy's one-time interp init.
+        // `flavor='raw'` because this is host-side dispatch state, not a
+        // GC-managed Python object.
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceStoreHook {
+        self.0.load(order) as *const NamespaceStoreHook
+    }
+}
+
+struct AtomicDeleteHookPtr(std::sync::atomic::AtomicPtr<NamespaceDeleteHook>);
+
+impl AtomicDeleteHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceDeleteHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceDeleteHook {
+        self.0.load(order) as *const NamespaceDeleteHook
+    }
+}
+
+struct AtomicLookupHookPtr(std::sync::atomic::AtomicPtr<NamespaceLookupHook>);
+
+impl AtomicLookupHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceLookupHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceLookupHook {
+        self.0.load(order) as *const NamespaceLookupHook
+    }
+}
+
+struct AtomicItemsHookPtr(std::sync::atomic::AtomicPtr<NamespaceItemsHook>);
+
+impl AtomicItemsHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceItemsHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceItemsHook {
+        self.0.load(order) as *const NamespaceItemsHook
+    }
+}
+
+static DICT_STORAGE_STORE_HOOK: AtomicHookPtr = AtomicHookPtr::new();
+static DICT_STORAGE_DELETE_HOOK: AtomicDeleteHookPtr = AtomicDeleteHookPtr::new();
+static DICT_STORAGE_LOOKUP_HOOK: AtomicLookupHookPtr = AtomicLookupHookPtr::new();
+static DICT_STORAGE_ITEMS_HOOK: AtomicItemsHookPtr = AtomicItemsHookPtr::new();
+
+/// Register the interpreter-level hook that writes (name, value) into a
+/// DictStorage. Called once during interpreter startup.
+pub fn register_dict_storage_store_hook(hook: NamespaceStoreHook) {
+    DICT_STORAGE_STORE_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that deletes `name` from a
+/// DictStorage. Called once during interpreter startup.
+pub fn register_dict_storage_delete_hook(hook: NamespaceDeleteHook) {
+    DICT_STORAGE_DELETE_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that looks up `name` in a
+/// DictStorage and returns its value (or `None`).  Called once during
+/// interpreter startup so dicts with a `dict_storage_proxy` surface
+/// storage entries on read miss.
+pub fn register_dict_storage_lookup_hook(hook: NamespaceLookupHook) {
+    DICT_STORAGE_LOOKUP_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that enumerates all str-keyed
+/// `(name, value)` pairs from a DictStorage.  Used by `w_dict_len`,
+/// `w_dict_items`, `w_dict_str_entries` and `w_dict_delitem_str` to keep
+/// the full dict protocol (`len(module.__dict__)`, `module.__dict__.items()`,
+/// `del module.__dict__[name]`) consistent with PyPy's
+/// `Module.getdict()` returning the live W_DictMultiObject — pyre splits
+/// the proxy off the dstorage Vec and would otherwise miss every storage
+/// entry not yet mirrored into the W_DictObject.
+pub fn register_dict_storage_items_hook(hook: NamespaceItemsHook) {
+    DICT_STORAGE_ITEMS_HOOK.store(hook);
+}
+
+/// Read-side counterpart of `maybe_sync_dict_storage_store`: enumerate
+/// the str-keyed entries currently in the backing storage.
+///
+/// Returns `None` when the items hook has not yet been registered (the
+/// hookless case fires for direct `w_module_new` callers and for unit
+/// tests that exercise dict surfaces before `register_dict_storage_*_hook`
+/// runs).  Callers must distinguish "hook missing" (storage view is
+/// indeterminate, fall back to dstorage Vec) from "hook installed, storage
+/// empty" (authoritative empty result) — collapsing the two would silently
+/// drop dstorage Vec str keys for proxied dicts whose hook arrives later
+/// in the bootstrap.
+unsafe fn maybe_items_dict_storage(ns_ptr: *mut u8) -> Option<Vec<(String, PyObjectRef)>> {
+    if ns_ptr.is_null() {
+        return Some(Vec::new());
+    }
+    let ptr = DICT_STORAGE_ITEMS_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    Some((*ptr)(ns_ptr))
+}
+
+/// Get the dict_storage_proxy pointer from a dict (used by interpreter for
+/// live globals sync).
+///
+/// Both W_DictObject and W_ModuleDictObject carry a `dict_storage_proxy`
+/// field (PRE-EXISTING-ADAPTATION until Phase 5e migrates
+/// `PyFrame.w_globals` to `PyObjectRef`); this returns whichever side
+/// is attached so callers like `exec(..., module.__dict__)` can re-use
+/// the existing backing storage instead of materialising a fresh
+/// `DictStorage` that drifts from the module dict.
+pub unsafe fn w_dict_get_dict_storage_proxy(obj: PyObjectRef) -> *mut u8 {
+    if is_module_dict(obj) {
+        return (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
+    }
+    (*(obj as *const W_DictObject)).dict_storage_proxy
+}
+
+/// Attach a `DictStorage` proxy to an existing dict so subsequent
+/// mutations sync into the storage.  Used by interpreter-level
+/// `pick_builtin` (`pypy/module/__builtin__/moduledef.py:102-103`)
+/// to lift an arbitrary user-supplied `__builtins__` dict into pyre's
+/// storage-keyed lookup model — counterpart of the no-op assignment
+/// `module.Module(space, None, w_builtin)` does in PyPy by aliasing
+/// `module.w_dict = w_builtin`.
+pub unsafe fn w_dict_set_dict_storage_proxy(obj: PyObjectRef, ns: *mut u8) {
+    if is_module_dict(obj) {
+        (*(obj as *mut W_ModuleDictObject)).dict_storage_proxy = ns;
+        return;
+    }
+    (*(obj as *mut W_DictObject)).dict_storage_proxy = ns;
+}
+
+/// Get a value by int key (convenience wrapper).  Wraps the raw i64
+/// into a `W_IntObject` and dispatches through `w_dict_lookup` so the
+/// strategy-slot path applies uniformly to W_DictObject and
+/// W_ModuleDictObject.
+pub unsafe fn w_dict_getitem(obj: PyObjectRef, key: i64) -> Option<PyObjectRef> {
+    w_dict_lookup(obj, crate::w_int_new(key))
+}
+
+/// Set a value by int key (convenience wrapper).
+pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
+    w_dict_store(obj, crate::w_int_new(key), value)
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:103-105 W_DictMultiObject.getitem_str`
+/// — `w_dict.get_strategy().getitem_str(w_dict, key)`.  Dispatches
+/// through the polymorphic strategy slot so module dicts go through
+/// `ModuleDictStrategy::getitem_str` (which honours
+/// `dict_storage_proxy` + the `mstrategy.caches` cell-cache) and
+/// regular dicts through `ObjectDictStrategy::getitem_str` (which
+/// honours W_DictObject's proxy via `w_dict_getitem_str_proxy_first`).
+pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    w_dict_get_strategy(obj).getitem_str(obj, key)
+}
+
+/// Internal helper: `ObjectDictStrategy::getitem_str` proxy-first
+/// lookup body.  Kept as a free function so the strategy trait
+/// impl can stay in `dictstrategy.rs` without re-implementing the
+/// `dict_storage_proxy` walk.  Mirrors `w_dict_lookup`'s
+/// storage-first contract for proxied W_DictObjects so stale
+/// `entries` snapshots (e.g. `dict_storage_to_dict` materialisation)
+/// don't shadow live storage updates.  Retires alongside
+/// `dict_storage_proxy` when Phase C-1 lands.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.  The sole caller is
+/// `ObjectDictStrategy::getitem_str`, which only fires when the
+/// receiver's `dstrategy` slot is `OBJECT_DICT_STRATEGY`; module
+/// dicts route through `ModuleDictStrategy::getitem_str` →
+/// `w_module_dict_getitem_str` instead.
+pub unsafe fn w_dict_getitem_str_proxy_first(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    let dict = &*(obj as *const W_DictObject);
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(v) = maybe_lookup_dict_storage(dict.dict_storage_proxy, key) {
+            return Some(v);
+        }
+    }
+    let entries = &*dict.dstorage;
+    for &(ref k, v) in entries {
+        if crate::is_str(*k) && crate::w_str_get_value(*k) == key {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:111-112 W_DictMultiObject.setitem_str`
+/// — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
+/// Dispatches through the polymorphic strategy slot so module dicts
+/// fan out via `ModuleDictStrategy::setitem_str` and regular dicts
+/// via `ObjectDictStrategy::setitem_str`.
+pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef) {
+    w_dict_get_strategy(obj).setitem_str(obj, key, value)
+}
+
+/// Set a value by str key WITHOUT firing the dict_storage_proxy
+/// store hook.  Used by the storage→W_DictObject back-mirror so a
+/// `dict_storage_store` on a storage that has a registered mirror
+/// target updates the W_DictObject's dstorage Vec without
+/// re-entering `maybe_sync_dict_storage_store` (which would feed
+/// the same write right back into the storage and create an
+/// observable double-invalidation of slot watchers).
+///
+/// PyPy keeps everything in one `W_DictMultiObject`, so the
+/// asymmetric "dstorage Vec write must skip storage notification"
+/// shape is pyre-only; the no-proxy variant is the structural
+/// adapter for the bidirectional sync that PyPy gets for free.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: PyObjectRef) {
+    if is_module_dict(obj) {
+        // The "no-proxy" qualifier means "do not bounce the write
+        // back to a sibling DictStorage".  Route through the
+        // W_ModuleDictObject's matching no-proxy setter so storage's
+        // mirror_target back-write doesn't loop.
+        return w_module_dict_setitem_str_no_proxy(obj, key, value);
+    }
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    for entry in entries.iter_mut() {
+        if crate::is_str(entry.0) && crate::w_str_get_value(entry.0) == key {
+            entry.1 = value;
+            dict_write_barrier(obj);
+            return;
+        }
+    }
+    entries.push((crate::w_str_new(key), value));
+    dict.len += 1;
+    dict_write_barrier(obj);
+}
+
+/// Remove an entry by str key WITHOUT firing the dict_storage_proxy
+/// delete hook.  Counterpart of `w_dict_setitem_str_no_proxy`; see
+/// that doc-comment for the back-mirror rationale.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
+    if is_module_dict(obj) {
+        return w_module_dict_delitem_str_no_proxy(obj, key).is_some();
+    }
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    if let Some(idx) = entries
+        .iter()
+        .position(|(k, _)| crate::is_str(*k) && crate::w_str_get_value(*k) == key)
+    {
+        entries.remove(idx);
+        dict.len -= 1;
+
+        true
+    } else {
+        false
+    }
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:469-471 W_DictMultiObject.descr_delitem`
+/// — `space.delitem(w_dict, w_key)` which calls
+/// `w_dict.get_strategy().delitem(w_dict, w_key)`.  PyPy has no
+/// `delitem_str` fast path on the trait (only `setitem_str` and
+/// `getitem_str`); pyre's str-keyed convenience wrapper routes
+/// through `w_dict_delitem(obj, w_str_new(key))` for parity.
+///
+/// Returns `true` when the key was present in either the strategy
+/// storage or the `dict_storage_proxy` back-mirror (PRE-EXISTING-
+/// ADAPTATION storage view).
+pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
+    let w_key = crate::w_str_new(key);
+    w_dict_delitem(obj, w_key)
+}
+
+/// Remove an entry by arbitrary key (str or non-str).  Returns `true`
+/// when the key was present.  Mirrors `pypy/objspace/std/dictmultiobject.py
+/// W_DictMultiObject.delitem` — PyPy's flat strategy walks the entries
+/// list, comparing each key by `space.eq_w` (the `dict_keys_equal`
+/// helper here), so `del d[1]` on an int key removes the entry.  The
+/// previous str-only `w_dict_delitem_str` left non-str entries
+/// untouched, breaking `dict.pop(int_key)`'s after-pop deletion.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+/// `pypy/objspace/std/dictmultiobject.py:101-102 W_DictMultiObject.delitem`
+/// — `w_dict.get_strategy().delitem(w_dict, w_key)`.  Dispatches
+/// through the polymorphic strategy slot so module dicts go through
+/// `ModuleDictStrategy::delitem` and regular dicts through
+/// `ObjectDictStrategy::delitem` (which honours W_DictObject's
+/// `dict_storage_proxy` storage-sync contract via
+/// `w_dict_delitem_object_strategy`).
+pub unsafe fn w_dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    w_dict_get_strategy(obj).delitem(obj, key)
+}
+
+/// Internal helper: `ObjectDictStrategy::delitem` body for pyre's
+/// W_DictObject — dstorage Vec scan + remove + len decrement + GC
+/// reporting via the `dict_storage_proxy` storage sync (str keys
+/// only).  Called only from the strategy trait impl to avoid
+/// recursion through `w_dict_delitem`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_delitem_object_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    let mut hit = false;
+    if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
+        entries.remove(idx);
+        dict.len -= 1;
+        hit = true;
+    }
+    // String-key delete must also flow into the storage proxy so
+    // `del module.__dict__[name]` and `globals().pop(name)` clear the
+    // backing namespace too.
+    if crate::is_str(key) && !dict.dict_storage_proxy.is_null() {
+        let key_str = crate::w_str_get_value(key);
+        if !hit && maybe_lookup_dict_storage(dict.dict_storage_proxy, key_str).is_some() {
+            hit = true;
+        }
+        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key_str);
+    }
+    hit
+}
+
+/// Internal helper: `ModuleDictStrategy::delitem` body for pyre's
+/// W_ModuleDictObject — `celldict.py:106-126`:
+///   * post-`switch_to_object_strategy`: walk unified dstorage Vec
+///     via `dict_keys_equal`, remove, mutated(), sync str keys
+///     back through proxy.
+///   * str fast path on fresh ModuleDictStrategy → delitem_str.
+///   * non-str + never-eq-str: fast-return false.
+///   * non-str otherwise: switch_to_object_strategy then walk.
+/// Called only from the strategy trait impl to avoid recursion
+/// through `w_dict_delitem`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    if w_module_dict_is_object_strategy(obj) {
+        let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
+        let entries = w_module_dict_object_storage_mut(obj);
+        if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
+            entries.remove(idx);
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+            if crate::is_str(key) {
+                maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+            }
+            return true;
+        }
+        return false;
+    }
+    if crate::is_str(key) {
+        return w_module_dict_delitem_str(obj, crate::w_str_get_value(key)).is_some();
+    }
+    if _never_equal_to_string(key) {
+        return false;
+    }
+    w_module_dict_switch_to_object_strategy(obj);
+    let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
+    let entries = w_module_dict_object_storage_mut(obj);
+    if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
+        entries.remove(idx);
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
+        if crate::is_str(key) {
+            maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
+        }
+        return true;
+    }
+    false
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:148-152 W_DictMultiObject.descr_clear`
+/// — `w_dict.get_strategy().clear(w_dict)`.  Dispatches through the
+/// polymorphic strategy slot.  Pyre wraps the dispatch with the
+/// `dict_storage_proxy` flush bookkeeping (`maybe_sync_dict_storage_delete`)
+/// so that `module.__dict__.clear()` / `globals().clear()` also empty
+/// the legacy str-keyed `DictStorage` shadow.  The proxy flush is a
+/// PRE-EXISTING-ADAPTATION; once `PyFrame.w_globals` migrates to
+/// `PyObjectRef` (Phase C-1), the shadow goes away and only the
+/// strategy.clear() body remains here.
+pub unsafe fn w_dict_clear(obj: PyObjectRef) {
+    let proxy = w_dict_get_dict_storage_proxy(obj);
+    // Snapshot str keys before strategy.clear so we can flush them
+    // out of the backing DictStorage in step with the W_DictMultiObject
+    // clear.  `dict.clear()` on `module.__dict__` must drain the
+    // frame-side `w_globals` carrier too.
+    let str_keys: Vec<String> = if proxy.is_null() {
+        Vec::new()
+    } else if let Some(items) = maybe_items_dict_storage(proxy) {
+        items.into_iter().map(|(k, _)| k).collect()
+    } else {
+        Vec::new()
+    };
+    w_dict_get_strategy(obj).clear(obj);
+    for k in str_keys {
+        maybe_sync_dict_storage_delete(proxy, &k);
+    }
+}
+
+/// Internal helper: `ObjectDictStrategy::clear` body for pyre's
+/// W_DictObject — truncates the dstorage Vec and resets the JIT
+/// inline length cache.  Called only from the strategy trait impl
+/// to avoid recursion through `w_dict_clear`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_clear_object_strategy(obj: PyObjectRef) {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.dstorage;
+    entries.clear();
+    dict.len = 0;
+}
+
+/// Internal helper: `ModuleDictStrategy::clear` body for pyre's
+/// W_ModuleDictObject — branches on `is_object_strategy` and drains
+/// whichever storage half is live.  Called only from the strategy
+/// trait impl to avoid recursion through `w_dict_clear`.  The proxy
+/// flush stays in the public `w_dict_clear` wrapper.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
+    if w_module_dict_is_object_strategy(obj) {
+        w_module_dict_object_storage_mut(obj).clear();
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
+    } else {
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        strategy.clear(storage);
+    }
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:107-109 W_DictMultiObject.length`
+/// — `return self.get_strategy().length(self)`.  Dispatches through
+/// the polymorphic strategy slot.
+pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
+    w_dict_get_strategy(obj).length(obj)
+}
+
+/// Internal helper: `ObjectDictStrategy::length` body for pyre's
+/// W_DictObject — reads the cached `len` field, reconciling with the
+/// `dict_storage_proxy` str-keyed view when attached.  Called only
+/// from the strategy trait impl to avoid recursion through
+/// `w_dict_len`.
+///
+/// Storage-authoritative for str keys when proxy is attached:
+/// returns the storage's str-key count plus any non-str-keyed
+/// `entries` Vec slots (storage is str-keyed by construction).  This
+/// avoids the stale-cache double-count `dict_storage_to_dict` would
+/// otherwise produce when a STORE_GLOBAL through the shared storage
+/// replaces a pre-existing entry — the dstorage Vec might still hold
+/// the old version, but storage owns the live count.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
+    let dict = &*(obj as *const W_DictObject);
+    if dict.dict_storage_proxy.is_null() {
+        return dict.len;
+    }
+    let entries = &*dict.dstorage;
+    let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
+        return dict.len;
+    };
+    let non_str = entries.iter().filter(|(k, _)| !crate::is_str(*k)).count();
+    storage_items.len() + non_str
+}
+
+/// Iterate over all (key, value) pairs without type assumptions.
+///
+/// Storage-authoritative for str keys when proxy is attached: emits
+/// the storage's str-keyed entries first, then any non-str-keyed
+/// `entries` Vec slots.  Stale str entries cached in the dstorage Vec
+/// (e.g. `dict_storage_to_dict` snapshot taken before a STORE_GLOBAL
+/// on the shared storage) are dropped in favour of the storage's
+/// live values.
+pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+    w_dict_get_strategy(obj).items(obj)
+}
+
+/// Internal helper: `ObjectDictStrategy::items` body for pyre's
+/// W_DictObject — clones the dstorage Vec or merges with the
+/// `dict_storage_proxy` str-keyed view.  Called only from the
+/// strategy trait impl to avoid recursion through `w_dict_items`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*dict.dstorage;
+    if dict.dict_storage_proxy.is_null() {
+        return entries.clone();
+    }
+    let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
+        return entries.clone();
+    };
+    let mut out: Vec<(PyObjectRef, PyObjectRef)> = storage_items
+        .into_iter()
+        .map(|(name, value)| (crate::w_str_new(&name), value))
+        .collect();
+    for &(k, v) in entries.iter() {
+        if !crate::is_str(k) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// Internal helper: `ModuleDictStrategy::items` body for pyre's
+/// W_ModuleDictObject — branches on `is_object_strategy` and emits
+/// from whichever storage half is live.  Called only from the
+/// strategy trait impl to avoid recursion through `w_dict_items`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        return entries.clone();
+    }
+    let strategy = &*w_module_dict_get_strategy(obj);
+    let storage = &*w_module_dict_get_storage(obj);
+    strategy
+        .getiterkeys(storage)
+        .zip(strategy.getitervalues(storage))
+        .map(|(k, v)| (crate::w_str_new(k), v))
+        .collect()
+}
+
+/// Iterate over (key_str, value) pairs. Keys must be str objects.
+///
+/// Pyre-only convenience wrapper around `w_dict_items` that drops
+/// non-str entries and unwraps the str keys.  Dispatches through
+/// the strategy slot via `w_dict_items`, so W_DictObject and
+/// W_ModuleDictObject both round-trip their dict_storage_proxy /
+/// celldict cell-cache walks uniformly.
+pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
+    w_dict_items(obj)
+        .into_iter()
+        .filter_map(|(k, v)| {
+            if crate::is_str(k) {
+                Some((crate::w_str_get_value(k).to_string(), v))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intobject::{w_int_get_value, w_int_new};
+    use crate::w_str_new;
+
+    #[test]
+    fn test_dict_int_key() {
+        let dict = w_dict_new();
+        unsafe {
+            assert!(is_dict(dict));
+            w_dict_setitem(dict, 1, w_int_new(100));
+            assert_eq!(w_int_get_value(w_dict_getitem(dict, 1).unwrap()), 100);
+        }
+    }
+
+    #[test]
+    fn test_dict_str_key() {
+        let dict = w_dict_new();
+        unsafe {
+            w_dict_setitem_str(dict, "hello", w_int_new(42));
+            assert_eq!(
+                w_int_get_value(w_dict_getitem_str(dict, "hello").unwrap()),
+                42
+            );
+            assert!(w_dict_getitem_str(dict, "world").is_none());
+        }
+    }
+
+    #[test]
+    fn test_dict_pyobj_key() {
+        let dict = w_dict_new();
+        let key = crate::w_str_new("test");
+        unsafe {
+            w_dict_store(dict, key, w_int_new(99));
+            assert_eq!(w_int_get_value(w_dict_lookup(dict, key).unwrap()), 99);
+        }
+    }
+
+    #[test]
+    fn test_dict_overwrite() {
+        let dict = w_dict_new();
+        unsafe {
+            w_dict_setitem(dict, 1, w_int_new(10));
+            w_dict_setitem(dict, 1, w_int_new(20));
+            assert_eq!(w_dict_len(dict), 1);
+        }
+    }
+
+    #[test]
+    fn w_dict_gc_type_id_matches_descr() {
+        assert_eq!(W_DICT_GC_TYPE_ID, 29);
+        assert_eq!(
+            <W_DictObject as crate::lltype::GcType>::TYPE_ID,
+            W_DICT_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_DictObject as crate::lltype::GcType>::SIZE,
+            W_DICT_OBJECT_SIZE
+        );
+    }
+
+    /// `dict_storage_proxy` attached but `register_dict_storage_items_hook`
+    /// has not yet been called (direct `w_module_new` callers,
+    /// hookless unit/integration tests).  The pre-fix code returned an
+    /// empty storage view from `maybe_items_dict_storage` and combined it
+    /// only with the *non-str* dstorage Vec slots, which silently dropped
+    /// every str key written through `w_dict_setitem_str`.  The current
+    /// behaviour treats the missing hook as "storage view indeterminate"
+    /// and falls back to the dstorage Vec, matching PyPy's
+    /// `W_DictMultiObject` single-source-of-truth semantics during the
+    /// hookless bootstrap window.
+    ///
+    /// pyre-object alone has no caller of
+    /// `register_dict_storage_items_hook`, so within `cargo test -p
+    /// pyre-object` the hook stays null for the lifetime of the test
+    /// process — the assertion is therefore stable here.
+    #[test]
+    fn test_w_dict_proxied_hookless_falls_back_to_entries_vec() {
+        let dict = w_dict_new();
+        unsafe {
+            // Non-null sentinel; the hook never fires because no hook
+            // has been registered, so the pointer's pointee is never
+            // dereferenced.
+            let sentinel: *mut u8 = 0xdead_beef_usize as *mut u8;
+            w_dict_set_dict_storage_proxy(dict, sentinel);
+
+            w_dict_setitem_str(dict, "alpha", w_int_new(1));
+            w_dict_setitem_str(dict, "beta", w_int_new(2));
+
+            assert_eq!(
+                w_dict_len(dict),
+                2,
+                "hookless proxied dict must expose the dstorage Vec count, not 0",
+            );
+
+            let items = w_dict_items(dict);
+            assert_eq!(items.len(), 2);
+            let mut keys: Vec<&str> = items
+                .iter()
+                .map(|&(k, _)| crate::w_str_get_value(k))
+                .collect();
+            keys.sort();
+            assert_eq!(keys, vec!["alpha", "beta"]);
+
+            let mut str_entries = w_dict_str_entries(dict);
+            str_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(str_entries.len(), 2);
+            assert_eq!(str_entries[0].0, "alpha");
+            assert_eq!(w_int_get_value(str_entries[0].1), 1);
+            assert_eq!(str_entries[1].0, "beta");
+            assert_eq!(w_int_get_value(str_entries[1].1), 2);
+        }
+    }
+
+    #[test]
+    fn module_dict_basic_roundtrip() {
+        let md = w_module_dict_new();
+        unsafe {
+            assert!(is_module_dict(md));
+            // PyPy surfaces both as `dict` (`dictmultiobject.py:67
+            // allocate_instance(..., space.w_dict)`), so the
+            // user-visible `is_dict` covers the module-dict layout.
+            assert!(is_dict(md));
+            w_module_dict_setitem_str(md, "x", w_int_new(1));
+            w_module_dict_setitem_str(md, "y", w_int_new(2));
+            assert_eq!(w_module_dict_length(md), 2);
+            assert_eq!(
+                w_int_get_value(w_module_dict_getitem_str(md, "x").unwrap()),
+                1,
+            );
+            assert_eq!(
+                w_int_get_value(w_module_dict_getitem_str(md, "y").unwrap()),
+                2,
+            );
+            let removed = w_module_dict_delitem_str(md, "x").unwrap();
+            assert_eq!(w_int_get_value(removed), 1);
+            assert_eq!(w_module_dict_length(md), 1);
+            assert!(w_module_dict_getitem_str(md, "x").is_none());
+        }
+    }
+
+    #[test]
+    fn module_dict_routes_through_w_dict_dispatch() {
+        // Confirms `w_dict_*` public ops dispatch through the
+        // `W_ModuleDictObject` branch when given a module dict, so
+        // existing callers that take `PyObjectRef` continue to work
+        // without knowing which layout backs the dict.
+        let md = w_module_dict_new();
+        unsafe {
+            w_dict_setitem_str(md, "alpha", w_int_new(11));
+            w_dict_setitem_str(md, "beta", w_int_new(22));
+            assert_eq!(w_dict_len(md), 2);
+            assert_eq!(
+                w_int_get_value(w_dict_getitem_str(md, "alpha").unwrap()),
+                11,
+            );
+            assert_eq!(
+                w_int_get_value(w_dict_lookup(md, w_str_new("beta")).unwrap()),
+                22,
+            );
+            assert!(w_dict_delitem_str(md, "alpha"));
+            assert!(w_dict_getitem_str(md, "alpha").is_none());
+            assert_eq!(w_dict_len(md), 1);
+        }
+    }
+
+    #[test]
+    fn module_dict_gc_type_id_matches_descr() {
+        // Trip-wire mirroring the W_CELL / W_INT / W_FLOAT guards —
+        // panics on startup if the constant here drifts from the id
+        // that `pyre/pyre-jit/src/eval.rs` asserts at JitDriver init.
+        assert_eq!(W_MODULE_DICT_GC_TYPE_ID, 48);
+        assert_eq!(
+            <W_ModuleDictObject as crate::lltype::GcType>::TYPE_ID,
+            W_MODULE_DICT_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_ModuleDictObject as crate::lltype::GcType>::SIZE,
+            W_MODULE_DICT_OBJECT_SIZE
+        );
+    }
+}

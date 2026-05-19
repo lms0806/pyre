@@ -5,7 +5,7 @@ use pyre_object::object_array::{
 };
 use std::sync::OnceLock;
 
-use crate::{PyFrame, new_builtin_dict_storage};
+use crate::PyFrame;
 
 fn trace_frame_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
@@ -112,7 +112,11 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     let w_frame = pyre_object::w_instance_new(trace_frame_type());
     unsafe {
         let frame_ref = &mut *frame;
-        let w_globals = frame_ref.get_w_globals();
+        // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
+        // (already a W_DictObject).  Pyre's eager `w_globals_obj` slot
+        // matches that identity; reading it here avoids a second
+        // `dict_storage_to_dict` round-trip below.
+        let w_globals_obj = frame_ref.get_w_globals_obj();
         let w_locals = frame_ref.get_w_locals();
         let w_trace = frame_ref.get_w_f_trace();
         // pypy/interpreter/pyframe.py:154 fget_f_back walks the
@@ -142,10 +146,10 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         let _ = crate::baseobjspace::setattr(
             w_frame,
             "f_globals",
-            if w_globals.is_null() {
+            if w_globals_obj.is_null() {
                 pyre_object::w_none()
             } else {
-                crate::baseobjspace::dict_storage_to_dict(w_globals as *const DictStorage)
+                w_globals_obj
             },
         );
         let _ = crate::baseobjspace::setattr(
@@ -466,7 +470,7 @@ impl DictStorage {
         self.slot_watchers.push(Vec::new());
         if !self.mirror_target.is_null() {
             unsafe {
-                pyre_object::dictobject::w_dict_setitem_str_no_proxy(
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     self.mirror_target,
                     name,
                     value,
@@ -499,7 +503,7 @@ impl DictStorage {
         // `self`.
         if !self.mirror_target.is_null() {
             unsafe {
-                pyre_object::dictobject::w_dict_setitem_str_no_proxy(
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     self.mirror_target,
                     &name,
                     value,
@@ -523,7 +527,7 @@ impl DictStorage {
         };
         if !self.mirror_target.is_null() {
             unsafe {
-                pyre_object::dictobject::w_dict_delitem_str_no_proxy(self.mirror_target, name);
+                pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(self.mirror_target, name);
             }
         }
         result
@@ -643,7 +647,20 @@ pub struct ExecutionContext {
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
     pub actionflag: ActionFlag,
-    builtins: DictStorage,
+    /// `pypy/objspace/std/dictmultiobject.py:60-69
+    /// allocate_and_init_instance(module=True)` parity — the builtins
+    /// module's `w_dict` is a `W_ModuleDictObject` backed by
+    /// `ModuleDictStrategy` (`celldict.py:28`).  Populated once at
+    /// construction time; pinned with `pin_root` so the strategy
+    /// storage survives the EC's lifetime.
+    builtins_module: PyObjectRef,
+    // `space.builtin.w_dict` is a single W_ModuleDictObject in PyPy
+    // (`pypy/interpreter/baseobjspace.py:642`).  Pyre used to keep a
+    // parallel `builtins: DictStorage` snapshot here as the seed for
+    // `fresh_dict_storage`, but that snapshot froze the builtin set at
+    // EC construction time — runtime mutations to `__builtins__`
+    // weren't visible to new frames.  Reading the live storage from
+    // `builtins_module` each call removes the double-storage gap.
     /// Cached dict wrapper over `self.builtins` — pyframe.py:200-204
     /// `space.builtin` returns the same object every call.
     builtin_dict_cache: std::cell::Cell<PyObjectRef>,
@@ -671,6 +688,8 @@ impl ExecutionContext {
         // floor.  `Once` makes this idempotent across multiple ECs.
         static HOOKS_INSTALLED: std::sync::Once = std::sync::Once::new();
         HOOKS_INSTALLED.call_once(crate::call::install_dict_storage_hooks);
+        let builtins_module = crate::builtins::new_builtin_module_dict();
+        pyre_object::gc_roots::pin_root(builtins_module);
         Self {
             space: pyre_object::PY_NULL,
             topframeref: std::ptr::null_mut(),
@@ -682,7 +701,7 @@ impl ExecutionContext {
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
             actionflag: ActionFlag::new(),
-            builtins: new_builtin_dict_storage(),
+            builtins_module,
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
         }
@@ -1428,24 +1447,28 @@ impl ExecutionContext {
     /// `Box::into_raw` so it can be shared across frames as a raw
     /// pointer.
     pub fn fresh_dict_storage(&self) -> DictStorage {
-        // Clone the EC's builtins storage so every new frame's globals
-        // start with all builtins inlined (`print`, `abs`, ...).  The
-        // dedicated `__builtins__` slot is then overwritten with the
-        // picked Module identity — `pyopcode.py:773-774` /
-        // `moduledef.py:89-109 pick_builtin` look it up via
-        // `space.getitem(w_globals, '__builtins__')` and expect a
-        // Module (or dict subclass) reference, not a raw storage view.
+        // Read the live builtins from `self.builtins_module` so any
+        // runtime mutation of `__builtins__` is visible to subsequent
+        // frame globals — PyPy's `space.builtin.w_dict` is a single
+        // source of truth (`pypy/interpreter/baseobjspace.py:642`),
+        // and `pick_builtin` (`moduledef.py:89-109`) consults that
+        // same dict on every LOAD_GLOBAL fallback.
         //
-        // The clone (vs. the simpler "seed only `__builtins__` and let
-        // LOAD_GLOBAL fall back to `frame.builtin`") is load-bearing
-        // for JIT-compiled trace stability: traces that read globals
-        // by name see the entries vector populated up-front, and the
-        // shape stays stable across frames so bridges can reconnect to
-        // the parent loop.  An empty-globals start triggers per-frame
-        // shape divergence and bridge-to-parent reconnect failures
-        // that cascade into blackhole interpretation of the whole
-        // user loop.
-        let mut ns = self.builtins.clone();
+        // The seed-vs-fallback choice is load-bearing for JIT-compiled
+        // trace stability: traces that read globals by name see the
+        // entries vector populated up-front, and the shape stays
+        // stable across frames so bridges can reconnect to the parent
+        // loop.  An empty-globals start triggers per-frame shape
+        // divergence and bridge-to-parent reconnect failures that
+        // cascade into blackhole interpretation of the whole user
+        // loop — that's the JIT-stability adaptation pyre keeps on
+        // top of upstream's lazy lookup.
+        let mut ns = DictStorage::new();
+        unsafe {
+            for (k, v) in pyre_object::w_dict_str_entries(self.builtins_module) {
+                crate::dict_storage_store(&mut ns, &k, v);
+            }
+        }
         let w_builtin = self.get_builtin();
         if !w_builtin.is_null() {
             crate::dict_storage_store(&mut ns, "__builtins__", w_builtin);
@@ -1455,7 +1478,7 @@ impl ExecutionContext {
 
     /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
     /// is a `Module` (not a dict).  Lazily build a `W_ModuleObject` whose
-    /// backing storage IS `self.builtins`, so subsequent
+    /// backing dict IS `self.builtins_module`, so subsequent
     /// `module.getdict(space)` access (`pyframe.py:770 fget_f_builtins`)
     /// surfaces the same storage as a dict view.  The cache field stores
     /// the Module identity so identity-sensitive callers (PyPy
@@ -1466,26 +1489,29 @@ impl ExecutionContext {
         if !cached.is_null() {
             return cached;
         }
-        let ns_ptr = &self.builtins as *const DictStorage as *mut u8;
-        // PyPy `module.py:77 Module.getdict()` parity: single
-        // `W_DictMultiObject` per storage.  Reuse the canonical
-        // W_DictObject already paired (via `dict_storage_to_dict`'s
-        // lazy mirror_target registration) instead of allocating a
-        // fresh one through `w_module_new` (which would create a
-        // sibling W_DictObject and conflict with any earlier
-        // `dict_storage_to_dict` call on this storage).  The cast
-        // strips `&self` const; safe because the EC keeps `self.builtins`
-        // alive for the program's lifetime and `mirror_target` is the
-        // only field touched.
-        let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr as *const DictStorage);
-        // `module.py:24 self.setdictvalue(space, '__name__', w_name)` —
-        // a single setitem inside `Module.__init__`.  Pyre routes that
-        // seed through `w_module_new_aliasing_dict`, which performs the
-        // setitem on the supplied W_DictObject when `name` is non-empty.
-        // Issuing a second `w_dict_setitem_str` here would be an extra
-        // storage-watcher invalidation with no PyPy counterpart.
-        let module = pyre_object::w_module_new_aliasing_dict("builtins", ns_ptr, canonical);
+        // `pypy/interpreter/module.py:Module.__init__` — `space.builtin`
+        // is a `Module` whose `w_dict` is the `W_ModuleDictObject`
+        // allocated by `allocate_and_init_instance(module=True)`
+        // (`dictmultiobject.py:60-69`).  Pyre's
+        // `new_builtin_module_dict` already populated the
+        // W_ModuleDictObject in `self.builtins_module`; wrap it
+        // through `w_module_new_aliasing_dict` without a raw storage
+        // pointer (the strategy storage IS the canonical store).
+        let module = pyre_object::w_module_new_aliasing_dict(
+            "builtins",
+            std::ptr::null_mut(),
+            self.builtins_module,
+        );
         self.builtin_dict_cache.set(module);
+        // `pypy/interpreter/baseobjspace.py:647` —
+        // `self.setitem(self.builtin.w_dict, 'builtins',  w_builtin)`.
+        // After the builtins module exists, install the self-reference
+        // so `__builtins__.__builtins__ is __builtins__` and
+        // user-level `import builtins; builtins.__builtins__` round-trips
+        // through `space.builtin.w_dict[__builtins__]`.
+        unsafe {
+            pyre_object::w_dict_setitem_str(self.builtins_module, "__builtins__", module);
+        }
         module
     }
 
@@ -1496,15 +1522,13 @@ impl ExecutionContext {
     /// when the frame's `w_globals` lacks the name (pypy/interpreter/
     /// pyopcode.py:558-565 LOAD_GLOBAL builtin fallback).
     pub fn lookup_builtin(&self, name: &str) -> Option<PyObjectRef> {
-        crate::dict_storage_get(&self.builtins, name)
-    }
-
-    /// Default storage that `pick_builtin` selects when `globals
-    /// ['__builtins__']` is absent — equivalent to PyPy's
-    /// `space.builtin` fallback in `pick_builtin` (`pypy/module/
-    /// __builtin__/moduledef.py:107-109`).
-    pub fn builtins_storage_ptr(&self) -> *mut DictStorage {
-        &self.builtins as *const DictStorage as *mut DictStorage
+        // `pypy/interpreter/pyopcode.py:558-565 LOAD_GLOBAL` builtin
+        // fallback reads through the builtin Module's W_DictObject
+        // (`space.getitem(space.builtin.w_dict, name)`).  Pyre's
+        // `builtins_module` IS that W_ModuleDictObject; the
+        // dispatching `w_dict_getitem_str` routes through
+        // `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).
+        unsafe { pyre_object::w_dict_getitem_str(self.builtins_module, name) }
     }
 }
 

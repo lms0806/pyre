@@ -267,7 +267,44 @@ pub fn function_new_with_closure(
     w_func_globals: *mut DictStorage,
     closure: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, closure, true)
+    function_new_impl(
+        &FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals,
+        PY_NULL,
+        closure,
+        true,
+    )
+}
+
+/// `pypy/interpreter/function.py:54-57 Function.__init__` —
+/// `self.w_func_globals = w_globals` stores the user-visible
+/// `__globals__` dict object directly.  Use this entry point when
+/// the caller already has the canonical `PyObjectRef` (e.g. MAKE_FUNCTION
+/// dispatched from a frame whose `w_globals_obj` is resolved); it
+/// bypasses `function_new_impl`'s lazy `dict_storage_to_dict`
+/// resolution so the function's `__globals__` identity IS the supplied
+/// PyObjectRef from the moment of construction.
+///
+/// `w_func_globals_obj` may be `PY_NULL` — falls back to the lazy
+/// resolution path then.
+pub fn function_new_with_globals_obj(
+    code: *const (),
+    name: String,
+    w_func_globals: *mut DictStorage,
+    w_func_globals_obj: PyObjectRef,
+    closure: PyObjectRef,
+) -> PyObjectRef {
+    function_new_impl(
+        &FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals,
+        w_func_globals_obj,
+        closure,
+        true,
+    )
 }
 
 fn function_new_impl(
@@ -275,6 +312,7 @@ fn function_new_impl(
     code: *const (),
     name: String,
     w_func_globals: *mut DictStorage,
+    w_func_globals_obj_hint: PyObjectRef,
     closure: PyObjectRef,
     can_change_code: bool,
 ) -> PyObjectRef {
@@ -304,7 +342,16 @@ fn function_new_impl(
     // step of Phase 5 commit 3 — collapsing the dual storage to
     // a single `PyObjectRef` field requires that every Function
     // already has its `__globals__` resolved at construction time.
-    let w_func_globals_obj = if w_func_globals.is_null() {
+    // Prefer the explicit `PyObjectRef` hint when the caller already
+    // resolved the canonical `__globals__` identity (MAKE_FUNCTION
+    // dispatched from a frame whose `w_globals_obj` is populated, or
+    // a builtin module's loader handing in the `W_ModuleDictObject`).
+    // Fall back to the legacy lazy `dict_storage_to_dict` resolution
+    // for synthetic test stubs and callers that have only the raw
+    // storage pointer.
+    let w_func_globals_obj = if !w_func_globals_obj_hint.is_null() {
+        w_func_globals_obj_hint
+    } else if w_func_globals.is_null() {
         PY_NULL
     } else {
         crate::baseobjspace::dict_storage_to_dict(w_func_globals)
@@ -353,7 +400,15 @@ pub fn function_new_with_fixed_code(
     name: String,
     w_func_globals: *mut DictStorage,
 ) -> PyObjectRef {
-    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, PY_NULL, false)
+    function_new_impl(
+        &FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals,
+        PY_NULL,
+        PY_NULL,
+        false,
+    )
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -368,6 +423,7 @@ pub fn function_new_builtin(
         code,
         name,
         w_func_globals,
+        PY_NULL,
         PY_NULL,
         false,
     )
@@ -1338,23 +1394,40 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// After fdel___module__ writes w_none(), subsequent reads return
 /// None without re-computing from globals.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre stores `w_func_globals` as a raw
-/// `*mut DictStorage` rather than a wrapped `W_DictObject`, so the
-/// upstream `space.is_w(self.w_func_globals, space.w_None)` arm at
-/// `function.py:505` collapses into the single null-pointer check
-/// here.  Phase 5 collapses the storage / W_DictObject split, after
-/// which the upstream arm-for-arm shape becomes expressible.
+/// Phase 5 cutover: reach for `w_func_globals_obj` (the canonical
+/// PyObjectRef the user actually sees via `__globals__`) and route
+/// through `w_dict_getitem_str`, which dispatches `is_module_dict`
+/// to `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).
+/// Falls back to the legacy raw-DictStorage read only when the
+/// PyObjectRef hasn't been resolved yet (synthetic test stubs).
 #[inline]
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *mut Function;
         // function.py:504: if self.w_module is None
         if (*func).w_module.is_null() {
-            // function.py:505-506: globals.get("__name__")
-            let globals = (*func).w_func_globals;
-            if !globals.is_null() {
+            // function.py:505-506: space.call_method(self.w_func_globals,
+            // "get", space.newtext("__name__"))
+            let w_globals_obj = (*func).w_func_globals_obj;
+            if !w_globals_obj.is_null() && !pyre_object::is_none(w_globals_obj) {
+                // Dispatch through `dict.get` so dict subclasses that
+                // override `get` are observed.  When the lookup yields
+                // PY_NULL we fall back to `space.w_None` per the
+                // upstream attribute-not-found branch.
+                let name_key = pyre_object::w_str_new("__name__");
+                let result = crate::baseobjspace::call_method(w_globals_obj, "get", &[name_key]);
                 function_write_barrier(obj);
-                (*func).w_module = (*globals)
+                (*func).w_module = if result.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    result
+                };
+            } else if !(*func).w_func_globals.is_null() {
+                // Legacy `*mut DictStorage` fast-path for synthetic
+                // test stubs (`function_new` callers that skip
+                // `dict_storage_to_dict` lazy resolution).
+                function_write_barrier(obj);
+                (*func).w_module = (*(*func).w_func_globals)
                     .get("__name__")
                     .copied()
                     .unwrap_or(pyre_object::w_none());

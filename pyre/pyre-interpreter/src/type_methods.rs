@@ -1792,15 +1792,25 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
 
 /// If dict has a dict_storage_proxy (i.e. it was returned by `globals()`),
 /// sync all str-keyed entries back to the DictStorage.
+///
+/// For `W_ModuleDictObject` every str-keyed write already fires
+/// `maybe_sync_dict_storage_store` through `w_module_dict_setitem_str`
+/// (`dictmultiobject.rs:362-398`), so the redundant walk would only
+/// duplicate work — and would mis-cast the module-dict layout to the
+/// regular `W_DictObject` shape (different field offsets for
+/// `entries` / `dstorage`).  Early-return for module dicts.
 fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
     unsafe {
+        if pyre_object::dictmultiobject::is_module_dict(dict) {
+            return;
+        }
         let ns_ptr = pyre_object::w_dict_get_dict_storage_proxy(dict);
         if ns_ptr.is_null() {
             return;
         }
         let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-        let dict_obj = &*(dict as *const pyre_object::dictobject::W_DictObject);
-        let entries = &*dict_obj.entries;
+        let dict_obj = &*(dict as *const pyre_object::dictmultiobject::W_DictObject);
+        let entries = &*dict_obj.dstorage;
         for &(k, v) in entries {
             if pyre_object::is_str(k) {
                 let name = pyre_object::w_str_get_value(k);
@@ -1829,7 +1839,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
                 // `d.pop(int_key)` actually removes the entry
                 // instead of the previous str-only branch silently
                 // leaving the dict mutated only by happenstance.
-                pyre_object::dictobject::w_dict_delitem(dict, key);
+                pyre_object::dictmultiobject::w_dict_delitem(dict, key);
                 return Ok(val);
             }
         }
@@ -1870,7 +1880,7 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             .last()
             .copied()
             .ok_or_else(|| crate::PyError::key_error("dictionary is empty"))?;
-        pyre_object::dictobject::w_dict_delitem(dict, k);
+        pyre_object::dictmultiobject::w_dict_delitem(dict, k);
         Ok(pyre_object::w_tuple_new(vec![k, v]))
     }
 }

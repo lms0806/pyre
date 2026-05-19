@@ -118,12 +118,103 @@ fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
+/// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` key
+/// equality bridge: ObjectDictStrategy stores its dstorage as
+/// `r_dict(space.eq_w, space.hash_w)` so user `__eq__` is honoured on
+/// lookup.  pyre-object cannot depend on pyre-interpreter for the
+/// dispatch, so this trampoline routes through
+/// `pyre_interpreter::baseobjspace::eq_w` (line-by-line port of
+/// `baseobjspace.py:823-825 W_ObjectSpace.eq_w`).  Registered at
+/// JIT init so all subsequent `dict_keys_equal` calls reach the full
+/// comparison protocol.
+unsafe fn pyre_object_eq_w_trampoline(
+    a: pyre_object::PyObjectRef,
+    b: pyre_object::PyObjectRef,
+) -> bool {
+    pyre_interpreter::baseobjspace::eq_w(a, b)
+}
+
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictobject::W_DictObject) };
-    let entries = unsafe { &mut *dict.entries };
+    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
+    let entries = unsafe { &mut *dict.dstorage };
     for (key, value) in entries.iter_mut() {
         f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// Custom trace for `W_ModuleDictObject`
+/// (`dictmultiobject.py:328 W_ModuleDictObject`).
+///
+/// PyPy's tracer follows `W_DictMultiObject.dstorage` (a real
+/// RPython `{str: cell_or_value}` dict) plus
+/// `ModuleDictStrategy.caches` (the per-name `GlobalCache` registry
+/// whose `cell` fields hold live values).  Pyre's W_ModuleDictObject
+/// carries four indirect storages behind raw pointers — none of them
+/// reachable through inline `gc_ptr_offsets`:
+///
+///   * `dstorage` → `ModuleDictStorage.entries` (Vec<(String,
+///     PyObjectRef)>) — every entry's value
+///   * `mstrategy` → `ModuleDictStrategy.caches` (Option<HashMap<...,
+///     Rc<RefCell<GlobalCache>>>>) — every live cache's `cell`
+///   * `object_storage` → post-`switch_to_object_strategy`
+///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
+///
+/// `dict_storage_proxy` points at a `DictStorage` (interpreter-side
+/// allocation, not GC-managed) and is traced through its W_DictObject
+/// counterpart, not from here.
+unsafe fn module_dict_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
+    if !md.dstorage.is_null() {
+        let storage = unsafe { &mut *md.dstorage };
+        for value in storage.iter_values_mut() {
+            f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+    }
+    if !md.object_storage.is_null() {
+        let object_storage = unsafe { &mut *md.object_storage };
+        for (key, value) in object_storage.iter_mut() {
+            f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+    }
+    if !md.mstrategy.is_null() {
+        let strategy = unsafe { &mut *md.mstrategy };
+        if let Some(caches) = strategy.caches.as_mut() {
+            for cache in caches.values() {
+                trace_global_cache(cache, f);
+            }
+        }
+    }
+}
+
+/// `celldict.py:261-277 GlobalCache`: walk both `cell` and the chained
+/// `builtincache` so the GC follows every live `PyObjectRef` reachable
+/// through the cache graph.  Under pyre's honor__builtins__=True
+/// equivalence `builtincache` is currently always `None`
+/// (`ModuleDictStrategy::get_global_cache` skips the install per
+/// `celldict.py:224`), but the trace mirrors the PyPy object graph
+/// shape so a future flip to honor=False — or a non-pyre embedder
+/// supplying its own `space.builtin.w_dict` — keeps every nested
+/// cell visible to the GC without further tracer edits.
+unsafe fn trace_global_cache(
+    cache: &std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let mut c = cache.borrow_mut();
+    if let Some(cell) = c.cell.as_mut() {
+        f(cell as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+    if let Some(builtincache) = c.builtincache.clone() {
+        // Drop the outer borrow before recursing — `borrow_mut` on the
+        // same RefCell would panic, but `builtincache` always points
+        // at a DIFFERENT GlobalCache instance per `celldict.py:236
+        // builtin_strategy.get_global_cache(w_builtin_dict, key)`.
+        drop(c);
+        trace_global_cache(&builtincache, f);
     }
 }
 
@@ -171,9 +262,10 @@ use crate::jit::descr::{
     W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
     W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
     W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
-    W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID,
-    W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_STR_GC_TYPE_ID,
-    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
+    W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
+    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
+    W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID,
+    W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -848,7 +940,7 @@ thread_local! {
         // hook so the GC updates those indirect key/value slots just as it
         // updates inline object fields.
         let w_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::dictobject::W_DictObject>(),
+            std::mem::size_of::<pyre_object::dictmultiobject::W_DictObject>(),
             object_tid,
             dict_object_custom_trace,
         ));
@@ -1236,6 +1328,89 @@ thread_local! {
             );
             pytype_to_tid.insert(pytype_ptr, tid);
         }
+        // `pypy/objspace/std/dictmultiobject.py:328 W_ModuleDictObject`
+        // — module / globals dict carrying its own storage + strategy
+        // pair (the celldict.py:ModuleDictStrategy port).  Separate GC
+        // tid (`W_MODULE_DICT_GC_TYPE_ID=48`) so the allocator can tell
+        // module dicts apart from regular dicts even though both
+        // surface as Python's `dict` via the `MODULE_DICT_TYPE` static.
+        // Registered after the foreign_pytypes loop so it occupies the
+        // tail slot 48, one past the five tids the loop assigns to
+        // NONE_TYPE (43), NOTIMPLEMENTED_TYPE (44), ELLIPSIS_TYPE (45),
+        // CODE_TYPE (46) and PYTRACEBACK_TYPE (47); placing it between
+        // W_DICT and W_SET would shift every subsequent tid by one and
+        // break descr ↔ GC tid correspondence.
+        // W_ModuleDictObject carries `dstorage: *mut ModuleDictStorage`
+        // (`Vec<(String, PyObjectRef)>` of cells / raw values),
+        // `mstrategy: *mut ModuleDictStrategy` (whose `caches`
+        // GlobalCache.cell fields hold live cells), and
+        // `object_storage: *mut Vec<(PyObjectRef, PyObjectRef)>` (active
+        // after `switch_to_object_strategy`).  Register a custom trace
+        // hook so the GC walks all three indirect storages — matching
+        // the W_DictObject pattern at line 851.
+        let w_module_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
+            object_tid,
+            module_dict_object_custom_trace,
+        ));
+        debug_assert_eq!(w_module_dict_tid, W_MODULE_DICT_GC_TYPE_ID);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::dictmultiobject::MODULE_DICT_TYPE as *const _ as usize,
+            w_module_dict_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::dictmultiobject::MODULE_DICT_TYPE as *const _ as usize,
+            w_module_dict_tid,
+        );
+        // `pypy/objspace/std/typeobject.py:22-71` cell layer:
+        // `MutableCell` subclasses (`ObjectMutableCell`,
+        // `IntMutableCell`) live inside `ModuleDictStorage` entries
+        // and are unwrapped on the way out of the strategy.  They
+        // never surface to user code so the static `PyType`s are
+        // internal-only; allocate distinct GC tids so the bump
+        // allocator can size them independently.
+        //
+        // `W_ObjectMutableCell.w_value` is a live `PyObjectRef` field
+        // that must be traced during minor collection — otherwise the
+        // wrapped value could be reclaimed while a still-installed
+        // cell holds the pointer.  Mirrors `W_CellObject`'s
+        // `contents` registration (`cellobject.rs:42`).
+        let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::celldict::W_ObjectMutableCell>(),
+            object_tid,
+            pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
+        ));
+        debug_assert_eq!(
+            w_object_mutable_cell_tid,
+            pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
+            w_object_mutable_cell_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
+            w_object_mutable_cell_tid,
+        );
+        let w_int_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::celldict::W_IntMutableCell>(),
+            object_tid,
+        ));
+        debug_assert_eq!(
+            w_int_mutable_cell_tid,
+            pyre_object::celldict::W_INT_MUTABLE_CELL_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::celldict::INT_MUTABLE_CELL_TYPE as *const _ as usize,
+            w_int_mutable_cell_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::celldict::INT_MUTABLE_CELL_TYPE as *const _ as usize,
+            w_int_mutable_cell_tid,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges
@@ -1287,6 +1462,10 @@ thread_local! {
             pyre_object_gc_current_object_address_trampoline,
         );
         pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
+        // Fix 9 — `dictmultiobject.py:1209 ObjectDictStrategy` key
+        // dispatch: register the `space.eq_w` trampoline so
+        // `dict_keys_equal` honours user-defined `__eq__`.
+        pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
         // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots
         // come from manual `pyre_object::gc_roots::pin_root` calls
@@ -1952,11 +2131,14 @@ pub fn set_param(
         }
     }
 
-    // interp_jit.py:157-167 — keyword arguments
+    // interp_jit.py:157-167 — keyword arguments.  Routed through
+    // strategy-dispatched `w_dict_items` (dictmultiobject.py:308 items)
+    // rather than reaching past the strategy slot into `dstorage` —
+    // the raw cast would tear once a non-Object strategy backs `kwds`.
     if let Some(kw_dict) = kwds {
         let ws = driver.meta_interp_mut().warm_state_mut();
-        let d = unsafe { &*(kw_dict as *const pyre_object::dictobject::W_DictObject) };
-        for &(k, v) in unsafe { &*d.entries } {
+        let items = unsafe { pyre_object::dictmultiobject::w_dict_items(kw_dict) };
+        for (k, v) in items {
             if !unsafe { pyre_object::is_str(k) } {
                 continue;
             }

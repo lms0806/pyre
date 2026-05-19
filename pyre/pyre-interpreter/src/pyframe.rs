@@ -111,23 +111,28 @@ pub struct PyFrame {
     /// `pyopcode.py:773-774`) see the picked Module, not the EC's
     /// default builtin.
     pub w_builtin: PyObjectRef,
-    /// Lazy-resolved canonical W_DictObject for `self.w_globals`.
-    ///
     /// `pypy/interpreter/pyframe.py:49 self.w_globals = w_globals`
-    /// stores the dict object directly — PyPy never carries a parallel
-    /// raw storage handle.  Pyre's split DictStorage / W_DictObject
-    /// model keeps the storage pointer in `w_globals` (the JIT layout
-    /// offset reads it for STORE/LOAD_GLOBAL), and this slot caches
-    /// the canonical sibling W_DictObject so `frame.w_globals_obj()`
-    /// resolves to the same identity as `function.__globals__` and
-    /// `module.__dict__`.  Initialised lazily — `PY_NULL` until the
-    /// first reader calls `get_w_globals_obj()`, which performs the
-    /// `dict_storage_to_dict` lookup once and stores the result here.
-    /// Migration milestone for the eventual `w_globals: PyObjectRef`
-    /// type unification (Phase 5+ Task 1) — once every reader (incl.
-    /// JIT vable replay) routes through this slot, the raw storage
-    /// pointer becomes derivable from the W_DictObject's
-    /// `dict_storage_proxy` and the legacy field can retire.
+    /// — the canonical W_DictObject paired with this frame's globals.
+    /// PyPy's frame carries only this slot; pyre keeps an adjacent
+    /// raw `*mut DictStorage` (`self.w_globals` above) because the
+    /// JIT vable layout reads STORE/LOAD_GLOBAL through a fixed byte
+    /// offset (`PYFRAME_W_GLOBALS_OFFSET`).
+    ///
+    /// **Population**: eagerly resolved at frame construction (per
+    /// `new_with_namespace` + `new_jit_test`) by calling
+    /// `dict_storage_to_dict(w_globals)`.  `pyframe.py:98 __init__`'s
+    /// `self.w_globals = w_globals` identity invariant — every reader
+    /// after construction observes the same W_DictObject across the
+    /// frame's lifetime.  `get_w_globals_obj()`'s null-check arm
+    /// remains as a safety net for synthetic test stubs that hand-build
+    /// PyFrame without going through the canonical constructors.
+    ///
+    /// **Convergence (Phase C-1)**: once every JIT consumer of
+    /// `PYFRAME_W_GLOBALS_OFFSET` (state.rs:3581 etc.) migrates to
+    /// reading PyObjectRef + chasing the W_ModuleDictObject's
+    /// `dict_storage_proxy` for STORE/LOAD_GLOBAL slot indexing, the
+    /// `w_globals` field above can be retired and this slot renamed
+    /// `w_globals` to fully match PyPy's `pyframe.py:49` shape.
     pub w_globals_obj: PyObjectRef,
 }
 
@@ -923,6 +928,17 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
         let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+        // `pyframe.py:98 __init__(self, space, code, w_globals, ...)`
+        // stores `w_globals` as the canonical W_DictObject directly.
+        // Pyre carries both the raw storage pointer (`w_globals`) and
+        // the W_DictObject (`w_globals_obj`); eager resolution at
+        // frame construction matches PyPy's `self.w_globals = w_globals`
+        // identity invariant without waiting for the first reader.
+        let w_globals_obj = if w_globals.is_null() {
+            PY_NULL
+        } else {
+            crate::baseobjspace::dict_storage_to_dict(w_globals)
+        };
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -941,7 +957,7 @@ impl PyFrame {
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
             w_builtin,
-            w_globals_obj: PY_NULL,
+            w_globals_obj,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -1031,6 +1047,14 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
         let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+        // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores
+        // the W_DictObject directly; eager `dict_storage_to_dict`
+        // mirrors the identity invariant on pyre's split layout.
+        let w_globals_obj = if w_globals.is_null() {
+            PY_NULL
+        } else {
+            crate::baseobjspace::dict_storage_to_dict(w_globals)
+        };
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -1049,7 +1073,7 @@ impl PyFrame {
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
             w_builtin,
-            w_globals_obj: PY_NULL,
+            w_globals_obj,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -2347,6 +2371,18 @@ pub fn createframe(
 
     let size = num_locals + num_cells + max_stack;
     let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+    // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores the
+    // dict object directly so `frame.w_globals` retains object identity
+    // for the lifetime of the frame.  pyre's split layout pairs the raw
+    // `*mut DictStorage` with the canonical W_DictObject via
+    // `dict_storage_to_dict`; populate the slot eagerly here too (the
+    // legacy `new_with_namespace` constructor already does this) so
+    // callers reading `frame.w_globals_obj` see a non-null PyObjectRef.
+    let w_globals_obj = if w_globals.is_null() {
+        PY_NULL
+    } else {
+        crate::baseobjspace::dict_storage_to_dict(w_globals)
+    };
     let mut frame = Box::new(PyFrame {
         execution_context,
         pycode: code,
@@ -2363,7 +2399,7 @@ pub fn createframe(
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
         w_builtin,
-        w_globals_obj: PY_NULL,
+        w_globals_obj,
     });
     if stores_global {
         frame.getorcreate_debug_data(-1).w_globals = w_globals;

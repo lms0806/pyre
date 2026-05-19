@@ -222,6 +222,7 @@ pub fn emit_trace_unpack_sequence(
 
 pub fn emit_trace_load_name_from_namespace(
     ctx: &mut TraceCtx,
+    frame: OpRef,
     namespace: OpRef,
     name: &str,
 ) -> OpRef {
@@ -229,8 +230,8 @@ pub fn emit_trace_load_name_from_namespace(
     emit_trace_call_ref_typed(
         ctx,
         jit_load_name_from_namespace as *const (),
-        &[namespace, name_ptr, name_len],
-        &[Type::Ref, Type::Int, Type::Int],
+        &[frame, namespace, name_ptr, name_len],
+        &[Type::Ref, Type::Ref, Type::Int, Type::Int],
     )
 }
 
@@ -841,14 +842,18 @@ mod tests {
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {
-        // `fresh_dict_storage` seeds only `__builtins__`; individual
-        // names like `abs` resolve via
-        // `frame.get_builtin().getdictvalue(name)` (`pyopcode.py:921`).
-        // Pull `abs` directly out of the EC's builtins storage to
-        // mirror the same resolution path the interpreter follows.
+        // `pypy/interpreter/pyopcode.py:921 LOAD_GLOBAL_cached` resolves
+        // builtin names through `frame.get_builtin().getdictvalue(name)`.
+        // Pyre's `get_builtin()` returns the builtin Module whose
+        // `w_dict` is a `W_ModuleDictObject` (per `dictmultiobject.py:60-69
+        // allocate_and_init_instance(module=True)`); reach `abs` via
+        // that path instead of the legacy raw storage pointer so the
+        // test exercises the same dispatch the JIT trace helpers will
+        // see once the remaining caller cutover lands.
         let ctx = PyExecutionContext::default();
-        let storage_ptr = ctx.builtins_storage_ptr();
-        let abs = unsafe { pyre_interpreter::dict_storage_get(&*storage_ptr, "abs") }
+        let w_builtin = ctx.get_builtin();
+        let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        let abs = unsafe { pyre_object::w_dict_getitem_str(w_builtin_dict, "abs") }
             .expect("abs builtin must exist");
         let result = jit_call_callable_1(0, abs as i64, w_int_new(-11) as i64);
         unsafe {

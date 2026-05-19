@@ -3915,18 +3915,21 @@ pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
     if !target.is_null() {
         return target;
     }
-    // Lazy canonical: snapshot-populate a fresh W_DictObject and
-    // register it as the storage's permanent back-mirror target so
-    // every subsequent `dict_storage_to_dict` call on this storage
-    // returns this same dict.  The snapshot pre-populates the entries
-    // Vec for storage entries that pre-date this call (the only path
-    // that adds bindings to the storage without going through the
-    // back-mirror).
-    let dict = pyre_object::dictobject::w_dict_new_with_dict_storage(ns_ptr as *mut u8);
+    // Lazy canonical: snapshot-populate a fresh W_ModuleDictObject
+    // (`pypy/interpreter/module.py:18 Module.__init__` uses
+    // `space.newdict(module=True)` whose underlying type IS
+    // W_ModuleDictObject) and register it as the storage's permanent
+    // back-mirror target.  Pre-populates the strategy storage for
+    // entries already present in the DictStorage.  The W_ModuleDictObject's
+    // `dict_storage_proxy = ns_ptr` keeps forward writes (module.__dict__
+    // mutations) in step with the legacy storage that
+    // `PyFrame.w_globals` still reads through.
+    let dict =
+        pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy(ns_ptr as *mut u8);
     unsafe {
         for (key, &value) in storage.entries() {
             if !value.is_null() {
-                pyre_object::dictobject::w_dict_setitem_str_no_proxy(dict, key, value);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, key, value);
             }
         }
     }
@@ -6772,11 +6775,18 @@ pub fn pick_builtin(
 /// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
 /// the empty string as the anonymous-name sentinel).
 fn build_default_pick_builtin_module() -> PyObjectRef {
-    let mut ns = Box::new(crate::DictStorage::new());
-    crate::dict_storage_store(&mut ns, "None", unsafe { pyre_object::w_none() });
-    ns.fix_ptr();
-    let storage: *mut crate::DictStorage = Box::into_raw(ns);
-    pyre_object::w_module_new("", storage as *mut u8)
+    // `pypy/module/__builtin__/moduledef.py:106-108` constructs the
+    // default Module backed by a `W_ModuleDictObject` whose strategy
+    // is `ModuleDictStrategy` (`celldict.py:28`).  Pyre's
+    // `w_module_dict_new()` ports that allocation directly; the
+    // `Module(space, None, w_builtin)` aliasing-constructor path
+    // hands the dict object straight through without the
+    // `DictStorage` carrier.
+    let w_dict = pyre_object::w_module_dict_new();
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_dict, "None", pyre_object::w_none());
+    }
+    pyre_object::w_module_new_aliasing_dict("", std::ptr::null_mut(), w_dict)
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053
@@ -6899,7 +6909,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
     // key is a unicode string — the ObjectStrategy and other
     // non-string strategies return `(None, None)` from their base
     // implementation.
-    let entries = unsafe { pyre_object::dictobject::w_dict_items(w_dict) };
+    let entries = unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict) };
     let mut keys: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
     let mut values: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
     for (w_key, w_val) in entries {
@@ -7311,14 +7321,20 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let list = pyre_object::w_list_new(items);
             return Ok(pyre_object::w_seq_iter_new(list, len));
         }
-        // dict → iterate over keys (dictobject.py __iter__)
+        // dict → iterate over keys (`pypy/objspace/std/dictmultiobject.py
+        // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
+        // For W_ModuleDictObject this dispatches through
+        // `ModuleDictStrategy.getiterkeys` (`celldict.py:188-189`);
+        // pyre's W_DictViewIterator captures `startlen` at iter()
+        // time and raises `RuntimeError("dictionary changed size
+        // during iteration")` mid-iteration — matches PyPy's
+        // `_check_modified` (`dictmultiobject.py:1716+`) without the
+        // snapshot list materialisation.
         if is_dict(obj) {
-            let d = &*(obj as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*d.entries;
-            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
-            let key_list = pyre_object::w_list_new(keys);
-            let len = entries.len();
-            return Ok(pyre_object::w_seq_iter_new(key_list, len));
+            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+                obj,
+                pyre_object::dictviewobject::DictViewKind::Keys,
+            ));
         }
         // set / frozenset → iterate via stable insertion order (PyPy:
         // setobject.py W_BaseSetObject.descr_iter, W_BaseSetIterObject).
@@ -7553,7 +7569,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             use pyre_object::dictviewobject as dv;
             let dict = dv::w_dict_view_iterator_get_dict(obj);
             let startlen = dv::w_dict_view_iterator_get_startlen(obj);
-            let current_len = pyre_object::dictobject::w_dict_len(dict);
+            let current_len = pyre_object::dictmultiobject::w_dict_len(dict);
             if startlen != current_len {
                 return Err(PyError::new(
                     PyErrorKind::RuntimeError,
@@ -7561,7 +7577,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ));
             }
             let index = dv::w_dict_view_iterator_get_index(obj);
-            let items = pyre_object::dictobject::w_dict_items(dict);
+            let items = pyre_object::dictmultiobject::w_dict_items(dict);
             if index >= items.len() {
                 return Err(PyError::stop_iteration());
             }
@@ -8476,7 +8492,7 @@ mod tests {
     /// through the same path and returns `(Some([]), Some([]))`.
     #[test]
     fn view_as_kwargs_empty_dict_returns_some_empty() {
-        let d = pyre_object::dictobject::w_dict_new();
+        let d = pyre_object::dictmultiobject::w_dict_new();
         let (names, values) = view_as_kwargs(d);
         assert_eq!(names.as_ref().map(|v| v.len()), Some(0));
         assert_eq!(values.as_ref().map(|v| v.len()), Some(0));
@@ -8488,8 +8504,8 @@ mod tests {
     #[test]
     fn view_as_kwargs_int_key_returns_none() {
         unsafe {
-            let d = pyre_object::dictobject::w_dict_new();
-            pyre_object::dictobject::w_dict_store(d, w_int_new(1), w_int_new(2));
+            let d = pyre_object::dictmultiobject::w_dict_new();
+            pyre_object::dictmultiobject::w_dict_store(d, w_int_new(1), w_int_new(2));
             let (names, values) = view_as_kwargs(d);
             assert!(names.is_none());
             assert!(values.is_none());
@@ -8743,8 +8759,21 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
-        let dict = &mut *(obj as *mut dictobject::W_DictObject);
-        let entries = &mut *dict.entries;
+        // `pypy/objspace/std/celldict.py:106-126 ModuleDictStrategy.delitem`
+        // routes through the strategy on W_ModuleDictObject; the
+        // dispatching `w_dict_delitem` covers both str (strategy)
+        // and non-str (extras Vec fallback for the
+        // `switch_to_object_strategy` path that pyre cannot do in
+        // place).  Surface a KeyError when the entry was absent.
+        if dictmultiobject::is_module_dict(obj) {
+            return if dictmultiobject::w_dict_delitem(obj, key) {
+                Ok(())
+            } else {
+                Err(PyError::key_error("KeyError"))
+            };
+        }
+        let dict = &mut *(obj as *mut dictmultiobject::W_DictObject);
+        let entries = &mut *dict.dstorage;
         for i in 0..entries.len() {
             let eq = if std::ptr::eq(entries[i].0, key) {
                 true
@@ -8773,7 +8802,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         // remove either way.  Mirrors `w_dict_delitem_str`'s
         // storage-fallback shape for str-keyed deletes.
         if is_str(key) {
-            return if dictobject::w_dict_delitem_str(obj, w_str_get_value(key)) {
+            return if dictmultiobject::w_dict_delitem_str(obj, w_str_get_value(key)) {
                 Ok(())
             } else {
                 Err(PyError::key_error("KeyError"))

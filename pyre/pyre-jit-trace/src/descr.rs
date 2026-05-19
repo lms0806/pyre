@@ -692,10 +692,15 @@ pub use pyre_object::bytesobject::W_BYTES_GC_TYPE_ID;
 // alongside the `W_BytearrayObject` struct it describes. Re-exported
 // for the JIT registration site.
 pub use pyre_object::bytearrayobject::W_BYTEARRAY_GC_TYPE_ID;
-// `W_DICT_GC_TYPE_ID` lives in `pyre-object::dictobject` alongside
+// `W_DICT_GC_TYPE_ID` lives in `pyre-object::dictmultiobject` alongside
 // the `W_DictObject` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::dictobject::W_DICT_GC_TYPE_ID;
+pub use pyre_object::dictmultiobject::W_DICT_GC_TYPE_ID;
+// `W_MODULE_DICT_GC_TYPE_ID` lives in `pyre-object::dictmultiobject`
+// alongside the `W_ModuleDictObject` struct it describes (the PyPy
+// `dictmultiobject.py:328 W_ModuleDictObject` port).  Re-exported
+// for the JIT registration site.
+pub use pyre_object::dictmultiobject::W_MODULE_DICT_GC_TYPE_ID;
 // `W_SET_GC_TYPE_ID` lives in `pyre-object::setobject` alongside the
 // `W_SetObject` struct it describes (covers both `set` and
 // `frozenset` PyTypes — same Rust struct). Re-exported for the JIT

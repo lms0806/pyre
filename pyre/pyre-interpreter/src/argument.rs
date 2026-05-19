@@ -205,7 +205,7 @@ pub fn check_not_duplicate_kwargs(
 /// bypasses the type's `__getitem__` slot via `dict_getitem` to avoid
 /// CPython issue 2435 where `dict` subclasses' `__getitem__` is silently
 /// ignored.  Pyre routes the True arm through
-/// `pyre_object::dictobject::w_dict_getitem_str` for the same direct
+/// `pyre_object::dictmultiobject::w_dict_getitem_str` for the same direct
 /// dict-storage access; the False arm goes through the generic
 /// `space.getitem` so subclass `__getitem__` overrides win when they
 /// should.  The string key was already extracted at line 197 so no
@@ -279,7 +279,7 @@ pub fn do_combine_starstarargs_wrapped(
             let direct = if backing.is_null() {
                 None
             } else {
-                unsafe { pyre_object::dictobject::w_dict_getitem_str(backing, &key) }
+                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(backing, &key) }
             };
             match direct {
                 Some(v) => v,
@@ -1042,7 +1042,7 @@ impl Arguments {
             // PyPy: `space.newdict(kwargs=True)` produces a kwargs-strategy
             // dict; pyre's W_DictObject lacks the strategy variant so a
             // plain dict is used (PRE-EXISTING-ADAPTATION).
-            w_kwds = pyre_object::dictobject::w_dict_new();
+            w_kwds = pyre_object::dictmultiobject::w_dict_new();
             let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
             scope_w[kwarg_loc] = w_kwds;
         }
@@ -1369,7 +1369,7 @@ impl Arguments {
     /// ```
     pub fn topacked(&self) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
         let w_args = pyre_object::w_tuple_new(self.arguments_w.clone());
-        let w_kwds = pyre_object::dictobject::w_dict_new();
+        let w_kwds = pyre_object::dictmultiobject::w_dict_new();
         if let (Some(names), Some(values)) =
             (self.keyword_names_w.as_ref(), self.keywords_w.as_ref())
         {
@@ -2095,7 +2095,7 @@ mod tests {
     fn combine_starstarargs_wrapped_dict_expansion() {
         let mut names: Vec<PyObjectRef> = vec![];
         let mut values: Vec<PyObjectRef> = vec![];
-        let dict = pyre_object::dictobject::w_dict_new();
+        let dict = pyre_object::dictmultiobject::w_dict_new();
         unsafe {
             pyre_object::w_dict_setitem_str(dict, "x", pyre_object::w_int_new(10));
             pyre_object::w_dict_setitem_str(dict, "y", pyre_object::w_int_new(20));
@@ -2130,7 +2130,7 @@ mod tests {
     #[test]
     fn new_with_w_starstararg_fills_kwargs() {
         let pos = [pyre_object::w_int_new(1)];
-        let dict = pyre_object::dictobject::w_dict_new();
+        let dict = pyre_object::dictmultiobject::w_dict_new();
         unsafe {
             pyre_object::w_dict_setitem_str(dict, "k", pyre_object::w_int_new(99));
         }

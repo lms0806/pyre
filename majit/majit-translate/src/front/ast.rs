@@ -7565,7 +7565,83 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
         },
         syn::Expr::Field(field) => receiver_type_root(&field.base, ctx),
         syn::Expr::Index(index) => receiver_type_root(&index.expr, ctx),
+        // Chained `foo().bar()` — derive the receiver root from the
+        // call's registered return type so `lookup_method_return_type`
+        // can resolve `.bar`'s declared signature.  Trait-object
+        // returns (`-> &dyn T` / `-> Box<dyn T>`) surface as the trait
+        // name; plain `-> Bar` / `-> &mut Bar` surface as `Bar`.
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(p) = &*call.func {
+                let key = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let ret = ctx.fn_return_types.get(&key)?;
+                return dyn_trait_root_from_type_str(ret)
+                    .or_else(|| bare_type_root_from_type_str(ret));
+            }
+            None
+        }
+        // Chained `x.foo().bar()` — same as `Expr::Call` but the
+        // callee key carries the receiver root prefix so the
+        // `fn_return_types` lookup matches the impl-block / trait
+        // registration.
+        syn::Expr::MethodCall(mc) => {
+            let owner = receiver_type_root(&mc.receiver, ctx)?;
+            let key = format!("{}::{}", owner, mc.method);
+            let ret = ctx.fn_return_types.get(&key)?;
+            dyn_trait_root_from_type_str(ret).or_else(|| bare_type_root_from_type_str(ret))
+        }
         _ => None,
+    }
+}
+
+/// Strip leading `&` / `&mut` / lifetime / `Box<>` / `Rc<>` / `Arc<>`
+/// from a type-string and return the bare type root identifier (the
+/// first path segment of the innermost type).  Returns `None` for
+/// `dyn Trait`-shaped strings — callers handle those via
+/// [`dyn_trait_root_from_type_str`] first.
+fn bare_type_root_from_type_str(s: &str) -> Option<String> {
+    let mut trimmed = s.trim();
+    // Drop leading `&` / `&mut` / lifetime annotations.
+    while let Some(rest) = trimmed.strip_prefix('&') {
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+        let rest = if let Some(after_quote) = rest.strip_prefix('\'') {
+            let rest = after_quote
+                .split_once(char::is_whitespace)
+                .map(|(_lt, tail)| tail.trim_start())
+                .unwrap_or("");
+            rest
+        } else {
+            rest
+        };
+        trimmed = rest;
+    }
+    if trimmed.starts_with("dyn ") {
+        return None;
+    }
+    for wrapper in ["Box", "Rc", "Arc"] {
+        let prefix = format!("{wrapper}<");
+        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+            && let Some(inner) = rest.strip_suffix('>')
+        {
+            return bare_type_root_from_type_str(inner);
+        }
+    }
+    // `Vec<T>` / `Option<T>` / generic containers do not map to a
+    // method-call receiver root.
+    if trimmed.contains('<') {
+        return None;
+    }
+    let leaf = trimmed.split_whitespace().next()?;
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf.to_string())
     }
 }
 
