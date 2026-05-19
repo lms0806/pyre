@@ -1647,6 +1647,62 @@ class AppTestSlots(AppTestCpythonExtensionBase):
         with raises(SystemError):
             module.test_zero()
 
+    def test_multiple_inheritance_small_basicsize(self):
+        # Regression test: two manually-allocated heap types whose tp_basicsize
+        # is smaller than sizeof(PyHeapTypeObject) (as pybind11 does) must be
+        # combinable in multiple inheritance when they share the same
+        # tp_basicsize, because there is no actual instance-layout conflict.
+        module = self.import_extension('foo', [
+           ("new_obj", "METH_NOARGS",
+            '''
+                /* Simulate pybind11: instance struct is PyObject_HEAD + one ptr,
+                   which is << sizeof(PyHeapTypeObject). */
+                typedef struct { PyObject_HEAD; void *extra; } SmallInst;
+                Py_ssize_t inst_size = (Py_ssize_t)sizeof(SmallInst);
+
+                PyTypeObject *B1, *B2, *B12;
+                B1  = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+                B2  = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+                B12 = (PyTypeObject*)PyType_Type.tp_alloc(&PyType_Type, 0);
+
+                PyObject *n1  = PyUnicode_FromString("B1");
+                PyObject *n2  = PyUnicode_FromString("B2");
+                PyObject *n12 = PyUnicode_FromString("B12");
+
+                B1->tp_name  = "B1";
+                B2->tp_name  = "B2";
+                B12->tp_name = "B12";
+
+                B1->tp_basicsize  = inst_size;
+                B2->tp_basicsize  = inst_size;
+                B12->tp_basicsize = inst_size;
+
+                ((PyHeapTypeObject*)B1)->ht_name  = n1;
+                ((PyHeapTypeObject*)B2)->ht_name  = n2;
+                ((PyHeapTypeObject*)B12)->ht_name = n12;
+                ((PyHeapTypeObject*)B1)->ht_qualname  = n1;
+                ((PyHeapTypeObject*)B2)->ht_qualname  = n2;
+                ((PyHeapTypeObject*)B12)->ht_qualname = n12;
+
+                B1->tp_flags  = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;
+                B2->tp_flags  = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;
+                B12->tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HEAPTYPE;
+
+                B12->tp_base  = B1;
+                B12->tp_bases = PyTuple_Pack(2, B1, B2);
+
+                if (PyType_Ready(B1)  < 0) return NULL;
+                if (PyType_Ready(B2)  < 0) return NULL;
+                if (PyType_Ready(B12) < 0) return NULL;
+
+                PyObject *obj = PyObject_New(PyObject, B12);
+                return obj;
+            '''
+            ),
+            ])
+        obj = module.new_obj()
+        assert 'B12' in str(obj)
+
     def test_multiple_inheritance_fetch_tp_bases(self):
         module = self.import_extension('foo', [
            ("foo", "METH_O",
