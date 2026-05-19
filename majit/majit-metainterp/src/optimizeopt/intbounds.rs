@@ -3002,7 +3002,7 @@ impl Optimization for OptIntBounds {
     /// Convergence path: extend the existing `setinfo_from_preamble`
     /// import surface (`mod.rs:setinfo_from_preamble_item`) to carry
     /// `IntBound` alongside `PtrInfo`/`IntBoundInfo`, so the next
-    /// iteration's `peek_intbound_via_box` finds bounds without a
+    /// iteration's `peek_intbound` finds bounds without a
     /// dedicated HashMap routed through the optimizer/unroll boundary.
     /// Multi-session retirement.
     fn export_arg_int_bounds(

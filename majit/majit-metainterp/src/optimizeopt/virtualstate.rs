@@ -1535,9 +1535,20 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
+                // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` —
+                // optimizer-tracked `get_known_class` first (info.py:763-772
+                // `_known_class` accessor), falling back to the runtime
+                // concrete read so the bridge case where the runtime box
+                // is a concrete Ref without optimizer-tracked PtrInfo
+                // still gets a class verdict.  `get_known_class` takes
+                // `&BoxRef`; the OpRef-to-BoxRef hoist mirrors the
+                // guard.rs / rewrite.rs caller pattern.
+                let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
+                    return Err(());
+                };
                 let Some(runtime_cls) = state
                     .ctx
-                    .get_known_class(rb)
+                    .get_known_class(&rb_box)
                     .or_else(|| state.ctx.cls_of_box(rb))
                 else {
                     return Err(());
@@ -1559,9 +1570,14 @@ impl VirtualState {
                 let Some(rb) = runtime_box else {
                     return Err(());
                 };
+                // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` —
+                // optimizer-tracked first, runtime concrete fallback.
+                let Some(rb_box) = state.ctx.get_box_replacement_box(rb) else {
+                    return Err(());
+                };
                 let Some(runtime_cls) = state
                     .ctx
-                    .get_known_class(rb)
+                    .get_known_class(&rb_box)
                     .or_else(|| state.ctx.cls_of_box(rb))
                 else {
                     return Err(());

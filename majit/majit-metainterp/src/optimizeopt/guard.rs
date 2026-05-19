@@ -875,8 +875,10 @@ impl OptGuard {
                 // RPython: setinfo_from_preamble sets PtrInfo.KnownClass or
                 // Instance with known_class. Check ctx for imported info.
                 if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
-                    if let Some(class_ptr) = ctx.get_known_class(op.arg(0)) {
-                        return class_ptr.0 as i64 == expected;
+                    if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
+                        if let Some(class_ptr) = ctx.get_known_class(&b) {
+                            return class_ptr.0 as i64 == expected;
+                        }
                     }
                 }
                 false
@@ -910,8 +912,10 @@ impl OptGuard {
                 }
                 // Check class via imported PtrInfo
                 if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
-                    if let Some(class_ptr) = ctx.get_known_class(op.arg(0)) {
-                        return class_ptr.0 as i64 == expected;
+                    if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
+                        if let Some(class_ptr) = ctx.get_known_class(&b) {
+                            return class_ptr.0 as i64 == expected;
+                        }
                     }
                 }
                 // Fallback: seen as a previous GuardClass with same args

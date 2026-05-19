@@ -219,21 +219,44 @@ fn walk_use_tree(
     }
 }
 
+/// Crate-root names that the analyzer treats as the local namespace —
+/// stripped from `use` paths the same way `crate::` is stripped.  This
+/// list aligns the analyzer's `path_hash(canonical_struct_name)`
+/// namespace with the runtime's `module_path!()`-stripped namespace and
+/// keeps cross-crate impl-method receiver spelling identical to the
+/// crate-stripped `module_path_from_source_file` form used by the
+/// production `analyze_multiple_pipeline_with_modules` entries.
+pub(crate) const PYRE_INTERNAL_CRATES: &[&str] = &[
+    "pyre_interpreter",
+    "pyre_jit",
+    "pyre_jit_trace",
+    "pyre_object",
+    "majit_ir",
+    "majit_metainterp",
+    "majit_translate",
+    "majit_gc",
+    "majit_backend_dynasm",
+    "majit_backend_cranelift",
+];
+
 /// Join the accumulated `use` path segments and drop the leading
-/// `crate::` keyword when present.  Runtime `#[jit_struct]` hashes
-/// types through `majit_ir::descr::path_hash_stripped_crate`, which
-/// strips the leading `module_path!()` segment (the crate root) before
-/// hashing.  Analyzer-side `path_hash` must see the same namespace, so
-/// the `crate::` syntactic marker is dropped here at collection time
-/// rather than at every consumer.  `use other_crate::Foo` paths are
-/// kept verbatim — the analyzer's `STRUCT_ORIGIN_REGISTRY` does not
-/// cover external crates anyway.
+/// `crate::` keyword (or any analyzer-internal crate root in
+/// [`PYRE_INTERNAL_CRATES`]) when present.  Runtime `#[jit_struct]`
+/// hashes types through `majit_ir::descr::path_hash_stripped_crate`,
+/// which strips the leading `module_path!()` segment (the crate root)
+/// before hashing.  Analyzer-side `path_hash` must see the same
+/// namespace, so the `crate::` syntactic marker (and the equivalent
+/// crate-root segment for cross-crate `use foo_crate::bar::T` imports
+/// inside the analyzer's source set) is dropped here at collection
+/// time rather than at every consumer.  `use other_crate::Foo` paths
+/// from crates outside the analyzer's source set are kept verbatim.
 fn joined_use_path(segments: &[String]) -> String {
-    if segments.first().map(String::as_str) == Some("crate") {
-        segments[1..].join("::")
-    } else {
-        segments.join("::")
+    if let Some(first) = segments.first().map(String::as_str) {
+        if first == "crate" || PYRE_INTERNAL_CRATES.contains(&first) {
+            return segments[1..].join("::");
+        }
     }
+    segments.join("::")
 }
 
 /// Find a top-level function by exact name in the parsed source.
@@ -547,9 +570,16 @@ pub fn extract_inherent_impl_methods(
     known_struct_names: &std::collections::HashSet<String>,
 ) -> Result<Vec<InherentMethodInfo>, crate::front::ast::FlowingError> {
     let mut methods = Vec::new();
+    // Feed `parsed.module_path` so the inherent-impl receiver-root
+    // qualification agrees with the caller-side
+    // `qualify_type_name_with_imports` result, which `analyze_pipeline_from_parsed`
+    // routes through `STRUCT_ORIGIN_REGISTRY` populated by
+    // `collect_struct_origins` over the same module path.  Empty
+    // `module_path` (fixtures using `parse_source`) falls through to
+    // the bare-name registration path.
     collect_inherent_methods_from_items(
         &parsed.file.items,
-        "",
+        &parsed.module_path,
         struct_fields,
         fn_return_types,
         &parsed.use_imports,
@@ -575,12 +605,25 @@ fn collect_inherent_methods_from_items(
                     continue;
                 }
                 let for_type = canonical_type_name(&impl_block.self_ty);
-                // Qualify bare type name with module prefix.  Route through
-                // `qualify_type_name_with_imports` so inherent-impl receiver
-                // resolution agrees with graph build's per-graph alias
-                // lookup (PyPy `bookkeeper.getdesc` single-source identity).
-                let self_ty_root = type_root_ident(&impl_block.self_ty).map(|t| {
-                    crate::front::ast::qualify_type_name_with_imports(&t, prefix, use_imports)
+                // Two `self_ty_root` forms run side by side:
+                //  - `self_ty_root_bare` keeps the raw `impl` type ident
+                //    (e.g. `"PyFrame"`) and is fed into the graph build so
+                //    inside-the-graph `self.field` accesses carry the
+                //    same `owner_root` spelling the virtualizable spec
+                //    (`virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT`,
+                //    plain `"PyFrame"`) matches against
+                //    (`jit_codewriter/jtransform.rs::VirtualizableFieldDescriptor::matches`).
+                //  - `self_ty_root_qualified` runs the bare name through
+                //    `qualify_type_name_with_imports` so the inherent-method
+                //    registration `CallPath::for_impl_method` agrees with
+                //    the caller-side receiver-type spelling
+                //    (`receiver_type_root` → `local_type_roots`, also fed
+                //    through `qualify_type_name_with_imports`).  PyPy
+                //    `bookkeeper.getdesc(value).graph` single-source
+                //    identity uses the same lookup at both ends.
+                let self_ty_root_bare = type_root_ident(&impl_block.self_ty);
+                let self_ty_root_qualified = self_ty_root_bare.as_ref().map(|t| {
+                    crate::front::ast::qualify_type_name_with_imports(t, prefix, use_imports)
                 });
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
@@ -593,17 +636,19 @@ fn collect_inherent_methods_from_items(
                         // jit.py:184-201 — inherent-impl methods get the
                         // same wrapper/orig synthesis as free fns;
                         // `?` propagates `FlowingError` per
-                        // `flowspace/flowcontext.py:417`.  The qualified
-                        // `self_ty_root` lets the wrapper's tail call
-                        // hit the impl-method registration path built
-                        // by `CallPath::for_impl_method`.
+                        // `flowspace/flowcontext.py:417`.  `synthesize_or_passthrough`
+                        // and `build_function_graph_with_self_ty_pub`
+                        // both receive the bare spelling so the wrapper's
+                        // self-typed tail call and the body's `self.field`
+                        // accesses share the same `owner_root` spelling
+                        // the vable spec asserts on.
                         for synth in crate::front::ast::synthesize_or_passthrough(
                             fake_fn,
-                            self_ty_root.as_deref(),
+                            self_ty_root_bare.as_deref(),
                         ) {
                             let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                                 &synth,
-                                self_ty_root.clone(),
+                                self_ty_root_bare.clone(),
                                 struct_fields,
                                 fn_return_types,
                                 prefix,
@@ -624,7 +669,7 @@ fn collect_inherent_methods_from_items(
                             };
                             methods.push(InherentMethodInfo {
                                 for_type: for_type.clone(),
-                                self_ty_root: self_ty_root.clone(),
+                                self_ty_root: self_ty_root_qualified.clone(),
                                 name: synth.sig.ident.to_string(),
                                 graph: sf.graph,
                                 return_type,

@@ -87,7 +87,9 @@ pub fn copy_str_content(
     let lgt_bound = ctx.getintbound(lengthbox);
     // vstring.py:343: isinstance(srcbox, ConstPtr)
     let src_is_const = ctx
-        .getconst(srcbox)
+        .get_box_replacement_box(srcbox)
+        .as_ref()
+        .and_then(|b| ctx.getconst(b))
         .is_some_and(|(_, tp)| tp == majit_ir::Type::Ref);
     let m = if src_is_const && srcoffset_bound.is_constant() {
         5
@@ -129,7 +131,7 @@ pub fn copy_str_content(
                         ch
                     } else if let Some(idx) = resolved_idx {
                         // vstring.py:394: isinstance(strbox, ConstPtr) + ConstInt
-                        let from_const = match ctx.getconst(srcbox) {
+                        let from_const = match srcbox_box.as_ref().and_then(|b| ctx.getconst(b)) {
                             Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
                                 let r = majit_ir::GcRef(raw as usize);
                                 ctx.string_content_resolver
@@ -461,7 +463,7 @@ impl OptString {
         }
         // vstring.py:393-403 _strgetitem: isinstance(strbox, ConstPtr)
         let mode = self.get_mode(resolved, ctx);
-        match ctx.getconst(resolved) {
+        match resolved_box.as_ref().and_then(|b| ctx.getconst(b)) {
             Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
                 let r = majit_ir::GcRef(raw as usize);
                 let ch_val = ctx

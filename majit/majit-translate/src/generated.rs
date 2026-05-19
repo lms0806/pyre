@@ -146,12 +146,31 @@ pub use crate::codewriter::AllJitCodes;
 ///
 /// `build.rs` carries a parallel `cargo:rerun-if-changed=...` entry for
 /// every string in this manifest; keep the two lists in lock-step.
-const PYRE_JIT_GRAPH_SOURCES: &[&str] = &[
-    include_str!("../../../pyre/pyre-interpreter/src/pyopcode.rs"),
-    include_str!("../../../pyre/pyre-interpreter/src/eval.rs"),
-    include_str!("../../../pyre/pyre-interpreter/src/pyframe.rs"),
-    include_str!("../../../pyre/pyre-interpreter/src/shared_opcode.rs"),
-    include_str!("../../../pyre/pyre-jit/src/eval.rs"),
+/// `(source_text, crate-stripped module_path)` pairs.  The module path
+/// matches the form `pyre-jit-trace/build.rs::module_path_from_source_file`
+/// emits, so analyzer-side `struct_origins[bare_name] = module_path` and
+/// `qualify_type_name_with_imports` produce the same canonical spelling
+/// the runtime + production analyser pipeline produce.  Empty module
+/// path (test fixtures that bypass module wiring) is reserved for
+/// `parse_source`; here every entry carries its real module path.
+const PYRE_JIT_GRAPH_SOURCES: &[(&str, &str)] = &[
+    (
+        include_str!("../../../pyre/pyre-interpreter/src/pyopcode.rs"),
+        "pyopcode",
+    ),
+    (
+        include_str!("../../../pyre/pyre-interpreter/src/eval.rs"),
+        "eval",
+    ),
+    (
+        include_str!("../../../pyre/pyre-interpreter/src/pyframe.rs"),
+        "pyframe",
+    ),
+    (
+        include_str!("../../../pyre/pyre-interpreter/src/shared_opcode.rs"),
+        "shared_opcode",
+    ),
+    (include_str!("../../../pyre/pyre-jit/src/eval.rs"), "eval"),
 ];
 
 static ALL_JITCODES: OnceLock<AllJitCodes> = OnceLock::new();
@@ -206,7 +225,16 @@ fn build() -> AllJitCodes {
     // JitCode bodies, but intentionally not for `fnaddr`. The symbolic
     // fallback is therefore part of the current API contract and is locked
     // down by the unit tests below.
-    let result = crate::analyze_multiple_pipeline(PYRE_JIT_GRAPH_SOURCES);
+    let sources: Vec<&str> = PYRE_JIT_GRAPH_SOURCES.iter().map(|(s, _)| *s).collect();
+    let module_paths: Vec<&str> = PYRE_JIT_GRAPH_SOURCES.iter().map(|(_, m)| *m).collect();
+    let result = crate::analyze_multiple_pipeline_with_modules(
+        &sources,
+        &module_paths,
+        &crate::AnalyzeConfig::default(),
+        None,
+        &|_, _| None,
+        &[],
+    );
     AllJitCodes {
         by_path: result.jitcodes_by_path,
         in_order: result.jitcodes,

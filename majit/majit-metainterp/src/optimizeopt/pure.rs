@@ -402,8 +402,10 @@ impl OptPure {
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
         let result = ctx.get_box_replacement(result);
-        if let Some((_raw, result_type)) = ctx.getconst(result) {
-            return result_type == op.result_type();
+        if let Some(result_box) = ctx.get_box_replacement_box(result) {
+            if let Some((_raw, result_type)) = ctx.getconst(&result_box) {
+                return result_type == op.result_type();
+            }
         }
         match ctx.opref_type(result) {
             Some(result_type) => result_type == op.result_type(),

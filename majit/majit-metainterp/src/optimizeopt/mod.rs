@@ -226,6 +226,136 @@ impl std::ops::Deref for PtrInfoHandleRef<'_> {
     }
 }
 
+/// IntBound counterpart to [`PtrInfoHandle`].
+///
+/// `optimizer.py:99-113 getintbound(op)` returns the live `IntBound`
+/// object stored on `box._forwarded`; downstream code calling
+/// `getintbound(box).intersect(b)` mutates that same object so any
+/// other holder observes the change.  In pyre, `OpInfo::IntBound`
+/// carries `Rc<RefCell<IntBound>>` (Phase 1A), so sharing the cell
+/// between two BoxRefs reproduces the RPython object-identity
+/// behaviour.  This handle is the public API for that identity:
+///
+///   - `Const(IntBound)` — a freshly synthesized `IntBound` from a
+///     `ConstInt` (`optimizer.py:102-103 from_constant`).  Two
+///     `Const` handles never compare equal under `ptr_eq` even when
+///     they wrap the same value.
+///   - `Live(Rc<RefCell<IntBound>>)` — the actual `_forwarded` cell.
+///     `Rc::ptr_eq` ≡ Python `is`.  In-place mutation via
+///     `handle.borrow_mut()` propagates to every other live handle
+///     cloned from the same cell.
+pub enum IntBoundHandle {
+    /// Freshly synthesized `IntBound::from_constant(_)` object
+    /// (optimizer.py:102-103 return path). Wrapped in `Rc<RefCell<>>`
+    /// so callers retain Python `from_constant(...)` reference
+    /// semantics — the object is mutable, and clones of *this same
+    /// handle* share the cell. Two independent `getintbound_handle`
+    /// calls on the same ConstInt mint distinct Rcs (PyPy: two
+    /// `from_constant(7)` calls return two distinct objects), so
+    /// mutations do not propagate across calls.
+    Const(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+    /// Live `_forwarded` cell — mutations propagate to every handle
+    /// cloned from the same Rc and through `box._forwarded`.
+    Live(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+}
+
+impl IntBoundHandle {
+    /// Wrap a freshly synthesized `IntBound::from_constant(_)`
+    /// (`optimizer.py:102-103` return path). Mints a fresh `Rc` so
+    /// each call produces a distinct object (Python `is` semantics).
+    pub fn const_(b: crate::optimizeopt::intutils::IntBound) -> Self {
+        IntBoundHandle::Const(std::rc::Rc::new(std::cell::RefCell::new(b)))
+    }
+
+    /// Wrap a live `_forwarded` cell handle (`optimizer.py:111-112`
+    /// return path).
+    pub fn live(
+        rc: std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>,
+    ) -> Self {
+        IntBoundHandle::Live(rc)
+    }
+
+    /// Identity comparison. Two handles are `ptr_eq` iff they hold
+    /// the same `Rc` — Python `is` parity. Const/Live cross-arm pairs
+    /// are never equal because they live in disjoint cell namespaces.
+    pub fn ptr_eq(&self, other: &IntBoundHandle) -> bool {
+        match (self, other) {
+            (IntBoundHandle::Const(a), IntBoundHandle::Const(b))
+            | (IntBoundHandle::Live(a), IntBoundHandle::Live(b)) => std::rc::Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Read access — yields a guard that `Deref`s into `&IntBound`.
+    pub fn borrow(&self) -> IntBoundHandleRef<'_> {
+        match self {
+            IntBoundHandle::Const(rc) => IntBoundHandleRef::Const(rc.borrow()),
+            IntBoundHandle::Live(rc) => IntBoundHandleRef::Live(rc.borrow()),
+        }
+    }
+
+    /// Mutable access for both arms. PyPy `getintbound(ConstInt)`
+    /// returns a mutable `IntBound.from_constant(...)` object whose
+    /// mutations are private to that object (no propagation back to
+    /// the box). The `Const` arm mirrors that: borrow_mut yields a
+    /// RefMut into the fresh per-call cell.
+    pub fn borrow_mut(
+        &self,
+    ) -> Option<std::cell::RefMut<'_, crate::optimizeopt::intutils::IntBound>> {
+        match self {
+            IntBoundHandle::Const(rc) | IntBoundHandle::Live(rc) => Some(rc.borrow_mut()),
+        }
+    }
+
+    /// Convert to an owned `IntBound` snapshot. Clones for both arms
+    /// since both wrap `Rc<RefCell<_>>`.
+    pub fn into_int_bound(self) -> crate::optimizeopt::intutils::IntBound {
+        match self {
+            IntBoundHandle::Const(rc) | IntBoundHandle::Live(rc) => rc.borrow().clone(),
+        }
+    }
+
+    /// Cheap clone-as-snapshot for read-only callsites that only need
+    /// an owned `IntBound` and don't care about identity.
+    pub fn snapshot(&self) -> crate::optimizeopt::intutils::IntBound {
+        match self {
+            IntBoundHandle::Const(rc) | IntBoundHandle::Live(rc) => rc.borrow().clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for IntBoundHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IntBoundHandle::Const(rc) => f
+                .debug_tuple("IntBoundHandle::Const")
+                .field(&*rc.borrow())
+                .finish(),
+            IntBoundHandle::Live(rc) => f
+                .debug_tuple("IntBoundHandle::Live")
+                .field(&*rc.borrow())
+                .finish(),
+        }
+    }
+}
+
+/// Borrow guard returned by `IntBoundHandle::borrow()`.
+/// `Deref<Target = IntBound>` lets callers call any `IntBound`
+/// method uniformly without first matching on the variant.
+pub enum IntBoundHandleRef<'a> {
+    Const(std::cell::Ref<'a, crate::optimizeopt::intutils::IntBound>),
+    Live(std::cell::Ref<'a, crate::optimizeopt::intutils::IntBound>),
+}
+
+impl std::ops::Deref for IntBoundHandleRef<'_> {
+    type Target = crate::optimizeopt::intutils::IntBound;
+    fn deref(&self) -> &crate::optimizeopt::intutils::IntBound {
+        match self {
+            IntBoundHandleRef::Const(r) | IntBoundHandleRef::Live(r) => r,
+        }
+    }
+}
+
 /// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
 ///
 /// Used by `PtrInfo::getnullness` and `IntBound::getnullness` to
@@ -1041,7 +1171,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // so a later equals-hit returns the SAME object.
         if let Some(cache) = info.cached_vinfo() {
             *cache.borrow_mut() = Some(std::rc::Rc::clone(&shared));
-            // `info` is a clone returned from `peek_ptr_info_via_box`;
+            // `info` is a clone returned from `peek_ptr_info`;
             // mutating its independent `cached_vinfo` RefCell does not feed
             // back into the BoxRef canonical slot. Project the cached Rc
             // handle directly onto the BoxRef PtrInfo so subsequent
@@ -2807,10 +2937,19 @@ impl OptContext {
     /// RPython uses sequential `if` (not elif) so multiple properties accumulate.
     /// `exported_infos`: None from use_box path (shortpreamble.py:404),
     /// Some from import_state path. When None, virtual branch does NOT recurse.
+    ///
+    /// `preamble_info_handle` is the live `Rc<RefCell<PtrInfo>>` cell from
+    /// the exporter's `_forwarded` slot (or the shortpreamble entry's
+    /// `OpInfo::Ptr(rc)`). The virtual branch shares the SAME `Rc`
+    /// (`unroll.py:61` `op.set_forwarded(preamble_info)`) so future
+    /// mutations to virtual fields propagate through both export and
+    /// import sides — RPython object identity. Non-virtual branches
+    /// snapshot the inner `PtrInfo` once because they intentionally
+    /// mint fresh info objects per upstream (`unroll.py:71` etc.).
     fn setinfo_from_preamble(
         &mut self,
         op: OpRef,
-        preamble_info: &PtrInfo,
+        preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
     ) {
         let op = self.get_box_replacement(op);
@@ -2835,11 +2974,21 @@ impl OptContext {
             return;
         };
 
-        // unroll.py:60-64: virtual — set_forwarded + recurse, then return
-        if preamble_info.is_virtual() {
-            self.set_ptr_info(&op_box, preamble_info.clone());
+        // unroll.py:60-64: virtual — set_forwarded + recurse, then return.
+        // Identity-preserving install: clone the `Rc` (not the inner
+        // `PtrInfo`) so that the exporter, the importer, and the recursive
+        // virtual fields all observe the same `RefCell<PtrInfo>` cell,
+        // matching PyPy `op.set_forwarded(preamble_info)` object sharing.
+        let is_virtual = preamble_info_handle.borrow().is_virtual();
+        if is_virtual {
+            let resolved = op_box.get_box_replacement(false);
+            if !resolved.is_constant() {
+                resolved.set_forwarded_info(crate::optimizeopt::info::OpInfo::Ptr(
+                    std::rc::Rc::clone(preamble_info_handle),
+                ));
+            }
             if let Some(infos) = exported_infos {
-                let items: Vec<OpRef> = match preamble_info {
+                let items: Vec<OpRef> = match &*preamble_info_handle.borrow() {
                     PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
                     PtrInfo::VirtualArray(a) => a.items.iter().copied().collect(),
                     PtrInfo::VirtualStruct(s) => s.fields.iter().map(|(_, r)| *r).collect(),
@@ -2855,6 +3004,13 @@ impl OptContext {
             }
             return;
         }
+
+        // Snapshot the non-virtual PtrInfo once. Non-virtual paths
+        // mint fresh info objects on each install (`unroll.py:71` etc.),
+        // so identity sharing is not required (and matches PyPy by
+        // intentionally not sharing).
+        let preamble_info_owned = preamble_info_handle.borrow().clone();
+        let preamble_info: &PtrInfo = &preamble_info_owned;
 
         // unroll.py:65-68: constant — return early
         if let PtrInfo::Constant(gcref) = preamble_info {
@@ -3015,8 +3171,10 @@ impl OptContext {
                 if let Some(gcref) = const_gcref {
                     self.make_constant(target, Value::Ref(gcref));
                 } else {
-                    let snapshot = rc.borrow().clone();
-                    self.setinfo_from_preamble(target, &snapshot, Some(exported_infos));
+                    // Pass the Rc handle so the virtual branch can
+                    // preserve `_forwarded` object identity per
+                    // unroll.py:61.
+                    self.setinfo_from_preamble(target, rc, Some(exported_infos));
                 }
             }
             // unroll.py:93-96 IntBound with widen(): intersect unconditionally.
@@ -3062,8 +3220,8 @@ impl OptContext {
         }
         match preamble_info {
             OpInfo::Ptr(rc) => {
-                let snapshot = rc.borrow().clone();
-                self.setinfo_from_preamble(target, &snapshot, exported_infos);
+                // Pass the Rc handle (unroll.py:61 identity preservation).
+                self.setinfo_from_preamble(target, rc, exported_infos);
             }
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
@@ -3726,6 +3884,45 @@ impl OptContext {
         op.get_box_replacement(false).ptr_info_handle()
     }
 
+    /// `optimizer.py:99-113 getintbound(op)` orthodox identity reader.
+    ///
+    /// Returns `IntBoundHandle::Const(from_constant(v))` for a
+    /// `ConstInt` terminal (line 102-103) and
+    /// `IntBoundHandle::Live(rc)` when the terminal's `_forwarded`
+    /// slot already holds an `OpInfo::IntBound(rc)` (line 105-108
+    /// `if cur is not None and isinstance(cur, IntBound): return cur`).
+    /// Returns `None` when the slot carries any other `Forwarded`
+    /// variant — caller decides whether to lazy-install via
+    /// [`Self::getintbound`].
+    ///
+    /// This is the IntBound counterpart of `peek_ptr_info_handle`;
+    /// two handles cloned from the same `Live` cell observe each
+    /// other's `.intersect(...)` / `.make_ge(...)` mutations
+    /// (`Rc::ptr_eq` ≡ `is`).
+    pub fn peek_intbound_handle(&self, op: &crate::r#box::BoxRef) -> Option<IntBoundHandle> {
+        // optimizer.py:100 `assert op.type == 'i'`. Void admitted as the
+        // pyre placeholder-box tolerance noted in `setintbound`'s comment
+        // (convergence path: D-3 box_pool retirement).
+        assert!(
+            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "peek_intbound_handle: expected 'i'-typed BoxRef, got {:?}",
+            op.type_()
+        );
+        let resolved = op.get_box_replacement(false);
+        // optimizer.py:107 `assert op.type == 'i'` — re-check post-walker.
+        assert!(
+            matches!(resolved.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "peek_intbound_handle: chain terminal lost 'i' type, got {:?}",
+            resolved.type_()
+        );
+        if let Some(Value::Int(v)) = resolved.const_value() {
+            return Some(IntBoundHandle::const_(
+                crate::optimizeopt::intutils::IntBound::from_constant(v as i64),
+            ));
+        }
+        resolved.int_bound_handle().map(IntBoundHandle::live)
+    }
+
     /// info.py: getptrinfo(op) — mutable variant. Walks the chain on `op`
     /// and runs the closure against the terminal BoxRef's `_forwarded`
     /// PtrInfo via `ptr_info_mut()`. The BoxRef slot is the authoritative
@@ -3985,6 +4182,67 @@ impl OptContext {
         let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
         b.set_forwarded_info(OpInfo::int_bound(intbound.clone()));
         intbound
+    }
+
+    /// `optimizer.py:99-113 getintbound(op)` orthodox identity variant.
+    ///
+    /// Walks `op.get_box_replacement(false)` and returns:
+    ///   - `IntBoundHandle::Const(from_constant(v))` for a `ConstInt`
+    ///     terminal (line 102-103).
+    ///   - `IntBoundHandle::Const(unbounded)` when the terminal carries
+    ///     a non-IntBound `_forwarded` slot (raw-pointer Int with
+    ///     PtrInfo etc.; `optimizer.py:106` non-IntBound `fw` branch).
+    ///   - `IntBoundHandle::Live(rc)` for an existing
+    ///     `OpInfo::IntBound(rc)` slot, **or** a freshly installed
+    ///     `unbounded` cell when the slot was `Forwarded::None` —
+    ///     mirroring RPython's lazy `op.set_forwarded(IntBound())`
+    ///     side-effect at line 111.
+    pub fn getintbound_handle(&mut self, op: &crate::r#box::BoxRef) -> IntBoundHandle {
+        use crate::optimizeopt::info::OpInfo;
+        // optimizer.py:100 `assert op.type == 'i'`. Void admitted as the
+        // pyre placeholder-box tolerance shared with `setintbound`.
+        assert!(
+            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "getintbound_handle: expected 'i'-typed BoxRef, got {:?}",
+            op.type_()
+        );
+        let resolved = op.get_box_replacement(false);
+        // optimizer.py:107 `assert op.type == 'i'` lifted ahead of every
+        // post-walker branch.  PyPy's structural-error catch fires when a
+        // non-`ConstInt` terminal reaches the `fw is None` arm and the
+        // assert sees a non-`'i'` `op.type` — pyre matches that position
+        // up-front so a cross-type-forwarded Int box (Int → ConstPtr /
+        // ConstFloat) panics here instead of being silently absorbed by
+        // the unbounded branch below.  Mirrors `peek_intbound_handle`'s
+        // assert shape.
+        assert!(
+            matches!(resolved.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "getintbound_handle: chain terminal lost 'i' type, got {:?}",
+            resolved.type_()
+        );
+        if let Some(Value::Int(v)) = resolved.const_value() {
+            return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::from_constant(
+                v as i64,
+            ));
+        }
+        match &*resolved.get_forwarded() {
+            crate::r#box::Forwarded::Info(OpInfo::IntBound(rc)) => {
+                return IntBoundHandle::live(std::rc::Rc::clone(rc));
+            }
+            crate::r#box::Forwarded::None => {}
+            _ => {
+                return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::unbounded());
+            }
+        }
+        // optimizer.py:110-112 lazy install — the new cell is the live
+        // identity that downstream `intersect`/`make_*` mutations
+        // propagate through.
+        let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
+        resolved.set_forwarded_info(OpInfo::int_bound(intbound));
+        let rc = resolved
+            .int_bound_handle()
+            .expect("just installed OpInfo::IntBound");
+        IntBoundHandle::live(rc)
     }
 
     /// optimizer.py:115-125: setintbound(op, bound) line-by-line port.
@@ -4339,14 +4597,15 @@ impl OptContext {
     }
 
     /// resume.py:157 getconst parity for synthetic rd_numb encoding.
-    /// Returns the (raw bits, type) of a constant OpRef, or None if it
+    /// Returns the (raw bits, type) of a constant BoxRef, or None if it
     /// is not a constant. Type comes from the `Value` variant directly;
-    /// raw-pointer Int constants live in `OpRef::ConstPtr` (Ref-typed)
-    /// per the typed-pointer model, so `Value::Int` is always a real
-    /// integer here.
-    pub fn getconst(&self, opref: OpRef) -> Option<(i64, majit_ir::Type)> {
-        // Check constant pool (through replacement chain).
-        if let Some(val) = self.get_constant(opref) {
+    /// raw-pointer Int constants live as `BoxKind::Const` with
+    /// `Value::Ref` (Ref-typed) per the typed-pointer model, so
+    /// `Value::Int` is always a real integer here.
+    pub fn getconst(&self, op: &crate::r#box::BoxRef) -> Option<(i64, majit_ir::Type)> {
+        // Walk the chain and read the terminal's const_value (Const Box).
+        let resolved = op.get_box_replacement(false);
+        if let Some(val) = resolved.const_value() {
             let (raw, tp) = match val {
                 Value::Int(v) => (v, majit_ir::Type::Int),
                 Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
@@ -4356,10 +4615,7 @@ impl OptContext {
             return Some((raw, tp));
         }
         // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo.
-        let opref_box = self.get_box_replacement_box(opref);
-        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
-            opref_box.as_ref().and_then(|b| self.peek_ptr_info(b))
-        {
+        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self.peek_ptr_info(op) {
             return Some((gcref.0 as i64, majit_ir::Type::Ref));
         }
         None
@@ -5470,6 +5726,8 @@ impl OptContext {
     /// callers that need identity/value parity (`same_info`, in-place
     /// mutation) use `.same_info()` / `.borrow()` / `.borrow_mut()`.
     pub fn getrawptrinfo_handle(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfoHandle> {
+        use crate::r#box::Forwarded;
+        use crate::optimizeopt::info::OpInfo;
         // info.py:867 — `assert op.type == 'i'`.
         debug_assert_eq!(
             op.type_(),
@@ -5490,9 +5748,32 @@ impl OptContext {
                 bits as usize,
             ))));
         }
-        // info.py:872-878 — IntBound forwarding returns None;
-        // AbstractRawPtrInfo forwarding returns the live `fw` cell.
-        terminal.ptr_info_handle().map(PtrInfoHandle::Live)
+        // info.py:872-878 line-by-line dispatch on the forwarded slot:
+        //     fw = op.get_forwarded()
+        //     if isinstance(fw, IntBound): return None
+        //     if fw is not None:
+        //         assert isinstance(fw, AbstractRawPtrInfo)
+        //         return fw
+        //     return None
+        match &*terminal.get_forwarded() {
+            Forwarded::None => None,
+            Forwarded::Info(OpInfo::IntBound(_)) => None,
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
+            // info.py:876 `assert isinstance(fw, AbstractRawPtrInfo)` —
+            // a non-Ptr, non-IntBound forwarded on an `'i'`-typed terminal
+            // is a structural invariant violation upstream would crash on.
+            Forwarded::Info(other) => panic!(
+                "getrawptrinfo: forwarded must be IntBound or AbstractRawPtrInfo \
+                 (info.py:876), got {:?}",
+                std::mem::discriminant(other),
+            ),
+            // Terminal of `get_box_replacement(false)` can only be `None`
+            // or `Info(_)` per the chain walker (box.rs:295-322).
+            Forwarded::Box(_) => unreachable!(
+                "getrawptrinfo: chain terminal must not carry Forwarded::Box \
+                 (box.rs:295 get_box_replacement walker invariant)",
+            ),
+        }
     }
 
     /// info.py:880-894 `getptrinfo(op)` parity (line-by-line port).
@@ -5528,6 +5809,8 @@ impl OptContext {
     /// shape that preserves RPython `_forwarded` object identity.
     /// See `getrawptrinfo_handle` for the variant semantics.
     pub fn getptrinfo_handle(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfoHandle> {
+        use crate::r#box::Forwarded;
+        use crate::optimizeopt::info::OpInfo;
         match op.type_() {
             // info.py:881-882 — `if op.type == 'i': return getrawptrinfo(op)`.
             majit_ir::Type::Int => return self.getrawptrinfo_handle(op),
@@ -5544,7 +5827,11 @@ impl OptContext {
         // info.py:886-893 type 'r' arm:
         //   op = get_box_replacement(op)
         //   if isinstance(op, ConstPtr): return ConstPtrInfo(op)
-        //   fw = op.get_forwarded(); if fw is not None: return fw
+        //   fw = op.get_forwarded()
+        //   if fw is not None:
+        //       assert isinstance(fw, PtrInfo)
+        //       return fw
+        //   return None
         let terminal = op.get_box_replacement(false);
         debug_assert_eq!(
             terminal.type_(),
@@ -5556,8 +5843,22 @@ impl OptContext {
         if let Some(Value::Ref(gcref)) = terminal.const_value() {
             return Some(PtrInfoHandle::Const(PtrInfo::Constant(gcref)));
         }
-        // info.py:890-893: fw = op.get_forwarded(); if fw is not None: return fw
-        terminal.ptr_info_handle().map(PtrInfoHandle::Live)
+        match &*terminal.get_forwarded() {
+            Forwarded::None => None,
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
+            // info.py:892 `assert isinstance(fw, PtrInfo)` — a Ref-typed
+            // terminal must not forward to IntBound / FloatConst / Unknown.
+            Forwarded::Info(other) => panic!(
+                "getptrinfo: forwarded must be PtrInfo (info.py:892), got {:?}",
+                std::mem::discriminant(other),
+            ),
+            // Terminal of `get_box_replacement(false)` can only be `None`
+            // or `Info(_)` per the chain walker (box.rs:295-322).
+            Forwarded::Box(_) => unreachable!(
+                "getptrinfo: chain terminal must not carry Forwarded::Box \
+                 (box.rs:295 get_box_replacement walker invariant)",
+            ),
+        }
     }
 
     /// virtualstate.py:48-55 `GenerateGuardState.get_runtime_field(box, descr)`
@@ -5785,13 +6086,11 @@ impl OptContext {
 
     /// info.py:880 `getptrinfo(op).get_known_class(cpu)` parity.
     ///
-    /// Routes the OpRef through `get_box_replacement_box` to obtain a
-    /// `BoxRef`, then delegates to `getptrinfo` + `PtrInfo::get_known_class`
-    /// so constant pointers are handled via `cls_of_box` the same way
+    /// Delegates to `getptrinfo(&BoxRef)` + `PtrInfo::get_known_class` so
+    /// constant pointers are handled via `cls_of_box` the same way
     /// `Instance` / `Virtual` read their stored `known_class`.
-    pub fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
-        let b = self.get_box_replacement_box(opref)?;
-        self.getptrinfo(&b)?.get_known_class()
+    pub fn get_known_class(&self, op: &crate::r#box::BoxRef) -> Option<majit_ir::GcRef> {
+        self.getptrinfo(op)?.get_known_class()
     }
 
     /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
@@ -6347,7 +6646,7 @@ impl OptContext {
         // `get_ptr_info` to compute `last_guard_pos`, drop that read, and
         // then either re-borrow mutably for the early return or fall
         // through to the upgrade.
-        // BoxRef-routing read. Owned PtrInfo from `peek_ptr_info_via_box` is
+        // BoxRef-routing read. Owned PtrInfo from `peek_ptr_info` is
         // consumed by `matches!` so no borrow is held when the mutable
         // re-borrow of the BoxRef slot runs below for the early return.
         let arg0_box = self.get_box_replacement_box(arg0);
@@ -7133,7 +7432,7 @@ mod boxref_forwarding_tests {
     ///      `source._forwarded = Box(placeholder_at_target_p1.raw)`.
     ///   2. Phase 2 imports info via `set_ptr_info(target_p1, info)` writes
     ///      `placeholder._forwarded = Info(info)`.
-    ///   3. Reading source via `peek_ptr_info_via_box` walks
+    ///   3. Reading source via `peek_ptr_info` walks
     ///      `source → placeholder` and sees the placeholder's info.
     ///
     /// PyPy parity is preserved structurally even though Phase 1's actual
@@ -7367,8 +7666,8 @@ mod boxref_forwarding_tests {
         assert_eq!(got, b0);
     }
 
-    // BoxRef-routing helpers `is_virtual_via_box` / `is_nonnull_via_box`
-    // read the same `_forwarded` slot that PyPy's getptrinfo() inspects.
+    // BoxRef-routing helpers `is_virtual` / `is_nonnull` read the same
+    // `_forwarded` slot that PyPy's getptrinfo() inspects.
 
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
@@ -7634,6 +7933,207 @@ mod boxref_forwarding_tests {
         assert!(same_const.same_info(&live));
         assert!(live.same_info(&same_const));
         assert!(!different_const.same_info(&live));
+    }
+
+    /// `getintbound_handle` lazy-installs `IntBound::unbounded` on first
+    /// access (mirroring `optimizer.py:110-112 op.set_forwarded(IntBound())`)
+    /// and subsequent calls return the same `Live` cell — `Rc::ptr_eq`
+    /// holds and mutation through one handle propagates to the other.
+    #[test]
+    fn int_bound_handle_live_identity_propagates_mutation() {
+        use crate::r#box::BoxRef;
+        use majit_ir::Type;
+
+        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let b = BoxRef::new_resop(Type::Int, 0);
+        let h1 = ctx.getintbound_handle(&b);
+        let h2 = ctx.getintbound_handle(&b);
+        assert!(
+            h1.ptr_eq(&h2),
+            "Live handles for the same box must share the same Rc cell"
+        );
+
+        // Mutation through h1 visible through h2 — RPython
+        // `getintbound(box).intersect(b)` propagation.
+        {
+            let mut m = h1.borrow_mut().expect("Live handle accepts mutable borrow");
+            let _ = m.make_ge_const(42);
+        }
+        assert_eq!(
+            h2.borrow().lower,
+            42,
+            "h2 must observe h1's make_ge mutation (shared Rc cell)"
+        );
+    }
+
+    /// `IntBoundHandle::Const` arms (synthesized from `ConstInt`) are
+    /// independent objects — fresh `IntBound::from_constant(v)` each
+    /// time, never `Rc::ptr_eq`.
+    #[test]
+    fn int_bound_handle_const_arms_are_not_ptr_eq() {
+        use crate::r#box::BoxRef;
+        use majit_ir::Value;
+
+        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let b = BoxRef::new_const_with_index(Value::Int(7), 0);
+        let h1 = ctx.getintbound_handle(&b);
+        let h2 = ctx.getintbound_handle(&b);
+        assert!(
+            !h1.ptr_eq(&h2),
+            "Const arms must be fresh independent objects, never ptr_eq"
+        );
+        assert_eq!(h1.borrow().lower, 7);
+        assert_eq!(h2.borrow().lower, 7);
+    }
+
+    /// `optimizer.py:102-103 return IntBound.from_constant(...)` —
+    /// PyPy yields a *mutable* fresh `IntBound` for ConstInt. The Rust
+    /// Const arm mirrors that: `borrow_mut()` succeeds and the mutation
+    /// is observable through the same handle (and any clones of it),
+    /// while a SEPARATE `getintbound_handle` call on the same ConstInt
+    /// produces an independent cell that does NOT see the mutation.
+    #[test]
+    fn int_bound_handle_const_arm_is_locally_mutable() {
+        use crate::r#box::BoxRef;
+        use majit_ir::Value;
+
+        let mut ctx = OptContext::with_num_inputs(0, 0);
+        let b = BoxRef::new_const_with_index(Value::Int(7), 0);
+        let h = ctx.getintbound_handle(&b);
+        // Direct field mutation through the RefMut — `make_ge_const`
+        // would reject 20 on `from_constant(7)` (empty interval); the
+        // parity claim is "borrow_mut succeeds and writes land in the
+        // cell", not "any arbitrary IntBound method succeeds".
+        {
+            let mut m = h
+                .borrow_mut()
+                .expect("Const arm must accept mutable borrow (optimizer.py:102)");
+            m.upper = 20;
+        }
+        assert_eq!(
+            h.borrow().upper,
+            20,
+            "Const arm mutation must be visible through the same handle"
+        );
+        // A fresh getintbound_handle call mints an independent cell —
+        // mutations on `h` do not leak across calls (PyPy: each
+        // `IntBound.from_constant(7)` is a distinct object).
+        let h_fresh = ctx.getintbound_handle(&b);
+        assert_eq!(
+            h_fresh.borrow().upper,
+            7,
+            "Fresh Const handle must not observe prior handle's mutation"
+        );
+    }
+
+    /// `resoperation.py:57-68 get_box_replacement` walks the
+    /// `_forwarded` chain until it hits a terminal that is not a Box
+    /// forward.  After two consecutive `replace_op(a, b)` /
+    /// `replace_op(b, c)` calls, reading `getptrinfo_handle(&a)`
+    /// must return a handle to the same Rc cell that
+    /// `getptrinfo_handle(&c)` returns — the chain walker resolves
+    /// `a → b → c` and the PtrInfo installed earliest on `a` has
+    /// transferred through both steps via the OpInfo clone.
+    #[test]
+    fn chain_walk_preserves_ptr_info_rc_identity_across_two_hops() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 3, 0, 3);
+        let a = BoxRef::new_inputarg(Type::Ref, Some(0));
+        let b = BoxRef::new_inputarg(Type::Ref, Some(1));
+        let c = BoxRef::new_inputarg(Type::Ref, Some(2));
+        ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
+        ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
+
+        ctx.replace_op(OpRef::InputArgRef(0), OpRef::InputArgRef(1));
+        ctx.replace_op(OpRef::InputArgRef(1), OpRef::InputArgRef(2));
+
+        let h_a = ctx
+            .getptrinfo_handle(&a)
+            .expect("chain a -> b -> c must surface c's _forwarded slot");
+        let h_c = ctx
+            .getptrinfo_handle(&c)
+            .expect("c carries the transferred PtrInfo");
+        assert!(
+            h_a.same_info(&h_c),
+            "chain walker must land on the same Rc cell that lives on c"
+        );
+
+        // Verify the original last_guard_pos survived both transfers.
+        assert_eq!(h_c.borrow().get_last_guard_pos(), Some(7));
+    }
+
+    /// `optimizer.py:387 make_equal_to` transfers the `_forwarded`
+    /// IntBound from `op` to `newop` by writing the same Python object
+    /// into `newop.set_forwarded(...)`.  Counterpart of
+    /// [`replace_op_preserves_ptr_info_rc_identity`] for the IntBound
+    /// cell.
+    #[test]
+    fn replace_op_preserves_int_bound_rc_identity() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
+        let old_box = BoxRef::new_inputarg(Type::Int, Some(0));
+        let new_box = BoxRef::new_inputarg(Type::Int, Some(1));
+        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.setintbound(
+            &old_box,
+            &crate::optimizeopt::intutils::IntBound::unbounded(),
+        );
+
+        let old_handle = ctx.getintbound_handle(&old_box);
+        assert!(matches!(old_handle, IntBoundHandle::Live(_)));
+
+        ctx.replace_op(OpRef::InputArgInt(0), OpRef::InputArgInt(1));
+        let new_handle = ctx.getintbound_handle(&new_box);
+        assert!(
+            old_handle.ptr_eq(&new_handle),
+            "replace_op must transfer the same Rc cell for IntBound"
+        );
+
+        // Mutation through new_handle visible through old_handle.
+        let _ = new_handle.borrow_mut().unwrap().make_ge_const(99);
+        assert_eq!(
+            old_handle.borrow().lower,
+            99,
+            "old must observe new's make_ge mutation (shared Rc)"
+        );
+    }
+
+    /// `optimizer.py:387 make_equal_to` transfers the `_forwarded`
+    /// PtrInfo from `op` to `newop` by writing the same Python object
+    /// into `newop.set_forwarded(...)`.  pyre's `replace_op` clones
+    /// the `OpInfo` enum, but since `OpInfo::Ptr` holds an `Rc`, the
+    /// clone shares the same cell — so after `replace_op(old, new)`
+    /// the handles obtained from `old` and `new` satisfy `ptr_eq`
+    /// and downstream mutation on one is visible through the other.
+    #[test]
+    fn replace_op_preserves_ptr_info_rc_identity() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
+        let old_box = BoxRef::new_inputarg(Type::Ref, Some(0));
+        let new_box = BoxRef::new_inputarg(Type::Ref, Some(1));
+        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
+
+        let old_handle = ctx
+            .getptrinfo_handle(&old_box)
+            .expect("install populated _forwarded on old");
+        ctx.replace_op(OpRef::InputArgRef(0), OpRef::InputArgRef(1));
+        let new_handle = ctx
+            .getptrinfo_handle(&new_box)
+            .expect("PtrInfo transferred to new via clone of Rc cell");
+        assert!(
+            old_handle.same_info(&new_handle),
+            "replace_op must transfer the same Rc cell (RPython _forwarded share)"
+        );
+
+        // Mutation through new_handle visible through old_handle —
+        // they share the same Rc<RefCell<PtrInfo>>.
+        new_handle
+            .borrow_mut()
+            .expect("Live handle accepts mutation")
+            .set_last_guard_pos(123);
+        assert_eq!(
+            old_handle.borrow().get_last_guard_pos(),
+            Some(123),
+            "old's view of the transferred info must see new's mutation"
+        );
     }
 }
 

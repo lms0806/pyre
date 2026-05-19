@@ -1656,7 +1656,11 @@ impl PtrInfo {
                     // (all raw=0).
                     if clear {
                         let resolved = ctx.get_box_replacement(item_ref);
-                        let is_default = matches!(ctx.getconst(resolved), Some((0, _)));
+                        let is_default = ctx
+                            .get_box_replacement_box(resolved)
+                            .as_ref()
+                            .and_then(|b| ctx.getconst(b))
+                            .map_or(false, |(raw, _)| raw == 0);
                         if is_default {
                             continue;
                         }

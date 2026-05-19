@@ -3905,10 +3905,12 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1338-1340 multi-frame state-field-JIT chain
-                // reconstruction (mirrors the loop_jit guard-fail path):
-                // root frame clones the dispatch JitCode singleton,
-                // sub-frames walk `parent.descrs[idx]` per
+                // resume.py:1338-1340 multi-frame chain reconstruction
+                // (mirrors the loop_jit guard-fail path):
+                //   jitcode = jitcodes[jitcode_pos]
+                //   curbh.setposition(jitcode, pc)
+                // Root frame clones `self.dispatch_jitcode`; sub-frames
+                // index into the parent's `descrs` array per
                 // `BC_INLINE_CALL`'s `j` argcode (`blackhole.py:150-157`).
                 let _ = env;
                 let dispatch_jitcode = self.dispatch_jitcode.clone();
@@ -3918,6 +3920,12 @@ impl<S: JitState> JitDriver<S> {
                 let resolve_jitcode =
                     |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let resolved_jitcode = if last_resolved.borrow().is_none() {
+                            // Root frame: clone the dispatch JitCode
+                            // singleton registered at install time
+                            // (`register_dispatch_jitcode`).  Returns
+                            // None only when the proc-macro lowerer
+                            // rejected the dispatch body shape and
+                            // install skipped registration.
                             dispatch_jitcode.as_ref()?.clone()
                         } else {
                             let parent = last_resolved

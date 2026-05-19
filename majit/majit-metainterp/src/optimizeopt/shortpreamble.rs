@@ -1430,9 +1430,9 @@ impl ProducedShortOp {
         let obj_resolved = ctx.get_box_replacement(obj);
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
+        // Pass the Rc handle (unroll.py:61 identity preservation).
         if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
-            let snapshot = rc.borrow().clone();
-            ctx.setinfo_from_preamble(obj_resolved, &snapshot, Some(exported_infos));
+            ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let mut getfield_op = Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
         getfield_op.descr = Some(descr.clone());
@@ -1536,9 +1536,9 @@ impl ProducedShortOp {
         // shortpreamble.py:68-71 applies to both getfield and
         // getarrayitem: if the base object has exported info, import it
         // before ensuring heap/array PtrInfo.
+        // Pass the Rc handle (unroll.py:61 identity preservation).
         if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
-            let snapshot = rc.borrow().clone();
-            ctx.setinfo_from_preamble(obj_resolved, &snapshot, Some(exported_infos));
+            ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let index_const = ctx.make_constant_int(index);
         let mut getarrayitem_op = Op::new(

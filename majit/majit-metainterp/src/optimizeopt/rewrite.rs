@@ -1552,11 +1552,13 @@ impl OptRewrite {
                     // getptrinfo → ConstPtrInfo.get_known_class (info.py:763-772)
                     // which is exactly cls_of_box for constant pointers.
                     if let Some(prev_cls) = info.get_known_class() {
-                        if let Some(expected_cls) = ctx.get_known_class(arg1) {
-                            if prev_cls != expected_cls {
-                                raise_invalid_loop(
-                                    "GUARD_VALUE proven to always fail (class mismatch)",
-                                );
+                        if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
+                            if let Some(expected_cls) = ctx.get_known_class(&arg1_box) {
+                                if prev_cls != expected_cls {
+                                    raise_invalid_loop(
+                                        "GUARD_VALUE proven to always fail (class mismatch)",
+                                    );
+                                }
                             }
                         }
                     }

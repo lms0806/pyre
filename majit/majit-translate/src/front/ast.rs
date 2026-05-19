@@ -182,6 +182,21 @@ impl StructFieldRegistry {
             .map(|(_, ty)| ty.as_str())
     }
 
+    /// Per-scope `field_type` lookup: route `owner` through the call
+    /// site's `use_imports` + `module_prefix` first (PyPy
+    /// `frame.f_globals` analog) so a bare receiver leaf lands at the
+    /// canonical key before the program-wide bookkeeper fallback.
+    pub fn field_type_in_scope(
+        &self,
+        owner: &str,
+        field_name: &str,
+        prefix: &str,
+        use_imports: &HashMap<String, String>,
+    ) -> Option<&str> {
+        let canonical_owner = qualify_type_name_with_imports(owner, prefix, use_imports);
+        self.field_type(&canonical_owner, field_name)
+    }
+
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         if let Some(fields) = self.fields.get(owner) {
             return Some(fields.as_slice());
@@ -4019,7 +4034,14 @@ fn lower_expr(
                 // from struct field registry for the kind suffix (i/r/f).
                 let item_field_type_string = elem_type
                     .as_ref()
-                    .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                    .and_then(|owner| {
+                        ctx.struct_fields.field_type_in_scope(
+                            owner,
+                            &field_name,
+                            &ctx.module_prefix,
+                            &ctx.use_imports,
+                        )
+                    })
                     .map(ToOwned::to_owned);
                 let item_ty = item_field_type_string
                     .as_deref()
@@ -4122,7 +4144,14 @@ fn lower_expr(
                         // from struct field registry for the kind suffix (i/r/f).
                         let item_ty = elem_type
                             .as_ref()
-                            .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                            .and_then(|owner| {
+                                ctx.struct_fields.field_type_in_scope(
+                                    owner,
+                                    &field_name,
+                                    &ctx.module_prefix,
+                                    &ctx.use_imports,
+                                )
+                            })
                             .map(type_string_to_value_type)
                             .unwrap_or(ValueType::Unknown);
                         graph.push_op(
@@ -6689,26 +6718,6 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                     return kind;
                 }
             }
-            // Canonical-receiver fallback: Item::Impl associated-const
-            // and method registration goes through `qualify_type_name(
-            // self_ty_root, prefix)` which now resolves bare known-struct
-            // names to defining-module form via `STRUCT_ORIGIN_REGISTRY`
-            // (PyPy `bookkeeper.getdesc` analog).  Bare receiver paths
-            // here reach the canonical-registered key only via this
-            // explicit second lookup.
-            let canonical_recv = majit_ir::descr::canonical_struct_name(
-                &path.path.segments[n - 2].ident.to_string(),
-            );
-            if canonical_recv != path.path.segments[n - 2].ident.to_string() {
-                let canonical_key =
-                    format!("{}::{}", canonical_recv, path.path.segments[n - 1].ident);
-                if let Some(ty) = ctx.fn_return_types.get(&canonical_key) {
-                    let kind = type_string_to_unary_not_kind(ty);
-                    if kind != UnaryNotOperandKind::Unknown {
-                        return kind;
-                    }
-                }
-            }
             UnaryNotOperandKind::Unknown
         }
         syn::Expr::Path(path)
@@ -7212,23 +7221,6 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                         let kind = type_string_to_unary_not_kind(ret);
                         if kind != UnaryNotOperandKind::Unknown {
                             return kind;
-                        }
-                    }
-                    // Canonical-receiver fallback for the multi-segment
-                    // Impl call: same shape as `expr_unary_not_operand_kind`'s
-                    // Multi-segment Path arm and `lookup_function_return_type`'s
-                    // tail.  Item::Impl method registration goes through
-                    // `qualify_type_name(self_ty_root, prefix)` which now
-                    // resolves bare known-struct names to defining-module
-                    // form via `STRUCT_ORIGIN_REGISTRY`.
-                    let canonical_recv = majit_ir::descr::canonical_struct_name(&segments[n - 2]);
-                    if canonical_recv != segments[n - 2] {
-                        let canonical_key = format!("{}::{}", canonical_recv, segments[n - 1]);
-                        if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
-                            let kind = type_string_to_unary_not_kind(ret);
-                            if kind != UnaryNotOperandKind::Unknown {
-                                return kind;
-                            }
                         }
                     }
                 }
@@ -7957,22 +7949,8 @@ fn lookup_method_return_type<'a>(
         return Some(ret);
     }
 
-    // Canonical-receiver exact-match: when the receiver is a bare
-    // known-struct name, route through `STRUCT_ORIGIN_REGISTRY` to its
-    // defining-module qualifier (PyPy `bookkeeper.getdesc` analog) and
-    // try the canonical key directly.  Avoids exercising the leaf-
-    // suffix uniqueness scan below for the common cross-module case.
+    let method_name = method.to_string();
     let receiver_leaf = receiver_root.rsplit("::").next().unwrap_or(receiver_root);
-    let canonical_recv = majit_ir::descr::canonical_struct_name(receiver_leaf);
-    if canonical_recv != receiver_leaf {
-        let canonical_key = format!("{}::{}", canonical_recv, method);
-        if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
-            return Some(ret);
-        }
-    }
-
-    let method_name = method.to_string();
-    let method_name = method.to_string();
     // Rust imports can make the call-site owner path shorter or longer
     // than the impl key. Use the leaf owner only when it is unambiguous.
     let mut matches = ctx.fn_return_types.iter().filter_map(|(key, ret)| {
@@ -8046,7 +8024,12 @@ fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Opt
                 syn::Member::Named(ident) => ident.to_string(),
                 syn::Member::Unnamed(_) => return None,
             };
-            let field_type = ctx.struct_fields.field_type(&owner, &field_name)?;
+            let field_type = ctx.struct_fields.field_type_in_scope(
+                &owner,
+                &field_name,
+                &ctx.module_prefix,
+                &ctx.use_imports,
+            )?;
             dyn_trait_root_from_type_str(field_type)
         }
         // `handlers[i].run()` — `handlers`'s declared full type is
@@ -8203,11 +8186,16 @@ fn bind_pattern_locals(
                 };
                 let field_type = ctx
                     .struct_fields
-                    .field_type(&owner, &field_name)
+                    .field_type_in_scope(&owner, &field_name, &ctx.module_prefix, &ctx.use_imports)
                     .or_else(|| {
-                        matched_owner
-                            .as_deref()
-                            .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                        matched_owner.as_deref().and_then(|owner| {
+                            ctx.struct_fields.field_type_in_scope(
+                                owner,
+                                &field_name,
+                                &ctx.module_prefix,
+                                &ctx.use_imports,
+                            )
+                        })
                     })
                     .map(|s| s.to_string());
                 bind_pattern_locals(&field_pat.pat, field_type.as_deref(), ctx);
@@ -9165,7 +9153,7 @@ fn field_type_string_from_expr(
     let field_name = member_name(member);
     let owner = receiver_type_root(base, ctx)?;
     ctx.struct_fields
-        .field_type(&owner, &field_name)
+        .field_type_in_scope(&owner, &field_name, &ctx.module_prefix, &ctx.use_imports)
         .map(ToOwned::to_owned)
 }
 
@@ -9647,17 +9635,14 @@ fn lookup_function_return_type<'a>(
         if let Some(ret) = ctx.fn_return_types.get(&bare_impl) {
             return Some(ret);
         }
-        // Canonical-receiver fallback: `Item::Impl` registration goes
-        // through `qualify_type_name(self_ty_root, prefix)` which now
-        // resolves bare known-struct names to their defining-module
-        // form via `STRUCT_ORIGIN_REGISTRY` (PyPy
-        // `bookkeeper.getdesc(value)` analog,
-        // `bookkeeper.py:353-409`).  Call sites that write the
-        // receiver in bare or use-site-qualified form land here; try
-        // the canonical-qualified key so the lookup matches the
-        // registered slot regardless of how the caller spelled the
-        // receiver.
-        let canonical_recv = majit_ir::descr::canonical_struct_name(&segments[n - 2]);
+        // Per-scope canonical-receiver fallback (PyPy
+        // `bookkeeper.py:353-409 getdesc` lexical-resolution layering):
+        // route the bare receiver leaf through the call site's own
+        // `use_imports` + `module_prefix` first (PyPy `frame.f_globals`
+        // role), then `STRUCT_ORIGIN_REGISTRY` + bare verbatim fallback
+        // — all three encapsulated in `qualify_type_name_with_imports`.
+        let canonical_recv =
+            qualify_type_name_with_imports(&segments[n - 2], &ctx.module_prefix, &ctx.use_imports);
         if canonical_recv != segments[n - 2] {
             let canonical_key = format!("{}::{}", canonical_recv, segments[n - 1]);
             if let Some(ret) = ctx.fn_return_types.get(&canonical_key) {
@@ -9768,7 +9753,12 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
             let owner_type = receiver_type_root(&field.base, ctx)?;
             let field_name = member_name(&field.member);
             // RPython: op.args[0].concretetype — returns full ARRAY type.
-            let field_type_str = ctx.struct_fields.field_type(&owner_type, &field_name)?;
+            let field_type_str = ctx.struct_fields.field_type_in_scope(
+                &owner_type,
+                &field_name,
+                &ctx.module_prefix,
+                &ctx.use_imports,
+            )?;
             Some(field_type_str.to_string())
         }
         // RPython: op.result.concretetype — for call expressions like `make_points()[i]`,

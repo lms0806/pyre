@@ -2438,8 +2438,15 @@ impl CallControl {
                         OpKind::Call { target, .. } => target,
                         _ => continue,
                     };
-                    let callee_path = match self.target_to_path(target) {
-                        Some(p) => p,
+                    // `call.py:97` direct_call → `funcobj.graph` — co-fetch
+                    // path + graph through the single Box-identity helper.
+                    // A missing graph (unregistered target) and a missing
+                    // path collapse into the same "skip" decision: the
+                    // earlier path-then-Some(graph) two-step never built a
+                    // SemanticFunction either when the graph wasn't in
+                    // `function_graphs`.
+                    let (callee_path, graph_ref) = match self.target_to_path_and_graph(target) {
+                        Some(pair) => pair,
                         None => continue,
                     };
                     // RPython call.py:80: kind = self.guess_call_kind(op, is_candidate)
@@ -2459,24 +2466,23 @@ impl CallControl {
                     // SemanticFunction from the stored graph + hints so
                     // the policy's `_jit_*_` / `_elidable_function_`
                     // checks fire identically to upstream.
-                    if let Some(graph) = self.function_graphs.get(&callee_path).cloned() {
-                        let hints = self
-                            .function_hints
-                            .get(&callee_path)
-                            .cloned()
-                            .unwrap_or_default();
-                        let func = SemanticFunction {
-                            name: callee_path.last_segment().unwrap_or_default().to_string(),
-                            graph,
-                            return_type: None,
-                            self_ty_root: None,
-                            hints,
-                            access_directly: false,
-                        };
-                        if policy.look_inside_graph(&func) {
-                            self.candidate_graphs.insert(callee_path.clone());
-                            todo.push(callee_path);
-                        }
+                    let graph = graph_ref.clone();
+                    let hints = self
+                        .function_hints
+                        .get(&callee_path)
+                        .cloned()
+                        .unwrap_or_default();
+                    let func = SemanticFunction {
+                        name: callee_path.last_segment().unwrap_or_default().to_string(),
+                        graph,
+                        return_type: None,
+                        self_ty_root: None,
+                        hints,
+                        access_directly: false,
+                    };
+                    if policy.look_inside_graph(&func) {
+                        self.candidate_graphs.insert(callee_path.clone());
+                        todo.push(callee_path);
                     }
                 }
             }
@@ -2857,6 +2863,23 @@ impl CallControl {
         }
     }
 
+    /// Look up the registered graph alongside its `CallPath` in a single
+    /// step — `call.py:97` `funcobj.graph` direct read.  The returned
+    /// `&FunctionGraph` is the same identity registered under the path,
+    /// without the `candidate_graphs` filter `direct_graph_for` imposes
+    /// (callers that want the candidate-only view continue to use
+    /// `direct_graph_for`).  The `CallPath` byproduct stays available
+    /// for legacy side-tables (`return_types`, `function_fnaddrs`)
+    /// still keyed by path string.
+    pub(crate) fn target_to_path_and_graph(
+        &self,
+        target: &CallTarget,
+    ) -> Option<(CallPath, &FunctionGraph)> {
+        let path = self.target_to_path(target)?;
+        let graph = self.function_graphs.get(&path)?;
+        Some((path, graph))
+    }
+
     /// Convert a CallTarget to a CallPath for lookup.
     ///
     /// FunctionPath → direct path.
@@ -2875,29 +2898,18 @@ impl CallControl {
                 receiver_root,
                 ..
             } => {
-                // RPython: direct_call → funcobj.graph. Try qualified path first
-                // so inherent methods resolve by direct graph linkage.
+                // `call.py:97` direct_call → `funcobj.graph` — inherent
+                // method receivers carry a canonical `module::Type` spelling
+                // (`parse::extract_inherent_impl_methods` registration and
+                // `front::ast::qualify_type_name_with_imports` callsite both
+                // route bare names through `STRUCT_ORIGIN_REGISTRY`, and
+                // `joined_use_path` strips the syntactic `crate::` prefix
+                // off `use_imports` entries), so the single qualified
+                // lookup hits the same `CallPath` registered above.
                 if let Some(receiver) = receiver_root.as_deref() {
                     let qualified = CallPath::for_impl_method(receiver, name.as_str());
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
-                    }
-                    // PyPy `bookkeeper.getdesc(value)` returns one desc per
-                    // Python class regardless of how the type was spelled at
-                    // the call site (alias, fully-qualified, bare).  Pyre
-                    // carries types as strings, so a `use crate::pyframe::
-                    // PyFrame` receiver yields `crate::pyframe::PyFrame`
-                    // while the inherent `impl PyFrame { ... }` block in
-                    // pyframe.rs registers under the bare leaf.  Retry the
-                    // lookup with just the leaf segment so the cross-form
-                    // call resolves to the same graph identity.
-                    if let Some(leaf) = receiver.rsplit("::").next() {
-                        if leaf != receiver {
-                            let leaf_path = CallPath::for_impl_method(leaf, name.as_str());
-                            if self.function_graphs.contains_key(&leaf_path) {
-                                return Some(leaf_path);
-                            }
-                        }
                     }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
@@ -3912,8 +3924,8 @@ impl CallControl {
                 // `block.inputargs` is unpopulated; `graph_non_void_arg_types`
                 // encapsulates the convention so direct-call validation matches
                 // upstream's hard-fail semantics.
-                if let Some(path) = self.target_to_path(target) {
-                    if let Some(graph) = self.function_graphs.get(&path) {
+                if let Some((path, graph)) = self.target_to_path_and_graph(target) {
+                    {
                         let expected_arg_types = graph_non_void_arg_types(graph);
                         // RPython call.py:223-228 compares the full
                         // `concretetype` list. Pyre's caller-side
