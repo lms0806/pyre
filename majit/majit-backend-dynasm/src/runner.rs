@@ -97,6 +97,8 @@ thread_local! {
     /// reach the live allocator without taking a dynasm dependency.
     pub static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
         const { RefCell::new(None) };
+    static DYNASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn majit_gc::GcAllocator>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> Option<R> {
@@ -104,6 +106,22 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
         let guard = cell.borrow();
         guard.as_deref().map(f)
     })
+}
+
+/// Clear both `DYNASM_ACTIVE_GC` and `DYNASM_ACTIVE_GC_RAW`. Callers
+/// that want to drop the active dynasm GC must go through this helper
+/// rather than mutating `DYNASM_ACTIVE_GC` directly, otherwise the raw
+/// mirror used by `dynasm_gc_owns_object`'s reentrant fallback would be
+/// left pointing at freed memory.
+pub fn clear_gc_allocator() {
+    // Drop the boxed allocator first so reentrant
+    // `dynasm_gc_owns_object` queries from its drop body still resolve
+    // old-heap addresses through the raw mirror, then clear the raw
+    // mirror.
+    DYNASM_ACTIVE_GC.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
 }
 
 /// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
@@ -261,7 +279,25 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
 /// `std::alloc::dealloc`).
 fn dynasm_gc_owns_object(addr: usize) -> bool {
     DYNASM_ACTIVE_GC.with(|cell| {
-        let guard = cell.borrow();
+        let guard = match cell.try_borrow() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Structural adaptation: RPython's GC descriptor is a
+                // normal object reference and `gc_current_object_address`
+                // can query ownership while a collection is already in
+                // progress. Pyre stores the active dynasm GC behind a
+                // Rust `RefCell`; during `alloc_nursery` the mutable
+                // borrow is held while extra-root walkers may ask whether
+                // a mapdict key is GC-managed. Use the raw pointer only
+                // for this immutable ownership query, matching the
+                // read-only nature of RPython's descriptor call, instead
+                // of panicking across the extern "C" slowpath.
+                return DYNASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+                    Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
+                    None => false,
+                });
+            }
+        };
         match guard.as_deref() {
             Some(gc) => gc.is_managed_heap_object(addr),
             None => false,
@@ -1034,7 +1070,23 @@ impl DynasmBackend {
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
         let supports_guard_gc_type = gc.supports_guard_gc_type();
-        DYNASM_ACTIVE_GC.with(|cell| *cell.borrow_mut() = Some(gc));
+        DYNASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            // Drop the previous allocator first so reentrant
+            // `dynasm_gc_owns_object` queries from its drop body still
+            // resolve old-heap addresses through the raw mirror — it
+            // keeps pointing at the live old box throughout the drop
+            // body. Publishing the new raw pointer before the drop
+            // would route those queries to the new allocator, which
+            // does not know about old-heap addresses. After the drop
+            // returns no further reentry is possible on this thread
+            // before the raw mirror is republished synchronously below.
+            *guard = Some(gc);
+            let raw = guard
+                .as_deref_mut()
+                .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
+            DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+        });
         majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
             check_is_object: Some(dynasm_check_is_object),
             get_actual_typeid: Some(dynasm_get_actual_typeid),
