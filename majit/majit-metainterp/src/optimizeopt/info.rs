@@ -1513,7 +1513,9 @@ impl PtrInfo {
                         // invariant) and never silently drops the write.
                         let const_ref = GcRef(ptr.0);
                         ctx.make_constant(opref, Value::Ref(const_ref));
-                        ctx.set_ptr_info_for(opref, PtrInfo::Constant(const_ref));
+                        if let Some(b) = ctx.ensure_box(opref) {
+                            ctx.set_ptr_info(&b, PtrInfo::Constant(const_ref));
+                        }
                         return opref;
                     }
                 }
@@ -1560,7 +1562,7 @@ impl PtrInfo {
                     let b_alloc = ctx
                         .ensure_box(alloc_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
+                    ctx.make_equal_to(&b_opref, &b_alloc);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1616,7 +1618,7 @@ impl PtrInfo {
                     let b_alloc = ctx
                         .ensure_box(alloc_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
+                    ctx.make_equal_to(&b_opref, &b_alloc);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1633,11 +1635,13 @@ impl PtrInfo {
             PtrInfo::VirtualArray(vinfo) => {
                 // info.py:540-558 ArrayPtrInfo._force_elements
                 // RPython `op.set_forwarded(self)` (post-force) is
-                // unconditional. `set_ptr_info_for` lazy-allocates the
-                // backing BoxRef via `ensure_box`, matching upstream's
-                // implicit "every Box exists" invariant.
+                // unconditional. `ensure_box` lazy-allocates the backing
+                // BoxRef, matching upstream's implicit "every Box exists"
+                // invariant.
                 let len = vinfo.items.len();
-                ctx.set_ptr_info_for(opref, PtrInfo::nonnull());
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
+                }
 
                 let len_ref = ctx.emit_constant_int(len as i64);
                 let alloc_opcode = if vinfo.clear {
@@ -1656,7 +1660,7 @@ impl PtrInfo {
                     let b_alloc = ctx
                         .ensure_box(alloc_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
+                    ctx.make_equal_to(&b_opref, &b_alloc);
                 }
 
                 // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
@@ -1699,10 +1703,11 @@ impl PtrInfo {
                 // created with clear=True, so the original op is always
                 // NEW_ARRAY_CLEAR.
                 // RPython `op.set_forwarded(self)` (post-force) is
-                // unconditional; set_ptr_info_for lazy-allocates the
-                // BoxRef.
+                // unconditional; ensure_box lazy-allocates the BoxRef.
                 let num_elements = vinfo.element_fields.len();
-                ctx.set_ptr_info_for(opref, PtrInfo::nonnull());
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(&b, PtrInfo::nonnull());
+                }
 
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
@@ -1716,7 +1721,7 @@ impl PtrInfo {
                     let b_alloc = ctx
                         .ensure_box(alloc_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
+                    ctx.make_equal_to(&b_opref, &b_alloc);
                 }
 
                 // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
@@ -1783,7 +1788,7 @@ impl PtrInfo {
                     let b_alloc = ctx
                         .ensure_box(alloc_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
+                    ctx.make_equal_to(&b_opref, &b_alloc);
                 }
 
                 // info.py:425: CHECK_MEMORY_ERROR
@@ -1852,7 +1857,7 @@ impl PtrInfo {
                     let b_new = ctx
                         .ensure_box(new_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_new));
+                    ctx.make_equal_to(&b_opref, &b_new);
                 }
                 new_ref
             }
@@ -1936,7 +1941,7 @@ impl PtrInfo {
                     let b_newop = ctx
                         .ensure_box(newop)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_opref, Some(&b_newop));
+                    ctx.make_equal_to(&b_opref, &b_newop);
                 }
 
                 // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)

@@ -1323,7 +1323,7 @@ impl ProducedShortOp {
             let b_result = ctx
                 .ensure_box(result_opref)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_source, Some(&b_result));
+            ctx.make_equal_to(&b_source, &b_result);
         }
         // `result_opref` is a typed synthetic alias minted by
         // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
@@ -1477,7 +1477,7 @@ impl ProducedShortOp {
         let b_result = ctx
             .ensure_box(result_opref)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_source, Some(&b_result));
+        ctx.make_equal_to(&b_source, &b_result);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1594,7 +1594,7 @@ impl ProducedShortOp {
         let b_result = ctx
             .ensure_box(result_opref)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_source, Some(&b_result));
+        ctx.make_equal_to(&b_source, &b_result);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1648,7 +1648,7 @@ impl ProducedShortOp {
         let b_result = ctx
             .ensure_box(result_opref)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_source, Some(&b_result));
+        ctx.make_equal_to(&b_source, &b_result);
         // `rewrite.py:31` `self.opt.loop_invariant_results[key] = old_op` —
         // dict-as-map semantics; pyre's Vec-backed parity overwrites the
         // entry when `func_ptr` already exists (PyPy dict behavior),

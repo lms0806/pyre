@@ -3493,72 +3493,46 @@ impl OptContext {
     ///     if opinfo is not None and not newop.is_constant():
     ///         newop.set_forwarded(opinfo)
     /// ```
-    ///
-    /// Chain-walks `old` to its terminal, captures any `AbstractInfo` in
-    /// `_forwarded`, points the terminal at `new`, then transfers the
-    /// captured info onto `new` unless `new` is a constant.
-    ///
-    /// `new = None` is the pyre-only clear-forwarding sentinel (PyPy has
-    /// no `make_equal_to(op, None)` path); it operates on `old`'s slot
-    /// directly so the chain rooted at `old` is broken at its root rather
-    /// than walked to the terminal.
-    pub fn make_equal_to(
-        &mut self,
-        old: &crate::r#box::BoxRef,
-        new: Option<&crate::r#box::BoxRef>,
-    ) {
-        if old.is_constant() {
+    pub fn make_equal_to(&mut self, op: &crate::r#box::BoxRef, newop: &crate::r#box::BoxRef) {
+        // optimizer.py:381 Const.set_forwarded asserts; pyre no-ops the
+        // chain head when `op` is itself a Const so callers can fold const
+        // sources without an explicit guard.
+        if op.is_constant() {
             return;
         }
-        if let Some(n) = new {
-            // optimizer.py:387 Box.type invariant: cross-type forwards
-            // would silently retype the chain head.
-            debug_assert_eq!(
-                old.get_box_replacement(false).type_(),
-                n.type_(),
-                "make_equal_to: cross-type forward (Box.type invariant)",
-            );
-        }
-        // optimizer.py:387 walks `op` to its terminal first so the
-        // `_forwarded` write lands on the chain's terminal box.  The
-        // clear-forwarding sentinel skips the walk to break the chain
-        // at its root rather than at the terminal.
-        let walked = if new.is_some() {
-            old.get_box_replacement(false)
-        } else {
-            old.clone()
-        };
-        if let Some(n) = new
-            && &walked == n
-        {
+        // optimizer.py:387 Box.type invariant: cross-type forwards would
+        // silently retype the chain head.
+        debug_assert_eq!(
+            op.get_box_replacement(false).type_(),
+            newop.type_(),
+            "make_equal_to: cross-type forward (Box.type invariant)",
+        );
+        // optimizer.py:391 op = get_box_replacement(op)
+        let op = op.get_box_replacement(false);
+        // optimizer.py:392 if op is newop: return
+        if &op == newop {
             return;
         }
-        if walked.is_constant() {
+        if op.is_constant() {
             return;
         }
-        // Capture old's AbstractInfo BEFORE overwriting per
-        // optimizer.py:387-400 — pyre stores three variants
-        // (Ptr/IntBound/FloatConst per info.py:851) that need transfer.
+        // optimizer.py:393 opinfo = op.get_forwarded()
         use crate::optimizeopt::info::OpInfo;
-        let info_to_transfer: Option<OpInfo> = match &*walked.get_forwarded() {
+        let info_to_transfer: Option<OpInfo> = match &*op.get_forwarded() {
             crate::r#box::Forwarded::Info(
                 opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConst(_)),
             ) => Some(opinfo.clone()),
             _ => None,
         };
-        // optimizer.py:387 `op.set_forwarded(newop)`.
-        match new {
-            None => walked.clear_forwarded(),
-            Some(n) => walked.set_forwarded_box(n.clone()),
-        }
-        // optimizer.py:400 `newop.set_forwarded(opinfo)` when opinfo
-        // exists and newop is not a Const (Const boxes carry their
-        // value directly and are not legitimate `_forwarded` carriers
-        // for PtrInfo / IntBound).
-        if let (Some(opinfo), Some(n)) = (info_to_transfer, new)
-            && !n.is_constant()
+        // optimizer.py:394 op.set_forwarded(newop)
+        op.set_forwarded_box(newop.clone());
+        // optimizer.py:395-396
+        //   if opinfo is not None and not newop.is_constant():
+        //       newop.set_forwarded(opinfo)
+        if let Some(opinfo) = info_to_transfer
+            && !newop.is_constant()
         {
-            n.set_forwarded_info(opinfo);
+            newop.set_forwarded_info(opinfo);
         }
     }
 
@@ -6935,26 +6909,6 @@ impl OptContext {
         resolved.set_forwarded_info(OpInfo::ptr(info));
     }
 
-    /// OpRef-direct variant of [`Self::set_ptr_info`] that mirrors RPython's
-    /// `op.set_forwarded(info)` callsite shape — the caller has an OpRef,
-    /// the storage walk is internal. RPython's box.set_forwarded is invoked
-    /// on the box itself: pyre's `OpRef` is value-typed (`Copy` u32 enum),
-    /// so the per-box mutable slot lives in `box_pool[idx]` and is reached
-    /// via `ensure_box`. This wrapper hides the BoxRef obtain step at every
-    /// callsite that doesn't have an unrelated reason to hold a BoxRef
-    /// (write-only ptr_info update).
-    ///
-    /// Constants (OpRef::ConstInt/ConstFloat/ConstPtr) and `OpRef::None`
-    /// silently no-op, matching upstream `Const.set_forwarded` assert.
-    pub fn set_ptr_info_for(&mut self, opref: OpRef, info: PtrInfo) {
-        if opref.is_none() || opref.is_constant() {
-            return;
-        }
-        if let Some(b) = self.ensure_box(opref) {
-            self.set_ptr_info(&b, info);
-        }
-    }
-
     /// Lazy-allocate a `BoxRef::new_resop(Type::Void, idx)` placeholder at
     /// `box_pool[idx]` (and any preceding holes) when absent, returning a
     /// clone of the BoxRef at that position.
@@ -7018,7 +6972,7 @@ impl OptContext {
         let b_new = self
             .ensure_box(new_ref)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        self.make_equal_to(&b_old, Some(&b_new));
+        self.make_equal_to(&b_old, &b_new);
         new_ref
     }
 }
@@ -7247,19 +7201,21 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_replace_op_mirrors_box_forward() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&b0, Some(&b1));
+        ctx.make_equal_to(&b0, &b1);
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => assert_eq!(target, &b1),
             other => panic!("expected Forwarded::Box, got {:?}", other),
         }
     }
 
-    /// `make_equal_to(old, NONE)` mirrors `old_box.clear_forwarded()`.
+    /// `box.clear_forwarded()` resets a previously-set forwarding slot
+    /// back to `Forwarded::None`.  PyPy has no `make_equal_to(op, None)`
+    /// path; chain reset happens on the box directly.
     #[test]
-    fn h3_1_replace_op_to_none_clears_box_forward() {
+    fn h3_1_clear_forwarded_resets_box_forward() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&b0, Some(&b1));
-        ctx.make_equal_to(&b0, None);
+        ctx.make_equal_to(&b0, &b1);
+        b0.clear_forwarded();
         assert!(matches!(*b0.get_forwarded(), BoxForwarded::None));
     }
 
@@ -7271,7 +7227,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
         ctx.setintbound(&b0, &bound);
-        ctx.make_equal_to(&b0, Some(&b1));
+        ctx.make_equal_to(&b0, &b1);
         // After: old's IntBound transferred to new (PyPy:
         // `newop.set_forwarded(opinfo)`). old now forwards to new.
         match &*b1.get_forwarded() {
@@ -7300,7 +7256,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx
             .ensure_box(const_opref)
             .expect("const_pool seeded above");
-        ctx.make_equal_to(&b0, Some(&b_const));
+        ctx.make_equal_to(&b0, &b_const);
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &*b0.get_forwarded() {
@@ -7381,7 +7337,7 @@ mod boxref_forwarding_tests {
         let b0_iarg = ctx
             .ensure_box(OpRef::input_arg_int(0))
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b0_iarg, Some(&const_box));
+        ctx.make_equal_to(&b0_iarg, &const_box);
         let b0_after = ctx.ensure_box(OpRef::input_arg_int(0)).expect("b0");
         assert!(b0_after.get_box_replacement(false).is_constant());
         // `Forwarded::Box(constbox)` planted directly via set_forwarded_box.
@@ -7438,7 +7394,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx
             .ensure_box(const_opref)
             .expect("const_pool seeded above");
-        ctx.make_equal_to(&b0, Some(&b_const));
+        ctx.make_equal_to(&b0, &b_const);
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert!(target.is_constant());
@@ -7461,7 +7417,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx
             .ensure_box(const_opref)
             .expect("const_pool seeded above");
-        ctx.make_equal_to(&b0, Some(&b_const));
+        ctx.make_equal_to(&b0, &b_const);
 
         assert_eq!(ctx.get_box_replacement(OpRef::int_op(0)), const_opref);
         assert_eq!(
@@ -7469,7 +7425,7 @@ mod boxref_forwarding_tests {
             OpRef::int_op(0)
         );
 
-        ctx.make_equal_to(&b1, Some(&b0));
+        ctx.make_equal_to(&b1, &b0);
         assert_eq!(ctx.get_box_replacement(OpRef::int_op(1)), const_opref);
         assert_eq!(
             ctx.get_box_replacement_not_const(OpRef::int_op(1)),
@@ -7493,7 +7449,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx
             .ensure_box(const_opref)
             .expect("ensure_box should have panicked above");
-        ctx.make_equal_to(&b0, Some(&b_const));
+        ctx.make_equal_to(&b0, &b_const);
     }
 
     /// H-3.4 slice 77b follow-up: Phase 2's `box_pool` carries placeholder
@@ -7540,7 +7496,7 @@ mod boxref_forwarding_tests {
         let source_p2 = OpRef::input_arg_ref(2);
 
         // Step 1: import_state's `source.set_forwarded(target)` equivalent.
-        ctx.make_equal_to(&source_box, Some(&placeholder_target));
+        ctx.make_equal_to(&source_box, &placeholder_target);
 
         // Step 2: setinfo_from_preamble's terminal write.
         // `setinfo_from_preamble(source, info)` first walks the chain via
@@ -7612,7 +7568,7 @@ mod boxref_forwarding_tests {
 
         // import_state's make_equal_to fires, but Phase 2 chose NOT to import
         // info (e.g. exported_infos didn't carry an entry for target_p1).
-        ctx.make_equal_to(&source_box, Some(&placeholder_target));
+        ctx.make_equal_to(&source_box, &placeholder_target);
 
         // BoxRef-routing reader: chain walks source → placeholder → None.
         let source_p2_box = ctx
@@ -7678,7 +7634,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_walks_forwarded_chain() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&b0, Some(&b1));
+        ctx.make_equal_to(&b0, &b1);
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
@@ -8117,8 +8073,8 @@ mod boxref_forwarding_tests {
         ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
         ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
-        ctx.make_equal_to(&a, Some(&b));
-        ctx.make_equal_to(&b, Some(&c));
+        ctx.make_equal_to(&a, &b);
+        ctx.make_equal_to(&b, &c);
 
         let h_a = ctx
             .getptrinfo_handle(&a)
@@ -8154,7 +8110,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
-        ctx.make_equal_to(&old_box, Some(&new_box));
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
@@ -8188,7 +8144,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx
             .getptrinfo_handle(&old_box)
             .expect("install populated _forwarded on old");
-        ctx.make_equal_to(&old_box, Some(&new_box));
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx
             .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");
@@ -8226,7 +8182,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
-        ctx.make_equal_to(&old_box, Some(&new_box));
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
@@ -8247,7 +8203,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx
             .getptrinfo_handle(&old_box)
             .expect("populated _forwarded on old");
-        ctx.make_equal_to(&old_box, Some(&new_box));
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx
             .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");
@@ -8257,12 +8213,11 @@ mod boxref_forwarding_tests {
         );
     }
 
-    /// `make_equal_to(old, None)` is the clear-forwarding sentinel
-    /// (PyPy has no `make_equal_to(op, None)` — this is the pyre-only
-    /// chain-break path).  After the call, `old`'s `_forwarded` slot is
-    /// `None` and its previously-stored IntBound is unreachable.
+    /// `box.clear_forwarded()` resets `_forwarded` directly.  After the
+    /// call, `old`'s slot is `None` and any previously-stored IntBound is
+    /// unreachable.
     #[test]
-    fn make_equal_to_with_none_clears_forwarding() {
+    fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let old_box = BoxRef::new_inputarg(Type::Int, Some(0));
         ctx.box_pool = vec![old_box.clone()].into();
@@ -8275,7 +8230,7 @@ mod boxref_forwarding_tests {
             IntBoundHandle::Live(_),
         ));
 
-        ctx.make_equal_to(&old_box, None);
+        old_box.clear_forwarded();
         assert!(matches!(
             &*old_box.get_forwarded(),
             crate::r#box::Forwarded::None,
@@ -9061,7 +9016,7 @@ mod opt_box_env_tests {
         let target_box = ctx
             .ensure_box(target)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&source_box, Some(&target_box));
+        ctx.make_equal_to(&source_box, &target_box);
         ctx.set_ptr_info(
             &target_box,
             PtrInfo::Virtual(VirtualInfo {

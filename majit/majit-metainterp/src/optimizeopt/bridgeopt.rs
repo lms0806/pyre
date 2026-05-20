@@ -191,7 +191,7 @@ pub fn deserialize_optimizer_knowledge(
     liveboxes: &[OpRef],
     livebox_types: &[majit_ir::Type],
     all_descrs: &[majit_ir::descr::DescrRef],
-    cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
@@ -240,20 +240,18 @@ pub fn deserialize_optimizer_knowledge(
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
             // RPython's type system guarantees frontend_boxes[i] is a valid
-            // GcRef when box.type == "r" and class_known is set. Our raw i64
-            // encoding requires a nonnull check (RPython's box.nonnull()
-            // equivalent, info.py:763).
-            if let Some(cpu_ref) = cpu.as_ref() {
-                let raw_ref = frontend_boxes[i];
-                if raw_ref != 0 {
-                    let cls = cpu_ref.cls_of_box(raw_ref);
-                    // optimizer.py:137-152 `make_constant_class` always
-                    // updates `_forwarded` after `get_box_replacement` —
-                    // `ensure_box` materializes a Box so the class info
-                    // install is never silently skipped.
-                    if let Some(b) = ctx.ensure_box(livebox) {
-                        super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
-                    }
+            // GcRef when box.type == "r" and class_known is set. Our raw
+            // i64 encoding requires a nonnull check (RPython's
+            // `box.nonnull()` equivalent, info.py:763).
+            let raw_ref = frontend_boxes[i];
+            if raw_ref != 0 {
+                let cls = cpu.cls_of_box(raw_ref);
+                // optimizer.py:137-152 `make_constant_class` always
+                // updates `_forwarded` after `get_box_replacement` —
+                // `ensure_box` materializes a Box so the class info
+                // install is never silently skipped.
+                if let Some(b) = ctx.ensure_box(livebox) {
+                    super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
                 }
             }
         }

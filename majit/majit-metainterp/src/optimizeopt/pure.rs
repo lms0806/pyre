@@ -1027,7 +1027,7 @@ impl Optimization for OptPure {
                     let b_cached = ctx
                         .ensure_box(cached_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_old, Some(&b_cached));
+                    ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1046,7 +1046,7 @@ impl Optimization for OptPure {
                         let b_cached = ctx
                             .ensure_box(cached_ref)
                             .expect("body-namespace OpRef must have a BoxRef slot");
-                        ctx.make_equal_to(&b_old, Some(&b_cached));
+                        ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
                     }
@@ -1135,7 +1135,7 @@ impl Optimization for OptPure {
                 let b_cached = ctx
                     .ensure_box(cached_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_cached));
+                ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1151,7 +1151,7 @@ impl Optimization for OptPure {
                 let b_cached = ctx
                     .ensure_box(cached_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_cached));
+                ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1199,7 +1199,7 @@ impl Optimization for OptPure {
                         let b_cached = ctx
                             .ensure_box(cached_ref)
                             .expect("body-namespace OpRef must have a BoxRef slot");
-                        ctx.make_equal_to(&b_old, Some(&b_cached));
+                        ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
                     }
@@ -1261,7 +1261,7 @@ impl Optimization for OptPure {
                 let b_cached = ctx
                     .ensure_box(cached_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_cached));
+                ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1274,7 +1274,7 @@ impl Optimization for OptPure {
                 let b_result = ctx
                     .ensure_box(result_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_result));
+                ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -2275,7 +2275,7 @@ mod tests {
         let b_canonical = ctx
             .ensure_box(canonical_arg)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_query, Some(&b_canonical));
+        ctx.make_equal_to(&b_query, &b_canonical);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 

@@ -276,7 +276,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg1)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // eq_one: int_eq(x, 1) => x  (when x is bool)
@@ -287,7 +287,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // eq_zero: int_eq(0, x) => int_is_zero(x)
@@ -423,7 +423,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg1)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // add_zero: int_add(x, 0) => x
@@ -434,7 +434,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // autogenintrules.py:42-88 — outer const on arg0, inner producer on arg1.
@@ -549,7 +549,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
             if autogen_eq(arg1, &b1, arg0_0, &b0_0) {
@@ -559,7 +559,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         } else if let Some(arg0_int_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
@@ -575,7 +575,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
             if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
@@ -585,7 +585,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         } else if let Some(arg0_int_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
@@ -601,7 +601,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
             if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
@@ -611,7 +611,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0_1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         }
@@ -623,7 +623,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // sub_from_zero: int_sub(0, x) => int_neg(x)
@@ -719,7 +719,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg1)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // mul_one: int_mul(x, 1) => x
@@ -730,7 +730,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // Outer const on arg0: mul_minus_one / mul_pow2_const
@@ -822,7 +822,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         }
@@ -837,7 +837,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         }
@@ -849,7 +849,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(x, y) => x
@@ -861,7 +861,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(y, x) => x
@@ -872,7 +872,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg1)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if b0.is_constant() {
@@ -1003,7 +1003,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(x, y) => x
@@ -1015,7 +1015,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(y, x) => x
@@ -1026,7 +1026,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg1)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if b0.is_constant() {
@@ -1206,7 +1206,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
@@ -1222,7 +1222,7 @@ impl OptIntBounds {
                 let b_inner = ctx
                     .ensure_box(inner_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_inner));
+                ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(int_xor(b, a), b) => a
@@ -1233,7 +1233,7 @@ impl OptIntBounds {
                 let b_inner = ctx
                     .ensure_box(inner_1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_inner));
+                ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
         }
@@ -1246,7 +1246,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(arg0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         } else if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
@@ -1262,7 +1262,7 @@ impl OptIntBounds {
                 let b_inner = ctx
                     .ensure_box(inner_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_inner));
+                ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(b, int_xor(b, a)) => a
@@ -1273,7 +1273,7 @@ impl OptIntBounds {
                 let b_inner = ctx
                     .ensure_box(inner_1)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_inner));
+                ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
         }
@@ -1351,7 +1351,7 @@ impl OptIntBounds {
             let b_inner = ctx
                 .ensure_box(inner_0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_inner));
+            ctx.make_equal_to(&b_old, &b_inner);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
@@ -1369,7 +1369,7 @@ impl OptIntBounds {
             let b_inner = ctx
                 .ensure_box(inner_0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_inner));
+            ctx.make_equal_to(&b_old, &b_inner);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
@@ -1397,7 +1397,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
@@ -1549,7 +1549,7 @@ impl OptIntBounds {
                 let b_inner = ctx
                     .ensure_box(inner_0)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_inner));
+                ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
         }
@@ -1561,7 +1561,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
@@ -1603,7 +1603,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
@@ -1656,7 +1656,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
@@ -1689,7 +1689,7 @@ impl OptIntBounds {
             let b_arg = ctx
                 .ensure_box(arg0)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_arg));
+            ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
@@ -1983,7 +1983,7 @@ impl OptIntBounds {
                 let b_arg = ctx
                     .ensure_box(op.arg(0))
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_arg));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         }

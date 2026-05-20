@@ -3539,7 +3539,7 @@ impl OptUnroll {
             let b_target = ctx
                 .ensure_box(*target)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_source, Some(&b_target));
+            ctx.make_equal_to(&b_source, &b_target);
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit] import_state_map[{i}]: source={source:?} target={target:?}");
             }
@@ -4395,7 +4395,7 @@ fn assemble_peeled_trace_with_jump_args(
                 let b_ela = ctx
                     .ensure_box(extended_label_arg)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_js, Some(&b_ela));
+                ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
@@ -6027,7 +6027,7 @@ mod tests {
         let b_tgt = ctx
             .ensure_box(OpRef::ref_op(14))
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_src, Some(&b_tgt));
+        ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::ref_op(19),
             invented_name: produced.invented_name,

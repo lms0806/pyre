@@ -31,8 +31,9 @@ pub(crate) struct PendingBridgeRd {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
     /// `optimizer.cpu` (model.py:39 AbstractCPU) — carried through the
-    /// bridge into the retrace `Optimizer.cpu` slot.
-    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
+    /// bridge into the retrace `Optimizer.cpu` slot. RPython never sees a
+    /// `None` here: `optimizer.cpu` is set at `Optimizer.__init__` time.
+    pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
 }
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -406,12 +407,12 @@ impl Optimizer {
     ) {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
-        // OpRef-direct ptr_info writes mirror RPython's
-        // `op.set_forwarded(info)` callsite shape (mod.rs:6080
-        // set_ptr_info_for). Constants take an OpRef-only path via
-        // `make_constant`. The Untyped/None/Constant short-circuits
-        // inside `set_ptr_info_for` keep the upstream
-        // `Const.set_forwarded` no-op invariant.
+        // `op.set_forwarded(info)` per optimizer.py — each arm materializes
+        // the box via `ensure_box(opref)` then writes through
+        // `set_ptr_info(&b, _)`. Constants take the value-only path via
+        // `make_constant`; ensure_box returns `None` for OpRef::NONE /
+        // OpRef::Const* so non-PtrInfo opref values silently no-op,
+        // matching upstream `Const.set_forwarded` assert.
         match info {
             VirtualStateInfo::Constant(value) => {
                 ctx.make_constant(opref, value.clone());
@@ -440,37 +441,41 @@ impl Optimizer {
                     imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                ctx.set_ptr_info_for(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::Virtual(
-                        crate::optimizeopt::info::VirtualInfo {
-                            descr: descr.clone(),
-                            known_class: *known_class,
-                            ob_type_descr: ob_type_descr.clone(),
-                            fields: imported_fields,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                        },
-                    ),
-                );
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        crate::optimizeopt::info::PtrInfo::Virtual(
+                            crate::optimizeopt::info::VirtualInfo {
+                                descr: descr.clone(),
+                                known_class: *known_class,
+                                ob_type_descr: ob_type_descr.clone(),
+                                fields: imported_fields,
+                                last_guard_pos: -1,
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
                     .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
                     .collect();
-                ctx.set_ptr_info_for(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArray(
-                        crate::optimizeopt::info::VirtualArrayInfo {
-                            descr: descr.clone(),
-                            clear: false,
-                            items: imported_items,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                        },
-                    ),
-                );
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArray(
+                            crate::optimizeopt::info::VirtualArrayInfo {
+                                descr: descr.clone(),
+                                clear: false,
+                                items: imported_items,
+                                last_guard_pos: -1,
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VStruct {
                 descr,
@@ -483,17 +488,19 @@ impl Optimizer {
                     imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                ctx.set_ptr_info_for(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                        crate::optimizeopt::info::VirtualStructInfo {
-                            descr: descr.clone(),
-                            fields: imported_fields,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                        },
-                    ),
-                );
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                            crate::optimizeopt::info::VirtualStructInfo {
+                                descr: descr.clone(),
+                                fields: imported_fields,
+                                last_guard_pos: -1,
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
@@ -514,27 +521,33 @@ impl Optimizer {
                             .collect()
                     })
                     .collect();
-                ctx.set_ptr_info_for(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
-                            descr: descr.clone(),
-                            fielddescrs: fielddescrs.clone(),
-                            element_fields: imported_elements,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                        },
-                    ),
-                );
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
+                            crate::optimizeopt::info::VirtualArrayStructInfo {
+                                descr: descr.clone(),
+                                fielddescrs: fielddescrs.clone(),
+                                element_fields: imported_elements,
+                                last_guard_pos: -1,
+                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            },
+                        ),
+                    );
+                }
             }
             VirtualStateInfo::KnownClass { class_ptr } => {
-                ctx.set_ptr_info_for(
-                    opref,
-                    crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
-                );
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(
+                        &b,
+                        crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
+                    );
+                }
             }
             VirtualStateInfo::NonNull => {
-                ctx.set_ptr_info_for(opref, crate::optimizeopt::info::PtrInfo::nonnull());
+                if let Some(b) = ctx.ensure_box(opref) {
+                    ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
+                }
             }
             VirtualStateInfo::IntBounded(bound) => {
                 // RPython parity: imported preamble bounds become the box's
@@ -2142,7 +2155,7 @@ impl Optimizer {
                         let b_fresh = ctx
                             .ensure_box(fresh)
                             .expect("body-namespace OpRef must have a BoxRef slot");
-                        ctx.make_equal_to(&b_source, Some(&b_fresh));
+                        ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
                         source
@@ -2499,7 +2512,7 @@ impl Optimizer {
                                     let b_orig = ctx
                                         .ensure_box(orig_field)
                                         .expect("body-namespace OpRef must have a BoxRef slot");
-                                    ctx.make_equal_to(&b_ff, Some(&b_orig));
+                                    ctx.make_equal_to(&b_ff, &b_orig);
                                     field.1 = ff;
                                 }
                                 crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
@@ -3501,7 +3514,7 @@ impl Optimizer {
             let b_new = ctx
                 .ensure_box(new)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, Some(&b_new));
+            ctx.make_equal_to(&b_old, &b_new);
             return;
         }
 
@@ -4377,7 +4390,7 @@ mod tests {
                     let b_new = ctx
                         .ensure_box(new)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_old, Some(&b_new));
+                    ctx.make_equal_to(&b_old, &b_new);
                     return OptimizationResult::Remove;
                 }
             }
@@ -5611,7 +5624,7 @@ mod tests {
         let b20 = ctx
             .ensure_box(OpRef::int_op(20))
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b11, Some(&b20));
+        ctx.make_equal_to(&b11, &b20);
         let b20 = ctx
             .ensure_box(OpRef::int_op(20))
             .expect("body-namespace OpRef must have a BoxRef slot");

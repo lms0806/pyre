@@ -730,7 +730,7 @@ impl OptVirtualize {
                 let b_val = ctx
                     .ensure_box(val_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_val));
+                ctx.make_equal_to(&b_old, &b_val);
                 return OptimizationResult::Remove;
             }
             // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
@@ -848,7 +848,7 @@ impl OptVirtualize {
                     let b_item = ctx
                         .ensure_box(item_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_old, Some(&b_item));
+                    ctx.make_equal_to(&b_old, &b_item);
                     return OptimizationResult::Remove;
                 }
             }
@@ -935,7 +935,7 @@ impl OptVirtualize {
                 let b_fld = ctx
                     .ensure_box(fld)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, Some(&b_fld));
+                ctx.make_equal_to(&b_old, &b_fld);
                 return OptimizationResult::Remove;
             }
         }
@@ -1094,7 +1094,7 @@ impl OptVirtualize {
                     let b_val = ctx
                         .ensure_box(val_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    ctx.make_equal_to(&b_old, Some(&b_val));
+                    ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
             }
@@ -1280,7 +1280,7 @@ impl OptVirtualize {
                                 let b_val = ctx
                                     .ensure_box(val_ref)
                                     .expect("body-namespace OpRef must have a BoxRef slot");
-                                ctx.make_equal_to(&b_old, Some(&b_val));
+                                ctx.make_equal_to(&b_old, &b_val);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1669,7 +1669,7 @@ impl OptVirtualize {
         let b_forced = ctx
             .ensure_box(forced_resolved)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        ctx.make_equal_to(&b_old, Some(&b_forced));
+        ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
         true

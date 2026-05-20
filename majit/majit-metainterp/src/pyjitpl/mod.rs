@@ -967,7 +967,10 @@ pub struct MetaInterp<M: Clone> {
     /// `cls_of_box(box)` (model.py:199-201) and, going forward, the
     /// rest of the AbstractCPU surface (`bh_*` runtime calls, GC type
     /// info accessors, etc.).  Default: `Some(default_cpu())` — the
-    /// lltype typeptr-at-offset-0 layout.
+    /// lltype typeptr-at-offset-0 layout. `None` only in dispatch test
+    /// fixtures that exercise the raw exc_value fallback in
+    /// `read_typeptr_from_exception` (e.g. `raise_catch_inline_call_*`
+    /// which raises non-memory raw `i64` values like `0xfeed`).
     pub(crate) cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
 
     /// model.py:266-273 + RPython `rclass.ll_issubclass` parity: callback
@@ -8715,7 +8718,10 @@ impl<M: Clone> MetaInterp<M> {
                     liveboxes,
                     livebox_types,
                     all_descrs: self.staticdata.all_descrs.lock().unwrap().clone(),
-                    cpu: self.cpu.clone(),
+                    cpu: self
+                        .cpu
+                        .clone()
+                        .expect("MetaInterp.cpu unset (seeded by MetaInterp::new)"),
                 })
             });
             let Some(tok) = compiled.live_token() else {
@@ -17796,7 +17802,7 @@ mod tests {
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
             all_descrs: vec![],
-            cpu: None,
+            cpu: crate::cpu::default_cpu(),
         };
 
         let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
