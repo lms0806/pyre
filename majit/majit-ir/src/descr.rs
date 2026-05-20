@@ -89,12 +89,11 @@
 ///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
 ///   retired.  RPython caches real `Arc<dyn FieldDescr>` /
 ///   `Arc<dyn SizeDescr>` on the equivalent struct
-///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre constructs vref
-///   field descrs on demand at the SETFIELD_GC emit sites
-///   (`optimizeopt/virtualize.rs:1521/1528 make_vref_field_descr`).
-///   Caching them on `VirtualRefInfo` for identity stability is a
-///   separate follow-up (no current pyre call site relied on the
-///   removed u32 placeholders).
+///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre now does the same
+///   with `VirtualRefInfo::{descr, descr_virtual_token, descr_forced}`.
+///   The module-level vref descriptor constructors return the same
+///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
+///   same identities carried by `MetaInterp.virtualref_info`.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -109,6 +108,67 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
+
+/// Thin-pointer wrapper for descrs whose address is baked into JIT-emitted
+/// code.  `history.py:109-114 AbstractDescr.{hide,show}` parity: PyPy bakes
+/// the GCREF of an `AbstractFailDescr` directly and recovers via
+/// `cast_gcref_to_instance(AbstractDescr, descr_gcref)` — a pure cast
+/// because every RPython GCREF is a typed pointer.
+///
+/// Rust's `Arc<dyn Descr>` is a fat pointer (data + vtable).  Codegen can
+/// only bake the data half, so reconstructing the fat Arc at recovery
+/// time needs a side-channel for the vtable.  `FailDescrCell` is a
+/// concrete-typed wrapper: `Arc<FailDescrCell>` is thin, so
+/// `Arc::as_ptr(&cell) as *const () as usize` bakes a complete identity
+/// and `Arc::from_raw(addr as *const FailDescrCell)` recovers it
+/// without a registry.
+///
+/// The cell is the unit kept alive by
+/// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`);
+/// the inner `DescrRef` carries the dynamic trait dispatch.
+pub struct FailDescrCell {
+    pub descr: DescrRef,
+}
+
+impl FailDescrCell {
+    pub fn wrap(descr: DescrRef) -> Arc<Self> {
+        Arc::new(Self { descr })
+    }
+}
+
+impl std::ops::Deref for FailDescrCell {
+    type Target = dyn Descr + 'static;
+    fn deref(&self) -> &(dyn Descr + 'static) {
+        &*self.descr
+    }
+}
+
+impl std::fmt::Debug for FailDescrCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FailDescrCell(cell={:p}, descr={:p})",
+            self as *const Self,
+            Arc::as_ptr(&self.descr) as *const ()
+        )
+    }
+}
+
+/// `history.py:113 AbstractDescr.show(cpu, descr_gcref)` parity.
+///
+/// # Safety
+/// `addr` MUST be the address of a live `Arc<FailDescrCell>` whose
+/// strong refcount is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
+/// (or an equivalent keep-alive collection) while the baked JIT code
+/// references this address.  Calling with any other address — including
+/// the address of a different concrete type — is undefined behavior.
+pub unsafe fn recover_fail_descr_cell(addr: usize) -> Arc<FailDescrCell> {
+    let ptr = addr as *const FailDescrCell;
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
+}
 
 /// descr.py: GcCache dict keys.
 ///

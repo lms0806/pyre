@@ -14,6 +14,7 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
+
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
@@ -684,28 +685,6 @@ pub struct DynasmBackend {
     /// owning backend — matches the lifetime guarantee RPython gets from
     /// `cpu` being a long-lived Python object.
     descr_attachments: crate::guard::CpuDescrHandle,
-    /// ptr → `DescrRef` registry enabling cross-token resolution of
-    /// guard fail descriptors. RPython resolves
-    /// `AbstractDescr.show(jf_descr)` via direct pointer dereference,
-    /// so the lookup naturally crosses loop/bridge boundaries. Pyre
-    /// keeps each descr as a `DescrRef` and stores them in per-token
-    /// `asmmemmgr_blocks`, so a bridge that JUMPs into another
-    /// compiled loop can leave the runtime holding a jf_descr whose
-    /// owning token is not the one currently executing. This registry
-    /// is the ptr-indexed view needed to complete that lookup.
-    fail_descr_registry:
-        Arc<std::sync::Mutex<std::collections::HashMap<usize, majit_ir::DescrRef>>>,
-    /// Backend-internal side-table mapping a source guard descr's
-    /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
-    /// patched in for that guard.  PyPy's `AbstractFailDescr._attrs_`
-    /// (`history.py:132`) carries no `bridge_addr` slot; once a bridge is
-    /// patched in, RPython relies on the in-place machine-code JMP and
-    /// recovers structural state from `asmmemmgr_blocks`.  Pyre's
-    /// metainterp queries `store_bridge_guard_hashes` /
-    /// `compiled_bridge_fail_descr_layouts` need to walk back from a
-    /// source descr to its bridge `CompiledCode`; this table is the
-    /// indirection that lets us do that without polluting the descr.
-    bridge_addr_by_descr: Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
     /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
     /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
     /// `self.propagate_exception_path` at `assembler.py:63,344` and
@@ -798,35 +777,36 @@ impl DynasmBackend {
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
             )),
-            fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             arch_cpu_ext: ArchCpuExt::new(),
         }
     }
 
-    /// Bridge entry-pointer registration keyed on the source guard
-    /// descr's `Arc::as_ptr` address.  Called from `compile_bridge`
-    /// immediately after `patch_jump_for_descr` redirects the source
-    /// guard at `runner.rs::compile_bridge` to point at the freshly
-    /// compiled bridge.
-    pub fn register_bridge_addr(&self, source_descr_ptr: usize, bridge_addr: usize) {
-        self.bridge_addr_by_descr
-            .lock()
-            .expect("bridge_addr_by_descr mutex poisoned")
-            .insert(source_descr_ptr, bridge_addr);
-    }
-
-    /// Bridge entry-pointer lookup by source descr `Arc::as_ptr` address.
-    /// Returns `0` when no bridge has been registered for the source
-    /// (PyPy parity: `assembler.py` treats `adr_jump_offset == 0`
-    /// uniformly as "patched / no entry").
-    pub fn lookup_bridge_addr(&self, source_descr_ptr: usize) -> usize {
-        self.bridge_addr_by_descr
-            .lock()
-            .expect("bridge_addr_by_descr mutex poisoned")
-            .get(&source_descr_ptr)
-            .copied()
-            .unwrap_or(0)
+    /// Bridge entry-pointer lookup by source guard `(trace_id, fail_index_per_trace)`.
+    /// Scans `token.asmmemmgr_blocks` for a `CompiledCode` whose `source_guard`
+    /// matches; returns `0` if none — `assembler.py` treats `adr_jump_offset == 0`
+    /// uniformly as "patched / no entry".
+    ///
+    /// `asmmemmgr_blocks` is append-only, so retracing the same guard
+    /// leaves multiple matching bridges in place.  Walk in reverse to
+    /// return the most recently compiled bridge — that is the one
+    /// `store_bridge_guard_hashes` / `compiled_bridge_fail_descr_layouts`
+    /// just wrote against and the one subsequent guard failures should
+    /// dispatch into.
+    pub fn lookup_bridge_addr(
+        &self,
+        token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> usize {
+        let blocks = token.asmmemmgr_blocks();
+        for block in blocks.iter().rev() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                if bridge.source_guard == Some((source_trace_id, source_fail_index)) {
+                    return codebuf::buffer_ptr(&bridge.buffer) as usize;
+                }
+            }
+        }
+        0
     }
 
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
@@ -915,19 +895,35 @@ impl DynasmBackend {
     /// token boundaries — required when a bridge JUMPs into another
     /// compiled loop and that loop's guard fires before control returns
     /// to the bridge's owning token.
+
     /// Register `DescrRef` instances into the addr→`DescrRef` lookup
     /// table.  Called from `compile_loop` / `compile_bridge` to
     /// populate after codegen.  Re-running is idempotent: existing
     /// entries are preserved via `entry().or_insert_with`.
-    pub fn register_fail_descrs(&self, descrs: &[majit_ir::DescrRef]) {
-        let mut reg = self.fail_descr_registry.lock().unwrap();
-        for descr_ref in descrs {
-            let ptr = Arc::as_ptr(descr_ref) as *const () as usize;
-            reg.entry(ptr).or_insert_with(|| descr_ref.clone());
-            // Mirror into the trampoline-reachable global registry as a
-            // `Weak<dyn Descr>` so the JIT helper trampoline can recover
-            // the descr identity without going through a backend instance.
-            crate::guard::register_fail_descr_global(ptr, descr_ref);
+    ///
+    /// Lifetime root: `token.compiled_loop_token.asmmemmgr_gcreftracers`
+    /// (`model.py:294`, `llsupport/assembler.py:190-194`
+    /// `get_asmmemmgr_gcreftracers`).  Pushes one tracer per
+    /// `register_fail_descrs` call mirroring
+    /// `assembler.py:822 gcreftracers.append(tracer)`; the tracer owns
+    /// the descr `Arc`s for the lifetime of the compiled loop so the
+    /// addresses baked into machine code stay live until
+    /// `free_loop_and_bridges` drops the CLT (`llmodel.py:252-268`).
+    pub fn register_fail_descrs(
+        &self,
+        token: &majit_backend::JitCellToken,
+        cells: &[Arc<majit_ir::FailDescrCell>],
+    ) {
+        // `assembler.py:820-823` parity: each call appends one tracer.
+        // `clt.asmmemmgr_gcreftracers` is the sole lifetime root for the
+        // baked descrs (`model.py:294` / `llmodel.py:252-268
+        // free_loop_and_bridges`).  The cells' addresses are baked into
+        // machine code, so the tracer must keep them alive — recovery
+        // (`recover_fail_descr_cell`) does `Arc::increment_strong_count`
+        // against these live cells and would UB-fault otherwise.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(cells.to_vec());
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
     }
 
@@ -1384,7 +1380,7 @@ impl DynasmBackend {
             .iter()
             .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
         {
-            return found.clone();
+            return found.descr.clone();
         }
 
         // Search bridge fail_descrs in asmmemmgr_blocks
@@ -1396,30 +1392,33 @@ impl DynasmBackend {
                     .iter()
                     .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
                 {
-                    return found.clone();
+                    return found.descr.clone();
                 }
             }
         }
         drop(blocks);
 
         // Cross-token fallback: a bridge attached to loop A may JUMP into
-        // loop B's body. When B's guard fires, the jf_descr ptr identifies
+        // loop B's body.  When B's guard fires, the jf_descr ptr identifies
         // a fail descr owned by B (or by a bridge attached to B), but the
-        // currently-executing `token` is still A. RPython's
-        // `AbstractDescr.show(jf_descr)` dereferences the pointer directly,
-        // so the lookup is inherently global; pyre emulates that with the
-        // per-backend ptr-indexed registry populated by `compile_loop` /
-        // `compile_bridge`.
-        if let Some(found) = self.fail_descr_registry.lock().unwrap().get(&ptr) {
-            return found.clone();
-        }
-
-        panic!(
-            "find_descr_by_ptr: jf_descr {:#x} not found in root loop, \
-             bridges, or ptr registry — RPython equivalent \
-             (AbstractDescr.show) never fails",
-            ptr
+        // currently-executing `token` is still A.  RPython's
+        // `AbstractDescr.show(jf_descr)` dereferences the pointer directly;
+        // pyre matches that via `recover_fail_descr_cell`, a pure cast
+        // through `Arc::from_raw` against the `FailDescrCell` wrapper that
+        // `register_fail_descrs` pinned onto the owning CLT's
+        // `asmmemmgr_gcreftracers`.
+        //
+        // A 0 `ptr` here means the JIT-baked code never wrote `jf_descr`
+        // (e.g. a force-token flow that bypassed both
+        // `_store_force_index_if_next_guard` and the inline guard-exit
+        // stub).  `Arc::from_raw(0)` is UB; refuse to recover and surface
+        // the producer-side defect.
+        assert_ne!(
+            ptr, 0,
+            "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
         );
+        let cell = unsafe { majit_ir::recover_fail_descr_cell(ptr) };
+        cell.descr.clone()
     }
 
     /// Find a descr by (trace_id, fail_index) across root loop + all
@@ -1481,7 +1480,7 @@ impl DynasmBackend {
         // with the trait default `0`.
         if compiled.trace_id == trace_id {
             if let Some(found) = compiled.fail_descrs.get(fail_index as usize) {
-                return Some(found.clone());
+                return Some(found.descr.clone());
             }
         }
         let blocks = token.asmmemmgr_blocks();
@@ -1489,7 +1488,7 @@ impl DynasmBackend {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
                     if let Some(found) = bridge.fail_descrs.get(fail_index as usize) {
-                        return Some(found.clone());
+                        return Some(found.descr.clone());
                     }
                 }
             }
@@ -1681,7 +1680,7 @@ impl Backend for DynasmBackend {
         let code_size = compiled.buffer.len();
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token, code_addr);
-        self.register_fail_descrs(&compiled.fail_descrs);
+        self.register_fail_descrs(token, &compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -1960,7 +1959,6 @@ impl Backend for DynasmBackend {
         }
         if ajo != 0 {
             Asm::patch_jump_for_descr(guard_fd, bridge_addr);
-            self.register_bridge_addr(Arc::as_ptr(&guard_descr) as *const () as usize, bridge_addr);
         } else {
             majit_ir::debug::log_one(
                 "jit-backend",
@@ -1976,7 +1974,12 @@ impl Backend for DynasmBackend {
         // when a bridge-internal guard fires.  RPython's asmmemmgr
         // ties code blocks and their resume descriptors to the same
         // compiled_loop_token lifetime.
-        self.register_fail_descrs(&compiled.fail_descrs);
+        //
+        // `compile.py:183-186 record_loop_or_bridge` attaches a
+        // bridge's resume descrs to the original loop's CLT, so the
+        // tracer batch lands on `original_token`'s
+        // `asmmemmgr_gcreftracers` (`model.py:294`).
+        self.register_fail_descrs(original_token, &compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
         // inherit the original loop's CompiledLoopToken.  See the
@@ -2078,8 +2081,9 @@ impl Backend for DynasmBackend {
         // Debug: verify bridge patches are visible
         if crate::majit_log_enabled() {
             for descr in &compiled.fail_descrs {
-                let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(descr) as *const () as usize);
                 if let Some(fd) = descr.as_fail_descr() {
+                    let bridge_addr =
+                        self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
                     if bridge_addr != 0 && fd.adr_jump_offset() == 0 {
                         eprintln!(
                             "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
@@ -2243,7 +2247,6 @@ impl Backend for DynasmBackend {
         }
         let exit_layout = Some(crate::guard::layout_for_fail_descr(
             descr_fd,
-            descr_addr,
             descr_fd.fail_index_per_trace(),
             descr_fd.trace_id(),
         ));
@@ -2287,83 +2290,34 @@ impl Backend for DynasmBackend {
         Arc::clone(&data.fail_descr)
     }
 
-    /// `fail_descr_registry` is the `addr → DescrRef` table populated by
-    /// `register_fail_descrs` at compile time, keeping every emitted
-    /// descr alive for the lifetime of its owning compiled code
-    /// (mirroring RPython's `cpu` retaining descr objects).  The cloned
-    /// `DescrRef` lets the CA bridge entry route descr identity into
-    /// `_trace_and_compile_from_bridge` (compile.py:704-709) without
-    /// going through the `(trace_id, fail_index)` surrogate key.
+    /// `llmodel.py:252-268 free_loop_and_bridges` parity.  When the CLT
+    /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
+    /// baked `FailDescrCell` Arcs; subsequent recovery from a stale
+    /// address would be UB, but the JIT-emitted code holding the address
+    /// is also retired when its CLT drops, so no live caller can reach a
+    /// stale `descr_addr`.
+    ///
+    /// `compile_loop` inserts the token into `CALL_ASSEMBLER_TARGETS`
+    /// (`runner.rs:1578`) and that map stores a strong
+    /// `Arc<CompiledLoopToken>`; without removal here the CLT — and the
+    /// fail-descr cells it pins — would live for the entire process
+    /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
-        // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
-        // evicted, RPython's GC reclaims the token's compiled code and
-        // every dependent FailDescr naturally because nothing keeps a
-        // strong ref past `alive_loops`.  Pyre's `fail_descr_registry`
-        // holds strong Arcs to every emitted descr for the C-ABI
-        // recovery path (`fail_descr_arc_from_addr` parity with
-        // `cpu.get_latest_descr`), so we must explicitly release the
-        // entries belonging to this token here — otherwise the descrs
-        // (and their `rd_loop_token_clt` chain) outlive their owning
-        // loop and pyre keeps memory PyPy would have freed.
-        //
-        // Sweep entries whose owning-JCT upgrade points back at this
-        // token. Ownerless entries (`descr_owning_jct == None`) are
-        // PRESERVED: in PyPy these correspond to FINISH descrs
-        // (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
-        // `compile.py:185` skipped via `isinstance(descr, ResumeDescr)`)
-        // which are module-level singletons not subject to per-loop GC.
-        // Treating `None` as "delete" would over-shoot PyPy's lifetime
-        // contract.
-        let mut removed_bridge_addr_keys = Vec::new();
-        let mut registry = self
-            .fail_descr_registry
+        CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        registry.retain(|_, descr| {
-            let dyn_descr = match descr.as_fail_descr() {
-                Some(fd) => fd,
-                None => return true,
-            };
-            match majit_backend::descr_owning_jct(dyn_descr) {
-                Some(owner) if owner.number == token.number => {
-                    removed_bridge_addr_keys.push(Arc::as_ptr(descr) as *const () as usize);
-                    false
-                }
-                Some(_) => true,
-                None => true,
-            }
-        });
-        drop(registry);
-        if !removed_bridge_addr_keys.is_empty() {
-            let mut bridge_addrs = self
-                .bridge_addr_by_descr
-                .lock()
-                .expect("bridge_addr_by_descr mutex poisoned");
-            for key in removed_bridge_addr_keys {
-                bridge_addrs.remove(&key);
-            }
-        }
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .remove(&token.number);
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
-        // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity: the
-        // dynasm registry holds a strong DescrRef for every emitted
-        // descr through its full lifetime, so a `descr_addr` arriving
-        // from the C-ABI guard-fail path is always present in the
-        // table.  A miss is an invariant violation, not a recoverable
-        // runtime mode.
-        let registry = self
-            .fail_descr_registry
-            .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        let descr = registry.get(&descr_addr).cloned().unwrap_or_else(|| {
-            panic!(
-                "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
-                 fail_descr_registry — every emitted fail descr must be \
-                 registered before its address reaches the C-ABI guard-fail boundary"
-            )
-        });
-        descr as majit_ir::DescrRef
+        // `history.py:109-114 AbstractDescr.show(cpu, descr_gcref) =
+        // cast_gcref_to_instance(...)` parity.  `descr_addr` is the thin
+        // pointer to the `FailDescrCell` that was baked at codegen time;
+        // recovery is a direct `Arc::from_raw` with a refcount bump.
+        // Safety: the cell is kept alive by `clt.asmmemmgr_gcreftracers`
+        // for the life of the executing JIT code (`model.py:294`).
+        let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_addr) };
+        cell.descr.clone()
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
@@ -2481,8 +2435,7 @@ impl Backend for DynasmBackend {
         source_fail_index: u32,
         hashes: &[u64],
     ) {
-        let source_descr = Self::find_descr(token, source_trace_id, source_fail_index);
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
+        let bridge_addr = self.lookup_bridge_addr(token, source_trace_id, source_fail_index);
         if bridge_addr == 0 {
             return;
         }
@@ -2503,44 +2456,6 @@ impl Backend for DynasmBackend {
                     return;
                 }
             }
-        }
-    }
-
-    fn read_descr_status(&self, descr_addr: usize) -> u64 {
-        // `compile.py:741 self.status` — route through the registry-backed
-        // `Arc<dyn FailDescr>` so the dispatch is trait-based.  Once
-        // `jf_descr` carries the meta Arc address (Unified-Descr identity
-        // flip), only the registry value changes; this dispatch chain
-        // stays the same.
-        if descr_addr == 0 {
-            return 0;
-        }
-        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr)
-            .as_fail_descr()
-            .map_or(0, |fd| fd.get_status())
-    }
-
-    fn start_compiling_descr(&self, descr_addr: usize) {
-        // `compile.py:786-788 self.start_compiling()` — trait dispatch.
-        if descr_addr == 0 {
-            return;
-        }
-        if let Some(fd) =
-            <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).as_fail_descr()
-        {
-            fd.start_compiling();
-        }
-    }
-
-    fn done_compiling_descr(&self, descr_addr: usize) {
-        // `compile.py:790-795 self.done_compiling()` — trait dispatch.
-        if descr_addr == 0 {
-            return;
-        }
-        if let Some(fd) =
-            <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).as_fail_descr()
-        {
-            fd.done_compiling();
         }
     }
 
@@ -3007,7 +2922,6 @@ impl Backend for DynasmBackend {
                 .map(|(idx, d)| {
                     crate::guard::layout_for_fail_descr(
                         d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                        Arc::as_ptr(d) as *const () as usize,
                         idx as u32,
                         trace_id,
                     )
@@ -3031,7 +2945,6 @@ impl Backend for DynasmBackend {
                     .map(|(idx, d)| {
                         crate::guard::layout_for_fail_descr(
                             d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                            Arc::as_ptr(d) as *const () as usize,
                             idx as u32,
                             trace_id,
                         )
@@ -3052,7 +2965,6 @@ impl Backend for DynasmBackend {
                             .map(|(idx, d)| {
                                 crate::guard::layout_for_fail_descr(
                                     d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                                    Arc::as_ptr(d) as *const () as usize,
                                     idx as u32,
                                     trace_id,
                                 )
@@ -3076,9 +2988,8 @@ impl Backend for DynasmBackend {
         // by (trace_id, fail_index) and must treat the miss as `None`
         // — match cranelift's `?` semantics in
         // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
-        let source_descr =
-            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
+        let bridge_addr =
+            self.lookup_bridge_addr(original_token, source_trace_id, source_fail_index);
         if bridge_addr == 0 {
             return None;
         }
@@ -3096,7 +3007,6 @@ impl Backend for DynasmBackend {
                             .map(|(idx, d)| {
                                 crate::guard::layout_for_fail_descr(
                                     d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                                    Arc::as_ptr(d) as *const () as usize,
                                     idx as u32,
                                     bridge_trace_id,
                                 )
