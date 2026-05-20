@@ -86,6 +86,7 @@ pub fn init(ns: &mut DictStorage) {
             std::ptr::null_mut(),
         );
         unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
+        unsafe { pyre_object::typeobject::w_type_ready(t) };
         dict_storage_store(ns, name, t);
     }
 }

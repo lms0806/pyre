@@ -3928,8 +3928,12 @@ fn init_type_type(ns: &mut DictStorage) {
                 // view.  Wrap the type's canonical W_DictObject so
                 // subsequent `cls.x = 1` setattrs flow through the
                 // dict_storage_proxy and become visible on the proxy.
-                let canonical =
-                    crate::baseobjspace::dict_storage_to_dict(ns_ptr as *const DictStorage);
+                // Instance flavor: a type's namespace is a regular
+                // W_DictObject, not a module-strategy dict.
+                let canonical = crate::baseobjspace::dict_storage_to_dict_kind(
+                    ns_ptr as *const DictStorage,
+                    crate::baseobjspace::DictWrapKind::Instance,
+                );
                 Ok(pyre_object::w_dict_proxy_new(canonical))
             }
         },

@@ -715,7 +715,11 @@ pub(crate) fn resolve_kwargs(
         result.push(pyre_object::w_tuple_new(extra_pos));
     }
     if has_varkw {
-        let kw_dict = pyre_object::w_dict_new();
+        // `dictmultiobject.py:77-80` — `space.newdict(kwargs=True)` selects
+        // EmptyKwargsDictStrategy so the first unicode setitem promotes
+        // directly to KwargsDictStrategy (parallel `(keys_w, values_w)`
+        // shape) instead of stepping through UnicodeDictStrategy.
+        let kw_dict = pyre_object::w_dict_new_kwargs();
         for (key, value) in &extra_kwargs {
             unsafe {
                 pyre_object::w_dict_store(kw_dict, *key, *value);
@@ -1710,6 +1714,9 @@ fn build_class_inner(
         if unsafe { pyre_object::is_type(result) } {
             let mro = unsafe { crate::baseobjspace::compute_default_mro(result) };
             unsafe { pyre_object::w_type_set_mro(result, mro) };
+            // typeobject.py:373-377 ready() — register self on each
+            // base's `weak_subclasses` after MRO is in place.
+            unsafe { pyre_object::typeobject::w_type_ready(result) };
             unsafe {
                 if (*result).w_class.is_null() {
                     (*result).w_class = w_metaclass;
@@ -1730,6 +1737,10 @@ fn build_class_inner(
         }
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
+        // typeobject.py:373-377 ready() — register self on each base's
+        // `weak_subclasses` so cross-subclass invalidation in
+        // `mutated()` and `__subclasses__()` see this class.
+        unsafe { pyre_object::typeobject::w_type_ready(w) };
         // __set_name__ protocol — type_new_set_names
         // Only needed here because w_type_new is a raw Rust call that
         // bypasses the type() builtin (builtins.rs) which already calls

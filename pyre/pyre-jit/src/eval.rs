@@ -134,13 +134,64 @@ unsafe fn pyre_object_eq_w_trampoline(
     pyre_interpreter::baseobjspace::eq_w(a, b)
 }
 
-unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
-    let entries = unsafe { &mut *dict.dstorage };
-    for (key, value) in entries.iter_mut() {
-        f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+/// `pypy/objspace/std/dictmultiobject.py:1210 r_dict(space.eq_w,
+/// space.hash_w)` hash bridge: ObjectDictStrategy uses both eq_w and
+/// hash_w; pyre's `dict_keys_equal` enforces the bucket invariant
+/// (same eq_w + same hash_w → same key, different hash_w → distinct).
+/// Routes through `pyre_interpreter::baseobjspace::hash_w` (line-by-
+/// line port of `baseobjspace.py:840-845 W_ObjectSpace.hash_w`).
+unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
+    pyre_interpreter::baseobjspace::hash_w(obj)
+}
+
+/// `pypy/objspace/std/typeobject.py:353-371
+/// W_TypeObject.compares_by_identity` trampoline.  Routes through
+/// `pyre_interpreter::baseobjspace::compares_by_identity` which
+/// walks the MRO and caches the result on
+/// `W_TypeObject.compares_by_identity_status`.  Registered at
+/// JIT init so `EmptyDictStrategy::switch_to_correct_strategy`
+/// (`dictmultiobject.py:702-705`) reaches the full
+/// `__eq__`/`__hash__` resolution.
+unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObjectRef) -> bool {
+    pyre_interpreter::baseobjspace::compares_by_identity(w_type)
+}
+
+/// Custom trace for `W_TypeObject`.
+///
+/// `W_TypeObject` carries one inline `PyObjectRef` field
+/// (`bases`) plus a `weak_subclasses: *mut Vec<PyObjectRef>`
+/// out-of-line list populated by `w_type_ready` / `add_subclass`
+/// at class-creation time (`typeobject.py:373-377` and
+/// `:640-662`).  PyPy stores `weakref.ref(w_subclass)` so the
+/// list does not pin subclass lifetimes; pyre follows PyPy's
+/// `not rweakref` strong-ref fallback path
+/// (`typeobject.py:642-650`) until a W_Weakref port lands, so
+/// every entry is a strong root that must be visited here.
+unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
+    f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    if !t.weak_subclasses.is_null() {
+        let subs = unsafe { &mut *t.weak_subclasses };
+        for slot in subs.iter_mut() {
+            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
     }
+}
+
+unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
+    // the storage layout, so each strategy walks its own native shape
+    // through `DictStrategy::walk_gc_refs` (`dictstrategy.rs`).  PyPy's
+    // counterpart is the per-`rerased`-pair GC trace fn generated from
+    // `new_erasing_pair("name")` at translation time
+    // (`rpython/rlib/rerased.py:24-72`); the trait method is pyre's
+    // runtime dispatch equivalent.
+    let w_dict = obj_addr as pyre_object::PyObjectRef;
+    let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
+    let mut adapter = |slot: *mut pyre_object::PyObjectRef| {
+        f(slot as *mut majit_ir::GcRef);
+    };
+    unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
 /// Custom trace for `W_ModuleDictObject`
@@ -1067,15 +1118,17 @@ thread_local! {
         );
         // W_TypeObject carries one inline `PyObjectRef` (`bases`)
         // plus several non-PyObject raw pointers (`name`, `dict`,
-        // `mro_w`, `layout`). Pre-registered ahead of the
-        // foreign-pytype loop because `TYPE_TYPE` is in
-        // `all_foreign_pytypes()` and the loop's
-        // `sizeof(PyObject)` approximation drastically under-counts
-        // the W_TypeObject payload.
-        let w_type_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        // `mro_w`, `layout`) and a `weak_subclasses: *mut
+        // Vec<PyObjectRef>` that must be walked manually
+        // (`typeobject.py:640-689` add/get/remove_subclass).
+        // Pre-registered ahead of the foreign-pytype loop because
+        // `TYPE_TYPE` is in `all_foreign_pytypes()` and the
+        // loop's `sizeof(PyObject)` approximation drastically
+        // under-counts the W_TypeObject payload.
+        let w_type_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::typeobject::W_TypeObject>(),
             object_tid,
-            pyre_object::typeobject::W_TYPE_GC_PTR_OFFSETS.to_vec(),
+            type_object_custom_trace,
         ));
         debug_assert_eq!(w_type_tid, W_TYPE_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1558,6 +1611,18 @@ thread_local! {
         // dispatch: register the `space.eq_w` trampoline so
         // `dict_keys_equal` honours user-defined `__eq__`.
         pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
+        // Item 1.2 — companion `space.hash_w` hook so
+        // `dict_keys_equal` enforces the r_dict bucket invariant
+        // (eq_w + matching hash_w → same key; different hash_w → distinct).
+        pyre_object::dict_eq_hook::register_hash_w_hook(pyre_object_hash_w_trampoline);
+        // Slice D5 — `dictmultiobject.py:702-705
+        // EmptyDictStrategy.switch_to_correct_strategy` identity branch:
+        // register the `W_TypeObject.compares_by_identity` trampoline so
+        // user-defined classes without overridden `__eq__`/`__hash__`
+        // route through IdentityDictStrategy.
+        pyre_object::dict_eq_hook::register_compares_by_identity_hook(
+            pyre_object_compares_by_identity_trampoline,
+        );
         // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots
         // come from manual `pyre_object::gc_roots::pin_root` calls

@@ -137,11 +137,10 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // directly — same identity as `module.__dict__` so trace
         // hooks (`sys.settrace`) observe `frame.f_globals is
         // module.__dict__`.  Pyre routes through
-        // `dict_storage_to_dict` which returns the canonical
-        // W_DictObject paired with the storage (mirror_target
-        // invariant); a fresh `w_dict_new_with_dict_storage`
-        // wrapper per trace callback would silently break that
-        // identity.  `f_locals` follows the same shape (PyPy
+        // `dict_storage_to_dict` which returns the canonical dict
+        // wrapper paired with the storage (mirror_target invariant);
+        // allocating a fresh dict per trace callback would silently
+        // break that identity.  `f_locals` follows the same shape (PyPy
         // `pyframe.py:546 fast2locals` then `self.debugdata.w_locals`).
         let _ = crate::baseobjspace::setattr(
             w_frame,
@@ -158,7 +157,13 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
             if w_locals.is_null() {
                 pyre_object::w_none()
             } else {
-                crate::baseobjspace::dict_storage_to_dict(w_locals as *const DictStorage)
+                // `pypy/interpreter/pyframe.py:546 fast2locals` builds a
+                // regular dict, not a module-strategy dict; function
+                // locals don't need GlobalCache machinery.
+                crate::baseobjspace::dict_storage_to_dict_kind(
+                    w_locals as *const DictStorage,
+                    crate::baseobjspace::DictWrapKind::Instance,
+                )
             },
         );
         let _ = crate::baseobjspace::setattr(

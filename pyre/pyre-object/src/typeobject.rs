@@ -110,22 +110,45 @@ pub struct W_TypeObject {
     /// `PyType`) so user-defined `dict`/`list`/`tuple` subclasses
     /// inherit the marker the same way PyPy does.
     pub flag_map_or_seq: std::sync::atomic::AtomicU8,
+    /// typeobject.py:171 `compares_by_identity_status?` —
+    /// `UNKNOWN=0`, `COMPARES_BY_IDENTITY=1`,
+    /// `OVERRIDES_EQ_CMP_OR_HASH=2`.  Cached result of
+    /// `W_TypeObject.compares_by_identity` (`:353-371`); UNKNOWN
+    /// until first lookup forces a `__eq__` / `__hash__` MRO walk.
+    ///
+    /// Invalidated by `baseobjspace::setattr` /
+    /// `baseobjspace::delattr` whenever a type-dict entry changes
+    /// (matches `typeobject.py:280 mutated()`), which walks
+    /// `weak_subclasses` and recurses, so a base-class mutation
+    /// eagerly resets cached subclasses.
+    pub compares_by_identity_status: std::sync::atomic::AtomicU8,
+    /// typeobject.py:640-689 `weak_subclasses` —
+    /// per-type list of subclass references populated by
+    /// `add_subclass` at heaptype creation time
+    /// (`typeobject.py:373-377 ready()` and
+    /// `:1604-1613 _add_mro_classes_as_subclasses`).
+    ///
+    /// PyPy stores `weakref.ref(w_subclass)` entries so subclasses
+    /// can be garbage-collected; when `not
+    /// space.config.translation.rweakref` (the fallback path PyPy
+    /// keeps for hosts without weakref support, `:642-650`) the
+    /// list holds strong refs and "ALL CLASSES LEAK".  Pyre
+    /// currently has no W_Weakref infrastructure on
+    /// `W_TypeObject`, so this port follows the strong-ref
+    /// fallback path — heaptype lifetimes are pinned by their
+    /// bases for as long as the base type is alive.  The vector
+    /// is heap-allocated (`Box::into_raw`) and walked by the GC
+    /// custom-trace hook registered for `W_TYPE_GC_TYPE_ID`
+    /// (`pyre-jit::eval`).  Null when no subclasses have been
+    /// registered.
+    pub weak_subclasses: *mut Vec<PyObjectRef>,
 }
-
-/// Field offset of `bases` within `W_TypeObject`.
-pub const TYPE_BASES_OFFSET: usize = std::mem::offset_of!(W_TypeObject, bases);
 
 /// GC type id assigned to `W_TypeObject` at JitDriver init time.
 pub const W_TYPE_GC_TYPE_ID: u32 = 33;
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_TYPE_OBJECT_SIZE: usize = std::mem::size_of::<W_TypeObject>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-/// Only `bases` is a `PyObjectRef` — `name` (`*mut String`),
-/// `dict` (`*mut u8`), `mro_w` (`*mut Vec<PyObjectRef>`), and `layout`
-/// (`*const Layout`) are non-PyObject heap allocations.
-pub const W_TYPE_GC_PTR_OFFSETS: [usize; 1] = [TYPE_BASES_OFFSET];
 
 impl crate::lltype::GcType for W_TypeObject {
     const TYPE_ID: u32 = W_TYPE_GC_TYPE_ID;
@@ -164,6 +187,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // typeobject.py:216 default — inheritance walk below may
         // overwrite from a non-`?` base.
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
+        compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
+        weak_subclasses: std::ptr::null_mut(),
     }) as PyObjectRef;
     // typeobject.py:1493-1496 — `for w_base in w_self.bases_w: if
     // w_self.flag_map_or_seq == '?': w_self.flag_map_or_seq =
@@ -252,7 +277,51 @@ pub fn w_type_new_builtin(
         // override via `w_type_set_flag_map_or_seq` at typedef
         // registration time (see `typedef.rs`).
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
+        compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
+        weak_subclasses: std::ptr::null_mut(),
     }) as PyObjectRef
+}
+
+/// `dictmultiobject.py:153 UNKNOWN` — cache miss; recompute via
+/// `compares_by_identity` lookup.
+pub const COMPARES_BY_IDENTITY_UNKNOWN: u8 = 0;
+/// `dictmultiobject.py:154 COMPARES_BY_IDENTITY` — type uses
+/// object-default `__eq__`/`__hash__`; identity comparison is
+/// observable-equivalent.
+pub const COMPARES_BY_IDENTITY_YES: u8 = 1;
+/// `dictmultiobject.py:155 OVERRIDES_EQ_CMP_OR_HASH` — type defines a
+/// custom `__eq__` or `__hash__`; identity comparison is not safe.
+pub const COMPARES_BY_IDENTITY_NO: u8 = 2;
+
+/// `typeobject.py:353-371 W_TypeObject.compares_by_identity` —
+/// status reader.  Returns the cached value directly without
+/// recomputation; callers that need the fresh value invoke the
+/// `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK` trampoline which
+/// forwards to pyre-interpreter for the MRO walk.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_compares_by_identity_status(w_type: PyObjectRef) -> u8 {
+    if w_type.is_null() || !is_w_type(w_type) {
+        return COMPARES_BY_IDENTITY_NO;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.compares_by_identity_status
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Write-side companion to [`w_type_compares_by_identity_status`].
+///
+/// # Safety
+/// Same as the reader; called by pyre-interpreter's lookup after
+/// resolving `__eq__` / `__hash__`.
+pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status: u8) {
+    if w_type.is_null() || !is_w_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.compares_by_identity_status
+        .store(status, std::sync::atomic::Ordering::Release);
 }
 
 /// typeobject.py:169 — `flag_map_or_seq` accessor on a `W_TypeObject`.
@@ -434,6 +503,123 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
 
 // Backward-compat no-ops for removed direct field setters.
 pub unsafe fn w_type_set_base_layout(_obj: PyObjectRef, _base: PyObjectRef) {}
+
+// ── Subclass tree (typeobject.py:640-689) ────────────────────────────
+
+/// `typeobject.py:640-662 W_TypeObject.add_subclass`.
+///
+/// Records `w_subclass` in `w_parent.weak_subclasses` if not
+/// already present.  In PyPy this stores `weakref.ref(w_subclass)`
+/// so subclass GC isn't blocked; under `not rweakref` PyPy
+/// degrades to a strong-ref list and warns "ALL CLASSES LEAK"
+/// (`:642-650`).  Pyre follows the strong-ref fallback because
+/// `W_TypeObject` has no weakref wiring yet — a future weakref
+/// port can switch this to a weak ref without changing call
+/// sites.
+///
+/// # Safety
+/// `w_parent` must point at a valid `W_TypeObject`.  `w_subclass`
+/// likewise; the function does not type-check the argument since
+/// `ready()` already filters non-type bases (`:374-376`).
+pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef) {
+    if w_parent.is_null() || w_subclass.is_null() {
+        return;
+    }
+    if !is_w_type(w_parent) || !is_w_type(w_subclass) {
+        return;
+    }
+    let parent = &mut *(w_parent as *mut W_TypeObject);
+    if parent.weak_subclasses.is_null() {
+        parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
+    }
+    let subs = &mut *parent.weak_subclasses;
+    // typeobject.py:654-657 — skip if already present.
+    for &existing in subs.iter() {
+        if existing == w_subclass {
+            return;
+        }
+    }
+    subs.push(w_subclass);
+}
+
+/// `typeobject.py:664-670 W_TypeObject.remove_subclass`.
+///
+/// Removes `w_subclass` from `w_parent.weak_subclasses` if
+/// present; no-op otherwise.  Pointer equality matches PyPy's
+/// `ref() is w_subclass`.
+///
+/// # Safety
+/// Same as [`w_type_add_subclass`].
+pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef) {
+    if w_parent.is_null() || w_subclass.is_null() {
+        return;
+    }
+    if !is_w_type(w_parent) {
+        return;
+    }
+    let parent = &mut *(w_parent as *mut W_TypeObject);
+    if parent.weak_subclasses.is_null() {
+        return;
+    }
+    let subs = &mut *parent.weak_subclasses;
+    for i in 0..subs.len() {
+        if subs[i] == w_subclass {
+            subs.remove(i);
+            return;
+        }
+    }
+}
+
+/// `typeobject.py:672-689 W_TypeObject.get_subclasses`.
+///
+/// Returns the recorded direct subclasses.  Under PyPy's weakref
+/// path, dead refs are filtered; pyre's strong-ref fallback has
+/// no dead entries to filter so the result is a copy of the
+/// stored vector.  The `only_real_subclasses` flag from PyPy
+/// (`:672-688`) — used by `descr___subclasses__` to filter
+/// metaclass-mro override leaks — is omitted because pyre has no
+/// `_add_mro_classes_as_subclasses` call site yet; invalidation
+/// callers only need the inclusive list.
+///
+/// # Safety
+/// `w_parent` must point at a valid `W_TypeObject`.
+pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
+    if w_parent.is_null() || !is_w_type(w_parent) {
+        return Vec::new();
+    }
+    let parent = &*(w_parent as *const W_TypeObject);
+    if parent.weak_subclasses.is_null() {
+        return Vec::new();
+    }
+    (*parent.weak_subclasses).clone()
+}
+
+/// `typeobject.py:373-377 W_TypeObject.ready` — register `w_self`
+/// as a direct subclass on each W_TypeObject base.  Called once
+/// per heap type after `bases` is set, so the subclass tree
+/// reflects the class declaration before any attribute lookup.
+///
+/// # Safety
+/// `w_self.bases` must be a valid tuple (or `PY_NULL`).
+pub unsafe fn w_type_ready(w_self: PyObjectRef) {
+    if w_self.is_null() || !is_w_type(w_self) {
+        return;
+    }
+    let bases = (*(w_self as *const W_TypeObject)).bases;
+    if bases.is_null() {
+        return;
+    }
+    let n = crate::w_tuple_len(bases);
+    for i in 0..n as i64 {
+        let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
+            continue;
+        };
+        if w_base.is_null() || !is_w_type(w_base) {
+            continue;
+        }
+        w_type_add_subclass(w_base, w_self);
+    }
+}
 
 #[cfg(test)]
 mod tests {

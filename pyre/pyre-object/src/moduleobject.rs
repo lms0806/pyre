@@ -75,8 +75,18 @@ impl crate::lltype::GcType for W_ModuleObject {
 /// `dict_ptr` — raw pointer to the module's backing dict storage; may
 ///   be null only for tests and the anonymous default Module.
 pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
+    // `pypy/interpreter/module.py:18 Module.__init__` opens
+    // `w_dict = space.newdict(module=True)` per `dictmultiobject.py:440-451
+    // _newdict(module=True)`, which lands on `W_ModuleDictObject`
+    // (ModuleDictStrategy + cell-cache).  Pyre routes through
+    // `w_module_dict_new_with_storage_proxy` so the legacy
+    // `*mut DictStorage` mirror still surfaces via
+    // `W_ModuleDictObject.dict_storage_proxy` while
+    // `pypy/objspace/std/celldict.py` strategy semantics
+    // (`get_global_cache`, `invalidate_caches`,
+    // `switch_to_object_strategy`) cover the module surface.
     let name_box = crate::lltype::malloc_raw(name.to_string());
-    let w_dict = crate::dictmultiobject::w_dict_new_with_dict_storage(dict_ptr);
+    let w_dict = crate::dictmultiobject::w_module_dict_new_with_storage_proxy(dict_ptr);
     if !name.is_empty() {
         unsafe {
             crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
@@ -193,7 +203,13 @@ pub unsafe fn w_module_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     if module.w_dict.is_null() {
         return std::ptr::null_mut();
     }
-    if !crate::is_dict(module.w_dict) {
+    // Accept both `W_DictObject` (legacy storage-backed Modules) and
+    // `W_ModuleDictObject` (`space.newdict(module=True)` per
+    // `module.py:18`).  Dict subclass instances reach `w_dict_get_dict_
+    // storage_proxy` only when they expose a real backing dict;
+    // arbitrary subclasses still bail out here so storage-keyed
+    // helpers (`dict_storage_get`/`_store`) stay safe.
+    if !crate::is_dict(module.w_dict) && !crate::dictmultiobject::is_module_dict(module.w_dict) {
         return std::ptr::null_mut();
     }
     crate::dictmultiobject::w_dict_get_dict_storage_proxy(module.w_dict)
@@ -226,7 +242,14 @@ pub unsafe fn w_module_alias_getitem_str(obj: PyObjectRef, name: &str) -> Option
     if module.w_dict.is_null() {
         return None;
     }
-    if !crate::is_dict(module.w_dict) {
+    // `W_ModuleDictObject` (`module.py:18 newdict(module=True)`) joins
+    // `W_DictObject` here so `w_dict_getitem_str` (which dispatches via
+    // the strategy slot) reaches both module-strategy and object-strategy
+    // backings.  Subclass instances still fall through to None so the
+    // caller (`eval.rs:load_global_value`) takes the
+    // `space.finditem_str` dispatch path with the subclass's own
+    // `__getitem__`.
+    if !crate::is_dict(module.w_dict) && !crate::dictmultiobject::is_module_dict(module.w_dict) {
         return None;
     }
     crate::dictmultiobject::w_dict_getitem_str(module.w_dict, name)

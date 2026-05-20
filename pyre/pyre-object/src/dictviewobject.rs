@@ -133,13 +133,19 @@ pub static DICT_KEYITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_key
 pub static DICT_VALUEITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_valueiterator");
 pub static DICT_ITEMITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_itemiterator");
 
-/// `dictmultiobject.py:809-822 W_BaseIteratorImplementation.next` —
-/// captures the source dict's `len` at iter() time; a subsequent
-/// `len()` change between iter() and `next()` trips the canonical
-/// `RuntimeError("dictionary changed size during iteration")`.
-/// PyPy intentionally tracks **length only** (not a version stamp),
-/// so re-assigning an existing key inside a loop (`for k in d: d[k]
-/// = new`) is permitted — only adds/removes are caught.
+/// `dictmultiobject.py:809-845 _new_next` — captures both the source
+/// dict's `len` and the active strategy at iter() time; `next()`
+/// performs two parity-mandated checks per `:821-822` and `:829`:
+///   * `self.len != self.w_dict.length()` → RuntimeError
+///     ("dictionary changed size during iteration").  Re-assigning
+///     an existing key inside a loop (`for k in d: d[k] = new`) is
+///     permitted because `length()` is unchanged.
+///   * `self.strategy is not self.w_dict.get_strategy()` → strategy
+///     transition (e.g. `switch_to_object_strategy` mid-iteration).
+///     The (key, value) pair in `result` may be out-of-date; PyPy
+///     re-looks up the key in the dict and raises "dictionary
+///     changed during iteration" if the key was removed (`:837-841`).
+///     Keys/values iterators accept the stale result.
 #[repr(C)]
 pub struct W_DictViewIterator {
     pub ob_header: PyObject,
@@ -155,6 +161,13 @@ pub struct W_DictViewIterator {
     /// kinds (`W_DictMultiIterKeys` / `Values` / `Items` —
     /// `:1499-1538`).
     pub kind: DictViewKind,
+    /// `:807 self.strategy = strategy` — strategy identity at iter()
+    /// time, stored as the strategy pointer cast to `usize` for
+    /// identity comparison (PyPy's `self.strategy is
+    /// self.w_dict.get_strategy()` at `:829`).  Strategy singletons
+    /// are `'static` so the cast is stable across the iterator's
+    /// lifetime.
+    pub start_strategy_id: usize,
 }
 
 pub const DICT_VIEW_ITER_W_DICT_OFFSET: usize = std::mem::offset_of!(W_DictViewIterator, w_dict);
@@ -180,11 +193,17 @@ pub fn dict_view_iterator_type_for_kind(kind: DictViewKind) -> &'static PyType {
     }
 }
 
-/// Allocate a fresh dict iterator capturing `w_dict`'s current length.
-/// Mirrors `dictmultiobject.py:807-822 W_BaseIteratorImplementation` —
-/// `self.len = w_dict.length()` set at iter() time.
+/// Allocate a fresh dict iterator capturing `w_dict`'s current length
+/// and active strategy.  Mirrors `dictmultiobject.py:807-808
+/// W_BaseIteratorImplementation.__init__`:
+///
+/// ```python
+/// self.strategy = strategy
+/// self.len = w_dict.length()
+/// ```
 pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let startlen = unsafe { crate::dictmultiobject::w_dict_len(w_dict) };
+    let start_strategy_id = unsafe { crate::dictmultiobject::w_dict_strategy_id(w_dict) };
     let tp = dict_view_iterator_type_for_kind(kind);
     crate::lltype::malloc_typed(W_DictViewIterator {
         ob_header: PyObject {
@@ -195,6 +214,7 @@ pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyOb
         startlen,
         index: 0,
         kind,
+        start_strategy_id,
     }) as PyObjectRef
 }
 
@@ -244,4 +264,16 @@ pub unsafe fn w_dict_view_iterator_set_index(obj: PyObjectRef, value: usize) {
     unsafe {
         (*(obj as *mut W_DictViewIterator)).index = value;
     }
+}
+
+/// `:807 self.strategy = strategy` — strategy id captured at iter()
+/// creation.  Consumers compare it against the dict's current
+/// `w_dict_strategy_id` to detect strategy transitions
+/// (`dictmultiobject.py:829`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictViewIterator`.
+#[inline]
+pub unsafe fn w_dict_view_iterator_get_start_strategy_id(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_DictViewIterator)).start_strategy_id }
 }

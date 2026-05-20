@@ -3907,6 +3907,40 @@ pub fn delweakref(obj: PyObjectRef) {
 /// here and registered as the `mirror_target`, so subsequent calls
 /// return the same object.
 pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
+    dict_storage_to_dict_kind(ns_ptr, DictWrapKind::Module)
+}
+
+/// `pypy/objspace/std/dictmultiobject.py:57-89 allocate_and_init_instance`
+/// distinguishes `module=True` (W_ModuleDictObject backed by
+/// ModuleDictStrategy with version-tag caches), `instance=True`
+/// (mapdict.make_instance_dict), and the default branch (regular
+/// W_DictObject on EmptyDictStrategy).  Pyre exposes the choice to
+/// callers so module globals get the strategy-cache machinery while
+/// function locals / type namespaces / generic dicts land on the
+/// regular path.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DictWrapKind {
+    /// `dictmultiobject.py:60-69` — Module.__init__ globals path.
+    /// Wraps into W_ModuleDictObject with ModuleDictStrategy +
+    /// GlobalCache slot map.  Used by `PyFrame.w_globals`,
+    /// `function.w_func_globals`, REPL globals, module sys.
+    Module,
+    /// `dictmultiobject.py:70-89` — instance / default path.  PyPy's
+    /// `instance=True` goes through `mapdict.make_instance_dict`
+    /// which pyre has not ported; pyre's default (no `module=True`,
+    /// no mapdict) lands on a regular W_DictObject with
+    /// EmptyDictStrategy.  Used by `type.__dict__`, `frame.f_locals`,
+    /// and exec/eval-only locals stores.
+    Instance,
+}
+
+/// Wrap a `DictStorage` as a Python dict object, classifying the
+/// shape per `DictWrapKind`.  Maintains the `mirror_target` invariant
+/// — the same storage always returns the same wrapper.
+pub fn dict_storage_to_dict_kind(
+    ns_ptr: *const crate::DictStorage,
+    kind: DictWrapKind,
+) -> PyObjectRef {
     if ns_ptr.is_null() {
         return pyre_object::w_dict_new();
     }
@@ -3915,17 +3949,27 @@ pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
     if !target.is_null() {
         return target;
     }
-    // Lazy canonical: snapshot-populate a fresh W_ModuleDictObject
-    // (`pypy/interpreter/module.py:18 Module.__init__` uses
-    // `space.newdict(module=True)` whose underlying type IS
-    // W_ModuleDictObject) and register it as the storage's permanent
-    // back-mirror target.  Pre-populates the strategy storage for
-    // entries already present in the DictStorage.  The W_ModuleDictObject's
-    // `dict_storage_proxy = ns_ptr` keeps forward writes (module.__dict__
-    // mutations) in step with the legacy storage that
-    // `PyFrame.w_globals` still reads through.
-    let dict =
-        pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy(ns_ptr as *mut u8);
+    // Lazy canonical: snapshot-populate a fresh wrapper of the
+    // requested flavor and register it as the storage's permanent
+    // back-mirror target.  The wrapper's `dict_storage_proxy = ns_ptr`
+    // keeps forward writes (module.__dict__ / cls.__dict__ /
+    // f_locals[k] = ...) in step with the legacy storage that
+    // `PyFrame.w_globals` and friends still read through.
+    let dict = match kind {
+        DictWrapKind::Module => {
+            // `pypy/interpreter/module.py:18 Module.__init__` uses
+            // `space.newdict(module=True)`; the resulting W_ModuleDictObject
+            // carries ModuleDictStrategy + GlobalCache slot map.
+            pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy(ns_ptr as *mut u8)
+        }
+        DictWrapKind::Instance => {
+            // `dictmultiobject.py:81-89` default branch — EmptyDictStrategy
+            // regular W_DictObject (PyPy `instance=True`'s mapdict path
+            // is a PRE-EXISTING-ADAPTATION: pyre stops at the regular
+            // W_DictObject shape until mapdict is ported).
+            pyre_object::dictmultiobject::w_dict_new_with_storage_proxy(ns_ptr as *mut u8)
+        }
+    };
     unsafe {
         for (key, &value) in storage.entries() {
             if !value.is_null() {
@@ -4370,7 +4414,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 if dict_ptr.is_null() {
                     return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
                 }
-                let canonical = dict_storage_to_dict(dict_ptr);
+                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
+                // wraps the type's regular W_DictObject — not a
+                // module-strategy dict — into the proxy.  Pass
+                // `Instance` kind so the type's namespace lives on
+                // the EmptyDictStrategy/typed-strategy ladder rather
+                // than ModuleDictStrategy's GlobalCache machinery.
+                let canonical = dict_storage_to_dict_kind(dict_ptr, DictWrapKind::Instance);
                 return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
@@ -5045,6 +5095,119 @@ pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
 /// PyPy equivalent: `space.lookup_in_type(w_type, name)`.
 pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where(w_type, name)
+}
+
+/// `typeobject.py:353-371 W_TypeObject.compares_by_identity` — walk
+/// the MRO checking whether any class **before `object`** defines
+/// `__eq__` or `__hash__`.
+///
+/// The cached status slot on W_TypeObject short-circuits repeat
+/// calls; cache miss recomputes and writes back.  Cache validity is
+/// maintained by [`mutated`] below — the setattr / delattr paths
+/// invoke it on every type-dict change, so adding `__eq__` /
+/// `__hash__` to a live class resets the slot back to UNKNOWN
+/// across the subclass tree.
+///
+/// PyPy reads `object_hash(self.space)` and `type_eq(self.space)` —
+/// static singletons resolved at translation time.  Pyre walks the
+/// MRO and stops at `w_object()` (`typedef.rs:734`); any class on
+/// the path that owns `__eq__` or `__hash__` short-circuits to
+/// `OVERRIDES_EQ_CMP_OR_HASH`.
+///
+/// # Safety
+/// `w_type` must point at a valid `W_TypeObject` (null tolerated).
+pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let cached = pyre_object::typeobject::w_type_compares_by_identity_status(w_type);
+    if cached == pyre_object::typeobject::COMPARES_BY_IDENTITY_YES {
+        return true;
+    }
+    if cached == pyre_object::typeobject::COMPARES_BY_IDENTITY_NO {
+        return false;
+    }
+    let object_type = crate::typedef::w_object();
+    let cached_mro = pyre_object::typeobject::w_type_get_mro(w_type);
+    let mro_owned;
+    let mro: &[PyObjectRef] = if !cached_mro.is_null() {
+        &*cached_mro
+    } else {
+        mro_owned = compute_mro(w_type);
+        &mro_owned
+    };
+    let mut compares_by_identity = true;
+    for cls in mro {
+        if (*cls).is_null() || !is_type(*cls) {
+            continue;
+        }
+        if *cls == object_type {
+            break;
+        }
+        let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
+        if ns_ptr.is_null() {
+            continue;
+        }
+        let ns = &*ns_ptr;
+        if let Some(&v) = ns.get("__eq__") {
+            if !v.is_null() {
+                compares_by_identity = false;
+                break;
+            }
+        }
+        if let Some(&v) = ns.get("__hash__") {
+            if !v.is_null() {
+                compares_by_identity = false;
+                break;
+            }
+        }
+    }
+    let result = if compares_by_identity {
+        pyre_object::typeobject::COMPARES_BY_IDENTITY_YES
+    } else {
+        pyre_object::typeobject::COMPARES_BY_IDENTITY_NO
+    };
+    pyre_object::typeobject::w_type_set_compares_by_identity_status(w_type, result);
+    compares_by_identity
+}
+
+/// `typeobject.py:266-291 W_TypeObject.mutated` — type-dict change
+/// observer.  Resets cached lookup state on `w_type` and recurses
+/// into `weak_subclasses` so cross-subclass caches stay coherent.
+///
+/// `key` is either the mutated attribute name or `None` for a
+/// generic invalidation; `compares_by_identity_status` reset is
+/// gated on the key being `__eq__` / `__hash__` per PyPy line 279.
+/// `_version_tag` and the other slots PyPy bumps here are not yet
+/// ported, so this function currently only manages the
+/// compares_by_identity cache — additional slots will hook in here
+/// as the JIT-side caches land.
+///
+/// # Safety
+/// `w_type` must be a valid `PyObjectRef` pointing at a
+/// `W_TypeObject` (null tolerated).
+pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    // typeobject.py:279 — `if (key is None or key == '__eq__' or
+    // key == '__hash__'): self.compares_by_identity_status =
+    // UNKNOWN`.
+    let resets_compare = match key {
+        None => true,
+        Some(k) => k == "__eq__" || k == "__hash__",
+    };
+    if resets_compare {
+        pyre_object::typeobject::w_type_set_compares_by_identity_status(
+            w_type,
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_UNKNOWN,
+        );
+    }
+    // typeobject.py:288-291 — walk direct subclasses recursively.
+    let subs = pyre_object::typeobject::w_type_get_subclasses(w_type);
+    for w_sub in subs {
+        mutated(w_sub, key);
+    }
 }
 
 /// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`.
@@ -5732,6 +5895,11 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store(&mut *dict_ptr, name, value);
+                // typeobject.py:430 — `self.mutated(name)` after the
+                // dict_w write so cached `compares_by_identity_status`
+                // (and future per-type caches) reset on this type and
+                // every entry in `weak_subclasses` recursively.
+                mutated(obj, Some(name));
                 return Ok(w_none());
             }
         }
@@ -5997,6 +6165,10 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store(&mut *dict_ptr, name, PY_NULL);
+                // typeobject.py:445 — `self.mutated(key)` mirrors the
+                // setattr branch's invalidation across the subclass
+                // tree.
+                mutated(obj, Some(name));
                 return Ok(w_none());
             }
         }
@@ -6901,25 +7073,20 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
     if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
         return (None, None);
     }
-    // dictmultiobject.py:308 — `if not self.user_overridden_class`.
-    // pyre's `is_dict` already screens out subclass instances (those
-    // are `W_InstanceObject`), so any wrapper that reached this point
-    // is the exact-type case.  The strategy-level fast path (kwargs
-    // strategy at dictmultiobject.py:1325) only succeeds when every
-    // key is a unicode string — the ObjectStrategy and other
-    // non-string strategies return `(None, None)` from their base
-    // implementation.
-    let entries = unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict) };
-    let mut keys: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
-    let mut values: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
-    for (w_key, w_val) in entries {
-        if !unsafe { pyre_object::is_str(w_key) } {
-            return (None, None);
-        }
-        keys.push(w_key);
-        values.push(w_val);
-    }
-    (Some(keys), Some(values))
+    // `dictmultiobject.py:269-272 W_DictMultiObject.view_as_kwargs`:
+    //
+    // ```python
+    // def view_as_kwargs(self):
+    //     return self.get_strategy().view_as_kwargs(self)
+    // ```
+    //
+    // Polymorphic dispatch via `w_dict_get_strategy(obj).view_as_kwargs`:
+    // UnicodeDictStrategy and KwargsDictStrategy override to return
+    // parallel arrays directly (`:1323-1334`, `kwargsdict.py:154-156`);
+    // every other strategy returns `(None, None)` from the trait
+    // default (`:568-569`), forcing the slow `keys()` path in
+    // `argument.py:121-150`.
+    unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict).view_as_kwargs(w_dict) }
 }
 
 /// pypy/interpreter/baseobjspace.py:2105-2140 `object_functionstr`.
@@ -7550,21 +7717,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
         }
-        // `pypy/objspace/std/dictmultiobject.py:1719-1741
-        // W_BaseDictIterator.descr_next` line-by-line —
+        // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`
+        // line-by-line — two parity-mandated checks:
         //
-        //     def next(self):
-        //         if self.len != self.w_dict.length():
-        //             raise oefmt(space.w_RuntimeError,
-        //                 "dictionary changed size during iteration")
-        //         ...
-        //
-        // Only `len` is compared — re-assigning an existing key
-        // (overwrite) is permitted because `length()` is unchanged.
-        // Pyre also routes the entry read through `w_dict_items()`
-        // so DictStorage-backed dicts (globals(), module dict)
-        // see their authoritative storage instead of the local
-        // mirror.
+        //     if self.len != self.w_dict.length():
+        //         raise oefmt(space.w_RuntimeError,
+        //                     "dictionary changed size during iteration")
+        //     ...
+        //     if self.strategy is self.w_dict.get_strategy():
+        //         return result      # common case
+        //     else:
+        //         # obscure: strategy changed but length is the same
+        //         if TP == 'key' or TP == 'value':
+        //             return result
+        //         w_key = result[0]
+        //         w_value = self.w_dict.getitem(w_key)
+        //         if w_value is None:
+        //             raise "dictionary changed during iteration"
+        //         return (w_key, w_value)
         if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
             use pyre_object::dictviewobject as dv;
             let dict = dv::w_dict_view_iterator_get_dict(obj);
@@ -7581,9 +7751,30 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             if index >= items.len() {
                 return Err(PyError::stop_iteration());
             }
-            let (k, v) = items[index];
+            let (k, mut v) = items[index];
             dv::w_dict_view_iterator_set_index(obj, index + 1);
-            return Ok(match dv::w_dict_view_iterator_get_kind(obj) {
+            // `:829-841` strategy-transition handling.
+            let start_strategy_id = dv::w_dict_view_iterator_get_start_strategy_id(obj);
+            let current_strategy_id = pyre_object::dictmultiobject::w_dict_strategy_id(dict);
+            let kind = dv::w_dict_view_iterator_get_kind(obj);
+            if start_strategy_id != current_strategy_id {
+                if matches!(kind, pyre_object::dictviewobject::DictViewKind::Items) {
+                    // `:837-841`: re-look-up the key on the new strategy;
+                    // raise if it was removed during the transition.
+                    match pyre_object::dictmultiobject::w_dict_lookup(dict, k) {
+                        Some(fresh) => v = fresh,
+                        None => {
+                            return Err(PyError::new(
+                                PyErrorKind::RuntimeError,
+                                "dictionary changed during iteration".to_string(),
+                            ));
+                        }
+                    }
+                }
+                // Keys / Values iterators return the cached entry as-is
+                // (`:836 if TP == 'key' or TP == 'value': return result`).
+            }
+            return Ok(match kind {
                 pyre_object::dictviewobject::DictViewKind::Keys => k,
                 pyre_object::dictviewobject::DictViewKind::Values => v,
                 pyre_object::dictviewobject::DictViewKind::Items => {
@@ -8664,6 +8855,18 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
     }
 }
 
+/// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w` —
+/// returns the `__hash__` digest as `i64`.  Routes through pyre's
+/// existing `builtins::hash_value`, which already covers
+/// int/long/bool/float/str/tuple/frozenset/None plus user
+/// `__hash__` dispatch through `lookup_in_type`.  Returns `0` for
+/// non-hashable types (PyPy raises; pyre surfaces the same
+/// hash-not-available signal by returning `0` and letting the dict
+/// dispatcher fall through).
+pub fn hash_w(obj: PyObjectRef) -> i64 {
+    crate::builtins::hash_value(obj)
+}
+
 /// Compare two objects for equality (returns bool, not PyObjectRef).
 /// baseobjspace.py:823-825 `eq_w`: identity first, then `==` truth.
 pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
@@ -8773,7 +8976,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
             };
         }
         let dict = &mut *(obj as *mut dictmultiobject::W_DictObject);
-        let entries = &mut *dict.dstorage;
+        let entries = dictmultiobject::w_dict_object_storage_mut(obj);
         for i in 0..entries.len() {
             let eq = if std::ptr::eq(entries[i].0, key) {
                 true

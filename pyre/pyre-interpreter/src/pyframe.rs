@@ -890,9 +890,8 @@ impl PyFrame {
     ///   `pyframe.py:540-545 getdictscope` returns
     ///   `self.debugdata.w_locals` — a single cached dict per frame.
     ///   pyre achieves the same identity by memoising the wrapper on
-    ///   the storage; building a fresh `w_dict_new_with_dict_storage`
-    ///   shell every call would let `frame.f_locals is
-    ///   frame.f_locals` evaluate to `False`.
+    ///   the storage; allocating a fresh dict shell every call would
+    ///   let `frame.f_locals is frame.f_locals` evaluate to `False`.
     /// * Empty case: forces `fast2locals` to materialise a fresh
     ///   `DictStorage` (matching pyframe.py:557-562 `w_locals = self
     ///   .space.newdict(instance=True)` followed by `d.w_locals =

@@ -1809,8 +1809,7 @@ fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
             return;
         }
         let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-        let dict_obj = &*(dict as *const pyre_object::dictmultiobject::W_DictObject);
-        let entries = &*dict_obj.dstorage;
+        let entries = pyre_object::dictmultiobject::w_dict_object_storage(dict);
         for &(k, v) in entries {
             if pyre_object::is_str(k) {
                 let name = pyre_object::w_str_get_value(k);

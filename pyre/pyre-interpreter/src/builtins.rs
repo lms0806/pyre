@@ -1182,6 +1182,10 @@ fn type_descr_new_with_metaclass(
         }
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w_type) };
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
+        // typeobject.py:373-377 ready() — link self into each base's
+        // `weak_subclasses` so `mutated()` and `__subclasses__()`
+        // observe this class.
+        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
         // __set_name__ protocol — CPython: type_new_set_names
         // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
@@ -3478,7 +3482,7 @@ fn _hash_frozenset(items: &[i64]) -> i64 {
 /// pyre keeps an FNV-style multiplicative mix here (functional but
 /// not bit-identical to CPython/PyPy).  Convergence target: import
 /// siphash24 from a workspace dep.
-pub(crate) fn hash_value(obj: PyObjectRef) -> i64 {
+pub fn hash_value(obj: PyObjectRef) -> i64 {
     unsafe {
         if is_int(obj) {
             return _hash_int(w_int_get_value(obj));

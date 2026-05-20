@@ -25,8 +25,25 @@ use std::cell::Cell;
 /// returns `false` — matching pyre's `baseobjspace::eq_w` shape.
 pub type EqWHookFn = unsafe fn(a: PyObjectRef, b: PyObjectRef) -> bool;
 
+/// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w`
+/// signature: returns the `__hash__` digest as `i64` (matching
+/// CPython `Py_hash_t`).  Errors are swallowed; the trampoline returns
+/// `0` for non-hashable types — callers (`dict_keys_equal`) gate on
+/// `try_hash_w` returning `Some(_)` before relying on the value.
+pub type HashWHookFn = unsafe fn(obj: PyObjectRef) -> i64;
+
+/// `pypy/objspace/std/typeobject.py:353-371
+/// W_TypeObject.compares_by_identity` trampoline.  Walks the type's
+/// MRO via `lookup_in_type('__eq__')` / `('__hash__')` and compares
+/// against the object-default to decide if identity comparison is
+/// observable-equivalent.  Updates the type's
+/// `compares_by_identity_status` cache slot.
+pub type ComparesByIdentityHookFn = unsafe fn(w_type: PyObjectRef) -> bool;
+
 thread_local! {
     static EQ_W_HOOK: Cell<Option<EqWHookFn>> = const { Cell::new(None) };
+    static HASH_W_HOOK: Cell<Option<HashWHookFn>> = const { Cell::new(None) };
+    static COMPARES_BY_IDENTITY_HOOK: Cell<Option<ComparesByIdentityHookFn>> = const { Cell::new(None) };
 }
 
 /// Install the `eq_w` callback for this thread.  Called from
@@ -40,6 +57,19 @@ pub fn clear_eq_w_hook() {
     EQ_W_HOOK.with(|cell| cell.set(None));
 }
 
+/// Install the `hash_w` callback for this thread.  Companion to
+/// `register_eq_w_hook`; together they let `dict_keys_equal` enforce
+/// r_dict semantics (eq_w + hash_w pair, per `dictmultiobject.py:1210
+/// r_dict(space.eq_w, space.hash_w, force_non_null=True)`).
+pub fn register_hash_w_hook(hook: HashWHookFn) {
+    HASH_W_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the `hash_w` callback on this thread.
+pub fn clear_hash_w_hook() {
+    HASH_W_HOOK.with(|cell| cell.set(None));
+}
+
 /// Invoke the installed `eq_w` hook.  Returns `None` when no hook is
 /// installed (pyre-object lib tests, pre-init snapshot tools); the
 /// caller falls back to the limited-type builtin equality so existing
@@ -51,4 +81,41 @@ pub fn clear_eq_w_hook() {
 #[inline]
 pub unsafe fn try_eq_w(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     EQ_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(a, b) }))
+}
+
+/// Invoke the installed `hash_w` hook.  Returns `None` when no hook
+/// is installed; callers treat that as "hash unavailable" and fall
+/// back to eq-only comparison (which preserves pre-Item-1.2 behavior
+/// on snapshot tools / single-crate tests).
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef (null tolerated).
+#[inline]
+pub unsafe fn try_hash_w(obj: PyObjectRef) -> Option<i64> {
+    HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }))
+}
+
+/// Install the `compares_by_identity` callback for this thread.
+/// Called from `pyre-jit::eval`'s init alongside the other
+/// thread-local hooks.
+pub fn register_compares_by_identity_hook(hook: ComparesByIdentityHookFn) {
+    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the `compares_by_identity` callback on this thread.
+pub fn clear_compares_by_identity_hook() {
+    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.set(None));
+}
+
+/// Invoke the installed `compares_by_identity` hook.  Returns `None`
+/// when no hook is installed (pyre-object lib tests, pre-init
+/// snapshot tools); callers fall back to the conservative
+/// `false` (i.e. presume `OVERRIDES_EQ_CMP_OR_HASH`).
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`
+/// (null tolerated).
+#[inline]
+pub unsafe fn try_compares_by_identity(w_type: PyObjectRef) -> Option<bool> {
+    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().map(|f| unsafe { f(w_type) }))
 }

@@ -859,6 +859,119 @@ impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_module_dict_clear_inner(w_dict);
     }
+
+    /// `celldict.py:166-173 popitem` — pop the most recently inserted
+    /// (key, cell) from the IndexMap, mutated(), unwrap the cell, and
+    /// return (`_wrapkey(space, key)`, `unwrap_cell(space, cell)`).
+    /// O(1) via `IndexMap::pop`; falls back to the trait default
+    /// after a `switch_to_object_strategy` (entries live in
+    /// `object_storage`).
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage_mut_opt(w_dict)
+        {
+            return entries.pop();
+        }
+        let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
+        let strategy = &mut *module.mstrategy;
+        let storage = &mut *module.dstorage;
+        let (key, cell) = storage.entries.pop()?;
+        strategy.mutated();
+        Some((crate::w_str_new(&key), unwrap_cell(cell)))
+    }
+
+    /// `celldict.py:198-199 getiterreversed` — reverse iteration
+    /// over the IndexMap's key insertion order (used by `reversed
+    /// (module.__dict__)`).  Native streaming reverse via
+    /// `IndexMap::iter().rev()`; the wrap_cell unwrap matches PyPy's
+    /// `wrapvalue(space, value) = unwrap_cell(space, value)` per
+    /// `:208 wrapvalue`.
+    unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            let mut out: Vec<(PyObjectRef, PyObjectRef)> = entries.clone();
+            out.reverse();
+            return out;
+        }
+        let module = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
+        let storage = &*module.dstorage;
+        storage
+            .entries
+            .iter()
+            .rev()
+            .map(|(k, &cell)| (crate::w_str_new(k), unwrap_cell(cell)))
+            .collect()
+    }
+
+    /// `celldict.py:207-216 copy` — produce a fresh W_DictObject that
+    /// owns unwrapped cell values keyed by str objects.
+    ///
+    /// PyPy's destination strategy is `UnicodeDictStrategy`; pyre
+    /// still allocates the destination through `w_dict_new()` (which
+    /// installs `OBJECT_DICT_STRATEGY`) — line-by-line parity for the
+    /// destination strategy lands when typed strategy storage is in
+    /// place (Task #147).
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let new_dict = crate::dictmultiobject::w_dict_new();
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            for &(k, v) in entries.iter() {
+                crate::dictmultiobject::w_dict_store(new_dict, k, v);
+            }
+            return new_dict;
+        }
+        let module = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
+        let storage = &*module.dstorage;
+        for (key, &cell) in storage.entries.iter() {
+            let unwrapped = unwrap_cell(cell);
+            let key_obj = crate::w_str_new(key);
+            crate::dictmultiobject::w_dict_store(new_dict, key_obj, unwrapped);
+        }
+        new_dict
+    }
+}
+
+/// `celldict.py:243-251 remove_cell(w_dict, space, name)` — replace
+/// any cell wrapper at `name` with the unwrapped value so subsequent
+/// reads observe the raw value directly (used when a module-level
+/// name is rebound in a context that no longer needs cell
+/// indirection, e.g. function-def replacing a previously
+/// cell-promoted slot).
+///
+/// ```python
+/// def remove_cell(w_dict, space, name):
+///     if isinstance(w_dict, W_DictMultiObject):
+///         strategy = w_dict.get_strategy()
+///         if isinstance(strategy, ModuleDictStrategy):
+///             w_value = strategy.getitem_str(w_dict, name)
+///             dict_w = strategy.unerase(w_dict.dstorage)
+///             strategy.mutated()
+///             dict_w[name] = w_value  # store without cell
+/// ```
+///
+/// Pyre's W_ModuleDictObject path: peek the unwrapped value via
+/// `getitem_str` (which already calls `unwrap_cell`), bump the
+/// strategy version (cache invalidate), and write back the raw
+/// PyObjectRef via `ModuleDictStorage::set` — bypassing
+/// `_setitem_str_cell_known`'s `write_cell` re-wrap.
+///
+/// # Safety
+/// `w_dict` must point at a valid PyObjectRef (W_ModuleDictObject
+/// or null/other type — no-op for non-module dicts).
+pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
+    if w_dict.is_null() {
+        return;
+    }
+    if (*(w_dict as *const crate::pyobject::PyObject)).ob_type
+        != &crate::dictmultiobject::MODULE_DICT_TYPE as *const crate::pyobject::PyType
+    {
+        return;
+    }
+    let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
+    let strategy = &mut *module.mstrategy;
+    let storage = &mut *module.dstorage;
+    let Some(w_value) = strategy.getitem_str(storage, name) else {
+        return;
+    };
+    strategy.mutated();
+    storage.set(name, w_value);
 }
 
 #[cfg(test)]

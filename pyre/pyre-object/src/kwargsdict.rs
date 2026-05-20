@@ -7,16 +7,18 @@
 //! constant-folds when the dict size and lookup key are both
 //! constant.
 //!
-//! Skeleton port — concrete `EmptyKwargsDictStrategy` swap from
-//! `EmptyDictStrategy.switch_to_unicode_strategy` lives in the same
-//! file per `kwargsdict.py:13-22`.
+//! `EmptyKwargsDictStrategy` (`kwargsdict.py:13-22`) — the subclass
+//! of `EmptyDictStrategy` that promotes to `KwargsDictStrategy` on
+//! unicode setitem — is not yet wired into pyre's argument
+//! processing path; once it lands, function-call sites can
+//! allocate dicts via the subclassed empty strategy.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::dictstrategy::DictStrategy;
+use crate::dictstrategy::{DictStrategy, OBJECT_DICT_STRATEGY};
 use crate::pyobject::PyObjectRef;
 
-/// `kwargsdict.py:25-198 KwargsDictStrategy`.
+/// `kwargsdict.py:25-178 KwargsDictStrategy`.
 ///
 /// ```python
 /// class KwargsDictStrategy(DictStrategy):
@@ -51,79 +53,195 @@ pub struct KwargsDictStrategy;
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
 
+/// `kwargsdict.py:62` size threshold past which the strategy
+/// promotes itself to UnicodeDictStrategy to avoid O(n) lookup
+/// degeneracy on too-large kwarg dicts.
+const KWARGS_PROMOTE_THRESHOLD: usize = 16;
+
+/// Typed accessor for `KwargsDictStrategy.unerase(w_dict.dstorage)` —
+/// `kwargsdict.py:26-32` parallel-array shape.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` whose strategy is
+/// [`KWARGS_DICT_STRATEGY`].
+#[inline]
+unsafe fn kwargs_storage<'a>(obj: PyObjectRef) -> &'a (Vec<PyObjectRef>, Vec<PyObjectRef>) {
+    let dict = &*(obj as *const crate::dictmultiobject::W_DictObject);
+    &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>))
+}
+
+#[inline]
+unsafe fn kwargs_storage_mut<'a>(obj: PyObjectRef) -> &'a mut (Vec<PyObjectRef>, Vec<PyObjectRef>) {
+    let dict = &mut *(obj as *mut crate::dictmultiobject::W_DictObject);
+    &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>))
+}
+
+impl KwargsDictStrategy {
+    /// `kwargsdict.py:34-36 is_correct_type` — `space.is_w
+    /// (space.type(w_obj), space.w_text)`.  Plain str (Py3 unicode).
+    #[inline]
+    unsafe fn is_correct_type(w_key: PyObjectRef) -> bool {
+        crate::is_str(w_key)
+    }
+
+    /// `kwargsdict.py:134-141 switch_to_object_strategy` —
+    /// walk parallel arrays, rebuild Vec<(PyObjectRef, _)>, retire
+    /// the typed box.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let old = Box::from_raw(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        let (keys_w, values_w) = *old;
+        let mut new_vec: Vec<(PyObjectRef, PyObjectRef)> = Vec::with_capacity(keys_w.len());
+        for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
+            new_vec.push((k, v));
+        }
+        dict.dstorage = Box::into_raw(Box::new(new_vec)) as *mut u8;
+        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    }
+
+    /// `kwargsdict.py:143-152 switch_to_unicode_strategy` —
+    /// promote to UnicodeDictStrategy when size hits the threshold.
+    /// PyPy walks the parallel arrays and re-inserts each entry via
+    /// `w_dict.setitem`; pyre does the same so any non-ASCII keys
+    /// further promote to ObjectDictStrategy.
+    unsafe fn switch_to_unicode_strategy(&self, w_dict: PyObjectRef) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let old = Box::from_raw(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        let (keys_w, values_w) = *old;
+        dict.dstorage = crate::dictstrategy::UNICODE_DICT_STRATEGY.get_empty_storage();
+        dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
+        dict.len = 0;
+        for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
+            crate::dictmultiobject::w_dict_store(w_dict, k, v);
+        }
+    }
+}
+
 impl DictStrategy for KwargsDictStrategy {
+    /// `kwargsdict.py:30-32 get_empty_storage` — erased `([], [])`.
     fn get_empty_storage(&self) -> *mut u8 {
-        // `kwargsdict.py:30-32`: erased `([], [])` parallel arrays.
         let v: Box<(Vec<PyObjectRef>, Vec<PyObjectRef>)> = Box::new((Vec::new(), Vec::new()));
         Box::into_raw(v) as *mut u8
     }
 
+    /// `kwargsdict.py:100-108 getitem` — `is_correct_type` →
+    /// linear scan, else `_never_equal_to` short-circuit or promote.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        // `kwargsdict.py:100-108 getitem` — dispatches to
-        // `getitem_correct` for str keys, else switches strategy.
-        // Stub routes through the W_DictObject Vec path until Phase
-        // C-3 wires the strategy hierarchy into W_DictObject.
+        if Self::is_correct_type(w_key) {
+            let (keys_w, values_w) = kwargs_storage(w_dict);
+            for i in 0..keys_w.len() {
+                if crate::dictmultiobject::dict_keys_equal(keys_w[i], w_key) {
+                    return Some(values_w[i]);
+                }
+            }
+            return None;
+        }
+        // `kwargsdict.py:38-39 _never_equal_to` returns False — no
+        // short-circuit; always promote and retry.
+        self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
     }
 
+    /// `kwargsdict.py:41-67 setitem` + `_setitem_correct_indirection`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
-        // `kwargsdict.py:41-67 setitem` + `_setitem_correct_indirection`.
+        if Self::is_correct_type(w_key) {
+            let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+            let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+            for i in 0..storage.0.len() {
+                if crate::dictmultiobject::dict_keys_equal(storage.0[i], w_key) {
+                    storage.1[i] = w_value;
+                    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+                    return;
+                }
+            }
+            if storage.0.len() >= KWARGS_PROMOTE_THRESHOLD {
+                self.switch_to_unicode_strategy(w_dict);
+                crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
+                return;
+            }
+            storage.0.push(w_key);
+            storage.1.push(w_value);
+            dict.len = storage.0.len();
+            crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+            return;
+        }
+        self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
+    /// `kwargsdict.py:80-83 delitem` — switches to object strategy
+    /// first (XXX comment: "could do better but is it worth it?").
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
-        // `kwargsdict.py:80-83 delitem` — switches to object strategy
-        // first (XXX comment: "could do better but is it worth it?").
+        self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
     }
 
+    /// `kwargsdict.py:85-86 length`.
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        // `kwargsdict.py:85-86 length`.
-        crate::dictmultiobject::w_dict_len(w_dict)
+        kwargs_storage(w_dict).0.len()
     }
 
+    /// `kwargsdict.py:110-112 w_keys` — returns a copy of `keys_w`.
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        // `kwargsdict.py:110-112 w_keys` — returns a copy of keys_w
-        // to keep the slice non-resizable.
-        crate::dictmultiobject::w_dict_items(w_dict)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect()
+        kwargs_storage(w_dict).0.clone()
     }
 
+    /// `kwargsdict.py:114-115 values`.
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        // `kwargsdict.py:114-115 values`.
-        crate::dictmultiobject::w_dict_items(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
+        kwargs_storage(w_dict).1.clone()
+    }
+
+    /// `kwargsdict.py:117-121 items` — zip parallel arrays into pairs.
+    unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+        let (keys_w, values_w) = kwargs_storage(w_dict);
+        keys_w
+            .iter()
+            .zip(values_w.iter())
+            .map(|(&k, &v)| (k, v))
             .collect()
     }
 
-    unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
-        // `kwargsdict.py:117-121 items` — zips the two parallel
-        // arrays per (key, value) pair.
-        crate::dictmultiobject::w_dict_items(w_dict)
-    }
-
+    /// `kwargsdict.py:123-129 popitem` — pop from both arrays in lock-step.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
-        // `kwargsdict.py:123-129 popitem` — pop from both arrays.
-        let mut items = self.items(w_dict);
-        items.pop()
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        let w_key = storage.0.pop()?;
+        let w_value = storage.1.pop()?;
+        dict.len = storage.0.len();
+        Some((w_key, w_value))
     }
 
+    /// `kwargsdict.py:131-132 clear` — `w_dict.dstorage =
+    /// self.get_empty_storage()`.  Pyre drops the typed parallel-array
+    /// box and installs a fresh empty pair.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
-        // `kwargsdict.py:131-132 clear` — replace dstorage with a
-        // fresh empty `([], [])`.
-        crate::dictmultiobject::w_dict_clear(w_dict);
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
+        ));
+        dict.dstorage = self.get_empty_storage();
+        dict.len = 0;
     }
 
-    /// `kwargsdict.py:154-156 view_as_kwargs` — expose the two
-    /// parallel arrays for `**kwargs` fast unpacking.  Stub returns
-    /// `(None, None)`; consumers route through `items()`.
-    fn view_as_kwargs(
+    /// `kwargsdict.py:154-156 view_as_kwargs` — copy parallel arrays
+    /// to non-resizable slices for the `**kwargs` fast unpack.
+    unsafe fn view_as_kwargs(
         &self,
-        _w_dict: PyObjectRef,
-    ) -> (Option<Vec<String>>, Option<Vec<PyObjectRef>>) {
-        (None, None)
+        w_dict: PyObjectRef,
+    ) -> (Option<Vec<PyObjectRef>>, Option<Vec<PyObjectRef>>) {
+        let (keys_w, values_w) = kwargs_storage(w_dict);
+        (Some(keys_w.clone()), Some(values_w.clone()))
+    }
+
+    /// `kwargsdict.py` traces both `keys_w` and `values_w` as
+    /// `list[W_Root]` — every entry on both sides is PyObjectRef.
+    unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+        let storage = kwargs_storage_mut(w_dict);
+        for k in storage.0.iter_mut() {
+            visitor(k as *mut PyObjectRef);
+        }
+        for v in storage.1.iter_mut() {
+            visitor(v as *mut PyObjectRef);
+        }
     }
 }
