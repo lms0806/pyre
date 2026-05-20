@@ -61,10 +61,9 @@ pub struct ObjectHeader {
 ///
 /// `virtual_token` and `forced` are both `llmemory.GCREF`/`OBJECTPTR`
 /// upstream — pointer fields, not int.  Pyre stores them as `*mut
-/// u8` so the runtime layout, the `VREF_FIELD_VIRTUAL_TOKEN`
-/// descriptor encoding (Ref bit), and the optimizer-side
+/// u8` so the runtime layout and the optimizer-side
 /// `make_vref_field_descr` (`Type::Ref` per
-/// `optimizeopt/virtualize.rs:1659`) all agree.
+/// `optimizeopt/virtualize.rs`) agree on the slot type.
 ///
 /// PRE-EXISTING-ADAPTATION (GC trace).  Upstream traces both fields as
 /// real GC pointers; pyre traces only `forced`.  `eval.rs:241-247`
@@ -181,41 +180,29 @@ pub fn token_tracing_rescall() -> *mut u8 {
     *TRACING_RESCALL_DUMMY_PTR.get_or_init(|| allocate_tracing_rescall_dummy() as usize) as *mut u8
 }
 
-/// Well-known field descriptor indices for JitVirtualRef fields.
-/// Properly encoded: FIELD_DESCR_TAG | (byte_offset << 4) | type_bits
-///
-/// Layout: super_.typeptr(0) | virtual_token(8) | forced(16)
-pub const VREF_FIELD_TYPEPTR: u32 = 0x1000_0000; // offset=0, Int
-/// `virtualref.py:17-20` declares `virtual_token` as `llmemory.GCREF`.
-pub const VREF_FIELD_VIRTUAL_TOKEN: u32 = 0x1000_0081; // offset=8, Ref
-pub const VREF_FIELD_FORCED: u32 = 0x1000_0101; // offset=16, Ref
-
-/// Descriptor indices for the virtual ref struct fields.
-pub mod descr {
-    /// Field descriptor index for `super_.typeptr` (RPython
-    /// `rclass.OBJECT.typeptr`).
-    pub const TYPEPTR: u32 = super::VREF_FIELD_TYPEPTR;
-    /// Field descriptor index for `virtual_token`.
-    pub const VIRTUAL_TOKEN: u32 = super::VREF_FIELD_VIRTUAL_TOKEN;
-    /// Field descriptor index for `forced`.
-    pub const FORCED: u32 = super::VREF_FIELD_FORCED;
-    /// Size descriptor index for the JitVirtualRef struct itself.
-    pub const VREF_SIZE: u32 = 0x7F10;
-}
-
 /// Virtual reference state for a single reference.
 ///
 /// A virtual reference wraps a virtualizable object during JIT execution.
 /// When code outside the JIT tries to access the virtual object, the
 /// reference is "forced" -- the virtual object is materialized on the heap.
+///
+/// `virtualref.py:32-42` parity: `descr` / `descr_virtual_token` /
+/// `descr_forced` hold the live `cpu.sizeof(JIT_VIRTUAL_REF)` and
+/// `cpu.fielddescrof(JIT_VIRTUAL_REF, 'virtual_token' | 'forced')`
+/// Arcs.  Pyre's underlying generators (`vref_size_descr()` /
+/// `make_vref_field_descr_typed(...)`) cache the Arc identity at
+/// module level so every read of these fields returns the same Arc
+/// that the optimizer-emit sites stamp into `op.descr`
+/// (`virtualize.rs:1520 / 1527`) — `Arc::ptr_eq` parity with
+/// `history.py:125 cpu.get_latest_descr() is op.getdescr()`.
 #[derive(Debug, Clone)]
 pub struct VirtualRefInfo {
-    /// Field descriptor index for the `virtual_token` field.
-    pub descr_virtual_token: u32,
-    /// Field descriptor index for the `forced` field.
-    pub descr_forced: u32,
-    /// Size descriptor index for the JitVirtualRef struct.
-    pub descr_size: u32,
+    /// `virtualref.py:32-33` `self.descr = cpu.sizeof(JIT_VIRTUAL_REF, ...)`
+    pub descr: majit_ir::DescrRef,
+    /// `virtualref.py:40-41` `self.descr_virtual_token = cpu.fielddescrof(..., 'virtual_token')`
+    pub descr_virtual_token: majit_ir::DescrRef,
+    /// `virtualref.py:42`    `self.descr_forced        = cpu.fielddescrof(..., 'forced')`
+    pub descr_forced: majit_ir::DescrRef,
 }
 
 impl Default for VirtualRefInfo {
@@ -266,12 +253,16 @@ impl crate::resume::VRefInfo for VirtualRefInfo {
 //   virtualref.py:172  (assert vref.virtual_token == TOKEN_NONE)
 //   virtualref.py:173  (assert vref.forced)
 impl VirtualRefInfo {
-    /// Create a VirtualRefInfo with the standard descriptor indices.
+    /// Create a VirtualRefInfo.
     pub fn new() -> Self {
+        use crate::optimizeopt::virtualize::{
+            VREF_FORCED_FIELD_INDEX, VREF_VIRTUAL_TOKEN_FIELD_INDEX, make_vref_field_descr_pub,
+            vref_size_descr,
+        };
         VirtualRefInfo {
-            descr_virtual_token: descr::VIRTUAL_TOKEN,
-            descr_forced: descr::FORCED,
-            descr_size: descr::VREF_SIZE,
+            descr: vref_size_descr(),
+            descr_virtual_token: make_vref_field_descr_pub(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
+            descr_forced: make_vref_field_descr_pub(VREF_FORCED_FIELD_INDEX),
         }
     }
 
@@ -514,14 +505,6 @@ mod tests {
             let header = rescall as *const ObjectHeader;
             assert_eq!((*header).typeptr, JITFRAME_DUMMY_VTABLE);
         }
-    }
-
-    #[test]
-    fn test_vref_info_default() {
-        let info = VirtualRefInfo::new();
-        assert_eq!(info.descr_virtual_token, descr::VIRTUAL_TOKEN);
-        assert_eq!(info.descr_forced, descr::FORCED);
-        assert_eq!(info.descr_size, descr::VREF_SIZE);
     }
 
     /// `virtualref.py:174-176`: `force_virtual` raises
