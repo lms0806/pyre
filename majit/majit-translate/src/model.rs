@@ -322,7 +322,8 @@ impl fmt::Display for CallTarget {
 
 /// RPython call ops always carry `op.args[0]` as the funcptr operand.
 /// Pyre keeps the same semantic slot but needs two Rust-level shapes:
-/// a symbolic direct-call target or a runtime `ValueId` for indirect calls.
+/// a symbolic direct-call target or the runtime `Variable` holding the
+/// funcptr value for indirect calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallFuncPtr {
     Target(CallTarget),
@@ -504,11 +505,12 @@ pub enum OpKind {
         trait_root: String,
         method_name: String,
     },
-    /// Indirect call — `op.args[0]` is the funcptr ValueId already produced
-    /// by the rtyper layer (e.g. from `VtableMethodPtr` for `dyn Trait`
-    /// dispatch). `args` are the full call arguments, including the
-    /// receiver. `graphs` mirrors the trailing `c_graphs` constant from
-    /// `rpbc.py:216`: `Some(full_family)` when known, `None` otherwise.
+    /// Indirect call — `funcptr` is the `Variable` carrying the callable
+    /// produced by the rtyper layer (e.g. from `VtableMethodPtr` for
+    /// `dyn Trait` dispatch). `args` are the full call arguments,
+    /// including the receiver. `graphs` mirrors the trailing `c_graphs`
+    /// constant from `rpbc.py:216`: `Some(full_family)` when known,
+    /// `None` otherwise.
     ///
     /// RPython: `rpython/rtyper/rpbc.py:216-217`
     /// ```python
@@ -594,7 +596,7 @@ pub enum OpKind {
     /// Elidable (pure) call — no side effects, result depends only on args.
     /// RPython: `call_elidable_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
     /// `funcptr` mirrors `op.args[0]` in RPython. Direct calls keep a
-    /// symbolic target; indirect calls carry the runtime `ValueId`
+    /// symbolic target; indirect calls carry the runtime `Variable`
     /// produced by rtype.
     CallElidable {
         funcptr: CallFuncPtr,
@@ -817,7 +819,14 @@ pub enum OpKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceOperation {
-    pub result: Option<ValueId>,
+    /// RPython `flowspace/model.py:439 self.result = result      #
+    /// either Variable or Constant instance`.  In the
+    /// rtyper-orthodox path the canonical writer is
+    /// `flowspace/operation.py:75 self.result = Variable()`,
+    /// matching the `Option<Variable>` carrier — `None` reserved for
+    /// the `direct_call`-shape test fixtures whose result slot is
+    /// unbound (`rpython/translator/backendopt/test/test_graphanalyze.py:76`).
+    pub result: Option<crate::flowspace::model::Variable>,
     pub kind: OpKind,
 }
 
@@ -861,21 +870,25 @@ pub struct Link {
 }
 
 impl Link {
-    /// `Link::new` — convenience constructor that projects each
-    /// `ValueId` arg through [`FunctionGraph::variable`] to its
-    /// backing [`crate::flowspace::model::Variable`] for the
-    /// upstream-orthodox `Link.args: List[Hlvalue]` shape
-    /// (`flowspace/model.py:140`).  The graph parameter is
-    /// load-bearing — without it the `ValueId → Variable`
-    /// projection cannot happen at construction.
-    pub fn new(
+    /// `Variable`-typed constructor — direct counterpart to RPython
+    /// `Link(args=[Hlvalue], target=Block, exitcase=...)` where each
+    /// `Hlvalue` is the upstream `Variable` instance pulled from an
+    /// `op.result` / `Block.inputargs` slot.  Mirrors the upstream
+    /// `flowspace/model.py:114-116` arity assert via `graph` lookup
+    /// for `target.inputargs`.
+    pub fn from_variables(
         graph: &FunctionGraph,
-        args: Vec<ValueId>,
+        args: Vec<crate::flowspace::model::Variable>,
         target: BlockId,
         exitcase: Option<ExitCase>,
     ) -> Self {
+        debug_assert_eq!(
+            args.len(),
+            graph.block(target).inputargs.len(),
+            "output args mismatch"
+        );
         Self::new_mixed(
-            args.into_iter().map(|v| LinkArg::value(graph, v)).collect(),
+            args.into_iter().map(LinkArg::Value).collect(),
             target,
             exitcase,
         )
@@ -958,23 +971,6 @@ pub enum LinkArg {
 }
 
 impl LinkArg {
-    /// Construct a `LinkArg::Value` from a [`ValueId`] — looks up
-    /// the backing Variable via [`FunctionGraph::variable`].
-    /// Replaces the lossy `From<ValueId>` impl that could not carry
-    /// the Variable identity.
-    pub fn value(graph: &FunctionGraph, vid: ValueId) -> Self {
-        let var = graph
-            .variable(vid)
-            .unwrap_or_else(|| {
-                panic!(
-                    "LinkArg::value: ValueId {vid:?} must have a backing Variable on graph {:?}",
-                    graph.name,
-                )
-            })
-            .clone();
-        Self::Value(var)
-    }
-
     /// Project the link-arg's backing Variable to pyre's dense
     /// `ValueId` via [`FunctionGraph::value_id_of`].  Returns
     /// `None` for constants and for Variables not registered on the
@@ -1714,8 +1710,18 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // (`int_add_ovf`, `int_floordiv_zer`, ...) MUST NOT be DCE'd
     // even if their result vid is unread — the raise side-effect
     // is observable.
-    let mut read_vars: HashSet<ValueId> = HashSet::new();
-    let mut dependencies: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    // RPython `simplify.py:425-426`:
+    //     read_vars = set()  # set of variables really used
+    //     dependencies = defaultdict(set) # map {Var: list-of-Vars-it-depends-on}
+    //
+    // Both sidetables are Variable-keyed (PyPy uses Python object
+    // identity for Variable's __hash__ / __eq__); pyre matches via
+    // Rc<i64>-backed Variable._nr.
+    let mut read_vars: HashSet<crate::flowspace::model::Variable> = HashSet::new();
+    let mut dependencies: HashMap<
+        crate::flowspace::model::Variable,
+        Vec<crate::flowspace::model::Variable>,
+    > = HashMap::new();
     for block in &graph.blocks {
         if !reachable.contains(&block.id) {
             continue;
@@ -1726,31 +1732,33 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             None
         };
         for (i, op) in block.operations.iter().enumerate() {
-            let operands = op_value_refs(&op.kind, Some(graph));
+            let operands: Vec<crate::flowspace::model::Variable> =
+                crate::inline::op_variable_refs(&op.kind, graph)
+                    .into_iter()
+                    .flatten()
+                    .collect();
             // `simplify.py:441-445`:
             //   if not canremove(op, block):    read_vars.update(args)
             //   else:                           dependencies[result] += args
             let removable = is_pure_op(&op.kind) && Some(i) != raising_op_idx;
-            if let Some(result) = op.result
+            if let Some(result_var) = op.result.clone()
                 && removable
             {
-                dependencies.entry(result).or_default().extend(operands);
+                dependencies.entry(result_var).or_default().extend(operands);
             } else {
-                for vid in operands {
-                    read_vars.insert(vid);
+                for var in operands {
+                    read_vars.insert(var);
                 }
             }
         }
         if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-            if let Some(vid) = graph.value_id_of(var) {
-                read_vars.insert(vid);
-            }
+            read_vars.insert(var.clone());
         }
         // `simplify.py:459-462`: terminal blocks (no exits)
         // implicitly use every inputarg.
         if block.exits.is_empty() {
-            for iarg in block.inputarg_value_ids(graph) {
-                read_vars.insert(iarg);
+            for iarg in &block.inputargs {
+                read_vars.insert(iarg.clone());
             }
         }
         for link in &block.exits {
@@ -1767,10 +1775,12 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 target_block.inputargs.len(),
                 "simplify.py:513 — len(link.args) == len(link.target.inputargs)",
             );
-            let target_vids = target_block.inputarg_value_ids(graph);
-            for (arg, target_iarg) in link.args.iter().zip(target_vids.iter().copied()) {
-                if let Some(arg_vid) = arg.as_value(graph) {
-                    dependencies.entry(target_iarg).or_default().push(arg_vid);
+            for (arg, target_iarg) in link.args.iter().zip(target_block.inputargs.iter()) {
+                if let Some(arg_var) = arg.as_variable() {
+                    dependencies
+                        .entry(target_iarg.clone())
+                        .or_default()
+                        .push(arg_var.clone());
                 }
             }
         }
@@ -1781,19 +1791,19 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // comment).
     for &sb in &start_blocks {
         if let Some(&i) = block_index.get(&sb) {
-            for iarg in graph.blocks[i].inputarg_value_ids(graph) {
-                read_vars.insert(iarg);
+            for iarg in &graph.blocks[i].inputargs {
+                read_vars.insert(iarg.clone());
             }
         }
     }
 
     // Step 4: backward flow.
     // `simplify.py:471-479 flow_read_var_backward`.
-    let mut pending: Vec<ValueId> = read_vars.iter().copied().collect();
+    let mut pending: Vec<crate::flowspace::model::Variable> = read_vars.iter().cloned().collect();
     while let Some(var) = pending.pop() {
-        if let Some(deps) = dependencies.get(&var) {
-            for &dep in deps {
-                if read_vars.insert(dep) {
+        if let Some(deps) = dependencies.get(&var).cloned() {
+            for dep in deps {
+                if read_vars.insert(dep.clone()) {
                     pending.push(dep);
                 }
             }
@@ -1820,7 +1830,16 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // pure op that happens to be the block's raising_op
     // (`canremove`'s `op is not block.raising_op` clause,
     // `simplify.py:436`) survives even when its result is unread.
-    for block in &mut graph.blocks {
+    // Pre-compute the (block_id, op_index) pairs of dead pure ops in
+    // an immutable pass; the mutable removal pass below operates on
+    // the precomputed list to avoid an overlapping borrow.
+    //
+    // RPython `simplify.py:484-488`:
+    //     if op.result not in read_vars:
+    //         if canremove(op, block):
+    //             del block.operations[i]
+    let mut dead_op_positions: Vec<(BlockId, usize)> = Vec::new();
+    for block in &graph.blocks {
         if !reachable.contains(&block.id) {
             continue;
         }
@@ -1829,15 +1848,24 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         } else {
             None
         };
-        for i in (0..block.operations.len()).rev() {
-            let op = &block.operations[i];
-            let dead = match op.result {
-                Some(r) => !read_vars.contains(&r),
+        for (i, op) in block.operations.iter().enumerate() {
+            let dead = match op.result.as_ref() {
+                Some(r) => !read_vars.contains(r),
                 None => false,
             };
             if dead && is_pure_op(&op.kind) && Some(i) != raising_op_idx {
-                block.operations.remove(i);
+                dead_op_positions.push((block.id, i));
             }
+        }
+    }
+    for block in &mut graph.blocks {
+        let mut dead_indices: Vec<usize> = dead_op_positions
+            .iter()
+            .filter_map(|(bid, idx)| (*bid == block.id).then_some(*idx))
+            .collect();
+        dead_indices.sort_unstable();
+        for i in dead_indices.into_iter().rev() {
+            block.operations.remove(i);
         }
     }
 
@@ -1851,11 +1879,11 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         let exits_len = graph.blocks[block_idx].exits.len();
         for exit_idx in 0..exits_len {
             let target = graph.blocks[block_idx].exits[exit_idx].target;
-            let target_iargs = {
+            let target_iargs: Vec<crate::flowspace::model::Variable> = {
                 let &i = block_index
                     .get(&target)
                     .expect("simplify.py:512 — link.target must be a graph block");
-                graph.blocks[i].inputarg_value_ids(graph)
+                graph.blocks[i].inputargs.clone()
             };
             assert_eq!(
                 graph.blocks[block_idx].exits[exit_idx].args.len(),
@@ -1863,8 +1891,8 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 "simplify.py:513 — len(link.args) == len(link.target.inputargs)",
             );
             for i in (0..target_iargs.len()).rev() {
-                let target_vid = target_iargs[i];
-                if !read_vars.contains(&target_vid) {
+                let target_iarg = &target_iargs[i];
+                if !read_vars.contains(target_iarg) {
                     graph.blocks[block_idx].exits[exit_idx].args.remove(i);
                 }
             }
@@ -1879,18 +1907,17 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         if !reachable.contains(&block_id) || block_id == return_block || block_id == except_block {
             continue;
         }
-        let inputargs = graph.blocks[block_idx].inputarg_value_ids(graph);
+        let inputargs: Vec<crate::flowspace::model::Variable> =
+            graph.blocks[block_idx].inputargs.clone();
         for i in (0..inputargs.len()).rev() {
-            let vid = inputargs[i];
-            if read_vars.contains(&vid) {
+            let iarg = &inputargs[i];
+            if read_vars.contains(iarg) {
                 continue;
             }
             graph.blocks[block_idx].inputargs.remove(i);
-            if let Some(op_idx) = graph.blocks[block_idx]
-                .operations
-                .iter()
-                .position(|op| matches!(op.kind, OpKind::Input { .. }) && op.result == Some(vid))
-            {
+            if let Some(op_idx) = graph.blocks[block_idx].operations.iter().position(|op| {
+                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(iarg)
+            }) {
                 graph.blocks[block_idx].operations.remove(op_idx);
             }
         }
@@ -1972,7 +1999,7 @@ where
     let remap_link_arg = |arg: &LinkArg| -> LinkArg {
         match arg {
             LinkArg::Value(_) => match arg.as_value(source) {
-                Some(vid) => LinkArg::value(target, remap_value(vid)),
+                Some(vid) => LinkArg::Value(target.must_variable(remap_value(vid))),
                 None => arg.clone(),
             },
             LinkArg::Const(value) => LinkArg::Const(value.clone()),
@@ -2181,7 +2208,7 @@ pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTyp
 /// [`FunctionGraph::set_concretetype`] only writes through when the
 /// existing Variable type's `getkind` does NOT already match the
 /// requested kind (i.e. the rtyper's authoritative type wins).
-fn concrete_to_canonical_lltype(
+pub(crate) fn concrete_to_canonical_lltype(
     ty: ConcreteType,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -2649,15 +2676,32 @@ impl FunctionGraph {
             self.value_variables
                 .resize_with(v.0 + 1, || Some(crate::flowspace::model::Variable::new()));
         }
-        if let Some(Some(var)) = self.value_variables.get(v.0) {
-            let preserve_existing = match (ty, var.concretetype.borrow().as_ref()) {
-                (kind, Some(existing)) if getkind(existing) == kind => true,
-                _ => false,
-            };
-            if !preserve_existing {
-                let synthetic = concrete_to_canonical_lltype(ty);
-                var.set_concretetype(synthetic);
-            }
+        self.set_concretetype_inline(v, ty);
+    }
+
+    /// `&self` variant of [`Self::set_concretetype`] — writes through
+    /// the backing Variable's `concretetype` cell via interior
+    /// mutability (`Rc<RefCell<…>>`), so the call site need not hold
+    /// `&mut FunctionGraph`.  Skips the slot-resize that
+    /// [`Self::set_concretetype`] performs for synthetic out-of-range
+    /// `ValueId`s; out-of-range vids are silently ignored (mirroring
+    /// RPython's "no `.concretetype` attribute" pre-`setconcretetype`
+    /// window).
+    ///
+    /// Preserves a richer rtyper-written `LowLevelType` when its
+    /// `getkind` already matches `ty` — same precedence rule as
+    /// [`Self::set_concretetype`].
+    pub fn set_concretetype_inline(&self, v: ValueId, ty: ConcreteType) {
+        let Some(Some(var)) = self.value_variables.get(v.0) else {
+            return;
+        };
+        let preserve_existing = matches!(
+            (ty, var.concretetype.borrow().as_ref()),
+            (kind, Some(existing)) if getkind(existing) == kind
+        );
+        if !preserve_existing {
+            let synthetic = concrete_to_canonical_lltype(ty);
+            var.set_concretetype(synthetic);
         }
     }
 
@@ -2721,9 +2765,11 @@ impl FunctionGraph {
 
     pub fn push_op(&mut self, block: BlockId, kind: OpKind, has_result: bool) -> Option<ValueId> {
         let result = has_result.then(|| self.alloc_value());
-        self.blocks[block.0]
-            .operations
-            .push(SpaceOperation { result, kind });
+        let result_var = result.map(|vid| self.must_variable(vid));
+        self.blocks[block.0].operations.push(SpaceOperation {
+            result: result_var,
+            kind,
+        });
         result
     }
 
@@ -2732,8 +2778,9 @@ impl FunctionGraph {
     /// pre-allocates phi vids) and the op now needs to be emitted with
     /// the same vid.
     pub fn push_op_with_result(&mut self, block: BlockId, kind: OpKind, result: ValueId) {
+        let result_var = self.must_variable(result);
         self.blocks[block.0].operations.push(SpaceOperation {
-            result: Some(result),
+            result: Some(result_var),
             kind,
         });
     }
@@ -2790,8 +2837,13 @@ impl FunctionGraph {
     /// `target` carrying `args`, `exitswitch = None`.  Upstream
     /// equivalent: `block.closeblock(Link(args, target))`
     /// (`flowspace/model.py:304`).
-    pub fn set_goto(&mut self, block: BlockId, target: BlockId, args: Vec<ValueId>) {
-        let link = Link::new(self, args, target, None);
+    pub fn set_goto(
+        &mut self,
+        block: BlockId,
+        target: BlockId,
+        args: Vec<crate::flowspace::model::Variable>,
+    ) {
+        let link = Link::from_variables(self, args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
@@ -2805,20 +2857,20 @@ impl FunctionGraph {
     pub fn set_branch(
         &mut self,
         block: BlockId,
-        cond: ValueId,
+        cond: crate::flowspace::model::Variable,
         if_true: BlockId,
-        true_args: Vec<ValueId>,
+        true_args: Vec<crate::flowspace::model::Variable>,
         if_false: BlockId,
-        false_args: Vec<ValueId>,
+        false_args: Vec<crate::flowspace::model::Variable>,
     ) {
-        let cond_var = self.must_variable(cond);
-        let false_link = Link::new(self, false_args, if_false, Some(ExitCase::Bool(false)))
-            .with_llexitcase_from_exitcase();
-        let true_link = Link::new(self, true_args, if_true, Some(ExitCase::Bool(true)))
+        let false_link =
+            Link::from_variables(self, false_args, if_false, Some(ExitCase::Bool(false)))
+                .with_llexitcase_from_exitcase();
+        let true_link = Link::from_variables(self, true_args, if_true, Some(ExitCase::Bool(true)))
             .with_llexitcase_from_exitcase();
         self.set_control_flow_metadata(
             block,
-            Some(ExitSwitch::Value(cond_var)),
+            Some(ExitSwitch::Value(cond)),
             vec![false_link, true_link],
         );
     }
@@ -2833,10 +2885,13 @@ impl FunctionGraph {
     /// kind defaults to Void (no regalloc color, no emitted move), so
     /// `Link.args` is always a prevblock value per upstream's
     /// `flowspace/model.py:114` invariant.
-    pub fn set_return(&mut self, block: BlockId, value: Option<ValueId>) {
+    pub fn set_return(&mut self, block: BlockId, value: Option<crate::flowspace::model::Variable>) {
         let (returnblock, _) = self.returnblock_arg();
-        let value = value.unwrap_or_else(|| self.alloc_value());
-        self.set_goto(block, returnblock, vec![value]);
+        let value_var = value.unwrap_or_else(|| {
+            let vid = self.alloc_value();
+            self.must_variable(vid)
+        });
+        self.set_goto(block, returnblock, vec![value_var]);
     }
 
     /// Route `block` to the graph's canonical `exceptblock` — the
@@ -2863,7 +2918,9 @@ impl FunctionGraph {
         let (exceptblock, _, _) = self.exceptblock_args();
         let etype = self.alloc_value();
         let evalue = self.alloc_value();
-        self.set_goto(block, exceptblock, vec![etype, evalue]);
+        let etype_var = self.must_variable(etype);
+        let evalue_var = self.must_variable(evalue);
+        self.set_goto(block, exceptblock, vec![etype_var, evalue_var]);
     }
 
     /// Terminate `block` with a Link to `exceptblock` carrying the
@@ -2880,7 +2937,12 @@ impl FunctionGraph {
     /// ValueIds into the exceptblock Link so the exception payload
     /// is preserved, not discarded in favor of fresh `alloc_value()`
     /// placeholders as `set_raise` does.
-    pub fn set_raise_values(&mut self, block: BlockId, etype: ValueId, evalue: ValueId) {
+    pub fn set_raise_values(
+        &mut self,
+        block: BlockId,
+        etype: crate::flowspace::model::Variable,
+        evalue: crate::flowspace::model::Variable,
+    ) {
         let (exceptblock, _, _) = self.exceptblock_args();
         self.set_goto(block, exceptblock, vec![etype, evalue]);
     }
@@ -2918,8 +2980,9 @@ impl FunctionGraph {
     /// must extend to cover them so the STORE_FAST rename gate
     /// stays parity-faithful.
     pub fn is_constant_define_value(&self, id: ValueId) -> bool {
+        let target = self.must_variable(id);
         self.iter_block_ops().any(|(_, op)| {
-            op.result == Some(id)
+            op.result.as_ref() == Some(&target)
                 && match &op.kind {
                     // RPython `Constant(int_value)` — integer-literal
                     // define op.
@@ -3023,7 +3086,8 @@ impl FunctionGraph {
             for op in &block.operations {
                 let result = op
                     .result
-                    .map(|v| format!("{} = ", self.fmt_value(v)))
+                    .as_ref()
+                    .map(|v| format!("{} = ", self.fmt_variable(v)))
                     .unwrap_or_default();
                 out.push_str(&format!("    {}{:?}\n", result, op.kind));
             }
@@ -3049,6 +3113,18 @@ impl FunctionGraph {
             format!("v{}", id.0)
         }
     }
+
+    /// Variable-identity rendering shadow of [`Self::fmt_value`].
+    /// RPython `flowspace/model.py:282 Variable.__repr__` produces
+    /// `'v%d' % self._nr`; the pyre dump prefers the dense graph-local
+    /// `ValueId` suffix when the Variable has one registered, falling
+    /// back to upstream's `_nr` for stand-alone Variables.
+    fn fmt_variable(&self, var: &crate::flowspace::model::Variable) -> String {
+        match self.value_id_of(var) {
+            Some(vid) => self.fmt_value(vid),
+            None => format!("v{}", var.id()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3070,7 +3146,8 @@ mod tests {
             )
             .unwrap();
         let next = graph.create_block();
-        graph.set_branch(entry, cond, next, vec![], next, vec![]);
+        let cond_var = graph.must_variable(cond);
+        graph.set_branch(entry, cond_var, next, vec![], next, vec![]);
         assert_eq!(graph.blocks.len(), 4);
         assert_eq!(graph.block(entry).operations.len(), 1);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
@@ -3082,7 +3159,8 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let entry = graph.startblock;
         let next = graph.create_block();
-        graph.set_control_flow_metadata(entry, None, vec![Link::new(&graph, vec![], next, None)]);
+        let link = Link::from_variables(&graph, vec![], next, None);
+        graph.set_control_flow_metadata(entry, None, vec![link]);
         assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
     }
 
@@ -3100,7 +3178,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(value));
+        graph.set_return(entry, Some(graph.must_variable(value)));
         // Upstream `flowspace/model.py:171-180` identifies the routed
         // return by Block.exits carrying a single Link(value, returnblock)
         // with exitswitch=None.
@@ -3111,7 +3189,7 @@ mod tests {
         assert_eq!(entry_block.exits[0].target, graph.returnblock);
         assert_eq!(
             entry_block.exits[0].args,
-            vec![LinkArg::value(&graph, value)]
+            vec![LinkArg::Value(graph.must_variable(value))]
         );
     }
 
@@ -3133,7 +3211,8 @@ mod tests {
         let cond_var = graph.must_variable(cond);
         graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond_var.clone()));
 
-        graph.recloseblock(entry, vec![Link::new(&graph, vec![], target, None)]);
+        let link = Link::from_variables(&graph, vec![], target, None);
+        graph.recloseblock(entry, vec![link]);
 
         assert_eq!(
             graph.block(entry).exitswitch,
@@ -3150,8 +3229,10 @@ mod tests {
         let first = graph.create_block();
         let second = graph.create_block();
 
-        graph.closeblock(entry, vec![Link::new(&graph, vec![], first, None)]);
-        graph.closeblock(entry, vec![Link::new(&graph, vec![], second, None)]);
+        let first_link = Link::from_variables(&graph, vec![], first, None);
+        let second_link = Link::from_variables(&graph, vec![], second, None);
+        graph.closeblock(entry, vec![first_link]);
+        graph.closeblock(entry, vec![second_link]);
     }
 
     #[test]
@@ -3230,8 +3311,9 @@ mod tests {
         let entry = graph.startblock;
         let const_v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         let merge = graph.create_block();
-        graph.set_goto(entry, merge, vec![const_v]);
         install_phi(&mut graph, merge, "x");
+        let const_v_var = graph.must_variable(const_v);
+        graph.set_goto(entry, merge, vec![const_v_var]);
         graph.set_return(merge, None);
 
         prune_dead_phis(&mut graph);
@@ -3265,8 +3347,9 @@ mod tests {
         let entry = graph.startblock;
         let const_v = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
         let merge = graph.create_block();
-        graph.set_goto(entry, merge, vec![const_v]);
         let phi_x = install_phi(&mut graph, merge, "x");
+        let const_v_var = graph.must_variable(const_v);
+        graph.set_goto(entry, merge, vec![const_v_var]);
         // BinOp whose result IS read (by `set_return`).  Backward
         // dataflow needs a live consumer of the BinOp result for the
         // pure-op-args→dependencies routing to keep phi_x alive.
@@ -3283,7 +3366,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(merge, Some(doubled));
+        graph.set_return(merge, Some(graph.must_variable(doubled)));
 
         prune_dead_phis(&mut graph);
 
@@ -3316,8 +3399,9 @@ mod tests {
         let entry = graph.startblock;
         let const_v = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
         let merge = graph.create_block();
-        graph.set_goto(entry, merge, vec![const_v]);
         let phi_x = install_phi(&mut graph, merge, "x");
+        let const_v_var = graph.must_variable(const_v);
+        graph.set_goto(entry, merge, vec![const_v_var]);
         let phi_x_var = graph.must_variable(phi_x);
         let doubled = graph
             .push_op(
@@ -3340,11 +3424,10 @@ mod tests {
             graph.block(merge).inputargs.is_empty(),
             "phi feeding only a dead pure op must collapse"
         );
-        let has_binop = graph
-            .block(merge)
-            .operations
-            .iter()
-            .any(|op| op.result == Some(doubled) && matches!(op.kind, OpKind::BinOp { .. }));
+        let doubled_var = graph.must_variable(doubled);
+        let has_binop = graph.block(merge).operations.iter().any(|op| {
+            op.result.as_ref() == Some(&doubled_var) && matches!(op.kind, OpKind::BinOp { .. })
+        });
         assert!(!has_binop, "dead pure op must be removed alongside the phi");
         let entry_exit = &graph.block(entry).exits[0];
         assert!(
@@ -3364,11 +3447,13 @@ mod tests {
         let entry = graph.startblock;
         let const_v = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let merge1 = graph.create_block();
-        graph.set_goto(entry, merge1, vec![const_v]);
         let phi_x = install_phi(&mut graph, merge1, "x");
+        let const_v_var = graph.must_variable(const_v);
+        graph.set_goto(entry, merge1, vec![const_v_var]);
         let merge2 = graph.create_block();
-        graph.set_goto(merge1, merge2, vec![phi_x]);
         install_phi(&mut graph, merge2, "y");
+        let phi_x_var = graph.must_variable(phi_x);
+        graph.set_goto(merge1, merge2, vec![phi_x_var]);
         graph.set_return(merge2, None);
 
         prune_dead_phis(&mut graph);
@@ -3474,9 +3559,9 @@ mod tests {
         // but for the test we need only the link arity to match.
         let etype = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
         let evalue = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
-        let normal_arg = LinkArg::value(&graph, raising);
-        let exc_etype_arg = LinkArg::value(&graph, etype);
-        let exc_evalue_arg = LinkArg::value(&graph, evalue);
+        let normal_arg = LinkArg::Value(graph.must_variable(raising));
+        let exc_etype_arg = LinkArg::Value(graph.must_variable(etype));
+        let exc_evalue_arg = LinkArg::Value(graph.must_variable(evalue));
         {
             let block = graph.block_mut(entry);
             block.exitswitch = Some(ExitSwitch::LastException);
@@ -3488,11 +3573,12 @@ mod tests {
 
         prune_dead_phis(&mut graph);
 
+        let raising_var = graph.must_variable(raising);
         let still_present = graph
             .block(entry)
             .operations
             .iter()
-            .any(|op| op.result == Some(raising));
+            .any(|op| op.result.as_ref() == Some(&raising_var));
         assert!(
             still_present,
             "pure raising_op (last op of canraise block) must survive DCE per \

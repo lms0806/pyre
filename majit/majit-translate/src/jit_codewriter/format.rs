@@ -52,47 +52,29 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
     }
 }
 
-/// `format.py:12-81 format_assembler(ssarepr)`.  Type-state-aware
-/// variant — when callers can supply the per-graph
-/// [`crate::jit_codewriter::type_state::TypeResolutionState`], pass
-/// it through [`Self::format_assembler_with_types`] so generic
-/// `OpKind::Call` argument lists print with `getkind(v.concretetype)`
-/// kinds instead of falling back to the Ref shape.
+/// `format.py:12-81 format_assembler(ssarepr)`.  Per-arg kinds for
+/// `OpKind::Call` argument lists resolve via `getkind(v.concretetype)`
+/// read directly from each operand `Variable`'s `concretetype` cell
+/// (`flowspace/model.py:280` `__slots__ = [..., "concretetype"]`); no
+/// side-table is consulted.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
-    format_assembler_full(ssarepr, None, None)
+    format_assembler_full(ssarepr, None)
 }
 
-/// Type-aware sibling of [`format_assembler`].  Mirrors
-/// `flatten.py:382 getcolor` for the residual `FlatOp::Op` and
-/// `OpKind::Call` slots that still carry [`ValueId`]s — when
-/// `types` is supplied, every per-arg kind is resolved via
-/// `getkind(v.concretetype)`.
-pub fn format_assembler_with_types(
-    ssarepr: &SSARepr,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
-) -> String {
-    format_assembler_full(ssarepr, types, None)
-}
-
-/// Graph-aware sibling of [`format_assembler_with_types`].  When
-/// `graph` is supplied, Variable-typed operands resolve their render
-/// suffix via `graph.value_id_of(v)` (graph-local SSA numbering)
-/// rather than `Variable.id()` (process-wide identity).  Tests that
-/// need stable RPython-shaped `%i<n>` suffixes across runs should
-/// route through this entry point.
+/// Graph-aware sibling of [`format_assembler`].  When `graph` is
+/// supplied, Variable-typed operands resolve their render suffix via
+/// `graph.value_id_of(v)` (graph-local SSA numbering) rather than
+/// `Variable.id()` (process-wide identity).  Tests that need stable
+/// RPython-shaped `%i<n>` suffixes across runs should route through
+/// this entry point.
 pub fn format_assembler_with_graph(
     ssarepr: &SSARepr,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
     graph: &crate::model::FunctionGraph,
 ) -> String {
-    format_assembler_full(ssarepr, types, Some(graph))
+    format_assembler_full(ssarepr, Some(graph))
 }
 
-fn format_assembler_full(
-    ssarepr: &SSARepr,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
-    graph: Option<&crate::model::FunctionGraph>,
-) -> String {
+fn format_assembler_full(ssarepr: &SSARepr, graph: Option<&crate::model::FunctionGraph>) -> String {
     // First pass: collect every label that appears as a target so the
     // numbering matches format.py's getlabelname (labels are numbered in
     // first-seen order).
@@ -148,7 +130,7 @@ fn format_assembler_full(
                 }
             }
             FlatOp::Op(space_op) => {
-                let args = op_args_repr(space_op, types, graph);
+                let args = op_args_repr(space_op, graph);
                 if args.is_empty() {
                     let _ = writeln!(out, "{prefix}{}", op_name(space_op));
                 } else {
@@ -465,7 +447,6 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
 
 fn call_funcptr_repr(
     funcptr: &crate::model::CallFuncPtr,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
     graph: Option<&crate::model::FunctionGraph>,
 ) -> String {
     match funcptr {
@@ -474,13 +455,13 @@ fn call_funcptr_repr(
         // by construction.  Pyre's lowering, however, can
         // materialize a funcptr Variable as Int when the rtyper
         // chose the integer-indexed dispatch path (e.g. opcode
-        // dispatch tables).  When the caller supplies both a `graph`
-        // and a `TypeResolutionState` we resolve Variable → ValueId →
-        // kind through `getkind(v.concretetype)`; otherwise we keep
-        // the upstream default (`Ref`).
+        // dispatch tables); `variable_kind` reads each Variable's
+        // `concretetype` cell directly via `getkind` so the funcptr
+        // kind matches the upstream `getkind(v.concretetype)` slot
+        // shape.  Falls back to `Ref` when the cell is unset.
         crate::model::CallFuncPtr::Value(var) => {
             let vid = variable_value_id(var, graph);
-            let kind = value_id_kind(vid, types).unwrap_or(RegKind::Ref);
+            let kind = variable_kind(var).unwrap_or(RegKind::Ref);
             register_repr_for_kind(vid, kind)
         }
     }
@@ -577,18 +558,18 @@ fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T]) -> String {
 
 fn op_args_repr(
     op: &crate::model::SpaceOperation,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
     graph: Option<&crate::model::FunctionGraph>,
 ) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
     match &op.kind {
         // `OpKind::Call` carries a heterogeneous argument list (no
-        // per-slot kind on the variant).  When the caller supplies
-        // a [`TypeResolutionState`], each arg's kind comes from
-        // `getkind(v.concretetype)` via [`value_id_kind`] — same
-        // strict source PyPy uses.  Without types (test fixtures),
-        // fall back to the Ref shape.
+        // per-slot kind on the variant).  Each arg's kind reads
+        // straight from its `Variable.concretetype` cell via
+        // [`variable_kind`] — same `getkind(v.concretetype)` source
+        // PyPy uses.  Falls back to the Ref shape when the cell is
+        // unset (anchor-test fixtures that build SSA shapes without
+        // running the rtyper).
         OpKind::Call { args, .. } => {
             // When a graph is provided we resolve Variable→ValueId via
             // `value_id_of` so the render suffix matches RPython's
@@ -599,7 +580,7 @@ fn op_args_repr(
                 .iter()
                 .map(|v| {
                     let vid = variable_value_id(v, graph);
-                    let kind = value_id_kind(vid, types).unwrap_or(RegKind::Ref);
+                    let kind = variable_kind(v).unwrap_or(RegKind::Ref);
                     register_repr_for_kind(vid, kind)
                 })
                 .collect();
@@ -644,7 +625,7 @@ fn op_args_repr(
             args_f,
             ..
         } => {
-            let mut parts = vec![call_funcptr_repr(funcptr, types, graph)];
+            let mut parts = vec![call_funcptr_repr(funcptr, graph)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
@@ -719,7 +700,17 @@ fn op_args_repr(
             // test demands it.
         }
     }
-    if let Some(result) = op.result {
+    let result_vid = match graph {
+        Some(g) => op.result.as_ref().and_then(|v| g.value_id_of(v)),
+        // No-graph render path: fall back to the Variable's `id()`
+        // (process-wide identity counter) when callers cannot supply a
+        // graph.  Pre-flip the `op.result` field carried the dense
+        // `ValueId`, so this preserves the prior render behaviour for
+        // standalone test fixtures that build `SpaceOperation` ahead of
+        // any graph context.
+        None => op.result.as_ref().map(|v| ValueId(v.id() as usize)),
+    };
+    if let Some(result) = result_vid {
         if !out.is_empty() {
             out.push(' ');
         }
@@ -738,19 +729,17 @@ fn op_args_repr(
     out
 }
 
-/// `getkind(v.concretetype)` for a [`ValueId`] — the type-state
-/// driven analogue used by debug-format helpers that resolve an arg
-/// list whose per-slot kind is not pinned by the variant (notably
-/// [`crate::model::OpKind::Call`]).  Returns `None` when no
-/// type-state is available or the value classifies as
-/// Void / Unknown.
-fn value_id_kind(
-    v: ValueId,
-    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
-) -> Option<RegKind> {
-    use crate::jit_codewriter::type_state::ConcreteType;
-    let types = types?;
-    match types.get(v) {
+/// `getkind(v.concretetype)` for a [`crate::flowspace::model::Variable`]
+/// — direct reader for debug-format helpers that resolve an arg list
+/// whose per-slot kind is not pinned by the variant (notably
+/// [`crate::model::OpKind::Call`]).  Reads
+/// `Variable.concretetype` (`flowspace/model.py:280`) via
+/// [`crate::model::getkind`].  Returns `None` when the cell is unset
+/// or the value classifies as Void / Unknown.
+fn variable_kind(v: &crate::flowspace::model::Variable) -> Option<RegKind> {
+    use crate::model::ConcreteType;
+    let lltype = v.concretetype()?;
+    match crate::model::getkind(&lltype) {
         ConcreteType::Signed => Some(RegKind::Int),
         ConcreteType::GcRef => Some(RegKind::Ref),
         ConcreteType::Float => Some(RegKind::Float),
@@ -809,7 +798,7 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
-        // only reaches this fall-through when `op.result == Some(_)`,
+        // only reaches this fall-through when `op.result.as_ref().and_then(|v| graph.value_id_of(v)) == Some(_)`,
         // so any miss surfaces as a real coverage gap to extend.
         _ => RegKind::Ref,
     }
@@ -901,33 +890,49 @@ mod tests {
     #[test]
     fn format_constint_emits_dollar_value() {
         // format.py:23 `'$%r' % (x.value,)`.
-        use crate::model::{OpKind, SpaceOperation};
+        use crate::model::{FunctionGraph, OpKind, SpaceOperation};
+        let mut graph = FunctionGraph::new("format_constint");
+        let vid = graph.alloc_value();
+        let suffix = vid.0;
+        let result_var = graph.must_variable(vid);
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::ConstInt(42),
-            result: Some(ValueId(0)),
+            result: Some(result_var),
         }));
-        let text = format_assembler(&ssa);
+        let text = format_assembler_with_graph(&ssa, &graph);
         assert!(text.contains("$42"), "expected `$42` in: {text}");
-        assert!(text.contains("-> %i0"), "expected `-> %i0` in: {text}");
+        assert!(
+            text.contains(&format!("-> %i{suffix}")),
+            "expected `-> %i{suffix}` in: {text}"
+        );
     }
 
     #[test]
     fn format_residual_call_emits_descr_and_listofkind() {
         // jtransform.py:414-435 + format.py:27,32-33.
         use crate::call::CallDescriptor;
-        use crate::flowspace::model::Variable;
-        use crate::model::{CallFuncPtr, CallTarget, OpKind, SpaceOperation};
+        use crate::model::{
+            CallFuncPtr, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueId,
+        };
         use majit_ir::descr::EffectInfo;
 
-        let mut ssa = empty_ssa();
+        let mut graph = FunctionGraph::new("format_residual_call");
+        let int_arg_vid = graph.alloc_value();
+        let ref_arg_vid = graph.alloc_value();
+        let _funcptr_vid = graph.alloc_value();
+        let result_vid = graph.alloc_value();
+        let int_arg = graph.must_variable(int_arg_vid);
+        let ref_arg = graph.must_variable(ref_arg_vid);
+        let result_var = graph.must_variable(result_vid);
+        let int_arg_id = int_arg_vid.0;
+        let ref_arg_id = ref_arg_vid.0;
+        let result_id = result_vid.0;
+        let _ = ValueId(0);
 
+        let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);
         let descriptor = CallDescriptor::known(EffectInfo::default());
-        let int_arg = Variable::new();
-        let ref_arg = Variable::new();
-        let int_arg_id = int_arg.id();
-        let ref_arg_id = ref_arg.id();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::CallResidual {
                 funcptr: CallFuncPtr::Target(funcptr),
@@ -938,9 +943,9 @@ mod tests {
                 result_kind: 'i',
                 indirect_targets: None,
             },
-            result: Some(ValueId(3)),
+            result: Some(result_var),
         }));
-        let text = format_assembler(&ssa);
+        let text = format_assembler_with_graph(&ssa, &graph);
         assert!(
             text.contains("residual_call_ir_i "),
             "expected residual_call_ir_i in: {text}"
@@ -967,7 +972,7 @@ mod tests {
             !text.contains("F["),
             "F[] must not appear when 'f' kind absent: {text}"
         );
-        assert!(text.contains("-> %i3"));
+        assert!(text.contains(&format!("-> %i{result_id}")));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
 use crate::flowspace::model::ConstValue;
-use crate::jit_codewriter::annotation_state::AnnotationState;
+use crate::jit_codewriter::annotation_state::{AnnotationState, somevalue_to_valuetype};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 
 /// Run annotation propagation to fixpoint.
@@ -85,9 +85,9 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
         for block in &graph.blocks {
             // Propagate annotations through ops in this block
             for op in &block.operations {
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     let inferred = infer_op_type(&op.kind, &state, graph);
-                    let current = state.get(result).clone();
+                    let current = state.get(result);
                     let merged = union_type(&current, &inferred);
                     if merged != current {
                         state.set(result, merged);
@@ -168,14 +168,14 @@ fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) 
                      that is not registered on the graph — malformed link.args"
                 )
             });
-            state.get(vid).clone()
+            state.get(vid)
         }
         LinkArg::Const(value) => const_value_type(&value.value),
     }
 }
 
 fn merge_value_type(state: &mut AnnotationState, dst: ValueId, src_ty: ValueType) -> bool {
-    let current = state.get(dst).clone();
+    let current = state.get(dst);
     let merged = union_type(&current, &src_ty);
     if merged != current {
         state.set(dst, merged);
@@ -210,11 +210,18 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 }
 
 fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
+    let Some(target) = graph.variable(value).cloned() else {
+        return true;
+    };
     for block in &graph.blocks {
-        if block.inputarg_value_ids(graph).contains(&value) {
+        if block.inputargs.contains(&target) {
             return false;
         }
-        if block.operations.iter().any(|op| op.result == Some(value)) {
+        if block
+            .operations
+            .iter()
+            .any(|op| op.result.as_ref() == Some(&target))
+        {
             return false;
         }
     }
@@ -263,7 +270,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) 
             } else {
                 graph
                     .value_id_of(operand)
-                    .and_then(|vid| state.types.get(&vid).cloned())
+                    .map(|vid| state.get(vid))
                     .unwrap_or(ValueType::Unknown)
             }
         }
@@ -283,9 +290,17 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) 
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
+                // RPython `intop.rtype_neg` / `rfloat.rtype_neg` dispatch
+                // on the operand `SomeValue`'s lowleveltype.  Read the
+                // orthodox `Variable.annotation` analogue
+                // (`some_values`) so a Float operand keeps its Float
+                // result; absent/Unknown-cleared operands default to Int
+                // matching the historical `.types.get(...).unwrap_or(Int)`
+                // semantics for the dominant "operand not yet annotated"
+                // case.
                 graph
                     .value_id_of(operand)
-                    .and_then(|vid| state.types.get(&vid).cloned())
+                    .and_then(|vid| state.some(vid).map(|s| somevalue_to_valuetype(s)))
                     .unwrap_or(ValueType::Int)
             }
         }
@@ -376,10 +391,10 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(entry, Some(v));
+        graph.set_return(entry, Some(graph.must_variable(v)));
 
         let state = annotate(&graph);
-        assert_eq!(state.get(v), &ValueType::Int);
+        assert_eq!(state.get(v), ValueType::Int);
     }
 
     #[test]
@@ -400,10 +415,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(v));
+        graph.set_return(entry, Some(graph.must_variable(v)));
 
         let state = annotate(&graph);
-        assert_eq!(state.get(v), &ValueType::Int);
+        assert_eq!(state.get(v), ValueType::Int);
     }
 
     #[test]
@@ -425,12 +440,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(result));
+        graph.set_return(entry, Some(graph.must_variable(result)));
 
         let state = annotate(&graph);
-        assert_eq!(state.get(a), &ValueType::Int);
-        assert_eq!(state.get(b), &ValueType::Int);
-        assert_eq!(state.get(result), &ValueType::Int);
+        assert_eq!(state.get(a), ValueType::Int);
+        assert_eq!(state.get(b), ValueType::Int);
+        assert_eq!(state.get(result), ValueType::Int);
     }
 
     #[test]
@@ -452,10 +467,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(result));
+        graph.set_return(entry, Some(graph.must_variable(result)));
 
         let state = annotate(&graph);
-        assert_eq!(state.get(result), &ValueType::Int);
+        assert_eq!(state.get(result), ValueType::Int);
     }
 
     #[test]
@@ -472,14 +487,15 @@ mod tests {
         let phi = phi_args[0];
 
         // Link: entry → target, passing val as the Phi arg
-        graph.set_goto(entry, target, vec![val]);
-        graph.set_return(target, Some(phi));
+        let val_var = graph.must_variable(val);
+        graph.set_goto(entry, target, vec![val_var]);
+        graph.set_return(target, Some(graph.must_variable(phi)));
 
         let state = annotate(&graph);
         // Phi should inherit Int from val via Link propagation
         assert_eq!(
             state.get(phi),
-            &ValueType::Int,
+            ValueType::Int,
             "Phi node should receive Int annotation from Link args"
         );
     }
@@ -491,28 +507,30 @@ mod tests {
         let (exc_block, etype, evalue) = graph.exceptblock_args();
         let last_exception = graph.alloc_value();
         let last_exc_value = graph.alloc_value();
+        let last_exception_var = graph.must_variable(last_exception);
+        let last_exc_value_var = graph.must_variable(last_exc_value);
         graph.set_control_flow_metadata(
             entry,
             Some(ExitSwitch::LastException),
             vec![
-                Link::new(
+                Link::from_variables(
                     &graph,
-                    vec![last_exception, last_exc_value],
+                    vec![last_exception_var.clone(), last_exc_value_var.clone()],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::value(&graph, last_exception)),
-                    Some(LinkArg::value(&graph, last_exc_value)),
+                    Some(LinkArg::Value(last_exception_var)),
+                    Some(LinkArg::Value(last_exc_value_var)),
                 ),
             ],
         );
 
         let state = annotate(&graph);
-        assert_eq!(state.get(last_exception), &ValueType::Int);
-        assert_eq!(state.get(last_exc_value), &ValueType::Ref);
-        assert_eq!(state.get(etype), &ValueType::Int);
-        assert_eq!(state.get(evalue), &ValueType::Ref);
+        assert_eq!(state.get(last_exception), ValueType::Int);
+        assert_eq!(state.get(last_exc_value), ValueType::Ref);
+        assert_eq!(state.get(etype), ValueType::Int);
+        assert_eq!(state.get(evalue), ValueType::Ref);
     }
 
     #[test]
@@ -533,12 +551,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(result));
+        graph.set_return(entry, Some(graph.must_variable(result)));
 
         let state = annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        assert_eq!(state.get(result), &ValueType::Float);
-        assert_eq!(state.get(ret), &ValueType::Float);
+        assert_eq!(state.get(result), ValueType::Float);
+        assert_eq!(state.get(ret), ValueType::Float);
     }
 
     #[test]
@@ -549,6 +567,6 @@ mod tests {
 
         let state = annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        assert_eq!(state.get(ret), &ValueType::Void);
+        assert_eq!(state.get(ret), ValueType::Void);
     }
 }

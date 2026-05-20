@@ -273,8 +273,8 @@ impl RegAllocator {
             {
                 die_at.insert(var, i);
             }
-            if let Some(result) = op.result {
-                die_at.insert(Self::var(graph, result), i + 1);
+            if let Some(result_var) = op.result.clone() {
+                die_at.insert(result_var, i + 1);
             }
         }
         // Variables used in exit links stay alive until block end.
@@ -316,8 +316,7 @@ impl RegAllocator {
                 alive.remove(&die_list[die_index].1);
                 die_index += 1;
             }
-            if let Some(result) = op.result {
-                let result_var = Self::var(graph, result);
+            if let Some(result_var) = op.result.clone() {
                 if consider(&result_var) {
                     self.depgraph.add_node(result_var.clone());
                     for v in &alive {
@@ -651,7 +650,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(v1));
+        graph.set_return(entry, Some(graph.must_variable(v1)));
 
         graph.set_concretetype(v0, ConcreteType::Signed);
         graph.set_concretetype(v1, ConcreteType::Signed);
@@ -700,7 +699,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(v2));
+        graph.set_return(entry, Some(graph.must_variable(v2)));
 
         graph.set_concretetype(v0, ConcreteType::Signed);
         graph.set_concretetype(v1, ConcreteType::Signed);
@@ -731,8 +730,9 @@ mod tests {
             .unwrap();
         let (block1, block1_args) = graph.create_block_with_args(1);
         let v1 = block1_args[0];
-        graph.set_goto(entry, block1, vec![v0]);
-        graph.set_return(block1, Some(v1));
+        let v0_var = graph.must_variable(v0);
+        graph.set_goto(entry, block1, vec![v0_var]);
+        graph.set_return(block1, Some(graph.must_variable(v1)));
 
         graph.set_concretetype(v0, ConcreteType::Signed);
         graph.set_concretetype(v1, ConcreteType::Signed);

@@ -259,8 +259,10 @@ fn compute_liveness_pass_with_graph(
                 alive.clear();
             }
             FlatOp::Op(inner_op) => {
-                if let Some(result) = inner_op.result {
-                    def_value(&mut alive, result);
+                if let Some(g) = graph {
+                    if let Some(result) = inner_op.result.as_ref().and_then(|v| g.value_id_of(v)) {
+                        def_value(&mut alive, result);
+                    }
                 }
                 for vid in crate::inline::op_value_refs(&inner_op.kind, graph) {
                     use_value(&mut alive, vid);
@@ -510,18 +512,18 @@ mod tests {
             insns: vec![
                 FlatOp::Label(Label(0)),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(0)),
+                    result: Some(graph.must_variable(ValueId(0))),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(1)),
+                    result: Some(graph.must_variable(ValueId(1))),
                     kind: OpKind::ConstInt(42),
                 }),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(2)),
+                    result: Some(graph.must_variable(ValueId(2))),
                     kind: OpKind::BinOp {
                         op: "add".into(),
                         lhs: lhs_var,

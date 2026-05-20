@@ -198,5 +198,7 @@ pub fn lower_exc_from_raise(
     // `flowspace/flowcontext.py:1253 Raise.nomoreblocks` — close
     // the block with the `(etype, evalue)` Link to the graph's
     // `exceptblock`.
-    graph.set_raise_values(block, etype, evalue);
+    let etype_var = graph.must_variable(etype);
+    let evalue_arg = graph.must_variable(evalue);
+    graph.set_raise_values(block, etype_var, evalue_arg);
 }

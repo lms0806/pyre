@@ -1557,7 +1557,7 @@ pub fn lower_expr_into_graph(
     )?;
     ctx.assert_stack_empty_at_stmt_boundary("lower_expr_into_graph exit");
     if graph.block(block).is_open() {
-        graph.set_return(block, lowered.value);
+        graph.set_return(block, lowered.value.map(|v| graph.must_variable(v)));
     }
     Ok(())
 }
@@ -2175,7 +2175,7 @@ fn allocate_loop_header_phis(
             .expect("OpKind::Input always produces a result");
         graph.name_value(phi_vid, name.clone());
         graph.push_inputarg(header_entry, phi_vid);
-        let entry_arg = LinkArg::value(graph, entry_vid);
+        let entry_arg = LinkArg::Value(graph.must_variable(entry_vid));
         graph.block_mut(pre_loop_block).exits[0]
             .args
             .push(entry_arg);
@@ -2197,14 +2197,14 @@ fn allocate_loop_header_phis(
 fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
     let header_block = graph.block(header);
     header_block
-        .inputarg_value_ids(graph)
-        .into_iter()
-        .filter_map(|iarg_vid| {
+        .inputargs
+        .iter()
+        .filter_map(|iarg| {
             header_block
                 .operations
                 .iter()
-                .find_map(|op| match (&op.kind, op.result) {
-                    (OpKind::Input { name, .. }, Some(r)) if r == iarg_vid => Some(name.clone()),
+                .find_map(|op| match (&op.kind, op.result.as_ref()) {
+                    (OpKind::Input { name, .. }, Some(r)) if r == iarg => Some(name.clone()),
                     _ => None,
                 })
         })
@@ -2685,8 +2685,10 @@ fn lazy_install_local_at_current_block(
         let block = graph.block(current_block);
         let block_inputarg_vids = block.inputarg_value_ids(graph);
         for op in &block.operations {
-            if let (Some(result), OpKind::Input { name: op_name, .. }) = (op.result, &op.kind)
-                && op_name == name
+            if let (Some(result), OpKind::Input { name: op_name, .. }) = (
+                op.result.as_ref().and_then(|v| graph.value_id_of(v)),
+                &op.kind,
+            ) && op_name == name
                 && block_inputarg_vids.contains(&result)
             {
                 return Some(result);
@@ -2951,7 +2953,7 @@ fn lazy_install_local_at_current_block(
     }
 
     for (pred_block, exit_idx, pred_vid) in pred_link_args {
-        let arg = crate::model::LinkArg::value(graph, pred_vid);
+        let arg = crate::model::LinkArg::Value(graph.must_variable(pred_vid));
         graph.block_mut(pred_block).exits[exit_idx].args.push(arg);
     }
 
@@ -2973,10 +2975,16 @@ fn value_id_defined_in_block(
     block_id: BlockId,
 ) -> bool {
     let block = graph.block(block_id);
-    if block.inputarg_value_ids(graph).contains(&vid) {
+    let Some(target) = graph.variable(vid).cloned() else {
+        return false;
+    };
+    if block.inputargs.contains(&target) {
         return true;
     }
-    block.operations.iter().any(|op| op.result == Some(vid))
+    block
+        .operations
+        .iter()
+        .any(|op| op.result.as_ref() == Some(&target))
 }
 
 // Build a SemanticFunction from a Rust function AST. Mirrors RPython
@@ -3178,7 +3186,7 @@ fn build_function_graph(
     // only statement-only / empty bodies synthesize the void return
     // value.
     if !lowered.path_closed && graph.block(entry).is_open() {
-        graph.set_return(entry, lowered.value);
+        graph.set_return(entry, lowered.value.map(|v| graph.must_variable(v)));
     }
 
     // RPython: op.result.concretetype — module-qualified for exact type identity.
@@ -3758,7 +3766,8 @@ fn lower_if_expr(
     // RPython parity: `flowspace/flowcontext.py:38
     // SpamBlock.framestate`.
     let pre_branch_snapshot = ctx.getstate(0);
-    graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
+    let cond_var = graph.must_variable(cond);
+    graph.set_branch(*block, cond_var, then_block, vec![], else_block, vec![]);
     graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
 
     // Stage B1: capture the pre-branch ctx state BEFORE
@@ -3835,11 +3844,13 @@ fn lower_if_expr(
     let (merge_block, phi_result) = if want_phi {
         let (merge, phi_args) = graph.create_block_with_args(1);
         if then_open {
-            graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
+            let then_var = graph.must_variable(then_value.unwrap());
+            graph.set_goto(then_block, merge, vec![then_var]);
             graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
         }
         if else_open {
-            graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
+            let else_var = graph.must_variable(else_value.unwrap());
+            graph.set_goto(else_block, merge, vec![else_var]);
             graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
         }
         (merge, Some(phi_args[0]))
@@ -4396,7 +4407,7 @@ fn lower_expr(
             } else {
                 None
             };
-            graph.set_return(*block, val);
+            graph.set_return(*block, val.map(|v| graph.must_variable(v)));
             Ok(Lowered::path_closed())
         }
 
@@ -4799,16 +4810,25 @@ fn lower_expr(
                 let mut true_arm_args: Vec<ValueId> = Vec::with_capacity(merged_names.len() + 1);
                 true_arm_args.push(const_true);
                 true_arm_args.extend(pre_fork_local_args.iter().cloned());
+                let false_arm_vars: Vec<crate::flowspace::model::Variable> = false_arm_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                let true_arm_vars: Vec<crate::flowspace::model::Variable> = true_arm_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                let cond_var = graph.must_variable(cond);
 
                 // Two Links into the same join: cond truthy → tail
                 // is `0` (false); cond falsy → tail is `1` (true).
                 graph.set_branch(
                     *block,
-                    cond,
+                    cond_var,
                     join_block,
-                    false_arm_args,
+                    false_arm_vars,
                     join_block,
-                    true_arm_args,
+                    true_arm_vars,
                 );
 
                 // Rebind locals to join_block's inputargs.  Same
@@ -4934,28 +4954,37 @@ fn lower_expr(
                 shortcut_link_args.push(lhs_raw);
                 shortcut_link_args.extend(pre_fork_local_args.iter().cloned());
                 let rhs_link_args = pre_fork_local_args.clone();
+                let shortcut_link_vars: Vec<crate::flowspace::model::Variable> = shortcut_link_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                let rhs_link_vars: Vec<crate::flowspace::model::Variable> = rhs_link_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                let cond_var = graph.must_variable(cond);
 
                 if is_and {
                     // `&&`: cond truthy → eval rhs; cond falsy →
                     // short-circuit `lhs_raw` straight to the join.
                     graph.set_branch(
                         *block,
-                        cond,
+                        cond_var,
                         rhs_block,
-                        rhs_link_args,
+                        rhs_link_vars,
                         join_block,
-                        shortcut_link_args,
+                        shortcut_link_vars,
                     );
                 } else {
                     // `||`: cond truthy → short-circuit `lhs_raw`
                     // straight to the join; cond falsy → eval rhs.
                     graph.set_branch(
                         *block,
-                        cond,
+                        cond_var,
                         join_block,
-                        shortcut_link_args,
+                        shortcut_link_vars,
                         rhs_block,
-                        rhs_link_args,
+                        rhs_link_vars,
                     );
                 }
 
@@ -5000,7 +5029,11 @@ fn lower_expr(
                         Vec::with_capacity(merged_names.len() + 1);
                     rhs_to_join_args.push(rhs_raw);
                     rhs_to_join_args.extend(rhs_exit_local_args);
-                    graph.set_goto(rhs_block, join_block, rhs_to_join_args);
+                    let rhs_to_join_vars: Vec<crate::flowspace::model::Variable> = rhs_to_join_args
+                        .into_iter()
+                        .map(|v| graph.must_variable(v))
+                        .collect();
+                    graph.set_goto(rhs_block, join_block, rhs_to_join_vars);
                 }
 
                 // Rebind locals to join_block's inputargs so post-join
@@ -5241,10 +5274,11 @@ fn lower_expr(
                 }
                 any_open = true;
                 open_arm_snapshots.push((exit_snapshot.clone(), exit_locals.clone()));
-                let goto_args = if all_open_arms_have_value {
+                let goto_args: Vec<crate::flowspace::model::Variable> = if all_open_arms_have_value
+                {
                     // Safe: the filter above guarantees every open arm's
                     // `result` is `Some`.
-                    vec![result.unwrap()]
+                    vec![graph.must_variable(result.unwrap())]
                 } else {
                     Vec::new()
                 };
@@ -5309,9 +5343,10 @@ fn lower_expr(
                 // the existing two-arm truthy split for those cases rather
                 // than inventing a fake switch key. Primitive literal
                 // patterns use the switch path above.
+                let scrutinee_var = graph.must_variable(scrutinee);
                 graph.set_branch(
                     *block,
-                    scrutinee,
+                    scrutinee_var,
                     arm_entries[0],
                     vec![],
                     arm_entries[1],
@@ -5538,7 +5573,8 @@ fn lower_expr(
             let cond = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
             let body_entry = graph.create_block();
             let header_branch_snapshot = ctx.getstate(0);
-            graph.set_branch(header_tail, cond, body_entry, vec![], exit, vec![]);
+            let cond_var = graph.must_variable(cond);
+            graph.set_branch(header_tail, cond_var, body_entry, vec![], exit, vec![]);
             graph.block_mut(header_tail).framestate = Some(header_branch_snapshot);
 
             // Body → back to header_entry (entry, not tail —
@@ -5576,7 +5612,11 @@ fn lower_expr(
                 let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                graph.set_goto(body_tail, header_entry, back_edge_args);
+                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                graph.set_goto(body_tail, header_entry, back_edge_vars);
                 // Audit Cat 2-1: stamp the body-tail's framestate
                 // so the post-loop lazy installer can thread reads
                 // of pre-loop locals through this back-edge.  Same
@@ -5644,7 +5684,11 @@ fn lower_expr(
                 let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, body_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                graph.set_goto(body_tail, body_entry, back_edge_args);
+                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                graph.set_goto(body_tail, body_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
 
@@ -5716,7 +5760,8 @@ fn lower_expr(
             // eager phis bound to ctx).
             let header_branch_snapshot = ctx.getstate(0);
             if let Some(cond) = for_cond {
-                graph.set_branch(header_entry, cond, body_entry, vec![], exit, vec![]);
+                let cond_var = graph.must_variable(cond);
+                graph.set_branch(header_entry, cond_var, body_entry, vec![], exit, vec![]);
             } else {
                 graph.set_goto(header_entry, body_entry, vec![]);
             }
@@ -5743,7 +5788,11 @@ fn lower_expr(
                 let body_tail_snapshot = ctx.getstate(0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                graph.set_goto(body_tail, header_entry, back_edge_args);
+                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
+                    .into_iter()
+                    .map(|v| graph.must_variable(v))
+                    .collect();
+                graph.set_goto(body_tail, header_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
 
@@ -5833,7 +5882,9 @@ fn lower_expr(
                     let pre_continue_snapshot = ctx.getstate(0);
                     let header_phi_names = header_phi_name_list(graph, frame.continue_target);
                     let args = link_args_from_ctx(ctx, &header_phi_names);
-                    graph.set_goto(*block, frame.continue_target, args);
+                    let arg_vars: Vec<crate::flowspace::model::Variable> =
+                        args.into_iter().map(|v| graph.must_variable(v)).collect();
+                    graph.set_goto(*block, frame.continue_target, arg_vars);
                     graph.block_mut(*block).framestate = Some(pre_continue_snapshot);
                 }
             }
@@ -5941,17 +5992,20 @@ fn lower_expr(
             let last_exception = graph.alloc_value();
             let last_exc_value = graph.alloc_value();
             let exc_block = graph.exceptblock;
-            graph.set_goto(*block, continuation, vec![inner]);
-            let normal_link = Link::new(graph, vec![inner], continuation, None);
-            let exc_link = Link::new(
+            let inner_var = graph.must_variable(inner);
+            let last_exception_var = graph.must_variable(last_exception);
+            let last_exc_value_var = graph.must_variable(last_exc_value);
+            graph.set_goto(*block, continuation, vec![inner_var.clone()]);
+            let normal_link = Link::from_variables(graph, vec![inner_var], continuation, None);
+            let exc_link = Link::from_variables(
                 graph,
-                vec![last_exception, last_exc_value],
+                vec![last_exception_var.clone(), last_exc_value_var.clone()],
                 exc_block,
                 Some(exception_exitcase()),
             )
             .extravars(
-                Some(LinkArg::value(graph, last_exception)),
-                Some(LinkArg::value(graph, last_exc_value)),
+                Some(LinkArg::Value(last_exception_var)),
+                Some(LinkArg::Value(last_exc_value_var)),
             );
             graph.set_control_flow_metadata(
                 *block,
@@ -6132,7 +6186,15 @@ fn lower_expr(
                             // order).
                             let pass_block = graph.create_block();
                             let mut fail_block = graph.create_block();
-                            graph.set_branch(*block, cond, pass_block, vec![], fail_block, vec![]);
+                            let cond_var = graph.must_variable(cond);
+                            graph.set_branch(
+                                *block,
+                                cond_var,
+                                pass_block,
+                                vec![],
+                                fail_block,
+                                vec![],
+                            );
                             // Walk every message-expr on the fail
                             // branch to preserve its side effects
                             // (Call / FieldRead / …) on the graph,
@@ -7642,9 +7704,10 @@ fn graph_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> 
 }
 
 fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueType) {
+    let target_var = graph.variable(value).cloned();
     for block in &mut graph.blocks {
         for op in &mut block.operations {
-            if op.result != Some(value) {
+            if op.result.as_ref() != target_var.as_ref() {
                 continue;
             }
             match &mut op.kind {
@@ -7764,12 +7827,13 @@ fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
 }
 
 fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    let target = graph.variable(value).cloned();
     graph
         .blocks
         .iter()
         .flat_map(|block| block.operations.iter())
         .find_map(|op| {
-            if op.result == Some(value) {
+            if op.result.as_ref() == target.as_ref() && target.is_some() {
                 op_result_value_type(&op.kind)
             } else {
                 None
@@ -10122,9 +10186,10 @@ mod tests {
         // eagerly by the iterative fold's fresh-phi step (the
         // disagreeing-vid branch of 2-way `union`).
         let phi_block = graph.blocks.iter().find(|block| {
-            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| inputarg_vids.contains(&r))
+                op.result
+                    .as_ref()
+                    .is_some_and(|r| block.inputargs.contains(r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -10204,9 +10269,10 @@ mod tests {
         // inputarg — that's the merge-block phi the lazy installer
         // allocates when the post-match `x` read fires.
         let phi_block = graph.blocks.iter().find(|block| {
-            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| inputarg_vids.contains(&r))
+                op.result
+                    .as_ref()
+                    .is_some_and(|r| block.inputargs.contains(r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -10282,10 +10348,12 @@ mod tests {
             if block.inputargs.is_empty() {
                 continue;
             }
-            let inputarg_vids = block.inputarg_value_ids(&graph);
             let has_i_input = block.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "i")
-                    && op.result.is_some_and(|r| inputarg_vids.contains(&r))
+                    && op
+                        .result
+                        .as_ref()
+                        .is_some_and(|r| block.inputargs.contains(r))
             });
             if !has_i_input {
                 continue;
@@ -11784,9 +11852,8 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(
             entry.exits[0].args,
-            vec![crate::model::LinkArg::value(
-                &func.graph,
-                entry.operations[0].result.expect("const result"),
+            vec![crate::model::LinkArg::Value(
+                entry.operations[0].result.clone().expect("const result"),
             )],
         );
     }
@@ -12421,12 +12488,13 @@ mod tests {
             }
             other => panic!("expected OpKind::Input, got {:?}", other),
         }
-        assert_eq!(phi_op.result, Some(phi_vid));
+        let phi_vid_var = graph.must_variable(phi_vid);
+        assert_eq!(phi_op.result.as_ref(), Some(&phi_vid_var));
 
         let pre_exit = &graph.block(pre_loop_block).exits[0];
         assert_eq!(
             pre_exit.args,
-            vec![LinkArg::value(&graph, pre_x)],
+            vec![LinkArg::Value(graph.must_variable(pre_x))],
             "forward-edge link arg for `x` must carry the pre-loop vid"
         );
 
@@ -12545,13 +12613,12 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
-        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
                 OpKind::Input { name, .. }
-                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                    if header.inputargs.contains(op.result.as_ref().unwrap()) =>
                 {
                     Some(name.as_str())
                 }
@@ -12610,13 +12677,12 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
-        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
                 OpKind::Input { name, .. }
-                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                    if header.inputargs.contains(op.result.as_ref().unwrap()) =>
                 {
                     Some(name.as_str())
                 }
@@ -12680,12 +12746,12 @@ mod tests {
         // inner loop headers).
         let mut loop_headers_with_outer = 0;
         for header in &graph.blocks {
-            let header_inputarg_vids = header.inputarg_value_ids(&graph);
             let has_outer_phi = header.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "outer")
                     && op
                         .result
-                        .map(|r| header_inputarg_vids.contains(&r))
+                        .as_ref()
+                        .map(|r| header.inputargs.contains(r))
                         .unwrap_or(false)
             });
             if !has_outer_phi {
@@ -12798,12 +12864,12 @@ mod tests {
         // `x`.  Today the loop header carries one because the AST
         // scan collapses both `let x` bindings into the same name.
         let any_x_phi = graph.blocks.iter().any(|b| {
-            let inputarg_vids = b.inputarg_value_ids(&graph);
             b.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "x")
                     && op
                         .result
-                        .map(|r| inputarg_vids.contains(&r))
+                        .as_ref()
+                        .map(|r| b.inputargs.contains(r))
                         .unwrap_or(false)
             })
         });
@@ -13027,10 +13093,9 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| {
-                let inputarg_vids = b.inputarg_value_ids(&graph);
                 let owns_count_phi = b.operations.iter().any(|op| {
                     matches!(&op.kind, OpKind::Input { name, .. } if name == "count")
-                        && op.result.is_some_and(|r| inputarg_vids.contains(&r))
+                        && op.result.as_ref().is_some_and(|r| b.inputargs.contains(r))
                 });
                 let pred_count = graph
                     .blocks

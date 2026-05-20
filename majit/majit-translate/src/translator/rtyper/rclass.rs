@@ -49,7 +49,7 @@ use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
-use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -79,7 +79,6 @@ use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList
 /// block in `model.rs`).
 pub fn class_get_method_ptr(
     graph: &mut FunctionGraph,
-    type_state: &mut TypeResolutionState,
     block_id: BlockId,
     op_index: usize,
     receiver: ValueId,
@@ -87,9 +86,10 @@ pub fn class_get_method_ptr(
     method_name: String,
 ) -> ValueId {
     let funcptr = graph.alloc_value();
+    let funcptr_var = graph.must_variable(funcptr);
     let receiver_var = graph.must_variable(receiver);
     let op = SpaceOperation {
-        result: Some(funcptr),
+        result: Some(funcptr_var),
         kind: OpKind::VtableMethodPtr {
             receiver: receiver_var,
             trait_root,
@@ -97,7 +97,11 @@ pub fn class_get_method_ptr(
         },
     };
     graph.blocks[block_id.0].operations.insert(op_index, op);
-    type_state.set(funcptr, ConcreteType::Signed);
+    // RPython parity: every Variable carries `concretetype` inline.
+    // Pyre writes through the backing Variable's `concretetype` cell
+    // directly (RPython `rtyper.py:258 v.concretetype = ...`), so
+    // downstream consumers read kinds via `graph.concretetype(v)`.
+    graph.set_concretetype(funcptr, ConcreteType::Signed);
     funcptr
 }
 

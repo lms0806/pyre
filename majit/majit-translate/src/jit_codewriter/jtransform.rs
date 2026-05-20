@@ -222,15 +222,20 @@ pub struct Transformer<'a> {
     /// Type resolution state from the rtype pass.
     /// Used by `make_three_lists()` to split args by kind.
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
-    type_state: Option<&'a crate::jit_codewriter::type_state::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
     /// Stores (vable_base, array_index, itemsize, is_signed) per vable array variable.
-    vable_array_vars: std::collections::HashMap<ValueId, (ValueId, usize, usize, bool)>,
+    vable_array_vars: std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        (crate::flowspace::model::Variable, usize, usize, bool),
+    >,
     /// RPython: `Transformer.vable_flags`.
     #[allow(dead_code)]
     vable_flags: std::collections::HashMap<ValueId, VableFlag>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
-    aliases: std::collections::HashMap<ValueId, ValueId>,
+    aliases: std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -273,8 +278,11 @@ fn prepend_const_prefix(prefix: &mut Vec<SpaceOperation>, result: RewriteResult)
 enum RewriteResult {
     /// Replace with these ops
     Replace(Vec<SpaceOperation>),
-    /// Remove the op (identity/alias: result remaps to the given value)
-    Identity(ValueId),
+    /// Remove the op (identity/alias: result remaps to the given Variable).
+    /// RPython `jtransform.py:236 rewrite_op_same_as` returns `op.args[0]`
+    /// directly; pyre wraps it in this enum so the caller can fold the
+    /// alias into the rename map.
+    Identity(crate::flowspace::model::Variable),
     /// Keep the op unchanged
     Keep,
 }
@@ -364,7 +372,6 @@ impl<'a> Transformer<'a> {
             callcontrol: None,
             portal_jd_index: None,
             config,
-            type_state: None,
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
@@ -401,33 +408,18 @@ impl<'a> Transformer<'a> {
         self.portal_jd_index
     }
 
-    /// Set the type resolution state for arg kind splitting.
-    /// RPython: types live on `Variable.concretetype`.
-    pub fn with_type_state(
-        mut self,
-        ts: &'a crate::jit_codewriter::type_state::TypeResolutionState,
-    ) -> Self {
-        self.type_state = Some(ts);
-        self
-    }
-
     /// RPython: Transformer.transform() — process all blocks in the graph.
+    ///
+    /// Reads operand kinds via `graph.concretetype(v)` (RPython
+    /// `getkind(v.concretetype)`).  Callers commit kinds to each
+    /// backing `Variable.concretetype` cell upstream — through
+    /// `legacy_resolve::resolve_types` (which writes through
+    /// `graph.set_concretetype_inline` per-set) or
+    /// `dual_gate_publish_concretetypes`.  Test fixtures that need
+    /// to hand-set kinds call `graph.set_concretetype_inline(vid, ct)`
+    /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
-
-        // PyPy parity: hydrate every Variable's `concretetype` cell
-        // from the rtyper-produced `type_state` BEFORE the rewrite
-        // loop runs.  jtransform's helpers (`get_value_kind`,
-        // `resolve_call_result_kind`, …) then read kinds via
-        // `graph.concretetype(v)` exactly like upstream's
-        // `getkind(v.concretetype)`, with no separate `TypeResolutionState`
-        // fallback inside the rewrite.  Callers that already
-        // pre-hydrate the graph (codewriter.rs / legacy_pipeline.rs)
-        // pay only the idempotent-write cost; callers that don't (test
-        // fixtures with `with_type_state`) get the same commit here.
-        if let Some(ts) = self.type_state {
-            crate::jit_codewriter::type_state::apply_to_graph(ts, &mut rewritten);
-        }
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -461,9 +453,9 @@ impl<'a> Transformer<'a> {
                     new_ops.extend(ops);
                 }
                 RewriteResult::Identity(alias_target) => {
-                    if let Some(result) = op.result {
+                    if let Some(result) = op.result.clone() {
                         self.aliases
-                            .insert(result, resolve_alias(alias_target, &self.aliases));
+                            .insert(result, resolve_alias(&alias_target, &self.aliases));
                     }
                 }
                 RewriteResult::Keep => {
@@ -479,7 +471,11 @@ impl<'a> Transformer<'a> {
                 graph,
                 &block.exitswitch,
                 &block.exits,
-                |v| remap_value(v, &self.aliases),
+                |vid| {
+                    let var = graph.must_variable(vid);
+                    let remapped = remap_value(&var, &self.aliases);
+                    graph.value_id_of(&remapped).unwrap_or(vid)
+                },
                 |b| b,
             )
         };
@@ -519,14 +515,21 @@ impl<'a> Transformer<'a> {
         graph.alloc_value_with_type(ty)
     }
 
+    /// RPython parity: `Variable.concretetype = ty` (`flowmodel.py
+    /// Variable.__init__`).  Updates the backing Variable's
+    /// `concretetype` cell in-place; the optional shape lets the
+    /// jtransform rewrite arms call this with `op.result.clone()`
+    /// for result-less ops without an extra guard.
     fn stamp_value_kind(
         &mut self,
         graph: &mut FunctionGraph,
-        value: Option<ValueId>,
+        value: Option<crate::flowspace::model::Variable>,
         ty: crate::jit_codewriter::type_state::ConcreteType,
     ) {
-        if let Some(value) = value {
-            graph.set_concretetype(value, ty);
+        if let Some(var) = value {
+            if let Some(vid) = graph.value_id_of(&var) {
+                graph.set_concretetype(vid, ty);
+            }
         }
     }
 
@@ -537,7 +540,7 @@ impl<'a> Transformer<'a> {
     fn stamp_value_kind_from_value_type(
         &mut self,
         graph: &mut FunctionGraph,
-        value: Option<ValueId>,
+        value: Option<crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) {
         let ty = match result_ty {
@@ -565,13 +568,14 @@ impl<'a> Transformer<'a> {
     fn resolve_call_result_kind(
         &self,
         graph: &FunctionGraph,
-        result: Option<ValueId>,
+        result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> Option<char> {
         if !matches!(result_ty, ValueType::Unknown) {
             return None;
         }
-        let value = result?;
+        let var = result?;
+        let value = graph.value_id_of(var)?;
         match graph.concretetype(value) {
             crate::jit_codewriter::type_state::ConcreteType::Signed => Some('i'),
             crate::jit_codewriter::type_state::ConcreteType::GcRef => Some('r'),
@@ -589,7 +593,7 @@ impl<'a> Transformer<'a> {
     fn resolve_call_result(
         &self,
         graph: &FunctionGraph,
-        result: Option<ValueId>,
+        result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ResolvedCallResult {
         let kind = self
@@ -623,9 +627,9 @@ impl<'a> Transformer<'a> {
         );
         let var = graph.must_variable(value);
         (
-            var,
+            var.clone(),
             SpaceOperation {
-                result: Some(value),
+                result: Some(var),
                 kind: OpKind::ConstInt(fnaddr),
             },
         )
@@ -740,7 +744,7 @@ impl<'a> Transformer<'a> {
             } if self.config.classify_calls => {
                 let funcptr_vid = graph
                     .value_id_of(funcptr)
-                    .expect("IndirectCall.funcptr must have a backing ValueId");
+                    .expect("IndirectCall funcptr must have a backing ValueId");
                 let args_vids: Vec<ValueId> = args
                     .iter()
                     .map(|v| {
@@ -780,7 +784,7 @@ impl<'a> Transformer<'a> {
                     _ => unreachable!("matched bit op names above"),
                 };
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: canonical.into(),
                         lhs: lhs.clone(),
@@ -840,11 +844,7 @@ impl<'a> Transformer<'a> {
                 // the original `(*operand)` entry — same outcome as
                 // upstream's explicit propagation, without keeping a
                 // redundant alias key.
-                RewriteResult::Identity(
-                    graph
-                        .value_id_of(operand)
-                        .expect("UnaryOp operand must have ValueId on graph"),
-                )
+                RewriteResult::Identity(operand.clone())
             }
             // RPython `jtransform.py:1592` rename pass:
             //   ('cast_bool_to_float', 'cast_int_to_float'),
@@ -858,11 +858,11 @@ impl<'a> Transformer<'a> {
             } if unop_name == "cast_bool_to_float" => {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::UnaryOp {
                         op: "cast_int_to_float".into(),
                         operand: operand.clone(),
@@ -893,7 +893,7 @@ impl<'a> Transformer<'a> {
                     "ptr_ne"
                 };
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: new_op.into(),
                         lhs: lhs.clone(),
@@ -943,14 +943,14 @@ impl<'a> Transformer<'a> {
                 };
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: format!("float_{canonical}"),
                         lhs,
@@ -973,14 +973,14 @@ impl<'a> Transformer<'a> {
             {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: format!("float_{binop_name}"),
                         lhs,
@@ -1004,7 +1004,7 @@ impl<'a> Transformer<'a> {
             {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
@@ -1014,7 +1014,7 @@ impl<'a> Transformer<'a> {
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(funcptr),
                         descriptor: CallDescriptor::from_signature(
@@ -1042,11 +1042,11 @@ impl<'a> Transformer<'a> {
             } if unop_name == "neg" && self.get_value_kind_var(graph, operand) == 'f' => {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::UnaryOp {
                         op: "float_neg".into(),
                         operand: operand.clone(),
@@ -1141,7 +1141,7 @@ impl<'a> Transformer<'a> {
             } if matches!(binop_name.as_str(), "mod" | "floordiv" | "div")
                 && self.get_value_kind_var(graph, lhs) == 'i'
                 && self.get_value_kind_var(graph, rhs) == 'i'
-                && self.binop_result_is_int(graph, op.result, result_ty) =>
+                && self.binop_result_is_int(graph, op.result.as_ref(), result_ty) =>
             {
                 // **Rust low-level → RPython low-level.**  Pyre's
                 // `BinOp { op: "mod" | "floordiv" | "div" }` over i64
@@ -1195,7 +1195,11 @@ impl<'a> Transformer<'a> {
                     .value_id_of(rhs)
                     .expect("BinOp rhs has backing ValueId");
                 RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
-                    graph, helper_key, lhs_vid, rhs_vid, op.result,
+                    graph,
+                    helper_key,
+                    lhs_vid,
+                    rhs_vid,
+                    op.result.clone(),
                 ))
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
@@ -1237,7 +1241,7 @@ impl<'a> Transformer<'a> {
             {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
                 let zero_id = self.fresh_synthetic_value_typed(
@@ -1246,11 +1250,11 @@ impl<'a> Transformer<'a> {
                 );
                 let zero_var = graph.must_variable(zero_id);
                 let zero_op = SpaceOperation {
-                    result: Some(zero_id),
+                    result: Some(zero_var.clone()),
                     kind: OpKind::ConstFloat(0.0_f64.to_bits()),
                 };
                 let ne_op = SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: "float_ne".into(),
                         lhs: operand.clone(),
@@ -1330,13 +1334,13 @@ impl<'a> Transformer<'a> {
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(funcptr),
                         descriptor: CallDescriptor::from_signature(
@@ -1368,13 +1372,13 @@ impl<'a> Transformer<'a> {
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(funcptr),
                         descriptor: CallDescriptor::from_signature(
@@ -1407,11 +1411,11 @@ impl<'a> Transformer<'a> {
             } if unop_name == "uint_is_true" => {
                 self.stamp_value_kind(
                     graph,
-                    op.result,
+                    op.result.clone(),
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::UnaryOp {
                         op: "int_is_true".into(),
                         operand: operand.clone(),
@@ -1466,7 +1470,7 @@ impl<'a> Transformer<'a> {
                 if let Some(key) = residual_key {
                     if self.get_value_kind_var(graph, lhs) == 'i'
                         && self.get_value_kind_var(graph, rhs) == 'i'
-                        && self.binop_result_is_int(graph, op.result, result_ty)
+                        && self.binop_result_is_int(graph, op.result.as_ref(), result_ty)
                     {
                         let lhs_vid = graph
                             .value_id_of(lhs)
@@ -1475,12 +1479,16 @@ impl<'a> Transformer<'a> {
                             .value_id_of(rhs)
                             .expect("BinOp rhs has backing ValueId");
                         return RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
-                            graph, key, lhs_vid, rhs_vid, op.result,
+                            graph,
+                            key,
+                            lhs_vid,
+                            rhs_vid,
+                            op.result.clone(),
                         ));
                     }
                 }
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::BinOp {
                         op: canonical.to_string(),
                         lhs: lhs.clone(),
@@ -1597,8 +1605,15 @@ impl<'a> Transformer<'a> {
         self.get_value_kind(graph, vid)
     }
 
-    fn get_value_type(&self, graph: &FunctionGraph, v: ValueId) -> Option<ValueType> {
-        match graph.concretetype(v) {
+    fn get_value_type(
+        &self,
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<ValueType> {
+        // RPython `jit/codewriter/jtransform.py`: `getkind(v.concretetype)`
+        // — read kind off the Variable.concretetype slot directly.
+        let vid = graph.value_id_of(var)?;
+        match graph.concretetype(vid) {
             crate::jit_codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
             crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref),
             crate::jit_codewriter::type_state::ConcreteType::Float => Some(ValueType::Float),
@@ -1610,16 +1625,16 @@ impl<'a> Transformer<'a> {
     fn binop_result_is_int(
         &self,
         graph: &FunctionGraph,
-        result: Option<ValueId>,
+        result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> bool {
         if *result_ty == ValueType::Int {
             return true;
         }
-        let Some(result) = result else {
+        let Some(var) = result else {
             return false;
         };
-        self.get_value_type(graph, result) == Some(ValueType::Int)
+        self.get_value_type(graph, var) == Some(ValueType::Int)
     }
 
     /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` residual call
@@ -1642,7 +1657,7 @@ impl<'a> Transformer<'a> {
         helper_key: &str,
         lhs: ValueId,
         rhs: ValueId,
-        result: Option<ValueId>,
+        result: Option<crate::flowspace::model::Variable>,
     ) -> Vec<SpaceOperation> {
         let helper_name = if helper_key == "mod" {
             "_ll_2_int_mod"
@@ -1709,9 +1724,9 @@ impl<'a> Transformer<'a> {
         );
         let coerced = graph.must_variable(coerced_vid);
         (
-            coerced,
+            coerced.clone(),
             vec![SpaceOperation {
-                result: Some(coerced_vid),
+                result: Some(coerced),
                 kind: OpKind::UnaryOp {
                     op: "cast_int_to_float".into(),
                     operand: value.clone(),
@@ -1747,7 +1762,7 @@ impl<'a> Transformer<'a> {
                     detail: format!("rewrite: {target}(...) → identity"),
                 });
                 if let Some(arg) = args.first().copied() {
-                    RewriteResult::Identity(arg)
+                    RewriteResult::Identity(graph.must_variable(arg))
                 } else {
                     RewriteResult::Keep
                 }
@@ -1760,15 +1775,14 @@ impl<'a> Transformer<'a> {
                 });
                 self.vable_rewrites += 1;
                 if let Some(arg) = args.first().copied() {
-                    let base = resolve_alias(arg, &self.aliases);
-                    if let Some(result) = op.result {
-                        self.aliases.insert(result, base);
+                    let arg_var = graph.must_variable(arg);
+                    let base = resolve_alias(&arg_var, &self.aliases);
+                    if let Some(result) = op.result.clone() {
+                        self.aliases.insert(result, base.clone());
                     }
                     RewriteResult::Replace(vec![SpaceOperation {
                         result: None,
-                        kind: OpKind::VableForce {
-                            base: graph.must_variable(base),
-                        },
+                        kind: OpKind::VableForce { base },
                     }])
                 } else {
                     RewriteResult::Keep
@@ -1889,8 +1903,12 @@ impl<'a> Transformer<'a> {
         let Some(arg) = args.first().copied() else {
             return RewriteResult::Keep;
         };
-        let base = resolve_alias(arg, &self.aliases);
-        let kind_char = self.value_kind(graph, base);
+        let arg_var = graph.must_variable(arg);
+        let base = resolve_alias(&arg_var, &self.aliases);
+        let base_vid = graph
+            .value_id_of(&base)
+            .expect("resolve_alias must yield a Variable registered on graph");
+        let kind_char = self.value_kind(graph, base_vid);
         // jtransform.py:608 `op.args[0].concretetype is not lltype.Void`
         // guard — void args fall through the rewrite (caller may want
         // to keep the original op).
@@ -1905,8 +1923,8 @@ impl<'a> Transformer<'a> {
         // operand can reach this arm.  Re-introduce the assertion
         // once pyre-object grows the layout and the `PromoteString` /
         // `PromoteUnicode` arms can satisfy their upstream asserts.
-        if let Some(result) = op.result {
-            self.aliases.insert(result, base);
+        if let Some(result) = op.result.clone() {
+            self.aliases.insert(result, base.clone());
         }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -1920,7 +1938,7 @@ impl<'a> Transformer<'a> {
             SpaceOperation {
                 result: None,
                 kind: OpKind::GuardValue {
-                    value: graph.must_variable(base),
+                    value: base,
                     kind_char,
                 },
             },
@@ -1948,24 +1966,22 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         let typed_ty = op
             .result
+            .as_ref()
             .and_then(|result| self.get_value_type(graph, result))
             .unwrap_or_else(|| ty.clone());
         // Track virtualizable array field reads
         if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
-            if let Some(result) = op.result {
+            if let Some(result) = op.result.clone() {
                 // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
                 // We store the vable base plus the arraydescr properties.
                 let base_var = match &op.kind {
                     OpKind::FieldRead { base, .. } => base.clone(),
                     _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
                 };
-                let base = graph
-                    .value_id_of(&base_var)
-                    .expect("FieldRead.base must have a backing ValueId");
                 let itemsize = array_field.array_itemsize.unwrap_or(8);
                 let is_signed = array_field.array_is_signed.unwrap_or(false);
                 self.vable_array_vars
-                    .insert(result, (base, array_field.index, itemsize, is_signed));
+                    .insert(result, (base_var, array_field.index, itemsize, is_signed));
             }
         }
         // Virtualizable scalar field → VableFieldRead
@@ -1983,7 +1999,7 @@ impl<'a> Transformer<'a> {
                 _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
             };
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::VableFieldRead {
                     base: base_var,
                     field_index: vable_field.index,
@@ -2047,7 +2063,7 @@ impl<'a> Transformer<'a> {
                         },
                     },
                     SpaceOperation {
-                        result: op.result,
+                        result: op.result.clone(),
                         kind: OpKind::FieldRead {
                             base: base.clone(),
                             field: field.clone(),
@@ -2067,7 +2083,7 @@ impl<'a> Transformer<'a> {
                     ),
                 });
                 return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::FieldRead {
                         base: base.clone(),
                         field: field.clone(),
@@ -2082,7 +2098,7 @@ impl<'a> Transformer<'a> {
                 return RewriteResult::Keep;
             };
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::FieldRead {
                     base: base.clone(),
                     field: field.clone(),
@@ -2104,8 +2120,9 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let value_var = graph.must_variable(value);
         let typed_ty = self
-            .get_value_type(graph, value)
+            .get_value_type(graph, &value_var)
             .unwrap_or_else(|| ty.clone());
         if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
             self.notes.push(GraphTransformNote {
@@ -2121,7 +2138,7 @@ impl<'a> Transformer<'a> {
                 _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
             };
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::VableFieldWrite {
                     base: base_var,
                     field_index: vable_field.index,
@@ -2136,7 +2153,7 @@ impl<'a> Transformer<'a> {
                 _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
             };
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::FieldWrite {
                     base: base_var,
                     field: field.clone(),
@@ -2160,9 +2177,12 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         let typed_item_ty = op
             .result
+            .as_ref()
             .and_then(|result| self.get_value_type(graph, result))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some(&(vable_base, arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base)
+        let base_var = graph.must_variable(base);
+        if let Some((vable_base, arr_idx, itemsize, is_signed)) =
+            self.vable_array_vars.get(&base_var).cloned()
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -2170,9 +2190,9 @@ impl<'a> Transformer<'a> {
             });
             self.vable_rewrites += 1;
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::VableArrayRead {
-                    base: graph.must_variable(vable_base),
+                    base: vable_base,
                     array_index: arr_idx,
                     elem_index: graph.must_variable(index),
                     item_ty: typed_item_ty,
@@ -2183,7 +2203,7 @@ impl<'a> Transformer<'a> {
         }
         if &typed_item_ty != item_ty {
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::ArrayRead {
                     base: graph.must_variable(base),
                     index: graph.must_variable(index),
@@ -2213,10 +2233,13 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let value_var = graph.must_variable(value);
         let typed_item_ty = self
-            .get_value_type(graph, value)
+            .get_value_type(graph, &value_var)
             .unwrap_or_else(|| item_ty.clone());
-        if let Some(&(vable_base, arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base)
+        let base_var = graph.must_variable(base);
+        if let Some((vable_base, arr_idx, itemsize, is_signed)) =
+            self.vable_array_vars.get(&base_var).cloned()
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -2224,12 +2247,12 @@ impl<'a> Transformer<'a> {
             });
             self.vable_rewrites += 1;
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::VableArrayWrite {
-                    base: graph.must_variable(vable_base),
+                    base: vable_base,
                     array_index: arr_idx,
                     elem_index: graph.must_variable(index),
-                    value: graph.must_variable(value),
+                    value: value_var,
                     item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
@@ -2238,7 +2261,7 @@ impl<'a> Transformer<'a> {
         }
         if &typed_item_ty != item_ty {
             return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::ArrayWrite {
                     base: graph.must_variable(base),
                     index: graph.must_variable(index),
@@ -2323,7 +2346,7 @@ impl<'a> Transformer<'a> {
         // already have resolved this to `CallTarget::SyntheticTransparentCtor`;
         // jtransform does not perform name-only matching.
         if self.is_synthetic_result_option_ctor(graph, target, args, result_ty) {
-            return RewriteResult::Identity(args[0]);
+            return RewriteResult::Identity(graph.must_variable(args[0]));
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
@@ -2345,7 +2368,7 @@ impl<'a> Transformer<'a> {
                     // getcalldescr() instead of accepting an effect-only descr.
                     let non_void_args = resolve_non_void_arg_types(graph, args);
                     let result_ir_type = self
-                        .resolve_call_result(graph, op.result, result_ty)
+                        .resolve_call_result(graph, op.result.as_ref(), result_ty)
                         .ir_type;
                     let extraeffect = classify_call(target, &self.config.call_effects)
                         .map(|(d, _)| d.extra_info.extraeffect);
@@ -2378,7 +2401,7 @@ impl<'a> Transformer<'a> {
             let non_void_args = resolve_non_void_arg_types(graph, args);
             let descriptor = descriptor.with_signature(
                 &non_void_args,
-                self.resolve_call_result(graph, op.result, result_ty)
+                self.resolve_call_result(graph, op.result.as_ref(), result_ty)
                     .ir_type,
             );
             self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
@@ -2446,7 +2469,7 @@ impl<'a> Transformer<'a> {
                                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                                 );
                                 prefix.push(SpaceOperation {
-                                    result: Some(vid),
+                                    result: Some(graph.must_variable(vid)),
                                     kind: OpKind::ConstInt(v),
                                 });
                                 eff.push(vid);
@@ -2458,7 +2481,7 @@ impl<'a> Transformer<'a> {
                                     crate::jit_codewriter::type_state::ConcreteType::Float,
                                 );
                                 prefix.push(SpaceOperation {
-                                    result: Some(vid),
+                                    result: Some(graph.must_variable(vid)),
                                     kind: OpKind::ConstFloat(bits),
                                 });
                                 eff.push(vid);
@@ -2519,15 +2542,16 @@ impl<'a> Transformer<'a> {
         //
         // jtransform.py:2186 _handle_dict_lookup_call passes
         // `extradescr=[cpu.fielddescrof(STRUCT, 'entries'), cpu.arraydescrof(STRUCT.entries.TO)]`
-        // derived from `op.args[1].concretetype.TO`. pyre's TypeResolutionState
-        // collapses lltype to four kinds, so the dict struct is not recoverable
-        // here — extradescrs stays None until full lltype propagation lands.
+        // derived from `op.args[1].concretetype.TO`. pyre's
+        // `graph.concretetype(v)` collapses lltype to four kinds, so
+        // the dict struct is not recoverable here — extradescrs stays
+        // None until full lltype propagation lands.
         // OptHeap::_optimize_call_dict_lookup returns false on None extradescrs
         // and the call falls through emit_residual_call (heap.py:472-475 emit
         // → force_from_effectinfo on the call's own effectinfo).
         let non_void_args = resolve_non_void_arg_types(graph, args);
         let result_ir_type = self
-            .resolve_call_result(graph, op.result, result_ty)
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
             .ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
@@ -2612,8 +2636,10 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
-        let result_kind = self.resolve_call_result(graph, op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        let result_kind = self
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
+            .kind;
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -2623,7 +2649,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:480-481: inline_call always followed by -live-
         RewriteResult::Replace(vec![
             SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::InlineCall {
                     jitcode,
                     args_i,
@@ -2680,8 +2706,10 @@ impl<'a> Transformer<'a> {
         };
         let (greens_i, greens_r, greens_f) = self.make_three_lists(graph, green_args);
         let (reds_i, reds_r, reds_f) = self.make_three_lists(graph, red_args);
-        let result_kind = self.resolve_call_result(graph, op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        let result_kind = self
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
+            .kind;
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -2698,7 +2726,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:532-533: recursive_call + -live-
         let to_var = |v: ValueId| graph.must_variable(v);
         ops.push(SpaceOperation {
-            result: op.result,
+            result: op.result.clone(),
             kind: OpKind::RecursiveCall {
                 jd_index,
                 greens_i: greens_i.into_iter().map(to_var).collect(),
@@ -2805,7 +2833,7 @@ impl<'a> Transformer<'a> {
                     detail: "jit.current_trace_length → current_trace_length".to_string(),
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CurrentTraceLength,
                 }])
             }
@@ -2818,7 +2846,7 @@ impl<'a> Transformer<'a> {
                     detail: format!("jit.isconstant → {kind_char}_isconstant"),
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::IsConstant {
                         value: graph.must_variable(value),
                         kind_char,
@@ -2834,7 +2862,7 @@ impl<'a> Transformer<'a> {
                     detail: format!("jit.isvirtual → {kind_char}_isvirtual"),
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::IsVirtual {
                         value: graph.must_variable(value),
                         kind_char,
@@ -2899,7 +2927,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:1990-1993
         let non_void_args = resolve_non_void_arg_types(graph, args);
         let result_ir_type = self
-            .resolve_call_result(graph, op.result, result_ty)
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
             .ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
@@ -2979,7 +3007,7 @@ impl<'a> Transformer<'a> {
         let condition_or_value = args[0];
         let func_args = if args.len() > 1 { &args[1..] } else { &[] };
         let non_void_args = resolve_non_void_arg_types(graph, func_args);
-        let resolved_result = self.resolve_call_result(graph, op.result, result_ty);
+        let resolved_result = self.resolve_call_result(graph, op.result.as_ref(), result_ty);
         let result_ir_type = resolved_result.ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
@@ -3007,7 +3035,7 @@ impl<'a> Transformer<'a> {
             "force_ir: no float args in conditional_call"
         );
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let rewritten_opname = if is_value {
             "conditional_call_value"
         } else {
@@ -3041,7 +3069,7 @@ impl<'a> Transformer<'a> {
         };
         // jtransform.py:1681-1682: -live- if calldescr_canraise
         let mut ops = vec![SpaceOperation {
-            result: op.result,
+            result: op.result.clone(),
             kind: call_kind,
         }];
         if descriptor.extra_info.check_can_raise(false) {
@@ -3356,8 +3384,10 @@ impl<'a> Transformer<'a> {
         // constraint. Honour that kind so the residual_call's
         // `result_kind` matches what every downstream consumer sees,
         // instead of falling back to `'r'` from the Unknown default.
-        let result_kind = self.resolve_call_result(graph, op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        let result_kind = self
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
+            .kind;
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
@@ -3367,7 +3397,7 @@ impl<'a> Transformer<'a> {
         let mut ops = vec![
             funcptr_op,
             SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::CallResidual {
                     funcptr: CallFuncPtr::Value(funcptr),
                     descriptor,
@@ -3416,9 +3446,9 @@ impl<'a> Transformer<'a> {
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
-        let resolved_result = self.resolve_call_result(graph, op.result, result_ty);
+        let resolved_result = self.resolve_call_result(graph, op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let non_void_args = resolve_non_void_arg_types(graph, args);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
@@ -3462,7 +3492,7 @@ impl<'a> Transformer<'a> {
                     },
                 });
                 ops.push(SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(graph.must_variable(funcptr)),
                         descriptor,
@@ -3500,7 +3530,7 @@ impl<'a> Transformer<'a> {
                     },
                 });
                 let mut ops = vec![SpaceOperation {
-                    result: op.result,
+                    result: op.result.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(graph.must_variable(funcptr)),
                         descriptor,
@@ -3546,13 +3576,15 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
-        let result_kind = self.resolve_call_result(graph, op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        let result_kind = self
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
+            .kind;
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         RewriteResult::Replace(vec![
             funcptr_op,
             SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::CallElidable {
                     funcptr: CallFuncPtr::Value(funcptr),
                     descriptor,
@@ -3586,14 +3618,16 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
-        let result_kind = self.resolve_call_result(graph, op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
+        let result_kind = self
+            .resolve_call_result(graph, op.result.as_ref(), result_ty)
+            .kind;
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
             funcptr_op,
             SpaceOperation {
-                result: op.result,
+                result: op.result.clone(),
                 kind: OpKind::CallMayForce {
                     funcptr: CallFuncPtr::Value(funcptr),
                     descriptor,
@@ -3781,53 +3815,67 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
     }
 }
 
+/// RPython `jtransform.py:264-275 _renamings_get(self, v)` — follow the
+/// alias chain to the canonical Variable.  Variable-keyed: RPython
+/// `self._renamings` is a `{Variable: Variable}` dict
+/// (`jtransform.py:71`).
 fn resolve_alias(
-    mut value: ValueId,
-    aliases: &std::collections::HashMap<ValueId, ValueId>,
-) -> ValueId {
-    while let Some(next) = aliases.get(&value).copied() {
-        if next == value {
+    value: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+) -> crate::flowspace::model::Variable {
+    let mut cur = value.clone();
+    while let Some(next) = aliases.get(&cur).cloned() {
+        if next == cur {
             break;
         }
-        value = next;
+        cur = next;
     }
-    value
+    cur
 }
 
-fn remap_value(value: ValueId, aliases: &std::collections::HashMap<ValueId, ValueId>) -> ValueId {
+fn remap_value(
+    value: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+) -> crate::flowspace::model::Variable {
     resolve_alias(value, aliases)
 }
 
 fn remap_list(
-    values: &[ValueId],
-    aliases: &std::collections::HashMap<ValueId, ValueId>,
-) -> Vec<ValueId> {
-    values
-        .iter()
-        .copied()
-        .map(|v| remap_value(v, aliases))
-        .collect()
+    values: &[crate::flowspace::model::Variable],
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+) -> Vec<crate::flowspace::model::Variable> {
+    values.iter().map(|v| remap_value(v, aliases)).collect()
 }
 
 fn remap_call_funcptr(
     funcptr: &CallFuncPtr,
-    aliases: &std::collections::HashMap<ValueId, ValueId>,
-    graph: &FunctionGraph,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    _graph: &FunctionGraph,
 ) -> CallFuncPtr {
     match funcptr {
         CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
-        CallFuncPtr::Value(var) => {
-            let vid = graph
-                .value_id_of(var)
-                .expect("CallFuncPtr::Value must have a backing ValueId on graph");
-            CallFuncPtr::Value(graph.must_variable(remap_value(vid, aliases)))
-        }
+        CallFuncPtr::Value(var) => CallFuncPtr::Value(remap_value(var, aliases)),
     }
 }
 
 fn remap_op(
     op: &SpaceOperation,
-    aliases: &std::collections::HashMap<ValueId, ValueId>,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
     graph: &crate::model::FunctionGraph,
 ) -> SpaceOperation {
     let kind = match &op.kind {
@@ -3838,17 +3886,23 @@ fn remap_op(
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::GuardValue { .. }
-        | OpKind::VtableMethodPtr { .. }
         | OpKind::Abort { .. } => op.kind.clone(),
-        OpKind::VableForce { base } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("VableForce.base must have a backing ValueId");
-            OpKind::VableForce {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-            }
-        }
+        OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
+            value: remap_value(value, aliases),
+            kind_char: *kind_char,
+        },
+        OpKind::VtableMethodPtr {
+            receiver,
+            trait_root,
+            method_name,
+        } => OpKind::VtableMethodPtr {
+            receiver: remap_value(receiver, aliases),
+            trait_root: trait_root.clone(),
+            method_name: method_name.clone(),
+        },
+        OpKind::VableForce { base } => OpKind::VableForce {
+            base: remap_value(base, aliases),
+        },
         OpKind::JitMergePoint {
             jitdriver_index,
             greens_i,
@@ -3858,12 +3912,7 @@ fn remap_op(
             reds_r,
             reds_f,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("JitMergePoint arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::JitMergePoint {
                 jitdriver_index: *jitdriver_index,
                 greens_i: greens_i.iter().map(remap_var).collect(),
@@ -3880,12 +3929,7 @@ fn remap_op(
             graphs,
             result_ty,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("IndirectCall arg/funcptr must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::IndirectCall {
                 funcptr: remap_var(funcptr),
                 args: args.iter().map(remap_var).collect(),
@@ -3897,72 +3941,46 @@ fn remap_op(
             base,
             field,
             mutate_field,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("RecordQuasiImmutField.base must have a backing ValueId");
-            OpKind::RecordQuasiImmutField {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                field: field.clone(),
-                mutate_field: mutate_field.clone(),
-            }
-        }
+        } => OpKind::RecordQuasiImmutField {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            mutate_field: mutate_field.clone(),
+        },
         OpKind::FieldRead {
             base,
             field,
             ty,
             pure,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("FieldRead.base must have a backing ValueId");
-            OpKind::FieldRead {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                field: field.clone(),
-                ty: ty.clone(),
-                pure: *pure,
-            }
-        }
+        } => OpKind::FieldRead {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+            pure: *pure,
+        },
         OpKind::FieldWrite {
             base,
             field,
             value,
             ty,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("FieldWrite.base must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("FieldWrite.value must have a backing ValueId");
-            OpKind::FieldWrite {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                field: field.clone(),
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::FieldWrite {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            value: remap_value(value, aliases),
+            ty: ty.clone(),
+        },
         OpKind::ArrayRead {
             base,
             index,
             item_ty,
             array_type_id,
             nolength,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("ArrayRead.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("ArrayRead.index must have a backing ValueId");
-            OpKind::ArrayRead {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                index: graph.must_variable(remap_value(index_vid, aliases)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-                nolength: *nolength,
-            }
-        }
+        } => OpKind::ArrayRead {
+            base: remap_value(base, aliases),
+            index: remap_value(index, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
+        },
         OpKind::ArrayWrite {
             base,
             index,
@@ -3970,46 +3988,27 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("ArrayWrite.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("ArrayWrite.index must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("ArrayWrite.value must have a backing ValueId");
-            OpKind::ArrayWrite {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                index: graph.must_variable(remap_value(index_vid, aliases)),
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-                nolength: *nolength,
-            }
-        }
+        } => OpKind::ArrayWrite {
+            base: remap_value(base, aliases),
+            index: remap_value(index, aliases),
+            value: remap_value(value, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
+        },
         OpKind::InteriorFieldRead {
             base,
             index,
             field,
             item_ty,
             array_type_id,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("InteriorFieldRead.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("InteriorFieldRead.index must have a backing ValueId");
-            OpKind::InteriorFieldRead {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                index: graph.must_variable(remap_value(index_vid, aliases)),
-                field: field.clone(),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-            }
-        }
+        } => OpKind::InteriorFieldRead {
+            base: remap_value(base, aliases),
+            index: remap_value(index, aliases),
+            field: field.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::InteriorFieldWrite {
             base,
             index,
@@ -4017,91 +4016,52 @@ fn remap_op(
             value,
             item_ty,
             array_type_id,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("InteriorFieldWrite.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("InteriorFieldWrite.index must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("InteriorFieldWrite.value must have a backing ValueId");
-            OpKind::InteriorFieldWrite {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                index: graph.must_variable(remap_value(index_vid, aliases)),
-                field: field.clone(),
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-            }
-        }
+        } => OpKind::InteriorFieldWrite {
+            base: remap_value(base, aliases),
+            index: remap_value(index, aliases),
+            field: field.clone(),
+            value: remap_value(value, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::Call {
             target,
             args,
             result_ty,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("Call arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::Call {
                 target: target.clone(),
                 args: args.iter().map(remap_var).collect(),
                 result_ty: result_ty.clone(),
             }
         }
-        OpKind::GuardTrue { cond } => {
-            let cond_vid = graph
-                .value_id_of(cond)
-                .expect("GuardTrue.cond must have a backing ValueId");
-            OpKind::GuardTrue {
-                cond: graph.must_variable(remap_value(cond_vid, aliases)),
-            }
-        }
-        OpKind::GuardFalse { cond } => {
-            let cond_vid = graph
-                .value_id_of(cond)
-                .expect("GuardFalse.cond must have a backing ValueId");
-            OpKind::GuardFalse {
-                cond: graph.must_variable(remap_value(cond_vid, aliases)),
-            }
-        }
+        OpKind::GuardTrue { cond } => OpKind::GuardTrue {
+            cond: remap_value(cond, aliases),
+        },
+        OpKind::GuardFalse { cond } => OpKind::GuardFalse {
+            cond: remap_value(cond, aliases),
+        },
         OpKind::VableFieldRead {
             base,
             field_index,
             ty,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("VableFieldRead.base must have a backing ValueId");
-            OpKind::VableFieldRead {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                field_index: *field_index,
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::VableFieldRead {
+            base: remap_value(base, aliases),
+            field_index: *field_index,
+            ty: ty.clone(),
+        },
         OpKind::VableFieldWrite {
             base,
             field_index,
             value,
             ty,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("VableFieldWrite.base must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("VableFieldWrite.value must have a backing ValueId");
-            OpKind::VableFieldWrite {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                field_index: *field_index,
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::VableFieldWrite {
+            base: remap_value(base, aliases),
+            field_index: *field_index,
+            value: remap_value(value, aliases),
+            ty: ty.clone(),
+        },
         OpKind::VableArrayRead {
             base,
             array_index,
@@ -4109,22 +4069,14 @@ fn remap_op(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("VableArrayRead.base must have a backing ValueId");
-            let elem_vid = graph
-                .value_id_of(elem_index)
-                .expect("VableArrayRead.elem_index must have a backing ValueId");
-            OpKind::VableArrayRead {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                array_index: *array_index,
-                elem_index: graph.must_variable(remap_value(elem_vid, aliases)),
-                item_ty: item_ty.clone(),
-                array_itemsize: *array_itemsize,
-                array_is_signed: *array_is_signed,
-            }
-        }
+        } => OpKind::VableArrayRead {
+            base: remap_value(base, aliases),
+            array_index: *array_index,
+            elem_index: remap_value(elem_index, aliases),
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -4133,69 +4085,37 @@ fn remap_op(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("VableArrayWrite.base must have a backing ValueId");
-            let elem_vid = graph
-                .value_id_of(elem_index)
-                .expect("VableArrayWrite.elem_index must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("VableArrayWrite.value must have a backing ValueId");
-            OpKind::VableArrayWrite {
-                base: graph.must_variable(remap_value(base_vid, aliases)),
-                array_index: *array_index,
-                elem_index: graph.must_variable(remap_value(elem_vid, aliases)),
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                item_ty: item_ty.clone(),
-                array_itemsize: *array_itemsize,
-                array_is_signed: *array_is_signed,
-            }
-        }
+        } => OpKind::VableArrayWrite {
+            base: remap_value(base, aliases),
+            array_index: *array_index,
+            elem_index: remap_value(elem_index, aliases),
+            value: remap_value(value, aliases),
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::BinOp {
             op,
             lhs,
             rhs,
             result_ty,
-        } => {
-            let lhs_vid = graph
-                .value_id_of(lhs)
-                .expect("BinOp.lhs must have a backing ValueId");
-            let rhs_vid = graph
-                .value_id_of(rhs)
-                .expect("BinOp.rhs must have a backing ValueId");
-            OpKind::BinOp {
-                op: op.clone(),
-                lhs: graph.must_variable(remap_value(lhs_vid, aliases)),
-                rhs: graph.must_variable(remap_value(rhs_vid, aliases)),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::BinOp {
+            op: op.clone(),
+            lhs: remap_value(lhs, aliases),
+            rhs: remap_value(rhs, aliases),
+            result_ty: result_ty.clone(),
+        },
         OpKind::UnaryOp {
             op,
             operand,
             result_ty,
-        } => {
-            let operand_vid = graph
-                .value_id_of(operand)
-                .expect("UnaryOp.operand must have a backing ValueId");
-            OpKind::UnaryOp {
-                op: op.clone(),
-                operand: graph.must_variable(remap_value(operand_vid, aliases)),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::UnaryOp {
+            op: op.clone(),
+            operand: remap_value(operand, aliases),
+            result_ty: result_ty.clone(),
+        },
         OpKind::JitDebug { args } => OpKind::JitDebug {
-            args: args
-                .iter()
-                .map(|var| {
-                    let vid = graph
-                        .value_id_of(var)
-                        .expect("JitDebug arg must have a backing ValueId");
-                    graph.must_variable(remap_value(vid, aliases))
-                })
-                .collect(),
+            args: args.iter().map(|var| remap_value(var, aliases)).collect(),
         },
         OpKind::RecordKnownResult {
             result_value,
@@ -4206,12 +4126,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("RecordKnownResult arg/result_value must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::RecordKnownResult {
                 result_value: remap_var(result_value),
                 funcptr: funcptr.clone(),
@@ -4222,33 +4137,18 @@ fn remap_op(
                 result_kind: *result_kind,
             }
         }
-        OpKind::AssertGreen { value, kind_char } => {
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("AssertGreen.value must have a backing ValueId");
-            OpKind::AssertGreen {
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                kind_char: *kind_char,
-            }
-        }
-        OpKind::IsConstant { value, kind_char } => {
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("IsConstant.value must have a backing ValueId");
-            OpKind::IsConstant {
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                kind_char: *kind_char,
-            }
-        }
-        OpKind::IsVirtual { value, kind_char } => {
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("IsVirtual.value must have a backing ValueId");
-            OpKind::IsVirtual {
-                value: graph.must_variable(remap_value(value_vid, aliases)),
-                kind_char: *kind_char,
-            }
-        }
+        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
+            value: remap_value(value, aliases),
+            kind_char: *kind_char,
+        },
+        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
+            value: remap_value(value, aliases),
+            kind_char: *kind_char,
+        },
+        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
+            value: remap_value(value, aliases),
+            kind_char: *kind_char,
+        },
         OpKind::CallElidable {
             funcptr,
             descriptor,
@@ -4257,12 +4157,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("CallElidable arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::CallElidable {
                 funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
@@ -4281,12 +4176,7 @@ fn remap_op(
             result_kind,
             indirect_targets,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("CallResidual arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::CallResidual {
                 funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
@@ -4305,12 +4195,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("CallMayForce arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::CallMayForce {
                 funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
@@ -4327,12 +4212,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("InlineCall arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::InlineCall {
                 jitcode: jitcode.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
@@ -4351,12 +4231,7 @@ fn remap_op(
             reds_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("RecursiveCall arg must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::RecursiveCall {
                 jd_index: *jd_index,
                 greens_i: greens_i.iter().map(remap_var).collect(),
@@ -4376,12 +4251,7 @@ fn remap_op(
             args_r,
             args_f,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("ConditionalCall arg/condition must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::ConditionalCall {
                 condition: remap_var(condition),
                 funcptr: funcptr.clone(),
@@ -4400,12 +4270,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = graph
-                    .value_id_of(var)
-                    .expect("ConditionalCallValue arg/value must have a backing ValueId");
-                graph.must_variable(remap_value(vid, aliases))
-            };
+            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::ConditionalCallValue {
                 value: remap_var(value),
                 funcptr: funcptr.clone(),
@@ -4418,7 +4283,7 @@ fn remap_op(
         }
     };
     SpaceOperation {
-        result: op.result,
+        result: op.result.clone(),
         kind,
     }
 }
@@ -4514,7 +4379,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+    use crate::jit_codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
     #[test]
@@ -4536,7 +4401,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         match &transformed.graph.block(graph.startblock).operations[0].kind {
@@ -4570,7 +4435,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(alias));
+        graph.set_return(graph.startblock, Some(graph.must_variable(alias)));
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let block = transformed.graph.block(graph.startblock);
@@ -4585,7 +4450,10 @@ mod tests {
         );
         assert_eq!(block.exits.len(), 1);
         assert_eq!(block.exits[0].target, transformed.graph.returnblock);
-        assert_eq!(block.exits[0].args, vec![LinkArg::value(&graph, input)]);
+        assert_eq!(
+            block.exits[0].args,
+            vec![LinkArg::Value(graph.must_variable(input))]
+        );
     }
 
     #[test]
@@ -4625,17 +4493,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Float);
-        type_state.set(result, ConcreteType::Float);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Float);
+        graph.set_concretetype_inline(result, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let transformed = Transformer::new(&config).transform(&graph);
         let ops = &transformed.graph.block(graph.startblock).operations;
         let cast_result = match &ops[2].kind {
             OpKind::UnaryOp {
@@ -4646,11 +4511,11 @@ mod tests {
                 assert_eq!(op, "cast_int_to_float");
                 assert_eq!(*operand, lhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
-                ops[2].result.unwrap()
+                ops[2].result.clone().unwrap()
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
-        let cast_result_var = transformed.graph.must_variable(cast_result);
+        let cast_result_var = cast_result;
         match &ops[3].kind {
             OpKind::BinOp {
                 op,
@@ -4704,17 +4569,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Float);
-        type_state.set(rhs, ConcreteType::Signed);
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(lhs, ConcreteType::Float);
+        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
 
         let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let transformed = Transformer::new(&config).transform(&graph);
         let ops = &transformed.graph.block(graph.startblock).operations;
         let cast_result = match &ops[2].kind {
             OpKind::UnaryOp {
@@ -4725,11 +4587,11 @@ mod tests {
                 assert_eq!(op, "cast_int_to_float");
                 assert_eq!(*operand, rhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
-                ops[2].result.unwrap()
+                ops[2].result.clone().unwrap()
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
-        let cast_result_var = transformed.graph.must_variable(cast_result);
+        let cast_result_var = cast_result;
         match &ops[3].kind {
             OpKind::BinOp {
                 op,
@@ -4783,17 +4645,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Float);
-        type_state.set(result, ConcreteType::Float);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Float);
+        graph.set_concretetype_inline(result, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let transformed = Transformer::new(&config).transform(&graph);
         let ops = &transformed.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 6, "Input + Input + cast + fnptr + call + Live");
         let cast_result = match &ops[2].kind {
@@ -4805,7 +4664,7 @@ mod tests {
                 assert_eq!(op, "cast_int_to_float");
                 assert_eq!(*operand, lhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
-                ops[2].result.unwrap()
+                ops[2].result.clone().unwrap()
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
@@ -4829,7 +4688,7 @@ mod tests {
                 );
                 assert!(args_i.is_empty());
                 assert!(args_r.is_empty());
-                let cast_result_var = transformed.graph.must_variable(cast_result);
+                let cast_result_var = cast_result;
                 let rhs_var = transformed.graph.must_variable(rhs);
                 assert_eq!(args_f, &vec![cast_result_var, rhs_var]);
                 assert_eq!(*result_kind, 'f');
@@ -4996,17 +4855,13 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, None);
-
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(
+        graph.set_concretetype_inline(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let result = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let result = Transformer::new(&config).transform(&graph);
 
         match &result.graph.block(graph.startblock).operations[0].kind {
             OpKind::FieldWrite { ty, .. } => assert_eq!(*ty, ValueType::Int),
@@ -5036,17 +4891,13 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, None);
-
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(
+        graph.set_concretetype_inline(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let result = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let result = Transformer::new(&config).transform(&graph);
 
         match &result.graph.block(graph.startblock).operations[0].kind {
             OpKind::ArrayWrite { item_ty, .. } => assert_eq!(*item_ty, ValueType::Int),
@@ -5071,18 +4922,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
-
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_concretetype_inline(
             result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let result = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let result = Transformer::new(&config).transform(&graph);
 
         match &result.graph.block(graph.startblock).operations[0].kind {
             OpKind::FieldRead { ty, .. } => assert_eq!(*ty, ValueType::Int),
@@ -5110,18 +4957,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
-
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_concretetype_inline(
             result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let result = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph);
+        let result = Transformer::new(&config).transform(&graph);
 
         match &result.graph.block(graph.startblock).operations[0].kind {
             OpKind::ArrayRead { item_ty, .. } => assert_eq!(*item_ty, ValueType::Int),
@@ -5172,16 +5015,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
 
         let mut cc = crate::call::CallControl::new();
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_type_state(&type_state)
             .transform(&graph);
 
         let (result_kind, descriptor) = transformed
@@ -5240,17 +5081,15 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Signed);
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_type_state(&type_state)
             .transform(&graph);
 
         let ops = &transformed.graph.block(graph.startblock).operations;
@@ -5326,17 +5165,15 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Signed);
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_type_state(&type_state)
             .transform(&graph);
 
         let ops = &transformed.graph.block(graph.startblock).operations;
@@ -5412,17 +5249,15 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Signed);
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_type_state(&type_state)
             .transform(&graph);
 
         let ops = &transformed.graph.block(graph.startblock).operations;
@@ -5495,17 +5330,15 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
-        let mut type_state = TypeResolutionState::new();
-        type_state.set(lhs, ConcreteType::Signed);
-        type_state.set(rhs, ConcreteType::Signed);
-        type_state.set(result, ConcreteType::Signed);
+        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
+        graph.set_concretetype_inline(result, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_type_state(&type_state)
             .transform(&graph);
 
         let ops = &transformed.graph.block(graph.startblock).operations;
@@ -5663,7 +5496,7 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(hinted);
+            .result = Some(graph.must_variable(hinted));
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -5716,7 +5549,7 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(forced);
+            .result = Some(graph.must_variable(forced));
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -5783,7 +5616,7 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(promoted);
+            .result = Some(graph.must_variable(promoted));
         // A downstream op that names the promote result so we can
         // observe that `optimize_block` aliased it back to `v`.
         graph.push_op(
@@ -5801,7 +5634,7 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(consumed);
+            .result = Some(graph.must_variable(consumed));
         graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(&graph, &GraphTransformConfig::default());
@@ -6172,8 +6005,8 @@ mod tests {
     /// straight port of `test_jtransform.py:1011-1046 test_jit_merge_point_1`.
     ///
     /// Input: `try_handle_jit_marker(JitMergePoint, [receiver, g1, g2,
-    /// r1])` with two greens and one red, all int-typed via
-    /// TypeResolutionState. Expected output (`promote_greens` +
+    /// r1])` with two greens and one red, all int-typed via direct
+    /// `graph.set_concretetype_inline`. Expected output (`promote_greens` +
     /// `handle_jit_marker__jit_merge_point`):
     ///
     /// ```text
@@ -6194,7 +6027,7 @@ mod tests {
     #[test]
     fn try_handle_jit_marker_jit_merge_point_emits_full_promote_greens_sequence() {
         use crate::jit_codewriter::call::CallControl;
-        use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+        use crate::jit_codewriter::type_state::ConcreteType;
         use crate::parse::CallPath;
 
         let g1 = ValueId(10);
@@ -6211,16 +6044,10 @@ mod tests {
             Vec::new(),
         );
 
-        let mut ts = TypeResolutionState::new();
-        ts.set(g1, ConcreteType::Signed);
-        ts.set(g2, ConcreteType::Signed);
-        ts.set(r1, ConcreteType::Signed);
-
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config)
             .with_callcontrol(&mut cc)
-            .with_portal_jd(Some(0))
-            .with_type_state(&ts);
+            .with_portal_jd(Some(0));
 
         let args = [receiver, g1, g2, r1];
         // promote_greens projects each green ValueId through
@@ -6232,7 +6059,9 @@ mod tests {
         // hydrate Variable.concretetype before invoking the handler so
         // the green/red classifier picks `'i'` instead of the
         // Unknown-defaulted `'r'`.
-        crate::jit_codewriter::type_state::apply_to_graph(&ts, &mut graph);
+        graph.set_concretetype_inline(g1, ConcreteType::Signed);
+        graph.set_concretetype_inline(g2, ConcreteType::Signed);
+        graph.set_concretetype_inline(r1, ConcreteType::Signed);
         let ops = transformer
             .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args, &graph)
             .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
@@ -6498,13 +6327,11 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let result = transformer.transform(&graph);
 
         let ops = &result.graph.block(graph.startblock).operations;
@@ -6594,13 +6421,11 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let result = transformer.transform(&graph);
 
         let residual = result
@@ -6753,13 +6578,11 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let result = transformer.transform(&graph);
 
         let ops = &result.graph.block(graph.startblock).operations;
@@ -7008,13 +6831,11 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .with_type_state(&type_state);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let result = transformer.transform(&graph);
 
         let ops = &result.graph.block(graph.startblock).operations;
@@ -7193,12 +7014,9 @@ mod tests {
         // seed `v` as `Signed` so the dual-hint arm sees an Int arg
         // and routes through the plain `<kind>_guard_value` path
         // instead of the str_guard_value helper chain.
-        let mut ts = TypeResolutionState::new();
-        ts.set(v, ConcreteType::Signed);
+        graph.set_concretetype_inline(v, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
-        let result = Transformer::new(&config)
-            .with_type_state(&ts)
-            .transform(&graph);
+        let result = Transformer::new(&config).transform(&graph);
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(matches!(ops[0].kind, OpKind::Live));
         match &ops[1].kind {

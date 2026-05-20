@@ -107,7 +107,7 @@ fn lookup_op_by_result<'a>(
         .blocks
         .iter()
         .flat_map(|b| b.operations.iter())
-        .find(|op| op.result == Some(v))
+        .find(|op| op.result.as_ref().and_then(|var| graph.value_id_of(var)) == Some(v))
 }
 
 /// PRE-EXISTING-ADAPTATION shape check — pins the

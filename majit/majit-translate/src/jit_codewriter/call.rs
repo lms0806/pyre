@@ -2643,13 +2643,11 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
             .inputargs
             .iter()
             .filter_map(|arg| {
-                let ty = graph.value_id_of(arg).and_then(|arg_id| {
-                    start.operations.iter().find_map(|op| match &op.kind {
-                        crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => {
-                            Some(ty)
-                        }
-                        _ => None,
-                    })
+                let ty = start.operations.iter().find_map(|op| match &op.kind {
+                    crate::model::OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => {
+                        Some(ty)
+                    }
+                    _ => None,
                 });
                 ty.map(map_ty).unwrap_or(Some(Type::Ref))
             })
@@ -3930,17 +3928,17 @@ impl CallControl {
                         // RPython call.py:223-228 compares the full
                         // `concretetype` list. Pyre's caller-side
                         // `arg_types` comes from `resolve_non_void_arg_types`
-                        // which falls back to `Type::Ref` whenever the
-                        // type-state has no resolved entry for the
-                        // ValueId.  Trait-method test fixtures
+                        // which falls back to `Type::Ref` whenever
+                        // `graph.concretetype(v)` returns `Unknown`.
+                        // Trait-method test fixtures
                         // (`transform_all_handlers_to_jitcode`) hit that
                         // path because they construct `CallControl` without
-                        // a populated `TypeResolutionState`, so the kind
-                        // tail of every arg appears as `Ref` even when the
-                        // callee declares `Int`.  Hard-fail only on arity
-                        // mismatch — the kind tail surfaces as a soft
-                        // signal until the type-state propagation lands
-                        // (`call.py:230` parity).
+                        // populating each Variable's `concretetype`, so
+                        // the kind tail of every arg appears as `Ref`
+                        // even when the callee declares `Int`.  Hard-fail
+                        // only on arity mismatch — the kind tail surfaces
+                        // as a soft signal until full `Variable.concretetype`
+                        // propagation lands (`call.py:230` parity).
                         if arg_types.len() != expected_arg_types.len() {
                             panic!(
                                 "in operation calling {target}: calling a \
@@ -4685,7 +4683,7 @@ fn resolve_array_identity(
     }
     // 3. Phi/link: RPython concretetype propagates through block boundaries.
     // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
-    let mut source = LinkArg::value(graph, *base);
+    let mut source = LinkArg::Value(graph.must_variable(*base));
     for _ in 0..4 {
         match &source {
             LinkArg::Value(var) => {
@@ -4825,7 +4823,12 @@ fn collect_readwrite_effects(
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
-        .filter_map(|op| op.result.map(|vid| (vid, &op.kind)))
+        .filter_map(|op| {
+            op.result
+                .as_ref()
+                .and_then(|v| graph.value_id_of(v))
+                .map(|vid| (vid, &op.kind))
+        })
         .collect();
 
     // RPython: phi/link args carry concretetype through block boundaries.
@@ -6410,24 +6413,26 @@ mod tests {
         g.push_inputarg(continuation, continuation_arg);
         let last_exception = g.alloc_value();
         let last_exc_value = g.alloc_value();
+        let continuation_arg_var = g.must_variable(continuation_arg);
+        let last_exception_var = g.must_variable(last_exception);
+        let last_exc_value_var = g.must_variable(last_exc_value);
+        let normal_link = Link::from_variables(&g, vec![continuation_arg_var], continuation, None);
+        let exc_link = Link::from_variables(
+            &g,
+            vec![last_exception_var.clone(), last_exc_value_var.clone()],
+            g.exceptblock,
+            Some(exception_exitcase()),
+        )
+        .extravars(
+            Some(LinkArg::Value(last_exception_var)),
+            Some(LinkArg::Value(last_exc_value_var)),
+        );
         g.set_control_flow_metadata(
             entry,
             Some(ExitSwitch::LastException),
-            vec![
-                Link::new(&g, vec![continuation_arg], continuation, None),
-                Link::new(
-                    &g,
-                    vec![last_exception, last_exc_value],
-                    g.exceptblock,
-                    Some(exception_exitcase()),
-                )
-                .extravars(
-                    Some(LinkArg::value(&g, last_exception)),
-                    Some(LinkArg::value(&g, last_exc_value)),
-                ),
-            ],
+            vec![normal_link, exc_link],
         );
-        g.set_return(continuation, Some(continuation_arg));
+        g.set_return(continuation, Some(g.must_variable(continuation_arg)));
         g
     }
 
@@ -6889,7 +6894,7 @@ mod tests {
         let forwarded = ValueId(2);
         let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
         let mut phi_sources: HashMap<ValueId, Option<LinkArg>> = HashMap::new();
-        phi_sources.insert(base, Some(LinkArg::value(&graph, forwarded)));
+        phi_sources.insert(base, Some(LinkArg::Value(graph.must_variable(forwarded))));
         phi_sources.insert(
             forwarded,
             Some(LinkArg::from(crate::flowspace::model::ConstValue::List(

@@ -125,7 +125,10 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
                         .expect("Call arg must have a backing ValueId on caller graph")
                 })
                 .collect();
-            (arg_vids, call_op.result)
+            (
+                arg_vids,
+                call_op.result.as_ref().and_then(|v| graph.value_id_of(v)),
+            )
         }
         _ => unreachable!("InlineSite should point to a Call op"),
     };
@@ -261,7 +264,9 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
                 (None, Some(remapped_ret)) => (caller_returnblock, vec![remapped_ret]),
                 (None, None) => (caller_returnblock, vec![]),
             };
-            graph.set_goto(new_block_id, target, args);
+            let arg_vars: Vec<crate::flowspace::model::Variable> =
+                args.into_iter().map(|v| graph.must_variable(v)).collect();
+            graph.set_goto(new_block_id, target, arg_vars);
         } else {
             // Preserve the callee block's upstream CFG shape (single
             // goto, can-raise, typed-exception, bool-branch) with
@@ -288,7 +293,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         .operations
         .iter()
         .filter(|op| matches!(&op.kind, OpKind::Input { .. }))
-        .filter_map(|op| op.result)
+        .filter_map(|op| op.result.as_ref().and_then(|v| callee.value_id_of(v)))
         .collect();
 
     // Map call args to callee input values
@@ -335,7 +340,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         .enumerate()
         .filter_map(|(i, _)| call_args.get(i).copied())
         .collect();
-    graph.set_goto(block_id, callee_entry, entry_args);
+    let entry_arg_vars: Vec<crate::flowspace::model::Variable> = entry_args
+        .into_iter()
+        .map(|v| graph.must_variable(v))
+        .collect();
+    graph.set_goto(block_id, callee_entry, entry_arg_vars);
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.
@@ -350,7 +359,7 @@ fn remap_callee_values(
             map.entry(v).or_insert_with(|| graph.alloc_value());
         }
         for op in &block.operations {
-            if let Some(result) = op.result {
+            if let Some(result) = op.result.as_ref().and_then(|v| callee.value_id_of(v)) {
                 map.entry(result).or_insert_with(|| graph.alloc_value());
             }
             for v in op_value_refs(&op.kind, Some(callee)) {
@@ -417,7 +426,12 @@ fn remap_op(
     target_graph: &FunctionGraph,
 ) -> SpaceOperation {
     let remap = |v: &ValueId| *value_map.get(v).unwrap_or(v);
-    let result = op.result.map(|v| remap(&v));
+    let result_vid = op
+        .result
+        .as_ref()
+        .and_then(|v| source_graph.value_id_of(v))
+        .map(|v| remap(&v));
+    let result = result_vid.map(|vid| target_graph.must_variable(vid));
     let kind = remap_op_kind(&op.kind, &remap, source_graph, target_graph);
     SpaceOperation { result, kind }
 }
@@ -1445,9 +1459,9 @@ pub fn op_variable_refs(
 /// `SpaceOperation.result: Hlvalue` (`flowspace/model.py:140`).
 pub fn op_result_variable(
     op: &crate::model::SpaceOperation,
-    graph: &crate::model::FunctionGraph,
+    _graph: &crate::model::FunctionGraph,
 ) -> Option<crate::flowspace::model::Variable> {
-    op.result.and_then(|vid| graph.variable(vid).cloned())
+    op.result.clone()
 }
 
 /// `true` iff `kind` is side-effect-free and may be removed from the
@@ -1807,7 +1821,7 @@ fn remap_value_in_ops(
     let remap = |v: &ValueId| if *v == old { new } else { *v };
     ops.iter()
         .map(|op| SpaceOperation {
-            result: op.result,
+            result: op.result.clone(),
             kind: remap_op_kind(&op.kind, &remap, graph, graph),
         })
         .collect()
@@ -1846,7 +1860,7 @@ mod tests {
             },
             true,
         );
-        g.set_return(entry, result);
+        g.set_return(entry, result.map(|v| g.must_variable(v)));
         g
     }
 
@@ -1873,7 +1887,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result);
+        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
 
         let callee = make_simple_callee();
 
@@ -1917,7 +1931,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result);
+        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
 
         let cc = CallControl::new(); // empty — no graphs registered
         let count = inline_graph(&mut caller, &cc, 3);
@@ -1958,7 +1972,7 @@ mod tests {
             },
             true,
         );
-        outer.set_return(entry, result);
+        outer.set_return(entry, result.map(|v| outer.must_variable(v)));
 
         // caller: fn caller(x) -> Call("outer", [x])
         let mut caller = FunctionGraph::new("caller");
@@ -1981,7 +1995,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(centry, result);
+        caller.set_return(centry, result.map(|v| caller.must_variable(v)));
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), inner);
@@ -2034,7 +2048,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result);
+        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), callee);
@@ -2103,11 +2117,8 @@ mod tests {
         let entry = g.block(g.startblock);
         for op in &entry.operations {
             let result_var = op_result_variable(op, &g);
-            match op.result {
-                Some(vid) => {
-                    let direct = g
-                        .variable(vid)
-                        .expect("op result ValueId has a backing Variable");
+            match &op.result {
+                Some(direct) => {
                     let projected = result_var.expect("op_result_variable returns Some");
                     assert_eq!(direct.id(), projected.id());
                 }

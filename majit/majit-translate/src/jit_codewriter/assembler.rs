@@ -362,7 +362,7 @@ impl Assembler {
             if debug_enabled {
                 self.current_flatop_debug = Some(format!("{op:?}"));
             }
-            self.write_insn(op, regallocs, &mut state, callcontrol, Some(graph));
+            self.write_insn(op, regallocs, &mut state, callcontrol, graph);
         }
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
@@ -442,21 +442,6 @@ impl Assembler {
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
             _ssarepr: Some(ssarepr.clone()),
-            // Build a transitional TypeResolutionState from the
-            // per-value `concretetype` snapshot so JitCode::dump's
-            // existing `format_assembler_with_types` continues to
-            // resolve operand kinds for `OpKind::Call` argument
-            // formatting.  Long-term this becomes a `&FunctionGraph`
-            // borrow inside dump().
-            _types: self.current_concretetypes.as_ref().map(|slice| {
-                let mut state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-                for (idx, ct) in slice.iter().enumerate() {
-                    if !matches!(ct, crate::model::ConcreteType::Unknown) {
-                        state.set(crate::model::ValueId(idx), ct.clone());
-                    }
-                }
-                state
-            }),
         };
 
         self.count_jitcodes += 1;
@@ -480,7 +465,7 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
-        graph: Option<&crate::model::FunctionGraph>,
+        graph: &crate::model::FunctionGraph,
     ) {
         match op {
             // RPython assembler.py:143-144: Label → record bytecode position
@@ -1029,7 +1014,7 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
-        graph: Option<&crate::model::FunctionGraph>,
+        graph: &crate::model::FunctionGraph,
     ) {
         use crate::model::OpKind;
 
@@ -1054,7 +1039,7 @@ impl Assembler {
                 result_kind,
                 ..
             } => {
-                let g = graph.expect("encode_op for InlineCall requires a graph");
+                let g = graph;
                 let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
                     args.iter()
                         .map(|v| {
@@ -1092,7 +1077,7 @@ impl Assembler {
                 // key-level `reskind` from regalloc so `_r_i` / `_r_r`
                 // match the actual `>X` argcode suffix.
                 let result_key_kind = self.emit_call_result_arg(
-                    op.result,
+                    op.result.as_ref().and_then(|v| graph.value_id_of(v)),
                     *result_kind,
                     regallocs,
                     state,
@@ -1124,7 +1109,7 @@ impl Assembler {
                 reds_f,
                 result_kind,
             } => {
-                let g = graph.expect("encode_op for RecursiveCall requires a graph");
+                let g = graph;
                 let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
                     args.iter()
                         .map(|v| {
@@ -1157,7 +1142,7 @@ impl Assembler {
                 self.emit_list_of_kind(&reds_f_vids, RegKind::Float, regallocs, state);
                 argcodes.push('F');
                 let result_key_kind = self.emit_call_result_arg(
-                    op.result,
+                    op.result.as_ref().and_then(|v| graph.value_id_of(v)),
                     *result_kind,
                     regallocs,
                     state,
@@ -1226,7 +1211,7 @@ impl Assembler {
                 // leading `i` operand.
                 match funcptr {
                     crate::model::CallFuncPtr::Value(var) => {
-                        let g = graph.expect("encode_op for Call funcptr requires a graph");
+                        let g = graph;
                         let vid = g
                             .value_id_of(var)
                             .expect("Call funcptr must be a known Variable on graph");
@@ -1245,8 +1230,7 @@ impl Assembler {
                 let calldescr = descriptor.to_bh_calldescr();
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
-                let g =
-                    graph.expect("encode_op for Call{Elidable,Residual,MayForce} requires a graph");
+                let g = graph;
                 let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
                     args.iter()
                         .map(|v| {
@@ -1292,7 +1276,7 @@ impl Assembler {
                 // `base_{kinds}_{reskind}` stays consistent with the
                 // argcode `>X` suffix. If no result, fall back to `v`.
                 let result_key_kind = self.emit_call_result_arg(
-                    op.result,
+                    op.result.as_ref().and_then(|v| graph.value_id_of(v)),
                     *result_kind,
                     regallocs,
                     state,
@@ -1321,7 +1305,7 @@ impl Assembler {
                 let idx = self.emit_const_i(*val, state);
                 state.code.push(idx);
                 argcodes.push('i');
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
@@ -1341,7 +1325,7 @@ impl Assembler {
                 let idx = self.emit_const_i(*val as i64, state);
                 state.code.push(idx);
                 argcodes.push('i');
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
@@ -1362,7 +1346,7 @@ impl Assembler {
                 let idx = self.emit_const_f(&const_value, state);
                 state.code.push(idx);
                 argcodes.push('f');
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
@@ -1384,7 +1368,6 @@ impl Assembler {
                 pure,
             } => {
                 let base_vid = graph
-                    .expect("encode_op for FieldRead requires a graph")
                     .value_id_of(base)
                     .expect("FieldRead.base must be a known Variable on graph");
                 let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
@@ -1401,15 +1384,16 @@ impl Assembler {
                 // while the SSA result register is always i/r/f after
                 // regalloc. Using the result kind keeps the opname
                 // aligned with the `>X` argcode the runtime dispatches on.
-                let result_kind = if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                    kc
-                } else {
-                    'v'
-                };
+                let result_kind =
+                    if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+                        argcodes.push('>');
+                        let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                        argcodes.push(kc);
+                        state.code.push(reg);
+                        kc
+                    } else {
+                        'v'
+                    };
                 let mut opname = format!("getfield_gc_{result_kind}");
                 if *pure {
                     opname.push_str("_pure");
@@ -1436,7 +1420,6 @@ impl Assembler {
                 method_name,
             } => {
                 let receiver_vid = graph
-                    .expect("encode_op for VtableMethodPtr requires a graph")
                     .value_id_of(receiver)
                     .expect("VtableMethodPtr.receiver must be a known Variable on graph");
                 let (reg, kc) = self.lookup_reg_with_kind(receiver_vid, regallocs);
@@ -1449,7 +1432,7 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
@@ -1472,7 +1455,6 @@ impl Assembler {
                 mutate_field,
             } => {
                 let base_vid = graph
-                    .expect("encode_op for RecordQuasiImmutField requires a graph")
                     .value_id_of(base)
                     .expect("RecordQuasiImmutField.base must be a known Variable on graph");
                 let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
@@ -1499,7 +1481,7 @@ impl Assembler {
                 field,
                 ty,
             } => {
-                let g = graph.expect("encode_op for FieldWrite requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("FieldWrite.base must be a known Variable on graph");
@@ -1533,7 +1515,7 @@ impl Assembler {
                 array_type_id,
                 nolength,
             } => {
-                let g = graph.expect("encode_op for ArrayRead requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("ArrayRead.base must be a known Variable on graph");
@@ -1563,15 +1545,16 @@ impl Assembler {
                 argcodes.push('d');
                 // RPython `bhimpl_getarrayitem_gc_{i,r,f}` keys off the
                 // result register's kind — same rationale as getfield_gc_*.
-                let result_kind = if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                    kc
-                } else {
-                    'v'
-                };
+                let result_kind =
+                    if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+                        argcodes.push('>');
+                        let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                        argcodes.push(kc);
+                        state.code.push(reg);
+                        kc
+                    } else {
+                        'v'
+                    };
                 let opname = format!("getarrayitem_gc_{result_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -1585,7 +1568,7 @@ impl Assembler {
                 array_type_id,
                 nolength,
             } => {
-                let g = graph.expect("encode_op for ArrayWrite requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("ArrayWrite.base must be a known Variable on graph");
@@ -1634,7 +1617,6 @@ impl Assembler {
                 base, field_index, ..
             } => {
                 let base_vid = graph
-                    .expect("encode_op for VableFieldRead requires a graph")
                     .value_id_of(base)
                     .expect("VableFieldRead.base must be a known Variable on graph");
                 let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
@@ -1652,15 +1634,16 @@ impl Assembler {
                 // kind. See FieldRead above for the Void/State/Unknown
                 // rationale — the pyre-only declared ty can be Void
                 // while the SSA result register is always i/r/f.
-                let result_kind = if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                    kc
-                } else {
-                    'v'
-                };
+                let result_kind =
+                    if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+                        argcodes.push('>');
+                        let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                        argcodes.push(kc);
+                        state.code.push(reg);
+                        kc
+                    } else {
+                        'v'
+                    };
                 let opname = format!("getfield_vable_{result_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -1672,7 +1655,7 @@ impl Assembler {
                 value,
                 ..
             } => {
-                let g = graph.expect("encode_op for VableFieldWrite requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("VableFieldWrite.base must be a known Variable on graph");
@@ -1707,7 +1690,7 @@ impl Assembler {
                 array_itemsize,
                 array_is_signed,
             } => {
-                let g = graph.expect("encode_op for VableArrayRead requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("VableArrayRead.base must be a known Variable on graph");
@@ -1736,7 +1719,7 @@ impl Assembler {
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
@@ -1756,7 +1739,7 @@ impl Assembler {
                 array_itemsize,
                 array_is_signed,
             } => {
-                let g = graph.expect("encode_op for VableArrayWrite requires a graph");
+                let g = graph;
                 let base_vid = g
                     .value_id_of(base)
                     .expect("VableArrayWrite.base must be a known Variable on graph");
@@ -1798,7 +1781,6 @@ impl Assembler {
             }
             OpKind::VableForce { base } => {
                 let base_vid = graph
-                    .expect("encode_op for VableForce requires a graph")
                     .value_id_of(base)
                     .expect("VableForce.base must be a known Variable on graph");
                 let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
@@ -1862,7 +1844,7 @@ impl Assembler {
                     state.code.push(jdindex_byte);
                     'i'
                 };
-                let g = graph.expect("encode_op for JitMergePoint requires a graph");
+                let g = graph;
                 let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
                     args.iter()
                         .map(|v| {
@@ -1898,13 +1880,13 @@ impl Assembler {
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 let mut operand_kinds = String::new();
-                for v in crate::inline::op_value_refs(other, graph) {
+                for v in crate::inline::op_value_refs(other, Some(graph)) {
                     let (reg, kind_char) = self.lookup_reg_with_kind(v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
                     operand_kinds.push(kind_char);
                 }
-                if let Some(result) = op.result {
+                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                     argcodes.push('>');
                     let (reg, kind_char) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kind_char);
@@ -2116,21 +2098,20 @@ impl Assembler {
     ///
     /// **RPython invariant** (`flatten.py:382 getcolor`): every
     /// Variable has exactly one `(kind, color)` via
-    /// `getkind(v.concretetype)` + `regallocs[kind]`.  When the
-    /// per-graph [`TypeResolutionState`] is threaded in
-    /// (`assemble_with_types`), this helper reads the kind from
-    /// `types.get(v)` first and looks up the color strictly in
-    /// `regallocs[kind].coloring[v]` — a hard panic on miss.
+    /// `getkind(v.concretetype)` + `regallocs[kind]`.  This helper
+    /// reads the kind from `graph.concretetype(v)` (which routes to
+    /// the backing `Variable.concretetype` cell) and looks up the
+    /// color strictly in `regallocs[kind].coloring[v]` — a hard panic
+    /// on miss.
     ///
-    /// Without `types` (test fixtures that drive `assemble`
-    /// directly, or callers that haven't been migrated yet), the
-    /// helper falls back to a [`KINDS`]-ordered scan with a
-    /// multi-class panic that still preserves "exactly one class per
-    /// value" semantics.  RPython has no equivalent fallback because
-    /// every assembler call comes from the typed flatten output; the
-    /// fallback is documented divergence pending the migration of
-    /// `encode_op` slot lookups to the strict `(v, expected_kind)`
-    /// form.
+    /// When the kind cannot be derived (test fixtures whose Variables
+    /// lack a populated `concretetype`), the helper falls back to a
+    /// [`KINDS`]-ordered scan with a multi-class panic that still
+    /// preserves "exactly one class per value" semantics.  RPython
+    /// has no equivalent fallback because every assembler call comes
+    /// from the typed flatten output; the fallback is documented
+    /// divergence pending the migration of `encode_op` slot lookups
+    /// to the strict `(v, expected_kind)` form.
     fn lookup_coloring(
         &self,
         v: ValueId,
@@ -2340,7 +2321,7 @@ impl Assembler {
             match op {
                 FlatOp::Op(inner) => {
                     let tag = opkind_tag(&inner.kind);
-                    if let Some(r) = inner.result {
+                    if let Some(r) = inner.result.as_ref().and_then(|v| graph.value_id_of(v)) {
                         sites.entry(r).or_default().has_def = true;
                     }
                     // Pass `Some(graph)` — `op_value_refs` requires a
@@ -4155,7 +4136,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(v1));
+        graph.set_return(entry, Some(graph.must_variable(v1)));
 
         graph.set_concretetype(v0, crate::model::ConcreteType::Signed);
         graph.set_concretetype(v1, crate::model::ConcreteType::Signed);
@@ -4221,7 +4202,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
@@ -4343,23 +4324,21 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        type_state.set(
+        // Publish kinds to graph cells before jtransform.  Variable
+        // Rc-shares the concretetype cell across clones, so the
+        // cloned rewritten graph picks up the same kinds.
+        graph.set_concretetype_inline(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
+        graph.set_concretetype_inline(
             index,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.set(
+        graph.set_concretetype_inline(
             value,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let mut rewritten = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph)
-            .graph;
-        crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
@@ -4459,29 +4438,27 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(array_result));
+        graph.set_return(graph.startblock, Some(graph.must_variable(array_result)));
 
-        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
-        type_state.set(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        type_state.set(
+        // Publish kinds to graph cells before jtransform.  Variable
+        // Rc-shares the concretetype cell across clones, so the
+        // cloned rewritten graph picks up the same kinds.
+        graph.set_concretetype_inline(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
+        graph.set_concretetype_inline(
             index,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.set(
+        graph.set_concretetype_inline(
             field_result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        type_state.set(
+        graph.set_concretetype_inline(
             array_result,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
-        let mut rewritten = Transformer::new(&config)
-            .with_type_state(&type_state)
-            .transform(&graph)
-            .graph;
-        crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
@@ -4566,7 +4543,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(sum));
+        graph.set_return(graph.startblock, Some(graph.must_variable(sum)));
 
         graph.set_concretetype(lhs, crate::model::ConcreteType::Signed);
         graph.set_concretetype(rhs, crate::model::ConcreteType::Signed);
@@ -4600,10 +4577,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "OpKind::Input must be eliminated before assembly")]
     fn assemble_rejects_input_ops() {
+        let mut graph = crate::model::FunctionGraph::new("bad_input");
+        let vid = graph.alloc_value();
+        let vid_var = graph.must_variable(vid);
         let mut flat = SSARepr {
             name: "bad_input".into(),
             insns: vec![FlatOp::Op(crate::model::SpaceOperation {
-                result: Some(ValueId(0)),
+                result: Some(vid_var),
                 kind: crate::model::OpKind::Input {
                     name: "x".into(),
                     ty: crate::model::ValueType::Int,
@@ -4616,7 +4596,6 @@ mod tests {
         // Empty regallocs — the test panics before any coloring lookup
         // runs (the assembler rejects OpKind::Input outright).
         let regallocs = HashMap::new();
-        let graph = crate::model::FunctionGraph::new("bad_input");
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs, &graph);

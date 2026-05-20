@@ -55,13 +55,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::annotator::model::SomeValue;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, GraphRef, Variable};
 use crate::flowspace::pygraph::PyGraph;
 use crate::front;
-use crate::jit_codewriter::annotation_state::AnnotationState;
-use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+use crate::jit_codewriter::annotation_state::{AnnotationState, somevalue_to_valuetype};
+use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::{FunctionGraph as LegacyGraph, ValueId, ValueType};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{
@@ -142,8 +141,9 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, Typer
 /// - the real path produced a definite kind for a `ValueId` the legacy
 ///   resolver did not resolve.
 ///
-/// Returns `Ok(())` only when the two `TypeResolutionState` projections
-/// agree on every definite kind.
+/// Returns `Ok(())` only when the legacy `legacy_graph.concretetype`
+/// view and the real-path `Variable.concretetype` projection agree on
+/// every definite kind.
 ///
 /// Today this entry survives only as a test helper: production
 /// callers go through [`dual_gate_check_with_registry`], which dropped
@@ -151,10 +151,7 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, Typer
 /// usage to the Skip arm.  The legacy-baseline diff stays here so
 /// anchor tests can keep validating the LL→Concrete projection.
 #[cfg(test)]
-pub(crate) fn dual_gate_check(
-    legacy_graph: &LegacyGraph,
-    legacy_state: &TypeResolutionState,
-) -> Result<(), String> {
+pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> {
     // The real path goes through `RPythonTyper::specialize`, which
     // asserts internal invariants (e.g. `genop`'s "wrong level!"
     // contract that every operand carry `concretetype`). Slice 1b
@@ -167,7 +164,7 @@ pub(crate) fn dual_gate_check(
         specialize_legacy_graph(legacy_graph)
     }));
     let real_state = match result {
-        Ok(Ok(state)) => state,
+        Ok(Ok((value_to_var, constants))) => project_value_to_var_to_map(&value_to_var, &constants),
         Ok(Err(e)) => return Err(format!("real path failed: {e}")),
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -186,20 +183,30 @@ pub(crate) fn dual_gate_check(
     // Diff every legacy-defined value. Once this gate is used to prove
     // cutover parity, real-path `Unknown` for a legacy-known value is a
     // coverage bug, not success.
-    for (vid, legacy_kind) in legacy_state.iter() {
-        let real_kind = real_state.get(vid);
+    //
+    // The legacy walker's kinds are read from `legacy_graph.concretetype`:
+    // `resolve_types` dual-writes every populated slot through
+    // `graph.set_concretetype_inline`, so the graph cells carry the
+    // same view the retired `legacy_state` parameter used to surface.
+    let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
+        if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        let vid = ValueId(idx);
+        let real_kind = real_state.get(&vid).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             divergences.push(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
-                vid.0, legacy_kind, real_kind
+                idx, legacy_kind, real_kind
             ));
         }
     }
     // Asymmetry direction: real should not produce a definite kind for
     // a ValueId the legacy resolver never resolved.
-    for (vid, real_kind) in real_state.iter() {
-        let legacy_kind = legacy_state.get(vid);
-        if *legacy_kind == ConcreteType::Unknown {
+    for (vid, real_kind) in &real_state {
+        let legacy_kind = legacy_graph.concretetype(*vid);
+        if legacy_kind == ConcreteType::Unknown {
             divergences.push(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
                 vid.0, legacy_kind, real_kind
@@ -219,7 +226,8 @@ pub(crate) fn dual_gate_check(
 /// a known-unported feature (`Skip(reason)` — production falls back
 /// to the legacy walker for the affected graph).
 ///
-/// `Match` carries the real path's `TypeResolutionState` so
+/// `Match` carries the real path's `ValueIdToVariable` map (each
+/// `Variable.concretetype` cell set by `RPythonTyper::specialize`) so
 /// production callers consume it directly.  Slice 10A inverted the
 /// dependency direction: real path is the authoritative producer;
 /// legacy is the fallback for Skip-classified graphs.  Slice 12.2
@@ -249,7 +257,6 @@ pub enum DualGateOutcome {
     /// is pyre-only scaffolding that retires once the legacy walker
     /// itself retires (Step 5 / Task #127).
     Match {
-        real_state: TypeResolutionState,
         /// Per-session annotator's `Variable.annotation` SomeValue
         /// lattice nodes projected onto a `ValueId`-keyed
         /// `AnnotationState`.  Slice 12.1 reader output — what the
@@ -285,7 +292,7 @@ pub enum DualGateOutcome {
 
 /// Production dual-gate — registry-aware entry.
 ///
-/// Drives the real path via [`specialize_legacy_graph_with_registry`]
+/// Drives the real path via [`specialize_legacy_graph_with_registry_returning_value_to_var`]
 /// against a pre-populated `PyreCallRegistry` so graphs with
 /// `OpKind::Call::FunctionPath` callsites resolve through the upstream
 /// `Constant(<function>) -> getdesc -> FunctionDesc` chain
@@ -297,9 +304,10 @@ pub enum DualGateOutcome {
 /// Returns:
 ///
 /// - `Ok(DualGateOutcome::Match)` when the real path succeeds.  The
-///   real path's `TypeResolutionState` and `AnnotationState` are
-///   the authoritative source for production consumption (Slice 12.1
-///   reader output).
+///   real path's `ValueIdToVariable` map (with each
+///   `Variable.concretetype` cell populated) and `AnnotationState`
+///   are the authoritative source for production consumption (Slice
+///   12.1 reader output).
 /// - `Ok(DualGateOutcome::Skip(reason))` when the real path failed
 ///   on a known-unported feature (registry miss / adapter
 ///   invariant break / unimplemented rtyper op).  Callers fall back
@@ -327,7 +335,7 @@ pub fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
-    let (real_state, real_annotations, real_value_to_var) = match result {
+    let (real_annotations, real_value_to_var, real_constants) = match result {
         Ok(Ok(triple)) => triple,
         Ok(Err(e)) => {
             let msg = format!("{e}");
@@ -361,61 +369,110 @@ pub fn dual_gate_check_with_registry(
     // closed by surfacing the panic as a fail-loud `Err`, so the
     // codewriter caller cannot silently accept a real-path result
     // whose parity has not been validated against the legacy baseline.
+    // resolve_types writes its baseline through
+    // `legacy_graph.set_concretetype_inline`; the comparison reads
+    // legacy-side kinds back from those graph cells (resolve_types
+    // returns `()`).
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let legacy_annotations = super::legacy_annotator::annotate(legacy_graph);
-        super::legacy_resolve::resolve_types(legacy_graph, &legacy_annotations)
+        super::legacy_resolve::resolve_types(legacy_graph, &legacy_annotations);
     }));
-    let legacy_state = match baseline {
-        Ok(state) => state,
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<unrecognised panic payload>".to_string()
-            };
-            return Err(format!(
-                "dual-gate baseline panicked (legacy walker crashed before \
-                 comparison could run — comparison cannot validate the real \
-                 path's result): {msg}"
-            ));
-        }
-    };
-    if let Some(divergence) = compare_real_against_legacy(&real_state, &legacy_state) {
+    if let Err(payload) = baseline {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unrecognised panic payload>".to_string()
+        };
+        return Err(format!(
+            "dual-gate baseline panicked (legacy walker crashed before \
+             comparison could run — comparison cannot validate the real \
+             path's result): {msg}"
+        ));
+    }
+    if let Some(divergence) =
+        compare_real_against_legacy(&real_value_to_var, &real_constants, legacy_graph)
+    {
         return Ok(DualGateOutcome::Skip(format!(
             "dual-gate divergence: {divergence}"
         )));
     }
     Ok(DualGateOutcome::Match {
-        real_state,
         real_annotations,
         real_value_to_var,
     })
 }
 
-/// Per-`ValueId` diff between the real path's `TypeResolutionState`
-/// and the legacy walker's baseline.  Returns `Some(message)` if the
-/// real path differs from a definite legacy kind on any `ValueId`,
-/// or assigns a definite kind to a `ValueId` the legacy walker did
-/// not resolve.  Mirror of the loop body in [`dual_gate_check`] but
-/// surfaces the first divergence as a single string for `Skip`.
+/// Per-`ValueId` diff between the real path's `Variable.concretetype`
+/// snapshot (via `value_to_var`) and the legacy walker's baseline.
+/// Returns `Some(message)` if the real path differs from a definite
+/// legacy kind on any `ValueId`, or assigns a definite kind to a
+/// `ValueId` the legacy walker did not resolve.  Mirror of the loop
+/// body in [`dual_gate_check`] but surfaces the first divergence as a
+/// single string for `Skip`.
+///
+/// The transient `real_state` is built locally from each
+/// `Variable.concretetype` via [`lowleveltype_to_concrete`] so the
+/// comparison's lifetime owns the projection — the side-table no
+/// longer needs to live on [`DualGateOutcome::Match`].
+/// Local projection of `value_to_var` Variables' concretetype cells
+/// into a `BTreeMap<ValueId, ConcreteType>` shape.  Errors from
+/// unsupported lltypes are silently treated as missing entries —
+/// `specialize_legacy_graph` already propagates the failure to its
+/// caller before reaching the dual-gate, so reaching here implies
+/// every Variable's lltype is projectable.  BTreeMap iteration is
+/// ascending-`ValueId` so `compare_real_against_legacy`'s
+/// "first divergence" message stays deterministic across runs.
+fn project_value_to_var_to_map(
+    value_to_var: &ValueIdToVariable,
+    constant_concretetypes: &HashMap<ValueId, LowLevelType>,
+) -> std::collections::BTreeMap<ValueId, ConcreteType> {
+    let mut real_state = std::collections::BTreeMap::new();
+    for (&vid, var) in value_to_var {
+        if let Some(lltype) = var.concretetype().as_ref() {
+            if let Ok(kind) = lowleveltype_to_concrete(lltype) {
+                real_state.insert(vid, kind);
+            }
+        }
+    }
+    // `Constant.concretetype` is the ground truth for constant operands
+    // — read it from the adapter's per-`ValueId` map rather than
+    // attempting to reconstruct from `AnnotationState`.
+    for (vid, lltype) in constant_concretetypes {
+        if let Ok(kind) = lowleveltype_to_concrete(lltype) {
+            real_state.insert(*vid, kind);
+        }
+    }
+    real_state
+}
+
 fn compare_real_against_legacy(
-    real_state: &TypeResolutionState,
-    legacy_state: &TypeResolutionState,
+    value_to_var: &ValueIdToVariable,
+    constants: &HashMap<ValueId, LowLevelType>,
+    legacy_graph: &LegacyGraph,
 ) -> Option<String> {
-    for (vid, legacy_kind) in legacy_state.iter() {
-        let real_kind = real_state.get(vid);
+    let real_state = project_value_to_var_to_map(value_to_var, constants);
+    // Legacy walker writes through `graph.set_concretetype_inline`
+    // during `resolve_types`, so `legacy_graph.concretetype` carries
+    // the legacy-side populated-slot view.
+    let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
+        if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        let vid = ValueId(idx);
+        let real_kind = real_state.get(&vid).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             return Some(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
-                vid.0, legacy_kind, real_kind
+                idx, legacy_kind, real_kind
             ));
         }
     }
-    for (vid, real_kind) in real_state.iter() {
-        let legacy_kind = legacy_state.get(vid);
-        if *legacy_kind == ConcreteType::Unknown {
+    for (vid, real_kind) in &real_state {
+        let legacy_kind = legacy_graph.concretetype(*vid);
+        if legacy_kind == ConcreteType::Unknown {
             return Some(format!(
                 "ValueId({}): legacy={:?}, real={:?}",
                 vid.0, legacy_kind, real_kind
@@ -734,8 +791,9 @@ fn signature_for_graph(graph: &LegacyGraph) -> Signature {
 /// Specialize a legacy `model::FunctionGraph` end-to-end through the
 /// real `RPythonTyper`.
 ///
-/// Returns a `TypeResolutionState` keyed by the original legacy
-/// `ValueId` — drop-in replacement for legacy
+/// Returns the `ValueIdToVariable` map (each `Variable.concretetype`
+/// cell set by the rtyper) plus the `Constant.concretetype`
+/// `HashMap<ValueId, LowLevelType>` — drop-in replacement for legacy
 /// `translator::rtyper::legacy_resolve::resolve_types` once Slice 4
 /// dual-gate validates the projection on the anchor corpus.
 /// Lift a pyre `model::FunctionGraph` (a callee that may appear on a
@@ -943,15 +1001,19 @@ pub fn populate_call_registry_from_program(
 /// production callers that need free function calls must build a
 /// pre-populated registry (one entry per reachable `FunctionPath`,
 /// with `register_callee(key, signature, lifted_pygraph)`) and call
-/// [`specialize_legacy_graph_with_registry`] directly.  Until the
+/// [`specialize_legacy_graph_with_registry_returning_value_to_var`] directly.  Until the
 /// production walker that traverses `SemanticProgram.functions`
 /// lands, this entry remains in-place for anchor tests + Slice 4
 /// dual-gate validation against graphs that have no `Call` ops.
-pub fn specialize_legacy_graph(legacy: &LegacyGraph) -> Result<TypeResolutionState, TyperError> {
+pub fn specialize_legacy_graph(
+    legacy: &LegacyGraph,
+) -> Result<(ValueIdToVariable, HashMap<ValueId, LowLevelType>), TyperError> {
     let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
-    specialize_legacy_graph_with_registry(legacy, &registry).map(|(state, _)| state)
+    let (_, value_to_var, constants) =
+        specialize_legacy_graph_with_registry_seed(legacy, None, &registry)?;
+    Ok((value_to_var, constants))
 }
 
 /// Slice 12.2 — test-only entry that lets fixtures hand-build a
@@ -967,116 +1029,34 @@ pub fn specialize_legacy_graph(legacy: &LegacyGraph) -> Result<TypeResolutionSta
 pub(crate) fn specialize_legacy_graph_with_seed_annotations(
     legacy: &LegacyGraph,
     seed_annotations: &AnnotationState,
-) -> Result<TypeResolutionState, TyperError> {
+) -> Result<(ValueIdToVariable, HashMap<ValueId, LowLevelType>), TyperError> {
     let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
-    specialize_legacy_graph_with_registry_seed(legacy, Some(seed_annotations), &registry)
-        .map(|(state, _, _)| state)
-}
-
-#[cfg(test)]
-pub(crate) fn dual_gate_check_with_registry_seed(
-    legacy_graph: &LegacyGraph,
-    seed_annotations: &AnnotationState,
-    legacy_state: &TypeResolutionState,
-    call_registry: &PyreCallRegistry,
-) -> Result<DualGateOutcome, String> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph_with_registry_seed(
-            legacy_graph,
-            Some(seed_annotations),
-            call_registry,
-        )
-    }));
-    match result {
-        Ok(Ok((real_state, real_annotations, real_value_to_var))) => {
-            // Test-side regression diff against legacy — keeps anchor
-            // tests honest until the orthodox `RPythonAnnotator::
-            // processblock` port produces the same shape.
-            let mut divergences: Vec<String> = Vec::new();
-            for (vid, legacy_kind) in legacy_state.iter() {
-                let real_kind = real_state.get(vid);
-                if real_kind != legacy_kind {
-                    divergences.push(format!(
-                        "ValueId({}): legacy={:?}, real={:?}",
-                        vid.0, legacy_kind, real_kind
-                    ));
-                }
-            }
-            for (vid, real_kind) in real_state.iter() {
-                let legacy_kind = legacy_state.get(vid);
-                if *legacy_kind == ConcreteType::Unknown {
-                    divergences.push(format!(
-                        "ValueId({}): legacy={:?}, real={:?}",
-                        vid.0, legacy_kind, real_kind
-                    ));
-                }
-            }
-            if divergences.is_empty() {
-                Ok(DualGateOutcome::Match {
-                    real_state,
-                    real_annotations,
-                    real_value_to_var,
-                })
-            } else {
-                Err(divergences.join("; "))
-            }
-        }
-        Ok(Err(e)) => {
-            let msg = format!("{e}");
-            if is_known_unported(&msg) {
-                Ok(DualGateOutcome::Skip(msg))
-            } else {
-                Err(format!("real path failed: {msg}"))
-            }
-        }
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<unrecognised panic payload>".to_string()
-            };
-            if is_known_unported(&msg) {
-                Ok(DualGateOutcome::Skip(msg))
-            } else {
-                Err(format!("real path panicked: {msg}"))
-            }
-        }
-    }
-}
-
-/// Slice A.2 — registry-aware entry point.
-///
-/// Production callers (`codegen.rs:2301`, `jit_codewriter/codewriter.rs`)
-/// will move from [`specialize_legacy_graph`] to this entry once the
-/// production builder that walks `SemanticProgram.functions` and
-/// registers each `FunctionPath` with its parameter `Signature`
-/// lands.  Anchor tests that exercise `OpKind::Call` switch to this
-/// entry as Slice A.3 wires the consumer in
-/// `flowspace_adapter::translate_op`.
-pub fn specialize_legacy_graph_with_registry(
-    legacy: &LegacyGraph,
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(TypeResolutionState, AnnotationState), TyperError> {
-    let (state, annotations, _value_to_var) =
-        specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)?;
-    Ok((state, annotations))
+    let (_, value_to_var, constants) =
+        specialize_legacy_graph_with_registry_seed(legacy, Some(seed_annotations), &registry)?;
+    Ok((value_to_var, constants))
 }
 
 /// `specialize_legacy_graph_with_registry` extended return shape that
-/// also surfaces the [`ValueIdToVariable`] map produced by the
-/// flowspace adapter.  Codewriter callers rebind each slot's backing
-/// Variable from the map via
-/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
-/// — the long-term parity path that retires the transitional
-/// `merge_synth_kinds` 4-source merge.
+/// also surfaces the [`ValueIdToVariable`] map and the per-`ValueId`
+/// `Constant.concretetype` table produced by the flowspace adapter.
+/// Codewriter callers consume `value_to_var` directly (the rtyper's
+/// `Variable.concretetype` writes propagate via
+/// `graph.set_concretetype_inline` at the dual-gate `Match` arm);
+/// `constants` feeds [`project_value_to_var_to_state`] for the
+/// dual-gate baseline comparison.
 pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
+) -> Result<
+    (
+        AnnotationState,
+        ValueIdToVariable,
+        HashMap<ValueId, LowLevelType>,
+    ),
+    TyperError,
+> {
     specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)
 }
 
@@ -1093,7 +1073,14 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     legacy: &LegacyGraph,
     seed_annotations: Option<&AnnotationState>,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
+) -> Result<
+    (
+        AnnotationState,
+        ValueIdToVariable,
+        HashMap<ValueId, LowLevelType>,
+    ),
+    TyperError,
+> {
     // Slice 3 v2 — RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1274,22 +1261,26 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // session-prologue), keeping the per-subject body unchanged.
     rtyper.specialize_more_blocks()?;
 
-    // ── Step 4 — read back per-ValueId ConcreteType ───────────────
-    let mut state = TypeResolutionState::new();
-    for (&vid, var) in &value_to_var {
-        let concretetype = var.concretetype.borrow();
-        if let Some(lltype) = concretetype.as_ref() {
-            state.set(vid, lowleveltype_to_concrete(lltype)?);
+    // ── Step 4 — validate per-ValueId lltype projection ───────────
+    //
+    // The eager side-table build was retired in Slice 4.31 and the
+    // struct itself deleted in Slice 4.38.  Each callable that needs
+    // a kind view derives one on demand from `value_to_var` +
+    // `constant_concretetypes` via
+    // [`project_value_to_var_to_state`] — same `Variable.concretetype`
+    // / `Constant.concretetype` ground truth, just routed at the
+    // consumer instead of eagerly materialised here.  Run a
+    // validation pass so unsupported lltypes still surface as a
+    // [`TyperError`] at this boundary (mirroring the pre-Slice-4.31
+    // fail-loud `?` propagation in the state-build loop).
+    for var in value_to_var.values() {
+        let cell = var.concretetype.borrow();
+        if let Some(lltype) = cell.as_ref() {
+            lowleveltype_to_concrete(lltype)?;
         }
     }
-    // RPython `Constant.concretetype` is the ground truth for constant
-    // operands.  Read it directly from the adapter's per-`ValueId` map
-    // rather than reconstructing the kind from `AnnotationState`, so a
-    // pyre-side annotation gap (e.g. an `Unknown` slot left by the
-    // legacy graph builder) does not silently strip the constant's
-    // resolved kind.
-    for (vid, lltype) in &constant_concretetypes {
-        state.set(*vid, lowleveltype_to_concrete(lltype)?);
+    for lltype in constant_concretetypes.values() {
+        lowleveltype_to_concrete(lltype)?;
     }
 
     // ── Step 5 — read back per-ValueId AnnotationState ────────────
@@ -1304,7 +1295,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // annotator carries the result of the bookkeeper-driven annotation
     // fixed-point.
     let real_annotations = read_annotations_from_value_to_var(&value_to_var);
-    Ok((state, real_annotations, value_to_var))
+    Ok((real_annotations, value_to_var, constant_concretetypes))
 }
 
 /// Project per-session `Variable.annotation` SomeValue lattice nodes onto
@@ -1328,42 +1319,16 @@ fn read_annotations_from_value_to_var(
         let Some(rc_some) = annotation.as_ref() else {
             continue;
         };
-        let vt = somevalue_to_valuetype(rc_some.as_ref());
-        state.types.insert(vid, vt);
+        // After Slice 5.6 (`AnnotationState::get` reads from
+        // `some_values` via `somevalue_to_valuetype`) the `types` slot
+        // is dead-write from every consumer's perspective; only the
+        // orthodox `some_values` shell needs to be published here.  The
+        // RPython `Variable.annotation` (`flowspace/model.py:280`)
+        // already carries the precise shell on `var`; we forward the
+        // same Rc to the legacy-baseline cutover comparator.
         state.some_values.insert(vid, rc_some.clone());
     }
     state
-}
-
-/// Reduce a `SomeValue` lattice node to its `ValueType` discriminator.
-/// Inverse of `valuetype_to_someshell` (`annotation_state.rs:65`).
-///
-/// RPython parity: `getkind` family in `rpython/rtyper/lltypesystem/lltype.py`
-/// reduces lltypes to backend kinds; the analogue here reduces
-/// annotation-stage `SomeValue` to pyre's flat `ValueType` enum used by
-/// downstream `jit_codewriter` consumers that haven't been ported to
-/// `SomeValue` directly.
-fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
-    match s {
-        SomeValue::Integer(_) => ValueType::Int,
-        SomeValue::Bool(_) => ValueType::Bool,
-        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
-            ValueType::Float
-        }
-        SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref,
-        // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
-        // which projects to `ValueType::Void` in pyre's flat enum just
-        // like upstream `lltype.Void`.
-        SomeValue::Impossible => ValueType::Void,
-        // Other variants (String / List / Tuple / Dict / Iterator /
-        // Exception / None_ / Property / InteriorPtr / LLADTMeth /
-        // Builtin / BuiltinMethod / WeakRef / TypeOf / ByteArray /
-        // Char / UnicodeCodePoint / UnicodeString / Type / Object) have
-        // no direct pyre `ValueType` mapping; downstream consumers that
-        // care will read from `some_values` directly.  Project to `Ref`
-        // so the rtyper's GC-pointer fallback applies.
-        _ => ValueType::Ref,
-    }
 }
 
 #[cfg(test)]
@@ -1373,6 +1338,21 @@ mod tests {
 
     fn link_to_returnblock(args: Vec<LinkArg>, returnblock_id: BlockId) -> crate::model::Link {
         crate::model::Link::new_mixed(args, returnblock_id, None)
+    }
+
+    /// Test helper — read the concrete kind of `vid` directly from
+    /// the post-rtyper `ValueIdToVariable` map's
+    /// `Variable.concretetype` cell (`flowspace/model.py:280`).
+    /// Replaces the retired `TypeResolutionState::get(vid)` path.
+    fn kind_of_in(value_to_var: &ValueIdToVariable, vid: ValueId) -> ConcreteType {
+        let var = value_to_var
+            .get(&vid)
+            .unwrap_or_else(|| panic!("vid {vid:?} missing from value_to_var"));
+        let ll = var
+            .concretetype()
+            .unwrap_or_else(|| panic!("Variable.concretetype for {vid:?} not populated"));
+        lowleveltype_to_concrete(&ll)
+            .unwrap_or_else(|_| panic!("lltype for {vid:?} does not project to ConcreteType"))
     }
 
     /// Test helper — project ValueIds to their backing Variables on
@@ -1506,7 +1486,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(1))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(1)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1523,12 +1503,13 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let state = specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-            .expect("identity int graph must specialize");
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
+                .expect("identity int graph must specialize");
 
         assert_eq!(
-            state.get(ValueId(1)),
-            &ConcreteType::Signed,
+            kind_of_in(&value_to_var, ValueId(1)),
+            ConcreteType::Signed,
             "Int-typed inputarg must specialize to Signed via SomeInteger → IntegerRepr"
         );
     }
@@ -1546,7 +1527,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(1))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(1)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1563,12 +1544,13 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let state = specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-            .expect("identity float graph must specialize");
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
+                .expect("identity float graph must specialize");
 
         assert_eq!(
-            state.get(ValueId(1)),
-            &ConcreteType::Float,
+            kind_of_in(&value_to_var, ValueId(1)),
+            ConcreteType::Float,
             "Float-typed inputarg must specialize to Float via SomeFloat → FloatRepr"
         );
     }
@@ -1594,7 +1576,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(1))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(1)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1611,11 +1593,12 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let state = specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-            .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
+                .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
         assert_eq!(
-            state.get(ValueId(1)),
-            &ConcreteType::GcRef,
+            kind_of_in(&value_to_var, ValueId(1)),
+            ConcreteType::GcRef,
             "Ref-typed inputarg must project to GcRef matching legacy"
         );
     }
@@ -1676,21 +1659,23 @@ mod tests {
             .clone()
     }
 
-    fn run_legacy_resolve(graph: &LegacyGraph) -> (AnnotationState, TypeResolutionState) {
+    fn run_legacy_resolve(graph: &LegacyGraph) {
         let annotations = crate::translator::rtyper::legacy_annotator::annotate(graph);
-        let state = crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations);
-        (annotations, state)
+        // resolve_types writes through `graph.set_concretetype_inline`;
+        // `dual_gate_check` reads its legacy-side kinds from
+        // `graph.concretetype` directly.  resolve_types returns `()`.
+        crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations);
     }
 
     #[test]
     fn anchor_int_identity_dual_gate_agrees() {
         let _lock = anchor_lock();
         let graph = build_anchor_graph("fn id(x: i64) -> i64 { x }\n", "id");
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
+        run_legacy_resolve(&graph);
         // Trivial identity — both paths must produce the same kinds.
         // Currently legacy resolves the inputarg as Signed; real path
         // produces the same via SomeInteger → IntegerRepr → Signed.
-        let result = dual_gate_check(&graph, &legacy_state);
+        let result = dual_gate_check(&graph);
         assert!(
             result.is_ok(),
             "Int identity must agree under dual-gate, got: {:?}",
@@ -1702,8 +1687,8 @@ mod tests {
     fn anchor_float_identity_dual_gate_agrees() {
         let _lock = anchor_lock();
         let graph = build_anchor_graph("fn id(x: f64) -> f64 { x }\n", "id");
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let result = dual_gate_check(&graph, &legacy_state);
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
         assert!(
             result.is_ok(),
             "Float identity must agree under dual-gate, got: {:?}",
@@ -1721,8 +1706,8 @@ mod tests {
         // rtyper then rewrites `add` → `int_add` for `Signed` operands
         // via `pair_int_int`, agreeing with the legacy resolver.
         let graph = build_anchor_graph("fn add(a: i64, b: i64) -> i64 { a + b }\n", "add");
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let result = dual_gate_check(&graph, &legacy_state);
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
         assert!(
             result.is_ok(),
             "Int addition must agree under dual-gate post-BinOp port, got: {:?}",
@@ -1790,8 +1775,8 @@ fn id(x: &Foo) -> &Foo { x }
 "#,
             "id",
         );
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let result = dual_gate_check(&graph, &legacy_state);
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
         assert!(
             result.is_ok(),
             "Ref-typed identity graph must agree under dual-gate via \
@@ -1810,8 +1795,8 @@ fn id(x: &Foo) -> &Foo { x }
         // operands via the unary `pair_int_*` dispatch, agreeing with
         // the legacy resolver.
         let graph = build_anchor_graph("fn negate(x: i64) -> i64 { -x }\n", "negate");
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let result = dual_gate_check(&graph, &legacy_state);
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
         assert!(
             result.is_ok(),
             "Int negation must agree under dual-gate post-UnaryOp port, got: {:?}",
@@ -1843,7 +1828,7 @@ fn id(x: &Foo) -> &Foo { x }
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
-                result: Some(ValueId(2)),
+                result: Some(graph.must_variable(ValueId(2))),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "not".into(),
                     operand: graph.must_variable(ValueId(1)),
@@ -1852,7 +1837,7 @@ fn id(x: &Foo) -> &Foo { x }
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(2))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(2)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1898,7 +1883,7 @@ fn id(x: &Foo) -> &Foo { x }
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
-                result: Some(ValueId(2)),
+                result: Some(graph.must_variable(ValueId(2))),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "deref".into(),
                     operand: graph.must_variable(ValueId(1)),
@@ -1907,7 +1892,7 @@ fn id(x: &Foo) -> &Foo { x }
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(2))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(2)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1951,9 +1936,8 @@ impl Frame {
 "#,
             "load_fast",
         );
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let err = dual_gate_check(&graph, &legacy_state)
-            .expect_err("FieldRead surfaces a Slice 1b followup");
+        run_legacy_resolve(&graph);
+        let err = dual_gate_check(&graph).expect_err("FieldRead surfaces a Slice 1b followup");
         assert!(
             err.contains("Slice 1b followup")
                 || err.contains("FieldRead")
@@ -1983,8 +1967,8 @@ fn fib(n: i64) -> i64 {
 "#,
             "fib",
         );
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        dual_gate_check(&graph, &legacy_state)
+        run_legacy_resolve(&graph);
+        dual_gate_check(&graph)
             .expect("fib must dual-gate-agree under the framestate cross-block merge");
     }
 
@@ -2017,7 +2001,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(1))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(1)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2034,11 +2018,12 @@ fn fib(n: i64) -> i64 {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let state = specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
-            .expect("GuardValue must be a no-op for the rtyper adapter");
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_seed_annotations(&graph, &annotations)
+                .expect("GuardValue must be a no-op for the rtyper adapter");
         assert_eq!(
-            state.get(ValueId(1)),
-            &ConcreteType::Signed,
+            kind_of_in(&value_to_var, ValueId(1)),
+            ConcreteType::Signed,
             "Int operand passing through GuardValue must specialize to Signed"
         );
     }
@@ -2059,7 +2044,7 @@ fn fib(n: i64) -> i64 {
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
-                result: Some(ValueId(2)),
+                result: Some(graph.must_variable(ValueId(2))),
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::Indirect {
                         trait_root: "MyTrait".into(),
@@ -2071,7 +2056,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(2))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(2)))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2128,7 +2113,7 @@ fn fib(n: i64) -> i64 {
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
-                result: Some(ValueId(2)),
+                result: Some(graph.must_variable(ValueId(2))),
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
@@ -2139,7 +2124,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&graph, ValueId(2))],
+                vec![LinkArg::Value(graph.must_variable(ValueId(2)))],
                 graph.returnblock,
             )],
             dead: false,
@@ -2180,7 +2165,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::value(&callee_graph, ValueId(10))],
+                vec![LinkArg::Value(callee_graph.must_variable(ValueId(10)))],
                 callee_graph.returnblock,
             )],
             dead: false,
@@ -2212,7 +2197,7 @@ fn fib(n: i64) -> i64 {
             pygraph,
         );
 
-        let (state, _annotations, _value_to_var) =
+        let (_annotations, value_to_var, _constants) =
             specialize_legacy_graph_with_registry_seed(&graph, Some(&annotations), &registry)
                 .expect("Slice A.4 cache pre-fill must let the leaf Call resolve end-to-end");
         // Slice A.4 closes the loop:
@@ -2232,14 +2217,14 @@ fn fib(n: i64) -> i64 {
         //      `concretetype` is set to `Signed`
         //      (`int_is_true → Bool` style projection).
         assert_eq!(
-            state.get(ValueId(2)),
-            &ConcreteType::Signed,
+            kind_of_in(&value_to_var, ValueId(2)),
+            ConcreteType::Signed,
             "leaf Call (fn foo(x: i64) -> i64 {{ x }}) result must project to Signed \
              through the rtyper's full simple_call → FunctionRepr.call chain"
         );
         assert_eq!(
-            state.get(ValueId(1)),
-            &ConcreteType::Signed,
+            kind_of_in(&value_to_var, ValueId(1)),
+            ConcreteType::Signed,
             "Int inputarg must project to Signed (independent of the Slice A.4 \
              call resolution path)"
         );
@@ -2309,7 +2294,7 @@ fn fib(n: i64) -> i64 {
         // PyGraph (Pass 2).  After the walker runs, a caller graph
         // referencing any of those functions through
         // `OpKind::Call::FunctionPath` resolves end-to-end through
-        // `specialize_legacy_graph_with_registry`.
+        // `specialize_legacy_graph_with_registry_returning_value_to_var`.
         let parsed = crate::parse::parse_source(
             r#"
             fn helper(x: i64) -> i64 { x }
@@ -2479,8 +2464,8 @@ fn rebind_both_arms(cond: bool) -> i64 {
 "#,
             "rebind_both_arms",
         );
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        dual_gate_check(&graph, &legacy_state).expect(
+        run_legacy_resolve(&graph);
+        dual_gate_check(&graph).expect(
             "Cat 2.1 Stage C — both-open-arm rebind merge resolves via lazy Link.args + phi inputarg",
         );
         for block in &graph.blocks {
@@ -2540,8 +2525,8 @@ fn cross_block(x: i64, cond: bool) -> i64 {
 "#,
             "cross_block",
         );
-        let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        dual_gate_check(&graph, &legacy_state)
+        run_legacy_resolve(&graph);
+        dual_gate_check(&graph)
             .expect("Cat 2.1 — Slice 2 closes cross-block locals via lazy Link.args threading");
 
         // Per-block invariant: every link from `block` to its target

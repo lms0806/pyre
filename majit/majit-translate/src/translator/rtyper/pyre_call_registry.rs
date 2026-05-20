@@ -144,7 +144,7 @@ impl PyreFunctionEntry {
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /
-/// `specialize_legacy_graph_with_registry` driver invocation; shares
+/// `specialize_legacy_graph_with_registry_seed` driver invocation; shares
 /// its `Bookkeeper` with the `RPythonAnnotator` so pre-registered
 /// entries are visible to the rtyper's `getdesc` lookup.
 ///
@@ -265,7 +265,7 @@ impl PyreCallRegistry {
     }
 
     /// The bookkeeper backing this registry — exposed so
-    /// `specialize_legacy_graph_with_registry` can pass the same
+    /// `specialize_legacy_graph_with_registry_seed` can pass the same
     /// bookkeeper to `RPythonAnnotator::new`, ensuring pre-registered
     /// entries are visible to the rtyper's `getdesc` lookup.
     pub fn bookkeeper(&self) -> &Rc<Bookkeeper> {

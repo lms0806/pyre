@@ -38,11 +38,19 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
 
     // Pass 1: Annotation (RPython annotator)
     let annotations = annotate(graph);
-    let annotations_count = annotations.types.len();
+    // `some_values` count tracks the orthodox `Variable.annotation`
+    // analogue (set whenever a non-Unknown ValueType is written; cleared
+    // on Unknown).  Test gate is `> 0` so the Unknown-clearing edge case
+    // (which would lower the count vs the prior `types.len()` form)
+    // does not affect the assertion in `analyze_program_runs`.
+    let annotations_count = annotations.some_values.len();
 
-    // Pass 2: Type resolution (RPython rtyper)
-    let mut types = resolve_types(graph, &annotations);
-
+    // Pass 2: Type resolution (RPython rtyper) — commits per-Variable
+    // `concretetype` cells via `graph.set_concretetype_inline`, so
+    // downstream consumers read kinds via `graph.concretetype(v)`.
+    // The returned scratch state is unused here (legacy_pipeline does
+    // not run the dual-gate comparison).
+    resolve_types(graph, &annotations);
     // Pass 2b: rtyper-equivalent indirect_call lowering. RPython's rtyper
     // (rpbc.py:199-217) always emits `indirect_call(funcptr, *args,
     // c_graphs)` before jtransform sees the graph. Pyre's canonical
@@ -57,52 +65,43 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     // which is the conservative RPython-orthodox fallback.
     let mut legacy_callcontrol = CallControl::new();
     let mut graph_owned = graph.clone();
-    crate::translator::rtyper::rpbc::lower_indirect_calls(
-        &mut graph_owned,
-        &mut types,
-        &legacy_callcontrol,
-    );
+    crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, &legacy_callcontrol);
 
-    // PyPy parity: hydrate every Variable's `concretetype` cell from the
-    // rtyper-produced `types` table BEFORE jtransform runs, so jtransform
-    // reads kinds via `graph.concretetype(v)` directly (the same
-    // `getkind(v.concretetype)` path as upstream).  `with_type_state` is
-    // still threaded as a belt-and-suspenders fallback for any slot that
-    // the rtyper left Unknown — without it the legacy snapshot path
-    // defaulted those slots to `'r'`, forcing `jtransform`'s
-    // kind-coercion arms to manufacture `cast_ptr_to_int` ops.
-    crate::jit_codewriter::type_state::apply_to_graph(&types, &mut graph_owned);
+    // `resolve_types` already commits each backing Variable's
+    // `concretetype` cell as it resolves, so jtransform reads kinds
+    // via `graph.concretetype(v)` (the upstream
+    // `getkind(v.concretetype)` path) directly here.
+    // `with_type_state` is still threaded as a belt-and-suspenders
+    // fallback for any slot that the rtyper left Unknown — without it
+    // the legacy snapshot path defaulted those slots to `'r'`,
+    // forcing `jtransform`'s kind-coercion arms to manufacture
+    // `cast_ptr_to_int` ops.
 
     // Pass 3: JIT transform (RPython jtransform) — thread the same empty
     // CallControl so `lower_indirect_call_op` has access to `getcalldescr`
     // / `guess_call_kind` / `graphs_from`. With no registered candidates
     // the op resolves to `CallKind::Residual`, matching upstream's
     // conservative fallback for `indirect_call` with unknown family.
+    //
+    // No `with_type_state(&types)` — `resolve_types` already
+    // committed every kind to each backing Variable's `concretetype`
+    // cell, and `Variable::clone` Rc-shares that cell so jtransform's
+    // internal `rewritten = graph.clone()` carries it through.
     let transform_result = {
         let mut transformer = crate::jtransform::Transformer::new(&config.transform)
-            .with_callcontrol(&mut legacy_callcontrol)
-            .with_type_state(&types);
+            .with_callcontrol(&mut legacy_callcontrol);
         transformer.transform(&graph_owned)
     };
     let vable_rewrites = transform_result.vable_rewrites;
     let transform_notes = transform_result.notes.clone();
-    let rewritten_types = crate::translator::rtyper::legacy_resolve::resolve_rewritten_types(
-        &types,
-        &transform_result.graph,
-        &annotations,
-    );
-
-    // Hydrate per-value `concretetype` cells on each backing
-    // Variable held in `graph.value_variables` — the upstream
-    // `Variable.concretetype` access pattern verbatim.  The
-    // transitional `TypeResolutionState` then becomes a scratch the
-    // regalloc projection still consumes; downstream consumers read
-    // kinds via `graph.concretetype(v)`.
+    // `resolve_rewritten_types` would commit the merged kinds to
+    // each backing Variable's `concretetype` cell, but everything it
+    // would write has already been published by `resolve_types` (Pass
+    // 2 / Pass 2.5 → Variable cells via apply_to_graph) and by
+    // jtransform's per-op result_kind stamps (committed in
+    // `Transformer::transform` → apply_to_graph).  Downstream
+    // consumers read kinds via `graph.concretetype(v)`.
     let mut transform_result = transform_result;
-    crate::jit_codewriter::type_state::apply_to_graph(
-        &rewritten_types,
-        &mut transform_result.graph,
-    );
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     // Reads kinds straight off `graph.concretetype(v)` after the

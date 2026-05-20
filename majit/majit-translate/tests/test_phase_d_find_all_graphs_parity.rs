@@ -35,11 +35,12 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
 
     let mut graph = FunctionGraph::new(name);
     let vid = graph.alloc_value();
+    let vid_var = graph.must_variable(vid);
     graph
         .block_mut(graph.startblock)
         .operations
         .push(SpaceOperation {
-            result: Some(vid),
+            result: Some(vid_var),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: callee_path.segments.clone(),
@@ -48,7 +49,7 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
                 result_ty: ValueType::Int,
             },
         });
-    graph.set_return(graph.startblock, Some(vid));
+    graph.set_return(graph.startblock, Some(graph.must_variable(vid)));
     graph
 }
 

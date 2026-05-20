@@ -115,17 +115,13 @@ pub struct JitCodeBody {
     /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
     /// flattened SSA representation, kept for `dump()` output. Set by
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
+    /// `OpKind::Call` arg-list rendering reads each operand
+    /// `Variable.concretetype` cell directly via `format_assembler`'s
+    /// `variable_kind` helper, so no side-table snapshot of the per-
+    /// graph kind view is required alongside `_ssarepr` — matching
+    /// upstream's `Variable.concretetype` carrier shape.
     #[serde(skip)]
     pub _ssarepr: Option<crate::flatten::SSARepr>,
-    /// Per-graph [`TypeResolutionState`] snapshot kept alongside
-    /// `_ssarepr` so `dump()` can round-trip the same
-    /// `getkind(v.concretetype)` view PyPy debug output uses.
-    /// RPython has no separate field — `Variable.concretetype`
-    /// stays on each Variable inside `_ssarepr` — but pyre's typeless
-    /// [`crate::model::ValueId`] needs the side snapshot to recover
-    /// the same shape from `format_assembler_with_types`.
-    #[serde(skip)]
-    pub _types: Option<crate::jit_codewriter::type_state::TypeResolutionState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -378,10 +374,7 @@ impl JitCode {
     pub fn dump(&self) -> String {
         match &self._ssarepr {
             None => format!("<no dump available for {:?}>", self.name),
-            Some(ssarepr) => crate::jit_codewriter::format::format_assembler_with_types(
-                ssarepr,
-                self._types.as_ref(),
-            ),
+            Some(ssarepr) => crate::jit_codewriter::format::format_assembler(ssarepr),
         }
     }
 

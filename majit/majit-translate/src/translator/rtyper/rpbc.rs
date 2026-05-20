@@ -38,11 +38,11 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rtyper::RPythonTyper;
-// `TypeResolutionState` lives at `jit_codewriter/type_state.rs` — see the
-// PRE-EXISTING-ADAPTATION header there. `lower_indirect_calls` threads a
-// `&mut TypeResolutionState` so the inserted `VtableMethodPtr` funcptr
-// gets recorded as Signed for downstream regalloc / flatten.
-use crate::jit_codewriter::type_state::TypeResolutionState;
+// `lower_indirect_calls` records the inserted `VtableMethodPtr` funcptr
+// as Signed for downstream regalloc / flatten via
+// `graph.set_concretetype_inline(vid, ConcreteType::Signed)` — the
+// rtyper-orthodox `v.concretetype = lltype` write
+// (`rpython/rtyper/rtyper.py:258`).
 
 /// RPython `ConcreteCallTableRow(dict)` (rpbc.py:71-82).
 #[derive(Clone, Debug)]
@@ -319,11 +319,7 @@ pub fn select_call_family_row(
 /// `args` remain the full call argument list, including the receiver.
 /// RPython's `convert_to_concrete_llfn` materialises the funcptr but the
 /// eventual `indirect_call` still receives `self, ...` as ordinary args.
-pub fn lower_indirect_calls(
-    graph: &mut JitFunctionGraph,
-    type_state: &mut TypeResolutionState,
-    call_control: &CallControl,
-) {
+pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallControl) {
     // Collect the (block, op_index) sites first so the rewrite below
     // can mutate the graph without aliasing the borrow.
     let sites: Vec<(usize, usize)> = graph
@@ -374,7 +370,6 @@ pub fn lower_indirect_calls(
         // RPython rclass.py:371-377 (condensed into a single op).
         let funcptr = rclass::class_get_method_ptr(
             graph,
-            type_state,
             block_id,
             oi,
             receiver,
@@ -827,8 +822,8 @@ pub(crate) mod tests {
         assert_eq!(pre_indirect, 1, "expected 1 Indirect Call pre-lowering");
 
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         // Post-lowering: invariant — zero Indirect targets.
         #[cfg(debug_assertions)]
@@ -892,8 +887,8 @@ pub(crate) mod tests {
 
         let pre_ops_len = graph.blocks[graph.startblock.0].operations.len();
         let annotations = annotate(&graph);
-        let mut type_state = resolve_types(&graph, &annotations);
-        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+        resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &cc);
 
         // Same op count; the Call op survives untouched.
         let ops = &graph.blocks[graph.startblock.0].operations;

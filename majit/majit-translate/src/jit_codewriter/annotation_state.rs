@@ -8,31 +8,21 @@
 //! (value-id-based), so the annotator output lives in this side table
 //! instead.
 //!
-//! The carrier comes in two layers, ordered from RPython-orthodox to
-//! pyre-only:
+//! The carrier is a single `some_values: HashMap<ValueId, Rc<SomeValue>>`
+//! — direct counterpart of `Variable.annotation`.  Producers set the
+//! precise lattice node (`SomeInteger`, `SomeFloat`,
+//! `SomeInstance(classdef)`, `SomePtr(ll_ptrtype)`, `SomePBC`, ...)
+//! either via [`AnnotationState::set_some`] directly (the orthodox
+//! `_setbinding` shape upstream) or via [`AnnotationState::set`] from a
+//! legacy `ValueType` that gets projected through
+//! [`valuetype_to_someshell`].  Downstream consumers (the flowspace
+//! adapter) clone the `SomeValue` onto `Variable.annotation` unchanged,
+//! exactly as `_setbinding` does upstream.
 //!
-//! 1. `some_values: HashMap<ValueId, Rc<SomeValue>>` — direct
-//!    counterpart of `Variable.annotation`.  When the producer can
-//!    determine the precise lattice node (`SomeInteger`, `SomeFloat`,
-//!    `SomeInstance(classdef)`, `SomePtr(ll_ptrtype)`, `SomePBC`, ...)
-//!    it sets the entry here; downstream consumers (the flowspace
-//!    adapter) clone it onto `Variable.annotation` unchanged, exactly
-//!    as `_setbinding` does upstream.
-//!
-//! 2. `types: HashMap<ValueId, ValueType>` — pyre-legacy fallback that
-//!    only carries the lattice family discriminator
-//!    (`Int`/`Float`/`Ref`/`Void`/`State`/`Unknown`).  Used when the
-//!    producer cannot synthesize a concrete `SomeValue` shell.  The
-//!    adapter projects through `valuetype_to_someshell`; `Unknown`
-//!    deliberately has no shell, so annotation gaps surface fail-loud
-//!    instead of being bridged to a fabricated GC reference.
-//!    Convergence path is to populate `some_values` for every `ValueId`
-//!    and drop this fallback together with the projection.
-//!
-//! The `annotate()` algorithm in
-//! `translator/rtyper/legacy_annotator.rs` populates `types` only;
-//! producers can populate `some_values` opportunistically (e.g. the
-//! frontend's struct/PBC/Ptr cases) without breaking back-compat.
+//! `ValueType::Unknown` has no shell — passing it through `set`
+//! removes any existing `some_values` entry so annotation gaps surface
+//! fail-loud at the rtyper's `bindingrepr` instead of being bridged to
+//! a fabricated GC reference.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -124,27 +114,68 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
     }
 }
 
-/// Annotation state: `ValueId -> SomeValue` (orthodox) /
-/// `ValueId -> ValueType` (legacy fallback).
+/// Reduce a `SomeValue` lattice node to its `ValueType` discriminator.
+/// Inverse of [`valuetype_to_someshell`].
+///
+/// RPython parity: `getkind` family in `rpython/rtyper/lltypesystem/lltype.py`
+/// reduces lltypes to backend kinds; the analogue here reduces
+/// annotation-stage `SomeValue` to pyre's flat `ValueType` enum used by
+/// downstream `jit_codewriter` consumers that haven't been ported to
+/// `SomeValue` directly.
+pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
+    match s {
+        SomeValue::Integer(_) => ValueType::Int,
+        SomeValue::Bool(_) => ValueType::Bool,
+        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
+            ValueType::Float
+        }
+        SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref,
+        // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
+        // which projects to `ValueType::Void` in pyre's flat enum just
+        // like upstream `lltype.Void`.
+        SomeValue::Impossible => ValueType::Void,
+        // Other variants (String / List / Tuple / Dict / Iterator /
+        // Exception / None_ / Property / InteriorPtr / LLADTMeth /
+        // Builtin / BuiltinMethod / WeakRef / TypeOf / ByteArray /
+        // Char / UnicodeCodePoint / UnicodeString / Type / Object) have
+        // no direct pyre `ValueType` mapping; downstream consumers that
+        // care will read from `some_values` directly.  Project to `Ref`
+        // so the rtyper's GC-pointer fallback applies.
+        _ => ValueType::Ref,
+    }
+}
+
+/// Annotation state: `ValueId -> SomeValue` (orthodox
+/// `Variable.annotation` analogue).
 #[derive(Debug, Clone)]
 pub struct AnnotationState {
-    pub types: HashMap<ValueId, ValueType>,
     /// Precise per-`ValueId` `SomeValue` — RPython's
-    /// `Variable.annotation` analogue.  When present this overrides
-    /// `types` for any consumer that wants the full lattice node.
+    /// `Variable.annotation` analogue.  Drives both the `ValueType`
+    /// discriminator (via [`somevalue_to_valuetype`] for legacy
+    /// consumers) and the full lattice node lookup.
     pub some_values: HashMap<ValueId, Rc<SomeValue>>,
 }
 
 impl AnnotationState {
     pub fn new() -> Self {
         Self {
-            types: HashMap::new(),
             some_values: HashMap::new(),
         }
     }
 
-    pub fn get(&self, id: ValueId) -> &ValueType {
-        self.types.get(&id).unwrap_or(&ValueType::Unknown)
+    /// Read the `ValueType` discriminator for `id` from the orthodox
+    /// `some_values` slot (RPython `Variable.annotation` analogue).
+    /// Returns an owned value so callers can read without cloning the
+    /// underlying `Rc<SomeValue>` shell.  Falls back to `Unknown` when
+    /// the producer left the slot empty — consistent with the prior
+    /// `types`-backed semantics under [`Self::set`]'s invariant (every
+    /// non-Unknown `set` writes a paired `some_values` shell; `Unknown`
+    /// clears it).
+    pub fn get(&self, id: ValueId) -> ValueType {
+        self.some_values
+            .get(&id)
+            .map(|s| somevalue_to_valuetype(s))
+            .unwrap_or(ValueType::Unknown)
     }
 
     /// Set the legacy `ValueType` discriminator for `id` and update the
@@ -163,9 +194,7 @@ impl AnnotationState {
     /// `seed_variable` then leaves `Variable.annotation` empty and the
     /// rtyper fails at `bindingrepr`, surfacing the producer-side gap.
     pub fn set(&mut self, id: ValueId, ty: ValueType) {
-        let shell = valuetype_to_someshell(&ty);
-        self.types.insert(id, ty);
-        if let Some(shell) = shell {
+        if let Some(shell) = valuetype_to_someshell(&ty) {
             self.set_some(id, Rc::new(shell));
         } else {
             self.some_values.remove(&id);
@@ -239,7 +268,7 @@ mod tests {
 
         state.set(ValueId(1), ValueType::Unknown);
 
-        assert_eq!(state.get(ValueId(1)), &ValueType::Unknown);
+        assert_eq!(state.get(ValueId(1)), ValueType::Unknown);
         assert!(
             state.some(ValueId(1)).is_none(),
             "Unknown must clear the previous annotation shell so stale \

@@ -49,15 +49,12 @@ mod test_support;
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
-pub use flatten::{
-    FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph, flatten_with_types,
-};
+pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph};
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
 };
-pub use jit_codewriter::annotation_state::AnnotationState;
-pub use jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+pub use jit_codewriter::type_state::ConcreteType;
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
     VirtualizableFieldDescriptor, rewrite_graph,
@@ -1664,13 +1661,12 @@ mod tests {
         );
 
         // Step 3: flatten the rewritten graph
-        let types = rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
-        // Hydrate per-value `concretetype` slots on the graph
-        // (pyre's `Variable.concretetype` analogue) so downstream
-        // consumers can read kinds via `graph.concretetype(v)`
-        // without a side-table lookup.
+        // `resolve_types` commits per-value `concretetype` cells on
+        // each backing Variable as it builds, so downstream consumers
+        // can read kinds via `graph.concretetype(v)` without a
+        // separate publish step.
+        rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
         let mut result = result;
-        crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
         let flattened = flatten::flatten_graph(&result.graph, &mut regallocs);
