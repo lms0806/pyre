@@ -12,8 +12,7 @@ Benchmark target for list allocation cost, driven by argv[1]:
                                   remove barriers from this path)
 
 Translate with:
-  ../pypy2.7-v7.3.20-linux64/bin/pypy rpython/bin/rpython -O2 \
-      --gc=incminimark rpython/translator/goal/targetlistalloc.py
+  pypy2.7 rpython/bin/rpython -O2 --gc=incminimark rpython/translator/goal/targetlistalloc.py
 
 Measure with callgrind:
   valgrind --tool=callgrind --callgrind-out-file=cg.out ./targetlistalloc-c <mode>
