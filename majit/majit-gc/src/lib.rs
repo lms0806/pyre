@@ -17,6 +17,7 @@ pub mod oldgen;
 pub mod rewrite;
 pub mod shadow_stack;
 pub mod trace;
+pub mod weakref;
 
 /// GC flags stored in object headers.
 ///
@@ -790,6 +791,34 @@ pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
     })
+}
+
+/// Thread-local callback that runs a full mark-sweep collection cycle
+/// on the active backend's GC (`GcAllocator::collect_full`). Used by
+/// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
+/// `gc.collect()` reaches the live GC through this trampoline. Returns
+/// silently when no backend is installed on this thread (callers treat
+/// it as a no-op).
+pub type CollectFullFn = fn();
+
+thread_local! {
+    static ACTIVE_COLLECT_FULL: Cell<Option<CollectFullFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's full-collection trampoline. Pass
+/// `None` to clear.
+pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
+    ACTIVE_COLLECT_FULL.with(|c| c.set(hook));
+}
+
+/// Trigger a full mark-sweep collection on the active backend's GC.
+/// No-op when no backend is installed on this thread.
+pub fn collect_full() {
+    ACTIVE_COLLECT_FULL.with(|c| {
+        if let Some(f) = c.get() {
+            f();
+        }
+    });
 }
 
 /// Thread-local callback that reports whether a raw address is owned

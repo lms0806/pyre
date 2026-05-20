@@ -78,6 +78,37 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
     GC_ALLOC_STABLE_HOOK.with(|cell| cell.get().map(|f| f(type_id, payload_size)))
 }
 
+/// Signature of the host-side full-collection callback. Used by
+/// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
+/// `gc.collect()` reaches the live GC through this hook.
+pub type GcCollectHookFn = fn();
+
+thread_local! {
+    static GC_COLLECT_HOOK: Cell<Option<GcCollectHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the full-collection callback for this thread. Overwrites
+/// any previously-installed hook.
+pub fn register_gc_collect_hook(hook: GcCollectHookFn) {
+    GC_COLLECT_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the full-collection callback on this thread.
+pub fn clear_gc_collect_hook() {
+    GC_COLLECT_HOOK.with(|cell| cell.set(None));
+}
+
+/// Trigger a full mark-sweep collection via the installed hook. No-op
+/// when no hook is installed on this thread.
+#[inline]
+pub fn try_gc_collect() {
+    GC_COLLECT_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f();
+        }
+    });
+}
+
 /// Signature of the host-side root-register callbacks (Task #141
 /// option a). `slot` is a pointer to a slot holding a `PyObjectRef`
 /// (equivalently `*mut u8`); the GC treats it as a live root until

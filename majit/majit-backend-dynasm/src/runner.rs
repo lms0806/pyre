@@ -235,6 +235,22 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
+/// User-level `gc.collect()` trampoline — drives `GcAllocator::collect_full`
+/// on the active dynasm-owned GC. PyPy's `pypy/module/gc/interp_gc.py:7-26`
+/// runs `rgc.collect()` from app-level `gc.collect`; this is the dynasm
+/// backend's edge of that path. Safety: callers must be at a safepoint
+/// where every live PyObjectRef is either in a registered root, on the
+/// Python value stack, or on the shadow stack — Rust-stack PyObjectRef
+/// in nursery would dangle after the embedded minor cycle.
+fn dynasm_collect_full() {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.collect_full();
+        }
+    });
+}
+
 /// Host-side root-register trampoline (Task #141 option a). Bridges
 /// `majit_gc::gc_add_root` to the active backend's `RootSet`.
 ///
@@ -1110,6 +1126,7 @@ impl DynasmBackend {
         });
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
+        majit_gc::set_active_collect_full(Some(dynasm_collect_full));
         majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
         majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));

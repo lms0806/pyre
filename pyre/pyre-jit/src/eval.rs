@@ -60,6 +60,27 @@ fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 
     majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
 }
 
+/// `gc.collect()` (interp_gc.py:7-26) trampoline. Bridges
+/// pyre-object's `try_gc_collect` to `majit_gc::collect_full`, which
+/// fans out to the active backend's `dynasm_collect_full` /
+/// `collect_full_via_active_runtime`. pyre-object intentionally has
+/// no majit-gc dep, hence the indirection lives here.
+///
+/// # Safety hazard (documented gap)
+///
+/// `do_collect_full` always runs a minor cycle first; the nursery is
+/// moving. Any live PyObjectRef held on the Rust stack of the
+/// bytecode interpreter that is NOT registered as a GC root (via
+/// `pyframe_root_walker` / shadow stack / `try_gc_add_root`) will
+/// dangle after collection. pyre's interpreter has no shadowstack
+/// pass and does not register every per-handler temporary, so a
+/// user-triggered `gc.collect()` from a JIT-initialised context can
+/// segfault on the next memory access. Wiring lands so the trampoline
+/// is in place; safe enablement waits on the shadowstack epic.
+fn pyre_object_gc_collect_trampoline() {
+    majit_gc::collect_full();
+}
+
 /// Task #141 option (a) trampoline: register a caller-owned slot as
 /// a GC root with the active backend. Bridges `*mut *mut u8` (the
 /// pyre-object-facing shape that does not depend on majit-gc) to
@@ -159,21 +180,22 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 /// Custom trace for `W_TypeObject`.
 ///
 /// `W_TypeObject` carries one inline `PyObjectRef` field
-/// (`bases`) plus a `weak_subclasses: *mut Vec<PyObjectRef>`
+/// (`bases`) plus a `weak_subclasses: *mut Vec<*mut Weakref>`
 /// out-of-line list populated by `w_type_ready` / `add_subclass`
 /// at class-creation time (`typeobject.py:373-377` and
-/// `:640-662`).  PyPy stores `weakref.ref(w_subclass)` so the
-/// list does not pin subclass lifetimes; pyre follows PyPy's
-/// `not rweakref` strong-ref fallback path
-/// (`typeobject.py:642-650`) until a W_Weakref port lands, so
-/// every entry is a strong root that must be visited here.
+/// `:640-662`).  Each slot is a strong root to the WEAKREF
+/// GcStruct itself — its `weakptr` payload is invalidated
+/// separately by the collector's
+/// `invalidate_young_weakrefs` / `invalidate_old_weakrefs`
+/// (incminimark.py:3058-3126), so passing the slot to `f` here
+/// keeps the WEAKREF alive without forcing the target alive.
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !t.weak_subclasses.is_null() {
         let subs = unsafe { &mut *t.weak_subclasses };
         for slot in subs.iter_mut() {
-            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
 }
@@ -1466,6 +1488,48 @@ thread_local! {
             &pyre_object::celldict::INT_MUTABLE_CELL_TYPE as *const _ as usize,
             w_int_mutable_cell_tid,
         );
+        // WEAKREF GcStruct (gctypelayout.py:587). TypeInfo::weakref()
+        // sets T_IS_WEAKREF so minor / major collections invalidate
+        // the single weakptr slot when its target dies
+        // (incminimark.py:3058-3126). pyre-object's
+        // `pyre_object::weakref::Weakref` mirrors the layout; the
+        // assert below pins the runtime tid to the constant it
+        // hardcodes.
+        let weakref_tid = gc.register_type(majit_gc::trace::TypeInfo::weakref());
+        debug_assert_eq!(weakref_tid, pyre_object::weakref::WEAKREF_GC_TYPE_ID);
+        debug_assert_eq!(
+            std::mem::size_of::<pyre_object::weakref::Weakref>(),
+            majit_gc::weakref::SIZEOF_WEAKREF,
+            "pyre_object::weakref::Weakref layout must match majit_gc::weakref::Weakref",
+        );
+        debug_assert_eq!(
+            std::mem::offset_of!(pyre_object::weakref::Weakref, weakptr),
+            majit_gc::weakref::WEAKPTR_OFFSET,
+            "weakptr field must sit at the offset majit_gc expects",
+        );
+        // W_GcWeakref — instance-dict-slot wrapper around `*mut Weakref`.
+        // Carries a single inline GcRef-shaped field (`inner`) so the
+        // Weakref struct itself survives across collections; the
+        // weakptr inside the Weakref is invalidated separately by the
+        // collector's invalidate_*_weakrefs hooks.
+        let w_gc_weakref_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::weakref::W_GcWeakref>(),
+            object_tid,
+            pyre_object::weakref::W_GC_WEAKREF_GC_PTR_OFFSETS.to_vec(),
+        ));
+        debug_assert_eq!(
+            w_gc_weakref_tid,
+            pyre_object::weakref::W_GC_WEAKREF_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
+            w_gc_weakref_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
+            w_gc_weakref_tid,
+        );
         // Per-`ExcKind` GC type ids.  The pre-registration loop at the
         // top of this function mapped every exception PyType to a
         // single `W_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
@@ -1598,6 +1662,7 @@ thread_local! {
         // lives here.
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
+        pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
         pyre_object::register_gc_root_hooks(
             pyre_object_gc_add_root_trampoline,
             pyre_object_gc_remove_root_trampoline,

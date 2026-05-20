@@ -149,10 +149,24 @@ fn empty_module_init(_ns: &mut DictStorage) {}
 
 /// gc module stub — enough to let `import gc` succeed.
 fn init_gc(ns: &mut DictStorage) {
+    // pypy/module/gc/interp_gc.py:7-26 collect — partial port:
+    // drive a full mark-sweep through `try_gc_collect` (which fans
+    // out through `pyre-jit::eval`'s trampoline to the active
+    // backend's `majit_gc::collect_full`). MethodCache / MapAttrCache
+    // clears (`:14-17`) skipped — pyre has no equivalent caches.
+    // Finalizer queue (`:28-46 _run_finalizers`) skipped pending the
+    // finalizer epic. Argument `generation` is ignored per upstream.
     crate::dict_storage_store(
         ns,
         "collect",
-        crate::make_builtin_function_with_arity("collect", |_| Ok(pyre_object::w_int_new(0)), 1),
+        crate::make_builtin_function_with_arity(
+            "collect",
+            |_| {
+                pyre_object::gc_hook::try_gc_collect();
+                Ok(pyre_object::w_int_new(0))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,

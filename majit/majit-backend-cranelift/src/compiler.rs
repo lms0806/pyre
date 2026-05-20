@@ -1407,6 +1407,15 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
+/// User-level `gc.collect()` trampoline — drives `GcAllocator::collect_full`
+/// on the active cranelift-owned GC. Mirrors the dynasm equivalent;
+/// safety constraints apply (caller must be at a safepoint where every
+/// live PyObjectRef is rooted — Rust-stack PyObjectRef in nursery would
+/// dangle after the embedded minor cycle).
+fn collect_full_via_active_runtime() {
+    with_cranelift_gc(|gc| gc.collect_full());
+}
+
 /// Host-side root-register trampoline (Task #141 option a). Bridges
 /// `majit_gc::gc_add_root` to the active cranelift-owned GC's
 /// `RootSet`.
@@ -7235,6 +7244,7 @@ impl CraneliftBackend {
         });
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
         majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
+        majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
         majit_gc::set_active_root_hooks(
             Some(gc_add_root_via_active_runtime),
             Some(gc_remove_root_via_active_runtime),

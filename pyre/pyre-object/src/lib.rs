@@ -41,6 +41,7 @@ pub mod superobject;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unionobject;
+pub mod weakref;
 
 pub use boolobject::*;
 pub use bytearrayobject::*;

@@ -176,8 +176,8 @@ impl TypeEntry {
 /// ```
 ///
 /// majit's `TypeInfo` doesn't carry every concept RPython encodes
-/// (no weakref or memory pressure surface), so the corresponding bits
-/// stay zero — but the bits we DO have are mapped one-for-one against
+/// (no memory pressure surface), so the corresponding bits stay
+/// zero — but the bits we DO have are mapped one-for-one against
 /// the RPython source for line-by-line parity:
 ///
 /// ```python
@@ -224,6 +224,11 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
                 infobits |= TypeInfoLayout::T_IS_GCARRAY_OF_GCPTR;
             }
         }
+    }
+    // gctypelayout.py:292-293 `if builder.is_weakref_type(TYPE):
+    // infobits |= T_IS_WEAKREF`.
+    if info.is_weakref {
+        infobits |= TypeInfoLayout::T_IS_WEAKREF;
     }
     // gctypelayout.py:294-295 `is_subclass_of_object`.
     if info.is_object {
@@ -356,6 +361,13 @@ pub struct TypeInfo {
     /// the exclusive upper bound of the same subtree. Populated by
     /// `freeze_types`.
     pub subclassrange_max: i64,
+    /// `gctypelayout.is_weakref_type(TYPE)` parity
+    /// (gctypelayout.py:390-391): set to `true` for the WEAKREF
+    /// GcStruct itself (gctypelayout.py:587). `encode_type_shape`
+    /// emits the `T_IS_WEAKREF` infobits bit (gctypelayout.py:292-293)
+    /// so the collector's minor / major cycles can locate weakref
+    /// objects when scanning the type-info group.
+    pub is_weakref: bool,
 }
 
 impl TypeInfo {
@@ -373,6 +385,29 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
+        }
+    }
+
+    /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
+    /// the singleton WEAKREF GcStruct itself (gctypelayout.py:587-589).
+    /// The struct payload is one `weakptr: GcRef` slot; the collector
+    /// invalidates it during minor / major cycles instead of tracing
+    /// it as a strong reference, so `gc_ptr_offsets` stays empty.
+    pub fn weakref() -> Self {
+        TypeInfo {
+            size: crate::weakref::SIZEOF_WEAKREF,
+            has_gc_ptrs: false,
+            gc_ptr_offsets: Vec::new(),
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: None,
+            is_object: false,
+            parent: None,
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+            is_weakref: true,
         }
     }
 
@@ -399,6 +434,7 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -422,6 +458,7 @@ impl TypeInfo {
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -454,6 +491,7 @@ impl TypeInfo {
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -476,6 +514,7 @@ impl TypeInfo {
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -495,6 +534,7 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -518,6 +558,7 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -537,6 +578,7 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 
@@ -562,6 +604,7 @@ impl TypeInfo {
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
+            is_weakref: false,
         }
     }
 

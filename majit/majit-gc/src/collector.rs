@@ -191,6 +191,22 @@ pub struct MiniMarkGC {
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
     old_objects_with_cards_set: Vec<usize>,
+    /// incminimark.py:414 `self.young_objects_with_weakrefs =
+    /// self.AddressStack()`. Nursery-resident WEAKREF objects pending
+    /// minor-cycle target invalidation. Populated by `alloc_with_type`
+    /// when the requested type's `TypeInfo.is_weakref` is set
+    /// (incminimark.py:692 `if contains_weakptr:`). Drained at end of
+    /// minor cycle by `invalidate_young_weakrefs`
+    /// (incminimark.py:1866-1867, :3058-3105).
+    young_objects_with_weakrefs: Vec<usize>,
+    /// incminimark.py:415 `self.old_objects_with_weakrefs =
+    /// self.AddressStack()`. Old-gen WEAKREF objects whose target is
+    /// also in old-gen. Populated by `invalidate_young_weakrefs` for
+    /// survivors and by direct old-gen weakref allocation. Drained by
+    /// `invalidate_old_weakrefs` during the sweep phase of a major
+    /// collection (incminimark.py:3107-3133); the major-side
+    /// consumer lands in Slice 3.
+    old_objects_with_weakrefs: Vec<usize>,
     /// Configuration.
     config: GcConfig,
     /// Count of minor collections performed.
@@ -258,6 +274,8 @@ impl MiniMarkGC {
             remembered_set: Vec::new(),
             last_write_barrier_old_obj: 0,
             old_objects_with_cards_set: Vec::new(),
+            young_objects_with_weakrefs: Vec::new(),
+            old_objects_with_weakrefs: Vec::new(),
             config,
             minor_collections: 0,
             major_collections: 0,
@@ -444,11 +462,15 @@ impl MiniMarkGC {
                 return self.alloc_in_oldgen(type_id, total_size);
             }
             Self::init_nursery_object(ptr, type_id);
-            return GcRef((ptr as usize) + GcHeader::SIZE);
+            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+            self.register_weakref_if_needed(type_id, obj.0);
+            return obj;
         }
 
         Self::init_nursery_object(ptr, type_id);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.register_weakref_if_needed(type_id, obj.0);
+        obj
     }
 
     /// Allocate without triggering collection.
@@ -469,7 +491,26 @@ impl MiniMarkGC {
         }
 
         Self::init_nursery_object(ptr, type_id);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.register_weakref_if_needed(type_id, obj.0);
+        obj
+    }
+
+    /// incminimark.py:690-692 parity. When a freshly-allocated object
+    /// is a WEAKREF (T_IS_WEAKREF in its TYPE_INFO), push it onto the
+    /// young-weakref list so the next minor collection can invalidate
+    /// its weakptr if the target dies.
+    ///
+    /// `obj_addr` is the payload base (post-header). The weakref's
+    /// single `weakptr` slot lives at `weakref::WEAKPTR_OFFSET`
+    /// inside that payload (gctypelayout.py:592).
+    fn register_weakref_if_needed(&mut self, type_id: u32, obj_addr: usize) {
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        if self.types.get(type_id).is_weakref {
+            self.young_objects_with_weakrefs.push(obj_addr);
+        }
     }
 
     /// Initialize a nursery object's header.
@@ -667,6 +708,13 @@ impl MiniMarkGC {
             break;
         }
 
+        // incminimark.py:1865-1867 — now that every live nursery
+        // object has been forwarded out, walk the young weakref
+        // list to update or invalidate each WEAKREF's `weakptr` slot.
+        if !self.young_objects_with_weakrefs.is_empty() {
+            self.invalidate_young_weakrefs();
+        }
+
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
             self.nursery.reset();
@@ -678,6 +726,70 @@ impl MiniMarkGC {
         // progress. Like incminimark, take one or more major steps until
         // promoted bytes are back under the current step credit.
         self.run_major_progress_after_minor();
+    }
+
+    /// incminimark.py:3058-3105 `invalidate_young_weakrefs(self)`.
+    ///
+    /// For each WEAKREF object recorded in `young_objects_with_weakrefs`:
+    ///   * If the weakref itself was not forwarded out, it died — skip.
+    ///   * Otherwise read the `weakptr` slot off the forwarded payload.
+    ///     If the target is a nursery object: forward → update slot;
+    ///     not forwarded → invalidate slot (set to null). If the target
+    ///     is in old-gen, the weakref survives — push onto
+    ///     `old_objects_with_weakrefs` for the next major cycle.
+    ///
+    /// RPython's broader checks for young raw-malloced targets,
+    /// pinned-target NULL semantics, and prebuilt-target skipping
+    /// have no current pyre analog (no raw-malloc young region, no
+    /// pinned-weakref code path, no immortal prebuilt objects with
+    /// `GCFLAG_NO_HEAP_PTRS`), so this slice ports the core branch
+    /// — the remaining filters are out of scope until the matching
+    /// surfaces land.
+    fn invalidate_young_weakrefs(&mut self) {
+        while let Some(obj_addr) = self.young_objects_with_weakrefs.pop() {
+            // incminimark.py:3065-3066: if not forwarded → weakref died.
+            let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
+            if !unsafe { (*hdr_ptr).is_forwarded() } {
+                continue;
+            }
+            let new_obj = unsafe { GcHeader::forwarding_address(hdr_ptr) };
+
+            // incminimark.py:3069-3070: pointing_to = (obj + offset)
+            //                                            .address[0]
+            // pyre's WEAKREF struct keeps `weakptr` at offset 0
+            // (gctypelayout.py:592, weakref.rs:WEAKPTR_OFFSET).
+            let weakptr_slot = (new_obj + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
+            let pointing_to = unsafe { (*weakptr_slot).0 };
+
+            // Null targets need no update or follow-up tracking.
+            if pointing_to == 0 {
+                continue;
+            }
+
+            // incminimark.py:3071-3079: pointing_to in nursery.
+            if self.is_nursery_object_start(pointing_to) {
+                let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;
+                if unsafe { (*target_hdr).is_forwarded() } {
+                    let fwd = unsafe { GcHeader::forwarding_address(target_hdr) };
+                    unsafe { (*weakptr_slot).0 = fwd };
+                    // Target lives in old gen now — weakref also lives.
+                    self.old_objects_with_weakrefs.push(new_obj);
+                } else {
+                    // Target dies; null out the weakptr and drop the
+                    // weakref from any further tracking.
+                    unsafe { (*weakptr_slot).0 = 0 };
+                }
+                continue;
+            }
+
+            // Target is in old-gen (or a foreign address pyre's GC
+            // does not own). Either way, the minor cycle leaves the
+            // weakptr untouched and the major cycle (Slice 3) gets
+            // the chance to invalidate it later.
+            if self.oldgen.contains(pointing_to) {
+                self.old_objects_with_weakrefs.push(new_obj);
+            }
+        }
     }
 
     /// Copy a single nursery object to old gen.
@@ -1058,11 +1170,60 @@ impl MiniMarkGC {
     /// Complete the sweep phase after incremental marking finishes.
     fn finish_incremental_cycle(&mut self) {
         self.major_collections += 1;
+        // incminimark.py:2961-2965 (and :2495-2499) — clear weak
+        // pointers to dying objects before the sweep frees them. The
+        // VISITED bit on every old-gen object is still meaningful at
+        // this point; sweep below tears down `VISITED` per object as
+        // it walks oldgen.
+        if !self.old_objects_with_weakrefs.is_empty() {
+            self.invalidate_old_weakrefs();
+        }
         self.oldgen.sweep();
         self.last_write_barrier_old_obj = 0;
         self.last_major_bytes = self.oldgen.total_bytes();
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
+    }
+
+    /// incminimark.py:3105-3126 `invalidate_old_weakrefs(self)`.
+    ///
+    /// For each old-gen WEAKREF recorded in `old_objects_with_weakrefs`:
+    ///   * If the weakref struct itself was not marked → it dies; drop
+    ///     it from the list (no slot mutation, sweep will reclaim it).
+    ///   * Else read the `weakptr` slot and check the target's VISITED
+    ///     bit. Live target → keep the weakref in a fresh list.
+    ///     Dying target → null the slot and drop the weakref.
+    ///
+    /// RPython's extra GCFLAG_FINALIZATION_ORDERING handling
+    /// (incminimark.py:3120-3121 — treats objects queued for finalize
+    /// as "dying for weakref purposes" even though they're still
+    /// reachable) is deferred until the finalizer queue itself lands;
+    /// the rule reduces to a plain VISITED check until then.
+    fn invalidate_old_weakrefs(&mut self) {
+        let entries = std::mem::take(&mut self.old_objects_with_weakrefs);
+        let mut new_with_weakref = Vec::with_capacity(entries.len());
+        for obj_addr in entries {
+            let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
+            // incminimark.py:3112: weakref itself not marked → dies.
+            if unsafe { !(*hdr_ptr).has_flag(flags::VISITED) } {
+                continue;
+            }
+            let weakptr_slot = (obj_addr + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
+            let pointing_to = unsafe { (*weakptr_slot).0 };
+            if pointing_to == 0 {
+                continue;
+            }
+            // Slice 2 only adds oldgen-resident targets here; the
+            // foreign-address path is filtered upstream. If the
+            // target's header reports VISITED, the weakref survives.
+            let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;
+            if unsafe { (*target_hdr).has_flag(flags::VISITED) } {
+                new_with_weakref.push(obj_addr);
+            } else {
+                unsafe { (*weakptr_slot).0 = 0 };
+            }
+        }
+        self.old_objects_with_weakrefs = new_with_weakref;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
@@ -4299,4 +4460,210 @@ mod tests {
     // compiler), so interior-pointer filtering is not part of the GC
     // contract. The test disagreed with that contract and was removed
     // to keep majit-gc structurally aligned with RPython.
+
+    /// incminimark.py:3068-3079 dead-target branch. A WEAKREF whose
+    /// target is a nursery object with no GC root must have its
+    /// `weakptr` slot invalidated to 0 after the minor cycle.
+    #[test]
+    fn test_minor_invalidate_young_weakref_dead_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        // Allocate the target first, then a WEAKREF whose payload's
+        // `weakptr` slot points to that target. Neither object is
+        // rooted in `gc.roots`; only the WEAKREF itself is rooted so
+        // the minor cycle keeps the WEAKREF alive long enough to
+        // observe the post-invalidation slot.
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        let mut wref_root = wref;
+        unsafe { gc.roots.add(&mut wref_root) };
+
+        gc.do_collect_nursery();
+
+        // The WEAKREF survived → forwarded into old-gen.
+        assert!(gc.oldgen.contains(wref_root.0));
+        // Target had no root and was not reachable through the WEAKREF
+        // (the collector does not trace weakptr), so it died — the
+        // slot must read null.
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert!(after.is_null(), "dead-target weakptr should read null");
+
+        gc.roots.clear();
+    }
+
+    /// incminimark.py:3071-3074 live-target branch. A WEAKREF whose
+    /// target survives the minor cycle (because something else
+    /// rooted it) must have its `weakptr` slot rewritten to the
+    /// target's new old-gen address.
+    #[test]
+    fn test_minor_invalidate_young_weakref_live_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        // Root both the target and the weakref so both forward.
+        let mut target_root = target;
+        let mut wref_root = wref;
+        unsafe {
+            gc.roots.add(&mut target_root);
+            gc.roots.add(&mut wref_root);
+        }
+
+        gc.do_collect_nursery();
+
+        // Both forwarded out.
+        assert!(gc.oldgen.contains(target_root.0));
+        assert!(gc.oldgen.contains(wref_root.0));
+        // The weakref's slot now reads the target's forwarded address.
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert_eq!(after.0, target_root.0);
+
+        gc.roots.clear();
+    }
+
+    /// incminimark.py:3065-3066 "weakref itself dies" branch. The
+    /// WEAKREF object has no root → the cycle treats the entry as a
+    /// no-op (no panic, no UB) and the bookkeeping list ends up empty.
+    #[test]
+    fn test_minor_invalidate_young_weakref_self_dies() {
+        let mut gc = test_gc(4096);
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let _wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        // No root on the WEAKREF itself.
+        assert_eq!(gc.young_objects_with_weakrefs.len(), 1);
+
+        gc.do_collect_nursery();
+
+        // The cycle drained the list and didn't push the dead weakref
+        // into the old-side queue.
+        assert!(gc.young_objects_with_weakrefs.is_empty());
+        assert!(gc.old_objects_with_weakrefs.is_empty());
+    }
+
+    /// incminimark.py:3116-3122 dying-target branch in
+    /// `invalidate_old_weakrefs`. After a full GC where the WEAKREF's
+    /// target is no longer rooted, the weakptr slot reads null and
+    /// the bookkeeping list drops the weakref.
+    #[test]
+    fn test_major_invalidate_old_weakref_dead_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        // Root all three (target, wref) and pre-promote them to old
+        // gen via a minor collection so the major cycle sees both as
+        // oldgen-resident.
+        let mut target_root = target;
+        let mut wref_root = wref;
+        unsafe {
+            gc.roots.add(&mut target_root);
+            gc.roots.add(&mut wref_root);
+        }
+        gc.do_collect_nursery();
+        assert!(gc.oldgen.contains(target_root.0));
+        assert!(gc.oldgen.contains(wref_root.0));
+        assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
+
+        // Drop the target root; keep wref rooted. Full GC should
+        // sweep the target and null out wref's weakptr slot.
+        gc.roots.remove(&mut target_root);
+        gc.do_collect_full();
+
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert!(after.is_null(), "dead-target old weakptr should read null");
+        // Weakref survived but its entry was popped from the list
+        // because its (now-null) slot has nothing left to clear.
+        assert!(gc.old_objects_with_weakrefs.is_empty());
+
+        gc.roots.clear();
+    }
+
+    /// incminimark.py:3120-3121 live-target keep branch. When both
+    /// the WEAKREF and its target survive the major mark, the
+    /// weakref carries over into the next cycle's bookkeeping list.
+    #[test]
+    fn test_major_invalidate_old_weakref_live_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        let mut target_root = target;
+        let mut wref_root = wref;
+        unsafe {
+            gc.roots.add(&mut target_root);
+            gc.roots.add(&mut wref_root);
+        }
+
+        gc.do_collect_full();
+
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert_eq!(after.0, target_root.0);
+        assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
+
+        gc.roots.clear();
+    }
+
+    /// incminimark.py:3112 "weakref itself not marked" branch.
+    /// Dropping the wref root before the major cycle drops the entry
+    /// silently — no slot mutation, no panic.
+    #[test]
+    fn test_major_invalidate_old_weakref_self_dies() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        let mut target_root = target;
+        let mut wref_root = wref;
+        unsafe {
+            gc.roots.add(&mut target_root);
+            gc.roots.add(&mut wref_root);
+        }
+        gc.do_collect_nursery();
+        assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
+
+        gc.roots.remove(&mut wref_root);
+        gc.do_collect_full();
+
+        assert!(gc.old_objects_with_weakrefs.is_empty());
+        gc.roots.clear();
+    }
 }

@@ -129,19 +129,16 @@ pub struct W_TypeObject {
     /// `:1604-1613 _add_mro_classes_as_subclasses`).
     ///
     /// PyPy stores `weakref.ref(w_subclass)` entries so subclasses
-    /// can be garbage-collected; when `not
-    /// space.config.translation.rweakref` (the fallback path PyPy
-    /// keeps for hosts without weakref support, `:642-650`) the
-    /// list holds strong refs and "ALL CLASSES LEAK".  Pyre
-    /// currently has no W_Weakref infrastructure on
-    /// `W_TypeObject`, so this port follows the strong-ref
-    /// fallback path — heaptype lifetimes are pinned by their
-    /// bases for as long as the base type is alive.  The vector
-    /// is heap-allocated (`Box::into_raw`) and walked by the GC
-    /// custom-trace hook registered for `W_TYPE_GC_TYPE_ID`
-    /// (`pyre-jit::eval`).  Null when no subclasses have been
-    /// registered.
-    pub weak_subclasses: *mut Vec<PyObjectRef>,
+    /// can be garbage-collected.  Pyre now follows the rweakref
+    /// path via `pyre_object::weakref::Weakref` — each slot is a
+    /// `*mut Weakref` whose `weakptr` is invalidated by the GC
+    /// when the target subclass becomes unreachable
+    /// (gctypelayout.py:587, incminimark.py:3058-3126).  The outer
+    /// `Vec` is heap-allocated (`Box::into_raw`); the GC's
+    /// custom-trace hook registered for `W_TYPE_GC_TYPE_ID` keeps
+    /// each `Weakref` struct alive across collections (`pyre-jit
+    /// ::eval`).  Null when no subclasses have been registered.
+    pub weak_subclasses: *mut Vec<*mut crate::weakref::Weakref>,
 }
 
 /// GC type id assigned to `W_TypeObject` at JitDriver init time.
@@ -533,13 +530,22 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
         parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
     }
     let subs = &mut *parent.weak_subclasses;
-    // typeobject.py:654-657 — skip if already present.
-    for &existing in subs.iter() {
+    // typeobject.py:651-660 — `newref = weakref.ref(w_subclass);
+    // for i in range(...): if ref() is w_subclass: return; if ref()
+    // is None: self.weak_subclasses[i] = newref; return;
+    // else: self.weak_subclasses.append(newref)`.
+    let newref = crate::weakref::w_weakref_new(w_subclass);
+    for i in 0..subs.len() {
+        let existing = crate::weakref::w_weakref_deref(subs[i]);
         if existing == w_subclass {
             return;
         }
+        if existing.is_null() {
+            subs[i] = newref;
+            return;
+        }
     }
-    subs.push(w_subclass);
+    subs.push(newref);
 }
 
 /// `typeobject.py:664-670 W_TypeObject.remove_subclass`.
@@ -562,8 +568,11 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
         return;
     }
     let subs = &mut *parent.weak_subclasses;
+    // typeobject.py:665-669 — `for i in range(len(self
+    // .weak_subclasses)): ref = self.weak_subclasses[i]; if ref()
+    // is w_subclass: del self.weak_subclasses[i]; return`.
     for i in 0..subs.len() {
-        if subs[i] == w_subclass {
+        if crate::weakref::w_weakref_deref(subs[i]) == w_subclass {
             subs.remove(i);
             return;
         }
@@ -591,7 +600,17 @@ pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
     if parent.weak_subclasses.is_null() {
         return Vec::new();
     }
-    (*parent.weak_subclasses).clone()
+    // typeobject.py:683-686 — `for ref in self.weak_subclasses: w_ob
+    // = ref(); if w_ob is not None: subclasses_w.append(w_ob)`.
+    let subs = &*parent.weak_subclasses;
+    let mut alive: Vec<PyObjectRef> = Vec::with_capacity(subs.len());
+    for &slot in subs.iter() {
+        let target = crate::weakref::w_weakref_deref(slot);
+        if !target.is_null() {
+            alive.push(target);
+        }
+    }
+    alive
 }
 
 /// `typeobject.py:373-377 W_TypeObject.ready` — register `w_self`

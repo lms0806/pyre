@@ -291,12 +291,20 @@ pub fn get_or_make_weakref(
 ) -> PyObjectRef {
     let w_weakreftype = weakref_type();
     if w_subtype.is_null() || std::ptr::eq(w_weakreftype, w_subtype) {
-        let cached = read_attr(self_lifeline, ATTR_CACHED_WEAKREF);
+        // interp__weakref.py:66-69: cached_weakref is a weakref TO the
+        // W_Weakref; w_cached = self.cached_weakref() returns the
+        // W_Weakref or None.
+        let cached_slot = read_attr(self_lifeline, ATTR_CACHED_WEAKREF);
+        let cached = unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(cached_slot) };
         if !cached.is_null() {
             return cached;
         }
         let w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
-        write_attr(self_lifeline, ATTR_CACHED_WEAKREF, w_ref);
+        write_attr(
+            self_lifeline,
+            ATTR_CACHED_WEAKREF,
+            pyre_object::weakref::w_gc_weakref_new_or_strong(w_ref),
+        );
         w_ref
     } else {
         // subclass: cannot cache
@@ -322,7 +330,11 @@ pub fn get_or_make_weakref(
 ///     return w_proxy
 /// ```
 pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
-    let cached = read_attr(self_lifeline, ATTR_CACHED_PROXY);
+    // interp__weakref.py:83-86: cached_proxy is a weakref TO the W_Proxy /
+    // W_CallableProxy; w_cached = self.cached_proxy() returns the proxy
+    // or None.
+    let cached_slot = read_attr(self_lifeline, ATTR_CACHED_PROXY);
+    let cached = unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(cached_slot) };
     if !cached.is_null() {
         return cached;
     }
@@ -331,7 +343,11 @@ pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyOb
     } else {
         W_Proxy_new(w_obj, PY_NULL)
     };
-    write_attr(self_lifeline, ATTR_CACHED_PROXY, w_proxy);
+    write_attr(
+        self_lifeline,
+        ATTR_CACHED_PROXY,
+        pyre_object::weakref::w_gc_weakref_new_or_strong(w_proxy),
+    );
     w_proxy
 }
 
@@ -352,7 +368,11 @@ pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyOb
 ///     return space.w_None
 /// ```
 pub fn get_any_weakref(self_lifeline: PyObjectRef) -> PyObjectRef {
-    let cached = read_attr(self_lifeline, ATTR_CACHED_WEAKREF);
+    // interp__weakref.py:95-98: cached_weakref is a weakref TO the
+    // W_Weakref; w_ref = self.cached_weakref() returns the W_Weakref
+    // or None.
+    let cached_slot = read_attr(self_lifeline, ATTR_CACHED_WEAKREF);
+    let cached = unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(cached_slot) };
     if !cached.is_null() {
         return cached;
     }
@@ -436,8 +456,12 @@ pub fn W_Weakref_new(
         w_subtype
     };
     let obj = w_instance_new(actual_type);
-    // W_WeakrefBase.__init__
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj);
+    // W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj)
+    write_attr(
+        obj,
+        ATTR_W_OBJ_WEAK,
+        pyre_object::weakref::w_gc_weakref_new_or_strong(w_obj),
+    );
     if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
         write_attr(obj, ATTR_W_CALLABLE, w_callable);
     } else {
@@ -452,7 +476,11 @@ pub fn W_Weakref_new(
 pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::instanceobject::w_instance_new;
     let obj = w_instance_new(proxy_type());
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj);
+    write_attr(
+        obj,
+        ATTR_W_OBJ_WEAK,
+        pyre_object::weakref::w_gc_weakref_new_or_strong(w_obj),
+    );
     if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
         write_attr(obj, ATTR_W_CALLABLE, w_callable);
     } else {
@@ -465,7 +493,11 @@ pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
 pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::instanceobject::w_instance_new;
     let obj = w_instance_new(callable_proxy_type());
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj);
+    write_attr(
+        obj,
+        ATTR_W_OBJ_WEAK,
+        pyre_object::weakref::w_gc_weakref_new_or_strong(w_obj),
+    );
     if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
         write_attr(obj, ATTR_W_CALLABLE, w_callable);
     } else {
@@ -483,7 +515,8 @@ pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObj
 ///     return w_obj
 /// ```
 pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
-    read_attr(w_ref, ATTR_W_OBJ_WEAK)
+    let slot = read_attr(w_ref, ATTR_W_OBJ_WEAK);
+    unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(slot) }
 }
 
 /// pypy/module/_weakref/interp__weakref.py:179-190 W_WeakrefBase.descr__repr__
@@ -773,11 +806,10 @@ pub fn getweakrefcount(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let count = match crate::baseobjspace::getweakref(w_obj) {
         None => 0,
         Some(lifeline) => {
-            if !read_attr(lifeline, ATTR_CACHED_WEAKREF).is_null() {
-                1
-            } else {
-                0
-            }
+            // interp__weakref.py:286: `if wref() is not None: count += 1`
+            let cached_slot = read_attr(lifeline, ATTR_CACHED_WEAKREF);
+            let cached = unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(cached_slot) };
+            if !cached.is_null() { 1 } else { 0 }
         }
     };
     Ok(pyre_object::w_int_new(count))
@@ -801,7 +833,9 @@ pub fn getweakrefs(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj = args[0];
     let mut result = Vec::new();
     if let Some(lifeline) = crate::baseobjspace::getweakref(w_obj) {
-        let cached = read_attr(lifeline, ATTR_CACHED_WEAKREF);
+        // interp__weakref.py:300-302: deref each cached wref; live ones go in.
+        let cached_slot = read_attr(lifeline, ATTR_CACHED_WEAKREF);
+        let cached = unsafe { pyre_object::weakref::w_gc_weakref_or_strong_deref(cached_slot) };
         if !cached.is_null() {
             result.push(cached);
         }
