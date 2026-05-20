@@ -30,8 +30,9 @@ pub(crate) struct PendingBridgeRd {
     pub livebox_types: Vec<Type>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
-    /// model.py:199-201 cpu.cls_of_box — always available via MetaInterp.
-    pub cls_of_box: Option<fn(i64) -> i64>,
+    /// `optimizer.cpu` (model.py:39 AbstractCPU) — carried through the
+    /// bridge into the retrace `Optimizer.cpu` slot.
+    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
 }
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -202,17 +203,12 @@ pub struct Optimizer {
     /// retrace helpers without recorder). Production parity paths route
     /// optimizer info through BoxRef `_forwarded`.
     pending_box_pool: crate::r#box::BoxPool,
-    /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
-    /// optimizer.cpu`. Reads the runtime typeptr (object class) at
-    /// offset 0 of a Ref payload. Used at trace-end virtualstate match
-    /// time to evaluate `cpu.cls_of_box(runtime_box)` precondition for
-    /// KnownClass guard generation (virtualstate.py:601 / :608 / :620).
-    ///
-    /// Plumbed from `MetaInterp.cls_of_box` (`pyjitpl/mod.rs:1764`)
-    /// at the Optimizer construction site. Optional because synthetic
-    /// fixtures that never run a real CPU may leave it unset; the
-    /// virtualstate match falls back to `get_known_class` in that case.
-    pub cls_of_box_fn: Option<fn(i64) -> i64>,
+    /// `optimizer.cpu` (`rpython/jit/backend/model.py:39 AbstractCPU`)
+    /// backref.  Hosts `cls_of_box(box)` (model.py:199-201) and other
+    /// backend services every Optimization sub-class reaches via
+    /// `self.optimizer.cpu.<method>()`.  Propagated to `OptContext.cpu`
+    /// at `setup_optimizations` time.
+    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
     /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
     /// set of OpRefs the optimizer has emitted (or that
     /// `replace_guard_op` substituted in place of an emitted op).
@@ -1093,7 +1089,7 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             pending_box_pool: crate::r#box::BoxPool::new(),
-            cls_of_box_fn: None,
+            cpu: None,
             emitted_operations: std::collections::HashSet::new(),
         }
     }
@@ -1341,7 +1337,7 @@ impl Optimizer {
 
     /// Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
 
-    /// Lock JUMP arg OpRefs so replace_op won't forward them.
+    /// Lock JUMP arg OpRefs so make_equal_to won't forward them.
 
     /// optimizer.py:557 parity:
     ///
@@ -1922,7 +1918,7 @@ impl Optimizer {
         // virtualstate match (KnownClass arms) can fall back to
         // `cpu.cls_of_box(runtime_box)` when the optimizer-tracked
         // PtrInfo has no `known_class` recorded.
-        ctx.cls_of_box_fn = self.cls_of_box_fn;
+        ctx.cpu = self.cpu.clone();
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
@@ -2058,7 +2054,7 @@ impl Optimizer {
                 &prd.liveboxes,
                 &prd.livebox_types,
                 &prd.all_descrs,
-                prd.cls_of_box,
+                prd.cpu.clone(),
                 self,
                 &mut ctx,
             );
@@ -2140,7 +2136,13 @@ impl Optimizer {
                             )
                         });
                         let fresh = ctx.alloc_op_position_typed(tp);
-                        ctx.replace_op(source, fresh);
+                        let b_source = ctx
+                            .ensure_box(source)
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_fresh = ctx
+                            .ensure_box(fresh)
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        ctx.make_equal_to(&b_source, Some(&b_fresh));
                         fresh
                     } else {
                         source
@@ -2438,7 +2440,7 @@ impl Optimizer {
                     // position the current slot points at) holds a DIFFERENT
                     // OpRef. If slot k self-forwards (original_args[k] ==
                     // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
-                    // which is a no-op in replace_op — no chain forms, so no
+                    // which is a no-op in make_equal_to — no chain forms, so no
                     // aliasing is needed.
                     let target_slot = arg.raw() as usize;
                     let target_slot_self_forwards = original_args
@@ -2491,7 +2493,13 @@ impl Optimizer {
                                         )
                                     });
                                     let ff = ctx.alloc_op_position_typed(tp);
-                                    ctx.replace_op(ff, orig_field);
+                                    let b_ff = ctx
+                                        .ensure_box(ff)
+                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    let b_orig = ctx
+                                        .ensure_box(orig_field)
+                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    ctx.make_equal_to(&b_ff, Some(&b_orig));
                                     field.1 = ff;
                                 }
                                 crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
@@ -3412,7 +3420,7 @@ impl Optimizer {
 
     /// Send one operation through the pass chain.
     ///
-    /// NOTE: Do NOT add `replace_op(original_pos, new_pos)` here.
+    /// NOTE: Do NOT add `make_equal_to(original_pos, new_pos)` here.
     /// The Emit variant's position tracking is handled by each pass
     /// and OptContext. Adding automatic replacement mapping here
     /// causes spurious forwarding that breaks heap/guard tests.
@@ -3469,7 +3477,7 @@ impl Optimizer {
         // encodes Const entries as TAGCONST in rd_numb, leaving fail_args
         // as TAGBOX-only references). Re-walking fail_args at pass entry
         // would be a pyre-only layer that could substitute Const refs
-        // post-`replace_op(_, const_target)` and de-sync from the
+        // post-`make_equal_to(_, const_target)` and de-sync from the
         // numbering snapshot.
         let mut resolved_op = op.clone();
         // optimizer.py:651-652 force_box loop parity.
@@ -3485,7 +3493,15 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            ctx.make_equal_to(current_op.pos.get(), current_op.arg(0));
+            let old = current_op.pos.get();
+            let new = current_op.arg(0);
+            let b_old = ctx
+                .ensure_box(old)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_new = ctx
+                .ensure_box(new)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_old, Some(&b_new));
             return;
         }
 
@@ -4353,7 +4369,15 @@ mod tests {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {
                     // Replace with first arg
-                    ctx.replace_op(op.pos.get(), op.arg(0));
+                    let old = op.pos.get();
+                    let new = op.arg(0);
+                    let b_old = ctx
+                        .ensure_box(old)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_new = ctx
+                        .ensure_box(new)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_new));
                     return OptimizationResult::Remove;
                 }
             }
@@ -5445,7 +5469,7 @@ mod tests {
         assert_eq!(ctx.inputarg_type(OpRef::int_op(101)), Some(Type::Ref));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(102)), Some(Type::Float));
         // Phase 1's inputarg slot OpRefs at [0..3) resolve through the
-        // new low-range fallback (Phase 2 inputarg_base=100 > 0).
+        // low-range fallback (Phase 2 inputarg_base=100 > 0).
         assert_eq!(ctx.inputarg_type(OpRef::int_op(0)), Some(Type::Int));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(1)), Some(Type::Ref));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(2)), Some(Type::Float));
@@ -5581,7 +5605,13 @@ mod tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        ctx.replace_op(OpRef::int_op(11), OpRef::int_op(20));
+        let b11 = ctx
+            .ensure_box(OpRef::int_op(11))
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b20 = ctx
+            .ensure_box(OpRef::int_op(20))
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b11, Some(&b20));
         let b20 = ctx
             .ensure_box(OpRef::int_op(20))
             .expect("body-namespace OpRef must have a BoxRef slot");

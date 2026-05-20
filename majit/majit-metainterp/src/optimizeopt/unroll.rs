@@ -134,12 +134,11 @@ pub struct UnrollOptimizer {
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
     pub call_pure_results:
         crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
-    /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
-    /// optimizer.cpu`. Propagated to the inner phase-1/phase-2
-    /// `Optimizer.cls_of_box_fn` so virtualstate match can read the
-    /// runtime typeptr via `cpu.cls_of_box(runtime_box)` at
-    /// virtualstate.py:601/:608/:620.
-    pub cls_of_box_fn: Option<fn(i64) -> i64>,
+    /// `optimizer.cpu` (model.py:39 `AbstractCPU`) backref, carried into
+    /// the inner phase-1/phase-2 `Optimizer.cpu` at spawn time so
+    /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
+    /// and any future `bh_*` calls resolve to the same backend services.
+    pub cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
 }
 
 impl UnrollOptimizer {
@@ -174,7 +173,7 @@ impl UnrollOptimizer {
             next_global_opref: 0,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            cls_of_box_fn: None,
+            cpu: None,
         }
     }
 
@@ -350,7 +349,7 @@ impl UnrollOptimizer {
             };
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
-            opt_p1.cls_of_box_fn = self.cls_of_box_fn;
+            opt_p1.cpu = self.cpu.clone();
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -451,7 +450,7 @@ impl UnrollOptimizer {
                     // `opcode.result_type()` + `Type::Ref` default would
                     // retype Phase 1 inputarg OpRefs (absent from `p1_ops`)
                     // as `Ref`, which later feeds the cross-type forward
-                    // assertion in `OptContext::replace_op`.
+                    // assertion in `OptContext::make_equal_to`.
                     // RPython Phase 1 → Phase 2 heap cache transfer:
                     // RPython does NOT serialize heap cache in ExportedState.
                     // HeapOps in the short preamble are replayed during Phase 2's
@@ -613,7 +612,7 @@ impl UnrollOptimizer {
         };
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
-        opt_p2.cls_of_box_fn = self.cls_of_box_fn;
+        opt_p2.cpu = self.cpu.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
@@ -1739,7 +1738,7 @@ enum ExportedGcRefField {
     BoxPoolInfoPtrInfoKnownClass(usize),
     /// box_pool_snapshot[index].forwarded = Box(target) where target is
     /// `BoxKind::Const(Value::Ref(_))` — `make_constant` /
-    /// `replace_op(... const ...)` writer mirror shape.
+    /// `make_equal_to(... const ...)` writer mirror shape.
     BoxPoolBoxConstRef(usize),
 }
 
@@ -2645,6 +2644,14 @@ impl OptUnroll {
         let renamed_inputarg_types: Vec<Type> = renamed_inputargs
             .iter()
             .map(|&opref| {
+                // history.py:220 `box.type` intrinsic
+                // (resoperation.py:719/727/739 InputArg{Int,Ref,Float}.type
+                // carries the inputarg's declared type on the Box itself).
+                // `inputarg_type` is a *read-only* lookup against the
+                // graph-level `inputarg_types` Vec — never materialize a
+                // fresh Box here, since the OpRef variant tag of a Phase 1
+                // low slot referenced from Phase 2 may mismatch the
+                // canonical `inputarg_types[idx]`.
                 ctx.inputarg_type(opref)
                     .or_else(|| ctx.opref_type(opref))
                     .unwrap_or_else(|| {
@@ -2663,7 +2670,7 @@ impl OptUnroll {
         // Phase 2 ctx that does NOT inherit Phase 1's forwarding map; if we
         // stored raw `end_args[i]` here, two top-level entries that shared
         // the same `VirtualStateInfoNode` Rc (because their post-resolution
-        // targets coincided in Phase 1) would `replace_op(source(i), raw_i)`
+        // targets coincided in Phase 1) would `make_equal_to(source(i), raw_i)`
         // to *different* raw OpRefs, and `make_inputargs` in Phase 2 would
         // see divergent forwarding for the supposedly-shared state slot.
         // RPython sidesteps this naturally because `box._forwarded` persists
@@ -3526,7 +3533,13 @@ impl OptUnroll {
             // makes this hold by construction in production callers.
             debug_assert!(source != *target, "import_state: source is target");
             // source.set_forwarded(target)
-            ctx.replace_op(source, *target);
+            let b_source = ctx
+                .ensure_box(source)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_target = ctx
+                .ensure_box(*target)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_source, Some(&b_target));
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit] import_state_map[{i}]: source={source:?} target={target:?}");
             }
@@ -4376,7 +4389,13 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                ctx.replace_op(jump_source, extended_label_arg);
+                let b_js = ctx
+                    .ensure_box(jump_source)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_ela = ctx
+                    .ensure_box(extended_label_arg)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_js, Some(&b_ela));
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
@@ -5694,7 +5713,7 @@ mod tests {
         // The fixture references both slots via `int_op(N)` (Int variant
         // tag), so targetargs must agree under variant-aware OpRef Eq —
         // a Ref-typed targetarg would trip the Box.type cross-type
-        // forward check in `replace_op`. Heap-field-cache mechanics are
+        // forward check in `make_equal_to`. Heap-field-cache mechanics are
         // exercised independent of base type.
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
@@ -5713,7 +5732,7 @@ mod tests {
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
         assert_eq!(pop.op, OpRef::int_op(11)); // Phase 1 source — pop.op
-        // forwards via replace_op to the body-visible OpRef.
+        // forwards via make_equal_to to the body-visible OpRef.
         drop(parent);
     }
 
@@ -5860,7 +5879,7 @@ mod tests {
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
             8,
-            &[Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+            &[Type::Int, Type::Int, Type::Int, Type::Int],
         );
         ctx.seed_constant(func, Value::Int(func_ptr));
 
@@ -5950,7 +5969,7 @@ mod tests {
     }
 
     /// B.6.3 invariant (Heap variant): same orthodox boundary as the Pure
-    /// case, with the producer's `replace_op(source, value)` forwarding
+    /// case, with the producer's `make_equal_to(source, value)` forwarding
     /// installed (`shortpreamble.rs::produce_heap_field`).
     /// `force_op_from_preamble_op` returns `preamble_source` (RPython
     /// `unroll.py:38 return preamble_op.op` ≡ `self.res`); the producer's
@@ -5999,10 +6018,16 @@ mod tests {
             .produced_short_op(OpRef::ref_op(19))
             .unwrap();
         // Path B (B.6.7-heap-field): produce_heap_field no longer installs
-        // replace_op, but the test still walks the get_box_replacement
+        // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        ctx.replace_op(OpRef::ref_op(19), OpRef::ref_op(14));
+        let b_src = ctx
+            .ensure_box(OpRef::ref_op(19))
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_tgt = ctx
+            .ensure_box(OpRef::ref_op(14))
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b_src, Some(&b_tgt));
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::ref_op(19),
             invented_name: produced.invented_name,
@@ -6031,7 +6056,7 @@ mod tests {
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
-        // pop.op=19 forwards to body-visible 14 via the producer's replace_op,
+        // pop.op=19 forwards to body-visible 14 via the producer's make_equal_to,
         // so used_boxes carries the resolved body-visible OpRef while
         // jump_args carries the unresolved Phase 1 source.
         assert_eq!(sp.used_boxes, vec![OpRef::ref_op(14)]);

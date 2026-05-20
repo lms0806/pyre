@@ -724,7 +724,13 @@ impl OptVirtualize {
                 _ => None,
             };
             if let Some(val_ref) = field_val {
-                ctx.replace_op(op.pos.get(), val_ref);
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_val = ctx
+                    .ensure_box(val_ref)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_val));
                 return OptimizationResult::Remove;
             }
             // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
@@ -836,7 +842,13 @@ impl OptVirtualize {
                     if item_ref.is_none() {
                         return OptimizationResult::InvalidLoop;
                     }
-                    ctx.replace_op(op.pos.get(), item_ref);
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_item = ctx
+                        .ensure_box(item_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_item));
                     return OptimizationResult::Remove;
                 }
             }
@@ -916,7 +928,14 @@ impl OptVirtualize {
                 if fld.is_none() {
                     return OptimizationResult::InvalidLoop;
                 }
-                ctx.replace_op(op.pos.get(), fld.unwrap());
+                let fld = fld.unwrap();
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_fld = ctx
+                    .ensure_box(fld)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_fld));
                 return OptimizationResult::Remove;
             }
         }
@@ -1069,7 +1088,13 @@ impl OptVirtualize {
                 };
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
-                    ctx.replace_op(op.pos.get(), val_ref);
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_val = ctx
+                        .ensure_box(val_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_val));
                     return OptimizationResult::Remove;
                 }
             }
@@ -1249,7 +1274,13 @@ impl OptVirtualize {
                             // make_nonnull + emit.
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
-                                ctx.replace_op(op.pos.get(), val_ref);
+                                let b_old = ctx
+                                    .ensure_box(op.pos.get())
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_val = ctx
+                                    .ensure_box(val_ref)
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                ctx.make_equal_to(&b_old, Some(&b_val));
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1632,7 +1663,13 @@ impl OptVirtualize {
             return false;
         }
         // self.make_equal_to(op, forcedop)
-        ctx.make_equal_to(op.pos.get(), forced_resolved);
+        let b_old = ctx
+            .ensure_box(op.pos.get())
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_forced = ctx
+            .ensure_box(forced_resolved)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b_old, Some(&b_forced));
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
         true
@@ -2558,9 +2595,9 @@ mod tests {
     /// Like `run_pass`, but declares specific OpRef slots as Int-typed.
     /// Use for tests whose anonymous high-numbered Boxes feed int-typed
     /// setfield values — otherwise the MUST_ALIAS replay through
-    /// `replace_op` would cross-type-forward an Int-typed `getfield_gc_i`
+    /// `make_equal_to` would cross-type-forward an Int-typed `getfield_gc_i`
     /// result into the Ref-seeded value slot and trip the Box.type
-    /// invariant guard on `replace_op`.
+    /// invariant guard on `make_equal_to`.
     fn run_pass_typed(ops: &[Op], int_slots: &[u32]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptVirtualize::new()));

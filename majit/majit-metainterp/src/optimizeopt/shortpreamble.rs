@@ -1317,7 +1317,13 @@ impl ProducedShortOp {
         // and corrupts the SAME_AS in `extra_same_as`.
         // Non-invented re-uses self.res directly without forwarding.
         if self.invented_name {
-            ctx.replace_op(source, result_opref);
+            let b_source = ctx
+                .ensure_box(source)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_result = ctx
+                .ensure_box(result_opref)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_source, Some(&b_result));
         }
         // `result_opref` is a typed synthetic alias minted by
         // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
@@ -1432,7 +1438,7 @@ impl ProducedShortOp {
         let mut getfield_op = Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
         getfield_op.setdescr(descr.clone());
         // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
-        // result_opref because `replace_op(source, result_opref)` installed
+        // result_opref because `make_equal_to(source, result_opref)` installed
         // below clobbers source's slot. Seed info at result_opref's slot
         // (set_preamble_forwarded_info via replay_pos) so
         // `take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos)`
@@ -1465,7 +1471,13 @@ impl ProducedShortOp {
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // PtrInfo / const-info side tables have been seeded (so the seeds
         // see the unforwarded source key consistent with `pop.op = source`).
-        ctx.replace_op(source, result_opref);
+        let b_source = ctx
+            .ensure_box(source)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_result = ctx
+            .ensure_box(result_opref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b_source, Some(&b_result));
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1576,7 +1588,13 @@ impl ProducedShortOp {
         }
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // const-info / ArrayPtrInfo side tables have been seeded.
-        ctx.replace_op(source, result_opref);
+        let b_source = ctx
+            .ensure_box(source)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_result = ctx
+            .ensure_box(result_opref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b_source, Some(&b_result));
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1624,7 +1642,13 @@ impl ProducedShortOp {
         // get_box_replacement uniformly.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
-        ctx.replace_op(source, result_opref);
+        let b_source = ctx
+            .ensure_box(source)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_result = ctx
+            .ensure_box(result_opref)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.make_equal_to(&b_source, Some(&b_result));
         // `rewrite.py:31` `self.opt.loop_invariant_results[key] = old_op` —
         // dict-as-map semantics; pyre's Vec-backed parity overwrites the
         // entry when `func_ptr` already exists (PyPy dict behavior),

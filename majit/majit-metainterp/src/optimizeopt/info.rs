@@ -42,7 +42,7 @@ pub struct PreambleOp {
     /// RPython `PreambleOp.op` — the carried Box (= `self.res` from the
     /// short_op). For non-invented entries this is the body-visible
     /// OpRef directly; for invented entries (CompoundOp alternates)
-    /// `op` forwards to the carried Box via `replace_op(source, op)`
+    /// `op` forwards to the carried Box via `make_equal_to(source, op)`
     /// so `get_box_replacement(op)` reaches the body-visible OpRef.
     pub op: OpRef,
     /// RPython: PreambleOp.invented_name
@@ -1577,7 +1577,13 @@ impl PtrInfo {
                     );
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_alloc = ctx
+                        .ensure_box(alloc_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1627,7 +1633,13 @@ impl PtrInfo {
                     );
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_alloc = ctx
+                        .ensure_box(alloc_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
@@ -1661,7 +1673,13 @@ impl PtrInfo {
                 alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_alloc = ctx
+                        .ensure_box(alloc_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
                 }
 
                 // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
@@ -1715,7 +1733,13 @@ impl PtrInfo {
                 alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_alloc = ctx
+                        .ensure_box(alloc_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
                 }
 
                 // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
@@ -1776,7 +1800,13 @@ impl PtrInfo {
                     ctx.set_ptr_info(&b, PtrInfo::nonnull());
                 }
                 if opref != alloc_ref {
-                    ctx.replace_op(opref, alloc_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_alloc = ctx
+                        .ensure_box(alloc_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_alloc));
                 }
 
                 // info.py:425: CHECK_MEMORY_ERROR
@@ -1839,7 +1869,13 @@ impl PtrInfo {
                     );
                 }
                 if opref != new_ref {
-                    ctx.replace_op(opref, new_ref);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_new = ctx
+                        .ensure_box(new_ref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_new));
                 }
                 new_ref
             }
@@ -1917,7 +1953,13 @@ impl PtrInfo {
 
                 // vstring.py:99-100: op.set_forwarded(newop)
                 if opref != newop {
-                    ctx.replace_op(opref, newop);
+                    let b_opref = ctx
+                        .ensure_box(opref)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_newop = ctx
+                        .ensure_box(newop)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_opref, Some(&b_newop));
                 }
 
                 // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)

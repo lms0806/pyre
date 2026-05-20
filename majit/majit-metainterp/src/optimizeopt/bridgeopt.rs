@@ -180,9 +180,10 @@ pub fn serialize_optimizer_knowledge(
 }
 
 /// `frontend_boxes`: runtime values from guard failure (RPython Box objects
-///   with concrete references). Used by cls_of_box to read vtable.
-/// `cls_of_box`: model.py:199-201 cpu.cls_of_box(box) — reads typeptr from
-///   a runtime Ref object. Returns the class pointer as i64.
+///   with concrete references). Used by `cpu.cls_of_box` to read vtable.
+/// `cpu`: `optimizer.cpu` (model.py:39 `AbstractCPU`).  Dispatches
+///   `cpu.cls_of_box(frontend_boxes[i])` for bridgeopt.py:145-146
+///   `make_constant_class`.
 pub fn deserialize_optimizer_knowledge(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
@@ -190,7 +191,7 @@ pub fn deserialize_optimizer_knowledge(
     liveboxes: &[OpRef],
     livebox_types: &[majit_ir::Type],
     all_descrs: &[majit_ir::descr::DescrRef],
-    cls_of_box: Option<fn(i64) -> i64>,
+    cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
@@ -242,10 +243,10 @@ pub fn deserialize_optimizer_knowledge(
             // GcRef when box.type == "r" and class_known is set. Our raw i64
             // encoding requires a nonnull check (RPython's box.nonnull()
             // equivalent, info.py:763).
-            if let Some(cls_fn) = cls_of_box {
+            if let Some(cpu_ref) = cpu.as_ref() {
                 let raw_ref = frontend_boxes[i];
                 if raw_ref != 0 {
-                    let cls = cls_fn(raw_ref);
+                    let cls = cpu_ref.cls_of_box(raw_ref);
                     // optimizer.py:137-152 `make_constant_class` always
                     // updates `_forwarded` after `get_box_replacement` —
                     // `ensure_box` materializes a Box so the class info

@@ -22,6 +22,7 @@ pub mod r#box;
 pub mod call_descr;
 pub(crate) mod compile;
 mod constant_pool;
+pub mod cpu;
 pub(crate) mod executor;
 pub mod greenfield;
 pub mod history;

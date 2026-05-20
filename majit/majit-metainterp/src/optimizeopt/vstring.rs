@@ -570,7 +570,13 @@ impl OptString {
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_box_replacement(ch_ref);
-                ctx.replace_op(op.pos.get(), ch_resolved);
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_new = ctx
+                    .ensure_box(ch_resolved)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_new));
                 return OptimizationResult::Remove;
             }
         }
@@ -597,7 +603,13 @@ impl OptString {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
             let lgtop = ctx.getstrlen_opref(arg1, mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
-            ctx.make_equal_to(op.pos.get(), lgtop);
+            let b_old = ctx
+                .ensure_box(op.pos.get())
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_lgtop = ctx
+                .ensure_box(lgtop)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_old, Some(&b_lgtop));
             return OptimizationResult::Remove;
         }
         // vstring.py:533: return self.emit(op)
@@ -1205,7 +1217,13 @@ impl OptString {
                 self.strgetitem(op.arg(2), 0, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
-                ctx.replace_op(op.pos.get(), result);
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_result = ctx
+                    .ensure_box(result)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_result));
                 return OptimizationResult::Remove;
             }
         }
@@ -1270,7 +1288,13 @@ impl OptString {
                     .unwrap_or(false);
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                    ctx.replace_op(op.pos.get(), arg1);
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg1 = ctx
+                        .ensure_box(arg1)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_arg1));
                     return OptimizationResult::Remove;
                 }
             }

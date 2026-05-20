@@ -542,7 +542,7 @@ pub struct JitCodeMachine<'mi, S, R> {
     last_exception_box: Option<OpRef>,
     last_exception_value: i64,
     class_of_last_exc_is_const: bool,
-    cls_of_box: Option<fn(i64) -> i64>,
+    cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>,
     issubclass: Option<fn(i64, i64) -> bool>,
     /// Outer interpreter pc captured BEFORE the
     /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
@@ -1084,7 +1084,7 @@ where
             last_exception_box: None,
             last_exception_value: 0,
             class_of_last_exc_is_const: false,
-            cls_of_box: None,
+            cpu: None,
             issubclass: None,
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
@@ -1093,8 +1093,8 @@ where
         }
     }
 
-    pub fn set_cls_of_box(&mut self, cls_of_box: Option<fn(i64) -> i64>) {
-        self.cls_of_box = cls_of_box;
+    pub fn set_cpu(&mut self, cpu: Option<std::sync::Arc<dyn crate::cpu::Cpu>>) {
+        self.cpu = cpu;
     }
 
     pub fn set_issubclass(&mut self, issubclass: Option<fn(i64, i64) -> bool>) {
@@ -1115,12 +1115,13 @@ where
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
-        if let Some(callback) = self.cls_of_box {
-            callback(exc_value)
+        if let Some(cpu) = self.cpu.as_ref() {
+            cpu.cls_of_box(exc_value)
         } else {
             // Standalone trace_jitcode() tests do not have a MetaInterp
-            // callback.  Keep the existing conservative fallback used by
-            // BC_LAST_EXCEPTION until typed exception dispatch is wired end-to-end.
+            // backend installed.  Keep the existing conservative fallback
+            // used by BC_LAST_EXCEPTION until typed exception dispatch is
+            // wired end-to-end.
             exc_value
         }
     }

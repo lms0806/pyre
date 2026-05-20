@@ -1595,7 +1595,13 @@ impl OptHeap {
                 }
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
-            ctx.make_equal_to(op.pos.get(), res_v);
+            let b_old = ctx
+                .ensure_box(op.pos.get())
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_res = ctx
+                .ensure_box(res_v)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_old, Some(&b_res));
             self.last_emitted_removed = true;
             return true;
         }
@@ -2017,7 +2023,13 @@ impl OptHeap {
                 if *lazy_obj == obj {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1);
-                    ctx.replace_op(op.pos.get(), cached);
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_cached = ctx
+                        .ensure_box(cached)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_cached));
                     return OptimizationResult::Remove;
                 }
                 // heap.py:67-75 possible_aliasing_two_infos:
@@ -2052,13 +2064,25 @@ impl OptHeap {
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(&descr).register_info(obj);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            let b_old = ctx
+                                .ensure_box(op.pos.get())
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_cached = ctx
+                                .ensure_box(cached)
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            ctx.make_equal_to(&b_old, Some(&b_cached));
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                let b_old = ctx
+                                    .ensure_box(op.pos.get())
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_cached = ctx
+                                    .ensure_box(cached)
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                ctx.make_equal_to(&b_old, Some(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2114,7 +2138,13 @@ impl OptHeap {
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
             let cached = ctx.get_box_replacement(cached);
-            ctx.replace_op(op.pos.get(), cached);
+            let b_old = ctx
+                .ensure_box(op.pos.get())
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_cached = ctx
+                .ensure_box(cached)
+                .expect("body-namespace OpRef must have a BoxRef slot");
+            ctx.make_equal_to(&b_old, Some(&b_cached));
             return OptimizationResult::Remove;
         }
 
@@ -2128,13 +2158,25 @@ impl OptHeap {
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(&descr).register_info(obj);
                         let cached = ctx.get_box_replacement(cached);
-                        ctx.replace_op(op.pos.get(), cached);
+                        let b_old = ctx
+                            .ensure_box(op.pos.get())
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_cached = ctx
+                            .ensure_box(cached)
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        ctx.make_equal_to(&b_old, Some(&b_cached));
                         return OptimizationResult::Remove;
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            let b_old = ctx
+                                .ensure_box(op.pos.get())
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_cached = ctx
+                                .ensure_box(cached)
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            ctx.make_equal_to(&b_old, Some(&b_cached));
                             return OptimizationResult::Remove;
                         }
                     }
@@ -2148,7 +2190,13 @@ impl OptHeap {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
                 let qi_cached = ctx.get_box_replacement(qi_cached);
-                ctx.replace_op(op.pos.get(), qi_cached);
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_qi = ctx
+                    .ensure_box(qi_cached)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_qi));
                 return OptimizationResult::Remove;
             }
             // First read after QUASIIMMUT_FIELD: emit the load, then cache
@@ -2571,7 +2619,13 @@ impl OptHeap {
                     if *lazy_obj == array {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2);
-                        ctx.replace_op(op.pos.get(), cached);
+                        let b_old = ctx
+                            .ensure_box(op.pos.get())
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_cached = ctx
+                            .ensure_box(cached)
+                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        ctx.make_equal_to(&b_old, Some(&b_cached));
                         return OptimizationResult::Remove;
                     }
                     // heap.py:108 possible_aliasing_two_infos
@@ -2603,13 +2657,25 @@ impl OptHeap {
                                     .register_info(array);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                let b_old = ctx
+                                    .ensure_box(op.pos.get())
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_cached = ctx
+                                    .ensure_box(cached)
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                ctx.make_equal_to(&b_old, Some(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let cached = ctx.get_box_replacement(cached);
-                                    ctx.replace_op(op.pos.get(), cached);
+                                    let b_old = ctx
+                                        .ensure_box(op.pos.get())
+                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    let b_cached = ctx
+                                        .ensure_box(cached)
+                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    ctx.make_equal_to(&b_old, Some(&b_cached));
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2665,7 +2731,13 @@ impl OptHeap {
                     .register_info(array);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                 let cached = ctx.get_box_replacement(cached);
-                ctx.replace_op(op.pos.get(), cached);
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_cached = ctx
+                    .ensure_box(cached)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, Some(&b_cached));
                 return OptimizationResult::Remove;
             }
             if let Some(cai) = self
@@ -2681,13 +2753,25 @@ impl OptHeap {
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos.get(), cached);
+                            let b_old = ctx
+                                .ensure_box(op.pos.get())
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_cached = ctx
+                                .ensure_box(cached)
+                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            ctx.make_equal_to(&b_old, Some(&b_cached));
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos.get(), cached);
+                                let b_old = ctx
+                                    .ensure_box(op.pos.get())
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_cached = ctx
+                                    .ensure_box(cached)
+                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                ctx.make_equal_to(&b_old, Some(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2743,7 +2827,13 @@ impl OptHeap {
             let indexbox = ctx.get_box_replacement(op.arg(1));
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
-                    ctx.replace_op(op.pos.get(), cached);
+                    let b_old = ctx
+                        .ensure_box(op.pos.get())
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_cached = ctx
+                        .ensure_box(cached)
+                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    ctx.make_equal_to(&b_old, Some(&b_cached));
                     return OptimizationResult::Remove;
                 }
             }
@@ -4027,8 +4117,8 @@ mod tests {
     /// int-typed fields (setfield_gc value, int_ args, etc.). Without this
     /// the `trace_inputarg_types = vec![Ref; 1024]` default types every
     /// anonymous slot as Ref and the heap cache's MUST_ALIAS replacement
-    /// `replace_op(getfield_gc_i.pos:Int, cached_value:Ref)` trips the
-    /// `replace_op` cross-type assertion introduced for the Box.type
+    /// `make_equal_to(getfield_gc_i.pos:Int, cached_value:Ref)` trips the
+    /// `make_equal_to` cross-type assertion introduced for the Box.type
     /// invariant.
     fn run_heap_opt_typed(ops: &mut [Op], int_slots: &[u32]) -> Vec<Op> {
         assign_positions(ops);
