@@ -2020,10 +2020,44 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
-        // pyjitpl.py:923-947 `_opimpl_getfield_gc_any_pureornot` cache hit:
-        //   if upd.currfieldbox is not None:
-        //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
-        //       return upd.currfieldbox
+        // pyjitpl.py:934-945 cache-hit sanity check (int arm). The
+        // line-by-line port runs `executor.execute(cpu, mi, opnum,
+        // fielddescr, box)` and asserts `resvalue ==
+        // upd.currfieldbox.getint()`.  Const boxes read from the
+        // constant pool; non-Const recorded op results read from the
+        // `opref_concrete` Box.value analog stamped on the miss path.
+        let expected_int = if cached.is_constant() {
+            match ctx.constants_get_value(cached) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            }
+        } else {
+            match ctx.lookup_opref_concrete(cached) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                _ => None,
+            }
+        };
+        if let Some(cached_int) = expected_int {
+            if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(majit_ir::Value::Int(loaded)) =
+                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                    {
+                        assert_eq!(
+                            loaded, cached_int,
+                            "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (int): loaded {loaded} != cached \
+                             {cached_int} (field_index={field_index}, \
+                             struct_ptr={struct_ptr:#x})"
+                        );
+                    }
+                }
+            }
+        }
+        // pyjitpl.py:946 cache-hit accounting:
+        //   self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
+        //   return upd.currfieldbox
         ctx.profiler().count_ops(
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
@@ -2060,7 +2094,15 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcI
     };
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int) {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
@@ -2072,9 +2114,39 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
-        // pyjitpl.py:929-947 `_opimpl_getfield_gc_any_pureornot` cache hit.
-        // RPython hardcodes `GETFIELD_GC_I` regardless of the rop variant
-        // (`_i` / `_r` / `_f`); pyre matches the hardcode for parity.
+        // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
+        let expected_ref = if cached.is_constant() {
+            match ctx.constants_get_value(cached) {
+                Some(majit_ir::Value::Ref(r)) => Some(r),
+                _ => None,
+            }
+        } else {
+            match ctx.lookup_opref_concrete(cached) {
+                Some(majit_ir::Value::Ref(r)) => Some(r),
+                _ => None,
+            }
+        };
+        if let Some(cached_ref) = expected_ref {
+            if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(majit_ir::Value::Ref(loaded)) =
+                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
+                    {
+                        assert_eq!(
+                            loaded, cached_ref,
+                            "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (ref): loaded {:#x} != cached {:#x} \
+                             (field_index={field_index}, struct_ptr=\
+                             {struct_ptr:#x})",
+                            loaded.0, cached_ref.0,
+                        );
+                    }
+                }
+            }
+        }
+        // pyjitpl.py:946 — RPython hardcodes `GETFIELD_GC_I` regardless
+        // of the rop variant (`_i` / `_r` / `_f`); pyre matches.
         ctx.profiler().count_ops(
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
@@ -2101,7 +2173,15 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcR
     };
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    if let majit_ir::Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref) {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }

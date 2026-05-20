@@ -2931,6 +2931,10 @@ impl<M: Clone> MetaInterp<M> {
                 // upstream (no clear in rpython/jit/metainterp/).
                 self.force_finish_trace = self.warm_state.should_force_finish_tracing(green_key);
                 ctx.set_force_finish(self.force_finish_trace);
+                // pyjitpl.py:929-947 `self.metainterp.cpu` analog —
+                // see `setup_tracing` for the contract on raw-pointer
+                // lifetime pinning by MetaInterp ownership.
+                ctx.set_cpu(Some(&self.backend));
                 // compile_tmp_callback parity: pending CALL_ASSEMBLER targets
                 // must expose the same red-args-only entry contract that
                 // `patch_new_loop_to_load_virtualizable_fields()` later hands
@@ -3168,6 +3172,12 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
         // so the proc-macro merge_fn closure can read it.
         ctx.set_force_finish(self.force_finish_trace);
+        // pyjitpl.py:929-947 `self.metainterp.cpu` analog: install the
+        // backend reference for the cache-hit sanity-check load.
+        // Captures a raw pointer that stays valid for the duration of
+        // this trace because `self` (MetaInterp) owns both `tracing`
+        // and `backend`, and tracing is torn down before `self` moves.
+        ctx.set_cpu(Some(&self.backend));
         // compile_tmp_callback parity: pending CALL_ASSEMBLER targets must
         // expose the same red-args-only entry contract that
         // `patch_new_loop_to_load_virtualizable_fields()` later hands to
@@ -3446,16 +3456,21 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
+    ///
+    /// `vable_struct_ptr` is the live struct pointer for the
+    /// cache-hit sanity check (pyjitpl.py:934-945); callers without a
+    /// live pointer pass `0` to leave the resolver disabled.
     pub fn opimpl_getfield_vable_int(
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_int requires active tracing")
-            .vable_getfield_int(pc, vable_opref, fielddescr)
+            .vable_getfield_int(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py:1173-1179 `opimpl_getfield_vable_r(box, fielddescr, pc)`.
@@ -3463,12 +3478,13 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_ref requires active tracing")
-            .vable_getfield_ref(pc, vable_opref, fielddescr)
+            .vable_getfield_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py:1180-1186 `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -3476,12 +3492,13 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_float requires active tracing")
-            .vable_getfield_float(pc, vable_opref, fielddescr)
+            .vable_getfield_float(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
@@ -3684,13 +3701,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(pc, vable_opref, fdescr, adescr)
+            .vable_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
     /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
@@ -9167,6 +9185,11 @@ impl<M: Clone> MetaInterp<M> {
         });
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
         ctx.set_force_finish(self.force_finish_trace);
+        // pyjitpl.py:929-947 `self.metainterp.cpu` analog — see
+        // `setup_tracing` for the contract on raw-pointer lifetime
+        // pinning by MetaInterp ownership.  Bridge traces share the
+        // same backend reference as the source loop.
+        ctx.set_cpu(Some(&self.backend));
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
         // `prepare_trace_segmenting` can set FORCE_BRIDGE_SEGMENTING here.
@@ -18901,7 +18924,7 @@ mod tests {
             Vec::new(),
         );
 
-        let (result, _) = meta.opimpl_getfield_vable_int(0, OpRef::input_arg_ref(0), fd8);
+        let (result, _) = meta.opimpl_getfield_vable_int(0, OpRef::input_arg_ref(0), 0, fd8);
         assert_eq!(result, OpRef::input_arg_int(1));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -18979,7 +19002,7 @@ mod tests {
             vec![2],
         );
 
-        let len_ref = meta.opimpl_arraylen_vable(0, OpRef::input_arg_ref(0), fd24, adesc);
+        let len_ref = meta.opimpl_arraylen_vable(0, OpRef::input_arg_ref(0), 0, fd24, adesc);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.num_ops(), 0);
@@ -19002,7 +19025,7 @@ mod tests {
         };
         let fd8 =
             majit_ir::descr::make_field_descr(8, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
-        let _result = meta.opimpl_getfield_vable_int(0, nonstandard_vable, fd8);
+        let _result = meta.opimpl_getfield_vable_int(0, nonstandard_vable, 0, fd8);
 
         // pyjitpl.py:1120-1146 _nonstandard_virtualizable falls through
         // to Step 4 (PTR_EQ + implement_guard_value) and Step 5a
@@ -19355,7 +19378,7 @@ mod tests {
         );
 
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
-        let _ = meta.opimpl_getfield_vable_int(0, OpRef::input_arg_ref(0), fd8);
+        let _ = meta.opimpl_getfield_vable_int(0, OpRef::input_arg_ref(0), 0, fd8);
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);

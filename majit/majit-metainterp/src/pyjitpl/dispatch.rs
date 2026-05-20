@@ -1634,7 +1634,12 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (opref, value) = ctx.vable_getfield_int(opcode_pc, vable_opref, fielddescr);
+                // Concrete struct pointer for pyjitpl.py:934-945
+                // cache-hit sanity check (Slice 2 plumbing; Slice 3
+                // wires the check itself).
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let (opref, value) =
+                    ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::insns::BC_GETFIELD_VABLE_R => {
@@ -1649,7 +1654,9 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (opref, value) = ctx.vable_getfield_ref(opcode_pc, vable_opref, fielddescr);
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let (opref, value) =
+                    ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::insns::BC_GETFIELD_VABLE_F => {
@@ -1664,7 +1671,9 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (opref, value) = ctx.vable_getfield_float(opcode_pc, vable_opref, fielddescr);
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let (opref, value) =
+                    ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::insns::BC_SETFIELD_VABLE_I => {
@@ -1836,10 +1845,11 @@ where
                     // the heapcache state is intentionally left
                     // untouched.  Pyre recovers `tobox.getint()`
                     // either via the constant pool (ConstInt cached
-                    // oprefs) or via the dispatch-tracked
-                    // `array_cache_concrete_int` side table; untracked
-                    // op-result oprefs from non-dispatch callers fall
-                    // through without a check.
+                    // oprefs) or via the unified `opref_concrete`
+                    // Box.value analog (dispatch tracks via the typed
+                    // `array_cache_track_concrete_int` accessor);
+                    // untracked op-result oprefs from non-dispatch
+                    // callers fall through without a check.
                     let expected =
                         ctx.array_cache_lookup_concrete_int(cached_opref)
                             .or_else(|| match ctx.constants_get_value(cached_opref) {
@@ -2058,7 +2068,14 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_arraylen_vable(opcode_pc, vable_opref, fdescr, adescr);
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let result = ctx.vable_arraylen_vable(
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fdescr,
+                    adescr,
+                );
                 // pyjitpl.py:1262-1263 `result =
                 // vinfo.get_array_length(virtualizable, arrayindex);
                 // return ConstInt(result)`.  RPython reads from the live
@@ -4419,6 +4436,36 @@ where
                 let (opref, concrete) = self.read_int_reg(src);
                 let promoted = ctx.promote_int(opref, concrete, 0);
                 self.set_int_reg(src, Some(promoted), Some(concrete));
+            }
+            // pyjitpl.py:385-391 opimpl_assert_not_none.  Blackhole:
+            // asserts the concrete ref is non-null and advances past
+            // the 1-byte ref operand.  Tracing: route through
+            // `TraceCtx::trace_assert_not_none` which gates on
+            // `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS`
+            // on cache hit per pyjitpl.py:387-388.
+            jitcode::insns::BC_ASSERT_NOT_NONE => {
+                let src = self.frames.current_mut().next_u8() as usize;
+                let (opref, concrete) = self.read_ref_reg(src);
+                ctx.trace_assert_not_none(opref, concrete);
+            }
+            // pyjitpl.py:393-410 opimpl_record_exact_class.  Blackhole:
+            // no-op (handler_record_exact_class advances past the 2-byte
+            // (ref, int) operand).  Tracing: route through
+            // `TraceCtx::trace_record_exact_class` which gates on
+            // `heap_cache.is_class_known` + bumps `HEAPCACHED_OPS` on
+            // cache hit per pyjitpl.py:396-397.  The class operand follows
+            // blackhole.py:616 `@arguments("r", "i")`.
+            jitcode::insns::BC_RECORD_EXACT_CLASS => {
+                let src = self.frames.current_mut().next_u8() as usize;
+                let cls = self.frames.current_mut().next_u8() as usize;
+                let (box_opref, _) = self.read_ref_reg(src);
+                let (cls_opref, cls_concrete) = self.read_int_reg(cls);
+                let cls_opref = if cls_opref.is_constant() {
+                    ctx.const_ref(cls_concrete)
+                } else {
+                    cls_opref
+                };
+                ctx.trace_record_exact_class(box_opref, cls_opref);
             }
             // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
             jitcode::insns::BC_REF_GUARD_VALUE => {

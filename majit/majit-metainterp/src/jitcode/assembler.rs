@@ -1703,6 +1703,35 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// pyjitpl.py:385-391 opimpl_assert_not_none: record that `src` is
+    /// non-null.
+    ///
+    /// Blackhole: asserts the concrete ref is non-null
+    /// (`blackhole.rs:5690 handler_assert_not_none`) and advances past
+    /// the operand byte.  Tracing dispatcher routes
+    /// through `TraceCtx::trace_assert_not_none(opref)` which gates on
+    /// `heap_cache.is_nullity_known` and bumps `HEAPCACHED_OPS` on
+    /// cache hit per pyjitpl.py:387-388.
+    pub fn assert_not_none(&mut self, src: u16) {
+        self.write_insn("assert_not_none/r");
+        self.push_reg_u8(src, "assert_not_none");
+    }
+
+    /// pyjitpl.py:393-410 opimpl_record_exact_class: record that
+    /// `src`'s class is exactly `cls` (vtable pointer in the int bank).
+    ///
+    /// Blackhole: no-op (`blackhole.rs:5574 handler_record_exact_class`
+    /// advances past the two operand bytes).  Tracing dispatcher routes
+    /// through `TraceCtx::trace_record_exact_class(opref, cls_const)`
+    /// which gates on `heap_cache.is_class_known` and bumps
+    /// `HEAPCACHED_OPS` on cache hit per pyjitpl.py:396-397.  Argcodes
+    /// `ri` mirrors `blackhole.py:616 @arguments("r", "i")`.
+    pub fn record_exact_class(&mut self, src: u16, cls: u16) {
+        self.write_insn("record_exact_class/ri");
+        self.push_reg_u8(src, "record_exact_class src");
+        self.push_reg_u8(cls, "record_exact_class cls");
+    }
+
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
         self.write_insn("ref_guard_value/r");

@@ -1783,10 +1783,25 @@ fn getfield_vable_via_metainterp(
     // stays line-by-line equivalent even if `is_nonstandard_virtualizable`
     // currently ignores the pc at the leaf (`trace_ctx.rs let _ = pc;`).
     let pc = op.pc;
+    // Concrete struct pointer for pyjitpl.py:934-945 cache-hit sanity
+    // check.  The walker keeps a parallel concrete Ref-bank shadow;
+    // thread the same live pointer that RPython's `box.getref_base()`
+    // would expose to `executor.execute(...)`.
+    let vable_struct_ptr = match read_ref_reg_concrete(code, op, 0, ctx) {
+        ConcreteValue::Ref(ptr) => ptr as i64,
+        ConcreteValue::Null => 0,
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
+    };
     let (result, _value) = match dst_bank {
-        'i' => ctx.trace_ctx.vable_getfield_int(pc, obj, descr),
-        'r' => ctx.trace_ctx.vable_getfield_ref(pc, obj, descr),
-        'f' => ctx.trace_ctx.vable_getfield_float(pc, obj, descr),
+        'i' => ctx
+            .trace_ctx
+            .vable_getfield_int(pc, obj, vable_struct_ptr, descr),
+        'r' => ctx
+            .trace_ctx
+            .vable_getfield_ref(pc, obj, vable_struct_ptr, descr),
+        'f' => ctx
+            .trace_ctx
+            .vable_getfield_float(pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
 

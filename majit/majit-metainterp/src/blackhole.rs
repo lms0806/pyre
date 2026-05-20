@@ -5690,10 +5690,17 @@ fn handler_int_mul_jump_if_ovf(
 // ── misc simple ops ─────────────────────────────────────────────────
 
 fn handler_assert_not_none(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
+    // blackhole.py:613 `bhimpl_assert_not_none(a): assert a`.
+    let reg = code[position] as usize;
+    let a = bh.registers_r[reg];
+    assert!(
+        a != 0,
+        "bhimpl_assert_not_none: ref register r{reg} is null"
+    );
     Ok(position + 1)
 }
 

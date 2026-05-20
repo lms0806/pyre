@@ -65,7 +65,8 @@ use super::call_policy_byte::{
     VOID_MAY_FORCE, VOID_RELEASE_GIL,
 };
 use super::codegen_trace::{
-    block_contains_match, find_dispatch_match, is_promote_call_path, stmt_contains_match,
+    block_contains_match, find_dispatch_match, is_assert_not_none_call_path, is_promote_call_path,
+    is_record_exact_class_call_path, stmt_contains_match,
 };
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit, ExprMatch,
@@ -985,6 +986,12 @@ pub(super) enum OpKind {
     StateField,
     /// `int_guard_value` / `float_guard_value` / `ref_guard_value`.
     GuardValue,
+    /// `assert_not_none` — record that a ref operand is non-null
+    /// (pyjitpl.py:385-391 opimpl_assert_not_none).
+    AssertNotNone,
+    /// `record_exact_class` — record that a ref operand's class is a
+    /// known constant (pyjitpl.py:393-410 opimpl_record_exact_class).
+    RecordExactClass,
     /// `record_known_result_*` — pure-call result hint, no real call.
     RecordKnownResult,
     /// `jit_merge_point` portal merge-point marker.

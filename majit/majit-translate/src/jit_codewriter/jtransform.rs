@@ -4457,6 +4457,113 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_graph_remaps_guard_value_after_same_as_identity() {
+        let mut graph = FunctionGraph::new("same_as_then_guard");
+        let input = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: graph.must_variable(input),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::GuardValue {
+                value: graph.must_variable(alias),
+                kind_char: 'i',
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let guard = transformed
+            .graph
+            .block(transformed.graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::GuardValue { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("GuardValue must survive the transform");
+
+        assert_eq!(
+            transformed.graph.value_id_of(guard),
+            Some(input),
+            "GuardValue.value must follow PyPy _do_renaming through same_as"
+        );
+    }
+
+    #[test]
+    fn rewrite_graph_remaps_vtable_method_receiver_after_same_as_identity() {
+        let mut graph = FunctionGraph::new("same_as_then_vtable_method");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "receiver".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: graph.must_variable(receiver),
+                    result_ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::VtableMethodPtr {
+                receiver: graph.must_variable(alias),
+                trait_root: "Handler".into(),
+                method_name: "run".into(),
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let vtable_receiver = transformed
+            .graph
+            .block(transformed.graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::VtableMethodPtr { receiver, .. } => Some(receiver),
+                _ => None,
+            })
+            .expect("VtableMethodPtr must survive the transform");
+
+        assert_eq!(
+            transformed.graph.value_id_of(vtable_receiver),
+            Some(receiver),
+            "VtableMethodPtr.receiver must follow PyPy _do_renaming through same_as"
+        );
+    }
+
+    #[test]
     fn rewrite_graph_coerces_mixed_float_add() {
         let mut graph = FunctionGraph::new("mixed_float_add");
         let lhs = graph

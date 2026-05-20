@@ -723,20 +723,96 @@ pub fn set_user_param(params: &mut JitParameters, text: &str) -> Result<(), JitH
 /// Assure the JIT that value is an instance of cls. This is a precise
 /// class check, like a guard_class.
 ///
-/// See also `debug_assert_not_none(x)`, which asserts that x is not None
+/// See also `assert_not_none(x)`, which asserts that x is not None
 /// and also assures the JIT that it is the case.
 ///
-/// rlib/jit.py:1181 — `assert type(value) is cls`
+/// rlib/jit.py:1181 — `assert type(value) is cls`. RPython
+/// `ll_record_exact_class(ll_value, ll_cls)` (rlib/jit.py:1191) asserts
+/// `ll_type(ll_value) is ll_cls`.  The blackhole bytecode signature is
+/// `record_exact_class/ri` (`blackhole.py:616`): the instance is a ref
+/// and the class pointer travels through the int register bank.
 ///
-/// In Rust, exact class checks use vtable pointers.  The `cls` parameter
-/// is a type discriminant (e.g., vtable address).  In interpreted mode,
-/// this is a debug assertion; in JIT, it becomes RECORD_EXACT_CLASS.
+/// In Rust, `cls` is the raw class/vtable sentinel address as an integer.
+/// Object references are checked by reading the first pointer-sized word,
+/// matching RPython's low-level object layout where `ll_type(ll_value)`
+/// reads `OBJECT.typeptr`.  Raw vtable callers can pass the vtable word
+/// directly; that mirrors the pre-lowered `type(value) is cls` check.
+pub trait RecordExactClassValue {
+    fn record_exact_class_typeptr(self) -> usize;
+}
+
+impl RecordExactClassValue for usize {
+    #[inline(always)]
+    fn record_exact_class_typeptr(self) -> usize {
+        self
+    }
+}
+
+impl RecordExactClassValue for i64 {
+    #[inline(always)]
+    fn record_exact_class_typeptr(self) -> usize {
+        self as usize
+    }
+}
+
+impl<T: ?Sized> RecordExactClassValue for &T {
+    #[inline(always)]
+    fn record_exact_class_typeptr(self) -> usize {
+        assert!(
+            std::mem::size_of_val(self) >= std::mem::size_of::<usize>(),
+            "record_exact_class called with value too small to carry typeptr"
+        );
+        let data = self as *const T as *const () as *const usize;
+        // RPython rclass.ll_type(obj) reads the typeptr field from the
+        // object header.  Pyre object layouts used with this hint put the
+        // class/vtable word at offset zero.
+        unsafe { *data }
+    }
+}
+
+impl<T> RecordExactClassValue for *const T {
+    #[inline(always)]
+    fn record_exact_class_typeptr(self) -> usize {
+        assert!(
+            !self.is_null(),
+            "record_exact_class called with None argument"
+        );
+        unsafe { *(self as *const usize) }
+    }
+}
+
+impl<T> RecordExactClassValue for *mut T {
+    #[inline(always)]
+    fn record_exact_class_typeptr(self) -> usize {
+        (self as *const T).record_exact_class_typeptr()
+    }
+}
+
 #[inline(always)]
-pub fn record_exact_class(value_vtable: usize, cls: usize) {
-    debug_assert_eq!(
-        value_vtable, cls,
-        "record_exact_class: value vtable does not match expected class"
+pub fn record_exact_class<V: RecordExactClassValue>(value: V, cls: usize) {
+    assert_eq!(
+        value.record_exact_class_typeptr(),
+        cls,
+        "record_exact_class called with invalid arguments"
     );
+}
+
+// ── assert_not_none ──
+// rtyper/debug.py:23-26 ll_assert_not_none
+
+/// Assure the JIT that value is not None.
+///
+/// rtyper/debug.py:23-26 — `assert x is not None; return x`
+///
+/// In Rust there is no Python `None` per se; the Option<&T> / Option<Box<T>>
+/// shape is the closest analog, and `Option::expect("ll_assert_not_none")`
+/// preserves the upstream assertion semantics. The standalone identity
+/// form (`x.assert_not_none()` on already-non-None Rust values) is a
+/// no-op at runtime; the JIT consumer recognises calls and emits an
+/// ASSERT_NOT_NONE op via [`crate::TraceCtx::trace_assert_not_none`].
+#[inline(always)]
+pub fn assert_not_none<T>(x: Option<T>) -> T {
+    x.expect("ll_assert_not_none")
 }
 
 // ── _jit_record_known_result ──
@@ -955,6 +1031,40 @@ mod tests {
         let mut vref = virtual_ref(&val);
         virtual_ref_finish(&mut vref, &val);
         assert!(vref.force().is_err());
+    }
+
+    #[test]
+    fn record_exact_class_accepts_matching_typeptr_header() {
+        #[repr(C)]
+        struct Obj {
+            typeptr: usize,
+            payload: i64,
+        }
+
+        let obj = Obj {
+            typeptr: 0xCAFE_BABE,
+            payload: 7,
+        };
+        record_exact_class(&obj, 0xCAFE_BABE);
+    }
+
+    #[test]
+    #[should_panic(expected = "record_exact_class called with invalid arguments")]
+    fn record_exact_class_rejects_mismatched_typeptr_header() {
+        #[repr(C)]
+        struct Obj {
+            typeptr: usize,
+        }
+
+        let obj = Obj { typeptr: 1 };
+        record_exact_class(&obj, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "record_exact_class called with None argument")]
+    fn record_exact_class_rejects_null_pointer() {
+        let ptr: *const usize = std::ptr::null();
+        record_exact_class(ptr, 1);
     }
 
     #[test]

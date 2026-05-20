@@ -3301,30 +3301,33 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta
-            .opimpl_getfield_vable_int(pc, vable_opref, fielddescr)
+            .opimpl_getfield_vable_int(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_ref(
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta
-            .opimpl_getfield_vable_ref(pc, vable_opref, fielddescr)
+            .opimpl_getfield_vable_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_float(
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta
-            .opimpl_getfield_vable_float(pc, vable_opref, fielddescr)
+            .opimpl_getfield_vable_float(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     pub fn opimpl_setfield_vable_int(
@@ -3493,11 +3496,12 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         pc: usize,
         vable_opref: OpRef,
+        vable_struct_ptr: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
         self.meta
-            .opimpl_arraylen_vable(pc, vable_opref, fdescr, adescr)
+            .opimpl_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
     /// Start bridge tracing from a guard failure point.

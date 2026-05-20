@@ -426,6 +426,21 @@ pub const BC_GETARRAYITEM_GC_R_RRD: u8 = 175;
 // Argcodes: `rdd` (struct ref + fielddescr + mutatefielddescr).
 pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 
+// `assert_not_none/r` — RPython `pyjitpl.py:385-391 opimpl_assert_not_none`
+// + `blackhole.py:613 bhimpl_assert_not_none`.  Records that `box` is
+// known non-null so subsequent nullity-aware sites
+// (`_establish_nullity`, KnownClass guards) can skip their own checks.
+// Argcodes: `r` (struct ref).
+pub const BC_ASSERT_NOT_NONE: u8 = 200;
+
+// `record_exact_class/ri` — RPython `pyjitpl.py:393-410
+// opimpl_record_exact_class` + `blackhole.py:616 bhimpl_record_exact_class`.
+// Records that `box`'s class is exactly `cls` (vtable ref constant) so
+// subsequent class-aware sites can skip the GuardClass.  Argcodes:
+// `ri` (struct ref + class pointer as int), matching
+// `blackhole.py:616 @arguments("r", "i")`.
+pub const BC_RECORD_EXACT_CLASS: u8 = 201;
+
 pub const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// Lookup a bytecode opcode by its `opname/argcodes` key.
@@ -843,6 +858,22 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
+
+    // Heapcache hint markers — `pyjitpl.py:385-410`.
+    // `assert_not_none/r` records that `box` is non-null;
+    // `record_exact_class/ri` records that `box`'s class equals the
+    // `cls` constant (vtable pointer carried through the int bank).
+    // `record_exact_class` is a no-op at
+    // blackhole resume; `assert_not_none` checks the concrete ref just
+    // like `blackhole.py:613`.  The trace-time dispatcher routes them through
+    // `TraceCtx::trace_assert_not_none` /
+    // `TraceCtx::trace_record_exact_class`, which gate on
+    // `heap_cache.is_nullity_known` / `is_class_known` and bump
+    // `HEAPCACHED_OPS` on cache hit per `pyjitpl.py:387-388 / 396-397`.
+    // The `/ri` suffix matches `blackhole.py:616`; tracing reboxes a
+    // constant int class pointer as a ConstPtr before recording.
+    m.insert("assert_not_none/r", BC_ASSERT_NOT_NONE);
+    m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
 
     // Float comparisons — `blackhole.py:721-746`
     // `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float pair → int (0/1).

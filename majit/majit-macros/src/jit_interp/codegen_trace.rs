@@ -395,3 +395,51 @@ pub(crate) fn is_promote_call_path(func: &syn::Expr) -> bool {
         _ => false,
     }
 }
+
+/// Check if a call expression's function path is a `jit::assert_not_none`
+/// call.
+///
+/// Matches: `assert_not_none`, `jit::assert_not_none`,
+/// `majit_metainterp::jit::assert_not_none`.  Mirrors RPython
+/// `rtyper/debug.py:23 ll_assert_not_none` recognition.
+pub(crate) fn is_assert_not_none_call_path(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(func_path) = func else {
+        return false;
+    };
+    let segments: Vec<_> = func_path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [name] => name == "assert_not_none",
+        [ns, name] => name == "assert_not_none" && ns == "jit",
+        [_, ns, name] => name == "assert_not_none" && ns == "jit",
+        _ => false,
+    }
+}
+
+/// Check if a call expression's function path is a `jit::record_exact_class`
+/// call.
+///
+/// Matches: `record_exact_class`, `jit::record_exact_class`,
+/// `majit_metainterp::jit::record_exact_class`.  Mirrors RPython
+/// `rlib/jit.py:1181 jit.record_exact_class` recognition.
+pub(crate) fn is_record_exact_class_call_path(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(func_path) = func else {
+        return false;
+    };
+    let segments: Vec<_> = func_path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [name] => name == "record_exact_class",
+        [ns, name] => name == "record_exact_class" && ns == "jit",
+        [_, ns, name] => name == "record_exact_class" && ns == "jit",
+        _ => false,
+    }
+}

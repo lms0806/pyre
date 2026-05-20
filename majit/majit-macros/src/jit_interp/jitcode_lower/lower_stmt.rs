@@ -701,6 +701,16 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_promote_stmt(expr) {
             return Some(());
         }
+        // pyjitpl.py:385-391 opimpl_assert_not_none — statement-form
+        // `jit::assert_not_none(x);` (discard return value).
+        if let Some(()) = self.lower_assert_not_none_stmt(expr) {
+            return Some(());
+        }
+        // pyjitpl.py:393-410 opimpl_record_exact_class — statement-form
+        // `jit::record_exact_class(value, cls);` (no return value).
+        if let Some(()) = self.lower_record_exact_class_stmt(expr) {
+            return Some(());
+        }
         // State field writes (register/tape machines).
         if let Some(()) = self.lower_state_field_update(expr) {
             return Some(());

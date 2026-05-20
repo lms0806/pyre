@@ -545,9 +545,50 @@ fn getfield_gc_i_pureornot(
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
+    use majit_ir::Value;
     // heapcache: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
+        // pyjitpl.py:934-945 cache-hit sanity check (int arm). The
+        // line-by-line port runs `executor.execute(cpu, mi, opnum,
+        // fielddescr, box)` and asserts `resvalue ==
+        // upd.currfieldbox.getint()`. Pyre projects the struct
+        // pointer through `concrete_of_opref(obj)`.  The expected
+        // value comes from Const boxes or the `opref_concrete`
+        // Box.value analog stamped on a previous miss.
+        let expected_int = if cached.is_constant() {
+            match ctx.constants_get_value(cached) {
+                Some(Value::Int(n)) => Some(n),
+                _ => None,
+            }
+        } else {
+            match ctx.lookup_opref_concrete(cached) {
+                Some(Value::Int(n)) => Some(n),
+                _ => None,
+            }
+        };
+        if let Some(cached_int) = expected_int {
+            if let Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(Value::Int(loaded)) =
+                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                    {
+                        assert_eq!(
+                            loaded, cached_int,
+                            "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (int): loaded {loaded} != cached \
+                             {cached_int} (field_index={field_index}, \
+                             struct_ptr={struct_ptr:#x})"
+                        );
+                    }
+                }
+            }
+        }
+        // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
+        // Counters.HEAPCACHED_OPS) — folded-away op accounting on cache hit.
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -555,7 +596,17 @@ fn getfield_gc_i_pureornot(
     } else {
         OpCode::GetfieldGcI
     };
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    if let Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if let Some(live) =
+                ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+            {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
@@ -682,8 +733,51 @@ fn getfield_gc_f_pureornot(
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
+    use majit_ir::Value;
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
+        // pyjitpl.py:941-945 cache-hit sanity check (float arm).
+        // ConstFloat.same_constant compares via longlong.extract_bits
+        // (history.py:283-294); pyre's Value Eq for Float uses
+        // to_bits — bit-identical, NaN==NaN, 0.0!=-0.0. The expected
+        // value comes from Const boxes or the `opref_concrete`
+        // Box.value analog stamped on a previous miss.
+        let expected_float = if cached.is_constant() {
+            match ctx.constants_get_value(cached) {
+                Some(Value::Float(f)) => Some(f),
+                _ => None,
+            }
+        } else {
+            match ctx.lookup_opref_concrete(cached) {
+                Some(Value::Float(f)) => Some(f),
+                _ => None,
+            }
+        };
+        if let Some(cached_float) = expected_float {
+            if let Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    if let Some(Value::Float(loaded)) =
+                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+                    {
+                        assert_eq!(
+                            loaded.to_bits(),
+                            cached_float.to_bits(),
+                            "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (float): loaded {loaded} != cached \
+                             {cached_float} (field_index={field_index}, \
+                             struct_ptr={struct_ptr:#x})"
+                        );
+                    }
+                }
+            }
+        }
+        // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
+        // Counters.HEAPCACHED_OPS) — the opnum literal in upstream is
+        // GETFIELD_GC_I regardless of type, so wire the float variant
+        // to the same counter bucket.
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -691,7 +785,17 @@ fn getfield_gc_f_pureornot(
     } else {
         OpCode::GetfieldGcF
     };
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    if let Value::Ref(struct_ref) = ctx.concrete_of_opref(obj) {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if let Some(live) =
+                ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+            {
+                ctx.set_opref_concrete(result, live);
+            }
+        }
+    }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }

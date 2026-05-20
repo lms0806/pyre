@@ -69,6 +69,11 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_promote_call(call) {
                     return Some(binding);
                 }
+                // pyjitpl.py:385-391 opimpl_assert_not_none — emit
+                // BC_ASSERT_NOT_NONE and return the unwrapped binding.
+                if let Some(binding) = self.lower_assert_not_none_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => self.lower_method_call_value(call),
@@ -121,6 +126,72 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Statement-context lowering for `jit::assert_not_none(x);`.
+    ///
+    /// pyjitpl.py:385-391 `opimpl_assert_not_none`. Bare statement form
+    /// discards the unwrapped value but still emits the
+    /// `BC_ASSERT_NOT_NONE` op so the trace records the nullity hint.
+    /// The `let x = jit::assert_not_none(y);` form goes through the
+    /// value-context lowerer instead (lower_value_expr →
+    /// lower_assert_not_none_call); this stmt site catches only the
+    /// bare-call shape.
+    pub(super) fn lower_assert_not_none_stmt(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        if !is_assert_not_none_call_path(&call.func) {
+            return None;
+        }
+        self.lower_value_expr(expr)?;
+        Some(())
+    }
+
+    /// Statement-context lowering for `jit::record_exact_class(value, cls);`.
+    ///
+    /// pyjitpl.py:393-410 `opimpl_record_exact_class`. RPython
+    /// `rlib/jit.py:1181 record_exact_class` is a void hint, so this is
+    /// the only emission shape — there is no value-form (the runtime
+    /// stub at `jit.rs:735` returns `()`).
+    ///
+    /// `value` must be Ref-kind and `cls` must be Int-kind, matching
+    /// `blackhole.py:616 @arguments("r", "i")`.  Non-matching kinds
+    /// silently skip per `pyjitpl.py:399 if isinstance(clsbox, Const):` —
+    /// dispatch-time `trace_record_exact_class` also gates on
+    /// `cls_const.is_constant()`.
+    pub(super) fn lower_record_exact_class_stmt(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        if !is_record_exact_class_call_path(&call.func) {
+            return None;
+        }
+        if call.args.len() != 2 {
+            return None;
+        }
+        let value_binding = self.lower_value_expr(&call.args[0])?;
+        let cls_binding = self.lower_value_expr(&call.args[1])?;
+        if !matches!(value_binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        if !matches!(cls_binding.kind, BindingKind::Int) {
+            return None;
+        }
+        let value_reg = value_binding.reg;
+        let cls_reg = cls_binding.reg;
+        // jtransform.py:289 emits a single SpaceOperation with no
+        // preceding `-live-` annotation (-live- is only attached to
+        // promote, jtransform.py:611).
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::RecordExactClass,
+                vec![Register::ref_(value_reg), Register::int(cls_reg)],
+                vec![],
+            ),
+            quote! { __builder.record_exact_class(#value_reg, #cls_reg); },
+        );
+        Some(())
+    }
+
     /// Lower `promote(x)` → emit `-live-` + `<kind>_guard_value(x_reg)`,
     /// return x binding.
     ///
@@ -137,6 +208,38 @@ impl<'c> Lowerer<'c> {
     /// at non-trace time).  Tracing: emits GUARD_VALUE to specialize on
     /// current value with the per-pc live set saved into all_liveness.
     ///
+    /// Recognizes: `assert_not_none(x)`, `jit::assert_not_none(x)`.
+    ///
+    /// pyjitpl.py:385-391 `opimpl_assert_not_none(box)`. Emits
+    /// `BC_ASSERT_NOT_NONE`; trace-time dispatcher routes through
+    /// `TraceCtx::trace_assert_not_none` which gates on
+    /// `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS` on cache
+    /// hit. Only fires for ref-typed bindings — `jit::assert_not_none<T>`
+    /// is documented as the `Option<T>::expect` analog at the runtime
+    /// stub (`jit.rs:756`), so non-ref bindings (int/float) cannot
+    /// reach this site through `Option<T>` unwrap.
+    fn lower_assert_not_none_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        if !is_assert_not_none_call_path(&call.func) {
+            return None;
+        }
+        if call.args.len() != 1 {
+            return None;
+        }
+        let binding = self.lower_value_expr(&call.args[0])?;
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let reg = binding.reg;
+        // jtransform.py:324-328 emits a single SpaceOperation with no
+        // preceding `-live-` annotation (-live- is only attached to
+        // promote, jtransform.py:611).
+        self.emit_op(
+            OpMeta::linear(OpKind::AssertNotNone, vec![Register::ref_(reg)], vec![]),
+            quote! { __builder.assert_not_none(#reg); },
+        );
+        Some(binding)
+    }
+
     /// Recognizes: `promote(x)`, `hint_promote(x)`, `jit::promote(x)`.
     fn lower_promote_call(&mut self, call: &ExprCall) -> Option<Binding> {
         if !is_promote_call_path(&call.func) {
@@ -1110,5 +1213,62 @@ impl<'c> Lowerer<'c> {
             Stmt::Expr(expr, None) => self.lower_value_expr(expr),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(reg: u16, kind: BindingKind) -> Binding {
+        Binding {
+            reg,
+            kind,
+            depends_on_stack: false,
+        }
+    }
+
+    #[test]
+    fn record_exact_class_statement_uses_ref_int_argcodes() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("value".to_string(), binding(1, BindingKind::Ref));
+        lowerer
+            .bindings
+            .insert("cls".to_string(), binding(2, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("jit::record_exact_class(value, cls)").expect("parse hint call");
+
+        assert_eq!(lowerer.lower_record_exact_class_stmt(&expr), Some(()));
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        assert_eq!(lowerer.op_metadata[0].kind, OpKind::RecordExactClass);
+        assert_eq!(
+            lowerer.op_metadata[0].reads,
+            vec![Register::ref_(1), Register::int(2)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("record_exact_class"));
+    }
+
+    #[test]
+    fn record_exact_class_statement_rejects_ref_class_operand() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("value".to_string(), binding(1, BindingKind::Ref));
+        lowerer
+            .bindings
+            .insert("cls".to_string(), binding(2, BindingKind::Ref));
+        let expr: Expr =
+            syn::parse_str("jit::record_exact_class(value, cls)").expect("parse hint call");
+
+        assert_eq!(lowerer.lower_record_exact_class_stmt(&expr), None);
+        assert!(lowerer.op_metadata.is_empty());
+        assert!(lowerer.statements.is_empty());
     }
 }

@@ -882,7 +882,7 @@ impl Link {
         target: BlockId,
         exitcase: Option<ExitCase>,
     ) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             args.len(),
             graph.block(target).inputargs.len(),
             "output args mismatch"
@@ -3162,6 +3162,14 @@ mod tests {
         let link = Link::from_variables(&graph, vec![], next, None);
         graph.set_control_flow_metadata(entry, None, vec![link]);
         assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
+    }
+
+    #[test]
+    #[should_panic(expected = "output args mismatch")]
+    fn link_new_panics_on_output_arg_mismatch() {
+        let mut graph = FunctionGraph::new("demo");
+        let (target, _) = graph.create_block_with_args(1);
+        let _ = Link::from_variables(&graph, vec![], target, None);
     }
 
     #[test]

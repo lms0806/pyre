@@ -1037,6 +1037,49 @@ pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
 /// transcribes onto `metainterp.last_exc_value` and overrides the
 /// result with `0` — matching `executor.py:52-78`'s neutral-zero
 /// behavior across INT, REF (NULL), FLOAT (longlong.ZEROF), and VOID.
+// executor.py:188-190
+//
+//     def do_getfield_gc_i(cpu, _, structbox, fielddescr):
+//         struct = structbox.getref_base()
+//         return cpu.bh_getfield_gc_i(struct, fielddescr)
+//
+// `structbox.getref_base()` returns the GCREF the box carries; pyre's
+// flat box analog is the concrete `i64` shadow paired with the symbolic
+// OpRef (the (OpRef, i64) tuple returned by `read_ref_reg`). The
+// caller has already projected `structbox.getref_base()` and passes it
+// as `structbox` here so the function shape matches RPython 1:1.
+pub fn do_getfield_gc_i(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> i64 {
+    let struct_ = structbox;
+    cpu.bh_getfield_gc_i(struct_, fielddescr)
+}
+
+// executor.py:192-194
+pub fn do_getfield_gc_r(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> majit_ir::GcRef {
+    let struct_ = structbox;
+    cpu.bh_getfield_gc_r(struct_, fielddescr)
+}
+
+// executor.py:196-198
+pub fn do_getfield_gc_f(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+) -> f64 {
+    let struct_ = structbox;
+    cpu.bh_getfield_gc_f(struct_, fielddescr)
+}
+
 pub fn execute_varargs<M: Clone>(
     metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,
