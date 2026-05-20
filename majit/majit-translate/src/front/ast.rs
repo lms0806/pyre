@@ -1795,12 +1795,15 @@ struct GraphBuildContext<'a> {
     /// scaffolded here so the stack-helper API surface (`pushvalue` /
     /// `popvalue` / `peekvalue` / `popvalues` / `dropvaluesuntil`) can
     /// be ported in advance and validated in isolation.  Cell type is
-    /// `ValueId` (pyre's flowspace::Variable identity surrogate); the
-    /// upstream's `Variable | Constant | FlowSignal` polymorphism is
-    /// closed to `ValueId` until Z4.E activates the SpamBlock chain
-    /// at Match merges and the FlowSignal cells need a tagged shape.
+    /// `StackElem` (Hlvalue cells per `flowcontext.py:285 self.stack`,
+    /// a polymorphic `Variable | Constant | FlowSignal` list).
+    /// `pushvalue(vid)` mints a fresh `Variable` and registers
+    /// `(variable, vid)` so the cell ID round-trips through
+    /// `bridge_variable`; `popvalue() -> ValueId` reverses the bridge.
+    /// `Hlvalue::Constant` and `FlowSignal` arms become callable once
+    /// the Z4 walker (slice Z4.B+) introduces a non-Variable push site.
     #[allow(dead_code)]
-    value_stack: Vec<ValueId>,
+    value_stack: Vec<crate::flowspace::framestate::StackElem>,
     /// Pending FSException at the current flow point — analogue of
     /// `flowcontext.py:354 self.last_exception`.  None until the Z4
     /// walker (slice Z4.B+) populates a real value at SETUP_EXCEPT /
@@ -2204,7 +2207,7 @@ fn is_compound_assign(op: syn::BinOp) -> bool {
 ///     header_entry, vec![])`).  This routine pushes onto that
 ///     existing exit's `args` rather than re-closing the block.
 ///   - `pre_loop_snapshot` was produced by
-///     `ctx.getstate(0)` (or constructed from the same
+///     `ctx.getstate(graph, 0)` (or constructed from the same
 ///     ctx state) so its entries are in first-bind positional order.
 ///
 /// Returns the ordered list of header-phi names.
@@ -2368,77 +2371,153 @@ impl<'a> GraphBuildContext<'a> {
         self.value_stack.len()
     }
 
-    /// `flowcontext.py:321-322 pushvalue(self, w_object)` — push onto
-    /// the value stack.
+    /// `flowcontext.py:321-322 pushvalue(self, w_object)` — push the
+    /// Hlvalue cell `w_object` onto the value stack.  PyPy signature
+    /// takes the cell verbatim; pyre wraps as `StackElem::Value` /
+    /// `StackElem::Signal` at the caller.
     #[allow(dead_code)]
-    fn pushvalue(&mut self, vid: ValueId) {
-        self.value_stack.push(vid);
+    fn pushvalue(&mut self, cell: crate::flowspace::framestate::StackElem) {
+        self.value_stack.push(cell);
     }
 
     /// `flowcontext.py:324-325 popvalue(self)` — pop the topmost cell.
     /// Panics when the stack is empty (upstream's `list.pop()` raises
     /// `IndexError`; pyre raises `unwrap`).
     #[allow(dead_code)]
-    fn popvalue(&mut self) -> ValueId {
+    fn popvalue(&mut self) -> crate::flowspace::framestate::StackElem {
         self.value_stack
             .pop()
             .expect("popvalue: empty stack (flowcontext.py:325 list.pop on empty)")
+    }
+
+    /// Production-side `pushvalue` for a pyre `ValueId` — fetches the
+    /// backing `Variable` from `graph.value_variables[vid.0]` (every
+    /// vid minted via `alloc_value` has one) and wraps it as a
+    /// `StackElem::Value(Hlvalue::Variable(_))` before pushing.
+    ///
+    /// Pyre's analogue of upstream's `pushvalue(self, w_object)` —
+    /// upstream's Variable carries its identity inline, so the
+    /// SpaceOperation `result` cell is what reaches the stack.  Pyre
+    /// keys identity through ValueId; the bridge through
+    /// `graph.variable(vid)` recovers the matching Variable so
+    /// stack-merge participants (`FrameState::union`,
+    /// `set_goto_from_framestate`) see the same identity downstream.
+    ///
+    /// Currently unused by production lower_expr / lower_stmt — the
+    /// Z4.B.1+ leaf-push migration consumes this once individual
+    /// `Expr` variants flip from return-Lowered::value to
+    /// push-onto-value_stack.  Test fixtures route through the
+    /// equivalent `z4a_push_vid` helper that mints + binds a fresh
+    /// Variable to a chosen vid; this production variant assumes the
+    /// vid was already minted via the canonical allocation path.
+    #[allow(dead_code)]
+    fn pushvid(&mut self, graph: &FunctionGraph, vid: ValueId) {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::Hlvalue;
+        let var = graph
+            .variable(vid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "pushvid: ValueId {vid:?} has no backing Variable on graph {:?}; \
+                     callers must mint the vid via `alloc_value` / \
+                     `alloc_value_with_variable` before pushing onto value_stack",
+                    graph.name,
+                )
+            })
+            .clone();
+        self.pushvalue(StackElem::Value(Hlvalue::Variable(var)));
+    }
+
+    /// Production-side `popvalue` recovering a `ValueId` from the
+    /// topmost cell — counterpart to [`Self::pushvid`].  Panics when
+    /// the stack is empty (`popvalue`'s precondition) or when the
+    /// topmost cell is not a `StackElem::Value(Hlvalue::Variable(_))`.
+    ///
+    /// Pyre's analogue of upstream's `w_obj = self.popvalue()` followed
+    /// by `op.result = w_obj` — upstream consumes Variables directly,
+    /// pyre threads them back to the pyre IR's `ValueId` carrier via
+    /// `graph.bridge_variable(&var)`.
+    ///
+    /// The Variable-only restriction matches the Z4.B.1 push contract
+    /// (only `pushvid`-style cells today); once Z4.G+ activates
+    /// Constant-cell pushes the helper will widen with a matching
+    /// `LinkArg::Const`-style return.
+    #[allow(dead_code)]
+    fn popvid(&mut self, graph: &FunctionGraph) -> ValueId {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::Hlvalue;
+        match self.popvalue() {
+            StackElem::Value(Hlvalue::Variable(v)) => graph.bridge_variable(&v),
+            other => panic!(
+                "popvid: expected StackElem::Value(Hlvalue::Variable), got {other:?} \
+                 (graph {:?})",
+                graph.name,
+            ),
+        }
     }
 
     /// `flowcontext.py:327-330 peekvalue(self, index_from_top=0)` —
     /// look at the cell `index_from_top` positions below the top.
     /// Top of stack is `peekvalue(0)`.
     #[allow(dead_code)]
-    fn peekvalue(&self, index_from_top: usize) -> ValueId {
+    fn peekvalue(&self, index_from_top: usize) -> &crate::flowspace::framestate::StackElem {
         let len = self.value_stack.len();
         assert!(
             index_from_top < len,
             "peekvalue: depth {index_from_top} exceeds stack size {len} (flowcontext.py:329)"
         );
-        self.value_stack[len - 1 - index_from_top]
+        &self.value_stack[len - 1 - index_from_top]
     }
 
     /// `flowcontext.py:332-334 settopvalue(self, w_object,
     /// index_from_top=0)` — overwrite the cell `index_from_top`
     /// positions below the top.
     #[allow(dead_code)]
-    fn settopvalue(&mut self, vid: ValueId, index_from_top: usize) {
+    fn settopvalue(
+        &mut self,
+        cell: crate::flowspace::framestate::StackElem,
+        index_from_top: usize,
+    ) {
         let len = self.value_stack.len();
         assert!(
             index_from_top < len,
             "settopvalue: depth {index_from_top} exceeds stack size {len} (flowcontext.py:333)"
         );
         let idx = len - 1 - index_from_top;
-        self.value_stack[idx] = vid;
+        self.value_stack[idx] = cell;
     }
 
     /// `flowcontext.py:336-341 popvalues(self, n)` — pop `n` cells in
     /// stack order (oldest first), returning them as a `Vec`.  `n == 0`
     /// returns an empty vec without touching the stack.
+    ///
+    /// PyPy uses Python negative-slice semantics — `self.stack[-n:]`
+    /// silently clamps when `n > len(self.stack)`, so the upstream
+    /// helper returns the entire stack and clears it without raising.
+    /// Mirror that behaviour by clamping `n` to `len` before splitting;
+    /// asserting here would diverge from upstream on overflow inputs.
     #[allow(dead_code)]
-    fn popvalues(&mut self, n: usize) -> Vec<ValueId> {
+    fn popvalues(&mut self, n: usize) -> Vec<crate::flowspace::framestate::StackElem> {
         if n == 0 {
             return Vec::new();
         }
         let len = self.value_stack.len();
-        assert!(
-            n <= len,
-            "popvalues: n={n} exceeds stack size {len} (flowcontext.py:339 negative slice)"
-        );
-        self.value_stack.split_off(len - n)
+        let take = n.min(len);
+        self.value_stack.split_off(len - take)
     }
 
     /// `flowcontext.py:343-344 dropvaluesuntil(self, finaldepth)` —
     /// shrink the stack to exactly `finaldepth` cells.  Used by
     /// `FrameBlock.cleanupstack` (`flowcontext.py:1335-1336`) when a
     /// SETUP_* block is unwound.
+    ///
+    /// PyPy's `del self.stack[finaldepth:]` is a no-op when
+    /// `finaldepth >= len(self.stack)` (the slice past the end is
+    /// empty).  `Vec::truncate` matches: it leaves the stack
+    /// unchanged when `finaldepth >= len`.  No assert — overflow
+    /// inputs silently pass.
     #[allow(dead_code)]
     fn dropvaluesuntil(&mut self, finaldepth: usize) {
-        let len = self.value_stack.len();
-        assert!(
-            finaldepth <= len,
-            "dropvaluesuntil: finaldepth {finaldepth} exceeds stack size {len} (flowcontext.py:344)"
-        );
         self.value_stack.truncate(finaldepth);
     }
 
@@ -2456,36 +2535,19 @@ impl<'a> GraphBuildContext<'a> {
     /// `last_exception` and `blocklist` thread directly because
     /// their cell types match between ctx and `FrameState`.
     ///
-    /// PRE-EXISTING-ADAPTATION (`flowcontext.py:347 self.stack[:]`):
-    /// upstream copies `self.stack` (a `Vec<Hlvalue>`) into the new
-    /// `FrameState.stack`.  Pyre's ctx field is `value_stack:
-    /// Vec<ValueId>` (graph-local-id surrogate) while
-    /// `FrameState.stack` is `Vec<StackElem>` (Hlvalue cells per the
-    /// P1.B parity port).  There is no Hlvalue→ValueId bridge at the
-    /// AST frontend yet, so a line-by-line port is structurally
-    /// blocked.  The function below substitutes `Vec::new()` — a
-    /// no-op observed today because production never writes
-    /// `value_stack` (Z4.B.0 stmt-boundary tripwire enforces depth
-    /// 0); a leaf push in Z4.B.1+ would expose the bridge gap as
-    /// real lost state.  Convergence options (both retire this
-    /// PRE-EXISTING-ADAPTATION):
-    ///   (a) add a pyre-only `value_stack_surrogate: Vec<ValueId>`
-    ///       field on `FrameState`, cloned here and consumed by
-    ///       `setstate`, retired at Z2.5 once `stack` carries the
-    ///       fused domain;
-    ///   (b) land Z2.5 directly — introduce Hlvalue↔ValueId
-    ///       bidirectional mapping at GraphBuildContext, then map
-    ///       `value_stack` cells into `Hlvalue::Variable` here and
-    ///       restore via the inverse in `setstate`.
-    /// Both are tied to Z4.last (subsumes Z2.5 Hlvalue migration).
+    /// `value_stack` (now `Vec<StackElem>` per Z4.A.5) is cloned
+    /// verbatim into `FrameState.stack` — direct match of upstream's
+    /// `self.stack[:]` because both carriers are Hlvalue-shaped.
+    /// `last_exception` and `blocklist` thread directly because their
+    /// cell types match between ctx and `FrameState`.
     ///
     /// Production capture path: every `set_branch` / `set_goto` site
     /// in `Expr::If` / `Expr::Match` / loop variants stamps
-    /// `Block.framestate = Some(ctx.getstate(0))` so the lazy
+    /// `Block.framestate = Some(ctx.getstate(graph, 0))` so the lazy
     /// installer can walk predecessor framestates back to a binding
     /// site.  `next_offset = 0` until the Z4 walker rewrite threads
     /// real bytecode-equivalent offsets through.
-    fn getstate(&self, next_offset: i64) -> FrameState {
+    fn getstate(&self, graph: &FunctionGraph, next_offset: i64) -> FrameState {
         let entries: Vec<Option<ValueId>> = self
             .local_first_bind_order
             .iter()
@@ -2495,14 +2557,28 @@ impl<'a> GraphBuildContext<'a> {
                     .map(|&(value_id, _defining_block)| value_id)
             })
             .collect();
+        // Populate the `locals_w` Hlvalue carrier in lockstep with
+        // `entries` — `flowcontext.py:346 getstate` carries
+        // `self.locals_w` directly into the new FrameState.  Pyre's
+        // locals projection currently keys identity through ValueId, so
+        // the matching Hlvalue cell is recovered via `graph.variable(
+        // vid)`; the same derivation `FrameState::union` performs on the
+        // merged side so all production-captured states are filled.
+        let locals_w: Vec<Option<crate::flowspace::model::Hlvalue>> = entries
+            .iter()
+            .map(|slot| {
+                slot.and_then(|vid| {
+                    graph
+                        .variable(vid)
+                        .cloned()
+                        .map(crate::flowspace::model::Hlvalue::Variable)
+                })
+            })
+            .collect();
         FrameState {
             entries,
-            // PRE-EXISTING-ADAPTATION (see doc-comment): `value_stack`
-            // copy blocked on Hlvalue↔ValueId bridge (Z2.5).
-            // Substituted no-op produces an empty `FrameState.stack`
-            // — load-bearing once Z4.B.1+ leaves push cells onto
-            // `value_stack`.
-            stack: Vec::new(),
+            locals_w,
+            stack: self.value_stack.clone(),
             last_exception: self.last_exception.clone(),
             blocklist: self.blockstack.clone(),
             next_offset,
@@ -2532,15 +2608,10 @@ impl<'a> GraphBuildContext<'a> {
     /// `RaiseImplicit` cells live on `value_stack` yet (Z4.H ports
     /// the exception-handling sites).
     ///
-    /// PRE-EXISTING-ADAPTATION (`flowcontext.py:352 self.stack =
-    /// state.stack[:]`): the mirror of the `getstate` gap above.
-    /// Upstream restores ctx stack from the FrameState's saved
-    /// `Vec<Hlvalue>`; pyre has no Hlvalue→ValueId bridge to
-    /// rehydrate `value_stack: Vec<ValueId>`, so the function below
-    /// substitutes `value_stack.clear()` — a no-op observed today
-    /// because `getstate` never captures anything (paired blind
-    /// spots).  Once Z4.B.1+ leaves push cells, this restore needs
-    /// the same Z2.5 bridge as `getstate`.
+    /// `value_stack` (now `Vec<StackElem>` per Z4.A.5) is replaced by
+    /// `state.stack.clone()` — direct match of upstream's
+    /// `self.stack = state.stack[:]` because both carriers are
+    /// Hlvalue-shaped.
     ///
     /// Currently unused — `LocalBindingSnapshot::restore` continues
     /// to be the production restore path; this is the structural
@@ -2564,15 +2635,37 @@ impl<'a> GraphBuildContext<'a> {
                 }
             }
         }
-        // PRE-EXISTING-ADAPTATION (see doc-comment): upstream's
-        // `self.stack = state.stack[:]` blocked on Hlvalue↔ValueId
-        // bridge (Z2.5).  Substituted no-op clears the surrogate
-        // stack — load-bearing once Z4.B.1+ leaves push cells.
-        self.value_stack.clear();
+        // `flowcontext.py:352 self.stack = state.stack[:]` — direct
+        // copy now that `value_stack` and `FrameState.stack` share the
+        // `Vec<StackElem>` carrier (Z4.A.5).
+        self.value_stack = state.stack.clone();
         self.last_exception = state.last_exception.clone();
         self.blockstack = state.blocklist.clone();
-        // `_normalize_raise_signals` no-op until Z4.H wires
-        // RaiseImplicit cells onto `value_stack`.
+        self.normalize_raise_signals();
+    }
+
+    /// `flowcontext.py:358-362 _normalize_raise_signals` — every
+    /// `RaiseImplicit` cell on the stack is downgraded to a plain
+    /// `Raise(same w_exc)` after `setstate` restores a captured
+    /// snapshot.  Upstream rationale: a stored `RaiseImplicit` no
+    /// longer carries its "produced inside `do_op`" context once
+    /// it has been replayed from a `FrameState`, so the stricter
+    /// `Raise` semantics take over.  Today a no-op because the AST
+    /// walker has not yet pushed `FlowSignal` cells onto
+    /// `value_stack` — gates activate when Z4.H wires exception
+    /// handling.  Surface kept in lockstep with upstream's setstate
+    /// body so the wiring drops in without scope creep when the
+    /// Z4 walker materialises signal cells.
+    fn normalize_raise_signals(&mut self) {
+        use crate::flowspace::flowcontext::FlowSignal;
+        use crate::flowspace::framestate::StackElem;
+        for cell in &mut self.value_stack {
+            if let StackElem::Signal(FlowSignal::RaiseImplicit { w_exc }) = cell {
+                *cell = StackElem::Signal(FlowSignal::Raise {
+                    w_exc: w_exc.clone(),
+                });
+            }
+        }
     }
 
     /// Z4.B.0 tripwire — assert `value_stack` is empty at a statement
@@ -3823,7 +3916,19 @@ fn lower_if_expr(
     // cond raises `FlowingError`, halting the walk.  A child
     // that closed its path (`if return_early { ... } else ...`)
     // also has no truth value — propagate via `get_value!`.
-    let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
+    //
+    // Z4.B.1.b first production round-trip — push the cond vid onto
+    // `value_stack` and pop it back before the branch.  Equivalent to
+    // upstream `flowcontext.py:1095 if_jump` where the cond was pushed
+    // by the prior `COMPARE_OP` / `LOAD_FAST` / `POP_JUMP_IF_FALSE`
+    // pops it (`flowcontext.py:1097 cond = self.popvalue()`).  Pyre's
+    // `lower_expr` still returns `Lowered::value`; the pushvid/popvid
+    // pair exercises the production stack helpers so a later slice can
+    // flip `lower_expr` to push internally and drop the explicit
+    // push side here, leaving only the `popvid` consume.
+    let cond_pre = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
+    ctx.pushvid(graph, cond_pre);
+    let cond = ctx.popvid(graph);
 
     let mut then_block = graph.create_block();
     let mut else_block = graph.create_block();
@@ -3838,7 +3943,7 @@ fn lower_if_expr(
     // duplication of Slice 2 collapses into a single field.
     // RPython parity: `flowspace/flowcontext.py:38
     // SpamBlock.framestate`.
-    let pre_branch_snapshot = ctx.getstate(0);
+    let pre_branch_snapshot = ctx.getstate(graph, 0);
     let cond_var = graph.must_variable(cond);
     graph.set_branch(*block, cond_var, then_block, vec![], else_block, vec![]);
     graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
@@ -3866,7 +3971,7 @@ fn lower_if_expr(
     // else-arm lowering mutates `ctx.local_value_ids`.  Used
     // only if then-arm is open (will `set_goto` to merge); a
     // closed arm's snapshot is unused.
-    let then_exit_snapshot = ctx.getstate(0);
+    let then_exit_snapshot = ctx.getstate(graph, 0);
     // Capture the full ctx as well so we can restore the surviving
     // arm's `local_value_ids` / `local_value_types` if the other arm
     // closes (return/raise/break).  Without this, e.g.
@@ -3895,7 +4000,7 @@ fn lower_if_expr(
             _ => lower_expr(graph, &mut else_block, else_branch, options, ctx)?,
         };
     }
-    let else_exit_snapshot = ctx.getstate(0);
+    let else_exit_snapshot = ctx.getstate(graph, 0);
     // Companion ctx capture for the else-arm — same rationale as
     // `then_exit_ctx`.
     let else_exit_ctx = LocalBindingSnapshot::capture(ctx);
@@ -4104,8 +4209,12 @@ fn lower_expr(
         syn::Expr::Field(field) => {
             if let syn::Expr::Index(idx) = &*field.base {
                 // RPython: getinteriorfield_gc — arr[i].field as a single op.
-                let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
-                let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                let base_pre = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                ctx.pushvid(graph, base_pre);
+                let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                ctx.pushvid(graph, index_pre);
+                let index = ctx.popvid(graph);
+                let base = ctx.popvid(graph);
                 let base_var = graph.must_variable(base);
                 let index_var = graph.must_variable(index);
                 let field_name = member_name(&field.member);
@@ -4147,7 +4256,9 @@ fn lower_expr(
                     path_closed: false,
                 })
             } else {
-                let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                let base_pre = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                ctx.pushvid(graph, base_pre);
+                let base = ctx.popvid(graph);
                 let base_var = graph.must_variable(base);
                 let field_name = member_name(&field.member);
                 let field_type_string =
@@ -4178,8 +4289,12 @@ fn lower_expr(
 
         // ── base[index] ──
         syn::Expr::Index(idx) => {
-            let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
-            let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+            let base_pre = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+            ctx.pushvid(graph, base_pre);
+            let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+            ctx.pushvid(graph, index_pre);
+            let index = ctx.popvid(graph);
+            let base = ctx.popvid(graph);
             let base_var = graph.must_variable(base);
             let index_var = graph.must_variable(index);
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
@@ -4208,14 +4323,22 @@ fn lower_expr(
             // `FlowingError`, the whole assignment is dropped.  `get_value!`
             // propagates both `FlowingError` (`Err(..)`) and `path_closed`
             // (`Ok(Lowered { path_closed: true })`) up the walk.
-            let value = get_value!(lower_expr(graph, block, &assign.right, options, ctx)?);
+            let value_pre = get_value!(lower_expr(graph, block, &assign.right, options, ctx)?);
+            ctx.pushvid(graph, value_pre);
+            let value = ctx.popvid(graph);
 
             match &*assign.left {
                 syn::Expr::Field(field) => {
                     if let syn::Expr::Index(idx) = &*field.base {
                         // RPython: setinteriorfield_gc — arr[i].field = value.
-                        let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
-                        let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                        let base_pre =
+                            get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                        ctx.pushvid(graph, base_pre);
+                        let index_pre =
+                            get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                        ctx.pushvid(graph, index_pre);
+                        let index = ctx.popvid(graph);
+                        let base = ctx.popvid(graph);
                         let base_var = graph.must_variable(base);
                         let index_var = graph.must_variable(index);
                         let value_var = graph.must_variable(value);
@@ -4251,7 +4374,10 @@ fn lower_expr(
                             false,
                         );
                     } else {
-                        let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                        let base_pre =
+                            get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                        ctx.pushvid(graph, base_pre);
+                        let base = ctx.popvid(graph);
                         let base_var = graph.must_variable(base);
                         let value_var = graph.must_variable(value);
                         let field_name = member_name(&field.member);
@@ -4273,8 +4399,12 @@ fn lower_expr(
                     }
                 }
                 syn::Expr::Index(idx) => {
-                    let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
-                    let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                    let base_pre = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                    ctx.pushvid(graph, base_pre);
+                    let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                    ctx.pushvid(graph, index_pre);
+                    let index = ctx.popvid(graph);
+                    let base = ctx.popvid(graph);
                     let base_var = graph.must_variable(base);
                     let index_var = graph.must_variable(index);
                     let value_var = graph.must_variable(value);
@@ -4337,11 +4467,15 @@ fn lower_expr(
 
         // ── function call ──
         syn::Expr::Call(call) => {
-            let mut args: Vec<ValueId> = Vec::with_capacity(call.args.len());
             for a in &call.args {
-                let v = get_value!(lower_expr(graph, block, a, options, ctx)?);
-                args.push(v);
+                let v_pre = get_value!(lower_expr(graph, block, a, options, ctx)?);
+                ctx.pushvid(graph, v_pre);
             }
+            let mut args: Vec<ValueId> = Vec::with_capacity(call.args.len());
+            for _ in 0..call.args.len() {
+                args.push(ctx.popvid(graph));
+            }
+            args.reverse();
             let target = canonical_call_target(&call.func, ctx);
             // RPython parity: same rationale as the MethodCall arm above
             // — `op.result.concretetype` is set from the registered
@@ -4397,13 +4531,18 @@ fn lower_expr(
 
         // ── method call ──
         syn::Expr::MethodCall(mc) => {
-            let mut args = Vec::new();
-            let recv = get_value!(lower_expr(graph, block, &mc.receiver, options, ctx)?);
-            args.push(recv);
+            let recv_pre = get_value!(lower_expr(graph, block, &mc.receiver, options, ctx)?);
+            ctx.pushvid(graph, recv_pre);
             for a in &mc.args {
-                let v = get_value!(lower_expr(graph, block, a, options, ctx)?);
-                args.push(v);
+                let v_pre = get_value!(lower_expr(graph, block, a, options, ctx)?);
+                ctx.pushvid(graph, v_pre);
             }
+            let total = 1 + mc.args.len();
+            let mut args: Vec<ValueId> = Vec::with_capacity(total);
+            for _ in 0..total {
+                args.push(ctx.popvid(graph));
+            }
+            args.reverse();
             // RPython `jtransform.py:410-412`: a polymorphic receiver
             // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
             // Detect via the collected local_dyn_trait_roots map so
@@ -4779,7 +4918,10 @@ fn lower_expr(
                 // Unknown fail-louds via `stop_unsupported`.
                 match expr_unary_not_operand_kind(&u.expr, ctx) {
                     UnaryNotOperandKind::Int => {
-                        let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                        let operand_pre =
+                            get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                        ctx.pushvid(graph, operand_pre);
+                        let operand = ctx.popvid(graph);
                         // The classifier returns `Int` for both
                         // primitive integer kinds (lowered as
                         // `ValueType::Int`) and arbitrary-precision
@@ -4832,7 +4974,9 @@ fn lower_expr(
                         );
                     }
                 }
-                let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                let operand_pre = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                ctx.pushvid(graph, operand_pre);
+                let operand = ctx.popvid(graph);
                 let operand_var = graph.must_variable(operand);
                 let cond = graph
                     .push_op(
@@ -4917,7 +5061,9 @@ fn lower_expr(
                     path_closed: false,
                 });
             }
-            let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            let operand_pre = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            ctx.pushvid(graph, operand_pre);
+            let operand = ctx.popvid(graph);
             let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
@@ -4968,7 +5114,9 @@ fn lower_expr(
             if matches!(bin.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
                 let is_and = matches!(bin.op, syn::BinOp::And(_));
 
-                let lhs_raw = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+                let lhs_raw_pre = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+                ctx.pushvid(graph, lhs_raw_pre);
+                let lhs_raw = ctx.popvid(graph);
                 let lhs_raw_var = graph.must_variable(lhs_raw);
                 let cond = graph
                     .push_op(
@@ -5127,8 +5275,12 @@ fn lower_expr(
                 });
             }
 
-            let lhs = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
-            let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
+            let lhs_pre = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+            ctx.pushvid(graph, lhs_pre);
+            let rhs_pre = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
+            ctx.pushvid(graph, rhs_pre);
+            let rhs = ctx.popvid(graph);
+            let lhs = ctx.popvid(graph);
             let op_name = binary_op_name(&bin.op);
             let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
             let lhs_var = graph.must_variable(lhs);
@@ -5185,7 +5337,9 @@ fn lower_expr(
 
         // ── cast: expr as T ──
         syn::Expr::Cast(cast) => {
-            let operand = get_value!(lower_expr(graph, block, &cast.expr, options, ctx)?);
+            let operand_pre = get_value!(lower_expr(graph, block, &cast.expr, options, ctx)?);
+            ctx.pushvid(graph, operand_pre);
+            let operand = ctx.popvid(graph);
             let result_ty = classify_fn_arg_ty(&cast.ty);
             if result_ty == ValueType::Unknown {
                 return Ok(Lowered::value(operand));
@@ -5260,7 +5414,14 @@ fn lower_expr(
 
         // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
-            let scrutinee = get_value!(lower_expr(graph, block, &m.expr, options, ctx)?);
+            // Z4.B.1.b: scrutinee eval routes through pushvid/popvid
+            // (cf. Expr::If cond at line 3852).  Equivalent to upstream
+            // `flowcontext.py:1180 build_class` / `:1207 setup_with`
+            // patterns where the scrutinee was on the stack from its
+            // producing opcode and the dispatching opimpl pops it.
+            let scrutinee_pre = get_value!(lower_expr(graph, block, &m.expr, options, ctx)?);
+            ctx.pushvid(graph, scrutinee_pre);
+            let scrutinee = ctx.popvid(graph);
             let scrutinee_type_string = expression_type_string(&m.expr, ctx);
 
             if m.arms.is_empty() {
@@ -5330,7 +5491,7 @@ fn lower_expr(
                 // `lazy_install_local_at_current_block` finds no
                 // snapshot and falls back to the legacy naked-`Input`
                 // emit, which loses the per-arm rebind information.
-                let arm_exit_snapshot = ctx.getstate(0);
+                let arm_exit_snapshot = ctx.getstate(graph, 0);
                 let arm_exit_locals = LocalBindingSnapshot::capture(ctx);
                 saved_locals.restore(ctx);
                 let arm_lowered = arm_lowered_result?;
@@ -5654,7 +5815,7 @@ fn lower_expr(
             // stamp shape:
             // `flowspace/flowcontext.py:407-408 record_block(block)`.
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.getstate(0);
+            let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
             let must_merge = loop_body_locals(&w.body);
@@ -5678,9 +5839,11 @@ fn lower_expr(
             // no fake cond, no fallback goto-exit.  The exit block we
             // pre-created above becomes dead; simplify prunes it.
             let mut header_tail = header_entry;
-            let cond = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
+            let cond_pre = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
+            ctx.pushvid(graph, cond_pre);
+            let cond = ctx.popvid(graph);
             let body_entry = graph.create_block();
-            let header_branch_snapshot = ctx.getstate(0);
+            let header_branch_snapshot = ctx.getstate(graph, 0);
             let cond_var = graph.must_variable(cond);
             graph.set_branch(header_tail, cond_var, body_entry, vec![], exit, vec![]);
             graph.block_mut(header_tail).framestate = Some(header_branch_snapshot);
@@ -5717,7 +5880,7 @@ fn lower_expr(
                 // `flowspace/framestate.py:92 getoutputargs` produces
                 // the same slot-by-slot mapping for the closing
                 // predecessor link.
-                let body_tail_snapshot = ctx.getstate(0);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
@@ -5755,7 +5918,7 @@ fn lower_expr(
             let exit = graph.create_block();
 
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.getstate(0);
+            let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, body_entry, vec![]);
 
             let must_merge = loop_body_locals(&l.body);
@@ -5789,7 +5952,7 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.getstate(0);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, body_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
@@ -5825,7 +5988,9 @@ fn lower_expr(
             // result vid is bound in `pre_loop_block` and reads of
             // it inside the header are forward edges covered by lazy
             // install — no special-casing needed.
-            let iterable = get_value!(lower_expr(graph, block, &f.expr, options, ctx)?);
+            let iterable_pre = get_value!(lower_expr(graph, block, &f.expr, options, ctx)?);
+            ctx.pushvid(graph, iterable_pre);
+            let iterable = ctx.popvid(graph);
             let _ = iterable;
 
             let header_entry = graph.create_block();
@@ -5833,7 +5998,7 @@ fn lower_expr(
             let exit = graph.create_block();
 
             let pre_loop_block = *block;
-            let pre_loop_snapshot = ctx.getstate(0);
+            let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
             let must_merge = loop_body_locals(&f.body);
@@ -5866,7 +6031,7 @@ fn lower_expr(
             // or post-loop exit recurse back to the header and find
             // its exit-time snapshot (which already includes the
             // eager phis bound to ctx).
-            let header_branch_snapshot = ctx.getstate(0);
+            let header_branch_snapshot = ctx.getstate(graph, 0);
             if let Some(cond) = for_cond {
                 let cond_var = graph.must_variable(cond);
                 graph.set_branch(header_entry, cond_var, body_entry, vec![], exit, vec![]);
@@ -5893,7 +6058,7 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.getstate(0);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
@@ -5929,16 +6094,37 @@ fn lower_expr(
             }
             if let Some(frame) = ctx.loop_stack.last().cloned() {
                 if graph.block(*block).is_open() {
-                    // `break` jumps to the loop's exit block, which has
-                    // no eager-allocated phi inputargs (post-loop reads
-                    // lazy-install at the exit consumer side).  Empty
-                    // args therefore matches `exit.inputargs` arity at
-                    // close time; any later-installed exit inputarg is
-                    // accompanied by a corresponding lazy-installed
-                    // arg push onto this exit's link by the lazy
-                    // installer's predecessor walk.
-                    let pre_break_snapshot = ctx.getstate(0);
-                    graph.set_goto(*block, frame.break_target, vec![]);
+                    // `flowcontext.py:438` close the predecessor via
+                    // `currentstate.getoutputargs(newstate)`.  The
+                    // post-loop block's entry framestate, when present,
+                    // is the merge result for this Link's target —
+                    // RPython `flowcontext.py:399-465 mergeblock` reads
+                    // `newstate.mergeable` to decide which positions
+                    // contribute args.  Read it from the break target
+                    // when set; fall back to the empty `FrameState`
+                    // otherwise (today's lazy-installer pipeline does
+                    // not eagerly populate the post-loop block's
+                    // framestate at break time, so the target state is
+                    // typically `None` here and getoutputargs over an
+                    // empty target.mergeable contributes zero args —
+                    // the previous explicit `vec![]` shape).  Any
+                    // later-installed exit inputarg is accompanied by a
+                    // corresponding lazy-installed arg push onto this
+                    // exit's link by the lazy installer's predecessor
+                    // walk; Z4 walker convergence retires that
+                    // adaptation in favour of the eager-merge protocol.
+                    let pre_break_snapshot = ctx.getstate(graph, 0);
+                    let target_state = graph
+                        .block(frame.break_target)
+                        .framestate
+                        .clone()
+                        .unwrap_or_default();
+                    graph.set_goto_from_framestate(
+                        *block,
+                        frame.break_target,
+                        &pre_break_snapshot,
+                        &target_state,
+                    );
                     // Stamp the break source's framestate so the
                     // post-loop lazy installer can read the locals
                     // visible on this predecessor edge — same role as
@@ -5987,7 +6173,7 @@ fn lower_expr(
                     // the recursive install at the header short-
                     // circuits via the same-block graph-state
                     // idempotency check on `block.inputargs`.
-                    let pre_continue_snapshot = ctx.getstate(0);
+                    let pre_continue_snapshot = ctx.getstate(graph, 0);
                     let header_phi_names = header_phi_name_list(graph, frame.continue_target);
                     let args = link_args_from_ctx(ctx, &header_phi_names);
                     let arg_vars: Vec<crate::flowspace::model::Variable> =
@@ -6088,7 +6274,9 @@ fn lower_expr(
                 .as_deref()
                 .and_then(transparent_result_ok_type)
                 .map(type_string_to_value_type);
-            let inner = get_value!(lower_expr(graph, block, &t.expr, options, ctx)?);
+            let inner_pre = get_value!(lower_expr(graph, block, &t.expr, options, ctx)?);
+            ctx.pushvid(graph, inner_pre);
+            let inner = ctx.popvid(graph);
             if let Some(ok_ty) = ok_ty {
                 retag_result_value_type(graph, inner, ok_ty);
             }
@@ -6247,10 +6435,14 @@ fn lower_expr(
                             let rhs_expr = it.next();
                             match (lhs_expr, rhs_expr) {
                                 (Some(le), Some(re)) => {
-                                    let lhs =
+                                    let lhs_pre =
                                         get_value!(lower_expr(graph, block, le, options, ctx)?);
-                                    let rhs =
+                                    ctx.pushvid(graph, lhs_pre);
+                                    let rhs_pre =
                                         get_value!(lower_expr(graph, block, re, options, ctx)?);
+                                    ctx.pushvid(graph, rhs_pre);
+                                    let rhs = ctx.popvid(graph);
+                                    let lhs = ctx.popvid(graph);
                                     let op_name = if macro_name.contains("_ne") {
                                         "ne"
                                     } else {
@@ -12530,9 +12722,16 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let merged = pred.union(&other, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        let link_args = pred.getoutputargs(&merged);
+        let link_args = pred.getoutputargs(&merged, &graph);
+        let link_arg_vids: Vec<ValueId> = link_args
+            .iter()
+            .map(|a| {
+                a.as_value(&graph)
+                    .expect("locals projection is Variable-only")
+            })
+            .collect();
         assert_eq!(
-            link_args,
+            link_arg_vids,
             vec![ValueId(10), ValueId(20), ValueId(30)],
             "getoutputargs must yield self's ValueIds in target slot order"
         );
@@ -12563,9 +12762,16 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        let link_args = a.getoutputargs(&merged);
+        let link_args = a.getoutputargs(&merged, &graph);
+        let link_arg_vids: Vec<ValueId> = link_args
+            .iter()
+            .map(|a| {
+                a.as_value(&graph)
+                    .expect("locals projection is Variable-only")
+            })
+            .collect();
         assert_eq!(
-            link_args,
+            link_arg_vids,
             vec![ValueId(11)],
             "only surviving slots emit link args; None-killed slots are skipped"
         );
@@ -12685,7 +12891,7 @@ mod tests {
         // `pre_loop_snapshot` is produced by ctx in the real lowering;
         // mirror that here so the allocator walks the same first-bind
         // positional order Slice 5c.1 will feed it.
-        let pre_loop_snapshot = ctx.getstate(0);
+        let pre_loop_snapshot = ctx.getstate(&graph, 0);
         assert_eq!(pre_loop_snapshot.entries.len(), 2);
 
         // `x` is read inside the body, `z` is body-only (rebound
@@ -13787,6 +13993,34 @@ mod tests {
         )
     }
 
+    /// Test-only push helper — mints a fresh `Variable`, binds it to
+    /// `vid` via `bind_variable`, and pushes the
+    /// `StackElem::Value(Hlvalue::Variable(...))` cell.  Mirrors how
+    /// production op-emission would push the SpaceOperation result
+    /// once leaves migrate to `value_stack` (Z4.B.1+).
+    fn z4a_push_vid(ctx: &mut GraphBuildContext, graph: &mut FunctionGraph, vid: ValueId) {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        let v = Variable::new();
+        graph.bind_variable(vid, v.clone());
+        ctx.pushvalue(StackElem::Value(Hlvalue::Variable(v)));
+    }
+
+    /// Bridge a `StackElem::Value(Hlvalue::Variable)` cell back to
+    /// `ValueId` via `bridge_variable`, panicking on a non-Variable
+    /// shape (Constant / FlowSignal arms unused in current tests).
+    fn z4a_cell_to_vid(
+        graph: &mut FunctionGraph,
+        elem: &crate::flowspace::framestate::StackElem,
+    ) -> ValueId {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::Hlvalue;
+        match elem {
+            StackElem::Value(Hlvalue::Variable(v)) => graph.bridge_variable(v),
+            other => panic!("expected Variable cell, got {other:?}"),
+        }
+    }
+
     #[test]
     fn z4a_pushvalue_popvalue_round_trip_matches_flowcontext_lifo() {
         let registry = StructFieldRegistry::default();
@@ -13794,15 +14028,58 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a_demo");
         assert_eq!(ctx.stackdepth(), 0);
-        ctx.pushvalue(ValueId(7));
-        ctx.pushvalue(ValueId(11));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(7));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(11));
         assert_eq!(ctx.stackdepth(), 2);
         // `popvalue` returns the topmost cell — LIFO per
         // `flowcontext.py:325 self.stack.pop()`.
-        assert_eq!(ctx.popvalue(), ValueId(11));
-        assert_eq!(ctx.popvalue(), ValueId(7));
+        let top = ctx.popvalue();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top), ValueId(11));
+        let bottom = ctx.popvalue();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), ValueId(7));
         assert_eq!(ctx.stackdepth(), 0);
+    }
+
+    /// Production-side `pushvid` / `popvid` round-trip — pyre IR's
+    /// `ValueId` threads through `value_stack` as
+    /// `StackElem::Value(Hlvalue::Variable(graph.variable(vid)))` and
+    /// recovers back through `graph.bridge_variable`.  Z4.B.1+ leaf
+    /// migrations consume this pair; the test pins the contract before
+    /// any production caller relies on it.
+    #[test]
+    fn pushvid_popvid_round_trip_through_value_stack() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("pushvid_round_trip");
+        let vid_a = graph.alloc_value();
+        let vid_b = graph.alloc_value();
+        ctx.pushvid(&graph, vid_a);
+        ctx.pushvid(&graph, vid_b);
+        assert_eq!(ctx.stackdepth(), 2);
+        // LIFO: top is `vid_b`.
+        assert_eq!(ctx.popvid(&graph), vid_b);
+        assert_eq!(ctx.popvid(&graph), vid_a);
+        assert_eq!(ctx.stackdepth(), 0);
+    }
+
+    /// `pushvid` panics when the vid was minted outside the canonical
+    /// allocation path (no backing Variable at `graph.value_variables`).
+    #[test]
+    #[should_panic(expected = "pushvid: ValueId")]
+    fn pushvid_panics_when_vid_has_no_backing_variable() {
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let graph = FunctionGraph::new("pushvid_unbacked");
+        // ValueId(42) was never allocated — graph.variable(42) returns None.
+        ctx.pushvid(&graph, ValueId(42));
     }
 
     #[test]
@@ -13812,32 +14089,45 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.pushvalue(ValueId(1));
-        ctx.pushvalue(ValueId(2));
-        ctx.pushvalue(ValueId(3));
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(3));
         // `peekvalue(0)` is the top per upstream's `~0 == -1` indexing
         // (`flowcontext.py:329`).
-        assert_eq!(ctx.peekvalue(0), ValueId(3));
-        assert_eq!(ctx.peekvalue(1), ValueId(2));
-        assert_eq!(ctx.peekvalue(2), ValueId(1));
+        let top0 = ctx.peekvalue(0).clone();
+        let top1 = ctx.peekvalue(1).clone();
+        let top2 = ctx.peekvalue(2).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(3));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(2));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), ValueId(1));
         // peekvalue is non-destructive.
         assert_eq!(ctx.stackdepth(), 3);
     }
 
     #[test]
     fn z4a_settopvalue_overwrites_at_index_from_top() {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::{Hlvalue, Variable};
         let registry = StructFieldRegistry::default();
         let fn_ret = HashMap::new();
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.pushvalue(ValueId(1));
-        ctx.pushvalue(ValueId(2));
-        ctx.pushvalue(ValueId(3));
-        ctx.settopvalue(ValueId(99), 1);
-        assert_eq!(ctx.peekvalue(0), ValueId(3));
-        assert_eq!(ctx.peekvalue(1), ValueId(99));
-        assert_eq!(ctx.peekvalue(2), ValueId(1));
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(3));
+        // Replace index_from_top=1 with a fresh cell paired to ValueId(99).
+        let v99 = Variable::new();
+        graph.bind_variable(ValueId(99), v99.clone());
+        ctx.settopvalue(StackElem::Value(Hlvalue::Variable(v99)), 1);
+        let top0 = ctx.peekvalue(0).clone();
+        let top1 = ctx.peekvalue(1).clone();
+        let top2 = ctx.peekvalue(2).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(3));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(99));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), ValueId(1));
     }
 
     #[test]
@@ -13849,7 +14139,8 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.pushvalue(ValueId(1));
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
         let popped = ctx.popvalues(0);
         assert!(popped.is_empty());
         assert_eq!(ctx.stackdepth(), 1);
@@ -13865,14 +14156,20 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.pushvalue(ValueId(10));
-        ctx.pushvalue(ValueId(20));
-        ctx.pushvalue(ValueId(30));
-        ctx.pushvalue(ValueId(40));
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(10));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(20));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(30));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(40));
         let popped = ctx.popvalues(3);
-        assert_eq!(popped, vec![ValueId(20), ValueId(30), ValueId(40)]);
+        let popped_vids: Vec<ValueId> = popped
+            .iter()
+            .map(|e| z4a_cell_to_vid(&mut graph, e))
+            .collect();
+        assert_eq!(popped_vids, vec![ValueId(20), ValueId(30), ValueId(40)]);
         assert_eq!(ctx.stackdepth(), 1);
-        assert_eq!(ctx.peekvalue(0), ValueId(10));
+        let bottom = ctx.peekvalue(0).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), ValueId(10));
     }
 
     #[test]
@@ -13886,13 +14183,62 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a_demo");
         for v in 1..=5 {
-            ctx.pushvalue(ValueId(v));
+            z4a_push_vid(&mut ctx, &mut graph, ValueId(v));
         }
         ctx.dropvaluesuntil(2);
         assert_eq!(ctx.stackdepth(), 2);
-        assert_eq!(ctx.peekvalue(0), ValueId(2));
-        assert_eq!(ctx.peekvalue(1), ValueId(1));
+        let top0 = ctx.peekvalue(0).clone();
+        let top1 = ctx.peekvalue(1).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(2));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(1));
+    }
+
+    #[test]
+    fn z4a_popvalues_n_exceeds_stack_returns_all_and_clears() {
+        // `flowcontext.py:339-340 self.stack[-n:]` is Python negative-
+        // slice — when `n > len(self.stack)`, the slice silently
+        // clamps to the whole stack and the subsequent `del` clears
+        // it.  Mirror the upstream tolerance: no assert, no panic.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        let popped = ctx.popvalues(5);
+        let popped_vids: Vec<ValueId> = popped
+            .iter()
+            .map(|e| z4a_cell_to_vid(&mut graph, e))
+            .collect();
+        assert_eq!(popped_vids, vec![ValueId(1), ValueId(2)]);
+        assert_eq!(ctx.stackdepth(), 0);
+    }
+
+    #[test]
+    fn z4a_dropvaluesuntil_finaldepth_exceeds_stack_is_noop() {
+        // `flowcontext.py:343-344 del self.stack[finaldepth:]` is a
+        // Python slice — when `finaldepth >= len(self.stack)` the
+        // slice past the end is empty and `del` is a no-op.  Pyre
+        // mirrors via `Vec::truncate` which leaves the stack
+        // unchanged on overflow inputs.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        ctx.dropvaluesuntil(10);
+        assert_eq!(ctx.stackdepth(), 2);
+        let top0 = ctx.peekvalue(0).clone();
+        let top1 = ctx.peekvalue(1).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(2));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(1));
     }
 
     #[test]
@@ -13930,12 +14276,15 @@ mod tests {
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         ctx.bind_local_id("x".into(), ValueId(7), BlockId(0));
         ctx.bind_local_id("y".into(), ValueId(11), BlockId(0));
-        // last_exception + blockstack stay at defaults (None, []).
-        let state = ctx.getstate(42);
+        let graph = FunctionGraph::new("z4a2_getstate_demo");
+        // last_exception + blockstack stay at defaults (None, []);
+        // value_stack stays empty so the stack projection round-trips
+        // as an empty Vec.
+        let state = ctx.getstate(&graph, 42);
         assert_eq!(state.entries, vec![Some(ValueId(7)), Some(ValueId(11))]);
         assert!(
             state.stack.is_empty(),
-            "stack vestigial empty until Z2.5 bridges Hlvalue identity (flowcontext.py:347 self.stack[:])"
+            "empty value_stack must project to empty FrameState.stack"
         );
         assert!(state.last_exception.is_none());
         assert!(state.blocklist.is_empty());
@@ -13943,23 +14292,55 @@ mod tests {
     }
 
     #[test]
-    fn z4a2_setstate_restores_locals_and_drops_stack_per_flowcontext_normalize() {
-        // Round-trip: getstate → setstate → getstate.  Locals project
-        // back through `local_first_bind_order`, value_stack is wiped
-        // (vestigial, see `setstate` doc-comment).
+    fn z4a2_getstate_copies_value_stack_into_frame_state_stack() {
+        // Z4.A.5 parity: `flowcontext.py:347 self.stack[:]` — pyre's
+        // value_stack and FrameState.stack share the Vec<StackElem>
+        // carrier so getstate clones verbatim.  When the walker
+        // populates value_stack with Hlvalue::Variable cells, the
+        // snapshot retains the same cell identities.
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::Hlvalue;
         let registry = StructFieldRegistry::default();
         let fn_ret = HashMap::new();
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a2_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(101));
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(202));
+        let state = ctx.getstate(&graph, 0);
+        assert_eq!(state.stack.len(), 2);
+        let StackElem::Value(Hlvalue::Variable(v0)) = &state.stack[0] else {
+            panic!("expected Variable cell at stack[0]");
+        };
+        let StackElem::Value(Hlvalue::Variable(v1)) = &state.stack[1] else {
+            panic!("expected Variable cell at stack[1]");
+        };
+        assert_eq!(graph.bridge_variable(v0), ValueId(101));
+        assert_eq!(graph.bridge_variable(v1), ValueId(202));
+    }
+
+    #[test]
+    fn z4a2_setstate_restores_locals_and_value_stack_from_captured_frame_state() {
+        // Round-trip: getstate → mutate → setstate restores.  Locals
+        // project back through `local_first_bind_order`; value_stack
+        // restores from `state.stack.clone()` per the Z4.A.5
+        // direct-copy port of `flowcontext.py:352 self.stack =
+        // state.stack[:]`.
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let mut graph = FunctionGraph::new("z4a2_demo");
         ctx.bind_local_id("x".into(), ValueId(1), BlockId(0));
         ctx.bind_local_id("y".into(), ValueId(2), BlockId(0));
-        let captured = ctx.getstate(7);
-        // Mutate ctx after capture to verify setstate actually
-        // restores: rebind x to a fresh vid, push to value_stack.
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(50));
+        let captured = ctx.getstate(&graph, 7);
+        // Mutate ctx after capture: rebind x, push a different cell.
         ctx.bind_local_id("x".into(), ValueId(99), BlockId(1));
-        ctx.pushvalue(ValueId(123));
-        assert_eq!(ctx.stackdepth(), 1);
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(123));
+        assert_eq!(ctx.stackdepth(), 2);
         ctx.setstate(&captured);
         // Locals back to captured shape.
         assert_eq!(
@@ -13972,12 +14353,11 @@ mod tests {
             Some(ValueId(2)),
             "y must be restored to captured vid"
         );
-        // value_stack wiped (vestigial drop).
-        assert_eq!(
-            ctx.stackdepth(),
-            0,
-            "setstate clears value_stack until Z2.5 bridges Hlvalue identity"
-        );
+        // value_stack restored to single-cell captured shape carrying
+        // ValueId(50).
+        assert_eq!(ctx.stackdepth(), 1);
+        let top = ctx.peekvalue(0).clone();
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top), ValueId(50));
     }
 
     #[test]
@@ -14010,8 +14390,45 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.pushvalue(ValueId(42));
+        let mut graph = FunctionGraph::new("z4b0_demo");
+        z4a_push_vid(&mut ctx, &mut graph, ValueId(42));
         ctx.assert_stack_empty_at_stmt_boundary("z4b0_negative_test");
+    }
+
+    #[test]
+    fn setstate_normalizes_raise_implicit_signals_on_value_stack() {
+        // `flowcontext.py:358-362 _normalize_raise_signals` — every
+        // RaiseImplicit cell on the post-setstate stack downgrades to
+        // a plain Raise carrying the same `w_exc`.  Verifies the AST
+        // setstate path invokes the helper so a future Z4.H wire-in
+        // doesn't need to chase the call site retroactively.
+        use crate::flowspace::flowcontext::FlowSignal;
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::{Constant, FSException, Hlvalue};
+        let registry = StructFieldRegistry::default();
+        let fn_ret = HashMap::new();
+        let names = std::collections::HashSet::new();
+        let trait_names = std::collections::HashSet::new();
+        let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
+        let exc = FSException::new(
+            Hlvalue::Constant(Constant::new(ConstValue::Int(101))),
+            Hlvalue::Constant(Constant::new(ConstValue::None)),
+        );
+        let captured = FrameState {
+            entries: Vec::new(),
+            stack: vec![StackElem::Signal(FlowSignal::RaiseImplicit {
+                w_exc: exc.clone(),
+            })],
+            ..Default::default()
+        };
+        ctx.setstate(&captured);
+        assert_eq!(ctx.value_stack.len(), 1);
+        match &ctx.value_stack[0] {
+            StackElem::Signal(FlowSignal::Raise { w_exc }) => {
+                assert_eq!(w_exc, &exc, "Raise must carry the same w_exc");
+            }
+            other => panic!("expected Raise after normalization, got {other:?}"),
+        }
     }
 
     #[test]
