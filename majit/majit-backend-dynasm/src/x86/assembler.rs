@@ -2720,7 +2720,20 @@ impl<'a> Assembler386<'a> {
                     } else {
                         match (a0, src) {
                             (Loc::Reg(a), Loc::Immed(i)) => {
-                                let v = -(i.value as i32);
+                                // regalloc.py:577 — `_consider_lea` is guarded
+                                // by `rx86.fits_in_32bits(-y.value)`, so check
+                                // the negated value directly.  `y.value =
+                                // 2147483648` is valid here because the disp32
+                                // is `-2147483648`; converting y to i32 first
+                                // would incorrectly reject that PyPy-valid case.
+                                let v = i
+                                    .value
+                                    .checked_neg()
+                                    .and_then(|negated| i32::try_from(negated).ok())
+                                    .expect(
+                                        "IntSub LEA requires an immediate \
+                                         encodable as signed disp32 after negation",
+                                    );
                                 dynasm!(self.mc ; .arch x64
                                     ; lea Rq(dst.value), [Rq(a.value) + v])
                             }
@@ -7455,15 +7468,15 @@ impl<'a> Assembler386<'a> {
         if !pos.is_none() {
             let slot = self.allocate_slot(pos);
             let offset = Self::slot_offset(slot);
-            match result_loc {
-                Some(Loc::Reg(r)) => {
-                    let rv = r.value;
-                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
-                }
-                _ => {
-                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], rax);
-                }
-            }
+            // malloc_cond / malloc_cond_varsize (assembler.py:2556,2604) keep
+            // the allocated pointer in ecx and route it through the regalloc-
+            // assigned `result_reg`.  Anything else here would spill a stale
+            // RAX (now caller-live) instead of the object pointer.
+            let Some(Loc::Reg(r)) = result_loc else {
+                panic!("CallMallocNursery result_loc must be a register; got {result_loc:?}");
+            };
+            let rv = r.value;
+            dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
         }
     }
 
