@@ -2190,18 +2190,19 @@ impl TraceCtx {
     /// nullity-aware sites (`_establish_nullity`, KnownClass guards) can
     /// skip their own checks.
     pub fn trace_assert_not_none(&mut self, opref: OpRef, concrete: i64) {
-        // executor.py:344 `do_assert_not_none`:
-        //     if not box.getref_base():
-        //         fatalerror("found during JITting: ll_assert_not_none() failed")
-        // The trace-time executor runs before the record bumps heapcache,
-        // so even a cache-hit path must observe the null operand and
-        // fatal-error — RPython's `count_ops` short-circuit is reached
-        // only when `is_nullity_known` is already true, which itself
-        // implies the operand is non-null in the live trace.
-        assert!(
-            concrete != 0,
-            "do_assert_not_none: ref operand {opref:?} is null at trace time"
-        );
+        // pyjitpl.py:387 `if self.metainterp.heapcache.is_nullity_known(box):`
+        // — RPython's `is_nullity_known` (heapcache.py:475-478) returns
+        // `bool(box.getref_base())` for `Const` and `_check_flag(...
+        // HF_KNOWN_NULLITY)` otherwise.  `class_now_known` sets
+        // `HF_KNOWN_NULLITY` alongside `HF_KNOWN_CLASS` (line 470-473),
+        // so the flag semantically means "known to be non-null".
+        // The `if`-test therefore short-circuits only on truthy values
+        // — `Const` known-null returns `False` and falls through to
+        // `executor.do_assert_not_none`, which `fatalerror`s on null
+        // (executor.py:344-346).  Pyre's `is_nullity_known` returns
+        // `Some(true)` for known non-null, `Some(false)` for known
+        // null, `None` for unknown — match PyPy's semantics by
+        // short-circuiting only on `Some(true)`.
         let known = self.heap_cache.is_nullity_known(opref, |op| {
             self.constants.get_value(op).and_then(|v| match v {
                 Value::Int(n) => Some(n),
@@ -2209,14 +2210,23 @@ impl TraceCtx {
                 _ => None,
             })
         });
-        if known.is_some() {
+        if known == Some(true) {
             self.profiler().count_ops(
                 OpCode::AssertNotNone,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
             );
             return;
         }
+        // pyjitpl.py:390 `self.execute(rop.ASSERT_NOT_NONE, box)` →
+        // executor.py:344-346 `do_assert_not_none(cpu, _, box)`:
+        //     if not box.getref_base():
+        //         fatalerror("found during JITting: ll_assert_not_none() failed")
+        assert!(
+            concrete != 0,
+            "do_assert_not_none: ref operand {opref:?} is null at trace time"
+        );
         self.record_op(OpCode::AssertNotNone, &[opref]);
+        // pyjitpl.py:391 `self.metainterp.heapcache.nullity_now_known(box)`.
         self.heap_cache.nullity_now_known(opref, true);
     }
 

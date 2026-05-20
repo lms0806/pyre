@@ -495,27 +495,30 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "UnicodeDecodeError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeDecodeError",
             exc_unicode_decode_error_new,
+            Some(exc_unicode_decode_error_init),
             unicode_error,
         ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeEncodeError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeEncodeError",
             exc_unicode_encode_error_new,
+            Some(exc_unicode_encode_error_init),
             unicode_error,
         ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeTranslateError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeTranslateError",
-            exc_unicode_error_new,
+            exc_unicode_translate_error_new,
+            Some(exc_unicode_translate_error_init),
             unicode_error,
         ),
     );
@@ -1351,14 +1354,232 @@ exc_constructor!(
     exc_unicode_error,
     pyre_object::excobject::ExcKind::UnicodeError
 );
-exc_constructor!(
-    exc_unicode_decode_error,
-    pyre_object::excobject::ExcKind::UnicodeDecodeError
-);
-exc_constructor!(
-    exc_unicode_encode_error,
-    pyre_object::excobject::ExcKind::UnicodeEncodeError
-);
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
+/// applied to UnicodeTranslateError: allocate the W_ExceptionObject
+/// and store the raw constructor args verbatim into `args_w`.  PyPy's
+/// `_new` runs no per-arg validation — type checks live in
+/// `descr_init` (line 433-445) and only fire when `__init__` is
+/// invoked by the type-call protocol after `__new__`.  Pyre's
+/// type-call (call.rs:982-996) routes through that same `__new__` ⇒
+/// `__init__` sequence, so `__new__` here can stay validation-free.
+fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeTranslateError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// for UnicodeDecodeError — allocation + raw args_w only.  Encoding,
+/// object, start/end/reason type checks happen in `descr_init` at
+/// `:1041-1059`.
+fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// for UnicodeEncodeError — allocation + raw args_w only.
+fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:433-445
+/// W_UnicodeTranslateError.descr_init` —
+///
+/// ```python
+/// def descr_init(self, space, w_object, w_start, w_end, w_reason):
+///     space.utf8_w(w_object); space.int_w(w_start); space.int_w(w_end)
+///     space.realtext_w(w_reason)
+///     self.w_object = w_object; self.w_start = w_start
+///     self.w_end = w_end; self.w_reason = w_reason
+///     W_BaseException.descr_init(self, space,
+///         [w_object, w_start, w_end, w_reason])
+/// ```
+///
+/// Typechecks go through subclass-accepting `isinstance_*_w` helpers
+/// to match PyPy's `space.utf8_w` / `space.int_w` / `space.realtext_w`
+/// behavior — `class MyStr(str): pass` and `class MyInt(int): pass`
+/// instances satisfy the check.  PyPy's `*_w` helpers raise
+/// `TypeError` from the typechecks; pyre mirrors via
+/// `PyError::type_error`.
+fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 5 {
+        // first arg is `self`; PyPy reports argcount excluding `self`.
+        return Err(crate::PyError::type_error(
+            "function takes exactly 4 arguments",
+        ));
+    }
+    let w_self = args[0];
+    let w_object = args[1];
+    let w_start = args[2];
+    let w_end = args[3];
+    let w_reason = args[4];
+    unsafe {
+        if !crate::baseobjspace::isinstance_str_w(w_object) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 4 must be str, not other",
+            ));
+        }
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        // `W_BaseException.descr_init(self, space, [w_object, w_start,
+        // w_end, w_reason])` → `self.args_w = args_w`.  The
+        // `W_ExceptionObject.args_w` slot already carries the same
+        // tuple shape from `__new__`, so we re-stamp it from the
+        // bound init args here for parity with PyPy line 444-445.
+        let args_list = pyre_object::w_list_new(vec![w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1041-1059
+/// W_UnicodeDecodeError.descr_init` — `(w_encoding, w_object, w_start,
+/// w_end, w_reason)`.  `w_object` may be `bytearray`; PyPy coerces it
+/// via `space.newbytes(space.charbuf_w(w_object))` before storing.
+/// Pyre accepts either `bytes` or `bytearray` and stores the coerced
+/// `bytes` so reads of `e.object` round-trip as `bytes` per PyPy.
+fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 6 {
+        return Err(crate::PyError::type_error(
+            "function takes exactly 5 arguments",
+        ));
+    }
+    let w_self = args[0];
+    let w_encoding = args[1];
+    let w_object_in = args[2];
+    let w_start = args[3];
+    let w_end = args[4];
+    let w_reason = args[5];
+    unsafe {
+        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if !crate::baseobjspace::isinstance_bytes_like_w(w_object_in) {
+            return Err(crate::PyError::type_error(
+                "argument 2 must be bytes-like, not other",
+            ));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 5 must be str, not other",
+            ));
+        }
+        // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
+        // `space.newbytes` coerce buffer-protocol producers
+        // (`bytearray`, exact `bytes`, and `bytes` subclasses) to a
+        // canonical `bytes`.  Pyre handles the two concrete cases
+        // pyre's interpreter exposes: `bytearray` → fresh `bytes`
+        // copy, anything else (which `isinstance_bytes_like_w`
+        // already gated to `bytes`-tagged objects) is stored as-is.
+        let w_object = if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
+            let data = pyre_object::bytes_like_data(w_object_in);
+            pyre_object::w_bytes_from_bytes(data)
+        } else {
+            w_object_in
+        };
+        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        // `interp_exceptions.py:1058-1059` — the args list passed to
+        // `W_BaseException.descr_init` is the un-coerced
+        // `[w_encoding, w_object, w_start, w_end, w_reason]`, so PyPy
+        // preserves the original `bytearray` in `e.args[1]` while
+        // storing the coerced `bytes` in `e.object`.
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object_in, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1159-1173
+/// W_UnicodeEncodeError.descr_init` — `(w_encoding, w_object, w_start,
+/// w_end, w_reason)`.  Encoding errors require `w_object` to be a
+/// `str` (`space.realutf8_w`).
+fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 6 {
+        return Err(crate::PyError::type_error(
+            "function takes exactly 5 arguments",
+        ));
+    }
+    let w_self = args[0];
+    let w_encoding = args[1];
+    let w_object = args[2];
+    let w_start = args[3];
+    let w_end = args[4];
+    let w_reason = args[5];
+    unsafe {
+        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if !crate::baseobjspace::isinstance_str_w(w_object) {
+            return Err(crate::PyError::type_error(
+                "argument 2 must be str, not other",
+            ));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 5 must be str, not other",
+            ));
+        }
+        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+    }
+    Ok(pyre_object::w_none())
+}
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
@@ -1400,6 +1621,7 @@ exc_new_wrapper!(exc_lookup_error_new, exc_lookup_error);
 exc_new_wrapper!(exc_unicode_error_new, exc_unicode_error);
 exc_new_wrapper!(exc_unicode_decode_error_new, exc_unicode_decode_error);
 exc_new_wrapper!(exc_unicode_encode_error_new, exc_unicode_encode_error);
+exc_new_wrapper!(exc_unicode_translate_error_new, exc_unicode_translate_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 fn make_exc_type(
@@ -1407,10 +1629,34 @@ fn make_exc_type(
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
 ) -> PyObjectRef {
+    make_exc_type_with_init(name, new_fn, None, base)
+}
+
+/// Variant of `make_exc_type` that also installs a per-class `__init__`
+/// descriptor.  Used for the three Unicode*Error subclasses whose PyPy
+/// `descr_init` does typed slot stamping after `__new__`'s raw
+/// `args_w` capture (`interp_exceptions.py:433-445`, `:1041-1059`,
+/// `:1159-1173`).  Without this split, every direct
+/// `UnicodeDecodeError.__new__(cls, *args)` call would inherit the
+/// typechecking that PyPy keeps confined to `descr_init` — see
+/// `_new` at `:274-284` (no per-arg validation).
+fn make_exc_type_with_init(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    init_fn: Option<crate::gateway::BuiltinCodeFn>,
+    base: PyObjectRef,
+) -> PyObjectRef {
     let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
             crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+            if let Some(init_fn) = init_fn {
+                crate::dict_storage_store(
+                    ns,
+                    "__init__",
+                    make_builtin_function("__init__", init_fn),
+                );
+            }
             // `pypy/module/exceptions/interp_exceptions.py:225-235`
             // `BaseException.with_traceback` — installed on every
             // builtin exception class so MRO lookup from a subclass

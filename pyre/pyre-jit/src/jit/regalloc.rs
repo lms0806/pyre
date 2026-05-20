@@ -56,10 +56,11 @@ pub struct GraphAllocationResult {
     pub num_colors: u16,
 }
 
-/// Field names follow `rpython/tool/algo/regalloc.py:47-49` exactly —
-/// `_depgraph`, `_unionfind`, `_coloring`.  The union-find is the real
-/// `tool/algo/unionfind.py UnionFind` port (`()` info, matching upstream
-/// `info_factory=None`).
+/// Field names follow `rpython/tool/algo/regalloc.py` — `_depgraph`
+/// (`make_dependencies`, py:77), `_unionfind` (`coalesce_variables`,
+/// py:80), `_coloring` (`find_node_coloring`, py:115).  The union-find
+/// is the real `tool/algo/unionfind.py UnionFind` port (`()` info,
+/// matching upstream `info_factory=None`).
 struct FlowGraphRegAllocator {
     _depgraph: DependencyGraph<ValueId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
@@ -268,27 +269,27 @@ impl FlowGraphRegAllocator {
 ///
 /// The `_graph_` prefix disambiguates from the sibling
 /// `perform_register_allocation` SSARepr scanner further down in this
-/// module.  **Currently not invoked from the production regalloc
-/// path** — it is a tested algorithm port kept to cover the CFG-level
-/// coalesce rules of `regalloc.py:79-112 coalesce_variables`, but pyre
-/// cannot drop the SSARepr scanner and activate this one the way
-/// upstream does, for two orthogonal reasons:
+/// module.  Invoked from production via
+/// `perform_graph_register_allocation_all_kinds` at
+/// `codewriter.rs:transform_graph_to_jitcode`, where its result feeds
+/// `walker_post_walk_insert_renamings` (the walker's port of
+/// `flatten.py:154 self.insert_renamings(link)`).  The SSARepr scanner
+/// further down still runs alongside this CFG allocator because pyre
+/// has two coalesce sources that cover non-overlapping work:
 ///
-///   1. Pyre's `getoutputargs()` builds `link.args` by positional walk
-///      over `targetstate.mergeable()` (`codewriter.rs::FrameState::
-///      getoutputargs`), so every pair this function would produce at
-///      the CFG level is trivially `(slot, slot)` — a structural no-op
-///      relative to what SSARepr-level coalescing already sees.
+///   1. This CFG allocator runs `coalesce_variables` over
+///      `link.args ↔ target.inputargs` pairs.  Every pair is trivially
+///      `(slot, slot)` because `FrameState::getoutputargs` builds
+///      `link.args` by positional walk over
+///      `targetstate.mergeable()`, so `try_coalesce` is a no-op at the
+///      CFG level today.  When the walker eventually defers SSARepr
+///      emission to the canonical `flatten_graph` driver, the CFG
+///      allocator will become the load-bearing coalesce source.
 ///   2. The SSARepr scanner handles **intra-block** `*_copy`
 ///      sequences (emitted by `emit_ref_copy!`/`emit_int_copy!` inline
 ///      for STORE_FAST-LOAD_FAST fusions) that have no Link-level
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
-///
-/// Keeping the helper documents that the RPython algorithm is ported
-/// correctly for the CFG shape pyre does maintain; the unit tests
-/// exercise exactly that surface.  It is not dead code, but it is also
-/// not a drop-in replacement for the scanner.
 pub(super) fn perform_graph_register_allocation(
     graph: &FlowGraph,
     kind: Kind,
@@ -369,7 +370,10 @@ pub fn perform_graph_register_allocation_all_kinds(
     ]
 }
 
-/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`.
+/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
+/// at the graph level (sibling to the SSA-side private
+/// `enforce_input_args` further down that handles per-RegAllocator
+/// swapcolors).
 ///
 /// Walks the startblock's inputargs in source order; for each inputarg
 /// of kind `K` whose current color in `regallocs[K]` does not equal
@@ -380,17 +384,13 @@ pub fn perform_graph_register_allocation_all_kinds(
 /// Upstream `flatten_graph` runs this immediately after
 /// `regallocs[kind] = perform_register_allocation(graph, kind)` and
 /// before `generate_ssa_form` walks links, so every downstream
-/// observer sees the post-swap coloring. Pyre's pipeline currently
-/// bypasses `flatten_graph`; callers that want
-/// `count_link_renamings_per_kind` (or any future graph-driven
-/// `*_copy` emitter) to match what `flatten_graph` would produce must
-/// run this simulation explicitly first.
-///
-/// Tracks the production-wiring follow-up in Task #214.
-pub fn enforce_input_args_simulation(
-    graph: &FlowGraph,
-    regallocs: &mut [GraphAllocationResult; 3],
-) {
+/// observer sees the post-swap coloring.  Pyre's canonical
+/// `flatten_graph` entry (`flatten.rs::flatten_graph`) and the
+/// walker-side post-walk path both call this free function rather
+/// than a `GraphFlattener` method: pyre's `get_register` closure
+/// captures `&regallocs` immutably, so the `&mut regallocs`
+/// swap must run BEFORE the closure is constructed.
+pub fn enforce_input_args_graph(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
     // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
     // counter in a `[u16; 3]` array indexed by `Kind::index()` per
@@ -415,7 +415,7 @@ pub fn enforce_input_args_simulation(
         }
         assert!(
             curcol > realcol,
-            "enforce_input_args_simulation: inputarg color {} must be >= realcol {} \
+            "enforce_input_args_graph: inputarg color {} must be >= realcol {} \
              (regalloc.py invariant)",
             curcol,
             realcol,
@@ -461,7 +461,7 @@ pub(super) fn count_link_renamings_per_kind(
     // `0, 1, 2, …` per kind before `generate_ssa_form` walks links.
     // Callers that want this probe's output to match
     // `flatten_graph`'s post-swap reality should invoke
-    // `enforce_input_args_simulation(graph, &mut regallocs)` first;
+    // `enforce_input_args_graph(graph, &mut regallocs)` first;
     // otherwise the per-link step count is a lower bound, since the
     // swap can shift inputarg colors and re-introduce previously
     // coalesced renamings. Production wiring is Task #214.
@@ -560,73 +560,6 @@ pub(super) fn count_link_renamings_per_kind(
     counts
 }
 
-/// Count operations recorded in `graph.iterblocks().operations` per
-/// opname. This is what `flatten_graph(graph, regallocs)` would walk
-/// before emitting the SSARepr (`flatten.py:60-100 generate_ssa_form`
-/// iterates `block.operations` per reachable block). Compared against
-/// `count_ssa_ops_per_opname(ssarepr)` to quantify the gap between
-/// pyre's parallel graph (sparse `record_graph_op` coverage today) and
-/// the canonical inline-emit SSARepr the walker still produces.
-///
-/// As `record_graph_op` coverage expands one op family at a time
-/// (Task #227 Phase 4 endgame), the graph-side per-opname count
-/// converges toward the SSA-side count for each retired family. Once
-/// they match for a family, that family's inline emit is safe to
-/// drop in favour of `flatten_graph` emission.
-pub(super) fn count_graph_ops_per_opname(graph: &FlowGraph) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for block in graph.iterblocks() {
-        for op in &block.borrow().operations {
-            *counts.entry(op.opname.clone()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-/// Count `Insn::Op` opnames in `ssarepr.insns`. The inline-emit
-/// counterpart to `count_graph_ops_per_opname`; together they bracket
-/// the convergence target for `flatten_graph` adoption (Task #227).
-/// Skips `Insn::Label` and `Insn::Unreachable` (neither is emitted by
-/// `GraphFlattener::serialize_op`).
-pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for insn in &ssarepr.insns {
-        if let Insn::Op { opname, .. } = insn {
-            *counts.entry(opname.clone()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-/// Count `*_copy` opnames in `ssarepr.insns` per `Kind`. Pyre's walker
-/// emits these inline at `emit_ref_copy!` / `emit_load_const_i` /
-/// `emit_pushvalue_ref!` / `emit_popvalue_ref!` etc. for stack/local
-/// lifecycle (no upstream equivalent — RPython `flatten.py:306-334`
-/// emits `*_copy` only via `insert_renamings` at link points). The two
-/// counts are tracked separately so the walker→flatten transition
-/// (Task #227) can be quantified before flipping the canonical SSARepr
-/// source.
-pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> [usize; 3] {
-    // `[usize; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
-    let mut counts: [usize; 3] = [0; 3];
-    for insn in &ssarepr.insns {
-        if let Insn::Op { opname, .. } = insn {
-            for &kind in &Kind::ALL {
-                let prefix = match kind {
-                    Kind::Int => "int_copy",
-                    Kind::Ref => "ref_copy",
-                    Kind::Float => "float_copy",
-                };
-                if opname == prefix {
-                    counts[kind.index()] += 1;
-                    break;
-                }
-            }
-        }
-    }
-    counts
-}
-
 /// External-input registers preserved across coloring.
 ///
 /// RPython parity: `regalloc.py:54-60` adds pairwise interference
@@ -693,11 +626,11 @@ pub(super) fn rename_lookup(rename: &[Vec<u16>; 3], kind: Kind, pre: u16) -> u16
 /// `nlocals` is the number of CPython fast locals (`code.varnames.len()`).
 ///
 /// `cfg_coalesce_pairs` is the output of
-/// `codewriter::collect_link_slot_pairs` — `(source_slot,
-/// target_slot)` pairs from CFG link boundaries, all of Ref kind
+/// `codewriter::collect_cfg_coalesce_pairs` — `(source_slot,
+/// target_slot)` pairs from CFG link boundaries (`regalloc.py:79-96`
+/// `link.args[i] ↔ link.target.inputargs[i]`), all of Ref kind
 /// because every `FrameState.mergeable()` position in pyre holds a
-/// Ref-kind Variable (locals, stack, last_exc pair).  See
-/// `collect_link_slot_pairs` docstring + `regalloc.py:79-96`.
+/// Ref-kind Variable (locals, stack, last_exc pair).
 ///
 /// RPython parity: `codewriter.py:45-47, 62-67`.
 pub(super) fn allocate_registers(
@@ -731,10 +664,9 @@ pub(super) fn allocate_registers(
                 }
             }
         }
-        // `cfg_coalesce_pairs` are CFG-level Variable pairs from Link
-        // boundaries (regalloc.py:79-96).  All mergeable positions in
-        // pyre's FrameState are Ref-kind, so pass them only to the
-        // Ref allocator; Int / Float regalloc sees an empty slice.
+        // CFG pairs are projected from `FrameState.mergeable()` Variables,
+        // which are uniformly Ref-kind in pyre.  Int / Float allocators
+        // see an empty slice.
         let cfg_pairs_for_kind: &[(u16, u16)] = if kind == Kind::Ref {
             cfg_coalesce_pairs
         } else {
@@ -838,30 +770,29 @@ fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs
 /// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
 /// the three-stage pipeline.
 ///
-/// Dual coalesce sources:
-///   1. `cfg_coalesce_pairs` — pre-computed `(source_slot,
-///      target_slot)` pairs from `codewriter::collect_link_slot_pairs`.
-///      These are the upstream `tool/algo/regalloc.py:79-96`
-///      `link.args ↔ link.target.inputargs` pairs, projected from
-///      Variables onto pyre's u16 register slots via the walker's
-///      positional alignment (see `collect_link_slot_pairs`
-///      docstring).  Trivially-equal pairs by `getoutputargs`
-///      construction — their `try_coalesce` is a no-op when
-///      `src_slot == dst_slot`, but the call preserves RPython's
-///      exact iteration shape.
-///   2. SSARepr `*_copy` scanner (Note) — pyre's
-///      walker emits intra-block `int_copy` / `ref_copy` /
-///      `float_copy` ops for stack shuffling / STORE_FAST sequences
-///      that have no CFG / Link representation.  The scanner unions
-///      each copy's src and dst so the chordal coloring reuses one
-///      color, turning the runtime copy into a no-op when
-///      `src_color == dst_color`.  Upstream does not have this
-///      SSARepr-level pass because `flatten.py:306-334`
-///      `insert_renamings` places its copies post-coalesce, so
-///      RPython's CFG-level `regalloc.py:79-96` is the sole coalesce
-///      source.  In pyre both sources are orthogonal — the CFG
-///      pairs cover cross-block link boundaries, the scanner covers
-///      intra-block shuffles — so both run.
+/// Dual coalesce source, ordered to give CFG link priority over the
+/// pyre-only SSARepr scanner when an interference edge forces a
+/// choice between two `try_coalesce` candidates:
+///   1. CFG-level `(source_slot, target_slot)` pairs from
+///      `link.args[i] ↔ link.target.inputargs[i]` per
+///      `regalloc.py:79-96 coalesce_variables`.  The caller derives
+///      these from `graph.iterblocks()` and the walker's slot
+///      assignment for each Variable; passing them in keeps the
+///      upstream iteration shape even when the walker's chosen
+///      slots make most pairs trivially equal (`try_coalesce(v, v)`
+///      returns immediately).  Runs FIRST so a link-driven union
+///      always wins over an SSA-copy union when both would target
+///      the same interference-graph cluster — matching upstream
+///      where CFG `coalesce_variables` is the only coalesce source.
+///   2. SSARepr `*_copy` scanner — pyre's walker emits intra-block
+///      `int_copy` / `ref_copy` / `float_copy` ops for stack
+///      shuffling / STORE_FAST sequences directly into the SSARepr;
+///      RPython has no analog because `flatten.py:306-334`
+///      `insert_renamings` places its copies post-coalesce at
+///      flatten time.  The scanner unions each `*_copy`'s src and
+///      dst so the chordal coloring reuses one color.  Runs after
+///      the CFG pass so the pyre-only source defers to upstream's
+///      link-driven priority on conflict.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
@@ -870,11 +801,13 @@ fn perform_register_allocation(
 ) -> RegAllocator {
     let mut alloc = RegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
-    // regalloc.py:79-96 CFG-level coalesce: union link.args[i] with
-    // link.target.inputargs[i] for every block exit.  Fed in from
-    // `codewriter::collect_link_slot_pairs` (Ref kind only).
-    for &(src_slot, dst_slot) in cfg_coalesce_pairs {
-        alloc.try_coalesce(src_slot, dst_slot);
+    // `regalloc.py:79-96` CFG-level coalesce — every Link's
+    // `link.args[i] ↔ link.target.inputargs[i]` pair, projected to
+    // the walker's u16 slots.  Runs BEFORE the SSARepr `*_copy`
+    // scanner so the upstream link-driven coalesce wins on
+    // interference-graph conflict.
+    for &(src, dst) in cfg_coalesce_pairs {
+        alloc.try_coalesce(src, dst);
     }
     alloc.coalesce_variables(ssarepr, kind);
     alloc.find_node_coloring();
@@ -1393,10 +1326,10 @@ mod tests {
     }
 
     /// `flatten.py:88-100 enforce_input_args` parity at the graph
-    /// allocator level: after the simulation, every kind's startblock
+    /// allocator level: after the swap, every kind's startblock
     /// inputargs occupy colors `0, 1, 2, …` in source order.
     #[test]
-    fn enforce_input_args_simulation_normalises_graph_inputarg_colors() {
+    fn enforce_input_args_graph_normalises_inputarg_colors() {
         // 2 Ref inputargs + 1 Int inputarg, all live across an op
         // that defines fresh Variables of each kind so the chordal
         // coloring has to place every node on its own color.
@@ -1421,24 +1354,24 @@ mod tests {
         ]);
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
-        enforce_input_args_simulation(&graph, &mut regallocs);
+        enforce_input_args_graph(&graph, &mut regallocs);
 
         let ref_colors = &regallocs[Kind::Ref.index()].coloring;
         let int_colors = &regallocs[Kind::Int.index()].coloring;
         assert_eq!(
             ref_colors.get(&a.id).copied(),
             Some(0),
-            "first Ref inputarg must occupy color 0 post-simulation"
+            "first Ref inputarg must occupy color 0 post-enforce_input_args"
         );
         assert_eq!(
             ref_colors.get(&b.id).copied(),
             Some(1),
-            "second Ref inputarg must occupy color 1 post-simulation"
+            "second Ref inputarg must occupy color 1 post-enforce_input_args"
         );
         assert_eq!(
             int_colors.get(&i.id).copied(),
             Some(0),
-            "first Int inputarg must occupy color 0 post-simulation"
+            "first Int inputarg must occupy color 0 post-enforce_input_args"
         );
     }
 
@@ -1723,64 +1656,6 @@ mod tests {
         // Single (v_src@0 → v_dst@1) pair: no cycle, one `int_copy` step.
         assert_eq!(counts[Kind::Int.index()], 1);
         assert_eq!(counts[Kind::Ref.index()], 0);
-        assert_eq!(counts[Kind::Float.index()], 0);
-    }
-
-    #[test]
-    fn count_graph_ops_per_opname_aggregates_across_blocks() {
-        // Graph with 2 reachable blocks; each block carries
-        // SpaceOperations that the helper aggregates by opname.
-        let v0 = flow_var(0, Kind::Int);
-        let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("graph_ops_count", start.clone(), Some(v0));
-        push_op(&start, SpaceOperation::new("foo", vec![v0.into()], None, 0));
-        push_op(&start, SpaceOperation::new("bar", vec![v0.into()], None, 0));
-        let mid = graph.new_block(vec![v0.into()]);
-        start.closeblock(vec![
-            Link::new(vec![v0.into()], Some(mid.clone()), None).into_ref(),
-        ]);
-        push_op(&mid, SpaceOperation::new("foo", vec![v0.into()], None, 0));
-        mid.closeblock(vec![
-            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
-        ]);
-        let counts = count_graph_ops_per_opname(&graph);
-        assert_eq!(counts.get("foo").copied().unwrap_or(0), 2);
-        assert_eq!(counts.get("bar").copied().unwrap_or(0), 1);
-        assert_eq!(counts.get("baz").copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn count_ssa_ops_per_opname_aggregates_insns() {
-        let mut ssarepr = SSARepr::new("ssa_ops_count");
-        ssarepr.insns.push(op_use("foo", vec![]));
-        ssarepr.insns.push(op_use("foo", vec![]));
-        ssarepr.insns.push(op_use("bar", vec![]));
-        let counts = count_ssa_ops_per_opname(&ssarepr);
-        assert_eq!(counts.get("foo").copied().unwrap_or(0), 2);
-        assert_eq!(counts.get("bar").copied().unwrap_or(0), 1);
-        assert_eq!(counts.get("baz").copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn count_ssa_copy_ops_aggregates_per_kind() {
-        let mut ssarepr = SSARepr::new("count_copy_ops");
-        ssarepr.insns.push(op_def(
-            "int_copy",
-            vec![Operand::ConstInt(7)],
-            r(Kind::Int, 0),
-        ));
-        ssarepr
-            .insns
-            .push(op_def("int_copy", vec![reg(Kind::Int, 0)], r(Kind::Int, 1)));
-        ssarepr
-            .insns
-            .push(op_def("ref_copy", vec![reg(Kind::Ref, 0)], r(Kind::Ref, 1)));
-        ssarepr
-            .insns
-            .push(op_use("ref_return", vec![reg(Kind::Ref, 1)]));
-        let counts = count_ssa_copy_ops_per_kind(&ssarepr);
-        assert_eq!(counts[Kind::Int.index()], 2);
-        assert_eq!(counts[Kind::Ref.index()], 1);
         assert_eq!(counts[Kind::Float.index()], 0);
     }
 }

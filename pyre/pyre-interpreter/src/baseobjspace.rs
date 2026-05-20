@@ -2136,6 +2136,61 @@ pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
     false
 }
 
+/// `space.isinstance_w(w_obj, space.w_int)` — PyPy parity helper for
+/// `space.int_w` callers that should accept `int` and any `int`
+/// subclass (e.g. `bool` and user-defined `class MyInt(int): pass`).
+/// pyre's `pyre_object::is_int` matches `int` + `bool` only.
+pub unsafe fn isinstance_int_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_int(obj) {
+        return true;
+    }
+    if let Some(int_type) = crate::typedef::gettypefor(&pyre_object::INT_TYPE) {
+        return isinstance_w(obj, int_type);
+    }
+    false
+}
+
+/// `space.isinstance_w(w_obj, space.w_bytes)` — accepts `bytes` and
+/// any `bytes` subclass.
+pub unsafe fn isinstance_bytes_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_bytes(obj) {
+        return true;
+    }
+    if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
+        return isinstance_w(obj, bytes_type);
+    }
+    false
+}
+
+/// `space.charbuf_w` admits anything implementing the buffer protocol;
+/// PyPy's `W_UnicodeDecodeError.descr_init` (`interp_exceptions.py:1043`)
+/// uses it for `w_object` and then coerces to `bytes`.  In pyre the
+/// concrete buffer producers are `bytes` and `bytearray` (incl.
+/// subclasses); this helper accepts either.
+pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_bytes_like(obj) {
+        return true;
+    }
+    if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
+        if isinstance_w(obj, bytes_type) {
+            return true;
+        }
+    }
+    if let Some(bytearray_type) = crate::typedef::gettypefor(&pyre_object::BYTEARRAY_TYPE) {
+        return isinstance_w(obj, bytearray_type);
+    }
+    false
+}
+
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
@@ -4883,6 +4938,86 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
             }
+            // `interp_exceptions.py:468-471`
+            // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
+            // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
+            // PyPy surfaces these as direct slot reads — `None` when the
+            // exception was constructed without going through
+            // `descr_init`.  Pyre stores `PY_NULL` in that case and
+            // resolves to `space.w_None` here, matching PyPy's
+            // class-default `w_object = None`.
+            //
+            // Gated on the three Unicode*Error kinds because PyPy
+            // attaches these `attrproperty_w` descriptors only on
+            // those typedefs — other exception kinds keep the regular
+            // attribute lookup fall-through.
+            "object" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_object(obj) };
+                    return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
+            "start" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_start(obj) };
+                    return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
+            "end" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_end(obj) };
+                    return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
+            "reason" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_reason(obj) };
+                    return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
+            "encoding" => {
+                // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
+                // / `:1200 W_UnicodeEncodeError.encoding`.
+                // `W_UnicodeTranslateError` has no encoding property per
+                // PyPy; the kind check here excludes Translate so
+                // attribute lookup on `UnicodeTranslateError().encoding`
+                // falls through to the generic AttributeError, matching
+                // `interp_exceptions.py:461-471 typedef` (no `encoding`
+                // attrproperty).
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_encoding(obj) };
+                    return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
             _ => {}
         }
     }
@@ -6027,6 +6162,76 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
                 let b = is_true(value);
                 unsafe { pyre_object::excobject::w_exception_set_suppress_context(obj, b) };
                 return Ok(w_none());
+            }
+            // `interp_exceptions.py:468-471`
+            // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
+            // and `:1081-1083` / `:1201-1203` for Decode / Encode.
+            // PyPy's `attrproperty_w` writer stores the raw `w_value`
+            // into the slot with no type coercion — that matches the
+            // direct slot write here.  Gated on the three Unicode*Error
+            // kinds because PyPy installs these descriptors only on
+            // those typedefs.
+            "object" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_object(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            "start" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_start(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            "end" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_end(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            "reason" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeTranslateError
+                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_reason(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            "encoding" => {
+                // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
+                // / `:1200 W_UnicodeEncodeError.encoding`.  Translate has
+                // no encoding attrproperty per `:461-471` typedef.
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::UnicodeDecodeError
+                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                ) {
+                    unsafe { pyre_object::excobject::w_exception_set_encoding(obj, value) };
+                    return Ok(w_none());
+                }
             }
             _ => {}
         }
