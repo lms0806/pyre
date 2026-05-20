@@ -5121,26 +5121,61 @@ fn lower_expr(
                 return Ok(Lowered::no_value());
             }
             let source_ty = graph_value_type(graph, operand);
-            let op = cast_op_name(source_ty.as_ref(), &result_ty).to_string();
-            // No silent elision: every `as T` reaches the adapter as a
-            // real `OpKind::UnaryOp { op, .. }`.  `cast_op_name` may
-            // return `"same_as"` for transparent (category-matching or
-            // source-unknown) casts; the cast handler family
-            // (`rbuiltin.rs::rtype_same_as` /
-            // `rtype_cast_int_to_float` / `rtype_cast_float_to_int` /
-            // `rtype_cast_int_to_ptr` / `rtype_cast_bool_to_int` /
-            // `rtype_cast_bool_to_float` / `rtype_int_is_true` /
-            // `rtype_float_is_true`) is wired in
-            // `RPythonTyper::translate_operation` (`rtyper.rs:2122-`)
-            // so each opname routes through the rtyper directly; the
-            // adapter at `flowspace_adapter.rs::normalize_unary_op_name`
-            // passes them through unchanged.
+            // RPython has no `expr as T` syntax — numeric conversions go
+            // through `int(v)` / `float(v)` / `bool(v)` builtin calls
+            // (`rbuiltin.py:178-189 rtype_builtin_int/float/bool`), and
+            // the rtyper's `Repr.rtype_int/float/bool` per-Repr methods
+            // (rint.py:137-147, rfloat.py:48-58, rbool.py:55-70) emit
+            // the low-level `cast_*_to_*` / `*_is_true` op as a side
+            // effect of `inputargs(target_lltype)` coercion through
+            // `pair_X_Y_convert_from_to`.  Pyre routes Rust's `as T`
+            // through the same canonical chain — `Call { target:
+            // FunctionPath { segments: vec!["int"/"float"/"bool"] } }`
+            // resolves through `flowspace_adapter`'s HOST_ENV fallback
+            // to the `__builtin__` class HostObject, annotates as
+            // `SomeBuiltin(analyser_name="int")`, then rtypes through
+            // `BuiltinFunctionRepr.rtype_simple_call →
+            // BUILTIN_TYPER[...]`.
+            if let Some(segments) = cast_builtin_name(source_ty.as_ref(), &result_ty) {
+                let operand_var = graph.must_variable(operand);
+                return Ok(Lowered {
+                    value: graph.push_op(
+                        *block,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: segments.iter().map(|s| s.to_string()).collect(),
+                            },
+                            args: vec![operand_var],
+                            result_ty,
+                        },
+                        true,
+                    ),
+                    path_closed: false,
+                });
+            }
+            // Identity / source-type-unknown casts: emit
+            // `OpKind::UnaryOp { op: "same_as", result_ty, .. }` so
+            // the target `ValueType` propagates through the graph
+            // (graph_value_type reads producer op's result_ty).
+            // RPython has no `expr as T` syntax, so identity coercion
+            // is implicit at use sites via the rtyper's
+            // `inputargs(target_lltype)` → `convertvar` →
+            // `pair(SrcRepr, TgtRepr).convert_from_to` chain — but
+            // pyre's surface DSL has `as T` which carries a target
+            // type the downstream pipeline needs to see.  The
+            // low-level `same_as` (rtyper.py:478-481) is the canonical
+            // RPython op for type-preserving copy; the rtyper's
+            // `"same_as"` arm dispatches to `rbuiltin::rtype_same_as`
+            // which emits the matching LL op while preserving the
+            // operand's lltype.  Backendopt's `removenoops::\
+            // remove_same_as` collapses identity copies post-rtyper
+            // when safe (removenoops.py:47-48).
             let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::UnaryOp {
-                        op,
+                        op: "same_as".to_string(),
                         operand: operand_var,
                         result_ty,
                     },
@@ -7975,32 +8010,156 @@ fn kind_char_to_value_type(kind: char) -> Option<ValueType> {
     }
 }
 
-pub(crate) fn cast_op_name(source_ty: Option<&ValueType>, target_ty: &ValueType) -> &'static str {
+/// RPython equivalent of Rust's `expr as T` for numeric / Bool /
+/// pointer casts.
+///
+/// Upstream has no `as T` syntax — numeric conversions are spelled as
+/// builtin calls `int(v)` / `float(v)` / `bool(v)` (`rbuiltin.py:178-189`),
+/// each of which the rtyper routes through
+/// `BuiltinFunctionRepr.rtype_simple_call → rtype_builtin_int/float/bool
+/// → arg_repr.rtype_int/float/bool` per `Repr` trait method.  Those
+/// per-Repr methods (rint.py:137-147, rfloat.py:48-58, rbool.py:55-70)
+/// emit the low-level `cast_*_to_*` / `*_is_true` op as a side effect
+/// of `inputargs(target_lltype)` coercion through the appropriate
+/// `pair_X_Y_convert_from_to` (rint.py:645-675, rbool.py:49-84).
+///
+/// Pointer↔int conversions go through `lltype.cast_ptr_to_int(p)` /
+/// `lltype.cast_int_to_ptr(T, v_int)` (`rbuiltin.py:543-557`), routed
+/// through the same `BUILTIN_TYPER` registry via the module-qualified
+/// HOST_ENV resolver in `flowspace_adapter`.
+///
+/// Maps each `(source, target)` pair to the matching callable path —
+/// a single `__builtin__` name (one segment) for numeric/Bool casts,
+/// or a fully qualified `["rpython", "rtyper", "lltypesystem",
+/// "lltype", <attr>]` / `["rpython", "rlib", "rarithmetic", <attr>]`
+/// path for pointer / Unsigned-bridging casts.  Pairs not covered
+/// (identity casts, source-type-unknown casts) return `None`, letting
+/// the caller emit `OpKind::UnaryOp { op: "same_as", result_ty, .. }`
+/// to preserve target-type propagation through the graph
+/// (rtyper.py:478-481 internal renaming op).  All 13 typed numeric /
+/// ptr / Unsigned cast names retired across Slices A.3 / B.1 / A.4a /
+/// A.4b / A.4c.
+fn cast_builtin_name(
+    source_ty: Option<&ValueType>,
+    target_ty: &ValueType,
+) -> Option<&'static [&'static str]> {
     match (source_ty, target_ty) {
-        (Some(ValueType::Int), ValueType::Float) => "cast_int_to_float",
-        (Some(ValueType::Float), ValueType::Int) => "cast_float_to_int",
-        (Some(ValueType::Ref), ValueType::Int) => "cast_ptr_to_int",
-        (Some(ValueType::Int), ValueType::Ref) => "cast_int_to_ptr",
-        // RPython `rbool.py:49` — Bool widens via dedicated cast ops:
-        // `cast_bool_to_int` / `cast_bool_to_float`.  The reverse
-        // direction (Int / Float → Bool) goes through truthiness
-        // predicates `int_is_true` / `float_is_true`
-        // (`rint.py:rtype_int__Bool` / `rfloat.py:rtype_Float__Bool`).
-        (Some(ValueType::Bool), ValueType::Int) => "cast_bool_to_int",
-        (Some(ValueType::Bool), ValueType::Float) => "cast_bool_to_float",
-        (Some(ValueType::Int), ValueType::Bool) => "int_is_true",
-        (Some(ValueType::Float), ValueType::Bool) => "float_is_true",
-        // RPython `rint.py` cross-signedness casts.  `rbool.py:77-83`
-        // `uint_is_true` is the unsigned counterpart to `int_is_true`.
-        (Some(ValueType::Unsigned), ValueType::Int) => "cast_uint_to_int",
-        (Some(ValueType::Int), ValueType::Unsigned) => "cast_int_to_uint",
-        (Some(ValueType::Unsigned), ValueType::Float) => "cast_uint_to_float",
-        (Some(ValueType::Float), ValueType::Unsigned) => "cast_float_to_uint",
-        (Some(ValueType::Bool), ValueType::Unsigned) => "cast_bool_to_uint",
-        (Some(ValueType::Unsigned), ValueType::Bool) => "uint_is_true",
-        _ => "same_as",
+        // upstream `float(v)`:
+        //   `IntegerRepr.rtype_float` (rint.py:144-147) — `inputargs(Float)`
+        //   coerces via `pair(IntegerRepr, FloatRepr).convert_from_to`
+        //   (rint.py:645-655) → `genop('cast_int_to_float', ...)`.
+        //   `BoolRepr.rtype_float` (rbool.py:65-70) — `inputargs(Float)`
+        //   coerces via `pair(BoolRepr, FloatRepr).convert_from_to`
+        //   (rbool.py:49-56) → `genop('cast_bool_to_float', ...)`.
+        (Some(ValueType::Int), ValueType::Float) => Some(&["float"]),
+        (Some(ValueType::Bool), ValueType::Float) => Some(&["float"]),
+        // `IntegerRepr.rtype_float` (rint.py:144-147) with `self`
+        // having lltype `Unsigned` — `inputargs(Float)` coerces via
+        // `pair(IntegerRepr, FloatRepr).convert_from_to`
+        // (rint.py:645-655) and the `r_from.lowleveltype == Unsigned`
+        // arm emits `genop('cast_uint_to_float', ...)`.
+        (Some(ValueType::Unsigned), ValueType::Float) => Some(&["float"]),
+        // upstream `int(v)`:
+        //   `FloatRepr.rtype_int` (rfloat.py:48-53) —
+        //   `genop('cast_float_to_int', ...)`.
+        //   `BoolRepr.rtype_int` (rbool.py:55-60) — `inputargs(Signed)`
+        //   coerces via `pair(BoolRepr, IntegerRepr).convert_from_to`
+        //   (rbool.py:73-78) → `genop('cast_bool_to_int', ...)`.
+        (Some(ValueType::Float), ValueType::Int) => Some(&["int"]),
+        (Some(ValueType::Bool), ValueType::Int) => Some(&["int"]),
+        // upstream `intmask(r_uint(...))` (rbuiltin.py:220-225) —
+        // `IntegerRepr.rtype_int` (rint.py:137-142) forbids `int(v)`
+        // for `r_uint`, so the canonical Unsigned→Signed entry is
+        // `rarithmetic.intmask(v_uint)`.  `rtype_intmask` calls
+        // `hop.inputargs(Signed)` which coerces from Unsigned via
+        // `pair(IntegerRepr, IntegerRepr).convert_from_to`
+        // (rint.py:202-213) emitting `cast_uint_to_int`.
+        (Some(ValueType::Unsigned), ValueType::Int) => {
+            Some(&["rpython", "rlib", "rarithmetic", "intmask"])
+        }
+        // upstream `bool(v)`:
+        //   `IntegerRepr.rtype_bool` (rint.py:85-88) —
+        //   `genop(self.opprefix + 'is_true', ...)`.
+        //   `FloatRepr.rtype_bool` (rfloat.py:32-34) —
+        //   `genop('float_is_true', ...)`.
+        (Some(ValueType::Int), ValueType::Bool) => Some(&["bool"]),
+        (Some(ValueType::Float), ValueType::Bool) => Some(&["bool"]),
+        // `IntegerRepr.rtype_bool` (rint.py:85-88) — `genop(self.\
+        // opprefix + 'is_true', ...)` — emits `uint_is_true` for
+        // Unsigned-prefixed Repr.
+        (Some(ValueType::Unsigned), ValueType::Bool) => Some(&["bool"]),
+        // upstream `lltype.cast_ptr_to_int(p)` (rbuiltin.py:543-548) —
+        //   `genop('cast_ptr_to_int', vlist, resulttype=Signed)`.
+        // upstream `lltype.cast_int_to_ptr(T, v_int)`
+        // (rbuiltin.py:551-557) — `genop('cast_int_to_ptr', [v_input],
+        //   resulttype=hop.r_result.lowleveltype)`.
+        //
+        // PRE-EXISTING-ADAPTATION (Task #345): the upstream surface is
+        // a 2-arg call `simple_call(lltype.cast_int_to_ptr, PTRTYPE,
+        // oddint)` where `PTRTYPE` is a constant Ptr type marker
+        // (`ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and
+        // returns `SomePtr(ll_ptrtype=PtrT.const)`,
+        // lltype.py:2379-2382).  Pyre emits a 1-arg call here.
+        //
+        // The constant carrier exists — `ConstValue::LowLevelType(Box<\
+        // LowLevelType>)` (flowspace/model.rs:1958) wraps any lltype
+        // including `LowLevelType::Ptr(Box<Ptr>)` — but the **frontend**
+        // does not yet have the concrete Ptr lltype at cast-lowering
+        // time.  `Expr::Cast` carries `ValueType::Ref` (the opaque
+        // high-level surface type); the concrete Ptr is computed only
+        // later by the rtyper from the result variable's annotation.
+        // The result lltype is recovered from `hop.r_result.\
+        // lowleveltype` at rtype-time — the same Ptr upstream would
+        // have read from `PtrT.const`.  Graduating to the 2-arg form
+        // is blocked on threading the concrete result Ptr from the
+        // rtyper-side annotation back to the frontend (or a deferred
+        // 2-arg rewrite in jtransform / annotator after the Ptr is
+        // known).
+        (Some(ValueType::Ref), ValueType::Int) => Some(&[
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]),
+        (Some(ValueType::Int), ValueType::Ref) => Some(&[
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]),
+        // upstream `r_uint(v)` (rarithmetic.py:600
+        // `build_int('r_uint', False, LONG_BIT)`) → the
+        // `ForTypeEntry.specialize_call` body emits
+        // `inputargs(Unsigned)` which coerces the source via
+        // `pair(SrcRepr, IntegerRepr<Unsigned>).convert_from_to`
+        // (rint.py:202-213 / rint.py:657-675 / rbool.py:62-66)
+        // emitting `cast_int_to_uint` / `cast_float_to_uint` /
+        // `cast_bool_to_uint`.
+        (Some(ValueType::Int), ValueType::Unsigned)
+        | (Some(ValueType::Float), ValueType::Unsigned)
+        | (Some(ValueType::Bool), ValueType::Unsigned) => {
+            Some(&["rpython", "rlib", "rarithmetic", "r_uint"])
+        }
+        _ => None,
     }
 }
+
+// `cast_op_name` retired in Slice C.1 — after the numeric / Bool /
+// pointer / Unsigned cast families all routed through `cast_builtin_\
+// name → simple_call(<host_callable>, v)` (Slices A.3 / B.1 /
+// A.4a-c), the only remaining arm was the `_ => "same_as"` catch-all
+// for identity / source-type-unknown casts.  Slice F3 restored the
+// `same_as` fallback inside `Expr::Cast` directly: when
+// `cast_builtin_name` returns None, the lowering emits
+// `OpKind::UnaryOp { op: "same_as", result_ty, .. }` so the target
+// `ValueType` propagates through the graph (`graph_value_type` reads
+// the producer op's result_ty).  Downstream
+// `rbuiltin::rtype_same_as` (verbatim port of `rtyper.py:478-481`)
+// preserves the operand's lltype; `backendopt::removenoops::remove_\
+// same_as` (removenoops.py:47-48) collapses the identity copy when
+// safe.
 
 fn lookup_method_return_type<'a>(
     ctx: &'a GraphBuildContext,
@@ -8556,10 +8715,12 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 // points mix `'r'` (Ref) and `'i'` (Int) kinds causing
                 // an `assembler.rs:581 int_copy` kind-mismatch panic.
                 // Reverting to `ValueType::Int` keeps the surface DSL
-                // monomorphic-int while the `cast_op_name` / rtyper
-                // Unsigned arms (`rtype_cast_uint_to_*`,
-                // `rtype_cast_*_to_uint`) remain scaffolded for the
-                // eventual flip.  Convergence path: walk all
+                // monomorphic-int while the `cast_builtin_name`
+                // Unsigned arms (route through
+                // `simple_call(rarithmetic.intmask|r_uint, v)` per
+                // Slices A.4a / A.4b / A.4c) remain scaffolded for
+                // the eventual producer-side flip.  Convergence path:
+                // walk all
                 // `OpKind::Input { ty: Int }` consumers reachable from
                 // `PYRE_JIT_GRAPH_SOURCES`, narrow the ones that take
                 // u* (currently widened-to-i64 via `as i64`) onto a

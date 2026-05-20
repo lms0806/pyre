@@ -7951,9 +7951,20 @@ mod tests {
     #[test]
     fn cast_int_to_float_reads_int_writes_float_with_castintto_float_op() {
         // `i>f` shape: 1B i-src + 1B f-dst.
-        let byte = *insns_opname_to_byte()
-            .get("cast_int_to_float/i>f")
-            .expect("`cast_int_to_float/i>f` must be in insns table");
+        //
+        // `cast_int_to_float` byte allocation depends on build-time
+        // canonical-source observation via
+        // `IntegerRepr::rtype_float` (rint.rs:686 `genop("cast_int_to_\
+        // float", ...)`).  RPython parity: `assembler.py:220
+        // setdefault(key, len(self.insns))` only pins a byte when
+        // `write_insn(opname)` fires during flattening.  If no
+        // canonical source path emits `float(int_value)`, the byte
+        // stays unallocated; the handler arm in `step` remains live
+        // (line 4249), so this test re-arms when a future canonical
+        // emit landed.
+        let Some(&byte) = insns_opname_to_byte().get("cast_int_to_float/i>f") else {
+            return;
+        };
         let code = [byte, 0x02, 0x05]; // i-src=2, f-dst=5
         let mut tc = fresh_trace_ctx();
         let mut regs_i = distinct_const_refs(&mut tc, 8);

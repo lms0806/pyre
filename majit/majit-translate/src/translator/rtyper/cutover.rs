@@ -645,14 +645,16 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading pass that mirrors RPython.
         || msg.contains("adapter cross-block body Input")
     // `normalize_unary_op_name: pyre UnaryOp` Skip entry retired
-    // 2026-05-06: every cast variant pyre's
-    // `front/ast.rs::cast_op_name` emits (`same_as` /
-    // `cast_int_to_float` / `cast_float_to_int` / `cast_int_to_ptr`;
-    // `cast_ptr_to_int` already had a handler) now has a dedicated
-    // `RPythonTyper::translate_operation` arm into
-    // `rbuiltin.rs::rtype_*` (verbatim ports of upstream
-    // `@typer_for(lltype.cast_*)` bodies).  `normalize_unary_op_name`
-    // accepts these opnames straight through; any residual fail-loud
+    // 2026-05-06 + Slice C.1 / F3 (2026-05-19): the 13 typed numeric
+    // / ptr / Unsigned casts now route through
+    // `simple_call(<host_callable>, v)` per Slices A.3 / B.1 / A.4a /
+    // A.4b / A.4c — reaching `Repr.rtype_int/float/bool` or
+    // `BUILTIN_TYPER[lltype.cast_*]` directly.  Only the `same_as`
+    // identity / source-type-unknown fallback remains on the
+    // `OpKind::UnaryOp` route, dispatched by
+    // `RPythonTyper::translate_operation` to `rbuiltin::rtype_same_as`
+    // (verbatim port of `rtyper.py:478-481`).  `normalize_unary_op_name`
+    // accepts `same_as` straight through; any residual fail-loud
     // surfaces as a dual-gate divergence panic — the parity-correct
     // outcome.
 }

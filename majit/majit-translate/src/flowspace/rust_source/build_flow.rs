@@ -4580,17 +4580,19 @@ fn lower_index(b: &mut Builder, idx: &ExprIndex) -> Result<Hlvalue, AdapterError
 
 fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> {
     // `x as T` is rejected here pending source-type inference.
-    // build_flow.rs does not track per-`Hlvalue` `ValueType`
-    // (unlike `front/ast.rs::Expr::Cast` which uses
-    // `graph_value_type`), so the only `cast_op_name(None, target)`
-    // arm reachable is the transparent `same_as` fallthrough — that
-    // would silently retype `Int → Float`, `Float → Int`, `Bool →
-    // Int` etc. as a value-preserving op, diverging from
-    // `rbool.py:49` `cast_bool_to_int` / `rfloat.py:48`
-    // `cast_int_to_float` / `rint.py:rtype_int__Bool` `int_is_true`.
+    // build_flow.rs does not track per-`Hlvalue` `ValueType` (unlike
+    // `front/ast.rs::Expr::Cast` which uses `graph_value_type`), so
+    // `cast_builtin_name(None, target)` would always return `None`
+    // and the cast would degrade to the `same_as` identity fallback
+    // — silently retyping `Int → Float`, `Float → Int`, `Bool → Int`
+    // etc. as a value-preserving op, diverging from `rfloat.py:48`
+    // `IntegerRepr.rtype_float` (emits `cast_int_to_float` through
+    // the `simple_call(float, v)` BUILTIN_TYPER path) / `rint.py:137`
+    // `FloatRepr.rtype_int` / `rbool.py:55` `BoolRepr.rtype_int`.
     // Convergence requires per-`Hlvalue` `ValueType` tracking on the
-    // build_flow.rs Builder so `cast_op_name(Some(src), tgt)` picks
-    // the correct opname — until then, fail loudly.
+    // build_flow.rs Builder so `cast_builtin_name(Some(src), tgt)`
+    // resolves to the correct `simple_call(<host_callable>, v)`
+    // FunctionPath — until then, fail loudly.
     Err(AdapterError::Unsupported {
         reason: "`x as T` lowering pending source-type inference in build_flow.rs — \
             without per-Hlvalue ValueType the cast would silently fall through to \
@@ -8503,11 +8505,12 @@ mod tests {
     fn rejects_numeric_cast_pending_source_type_inference() {
         // `x as T` is fail-loud in `build_flow.rs` until per-Hlvalue
         // `ValueType` tracking lands on the Builder.  Without it,
-        // `cast_op_name(None, target)` falls through to the
-        // transparent `same_as` arm and would silently mistranslate
-        // `cast_int_to_float` / `cast_bool_to_int` / `int_is_true`.
-        // Front/ast.rs::Expr::Cast (which has `graph_value_type`)
-        // remains the lowering path for typed casts.
+        // `cast_builtin_name(None, target)` returns None and the
+        // cast degrades to the transparent `same_as` fallback —
+        // silently mistranslating `cast_int_to_float` /
+        // `cast_bool_to_int` / `int_is_true`.  Front/ast.rs::
+        // Expr::Cast (which has `graph_value_type`) remains the
+        // lowering path for typed casts.
         match lower("fn f(x: i64) -> i64 { x as i32 }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
                 assert!(reason.contains("`x as T`"), "reason: {reason}");

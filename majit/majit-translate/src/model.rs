@@ -32,12 +32,14 @@ pub enum ValueType {
     /// them onto this arm cascades into pyre-source analysis
     /// regressions (`annotator/unaryop.rs:445` getattr,
     /// `assembler.rs:581` kind-mismatch in `setinteriorfield_gc_r`).
-    /// The `cast_op_name` Unsigned arms (`cast_uint_to_*`,
-    /// `cast_*_to_uint`, `uint_is_true`) and the matching rtyper
-    /// handlers (`rtype_cast_uint_to_float` /
-    /// `rtype_cast_float_to_uint` / `rtype_uint_is_true`) are wired
-    /// for the eventual flip — see `front/ast.rs:classify_fn_arg_ty`
-    /// TODO(unsigned-producer-flip) for the convergence path.
+    /// `front/ast.rs::cast_builtin_name` now routes the eight
+    /// Unsigned `(source, target)` pairs through
+    /// `simple_call(__builtin__.float/bool, v_uint)`,
+    /// `simple_call(rarithmetic.intmask, v_uint)`, and
+    /// `simple_call(rarithmetic.r_uint, v)` per upstream
+    /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
+    /// `rarithmetic.py:600` — see `front/ast.rs:classify_fn_arg_ty`
+    /// TODO(unsigned-producer-flip) for the producer-side flip.
     Unsigned,
     /// RPython `SomeBool` (`annotator/model.py:185-198`): a Python `bool`
     /// at the annotator level.  Distinct from `Int` (RPython `SomeInteger`,

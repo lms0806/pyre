@@ -1660,6 +1660,28 @@ impl HostEnv {
             "longlongmask",
             HostObject::new_builtin_callable("rarithmetic.longlongmask"),
         );
+        // PRE-EXISTING-ADAPTATION (Task #344 — extregistry port):
+        // upstream models `r_uint` as the class object created via
+        // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py:546-600).
+        // Annotation / typing dispatch happens through an
+        // `extregistry.ExtRegistryEntry` with `_about_ = r_uint`
+        // (rarithmetic.py:572-582) — `compute_result_annotation` returns
+        // `SomeInteger(knowntype=r_uint, unsigned=True)` and
+        // `specialize_call` emits `inputargs(Unsigned)` then returns.
+        // The dispatch surface for a `_about_` extregistry entry is
+        // distinct from `BUILTIN_ANALYZERS` (`rbuiltin.py:14-15`) — the
+        // bookkeeper consults `extregistry.lookup_type` per class type
+        // rather than `BUILTIN_ANALYZERS` per qualname.  Pyre has no
+        // extregistry port yet, so `r_uint` is registered here as a
+        // builtin callable instead; the annotator (rarith_r_uint) and
+        // the typer (rtype_r_uint) reproduce the same observable
+        // `SomeInteger(unsigned=True)` and `inputargs(Unsigned)` output.
+        // Dispatch shape converges once extregistry lands; result
+        // coercion is unaffected.
+        rarithmetic.module_set(
+            "r_uint",
+            HostObject::new_builtin_callable("rarithmetic.r_uint"),
+        );
 
         os.module_set("fdopen", HostObject::new_builtin_callable("os.fdopen"));
         os.module_set("tmpfile", HostObject::new_builtin_callable("os.tmpfile"));
@@ -1781,6 +1803,20 @@ impl HostEnv {
         lltype.module_set(
             "cast_pointer",
             HostObject::new_builtin_callable("lltype.cast_pointer"),
+        );
+        // `lltype.cast_ptr_to_int` / `cast_int_to_ptr` — registered upstream
+        // at `rpython/rtyper/lltypesystem/lltype.py:2367-2382` via the
+        // `ann_cast_ptr_to_int` / `ann_cast_int_to_ptr` annotator hooks plus
+        // `BUILTIN_TYPER` entries in `rbuiltin.py`. The Rust frontend lowers
+        // `Expr::Cast { Ref ↔ Int }` to a `simple_call` against these
+        // HostObjects (see `front/ast.rs::cast_builtin_name`).
+        lltype.module_set(
+            "cast_ptr_to_int",
+            HostObject::new_builtin_callable("lltype.cast_ptr_to_int"),
+        );
+        lltype.module_set(
+            "cast_int_to_ptr",
+            HostObject::new_builtin_callable("lltype.cast_int_to_ptr"),
         );
         lltype.module_set(
             "render_immortal",

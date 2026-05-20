@@ -295,12 +295,38 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
 
     // builtin.py:217-293 — sys / rarithmetic / objectmodel helpers.
     analyzer_for(&mut reg, "sys.getdefaultencoding", conf);
-    analyzer_for(&mut reg, "rpython.rlib.rarithmetic.intmask", rarith_intmask);
-    analyzer_for(
-        &mut reg,
-        "rpython.rlib.rarithmetic.longlongmask",
-        rarith_longlongmask,
-    );
+    // Analyzer keys mirror the `HostObject::new_builtin_callable`
+    // qualname that `flowspace/model.rs::bootstrap_std_modules`
+    // assigns ("rarithmetic.intmask" etc.) so the bookkeeper.rs:1913
+    // SomeBuiltin-branch gate matches — keying under the full dotted
+    // module path silently routes the value to the
+    // extregistry / generic fallback path.  The doc-comment paths in
+    // each analyser body still reference upstream `rbuiltin.py:221`
+    // etc., which is the source-of-truth for the per-callable
+    // semantics.
+    analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
+    analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
+    // PRE-EXISTING-ADAPTATION (Task #344 — extregistry port):
+    // `build_int.ForTypeEntry(_about_ = r_uint).compute_result_\
+    // annotation` (rarithmetic.py:572-577) returns
+    // `SomeInteger(knowntype=r_uint, unsigned=True)`.  Upstream dispatch
+    // goes through `extregistry.lookup_type` per the class object;
+    // pyre routes through `BUILTIN_ANALYZERS[qualname]` keyed by
+    // `"rarithmetic.r_uint"` because no extregistry port exists yet.
+    // The body below reproduces the same observable `SomeInteger`
+    // shape so coercion converges; only dispatch lookup diverges.
+    analyzer_for(&mut reg, "rarithmetic.r_uint", rarith_r_uint);
+    // lltype.py:2367-2382 — `@analyzer_for(cast_ptr_to_int)` and
+    // `@analyzer_for(cast_int_to_ptr)`.  The Rust frontend lowers
+    // `Expr::Cast { Ref ↔ Int }` to a `simple_call` against the
+    // matching `lltype.*` HostObject (see `front/ast.rs::cast_builtin_name`),
+    // so the annotation pass routes through these analyzers when the
+    // cast surface lands in user code.  Keyed by the `qualname` that
+    // `HostObject::new_builtin_callable("lltype.cast_ptr_to_int")`
+    // produces (bookkeeper.rs:1939 reads `obj.qualname()` directly
+    // for `SomeBuiltin.analyser_name`).
+    analyzer_for(&mut reg, "lltype.cast_ptr_to_int", lltype_cast_ptr_to_int);
+    analyzer_for(&mut reg, "lltype.cast_int_to_ptr", lltype_cast_int_to_ptr);
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -323,12 +349,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     );
     analyzer_for(
         &mut reg,
-        "rpython.rlib.objectmodel.keepalive_until_here",
+        "objectmodel.keepalive_until_here",
         robjmodel_keepalive_until_here,
     );
     analyzer_for(
         &mut reg,
-        "rpython.rlib.objectmodel.free_non_gc_object",
+        "objectmodel.free_non_gc_object",
         robjmodel_free_non_gc_object,
     );
 
@@ -1143,6 +1169,97 @@ pub fn rarith_longlongmask(
     )))
 }
 
+/// Upstream `ann_cast_ptr_to_int(s_ptr)`
+/// (rpython/rtyper/lltypesystem/lltype.py:2367-2369).
+///
+/// ```python
+/// @analyzer_for(cast_ptr_to_int)
+/// def ann_cast_ptr_to_int(s_ptr): # xxx
+///     return SomeInteger()
+/// ```
+pub fn lltype_cast_ptr_to_int(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::default()))
+}
+
+/// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
+/// (rpython/rtyper/lltypesystem/lltype.py:2379-2382).
+///
+/// ```python
+/// @analyzer_for(cast_int_to_ptr)
+/// def ann_cast_int_to_ptr(PtrT, s_int):
+///     assert PtrT.is_constant()
+///     return SomePtr(ll_ptrtype=PtrT.const)
+/// ```
+///
+/// PRE-EXISTING-ADAPTATION (Task #345): the Rust frontend's
+/// `Expr::Cast { ValueType::Ref }` carries only the opaque high-level
+/// `Ref` (no concrete Ptr lltype is known at lowering time), so the
+/// frontend lowers `Int → Ref` to a **1-arg** `simple_call(lltype.\
+/// cast_int_to_ptr, v_int)` instead of upstream's 2-arg `simple_call\
+/// (lltype.cast_int_to_ptr, PTRTYPE, oddint)`.  Upstream's
+/// `ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and returns
+/// `SomePtr(ll_ptrtype=PtrT.const)` (lltype.py:2379-2382), reading
+/// the concrete Ptr type from the first argument.  Pyre's analyzer
+/// cannot recover that concrete Ptr from `args_s[0]` because it
+/// isn't there.  We return `SomePtr` with a Gc-Opaque placeholder
+/// Ptr (mirroring the opaque Ref bank); the rtyper-phase
+/// `rtype_cast_int_to_ptr` recovers the caller-side concrete Ptr
+/// from `hop.r_result.lowleveltype()`.  The constant carrier already
+/// exists (`ConstValue::LowLevelType(Box<LowLevelType>)`, flowspace/
+/// model.rs:1958, supports `LowLevelType::Ptr`); the blocker is the
+/// frontend not having the concrete Ptr available at `Expr::Cast`
+/// lowering time.  Graduating to the 2-arg form is blocked on
+/// threading the rtyper-side annotation back to the frontend (or a
+/// deferred 2-arg rewrite in jtransform / annotator once the Ptr is
+/// known).
+pub fn lltype_cast_int_to_ptr(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
+    let opaque = OpaqueType::gc("PYRE_REF_OPAQUE");
+    let placeholder_ptr = Ptr::from_container_type(
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
+    )
+    .expect("Opaque container yields a valid Ptr");
+    Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
+}
+
+/// Upstream `ForTypeEntry(_about_ = r_uint).compute_result_annotation`
+/// (rarithmetic.py:572-577).
+///
+/// ```python
+/// def compute_result_annotation(self, *args_s, **kwds_s):
+///     from rpython.annotator import model as annmodel
+///     return annmodel.SomeInteger(knowntype=int_type)
+/// ```
+///
+/// `r_uint` is `build_int('r_uint', False, LONG_BIT)` so
+/// `int_type.SIGN == False` → `SomeInteger(unsigned=True,
+/// knowntype=r_uint)`.
+///
+/// PRE-EXISTING-ADAPTATION (Task #344): upstream dispatch is via
+/// `extregistry._about_` keyed on the class object; pyre keys on the
+/// `"rarithmetic.r_uint"` qualname through `BUILTIN_ANALYZERS`.  The
+/// body is parity-correct — only the lookup mechanism diverges,
+/// producing the same `SomeInteger(unsigned=True, knowntype=Ruint)`
+/// result.
+pub fn rarith_r_uint(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        true,
+        crate::annotator::model::KnownType::Ruint,
+    )))
+}
+
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
 /// (builtin.py:229-242).
 pub fn robjmodel_instantiate(
@@ -1559,10 +1676,14 @@ mod tests {
 
     #[test]
     fn registry_contains_analyzer_for_entries() {
-        // upstream `@analyzer_for(...)` decorations.
+        // upstream `@analyzer_for(...)` decorations.  Each registry key
+        // matches the qualname `HostObject::new_builtin_callable(...)`
+        // assigns to its module attribute (see flowspace/model.rs
+        // bootstrap), so bookkeeper.rs:1913 `is_registered(qualname)`
+        // hits.
         assert!(is_registered("object.__init__"));
         assert!(is_registered("sys.getdefaultencoding"));
-        assert!(is_registered("rpython.rlib.rarithmetic.intmask"));
+        assert!(is_registered("rarithmetic.intmask"));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("weakref.ref"));
         assert!(is_registered("pdb.set_trace"));
@@ -2124,6 +2245,79 @@ mod tests {
             },
             other => panic!("expected SomeBool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_env_builtin_analyzer_keys_audit() {
+        // Survey HOST_ENV-registered builtin callables and flag every
+        // one whose qualname is NOT keyed in BUILTIN_ANALYZERS.
+        // bookkeeper.rs:1913 gates the SomeBuiltin branch on
+        // `is_registered(obj.qualname())`; a False return silently
+        // routes the value to the extregistry / generic fallback path
+        // — the analyser is effectively dead code.
+        use crate::flowspace::model::HOST_ENV;
+
+        let cases: &[(&str, &str)] = &[
+            ("rpython.rlib.rarithmetic", "intmask"),
+            ("rpython.rlib.rarithmetic", "longlongmask"),
+            ("rpython.rlib.rarithmetic", "r_uint"),
+            ("rpython.rlib.objectmodel", "keepalive_until_here"),
+            ("rpython.rlib.objectmodel", "free_non_gc_object"),
+            ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),
+            ("rpython.rtyper.lltypesystem.lltype", "cast_int_to_ptr"),
+        ];
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for (module_path, attr) in cases {
+            let m = HOST_ENV
+                .import_module(module_path)
+                .unwrap_or_else(|| panic!("module {module_path} not in HOST_ENV"));
+            let Some(obj) = m.module_get(attr) else {
+                continue;
+            };
+            let q = obj.qualname().to_string();
+            if !super::is_registered(&q) {
+                missing.push((format!("{module_path}.{attr}"), q));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "BUILTIN_ANALYZERS missing keys for qualnames bookkeeper.rs:1913 \
+             reads — these analyzers are silently unreachable: {missing:#?}"
+        );
+    }
+
+    #[test]
+    fn lltype_cast_analyzer_lookup_matches_host_qualname() {
+        // F2 followup: verify that the analyser registered for
+        // `lltype.cast_ptr_to_int` / `lltype.cast_int_to_ptr` is
+        // discoverable under the exact qualname that bookkeeper.rs:1939
+        // assigns as `SomeBuiltin.analyser_name` (i.e. what
+        // `call_builtin(analyser_name, ..)` will look up).
+        use crate::flowspace::model::HOST_ENV;
+        let lltype = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .expect("lltype module registered in HOST_ENV bootstrap");
+        let cast_p2i = lltype
+            .module_get("cast_ptr_to_int")
+            .expect("F1 registered cast_ptr_to_int attr on lltype");
+        let cast_i2p = lltype
+            .module_get("cast_int_to_ptr")
+            .expect("F1 registered cast_int_to_ptr attr on lltype");
+        // What bookkeeper.rs:1939 will use as analyser_name.
+        let q_p2i = cast_p2i.qualname();
+        let q_i2p = cast_i2p.qualname();
+        assert!(
+            super::is_registered(q_p2i),
+            "F2 analyzer must be registered under the qualname \
+             bookkeeper produces. Got qualname {q_p2i:?} which is \
+             NOT in BUILTIN_ANALYZERS — call_builtin would fail."
+        );
+        assert!(
+            super::is_registered(q_i2p),
+            "F2 analyzer must be registered under the qualname \
+             bookkeeper produces. Got qualname {q_i2p:?} which is \
+             NOT in BUILTIN_ANALYZERS — call_builtin would fail."
+        );
     }
 
     #[test]
