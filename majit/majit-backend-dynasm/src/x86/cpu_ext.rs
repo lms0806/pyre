@@ -25,9 +25,14 @@ use dynasmrt::ExecutableBuffer;
 /// `asmmemmgr`, which roots helper buffers on the CPU.
 pub(crate) struct X86CpuExt {
     /// `assembler.py:63 self.malloc_slowpath` parity.  Entry address
-    /// of the fixed-size malloc slowpath helper built by
-    /// `build_malloc_slowpath_fixed`; `_buffer` is the matching RX
-    /// mapping kept for the lifetime of this struct.
+    /// of the shared malloc slowpath trampoline built by
+    /// `build_malloc_slowpath_fixed`.  PyPy's `malloc_cond` (line
+    /// 2554) and `malloc_cond_varsize_frame` (line 2578) both route
+    /// through this single helper; pyre follows that — both call
+    /// sites reach this address via the same `JA slow_path` jump and
+    /// the trampoline's `SUB rdx, rcx` recovers the byte count.
+    /// `_buffer` is the matching RX mapping kept for the lifetime of
+    /// this struct.
     malloc_slowpath_fixed: Option<usize>,
     _malloc_slowpath_fixed_buffer: Option<ExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.

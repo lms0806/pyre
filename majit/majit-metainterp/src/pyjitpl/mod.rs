@@ -1165,6 +1165,18 @@ pub struct MetaInterp<M: Clone> {
     /// `self.history` exists (RPython places resumekey on `MetaInterp`
     /// directly, not on the history object).
     pub(crate) bridge_info: Option<BridgeTraceInfo>,
+    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` ↔ `:2897 /
+    /// :2934 profiler.end_tracing()` pairing flag.  PyPy fires both at
+    /// the entry/finally of `compile_and_run_once` /
+    /// `handle_guard_failure`; pyre fires them at the same structural
+    /// points (`prepare_trace_start_runtime` for roots,
+    /// `start_retrace_from_guard` for bridges) and balances the pair
+    /// via [`leave_profiler_tracing`].  Decoupled from
+    /// `active_trace_session` because the M-ownership lifecycle and
+    /// the profiler event lifecycle do not coincide: the session
+    /// opens later (`begin_trace_session`) and may be drained earlier
+    /// (`take_trace_meta`) than the profiler event scope.
+    pub(crate) profiler_tracing_active: bool,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -1888,6 +1900,7 @@ impl<M: Clone> MetaInterp<M> {
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
+            profiler_tracing_active: false,
         };
         // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
         // now that both sides of the pair exist, publish the
@@ -2041,6 +2054,15 @@ impl<M: Clone> MetaInterp<M> {
     /// path.  Panics if a prior session was not cleared — mirrors
     /// RPython's invariant that `self.history` has a single owner per
     /// trace.
+    ///
+    /// Manages only the M-ownership half of the lifecycle; the paired
+    /// `profiler.start_tracing()` ↔ `end_tracing()` events fire at
+    /// PyPy's `compile_and_run_once` / `handle_guard_failure` entry
+    /// and finally — pyre routes those through
+    /// [`enter_profiler_tracing`] (called from
+    /// `prepare_trace_start_runtime` for roots and
+    /// `start_retrace_from_guard` for bridges) and
+    /// [`leave_profiler_tracing`] (called from session-close paths).
     pub fn begin_trace_session(&mut self, trace_meta: M) {
         debug_assert!(
             self.active_trace_session.is_none(),
@@ -2086,9 +2108,16 @@ impl<M: Clone> MetaInterp<M> {
         self.active_trace_session.as_ref().map(|s| &s.trace_meta)
     }
 
-    /// Take ownership of the frontend trace metadata and end the
-    /// session.  Used by the finish-compile helpers that consume `M`
+    /// Drain the frontend trace metadata, leaving the session slot
+    /// empty.  Used by the finish-compile helpers that consume `M`
     /// before calling `recorder.finish()` + backend compile.
+    ///
+    /// Does *not* fire `profiler.end_tracing()`: the profiler event
+    /// scope is owned by [`leave_profiler_tracing`] and matches PyPy's
+    /// `compile_and_run_once` / `handle_guard_failure` `finally`
+    /// boundary, which is reached *after* the finish-compile body
+    /// runs.  Callers fire `leave_profiler_tracing` at the
+    /// finally-equivalent point themselves.
     pub fn take_trace_meta(&mut self) -> Option<M> {
         self.active_trace_session.take().map(|s| s.trace_meta)
     }
@@ -2097,10 +2126,45 @@ impl<M: Clone> MetaInterp<M> {
     /// the abort / cleanup path used when tracing aborts before
     /// finish.  Also clears `bridge_info` — `pyjitpl.py:3105`
     /// `_finish_off_the_metainterp` resets `self.resumekey` together
-    /// with the trace's history.
+    /// with the trace's history, and `pyjitpl.py:2897 / 2934`
+    /// `finally: profiler.end_tracing()` pairs the start fired by
+    /// `prepare_trace_start_runtime` / `start_retrace_from_guard`.
+    /// Both effects are bundled here because every trace-abort path
+    /// reaches `clear_trace_session` (it is the structural close
+    /// point); success paths that drain via [`take_trace_meta`] fire
+    /// [`leave_profiler_tracing`] explicitly at the close-equivalent
+    /// point and reach a no-op here.
     pub fn clear_trace_session(&mut self) {
+        self.leave_profiler_tracing();
         self.active_trace_session = None;
         self.bridge_info = None;
+    }
+
+    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` parity —
+    /// open the tracing profiler event scope.  Idempotent re-entry is
+    /// not allowed (PyPy's compile_and_run_once / handle_guard_failure
+    /// are not re-entrant on the same MetaInterp).
+    pub fn enter_profiler_tracing(&mut self) {
+        debug_assert!(
+            !self.profiler_tracing_active,
+            "enter_profiler_tracing called while tracing profiler event is already open",
+        );
+        self.staticdata.profiler.start_tracing();
+        self.profiler_tracing_active = true;
+    }
+
+    /// `pyjitpl.py:2897 / 2934` `profiler.end_tracing()` parity —
+    /// close the tracing profiler event scope opened by
+    /// [`enter_profiler_tracing`].  No-op if the scope was already
+    /// closed (mirrors PyPy's `finally` semantics: a path that never
+    /// reached `start_tracing` still passes through `finally` without
+    /// firing `end_tracing` because the implicit pairing depends on
+    /// whether the entry method ran past `start_tracing`).
+    pub fn leave_profiler_tracing(&mut self) {
+        if self.profiler_tracing_active {
+            self.staticdata.profiler.end_tracing();
+            self.profiler_tracing_active = false;
+        }
     }
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
@@ -2857,6 +2921,21 @@ impl<M: Clone> MetaInterp<M> {
         self.on_back_edge_typed(green_key, (0, 0), None, None, &typed_values)
     }
 
+    fn prepare_trace_start_runtime(&mut self) {
+        // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
+        //   debug_start('jit-tracing')
+        //   self.staticdata._setup_once()
+        //   self.staticdata.profiler.start_tracing()
+        //   self.staticdata.try_to_free_some_loops()
+        // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
+        // bootstrap; it has no PyPy analog (jitlog wiring runs inside
+        // `_setup_once` upstream) and stays idempotent.
+        self.warm_state.ensure_jitlog_initialised();
+        self.staticdata._setup_once(&mut self.backend);
+        self.enter_profiler_tracing();
+        self.try_to_free_some_loops();
+    }
+
     /// Force-start tracing for a green key, bypassing the hot counter.
     pub fn force_start_tracing(
         &mut self,
@@ -2865,24 +2944,6 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // pyjitpl.py:2884 `compile_and_run_once` invokes `_setup_once`
-        // before every trace start.  pyre routes back-edge traces
-        // through `bound_reached`, but function-entry traces enter
-        // here, so the same gate must fire to materialise per-CPU
-        // trampolines (`cpu.setup_once`), profiler `start`, and the
-        // jitlog header before the first trace records anything.
-        // Idempotent — `globaldata.initialized` short-circuits after
-        // the first call.
-        //
-        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
-        // `WarmEnterState` rather than `MetaInterpStaticData`, so the
-        // `pyjitpl.py:2295 self.jitlog.setup_once()` step is driven
-        // here against this MetaInterp's own warmstate.  Idempotent
-        // — `ensure_jitlog_initialised` only fills the slot when it
-        // is still `None`.
-        self.warm_state.ensure_jitlog_initialised();
-        self.staticdata._setup_once(&mut self.backend);
-
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -2890,6 +2951,7 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state.force_start_tracing(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                self.prepare_trace_start_runtime();
                 // RPython pyjitpl.py:2604 create_empty_history(inputargs): the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -3014,33 +3076,22 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // `pyjitpl.py:2889 self.staticdata._setup_once()` parity —
-        // PyPy's first `compile_and_run_once` per CPU dispatches the
-        // `globaldata.initialized`-gated `_setup_once` which calls
-        // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
-        // back-edge entry routes through `bound_reached`, so the
-        // gate fires here.  Idempotent.
-        //
-        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
-        // `WarmEnterState`, not on `MetaInterpStaticData`; drive the
-        // per-warmstate `setup_once` step here before the staticdata
-        // hook runs (matches PyPy's `jitlog → ...` order).
-        self.warm_state.ensure_jitlog_initialised();
-        self.staticdata._setup_once(&mut self.backend);
-
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
 
         match self.warm_state.force_start_tracing(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => self.setup_tracing(
-                green_key,
-                green_key_raw,
-                green_key_values,
-                driver_descriptor,
-                live_values,
-            ),
+            HotResult::StartTracing => {
+                self.prepare_trace_start_runtime();
+                self.setup_tracing(
+                    green_key,
+                    green_key_raw,
+                    green_key_values,
+                    driver_descriptor,
+                    live_values,
+                )
+            }
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
         }
@@ -3061,14 +3112,7 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
-                self.warm_state.ensure_jitlog_initialised();
-                self.staticdata._setup_once(&mut self.backend);
-                // pyjitpl.py:2890-2892 `compile_and_run_once`:
-                // `_setup_once`, then `profiler.start_tracing()`, then
-                // `try_to_free_some_loops()` before the trace history is
-                // created.  `setup_tracing` owns the history creation in pyre.
-                self.staticdata.profiler.start_tracing();
-                self.try_to_free_some_loops();
+                self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
@@ -3950,6 +3994,12 @@ impl<M: Clone> MetaInterp<M> {
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
+        // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
+        // `clear_trace_session` bundles `leave_profiler_tracing` with
+        // session/bridge_info cleanup, balancing the `start_tracing`
+        // fired at `prepare_trace_start_runtime` /
+        // `start_retrace_from_guard`.  No-op when no scope was open.
+        self.clear_trace_session();
         Some((trace, constants))
     }
 
@@ -4120,10 +4170,13 @@ impl<M: Clone> MetaInterp<M> {
         let outcome = self.compile_loop_body(jump_args, meta);
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
-        // next `begin_trace_session` sees a clean slate. Cancelled paths
-        // that kept `self.tracing` alive (e.g. `prior_retraced_count ==
-        // MAX` above) fall through harmlessly and keep tracing running.
-        if self.tracing.is_none() && self.active_trace_session.is_some() {
+        // next `begin_trace_session` sees a clean slate, and fire the
+        // `pyjitpl.py:2897 finally: profiler.end_tracing()` pairing for
+        // the `start_tracing` opened by `prepare_trace_start_runtime`.
+        // Cancelled paths that kept `self.tracing` alive (e.g.
+        // `prior_retraced_count == MAX` above) fall through harmlessly
+        // and keep tracing running.
+        if self.tracing.is_none() {
             self.clear_trace_session();
         }
         outcome
@@ -4173,9 +4226,7 @@ impl<M: Clone> MetaInterp<M> {
                     // pyjitpl.py:3004: creation of the loop was cancelled!
                     self.cancel_count += 1;
                     if self.cancelled_too_many_times() {
-                        if crate::majit_log_enabled() {
-                            eprintln!("[jit] retrace cancelled too many times");
-                        }
+                        crate::debug::log_one("jit-tracing", "retrace cancelled too many times");
                         self.clear_retrace_state();
                         if let Some(ctx) = self.tracing.take() {
                             self.warm_state.abort_tracing(ctx.green_key, false);
@@ -4194,9 +4245,10 @@ impl<M: Clone> MetaInterp<M> {
                     // Not too many — clear retrace state and fall through
                     // to normal compile_loop path.
                     self.exported_state = None;
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] retrace cancelled, trying normal compilation");
-                    }
+                    crate::debug::log_one(
+                        "jit-tracing",
+                        "retrace cancelled, trying normal compilation",
+                    );
                 } else {
                     // pyjitpl.py:2994-2995: position mismatch — abort.
                     self.clear_retrace_state();
@@ -4270,8 +4322,11 @@ impl<M: Clone> MetaInterp<M> {
             .map(|token| token.get_retraced_count())
             .unwrap_or(0);
         if prior_retraced_count_early == u32::MAX && !prior_front_target_tokens_early.is_empty() {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] skipping recompile: retraced_count=MAX for key={green_key}");
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-tracing",
+                    &format!("skipping recompile: retraced_count=MAX for key={green_key}"),
+                );
             }
             self.warm_state.abort_tracing(green_key, true);
             return CompileOutcome::Cancelled;
@@ -4627,9 +4682,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
-        if crate::majit_log_enabled() {
-            eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&compiled_ops, &constants));
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-loop");
+            crate::debug::debug_print("--- trace (after opt) ---");
+            for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
                     if let Some(fa) = op.getfailargs() {
@@ -4637,7 +4695,10 @@ impl<M: Clone> MetaInterp<M> {
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
                             .collect();
-                        eprintln!("[jit] FINAL GuardNotInv fail_args=[{}]", raw.join(", "));
+                        crate::debug::debug_print(&format!(
+                            "FINAL GuardNotInv fail_args=[{}]",
+                            raw.join(", ")
+                        ));
                     }
                 }
             }
@@ -4760,6 +4821,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend.compile_loop(
                 &inputargs,
@@ -4768,17 +4832,21 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
                 let is_invalid_loop = e.downcast_ref::<crate::optimize::InvalidLoop>().is_some();
-                if crate::majit_log_enabled() {
+                if crate::debug::have_debug_prints() {
                     let kind = if is_invalid_loop {
                         "InvalidLoop"
                     } else {
                         "panic"
                     };
-                    eprintln!("[jit] compile_loop {kind}, aborting trace at key={green_key}");
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("compile_loop {kind}, aborting trace at key={green_key}"),
+                    );
                 }
                 // compile.py:288 parity: preserve preamble target_tokens
                 // even on InvalidLoop/panic. The unroller's Phase 1 created
@@ -4900,8 +4968,11 @@ impl<M: Clone> MetaInterp<M> {
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!("compiled_loops.insert green_key={green_key}"),
+                    );
                 }
                 token.set_retraced_count(final_retraced_count);
                 self.compiled_loops.insert(
@@ -4926,6 +4997,11 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
                 self.stats.loops_compiled += 1;
+                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
+                // parity — bump the per-process profiler tracker so
+                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
+                // the post-`record_loop_or_bridge` total.
+                self.staticdata.profiler.inc_compiled_loop();
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
@@ -4948,9 +5024,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(e) => {
                 self.stats.loops_aborted += 1;
                 let msg = format!("JIT compilation failed: {e}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
@@ -5470,8 +5544,11 @@ impl<M: Clone> MetaInterp<M> {
                     .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] compile_retrace: InvalidLoop at key={}", green_key);
+                    if crate::debug::have_debug_prints() {
+                        crate::debug::log_one(
+                            "jit-abort",
+                            &format!("compile_retrace: InvalidLoop at key={green_key}"),
+                        );
                     }
                     return false;
                 }
@@ -5524,17 +5601,18 @@ impl<M: Clone> MetaInterp<M> {
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
-        if crate::majit_log_enabled() {
-            eprintln!("--- retrace combined (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&combined_ops, &constants));
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-bridge");
+            crate::debug::debug_print("--- retrace combined (after opt) ---");
+            for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
         }
 
         let num_combined_ops = combined_ops.len();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] compile_retrace: guardless loop");
-            }
+            crate::debug::log_one("jit-abort", "compile_retrace: guardless loop");
             return false;
         }
 
@@ -5578,6 +5656,9 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Wrap to `Vec<OpRc>` for the backend's trait boundary.
             let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
@@ -5591,11 +5672,15 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => {
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_retrace panicked at key={green_key}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("compile_retrace panicked at key={green_key}"),
+                    );
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 return false;
@@ -5709,8 +5794,11 @@ impl<M: Clone> MetaInterp<M> {
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!("compiled_loops.insert green_key={green_key}"),
+                    );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
@@ -5732,6 +5820,11 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
+                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
+                // parity — bump the per-process profiler tracker so
+                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
+                // the post-`record_loop_or_bridge` total.
+                self.staticdata.profiler.inc_compiled_loop();
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, 0, num_combined_ops);
@@ -5740,8 +5833,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_retrace failed: {e}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one("jit-abort", &format!("compile_retrace failed: {e}"));
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 false
@@ -5972,8 +6065,11 @@ impl<M: Clone> MetaInterp<M> {
                     .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] abort finish: InvalidLoop at key={}", green_key);
+                    if crate::debug::have_debug_prints() {
+                        crate::debug::log_one(
+                            "jit-abort",
+                            &format!("abort finish: InvalidLoop at key={green_key}"),
+                        );
                     }
                     self.warm_state.abort_tracing(green_key, true);
                     // pyjitpl.py:2760 aborted_tracing() reads greenkey from
@@ -6103,12 +6199,18 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        match self.backend.compile_loop(
-            &inputargs,
-            &optimized_ops_rc,
-            Arc::get_mut(&mut token)
-                .expect("JitCellToken must stay uniquely owned until backend compile"),
-        ) {
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        let compile_loop_result = {
+            let _backend_guard = self.staticdata.profiler.enter_backend();
+            self.backend.compile_loop(
+                &inputargs,
+                &optimized_ops_rc,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
+        };
+        match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -6223,10 +6325,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] finish_and_compile: compiled trace key={}, trace_id={}",
-                        green_key, trace_id
+                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
+                // parity — bump the per-process profiler tracker so
+                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
+                // the post-`record_loop_or_bridge` total.
+                self.staticdata.profiler.inc_compiled_loop();
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!(
+                            "finish_and_compile: compiled trace key={green_key}, trace_id={trace_id}"
+                        ),
                     );
                 }
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -6235,9 +6344,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(e) => {
                 let msg = format!("finish_and_compile: compile_loop FAILED key={green_key}: {e:?}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
@@ -6451,12 +6558,18 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        match self.backend.compile_loop(
-            &inputargs,
-            &compiled_ops_rc,
-            Arc::get_mut(&mut token)
-                .expect("JitCellToken must stay uniquely owned until backend compile"),
-        ) {
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        let compile_loop_result = {
+            let _backend_guard = self.staticdata.profiler.enter_backend();
+            self.backend.compile_loop(
+                &inputargs,
+                &compiled_ops_rc,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
+        };
+        match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -6535,6 +6648,11 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 self.stats.loops_compiled += 1;
+                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
+                // parity — bump the per-process profiler tracker so
+                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
+                // the post-`record_loop_or_bridge` total.
+                self.staticdata.profiler.inc_compiled_loop();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_simple_loop: compiled segmented trace key={}, trace_id={}",
@@ -7169,8 +7287,11 @@ impl<M: Clone> MetaInterp<M> {
     pub fn invalidate_loop(&mut self, green_key: u64) {
         if let Some(token) = self.warm_state.get_compiled(green_key) {
             token.invalidate();
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] invalidated loop at key={}", green_key);
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-invalidate",
+                    &format!("invalidated loop at key={green_key}"),
+                );
             }
         }
     }
@@ -7218,6 +7339,26 @@ impl<M: Clone> MetaInterp<M> {
     pub fn try_to_free_some_loops(&mut self) {
         let evicted = self.warm_state.memory_manager.next_generation();
         for token in evicted {
+            // model.py:289 `cpu.free_loop_and_bridges` parity for the
+            // counter side: PyPy's `LoopToken.__del__` runs that
+            // routine, which on its way out bumps
+            // `cpu.tracker.total_freed_loops += 1` plus
+            // `total_freed_bridges += loop.bridges_count`.  Pyre's
+            // backend has no global `cpu.tracker`; we keep the same
+            // four counters on the per-process `JitProfiler` and
+            // increment them here, where the eviction is observed.
+            // `compiled_loop_token` is None before backend compile
+            // completes — never reachable on an evicted token, but
+            // guarded for safety.
+            let bridges = token
+                .compiled_loop_token
+                .as_ref()
+                .map(|clt| *clt.bridges_count.lock())
+                .unwrap_or(0);
+            self.staticdata.profiler.inc_freed_loop();
+            if bridges > 0 {
+                self.staticdata.profiler.add_freed_bridges(bridges);
+            }
             let gk = token.green_key;
             let Some(entry) = self.compiled_loops.get_mut(&gk) else {
                 continue;
@@ -7234,8 +7375,11 @@ impl<M: Clone> MetaInterp<M> {
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
                 self.compiled_loops.remove(&gk);
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][memmgr] evicted current loop key={}", gk);
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-mem-collect",
+                        &format!("evicted current loop key={gk}"),
+                    );
                 }
             } else {
                 let before = entry.previous_tokens.len();
@@ -7244,8 +7388,11 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|t| !std::sync::Arc::ptr_eq(&t, &token))
                         .unwrap_or(false)
                 });
-                if crate::majit_log_enabled() && entry.previous_tokens.len() < before {
-                    eprintln!("[jit][memmgr] evicted previous token at key={}", gk);
+                if crate::debug::have_debug_prints() && entry.previous_tokens.len() < before {
+                    crate::debug::log_one(
+                        "jit-mem-collect",
+                        &format!("evicted previous token at key={gk}"),
+                    );
                 }
             }
         }
@@ -7820,9 +7967,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] must_compile: descr_addr=0, skip");
-            }
+            crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
         // compile.py:741: self.status — read live status directly from the
@@ -8429,6 +8574,9 @@ impl<M: Clone> MetaInterp<M> {
             token_mut.num_scalar_inputargs = self.num_scalar_inputargs;
         }
 
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
                 .iter()
@@ -8441,6 +8589,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => return false,
@@ -8560,6 +8709,11 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
+                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
+                // parity — bump the per-process profiler tracker so
+                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
+                // the post-`record_loop_or_bridge` total.
+                self.staticdata.profiler.inc_compiled_loop();
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(original_green_key, bridge_ops.len(), num_optimized_ops);
                 }
@@ -9006,7 +9160,10 @@ impl<M: Clone> MetaInterp<M> {
                 .iter()
                 .map(|op| std::rc::Rc::new(op.clone()))
                 .collect();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // compile.py:589-599 `profiler.start_backend() ... try:
+            // do_compile_bridge ... finally: ... profiler.end_backend()`.
+            self.staticdata.profiler.start_backend();
+            let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
                     bridge_inputargs,
@@ -9015,7 +9172,9 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens,
                     caller_recovery_layout.as_ref(),
                 )
-            })) {
+            }));
+            self.staticdata.profiler.end_backend();
+            match bridge_result {
                 Ok(r) => r,
                 Err(e) => {
                     if crate::majit_log_enabled() {
@@ -9137,6 +9296,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
+                // jitprof.py:108 `self.cpu.tracker.total_compiled_bridges`
+                // parity — bump the per-process profiler tracker.
+                self.staticdata.profiler.inc_compiled_bridge();
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
@@ -9148,9 +9310,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is not permanent — the counter resets and may fire again.
                 // RPython uses ST_BUSY_FLAG only (cleared by done_compiling).
                 let msg = format!("Bridge compilation failed: {e}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
@@ -9182,12 +9342,32 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
+        // pyjitpl.py:2914-2924 `handle_guard_failure` opening, line-by-line:
+        //   debug_start('jit-tracing')
+        //   self.staticdata.profiler.start_tracing()
+        //   key = resumedescr.get_resumestorage()
+        //   ...
+        //   self.staticdata.try_to_free_some_loops()
+        //   self.create_history(...)
+        // pyre's `compiled_loops` lookup below stands in for
+        // `get_resumestorage`/`loop_token_wref()`; both gate the trace on
+        // the source loop still being live.
+        self.enter_profiler_tracing();
+        self.try_to_free_some_loops();
         // bridgeopt.py:124 frontend_boxes come directly from the guard
         // failure values in fail_arg_types order.
         self.pending_frontend_boxes = Some(fail_values.to_vec());
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
-            None => return None,
+            None => {
+                // Source loop already evicted — bail out of the bridge
+                // before opening the M-ownership session.  Pair the
+                // `start_tracing` fired above so the profiler stack
+                // stays balanced (PyPy's `finally` would run even when
+                // `handle_guard_failure` returns early via `giveup`).
+                self.leave_profiler_tracing();
+                return None;
+            }
         };
 
         let norm_tid = trace_id;
@@ -11909,7 +12089,15 @@ impl<M: Clone> MetaInterp<M> {
         let meta = self
             .take_trace_meta()
             .expect("compile_finish_from_active_session: session must be present");
-        self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception)
+        let result =
+            self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception);
+        // pyjitpl.py:2897 `finally: profiler.end_tracing()` — close the
+        // tracing event scope opened by `prepare_trace_start_runtime`
+        // / `start_retrace_from_guard` for the root-finish path.  The
+        // session was drained above; `clear_trace_session` is not
+        // needed because `bridge_info` already cleared at bridge entry.
+        self.leave_profiler_tracing();
+        result
     }
 
     /// pyjitpl.py:2174-2186 `MIFrame.do_residual_or_indirect_call`.
@@ -13600,6 +13788,21 @@ pub mod counters {
     pub const NVHOLES: i32 = 20;
     /// jit.py:1437 `Counters.NVREUSED`.
     pub const NVREUSED: i32 = 21;
+    /// jit.py:1438 `Counters.TOTAL_COMPILED_LOOPS`.  jitprof.py:105-106
+    /// routes this id to `cpu.tracker.total_compiled_loops`.  pyre has
+    /// no global per-CPU tracker yet — [`crate::jitprof::JitProfiler::get_counter`]
+    /// returns `None` for this id (see
+    /// `majit-backend/src/lib.rs:939-943` PRE-EXISTING-ADAPTATION note).
+    pub const TOTAL_COMPILED_LOOPS: i32 = 22;
+    /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_COMPILED_BRIDGES: i32 = 23;
+    /// jit.py:1440 `Counters.TOTAL_FREED_LOOPS`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_FREED_LOOPS: i32 = 24;
+    /// jit.py:1441 `Counters.TOTAL_FREED_BRIDGES`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_FREED_BRIDGES: i32 = 25;
 }
 
 impl SwitchToBlackhole {

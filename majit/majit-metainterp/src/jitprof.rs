@@ -8,15 +8,35 @@
 //! `MetaInterpStaticData.profiler` through the shared `Arc` without any
 //! extra synchronisation.
 //!
-//! `Ordering::Relaxed` is sufficient for every counter: there is no causal
-//! relationship between any two counter updates, and we only ever publish
-//! totals via [`JitProfiler::snapshot`] which itself is `Relaxed`.
+//! `Ordering::Relaxed` is sufficient for every counter/timer total: there is
+//! no causal relationship between any two updates, and we only ever publish
+//! totals via [`JitProfiler::snapshot`] which itself is `Relaxed`. The nested
+//! `current` event stack from PyPy's profiler is thread-local, avoiding a
+//! mutex while preserving per-thread event nesting.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use majit_ir::OpCode;
 
 use crate::pyjitpl::counters;
+
+thread_local! {
+    static TIMING_STATE: RefCell<TimingState> = RefCell::new(TimingState::default());
+}
+
+#[derive(Clone, Copy)]
+struct TimingFrame {
+    profiler: usize,
+    event: i32,
+}
+
+#[derive(Default)]
+struct TimingState {
+    t1: Option<Instant>,
+    current: Vec<TimingFrame>,
+}
 
 /// jitprof.py:52-122 `Profiler` — every `Counters.*` slot is one
 /// `AtomicUsize`, plus the standalone `calls` counter that
@@ -32,12 +52,14 @@ use crate::pyjitpl::counters;
 #[derive(Default, Debug)]
 pub struct JitProfiler {
     /// jit.py:1416 `Counters.TRACING` — RPython tracks this as wall-clock
-    /// time + entry count via `_start`/`_end` (jitprof.py:75-93). Pyre
-    /// only records the entry count today; the wall-clock split lands
-    /// when start_tracing/end_tracing hooks are wired.
+    /// time + entry count via `_start`/`_end` (jitprof.py:75-93).
     pub tracing: AtomicUsize,
     /// jit.py:1417 `Counters.BACKEND` — same shape as TRACING.
     pub backend: AtomicUsize,
+    /// Accumulated nanoseconds for `Counters.TRACING`.
+    pub tracing_time_ns: AtomicU64,
+    /// Accumulated nanoseconds for `Counters.BACKEND`.
+    pub backend_time_ns: AtomicU64,
     /// jit.py:1418 `Counters.OPS` — every executed op
     /// (`execute_and_record_varargs` / `execute_and_record`,
     /// pyjitpl.py:2629/2645).
@@ -93,6 +115,28 @@ pub struct JitProfiler {
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
     /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
     pub calls: AtomicUsize,
+    /// jit.py:1438 `Counters.TOTAL_COMPILED_LOOPS`.  jitprof.py:105-106
+    /// reads `self.cpu.tracker.total_compiled_loops` — pyre's backends
+    /// have no shared `cpu.tracker` instance, so this counter lives on
+    /// the per-process profiler and is incremented at the same
+    /// structural points PyPy's `cpu.tracker` is bumped:
+    /// `record_loop_or_bridge` for a freshly-compiled loop
+    /// (`compile.py:213`).
+    pub total_compiled_loops: AtomicUsize,
+    /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  Bumped from the
+    /// bridge close-out path matching PyPy `compile.py:213` /
+    /// `compile.py:601`.
+    pub total_compiled_bridges: AtomicUsize,
+    /// jit.py:1440 `Counters.TOTAL_FREED_LOOPS`.  Bumped from
+    /// `MemoryManager::_kill_old_loops_now` when an evicted token's
+    /// `bridges_count == 0` — PyPy's `cpu.tracker` tracks the loop
+    /// side here.
+    pub total_freed_loops: AtomicUsize,
+    /// jit.py:1441 `Counters.TOTAL_FREED_BRIDGES`.  Bumped from
+    /// `MemoryManager::_kill_old_loops_now` for each bridge attached
+    /// to an evicted token; PyPy's `cpu.tracker.total_freed_bridges`
+    /// is bumped in `cpu.free_loop_and_bridges`.
+    pub total_freed_bridges: AtomicUsize,
     /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
     /// self.profiler.initialized: self.profiler.start(); ...
     /// initialized = True`.  RPython keeps this flag separate from
@@ -134,25 +178,46 @@ impl JitProfiler {
             &self.nvholes,
             &self.nvreused,
             &self.calls,
+            // tracker counters exposed via `get_counter(TOTAL_COMPILED_*
+            // / TOTAL_FREED_*)` — reset on `start()` so a profiler
+            // reused across test setups or explicit restarts does not
+            // report inflated totals carried over from the prior run.
+            &self.total_compiled_loops,
+            &self.total_compiled_bridges,
+            &self.total_freed_loops,
+            &self.total_freed_bridges,
         ] {
             field.store(0, Ordering::Relaxed);
         }
+        self.tracing_time_ns.store(0, Ordering::Relaxed);
+        self.backend_time_ns.store(0, Ordering::Relaxed);
+        let profiler = self.profiler_id();
+        TIMING_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.current.retain(|frame| frame.profiler != profiler);
+            state.t1 = Some(Instant::now());
+        });
     }
 
     /// jitprof.py:95 `Profiler.start_tracing`.
-    ///
-    /// PyPy also accounts elapsed time through `_start(Counters.TRACING)`.
-    /// Pyre's profiler currently stores only the entry count for timed
-    /// counters, so this is the counter-side parity hook.
     pub fn start_tracing(&self) {
-        self.tracing.fetch_add(1, Ordering::Relaxed);
+        self.start_event(counters::TRACING);
     }
 
     /// jitprof.py:96 `Profiler.end_tracing`.
-    ///
-    /// Kept as the structural counterpart to `start_tracing`; elapsed-time
-    /// buckets are not represented in Pyre yet.
-    pub fn end_tracing(&self) {}
+    pub fn end_tracing(&self) {
+        self.end_event(counters::TRACING);
+    }
+
+    /// jitprof.py:98 `Profiler.start_backend`.
+    pub fn start_backend(&self) {
+        self.start_event(counters::BACKEND);
+    }
+
+    /// jitprof.py:99 `Profiler.end_backend`.
+    pub fn end_backend(&self) {
+        self.end_event(counters::BACKEND);
+    }
 
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
     ///
@@ -191,9 +256,51 @@ impl JitProfiler {
 
     /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
     /// readback via `Counters.*` id. `None` for unknown ids.
+    ///
+    /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
+    /// readback via `Counters.*` id.  PyPy routes `TOTAL_COMPILED_*` /
+    /// `TOTAL_FREED_*` (ids 22..25) to `self.cpu.tracker.total_*`;
+    /// pyre keeps the same four counters directly on `JitProfiler`
+    /// (no per-CPU tracker in this backend) and routes them through
+    /// [`field_for_kind`] alongside the `Counters.*` slots, so the
+    /// caller sees identical semantics regardless of where the values
+    /// physically live.  Unknown ids return `None`.
     pub fn get_counter(&self, kind: i32) -> Option<usize> {
         self.field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed))
+    }
+
+    /// `cpu.tracker.total_compiled_loops += 1` parity.  Fired from the
+    /// loop close-out path (`record_loop_or_bridge` for a root trace,
+    /// `compile.py:213`).
+    pub fn inc_compiled_loop(&self) {
+        self.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_compiled_bridges += 1` parity.  Fired from the
+    /// bridge close-out path (`record_loop_or_bridge` for a bridge,
+    /// `compile.py:601`).
+    pub fn inc_compiled_bridge(&self) {
+        self.total_compiled_bridges.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
+    /// memory manager when an evicted token represents a root loop.
+    pub fn inc_freed_loop(&self) {
+        self.total_freed_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_freed_bridges += n` parity.  Fired from the
+    /// memory manager when an evicted token carries `n` bridges; PyPy's
+    /// `cpu.free_loop_and_bridges` bumps the tracker once per bridge.
+    pub fn add_freed_bridges(&self, n: usize) {
+        self.total_freed_bridges.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// jitprof.py:115-116 `Profiler.get_times(num)` — seconds.
+    pub fn get_times(&self, kind: i32) -> Option<f64> {
+        self.time_field_for_kind(kind)
+            .map(|field| field.load(Ordering::Relaxed) as f64 / 1_000_000_000.0)
     }
 
     /// Snapshot every counter at a moment.
@@ -228,7 +335,120 @@ impl JitProfiler {
             nvholes: self.nvholes.load(Ordering::Relaxed),
             nvreused: self.nvreused.load(Ordering::Relaxed),
             calls: self.calls.load(Ordering::Relaxed),
+            tracing_time_ns: self.tracing_time_ns.load(Ordering::Relaxed),
+            backend_time_ns: self.backend_time_ns.load(Ordering::Relaxed),
         }
+    }
+
+    /// Panic-safe RAII pairing for `start_tracing` / `end_tracing`.
+    /// `compile.py:532-546/589-599` wraps the backend compile in a
+    /// `start_backend()`/`end_backend()` pair via `try/finally`; the
+    /// pyre equivalent is this guard, which fires `end_*` from `Drop`
+    /// so panics inside the body still unwind through `end_event` and
+    /// the `current` stack stays balanced.
+    pub fn enter_tracing(&self) -> ProfilerEventGuard<'_> {
+        self.start_tracing();
+        ProfilerEventGuard {
+            profiler: self,
+            event: counters::TRACING,
+        }
+    }
+
+    /// Panic-safe RAII pairing for `start_backend` / `end_backend`.
+    /// Wraps `backend.compile_loop` / `backend.compile_bridge` call
+    /// sites with the same semantics as PyPy's `compile.py:532-546`
+    /// `try: ... finally: end_backend()`.
+    pub fn enter_backend(&self) -> ProfilerEventGuard<'_> {
+        self.start_backend();
+        ProfilerEventGuard {
+            profiler: self,
+            event: counters::BACKEND,
+        }
+    }
+
+    fn start_event(&self, event: i32) {
+        let now = Instant::now();
+        let profiler = self.profiler_id();
+        TIMING_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if let (Some(t1), Some(frame)) = (state.t1, state.current.last().copied()) {
+                if frame.profiler == profiler {
+                    self.add_time(frame.event, now.saturating_duration_since(t1));
+                }
+            }
+            state.t1 = Some(now);
+            self.count(event, 1);
+            state.current.push(TimingFrame { profiler, event });
+        });
+        if let Some(channel) = debug_channel_for_event(event) {
+            crate::debug::debug_start(channel);
+        }
+    }
+
+    fn end_event(&self, event: i32) {
+        let now = Instant::now();
+        let profiler = self.profiler_id();
+        // `ended` mirrors the symmetric `debug_start`/`debug_stop`
+        // pairing in `start_event`: we only close the debug channel
+        // when the TLS frame for this `(profiler, event)` actually
+        // matched and was popped.  On broken-data early returns the
+        // paired `debug_start` either never ran (empty stack) or
+        // belongs to a sibling profiler still owning the top of the
+        // stack; firing `debug_stop` anyway would desynchronize the
+        // per-thread category stack and panic the now-strict
+        // `debug_stop(category)` mismatch guard
+        // (`majit-ir/src/debug.rs:84-`).
+        let mut ended = false;
+        TIMING_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            // RPython peeks the top frame first (`self.current` is
+            // per-Profiler, so a wrong-event peek can only be a
+            // re-entry bug — never another instance leaking in).  Pyre
+            // shares `TIMING_STATE` across `JitProfiler` instances on
+            // the thread, so peek-then-pop is required: popping before
+            // the validation would lose the frame of a sibling
+            // profiler that legitimately owns the stack top.
+            let Some(&frame) = state.current.last() else {
+                // jitprof.py:86-88 `if not self.current: debug_print("BROKEN
+                // PROFILER DATA!"); return`.
+                crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
+                state.t1 = Some(now);
+                return;
+            };
+            if frame.profiler != profiler || frame.event != event {
+                // jitprof.py:90-92 `if ev1 != event: debug_print("BROKEN
+                // PROFILER DATA!"); return`.  pyre additionally diagnoses
+                // a mismatched profiler-instance frame, which RPython
+                // can't reach because each Profiler owns its own `current`
+                // list.  Leave the top frame in place — its owner will
+                // close it in their own `end_event`.
+                crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
+                state.t1 = Some(now);
+                return;
+            }
+            state.current.pop();
+            if let Some(t1) = state.t1 {
+                self.add_time(event, now.saturating_duration_since(t1));
+            }
+            state.t1 = Some(now);
+            ended = true;
+        });
+        if ended {
+            if let Some(channel) = debug_channel_for_event(event) {
+                crate::debug::debug_stop(channel);
+            }
+        }
+    }
+
+    fn add_time(&self, event: i32, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        if let Some(field) = self.time_field_for_kind(event) {
+            field.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    fn profiler_id(&self) -> usize {
+        self as *const Self as usize
     }
 
     fn field_for_kind(&self, kind: i32) -> Option<&AtomicUsize> {
@@ -255,8 +475,51 @@ impl JitProfiler {
             counters::NVIRTUALS => &self.nvirtuals,
             counters::NVHOLES => &self.nvholes,
             counters::NVREUSED => &self.nvreused,
+            counters::TOTAL_COMPILED_LOOPS => &self.total_compiled_loops,
+            counters::TOTAL_COMPILED_BRIDGES => &self.total_compiled_bridges,
+            counters::TOTAL_FREED_LOOPS => &self.total_freed_loops,
+            counters::TOTAL_FREED_BRIDGES => &self.total_freed_bridges,
             _ => return None,
         })
+    }
+
+    fn time_field_for_kind(&self, kind: i32) -> Option<&AtomicU64> {
+        Some(match kind {
+            counters::TRACING => &self.tracing_time_ns,
+            counters::BACKEND => &self.backend_time_ns,
+            _ => return None,
+        })
+    }
+}
+
+/// RAII guard returned by [`JitProfiler::enter_tracing`] /
+/// [`JitProfiler::enter_backend`].  Drops by firing the matching
+/// `end_*` so the profiler stack stays balanced even when the
+/// surrounding body panics — the PyPy `try/finally` equivalent.
+#[must_use = "drop the guard to fire the paired end_* event"]
+pub struct ProfilerEventGuard<'a> {
+    profiler: &'a JitProfiler,
+    event: i32,
+}
+
+impl Drop for ProfilerEventGuard<'_> {
+    fn drop(&mut self) {
+        self.profiler.end_event(self.event);
+    }
+}
+
+/// debug.py `debug_start("jit-tracing")` / `debug_start("jit-backend")`
+/// channel name for a `Counters.*` event id.  Returns `None` for events
+/// that don't have a paired debug scope upstream (count-only kinds like
+/// OPS / ABORT_*).  Used by [`JitProfiler::start_event`] /
+/// [`JitProfiler::end_event`] to emit grep-able scope markers under the
+/// single `MAJIT_LOG` switch (see `memmgr.rs` PRE-EXISTING-ADAPTATION
+/// note for the channel-registry deferral).
+fn debug_channel_for_event(event: i32) -> Option<&'static str> {
+    match event {
+        counters::TRACING => Some("jit-tracing"),
+        counters::BACKEND => Some("jit-backend"),
+        _ => None,
     }
 }
 
@@ -290,6 +553,8 @@ pub struct JitProfilerSnapshot {
     pub nvholes: usize,
     pub nvreused: usize,
     pub calls: usize,
+    pub tracing_time_ns: u64,
+    pub backend_time_ns: u64,
 }
 
 #[cfg(test)]
@@ -409,6 +674,30 @@ mod tests {
         assert_eq!(prof.get_counter(counters::ABORT_ESCAPE), Some(1));
         assert_eq!(prof.get_counter(counters::OPS), Some(0));
         assert_eq!(prof.get_counter(-1), None);
+    }
+
+    #[test]
+    fn start_end_timed_events_count_and_accumulate_elapsed_time() {
+        // jitprof.py:75-99 `_start`/`_end` contract: entering a nested
+        // event charges elapsed time to the previously-active event; leaving
+        // charges elapsed time to the ending event.
+        let prof = JitProfiler::default();
+        prof.start();
+        prof.start_tracing();
+        std::thread::sleep(Duration::from_millis(1));
+        prof.start_backend();
+        std::thread::sleep(Duration::from_millis(1));
+        prof.end_backend();
+        std::thread::sleep(Duration::from_millis(1));
+        prof.end_tracing();
+
+        let snap = prof.snapshot();
+        assert_eq!(snap.tracing, 1);
+        assert_eq!(snap.backend, 1);
+        assert!(snap.tracing_time_ns > 0);
+        assert!(snap.backend_time_ns > 0);
+        assert!(prof.get_times(counters::TRACING).unwrap() > 0.0);
+        assert_eq!(prof.get_times(counters::OPS), None);
     }
 
     #[test]
