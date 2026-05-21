@@ -756,10 +756,13 @@ impl Default for CodeWriter {
 /// via the dual-gate `value_to_var` map, extracts
 /// `SomeInstance.classdef` (`model.py:1054`) when present, and stamps
 /// the resulting `ClassDefKey` onto the op's `classdef_hint` field.
-/// The corresponding `(ClassDefKey → shortname)` pair is registered on
-/// `callcontrol` so [`crate::call::CallControl::resolve_method`] /
-/// [`crate::call::CallControl::resolve_method_impl_type`] can take the
-/// classdef-keyed fast path — mirroring upstream's
+/// The corresponding `(ClassDefKey → classdef.name)` pair is
+/// registered on `callcontrol`; `register_classdef_impl_type`
+/// canonicalises the value to `::` separators so the lookup against
+/// `function_graphs` via `CallPath::for_impl_method` (parse.rs:65)
+/// matches verbatim.  [`crate::call::CallControl::resolve_method`] /
+/// [`crate::call::CallControl::resolve_method_impl_type`] then take
+/// the classdef-keyed fast path — mirroring upstream's
 /// `bookkeeper.py:431-442 getmethoddesc` keying on the concrete
 /// `ClassDef` reference rather than a source-syntax string.
 ///
@@ -812,32 +815,45 @@ fn stamp_classdef_hints_on_graph(
                 continue;
             };
             let key = ClassDefKey::from_classdef(classdef_rc);
-            // Prime the upstream-orthodox `bookkeeper.methoddescs`
-            // cache by routing the receiver classdef + method name
-            // through `Bookkeeper.getmethoddesc_for_attribute`, which
-            // mirrors the regular-method branch of `bookkeeper.py:383-397
-            // getdesc`. The returned MethodDesc rc is discarded — the
-            // call is invoked for its cache-priming side-effect only,
-            // so the upstream-orthodox MethodDesc identity is reachable
-            // for any future PyPy-orthodox consumer that navigates the
-            // receiver classdef's bookkeeper backlink.
-            if let Some(bk) = classdef_rc.borrow().bookkeeper.upgrade() {
-                let _ = bk.getmethoddesc_for_attribute(classdef_rc, method_name);
-            }
-            // Store the fully qualified `ClassDef.name` (RPython
-            // `classdef.py:36 self.name = self.classdesc.name`,
-            // `module.Class` form) rather than `shortname`. The leaf-only
-            // spelling collapses distinct classdefs that share the same
-            // unqualified name (`pkg1.C` vs `pkg2.C`) onto a single
-            // side-table value, which can hand back the wrong registered
-            // graph when `trait_method_graphs` carries multiple impls
-            // under bare `C`. PRE-EXISTING-ADAPTATION on the
-            // `classdef_impl_types` map itself (no upstream basis in
-            // `bookkeeper.py`); retired when `trait_method_graphs` is
-            // re-keyed on the upstream-orthodox `MethodDesc` identity
-            // directly so dispatch consumes `bookkeeper.methoddescs`
-            // primed above.
-            let impl_type = classdef_rc.borrow().name.clone();
+            // Source of truth for `impl_type` is the bound MethodDesc's
+            // selfclassdef per `bookkeeper.py:384 getdesc` regular-
+            // method branch and `description.py:451 MethodDesc.bind_self`:
+            // the MethodDesc rebound by `getmethoddesc_for_attribute`
+            // carries `selfclassdef = receiver_classdef_key` and the
+            // dispatch namespace string follows from that binding's
+            // classdef.name.
+            //
+            // Fallback to the receiver classdef.name when the bind
+            // path is unreachable.  Three reachable fallback paths:
+            //   1. Bookkeeper weak-ref upgrade fails (classdef was
+            //      constructed standalone — typically a fixture).
+            //   2. `getmethoddesc_for_attribute` finds no Method PBC
+            //      under `name` in the receiver MRO.  Upstream
+            //      `bookkeeper.py:391 classdef.find_attribute(name)`
+            //      runs eagerly at annotation time, materialising the
+            //      attribute on the classdef; our pure-read adapter
+            //      operates post-annotator and tolerates the
+            //      materialisation gap by falling back to receiver
+            //      identity.  In the unbound-rebind case this is
+            //      parity-equivalent to the upstream answer
+            //      (`selfclassdef = receiver` ⇒
+            //      `bound_classdef.name = receiver.name`).
+            //   3. `lookup_classdef` cannot resolve the bound selfclassdef
+            //      key (Bookkeeper.classdefs was not seeded — fixture).
+            let impl_type = if let Some(bk) = classdef_rc.borrow().bookkeeper.upgrade() {
+                match bk.getmethoddesc_for_attribute(classdef_rc, method_name) {
+                    Some(md) => {
+                        let selfclassdef = md.borrow().selfclassdef;
+                        match selfclassdef.and_then(|sc| bk.lookup_classdef(sc)) {
+                            Some(cd) => cd.borrow().name.clone(),
+                            None => classdef_rc.borrow().name.clone(),
+                        }
+                    }
+                    None => classdef_rc.borrow().name.clone(),
+                }
+            } else {
+                classdef_rc.borrow().name.clone()
+            };
             stamps.push((b_idx, o_idx, key, impl_type));
         }
     }
@@ -1016,10 +1032,15 @@ mod stamp_classdef_hints_tests {
             "PyFrame".into(),
         )));
         let classdef = ClassDef::new(&bk, &desc);
+        bk.register_classdef(classdef.clone());
         let classdef_key = ClassDefKey::from_classdef(&classdef);
 
-        // Mint an upstream-shaped MethodDesc via bookkeeper.getmethoddesc
-        // and bind it as a Method PBC under `attrs[push_value]`.
+        // Seed the realistic upstream pattern: `attrs[push_value]`
+        // carries an *unbound* MethodDesc (selfclassdef = None). PyPy
+        // attaches the unbound carrier to the class dict at class-
+        // definition time, then `bookkeeper.py:384` getdesc binds it
+        // to the receiver on every access. The producer must perform
+        // the same bind via `getmethoddesc_for_attribute`.
         let funcdesc = Rc::new(RefCell::new(FunctionDesc::new(
             bk.clone(),
             None,
@@ -1028,14 +1049,19 @@ mod stamp_classdef_hints_tests {
             None,
             None,
         )));
-        let md = bk.getmethoddesc(
+        let unbound = bk.getmethoddesc(
             &funcdesc,
             classdef_key,
-            Some(classdef_key),
+            None,
             "push_value",
             std::collections::BTreeMap::new(),
         );
-        let pbc = SomePBC::new([DescEntry::Method(md.clone())], false);
+        assert_eq!(
+            unbound.borrow().selfclassdef,
+            None,
+            "test fixture seeds an unbound MethodDesc",
+        );
+        let pbc = SomePBC::new([DescEntry::Method(unbound.clone())], false);
         let mut attr = Attribute::new("push_value");
         attr.s_value = SomeValue::PBC(pbc);
         classdef
@@ -1071,37 +1097,40 @@ mod stamp_classdef_hints_tests {
         let mut callcontrol = CallControl::new();
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
 
-        // Producer primed bookkeeper.methoddescs (the upstream-orthodox
-        // cache) so the MethodDescKey shape resolves to the same
-        // MethodDesc Rc through the bookkeeper backlink. PyPy's actual
-        // structure — no separate pyre side-table.
-        let md_borrow = md.borrow();
-        let key = MethodDescKey {
-            funcdesc_id: DescKey::from_rc(&md_borrow.funcdesc),
-            originclassdef: md_borrow.originclassdef,
-            selfclassdef: md_borrow.selfclassdef,
-            name: md_borrow.name.clone(),
-            flags: md_borrow
-                .flags
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect(),
+        // Producer routed the receiver classdef + method name through
+        // `getmethoddesc_for_attribute`, which executed the upstream
+        // bind path: `getmethoddesc(funcdesc, originclassdef,
+        // selfclassdef=receiver_classdef, name)`. The cache now
+        // contains the *bound* entry (selfclassdef = Some(receiver_key)).
+        let bound_key = MethodDescKey {
+            funcdesc_id: DescKey::from_rc(&funcdesc),
+            originclassdef: classdef_key,
+            selfclassdef: Some(classdef_key),
+            name: "push_value".into(),
+            flags: Vec::new(),
         };
-        let cached_md = bk
+        let cached_bound = bk
             .methoddescs
             .borrow()
-            .get(&key)
+            .get(&bound_key)
             .cloned()
-            .expect("producer should prime bookkeeper.methoddescs");
+            .expect("producer should prime bookkeeper.methoddescs with the bound entry");
+        assert_eq!(
+            cached_bound.borrow().selfclassdef,
+            Some(classdef_key),
+            "primed entry must be bound to the receiver classdef",
+        );
         assert!(
-            Rc::ptr_eq(&cached_md, &md),
-            "primed entry should be the same MethodDesc rc as the originally-minted one",
+            !Rc::ptr_eq(&cached_bound, &unbound),
+            "bound entry is a distinct MethodDesc rc from the seeded unbound carrier",
         );
 
-        // The legacy `classdef_impl_types` side-table still carries the
-        // cached qualified `classdef.name` for the existing
-        // string-keyed dispatch. PRE-EXISTING-ADAPTATION; retired when
-        // `trait_method_graphs` is re-keyed on MethodDesc identity.
+        // `classdef_impl_types` carries the canonicalised qualified
+        // `classdef.name` (`::`-joined per `register_classdef_impl_type`)
+        // so the resolve_method classdef-keyed fast path builds the
+        // matching `CallPath::for_impl_method` directly against
+        // `function_graphs` — the same `getfunctionptr(graph)`
+        // identity surface upstream uses at call.py:175-187.
         assert_eq!(
             callcontrol.classdef_impl_type_for_test(classdef_key),
             Some("PyFrame"),

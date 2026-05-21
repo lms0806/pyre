@@ -54,9 +54,17 @@ impl CallPath {
     /// restores uniformity (RPython parity: `getfunctionptr(graph)` is
     /// string-free and does not distinguish the two shapes
     /// `rpython/jit/codewriter/call.py:174-187`).
+    ///
+    /// Both `::` (Rust path) and `.` (upstream `module.Class`) separators
+    /// are accepted — `ClassDef.name` mirrors upstream `classdesc.py:500-502`
+    /// (`cls.__module__ + '.' + cls.__name__`), while Rust impl
+    /// extraction emits `module::Type`.  Splitting on both keeps the
+    /// fast path keyed off `classdef_impl_types` reaching the same
+    /// `CallPath` registered by `register_trait_method`.
     pub fn for_impl_method(impl_type_joined: &str, method: &str) -> Self {
         let mut segments: Vec<String> = impl_type_joined
             .split("::")
+            .flat_map(|s| s.split('.'))
             .filter(|seg| !seg.is_empty())
             .map(|seg| seg.to_string())
             .collect();
@@ -71,6 +79,23 @@ impl CallPath {
     pub fn canonical_key(&self) -> String {
         self.segments.join("::")
     }
+}
+
+/// Strip every `::` and `.` prefix and return the trailing segment.
+///
+/// Type-name strings traversing the codewriter boundary carry one of
+/// two separator conventions: `module.Class` (RPython parity:
+/// `classdesc.py:500-502 cls.__module__ + '.' + cls.__name__`) or
+/// `module::Class` (Rust path extraction at `parse.rs:632-635
+/// self_ty_root_qualified`). Comparators that want the bare leaf
+/// (override pattern matchers, debug printers) must accept both — a
+/// plain `rsplit('.')` misses Rust-rooted values and a plain
+/// `rsplit("::")` misses Python-rooted values. Strip the longer
+/// `::` first, then the single-char `.`, so the returned slice is
+/// the final identifier regardless of mix.
+pub fn canonical_leaf(name: &str) -> &str {
+    let after_colon = name.rsplit("::").next().unwrap_or(name);
+    after_colon.rsplit('.').next().unwrap_or(after_colon)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

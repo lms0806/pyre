@@ -4242,14 +4242,15 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
 ///
 /// PRE-EXISTING-ADAPTATION: the override table itself is pyre-only
 /// (no upstream basis). The producer (`codewriter.rs::
-/// stamp_classdef_hints_on_graph`) stores
-/// `ClassDef.name` (RPython `classdef.py:36 self.name`, fully
-/// qualified `module.Class`) so distinct classdefs sharing a
-/// `shortname` don't collide. Override patterns such as
-/// `PYFRAME_CALL_OWNER_ROOT = "PyFrame"` are written bare in
-/// `pyre-jit-trace/src/call_spec.rs`, so the classdef-keyed branch
-/// also accepts a leaf-suffix match (`rsplit('.').next()`) against
-/// the qualified side-table value.
+/// stamp_classdef_hints_on_graph`) stores the receiver's `ClassDef.name`
+/// (RPython `classdef.py:36 self.name`, fully qualified `module.Class`)
+/// canonicalised through `register_classdef_impl_type` to `::`
+/// separators so distinct classdefs sharing a leaf identifier don't
+/// collide. Override patterns such as `PYFRAME_CALL_OWNER_ROOT =
+/// "PyFrame"` are written bare in `pyre-jit-trace/src/call_spec.rs`, so
+/// the classdef-keyed branch also accepts a leaf-suffix match
+/// (`crate::parse::canonical_leaf`) against the qualified side-table
+/// value — accepting both `module.Class` and `module::Class` forms.
 fn call_target_matches_loose(
     pattern: &CallTarget,
     target: &CallTarget,
@@ -4281,14 +4282,17 @@ fn call_target_matches_loose(
                             if side == p {
                                 return true;
                             }
-                            // Side-table value is the fully qualified
-                            // `ClassDef.name`; pattern receivers in
-                            // pyre-jit-trace's PYFRAME_CALL_EFFECTS are
-                            // bare leaf spellings. Compare on the leaf
-                            // after the final `.` so the override
-                            // matcher still fires for bare patterns.
-                            let side_leaf = side.rsplit('.').next().unwrap_or(side);
-                            if side_leaf == p {
+                            // Side-table value is the canonicalised
+                            // qualified `ClassDef.name` (`::`-joined per
+                            // `register_classdef_impl_type`); pattern
+                            // receivers in pyre-jit-trace's
+                            // PYFRAME_CALL_EFFECTS are bare leaf
+                            // spellings. Compare on the leaf after the
+                            // final separator (`canonical_leaf` accepts
+                            // both `::` and `.`) so the override matcher
+                            // fires for bare patterns regardless of how
+                            // the producer's classdef was named.
+                            if crate::parse::canonical_leaf(side) == p {
                                 return true;
                             }
                         }

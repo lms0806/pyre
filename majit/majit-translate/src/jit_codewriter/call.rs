@@ -480,10 +480,6 @@ pub struct CallControl {
     /// [`crate::policy::JitPolicy::look_inside_graph`] inside `find_all_graphs`.
     function_hints: HashMap<CallPath, Vec<String>>,
 
-    /// Trait impl method graphs: (method_name, impl_type) → FunctionGraph.
-    /// Used for resolving `handler.method_name()` calls.
-    trait_method_graphs: HashMap<(String, String), FunctionGraph>,
-
     /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
     ///
     /// Keyed by the *declaring trait* (impl's `trait_name` from
@@ -1029,7 +1025,6 @@ impl CallControl {
         Self {
             function_graphs: HashMap::new(),
             function_hints: HashMap::new(),
-            trait_method_graphs: HashMap::new(),
             trait_method_impls: HashMap::new(),
             candidate_graphs: HashSet::new(),
             portal_targets: HashSet::new(),
@@ -1939,24 +1934,17 @@ impl CallControl {
         impl_type: &str,
         graph: FunctionGraph,
     ) {
-        self.trait_method_graphs.insert(
-            (method_name.to_string(), impl_type.to_string()),
-            graph.clone(),
-        );
         if let Some(trait_root) = trait_root {
             self.trait_method_impls
                 .entry((trait_root.to_string(), method_name.to_string()))
                 .or_default()
                 .push(impl_type.to_string());
         }
-        // Register in function_graphs for BFS reachability.
-        // RPython: each graph has its own identity via funcptr._obj.graph.
-        // We emulate this with `CallPath::for_impl_method(impl_type,
-        // method_name)` which splits the impl_type across `::` so every
-        // segment has the same granularity as free-fn paths — each impl
-        // still gets a distinct path (PyFrame::push_value stays
-        // `["PyFrame", "push_value"]`, MIFrame::push_value stays
-        // `["MIFrame", "push_value"]`).
+        // `function_graphs` is the canonical `getfunctionptr(graph)`
+        // identity (RPython `call.py:175-187`).  Each impl gets a
+        // distinct CallPath built from `for_impl_method` so PyFrame's
+        // `push_value` and MIFrame's `push_value` stay separate
+        // (`["PyFrame", "push_value"]` vs `["MIFrame", "push_value"]`).
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
         self.function_graphs.entry(qualified_path).or_insert(graph);
     }
@@ -3025,17 +3013,17 @@ impl CallControl {
                 // Classdef-keyed fast path mirrors
                 // `MethodDesc.selfclassdef` lookup at
                 // description.py:447-456 — purely additive. The side-
-                // table stores `classdef.shortname`
-                // (`codewriter.rs:754`); when that string does not name
-                // a registered `CallPath` (default-method shims
-                // registered under `<default methods of <Trait>>` per
-                // `lib.rs:573-633`, or qualified `module::Type`
-                // spellings from `parse.rs:625-627`), fall through to
-                // the receiver-root / `resolve_method_impl_type`
-                // resolution below rather than short-circuit to an
-                // unregistered path that downstream
-                // [`Self::direct_graph_for`] would reject via
-                // `candidate_graphs.contains(&path)`.
+                // table stores the canonicalised qualified
+                // `ClassDef.name` (`::`-joined per
+                // `register_classdef_impl_type`); when that string
+                // does not name a registered `CallPath` (default-
+                // method shims registered under
+                // `<default methods of <Trait>>` per `lib.rs:573-633`),
+                // fall through to the receiver-root /
+                // `resolve_method_impl_type` resolution below rather
+                // than short-circuit to an unregistered path that
+                // downstream [`Self::direct_graph_for`] would reject
+                // via `candidate_graphs.contains(&path)`.
                 if let Some(key) = classdef_hint {
                     if let Some(impl_type) = self.classdef_impl_type(*key) {
                         let qualified = CallPath::for_impl_method(impl_type, name.as_str());
@@ -3229,7 +3217,14 @@ impl CallControl {
         key: crate::annotator::description::ClassDefKey,
         impl_type: impl Into<String>,
     ) {
-        self.classdef_impl_types.insert(key, impl_type.into());
+        // `function_graphs` CallPaths are derived from
+        // `CallPath::for_impl_method` (parse.rs:65-72) which accepts
+        // both `::` and `.` separators.  Canonicalise the stored
+        // string to `::`-joined so leaf comparators
+        // (`jtransform.rs::call_target_matches_loose` via
+        // `parse::canonical_leaf`) see a single consistent shape.
+        let normalized = impl_type.into().replace('.', "::");
+        self.classdef_impl_types.insert(key, normalized);
     }
 
     /// Read accessor — returns the `impl_type` string associated with
@@ -3268,6 +3263,12 @@ impl CallControl {
 
     /// Resolve a method call to a concrete impl graph.
     ///
+    /// Every successful resolution goes through
+    /// [`Self::function_graphs`] via [`CallPath::for_impl_method`] —
+    /// the same `getfunctionptr(graph)` identity surface upstream uses
+    /// at `call.py:175-187`.  The string-keyed `trait_method_graphs`
+    /// side-table was retired in favour of this single-source lookup.
+    ///
     /// When `classdef_hint` is `Some` and the side-table has a binding,
     /// take the classdef-keyed fast path that mirrors upstream
     /// `bookkeeper.py:431-442 getmethoddesc` dispatch on the concrete
@@ -3285,23 +3286,21 @@ impl CallControl {
         receiver_root: Option<&str>,
         classdef_hint: Option<crate::annotator::description::ClassDefKey>,
     ) -> Option<&FunctionGraph> {
-        // Classdef-keyed fast path — purely additive. The side-table
-        // currently stores `classdef.shortname` (`codewriter.rs:754`)
-        // and `bookkeeper.py:431-442 getmethoddesc`'s full key
-        // `(funcdesc, originclassdef, selfclassdef, …)` is not yet
-        // ported. When the shortname-derived `impl_type` does not name
-        // a registered `(name, impl_type)` graph — e.g. default-method
-        // entries stored under `"<default methods of <Trait>>"`
-        // (`lib.rs:573-633`) or qualified-receiver registrations such
-        // as `module::Type` from `parse.rs:625-627` — fall through to
-        // the receiver-root / default-method fallback below rather
-        // than short-circuit to `None`.
+        // Classdef-keyed fast path mirrors
+        // `bookkeeper.py:431-442 getmethoddesc` keyed on
+        // `(funcdesc, originclassdef, selfclassdef, …)` — pyre's
+        // side-table reduces that 4-tuple to a single `ClassDefKey`
+        // identity by routing the receiver through
+        // `register_classdef_impl_type` (canonicalised `::`-joined
+        // `ClassDef.name`).  The side-table value may not name a
+        // registered impl when `register_trait_method` recorded the
+        // method under `<default methods of <Trait>>`
+        // (`lib.rs:573-633`); fall through to the explicit
+        // receiver-root match below before treating that as a miss.
         if let Some(key) = classdef_hint {
             if let Some(impl_type) = self.classdef_impl_type(key) {
-                if let Some(g) = self
-                    .trait_method_graphs
-                    .get(&(name.to_string(), impl_type.to_string()))
-                {
+                let path = CallPath::for_impl_method(impl_type, name);
+                if let Some(g) = self.function_graphs.get(&path) {
                     return Some(g);
                 }
             }
@@ -3310,46 +3309,57 @@ impl CallControl {
         if impls.is_empty() {
             return None;
         }
+
+        // Receiver-string exact-match.  When `classdef_hint` is
+        // present and an `impl_type` was registered, this is dead code
+        // (the fast path above already hit); when the hint is missing
+        // it's the only orthodox resort.
+        if let Some(receiver) = receiver_root {
+            let path = CallPath::for_impl_method(receiver, name);
+            if let Some(g) = self.function_graphs.get(&path) {
+                return Some(g);
+            }
+        }
+
+        // PRE-EXISTING-ADAPTATION: receiver-agnostic "unique concrete
+        // impl" fallback.  Upstream `call.py:175-187
+        // getfunctionptr(graph)` keys on graph identity, never on
+        // method name, so this branch has no RPython counterpart.
+        // Pyre keeps it as a BFS-coverage adaptation: the codewriter
+        // producer (`codewriter.rs::stamp_classdef_hints_on_graph`)
+        // runs per-graph during transform, which is AFTER
+        // `find_all_graphs_bfs` (`call.rs:2398`) has already chosen
+        // candidates.  When BFS walks a Call site whose receiver is a
+        // generic trait variable (`<H: OpcodeStepExecutor>`) with no
+        // annotator-derived classdef hint and no receiver-name match,
+        // collapsing to the unique concrete impl is the only way to
+        // include the impl's body in `candidate_graphs`.  Retired once
+        // the annotator-monomorphization epic publishes classdef hints
+        // before BFS runs (plan §M3); the
+        // `find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal`
+        // and `all_jitcodes_registry_contains_inherent_impl_methods`
+        // oracles pin the BFS coverage this branch enables.
         let concrete_impls: Vec<&String> = impls
             .iter()
             .copied()
             .filter(|t| !t.starts_with("<default methods of"))
             .collect();
-
         if concrete_impls.len() == 1 {
-            // Unique concrete impl — use it regardless of receiver
             let impl_type = concrete_impls[0];
-            return self
-                .trait_method_graphs
-                .get(&(name.to_string(), impl_type.clone()));
+            let path = CallPath::for_impl_method(impl_type, name);
+            return self.function_graphs.get(&path);
         }
 
-        // Multiple concrete impls — exact-match lookup by receiver
-        // string. Generic receiver names ("H", "handler", "self")
-        // cannot equal any registered `impl_type` so the lookup is a
-        // miss and we fall through to the default-method branch
-        // below. PRE-EXISTING-ADAPTATION: the lookup itself is keyed
-        // on source-syntax string rather than the annotator's
-        // `ClassDef` reference (`bookkeeper.py:431-442 getmethoddesc`).
-        // The classdef-keyed fast path above is the upstream-orthodox
-        // resolution; this fallback is reachable only when the
-        // producer hasn't covered the site.
-        if let Some(receiver) = receiver_root {
-            if let Some(g) = self
-                .trait_method_graphs
-                .get(&(name.to_string(), receiver.to_string()))
-            {
-                return Some(g);
-            }
-        }
-
-        // All impls are default-method shims AND there's exactly one
-        // — return that.
+        // Single registered "default methods" shim — uniqueness here
+        // does not depend on the receiver because the trait default
+        // body is the same for every impl that does not override it
+        // (`classdesc.py:749 lookup` MRO walk).  Match only when the
+        // sole registration is a default-method shim AND no
+        // overriding concrete impl exists.
         if concrete_impls.is_empty() && impls.len() == 1 {
             let impl_type = impls[0];
-            return self
-                .trait_method_graphs
-                .get(&(name.to_string(), impl_type.clone()));
+            let path = CallPath::for_impl_method(impl_type, name);
+            return self.function_graphs.get(&path);
         }
 
         None
@@ -3372,11 +3382,14 @@ impl CallControl {
         receiver_root: Option<&str>,
         classdef_hint: Option<crate::annotator::description::ClassDefKey>,
     ) -> Option<&'b str> {
-        // Classdef-keyed fast path — purely additive. Same caveat as
-        // [`Self::resolve_method`]: the shortname-derived side-table
-        // string may not name a registered impl for this method (default
-        // methods, qualified `module::Type` registrations), in which
-        // case fall through to the receiver-root path below.
+        // Classdef-keyed fast path mirrors
+        // `bookkeeper.py:431-442 getmethoddesc`; pyre folds the
+        // 4-tuple into a single `ClassDefKey` identity via
+        // `register_classdef_impl_type` (canonicalised `::`-joined
+        // `ClassDef.name`).  Side-table value may not name a
+        // registered impl for this method (default-method shims at
+        // `<default methods of <Trait>>` per `lib.rs:573-633`); fall
+        // through to receiver-root match before treating as a miss.
         let impls = self.impls_for_method_name(name);
         if let Some(key) = classdef_hint {
             if let Some(impl_type) = self.classdef_impl_type(key) {
@@ -3388,20 +3401,31 @@ impl CallControl {
         if impls.is_empty() {
             return None;
         }
-        let concrete_impls: Vec<&String> = impls
-            .iter()
-            .copied()
-            .filter(|t| !t.starts_with("<default methods of"))
-            .collect();
 
-        if concrete_impls.len() == 1 {
-            return Some(concrete_impls[0].as_str());
-        }
+        // Receiver-string exact-match.  Mirrors [`Self::resolve_method`].
         if let Some(receiver) = receiver_root {
             if let Some(impl_name) = impls.iter().copied().find(|t| t.as_str() == receiver) {
                 return Some(impl_name.as_str());
             }
         }
+
+        // PRE-EXISTING-ADAPTATION: receiver-agnostic "unique concrete
+        // impl" fallback — see the matching branch in
+        // [`Self::resolve_method`] for the rationale.  Retired
+        // alongside it once the annotator publishes classdef hints
+        // before BFS.
+        let concrete_impls: Vec<&String> = impls
+            .iter()
+            .copied()
+            .filter(|t| !t.starts_with("<default methods of"))
+            .collect();
+        if concrete_impls.len() == 1 {
+            return Some(concrete_impls[0].as_str());
+        }
+
+        // Lone default-method shim — uniqueness here is a property of
+        // the trait, not the receiver (every impl shares the default
+        // body per `classdesc.py:749 lookup` MRO walk).
         if concrete_impls.is_empty() && impls.len() == 1 {
             return Some(impls[0].as_str());
         }
@@ -6522,7 +6546,11 @@ mod tests {
             graph,
         );
 
-        // Unique impl — resolves for any receiver
+        // PRE-EXISTING-ADAPTATION: receiver-agnostic unique-impl
+        // fallback in `resolve_method` enables BFS to monomorphise
+        // generic-receiver call sites at trait dispatch.  Retired
+        // when the annotator publishes classdef hints before BFS
+        // (plan §M3).
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), None)
                 .is_some()
@@ -6606,9 +6634,9 @@ mod tests {
     #[test]
     fn resolve_method_falls_back_when_classdef_hint_not_registered() {
         // If `classdef_hint` is supplied but the side-table is empty,
-        // resolution must fall back to the receiver-root path rather
-        // than returning None. `register_classdef_impl_type` is the
-        // only producer entry, so an unregistered key must not poison
+        // resolution falls back to the receiver-root path before
+        // failing.  `register_classdef_impl_type` is the only
+        // producer entry, so an unregistered key must not poison
         // resolution while the producer still misses some sites.
         use crate::annotator::description::ClassDefKey;
         let mut cc = CallControl::new();
@@ -6620,6 +6648,7 @@ mod tests {
         );
 
         let unknown_key = ClassDefKey::from_raw(0xBEEF);
+        // Falls through to unique-impl PRE-EXISTING-ADAPTATION.
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), Some(unknown_key))
                 .is_some()
