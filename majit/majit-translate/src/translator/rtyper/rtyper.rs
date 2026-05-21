@@ -5351,7 +5351,7 @@ mod tests {
             .expect("initialize_exceptiondata");
         let ed = rtyper.exceptiondata().expect("exceptiondata");
 
-        let mut var_etype = Variable::new();
+        let var_etype = Variable::new();
         var_etype.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
         let var_etype_h = Hlvalue::Variable(var_etype);
 
@@ -5402,12 +5402,12 @@ mod tests {
             .expect("initialize_exceptiondata");
         let ed = rtyper.exceptiondata().expect("exceptiondata");
 
-        let mut var_etype = Variable::new();
+        let var_etype = Variable::new();
         var_etype.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
         let var_etype_h = Hlvalue::Variable(var_etype);
         // Pass a Variable as `const_etype` to violate the upstream
         // contract that it must carry a concrete `_ptr`.
-        let mut bad_const = Variable::new();
+        let bad_const = Variable::new();
         bad_const.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
         let bad_const_h = Hlvalue::Variable(bad_const);
 
@@ -5684,10 +5684,10 @@ mod tests {
         let ptr = Ptr {
             TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
         };
-        let mut v_array = Variable::new();
+        let v_array = Variable::new();
         v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         let v_index = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
-        let mut result = Variable::new();
+        let result = Variable::new();
         result
             .annotation
             .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
@@ -5756,7 +5756,7 @@ mod tests {
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), Vec::new(), llops);
         let repr: Arc<dyn Repr> = Arc::new(VoidRepr::new());
-        let mut var = Variable::new();
+        let var = Variable::new();
         var.set_concretetype(Some(LowLevelType::Void));
         let arg = Hlvalue::Variable(var.clone());
         hop.args_v.borrow_mut().push(arg.clone());
@@ -5905,7 +5905,7 @@ mod tests {
         let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         // Build a typed input arg so the concretetype assertion passes.
-        let mut input = Variable::new();
+        let input = Variable::new();
         input.set_concretetype(Some(LowLevelType::Signed));
         let result = llops
             .genop(
@@ -5957,7 +5957,7 @@ mod tests {
         // do not require the typer (`genop`, `append`, `len`,
         // `is_empty`) work normally.
         let mut llops = LowLevelOpList::without_rtyper(None);
-        let mut input = Variable::new();
+        let input = Variable::new();
         input.set_concretetype(Some(LowLevelType::Bool));
         let result = llops
             .genop(
@@ -6243,7 +6243,7 @@ mod tests {
         // positive path.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let mut var = Variable::new();
+        let var = Variable::new();
         var.annotation
             .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
         let v = Hlvalue::Variable(var);
@@ -6306,7 +6306,7 @@ mod tests {
         // rtyper.py:174-175.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let mut var = Variable::new();
+        let var = Variable::new();
         var.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
         let v = Hlvalue::Variable(var);
         let repr = rtyper.bindingrepr(&v).unwrap();
@@ -6319,7 +6319,7 @@ mod tests {
         // rtyper.py:258-260.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let mut var = Variable::new();
+        let var = Variable::new();
         var.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
         assert_eq!(var.concretetype(), None);
         rtyper.setconcretetype(&var).unwrap();
@@ -6332,7 +6332,7 @@ mod tests {
         // rtyper.py:272-278 normal path.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let mut v = Variable::new();
+        let v = Variable::new();
         v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
         let block = Block::shared(vec![Hlvalue::Variable(v)]);
         let reprs = rtyper.setup_block_entry(&block).unwrap();
@@ -6396,9 +6396,9 @@ mod tests {
         // rtyper.py:263-270 special-case. Blocked on ExceptionData port.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let mut v1 = Variable::new();
+        let v1 = Variable::new();
         v1.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
-        let mut v2 = Variable::new();
+        let v2 = Variable::new();
         v2.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
         let block = Block::shared(vec![Hlvalue::Variable(v1), Hlvalue::Variable(v2)]);
         block.borrow_mut().mark_final();
@@ -6440,11 +6440,11 @@ mod tests {
         // result; bind annotations so `rtyper.binding` succeeds.
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
-        let mut arg_var = Variable::new();
+        let arg_var = Variable::new();
         arg_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));
-        let mut result_var = Variable::new();
+        let result_var = Variable::new();
         result_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));
@@ -6484,11 +6484,11 @@ mod tests {
         use crate::annotator::model::SomeWeakRef;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
-        let mut arg_var = Variable::new();
+        let arg_var = Variable::new();
         arg_var
             .annotation
             .replace(Some(Rc::new(SomeValue::WeakRef(SomeWeakRef::new(None)))));
-        let mut result_var = Variable::new();
+        let result_var = Variable::new();
         result_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));
@@ -6559,7 +6559,7 @@ mod tests {
         use crate::annotator::model::SomeInteger;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
-        let mut result_var = Variable::new();
+        let result_var = Variable::new();
         result_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(

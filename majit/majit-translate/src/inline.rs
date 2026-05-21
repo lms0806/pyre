@@ -414,11 +414,13 @@ fn remap_callee_blocks(
     map
 }
 
-/// Remap a single Op's values.  `source_graph` / `target_graph` are
-/// threaded so the upcoming OpKind storage flip can project a
-/// variant's `Variable` field across graphs (`source_graph.value_id_of`
-/// → `value_map` → `target_graph.must_variable`).  Today only the
-/// signature is graph-aware; the body still works on `ValueId`.
+/// Remap a single Op's values.  Each variant field carries a
+/// `flowspace::Variable`; the body projects every operand across
+/// graphs as `source_graph.value_id_of(var) → value_map → target_graph.must_variable(remapped_vid)`.
+/// `value_map` itself is still keyed on the legacy dense `ValueId`
+/// index; the surrounding `inline_call_site` builds it that way
+/// because the callee/caller renaming is the canonical step where
+/// fresh `ValueId`s are allocated.
 fn remap_op(
     op: &SpaceOperation,
     value_map: &HashMap<ValueId, ValueId>,
@@ -1060,15 +1062,13 @@ fn remap_op_kind(
     }
 }
 
-/// Collect all ValueId references used in an OpKind (not including result).
+/// Collect all `ValueId` references used in an `OpKind` (not including result).
 ///
-/// `graph` is threaded so callers can prepare for the upstream-shaped
-/// storage flip where each variant field carries a `flowspace::Variable`
-/// instead of a dense `ValueId`. The current body still reads `ValueId`
-/// directly out of the variant; once storage is flipped this function
-/// projects the Variable back to its `ValueId` via `graph.value_id_of`.
-/// Callers without a graph context (deprecated test-only paths) pass
-/// `None`; once storage is flipped these paths must supply a graph.
+/// Each variant field carries a `flowspace::Variable`; this function
+/// projects every Variable operand back to its dense `ValueId` via
+/// `graph.value_id_of`.  Callers without a graph context (deprecated
+/// test-only paths) pass `None` — they must only be used for variants
+/// that carry no Variable operands (e.g. `ConstInt`, `Live`).
 pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
@@ -1453,17 +1453,6 @@ pub fn op_variable_refs(
         .collect()
 }
 
-/// Variable-identity accessor for an op's result slot — returns
-/// `Some(var)` when the op produces a result and that result has a
-/// backing Variable on the graph.  Mirrors upstream
-/// `SpaceOperation.result: Hlvalue` (`flowspace/model.py:140`).
-pub fn op_result_variable(
-    op: &crate::model::SpaceOperation,
-    _graph: &crate::model::FunctionGraph,
-) -> Option<crate::flowspace::model::Variable> {
-    op.result.clone()
-}
-
 /// `true` iff `kind` is side-effect-free and may be removed from the
 /// graph when its result has no readers.  Direct port of RPython
 /// `simplify.py:405-417 CanRemove` set + the lltype-level
@@ -1494,16 +1483,16 @@ pub fn op_result_variable(
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
-        // `ValueId` for a literal in pyre's ValueId-based IR.  There
+        // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is
         // a value class (`flowmodel.py Constant(rfloat)`), not an
         // operation, so it appears inline in `op.args` rather than
         // as a standalone op in `block.operations`.  Pyre's
         // op-shaped representation is forced by the
         // `Block.operations: Vec<Op>` /
-        // `Op.result: Option<ValueId>` design: every value the
+        // `Op.result: Option<Variable>` design: every value the
         // graph produces must be materialised through an op so a
-        // ValueId can be allocated for it.  Returning `true` here
+        // backing `Variable` can be minted for it.  Returning `true` here
         // is the dataflow-equivalent of upstream's "Constant args
         // pin nothing" behaviour: the const op is removed by
         // `prune_dead_phis` Step 5 when its result is unread, which
@@ -1512,7 +1501,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         //
         // `Input` is structurally pure: inputarg-shaped Input ops
         // are protected from `model::prune_dead_phis` Step 5 sweep
-        // by their result vid being pinned in `read_vars` (Step
+        // by their result `Variable` being pinned in `read_vars` (Step
         // 1+3+dependency-routing); naked Input ops (legacy frontend
         // fallback) are removed by Step 5 when their result is
         // dead.  Returned as `true` here for consistency with the
@@ -2108,22 +2097,6 @@ mod tests {
                 .as_ref()
                 .expect("op_variable_refs preserves the bound Variable");
             assert_eq!(direct.id(), projected.id(), "Variable identity preserved");
-        }
-    }
-
-    #[test]
-    fn op_result_variable_returns_some_for_result_carrying_ops() {
-        let g = make_simple_callee();
-        let entry = g.block(g.startblock);
-        for op in &entry.operations {
-            let result_var = op_result_variable(op, &g);
-            match &op.result {
-                Some(direct) => {
-                    let projected = result_var.expect("op_result_variable returns Some");
-                    assert_eq!(direct.id(), projected.id());
-                }
-                None => assert!(result_var.is_none()),
-            }
         }
     }
 }

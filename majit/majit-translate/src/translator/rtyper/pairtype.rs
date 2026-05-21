@@ -1488,9 +1488,9 @@ mod tests {
             .initialize_exceptiondata()
             .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
-        let mut v_int = Variable::new();
+        let v_int = Variable::new();
         v_int.set_concretetype(Some(LowLevelType::Signed));
-        let mut v_float = Variable::new();
+        let v_float = Variable::new();
         v_float.set_concretetype(Some(LowLevelType::Float));
         let hop = HighLevelOp::new(
             rtyper.clone(),

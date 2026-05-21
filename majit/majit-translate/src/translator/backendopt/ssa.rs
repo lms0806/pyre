@@ -655,7 +655,6 @@ mod tests {
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Link, SpaceOperation,
     };
-    use std::cell::RefCell;
 
     fn mk_graph_start_to_block(name: &str, block: BlockRef) -> FunctionGraph {
         FunctionGraph::new(name, block)

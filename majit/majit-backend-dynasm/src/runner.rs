@@ -9,7 +9,7 @@ use std::sync::Mutex;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
-use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -1028,7 +1028,7 @@ impl DynasmBackend {
             .iter()
             .enumerate()
             .map(|(op_idx, op)| {
-                let mut n = op.clone();
+                let n = op.clone();
                 if n.result_type() != Type::Void && n.pos.get().is_none() {
                     let pos = num_inputs + op_idx as u32;
                     n.pos.set(match n.result_type() {

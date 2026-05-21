@@ -31,7 +31,7 @@
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpCode, OpRc, OpRef};
+use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 

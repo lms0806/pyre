@@ -2927,7 +2927,7 @@ mod tests {
         // atom so `canraise()` returns True.
         use crate::flowspace::model::{Atom, LAST_EXCEPTION};
         let last_exc_atom = Atom {
-            name: LAST_EXCEPTION.name.clone(),
+            name: LAST_EXCEPTION.name,
         };
         start.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::new(ConstValue::Atom(
             last_exc_atom,
@@ -3372,7 +3372,7 @@ mod tests {
             Hlvalue::Variable(Variable::named("r")),
         ));
         let last_exc_atom = Atom {
-            name: LAST_EXCEPTION.name.clone(),
+            name: LAST_EXCEPTION.name,
         };
         block.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::new(ConstValue::Atom(
             last_exc_atom,

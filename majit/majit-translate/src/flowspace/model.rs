@@ -4376,7 +4376,7 @@ mod tests {
     fn variable_copy_preserves_annotation_and_concretetype() {
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        let mut v = Variable::new();
+        let v = Variable::new();
         v.annotation
             .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
         v.set_concretetype(Some(LowLevelType::Signed));

@@ -744,7 +744,7 @@ mod tests {
         let func_host = mk_func_host("callee", "<callee.py>", 42);
         let desc = ann.bookkeeper.getdesc(&func_host).unwrap();
         let pbc = SomeValue::PBC(SomePBC::new(vec![desc], false));
-        let mut v_func = Variable::named("v_func");
+        let v_func = Variable::named("v_func");
         v_func.annotation.replace(Some(Rc::new(pbc)));
         let oper = crate::flowspace::model::SpaceOperation::new(
             "simple_call",
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn format_annotations_uses_upstream_style_somevalue_rendering() {
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let mut v = Variable::named("v0");
+        let v = Variable::named("v0");
         v.annotation.replace(Some(Rc::new(SomeValue::Integer(
             crate::annotator::model::SomeInteger::new(true, false),
         ))));

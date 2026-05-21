@@ -36,7 +36,7 @@ pub mod vstring;
 use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use std::collections::{HashMap, VecDeque};
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;

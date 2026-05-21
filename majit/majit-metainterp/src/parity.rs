@@ -3,7 +3,7 @@
 
 use crate::history::TreeLoop;
 use crate::optimizeopt::vec_assoc::VecAssoc;
-use majit_ir::{Op, OpRc, OpRef, Type};
+use majit_ir::{Op, OpRef, Type};
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.

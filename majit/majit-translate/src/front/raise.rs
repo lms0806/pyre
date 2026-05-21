@@ -56,10 +56,9 @@
 //! self.args[1:]` — that is, `args[0]` is *itself* the Constant
 //! carrier, with no producing op.
 //!
-//! Pyre's `FunctionGraph` represents every SSA value through
-//! `ValueId(usize)` produced by a `SpaceOperation`.  The op-args slot
-//! is currently `Vec<Variable>` (migrated from `Vec<ValueId>` as part
-//! of the Variable-based IR refactor) and still carries no
+//! Pyre's `FunctionGraph` represents every SSA value through a
+//! `Variable` produced by a `SpaceOperation`.  The op-args slot
+//! is currently `Vec<Variable>` and still carries no
 //! `LinkArg`-style mixed enum.  The properly orthodox fix is to
 //! migrate `OpKind::Call.args` to `Vec<LinkArg>` (RPython parity rule
 //! #1: structural equivalence) and update every consumer (~80 sites
@@ -83,10 +82,10 @@
 //!    rejected it because RPython has no `const` op at all (Constants
 //!    are SSA values, not ops).
 //! 2. **`FunctionGraph.constants` side table + `alloc_const`** — gave
-//!    each constant a real `ValueId` with no producer op, mirroring
+//!    each constant a real `Variable` with no producer op, mirroring
 //!    upstream's "Constant has no producer".  Broke regalloc /
 //!    assembler `lookup_coloring` because the downstream pipeline
-//!    requires every `args` `ValueId` to have a regalloc coloring,
+//!    requires every `args` `Variable` to have a regalloc coloring,
 //!    which non-Variable Constants don't have.  Plumbing constants
 //!    through liveness / regalloc / assembler is multi-session.
 //! 3. **`OpKind::Const { value, result_ty }`** — a typed parallel of
@@ -139,7 +138,7 @@ use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 /// segment of the `simple_call` target's `FunctionPath`.  See the
 /// module-level "PRE-EXISTING-ADAPTATION" block for why the class
 /// is not yet at `simple_call.args[0]` — the orthodox fix is the
-/// `Vec<ValueId>` → `Vec<LinkArg>` migration tracked separately
+/// `Vec<Variable>` → `Vec<LinkArg>` migration tracked separately
 /// (multi-session).
 ///
 /// `message_args` is the pre-evaluated list of message `Variable`s

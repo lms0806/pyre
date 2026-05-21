@@ -33,7 +33,7 @@ use crate::model::ValueType;
 /// | `Ref`              | `Instance(SomeInstance{classdef:None,..})` | `model.py:438` `SomeInstance.__init__(classdef, can_be_None=False, flags={})`.  `classdef=None` denotes the abstract `object`-only instance — the legitimate RPython placeholder when the bookkeeper has not narrowed the ClassDef.  Routes through `rclass.py:445-447 SomeInstance.rtyper_makerepr` -> `getinstancerepr(rtyper, None, Gc)` -> `InstanceRepr::new_rootinstance` -> `Ptr(GcStruct(OBJECT))` -> `lowleveltype_to_concrete` GC-arm -> `ConcreteType::GcRef`, matching legacy `resolve_types(Ref) -> GcRef`.  Convergence path: a producer (frontend / annotator with bookkeeper) attaches a richer `SomeInstance(classdef=Some(..))` directly onto `Variable.annotation` once the ClassDef is known (RPython `annrpython.py:289-294 setbinding`). |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **PRE-EXISTING-ADAPTATION (no upstream)**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
-/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs:418`) on the first attempt to lower the affected `ValueId`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
+/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs:418`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
 ///
 /// Returns `None` only for `ValueType::Unknown`; every other variant
 /// projects to a definite `SomeValue` shell.
@@ -105,14 +105,14 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // `None` leaves `Variable.annotation` empty so the rtyper
             // panics at `bindingrepr` (annotator/annrpython.rs:418
             // "KeyError: no binding for arg") on the first attempt to
-            // lower an Unknown ValueId.  This surfaces the producer-
+            // lower an Unknown Variable.  This surfaces the producer-
             // side gap rather than silently bridging it to `GcRef` via
             // a fabricated `SomeInstance(None)` shell — that bridging
             // conflated the annotation-stage lattice node with the
             // **legacy** resolver-stage backfill
             // (`resolve_types(Unknown) -> ConcreteType::Unknown ->
             // GcRef`).  Convergence path: precise producer-side
-            // `set_some` for every `ValueId`.
+            // `set_some` for every `Variable`.
             None
         }
         ValueType::Void => Some(SomeValue::Impossible),

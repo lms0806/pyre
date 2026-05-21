@@ -56,7 +56,7 @@
 //! information, different host vehicle.
 
 use crate::jit_codewriter::call::CallControl;
-use crate::model::{OpKind, SpaceOperation, ValueId};
+use crate::model::{OpKind, SpaceOperation};
 use crate::parse::CallPath;
 
 use majit_ir::value::Type;
@@ -118,10 +118,10 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// bare-name extraction + positional forwarding — pyre's `lib.rs:707-741`
 /// bindings have no `(...)` pattern, so no argname lookup is needed.
 ///
-/// Return type is `Vec<NormalizedArg>` (not `Vec<ValueId>`): a slot
-/// may be a passthrough `Pass(ValueId)` or a `ConstInt(i64)` literal
+/// Return type is `Vec<NormalizedArg>` (not `Vec<Variable>`): a slot
+/// may be a passthrough `Pass(Variable)` or a `ConstInt(i64)` literal
 /// that the caller must materialise as an `OpKind::ConstInt` op.
-/// `jtransform.rs::handle_builtin_call` allocates the ValueIds for
+/// `jtransform.rs::handle_builtin_call` mints fresh Variables for
 /// constant slots at the residual-call site.
 ///
 /// `gc_identityhash` / `gc_id`: pyre has no corresponding OpKind
@@ -143,20 +143,11 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 pub fn decode_builtin_call(
     op: &SpaceOperation,
     call_control: &CallControl,
-    graph: &crate::model::FunctionGraph,
 ) -> (String, Vec<NormalizedArg>) {
     match &op.kind {
         // `support.py:756-759`: op.opname == 'direct_call' → resolve via fnobj
         OpKind::Call { target, args, .. } => {
-            let args: Vec<crate::model::ValueId> = args
-                .iter()
-                .map(|v| {
-                    graph
-                        .value_id_of(v)
-                        .expect("decode_builtin_call: arg must have a backing ValueId on graph")
-                })
-                .collect();
-            let args = args.as_slice();
+            let args: &[crate::flowspace::model::Variable] = args.as_slice();
             // `support.py:757 fnobj = op.args[0].value._obj` →
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
@@ -198,10 +189,14 @@ pub fn decode_builtin_call(
                     // `support.py:758 opargs = op.args[1:]`: pyre's
                     // `OpKind::Call::args` already excludes the funcptr
                     // so the positional args flow through directly,
-                    // wrapped as `Pass(vid)` for the uniform return shape.
+                    // wrapped as `Pass(Variable)` for the uniform return
+                    // shape — matches `normalize_opargs()`'s pass-through
+                    // behaviour when no argnames metadata exists.
                     let oopspec_name = spec.split('(').next().unwrap_or(spec).trim().to_string();
-                    let opargs: Vec<NormalizedArg> =
-                        args.iter().map(|vid| NormalizedArg::Pass(*vid)).collect();
+                    let opargs: Vec<NormalizedArg> = args
+                        .iter()
+                        .map(|var| NormalizedArg::Pass(var.clone()))
+                        .collect();
                     (oopspec_name, opargs)
                 }
             }
@@ -268,8 +263,9 @@ pub enum NormalizeSlot {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedArg {
     /// `support.py:721 result.append(opargs[obj.n])` — pass an
-    /// existing `ValueId` through verbatim.
-    Pass(ValueId),
+    /// existing `Variable` through verbatim (upstream `Hlvalue::Variable`
+    /// at `flowspace/model.py:140` identity).
+    Pass(crate::flowspace::model::Variable),
     /// `support.py:723 result.append(Constant(obj, lltype.Signed))`
     /// — caller materialises an `OpKind::ConstInt(v)` op carrying
     /// this value.
@@ -443,13 +439,16 @@ fn parse_literal_slot(
 /// decide how to materialise the constant injection (pyre's constants
 /// are `OpKind::ConstInt` SSA ops whose creation needs graph-builder
 /// access at the residual-call callsite, not here).
-pub fn normalize_opargs(argtuple: &[NormalizeSlot], opargs: &[ValueId]) -> Vec<NormalizedArg> {
+pub fn normalize_opargs(
+    argtuple: &[NormalizeSlot],
+    opargs: &[crate::flowspace::model::Variable],
+) -> Vec<NormalizedArg> {
     argtuple
         .iter()
         .map(|slot| match slot {
             // `support.py:720-721 if isinstance(obj, Index):
             //                        result.append(opargs[obj.n])`
-            NormalizeSlot::Index(n) => NormalizedArg::Pass(opargs[*n]),
+            NormalizeSlot::Index(n) => NormalizedArg::Pass(opargs[*n].clone()),
             // `support.py:722-723 else: result.append(Constant(obj, lltype.typeOf(obj)))`
             // — one branch per lltype Constant flavour.
             NormalizeSlot::ConstInt(v) => NormalizedArg::ConstInt(*v),
@@ -1091,25 +1090,20 @@ mod tests {
 
     fn make_call_op(
         target: crate::model::CallTarget,
-        args: Vec<ValueId>,
-    ) -> (SpaceOperation, crate::model::FunctionGraph) {
-        let mut graph = crate::model::FunctionGraph::new("decode_builtin_call_fixture");
-        if let Some(max_vid) = args.iter().map(|v| v.0).max() {
-            if max_vid + 1 > graph.next_value() {
-                graph.set_next_value(max_vid + 1);
-            }
-        }
-        let arg_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable(*v)).collect();
+        num_args: usize,
+    ) -> (SpaceOperation, Vec<crate::flowspace::model::Variable>) {
+        let arg_vars: Vec<crate::flowspace::model::Variable> = (0..num_args)
+            .map(|_| crate::flowspace::model::Variable::new())
+            .collect();
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Call {
                 target,
-                args: arg_vars,
+                args: arg_vars.clone(),
                 result_ty: crate::model::ValueType::Int,
             },
         };
-        (op, graph)
+        (op, arg_vars)
     }
 
     #[test]
@@ -1120,17 +1114,17 @@ mod tests {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["jit", "isconstant"]);
         cc.mark_oopspec(path.clone(), "jit.isconstant".to_string());
-        let (op, graph) = make_call_op(
+        let (op, args) = make_call_op(
             crate::model::CallTarget::function_path(["jit", "isconstant"]),
-            vec![ValueId(7), ValueId(11)],
+            2,
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
+        let (name, opargs) = decode_builtin_call(&op, &cc);
         assert_eq!(name, "jit.isconstant");
         assert_eq!(
             opargs,
             vec![
-                NormalizedArg::Pass(ValueId(7)),
-                NormalizedArg::Pass(ValueId(11))
+                NormalizedArg::Pass(args[0].clone()),
+                NormalizedArg::Pass(args[1].clone()),
             ]
         );
     }
@@ -1147,17 +1141,17 @@ mod tests {
             CallPath::from_segments(["int", "py_mod"]),
             "int.py_mod(x, y)".to_string(),
         );
-        let (op, graph) = make_call_op(
+        let (op, args) = make_call_op(
             crate::model::CallTarget::function_path(["int", "py_mod"]),
-            vec![ValueId(2), ValueId(3)],
+            2,
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
+        let (name, opargs) = decode_builtin_call(&op, &cc);
         assert_eq!(name, "int.py_mod");
         assert_eq!(
             opargs,
             vec![
-                NormalizedArg::Pass(ValueId(2)),
-                NormalizedArg::Pass(ValueId(3))
+                NormalizedArg::Pass(args[0].clone()),
+                NormalizedArg::Pass(args[1].clone()),
             ]
         );
     }
@@ -1171,11 +1165,11 @@ mod tests {
         // (per `jtransform.py:484 handle_builtin_call`) catch wiring
         // gaps loudly.
         let cc = CallControl::new();
-        let (op, graph) = make_call_op(
+        let (op, _args) = make_call_op(
             crate::model::CallTarget::function_path(["some", "unregistered"]),
-            vec![],
+            0,
         );
-        let _ = decode_builtin_call(&op, &cc, &graph);
+        let _ = decode_builtin_call(&op, &cc);
     }
 
     #[test]
@@ -1197,8 +1191,7 @@ mod tests {
                 result_ty: crate::model::ValueType::Int,
             },
         };
-        let graph = crate::model::FunctionGraph::new("non_call_fixture");
-        let _ = decode_builtin_call(&op, &cc, &graph);
+        let _ = decode_builtin_call(&op, &cc);
     }
 
     // ── `parse_oopspec` + `normalize_opargs` pure-function ports ────
@@ -1302,13 +1295,15 @@ mod tests {
             super::NormalizeSlot::Index(0),
             super::NormalizeSlot::Index(1),
         ];
-        let opargs = vec![ValueId(11), ValueId(22)];
+        let v0 = crate::flowspace::model::Variable::new();
+        let v1 = crate::flowspace::model::Variable::new();
+        let opargs = vec![v0.clone(), v1.clone()];
         let normalized = super::normalize_opargs(&argtuple, &opargs);
         assert_eq!(
             normalized,
             vec![
-                super::NormalizedArg::Pass(ValueId(11)),
-                super::NormalizedArg::Pass(ValueId(22)),
+                super::NormalizedArg::Pass(v0),
+                super::NormalizedArg::Pass(v1),
             ]
         );
     }
@@ -1322,14 +1317,16 @@ mod tests {
             super::NormalizeSlot::Index(1),
             super::NormalizeSlot::Index(0),
         ];
-        let opargs = vec![ValueId(100), ValueId(200)];
+        let v100 = crate::flowspace::model::Variable::new();
+        let v200 = crate::flowspace::model::Variable::new();
+        let opargs = vec![v100.clone(), v200.clone()];
         let normalized = super::normalize_opargs(&argtuple, &opargs);
         assert_eq!(
             normalized,
             vec![
                 super::NormalizedArg::ConstInt(7),
-                super::NormalizedArg::Pass(ValueId(200)),
-                super::NormalizedArg::Pass(ValueId(100)),
+                super::NormalizedArg::Pass(v200),
+                super::NormalizedArg::Pass(v100),
             ]
         );
     }
@@ -1343,19 +1340,16 @@ mod tests {
         let path = CallPath::from_segments(["my_helper"]);
         cc.mark_oopspec(path.clone(), "myop(y, x)".to_string());
         cc.mark_oopspec_argnames(path, vec!["x".to_string(), "y".to_string()]);
-        let (op, graph) = make_call_op(
-            crate::model::CallTarget::function_path(["my_helper"]),
-            vec![ValueId(10), ValueId(20)],
-        );
-        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
+        let (op, args) = make_call_op(crate::model::CallTarget::function_path(["my_helper"]), 2);
+        let (name, opargs) = decode_builtin_call(&op, &cc);
         assert_eq!(name, "myop");
-        // Argname `y` → Index(1) → opargs[1] = ValueId(20)
-        // Argname `x` → Index(0) → opargs[0] = ValueId(10)
+        // Argname `y` → Index(1) → opargs[1] = args[1]
+        // Argname `x` → Index(0) → opargs[0] = args[0]
         assert_eq!(
             opargs,
             vec![
-                NormalizedArg::Pass(ValueId(20)),
-                NormalizedArg::Pass(ValueId(10))
+                NormalizedArg::Pass(args[1].clone()),
+                NormalizedArg::Pass(args[0].clone()),
             ]
         );
     }
@@ -1376,18 +1370,15 @@ mod tests {
             path,
             vec!["i".to_string(), "marker".to_string(), "c".to_string()],
         );
-        let (op, graph) = make_call_op(
-            crate::model::CallTarget::function_path(["foobar"]),
-            vec![ValueId(11), ValueId(22), ValueId(33)],
-        );
-        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
+        let (op, args) = make_call_op(crate::model::CallTarget::function_path(["foobar"]), 3);
+        let (name, opargs) = decode_builtin_call(&op, &cc);
         assert_eq!(name, "foobar");
         assert_eq!(
             opargs,
             vec![
                 NormalizedArg::ConstInt(2),
-                NormalizedArg::Pass(ValueId(33)),
-                NormalizedArg::Pass(ValueId(11)),
+                NormalizedArg::Pass(args[2].clone()),
+                NormalizedArg::Pass(args[0].clone()),
             ]
         );
     }
@@ -1440,13 +1431,14 @@ mod tests {
             super::NormalizeSlot::ConstFloat(3.14f64.to_bits()),
             super::NormalizeSlot::Index(0),
         ];
-        let opargs = vec![ValueId(7)];
+        let v7 = crate::flowspace::model::Variable::new();
+        let opargs = vec![v7.clone()];
         let normalized = super::normalize_opargs(&argtuple, &opargs);
         assert_eq!(
             normalized,
             vec![
                 super::NormalizedArg::ConstFloat(3.14f64.to_bits()),
-                super::NormalizedArg::Pass(ValueId(7)),
+                super::NormalizedArg::Pass(v7),
             ]
         );
     }

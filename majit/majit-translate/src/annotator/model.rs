@@ -4667,7 +4667,7 @@ mod tests {
     #[test]
     fn variable_annotation_roundtrip() {
         use std::rc::Rc;
-        let mut v = Variable::named("x");
+        let v = Variable::named("x");
         let s = SomeValue::Integer(SomeInteger::default());
         v.annotation.replace(Some(Rc::new(s.clone())));
         let got = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());

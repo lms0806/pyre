@@ -2735,7 +2735,7 @@ mod tests {
     #[test]
     fn builtin_method_repr_rtype_simple_call_rewrites_constant_bound_method_arg0() {
         use crate::annotator::model::SomeInteger;
-        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::flowspace::model::{Constant, Hlvalue};
         use crate::translator::rtyper::rmodel::Repr;
 
         // Observer repr to inspect args_v[0] after rtype_simple_call's

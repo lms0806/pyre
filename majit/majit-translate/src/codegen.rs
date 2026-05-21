@@ -3186,7 +3186,6 @@ mod tests {
                 flattened: crate::flatten::SSARepr {
                     name: name.into(),
                     insns: Vec::new(),
-                    num_values: 0,
                     num_blocks: 0,
                     insns_pos: None,
                 },
@@ -3236,7 +3235,6 @@ mod tests {
             flattened: crate::flatten::SSARepr {
                 name: "add".into(),
                 insns: Vec::new(),
-                num_values: 0,
                 num_blocks: 0,
                 insns_pos: None,
             },

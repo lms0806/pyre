@@ -60,9 +60,7 @@ pub use jtransform::{
     VirtualizableFieldDescriptor, rewrite_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
-pub use model::{
-    Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueId, ValueType,
-};
+pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
     CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,

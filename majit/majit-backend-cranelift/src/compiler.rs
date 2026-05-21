@@ -29,8 +29,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcMap, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
-    AccumInfo, CallDescr, Descr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex,
-    Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op,
+    OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -4706,7 +4706,7 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
     ops.iter()
         .enumerate()
         .map(|(op_idx, op)| {
-            let mut normalized = op.clone();
+            let normalized = op.clone();
             let rt = normalized.result_type();
             if rt != Type::Void && normalized.pos.get().is_none() {
                 // op_typed mints the typed Int/Float/Ref variant

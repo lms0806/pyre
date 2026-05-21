@@ -826,32 +826,6 @@ pub struct SpaceOperation {
     pub kind: OpKind,
 }
 
-impl SpaceOperation {
-    /// Strict projection of [`Self::result`] onto pyre's `ValueId`
-    /// surface.  Returns `None` only when `result` is `None`
-    /// (intentionally void op).  Panics when `result` is `Some(var)`
-    /// but the Variable is not registered on the graph — a contract
-    /// violation that the inline `self.result.as_ref().and_then(|v|
-    /// graph.value_id_of(v))` idiom would otherwise swallow into the
-    /// same `None` as a genuinely void op, silently dropping
-    /// authoritative type inference for the unregistered ValueId.
-    ///
-    /// Mirrors the panic shape used by
-    /// [`Block::inputarg_value_ids`] and the `ExitSwitch::Value`
-    /// branch of [`remap_control_flow_metadata`].
-    pub fn registered_result_value_id(&self, graph: &FunctionGraph) -> Option<ValueId> {
-        self.result.as_ref().map(|var| {
-            graph.value_id_of(var).unwrap_or_else(|| {
-                panic!(
-                    "SpaceOperation.result ({var:?}) is not registered on \
-                     the graph — malformed op metadata (every result \
-                     Variable must be allocated through the graph allocator)"
-                )
-            })
-        })
-    }
-}
-
 /// RPython `Block.exitswitch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitSwitch {
@@ -1139,7 +1113,8 @@ pub struct FrameState {
     /// Currently derived from `entries` at the end of `union` via
     /// `graph.variable(vid)` lookup; the long-term plan is to
     /// promote this to the single source of truth and retire the
-    /// ValueId carrier (task #117).  Production read sites still
+    /// ValueId carrier (task #56 — Delete ValueId struct, key IR
+    /// slots on Variable identity).  Production read sites still
     /// consume `entries`; future substeps swap them over slot-by-slot
     /// before flipping the construction direction (fixtures populate
     /// `locals_w` directly, `entries` becomes the derived projection).
@@ -1189,13 +1164,6 @@ impl FrameState {
             .iter()
             .enumerate()
             .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-    }
-
-    /// `Link.args` payload for this snapshot — `ValueId`s of bound
-    /// slots in storage order.  Unbound (None) slots are skipped.
-    #[allow(dead_code)]
-    pub fn link_args(&self) -> Vec<ValueId> {
-        self.entries.iter().filter_map(|e| *e).collect()
     }
 
     /// Authoritative locals view — upstream `framestate.py:19 self.locals_w`
@@ -1661,7 +1629,8 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                     break;
                 }
                 // upstream: `exit = block1.exits[0]`.
-                let target_inputargs = target_block.inputarg_value_ids(graph);
+                let target_inputargs: Vec<crate::flowspace::model::Variable> =
+                    target_block.inputargs.clone();
                 let target_exit = target_block.exits[0].clone();
                 // upstream: `assert block1 is not exit.target, "the
                 // graph contains an empty infinite loop"` (`simplify.py:64`).
@@ -1673,7 +1642,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                 // upstream: `subst = dict(zip(block1.inputargs,
                 // link.args))`.
                 let link_args = graph.block(block_id).exits[exit_idx].args.clone();
-                let subst: HashMap<ValueId, LinkArg> = target_inputargs
+                let subst: HashMap<crate::flowspace::model::Variable, LinkArg> = target_inputargs
                     .into_iter()
                     .zip(link_args.into_iter())
                     .collect();
@@ -1682,8 +1651,8 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                 let new_args: Vec<LinkArg> = target_exit
                     .args
                     .iter()
-                    .map(|arg| match arg.as_value(graph) {
-                        Some(v) => subst.get(&v).cloned().unwrap_or_else(|| arg.clone()),
+                    .map(|arg| match arg.as_variable() {
+                        Some(v) => subst.get(v).cloned().unwrap_or_else(|| arg.clone()),
                         None => arg.clone(),
                     })
                     .collect();
@@ -1766,7 +1735,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///      raising op of a `canraise` block is preserved here even if
 ///      its result is dead.  Inputarg-shaped `OpKind::Input` ops
 ///      are protected by Step 1+3+dependency-routing pinning their
-///      result vid in `read_vars`; the dead ones are swept here
+///      result `Variable` in `read_vars`; the dead ones are swept here
 ///      alongside Step 7's inputarg trim (the matching
 ///      `block.inputargs[i]` removal becomes a no-op when the
 ///      Input op is already gone).  Naked `OpKind::Input` ops
@@ -1809,7 +1778,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///      if still present in `block.operations`) for every dead
 ///      vid (`simplify.py:520-524`).
 pub fn prune_dead_phis(graph: &mut FunctionGraph) {
-    use crate::inline::{is_pure_op, op_value_refs};
+    use crate::inline::is_pure_op;
     use std::collections::HashMap;
     let start = graph.startblock;
     let return_block = graph.returnblock;
@@ -2115,12 +2084,7 @@ impl Block {
     /// Variable-identity iter over [`Self::inputargs`] — direct
     /// over the upstream-orthodox `Vec<Variable>` storage, matching
     /// `Block.inputargs: List[Variable]` (`flowspace/model.py:21-25`).
-    /// The `_graph` parameter is vestigial, kept for the existing
-    /// call signature now that the storage migration has landed.
-    pub fn input_variables<'a>(
-        &'a self,
-        _graph: &'a FunctionGraph,
-    ) -> impl Iterator<Item = &'a crate::flowspace::model::Variable> + 'a {
+    pub fn input_variables(&self) -> impl Iterator<Item = &crate::flowspace::model::Variable> + '_ {
         self.inputargs.iter()
     }
 
@@ -3027,7 +2991,7 @@ impl FunctionGraph {
             .union(&iter_variable_ids(other_stack, other_exc))
             .copied()
             .collect();
-        let mut register_if_fresh =
+        let register_if_fresh =
             |graph: &mut FunctionGraph, v: &crate::flowspace::model::Variable| {
                 if !pred_ids.contains(&v.id()) {
                     let _ = graph.ensure_variable_registered(v);
@@ -4572,7 +4536,7 @@ mod tests {
         let v_local = Variable::new();
         let v_stack = Variable::new();
         let local_vid = graph.alloc_value_with_variable(v_local.clone());
-        let stack_vid = graph.alloc_value_with_variable(v_stack.clone());
+        graph.alloc_value_with_variable(v_stack.clone());
 
         let pred_state = FrameState {
             entries: vec![Some(local_vid)],
@@ -4680,7 +4644,6 @@ mod tests {
     /// already the result of an op in `block` — definition-by-op-result.
     #[test]
     fn ensure_variable_at_block_idempotent_on_existing_op_result() {
-        use crate::flowspace::model::Variable;
         let mut graph = FunctionGraph::new("ensure_var_idempotent_op");
         let block = graph.create_block();
         let _v = graph.push_op(
@@ -4971,7 +4934,7 @@ mod tests {
         let v_a = Variable::new();
         let v_b = Variable::new();
         let a_vid = graph.alloc_value_with_variable(v_a.clone());
-        let b_vid = graph.alloc_value_with_variable(v_b.clone());
+        graph.alloc_value_with_variable(v_b.clone());
 
         // Two predecessors disagreeing on stack slot 0 (Variable phi)
         // and on exception (Variable phi); locals agree on a_vid.

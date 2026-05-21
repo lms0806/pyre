@@ -89,37 +89,35 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// Allocate a fresh `flowspace::Variable` and attach the projected
 /// `SomeValue` shell to its `annotation` slot.
 ///
-/// The legacy `ValueId` does NOT carry over to `Variable.id` —
-/// `Variable::new` allocates a fresh process-wide identity
-/// (`flowspace/model.rs:2042`). Identity correspondence is preserved
-/// out-of-band by [`ValueIdToVariable`].
-fn seed_variable(vid: ValueId, legacy: &FunctionGraph) -> Variable {
+/// The legacy `Variable.id` does NOT carry over to the fresh
+/// Variable's id — `Variable::new` allocates a fresh process-wide
+/// identity (`flowspace/model.rs:2042`). Identity correspondence is
+/// preserved out-of-band by [`ValueIdToVariable`].
+fn seed_variable(legacy_var: &Variable) -> Variable {
     let var = Variable::new();
     // Copy the precise per-`Variable.annotation` `SomeValue` shell
-    // from the legacy graph onto the freshly minted Variable,
+    // from the legacy Variable onto the freshly minted one,
     // matching upstream `_setbinding(v, s_value)` semantics
     // (`rpython/annotator/annrpython.py:333-340`).
     //
     // Source: tests that hand-seed annotations call
-    // `legacy_annotator::setbinding(&legacy.variable(vid), ty)` before
+    // `legacy_annotator::setbinding(&legacy_var, ty)` before
     // reaching here;
     // the production `addpendingblock` flowin path leaves
-    // `legacy.variable(vid).annotation` empty so the fresh Variable
+    // `legacy_var.annotation` empty so the fresh Variable
     // starts unannotated and flowin populates it via `setbinding`.
     // The dual-gate baseline that calls `legacy_annotator::annotate`
     // runs AFTER specialize completes (cutover.rs:dual_gate_check /
     // dual_gate_check_with_registry baseline section), so the wider
     // legacy lift never reaches this site.
     //
-    // A missing entry corresponds to either an unpopulated slot or
-    // `ValueType::Unknown`, both of which leave `Variable.annotation`
+    // An empty `legacy_var.annotation` slot (unpopulated or
+    // `ValueType::Unknown`) leaves the fresh `Variable.annotation`
     // empty — the rtyper then fails at `bindingrepr` with `KeyError:
     // no binding for arg` on first touch, surfacing the producer-
     // side gap rather than silently bridging to `GcRef` via a
     // fabricated `SomeInstance(None)` shell.
-    if let Some(legacy_var) = legacy.variable(vid)
-        && let Some(s) = legacy_var.annotation.borrow().as_ref()
-    {
+    if let Some(s) = legacy_var.annotation.borrow().as_ref() {
         *var.annotation.borrow_mut() = Some(s.clone());
     }
     var
@@ -178,10 +176,11 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> ValueIdToVa
     let mut map: ValueIdToVariable = HashMap::new();
     for block in &legacy.blocks {
         // Class 1a — block-inputarg definitions.
-        let inputarg_vids = block.inputarg_value_ids(legacy);
-        for vid in &inputarg_vids {
-            map.entry(*vid)
-                .or_insert_with(|| seed_variable(*vid, legacy));
+        for var in &block.inputargs {
+            let Some(vid) = legacy.value_id_of(var) else {
+                continue;
+            };
+            map.entry(vid).or_insert_with(|| seed_variable(var));
         }
 
         // Per-block name → inputarg-Variable lookup for `OpKind::Input`
@@ -198,22 +197,24 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> ValueIdToVa
         // concretetype, tripping `genop`'s "wrong level!" assertion.
         let mut name_to_inputarg_var: HashMap<&str, Variable> = HashMap::new();
         for op in &block.operations {
-            if let OpKind::Input { name, .. } = &op.kind {
-                if let Some(result) = op.result.as_ref().and_then(|v| legacy.value_id_of(v)) {
-                    if inputarg_vids.contains(&result) {
-                        if let Some(var) = map.get(&result) {
-                            name_to_inputarg_var
-                                .entry(name.as_str())
-                                .or_insert_with(|| var.clone());
-                        }
-                    }
-                }
+            if let OpKind::Input { name, .. } = &op.kind
+                && let Some(result_var) = op.result.as_ref()
+                && block.inputargs.contains(result_var)
+                && let Some(result) = legacy.value_id_of(result_var)
+                && let Some(var) = map.get(&result)
+            {
+                name_to_inputarg_var
+                    .entry(name.as_str())
+                    .or_insert_with(|| var.clone());
             }
         }
 
         // Class 1b — op-result definitions, with Input rebind aliasing.
         for op in &block.operations {
-            let Some(result) = op.result.as_ref().and_then(|v| legacy.value_id_of(v)) else {
+            let Some(result_var) = op.result.as_ref() else {
+                continue;
+            };
+            let Some(result) = legacy.value_id_of(result_var) else {
                 continue;
             };
             if map.contains_key(&result) {
@@ -223,38 +224,34 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> ValueIdToVa
                 name_to_inputarg_var
                     .get(name.as_str())
                     .cloned()
-                    .unwrap_or_else(|| seed_variable(result, legacy))
+                    .unwrap_or_else(|| seed_variable(result_var))
             } else {
-                seed_variable(result, legacy)
+                seed_variable(result_var)
             };
             map.insert(result, var);
         }
         // Class 3 — exitswitch-referenced values.
         if let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch {
             if let Some(vid) = legacy.value_id_of(var) {
-                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
+                map.entry(vid).or_insert_with(|| seed_variable(var));
             }
         }
         // Class 2 — link-side sentinels.
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(vid) = arg.as_value(legacy) {
-                    map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
+                if let (Some(vid), Some(var)) = (arg.as_value(legacy), arg.as_variable()) {
+                    map.entry(vid).or_insert_with(|| seed_variable(var));
                 }
             }
-            if let Some(vid) = link
-                .last_exception
-                .as_ref()
-                .and_then(|a| a.as_value(legacy))
+            if let Some(arg) = link.last_exception.as_ref()
+                && let (Some(vid), Some(var)) = (arg.as_value(legacy), arg.as_variable())
             {
-                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
+                map.entry(vid).or_insert_with(|| seed_variable(var));
             }
-            if let Some(vid) = link
-                .last_exc_value
-                .as_ref()
-                .and_then(|a| a.as_value(legacy))
+            if let Some(arg) = link.last_exc_value.as_ref()
+                && let (Some(vid), Some(var)) = (arg.as_value(legacy), arg.as_variable())
             {
-                map.entry(vid).or_insert_with(|| seed_variable(vid, legacy));
+                map.entry(vid).or_insert_with(|| seed_variable(var));
             }
         }
     }
@@ -544,7 +541,7 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 ///
 /// Returns `Ok(Vec::new())` when the op is **fully consumed by other
 /// adapter infrastructure** — `OpKind::Input` (handled by Slice 1c
-/// block topology, where the result `ValueId` becomes a
+/// block topology, where the result `Variable` becomes a
 /// `block.inputargs` entry) and `OpKind::ConstInt` / `ConstFloat`
 /// (handled by [`build_value_to_hlvalue_map`], which inlines the
 /// constant at every consuming op's args site).
@@ -1401,7 +1398,10 @@ fn link_extravar_to_hlvalue(
             if let Some(existing) = value_map.get(&vid).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(vid, graph);
+            let legacy_var = arg
+                .as_variable()
+                .expect("LinkArg with as_value=Some must expose as_variable");
+            let var = seed_variable(legacy_var);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             let hlvalue = Hlvalue::Variable(var);
             value_map.insert(vid, hlvalue.clone());
@@ -1451,34 +1451,31 @@ pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_ty_by_result: HashMap<ValueId, &crate::model::ValueType> = HashMap::new();
+    let mut input_ty_by_result: HashMap<
+        crate::flowspace::model::Variable,
+        &crate::model::ValueType,
+    > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, .. }) = (
-            op.result.as_ref().and_then(|v| legacy.value_id_of(v)),
-            &op.kind,
-        ) {
-            input_ty_by_result.insert(result, ty);
+        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
+            input_ty_by_result.insert(result.clone(), ty);
         }
     }
-    let startblock_vids = startblock.inputarg_value_ids(legacy);
-    let mut cells = Vec::with_capacity(startblock_vids.len());
-    for (idx, vid) in startblock_vids.iter().enumerate() {
+    let mut cells = Vec::with_capacity(startblock.inputargs.len());
+    for (idx, var) in startblock.inputargs.iter().enumerate() {
         // 1. Explicit SomeValue seed published onto
-        //    `legacy.variable(vid).annotation` (test fixtures seed via
+        //    `var.annotation` (test fixtures seed via
         //    `legacy_annotator::setbinding(&var, ty)` before invoking
         //    this function).
-        if let Some(var) = legacy.variable(*vid)
-            && let Some(rc) = var.annotation.borrow().as_ref()
-        {
+        if let Some(rc) = var.annotation.borrow().as_ref() {
             cells.push((**rc).clone());
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(ty) = input_ty_by_result.get(vid) {
+        if let Some(ty) = input_ty_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
-                     ({vid:?}) has `ValueType::{ty:?}` (from Input op) whose \
+                     ({var:?}) has `ValueType::{ty:?}` (from Input op) whose \
                      `valuetype_to_someshell` projection is `None` (annotation gap — \
                      only `ValueType::Unknown` lacks a SomeValue shell)"
                 ))
@@ -1492,7 +1489,7 @@ pub(crate) fn derive_subject_inputcells(
         // shell nor a startblock Input op.
         return Err(TyperError::message(format!(
             "derive_subject_inputcells: startblock.inputargs[{idx}] \
-             ({vid:?}) has no matching `OpKind::Input {{ ty }}` op at \
+             ({var:?}) has no matching `OpKind::Input {{ ty }}` op at \
              the startblock and no `Variable.annotation` shell — \
              front-end producer divergence (every typed parameter emits \
              the Input op alongside the inputargs registration; see \
@@ -1599,10 +1596,13 @@ pub fn function_graph_to_flowspace(
         let mut local_inputs: HashMap<ValueId, Variable> = HashMap::new();
         let legacy_inputarg_vids = legacy_block.inputarg_value_ids(legacy);
         let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_inputarg_vids.len());
-        for vid in legacy_inputarg_vids {
-            let var = seed_variable(vid, legacy);
-            value_to_var.entry(vid).or_insert_with(|| var.clone());
-            local_inputs.insert(vid, var.clone());
+        for (vid, legacy_var) in legacy_inputarg_vids
+            .iter()
+            .zip(legacy_block.inputargs.iter())
+        {
+            let var = seed_variable(legacy_var);
+            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            local_inputs.insert(*vid, var.clone());
             inputargs.push(Hlvalue::Variable(var));
         }
         block_inputarg_vars.insert(legacy_block.id, local_inputs);
@@ -1634,9 +1634,13 @@ pub fn function_graph_to_flowspace(
         .blocks
         .iter()
         .find(|b| b.id == legacy.returnblock)
-        .and_then(|b| b.inputarg_value_ids(legacy).first().copied())
-        .map(|vid| {
-            let var = seed_variable(vid, legacy);
+        .and_then(|b| {
+            let vid = b.inputarg_value_ids(legacy).first().copied()?;
+            let legacy_var = b.inputargs.first()?;
+            Some((vid, legacy_var.clone()))
+        })
+        .map(|(vid, legacy_var)| {
+            let var = seed_variable(&legacy_var);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             Hlvalue::Variable(var)
         })
@@ -1660,9 +1664,13 @@ pub fn function_graph_to_flowspace(
     if let Some(legacy_exceptblock) = legacy.blocks.iter().find(|b| b.id == legacy.exceptblock) {
         if legacy_exceptblock.inputargs.len() == 2 {
             let mut except_inputargs = Vec::with_capacity(2);
-            for vid in legacy_exceptblock.inputarg_value_ids(legacy) {
-                let var = seed_variable(vid, legacy);
-                value_to_var.entry(vid).or_insert_with(|| var.clone());
+            let except_inputarg_vids = legacy_exceptblock.inputarg_value_ids(legacy);
+            for (vid, legacy_var) in except_inputarg_vids
+                .iter()
+                .zip(legacy_exceptblock.inputargs.iter())
+            {
+                let var = seed_variable(legacy_var);
+                value_to_var.entry(*vid).or_insert_with(|| var.clone());
                 except_inputargs.push(Hlvalue::Variable(var));
             }
             exceptblock_ref.borrow_mut().inputargs = except_inputargs;
@@ -1788,16 +1796,13 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
 
-            if let Some(result) = legacy_op
-                .result
-                .as_ref()
-                .and_then(|v| legacy.value_id_of(v))
+            if let Some(result_var) = legacy_op.result.as_ref()
+                && let Some(result) = legacy.value_id_of(result_var)
+                && !value_map.contains_key(&result)
             {
-                if !value_map.contains_key(&result) {
-                    let var = seed_variable(result, legacy);
-                    value_to_var.entry(result).or_insert_with(|| var.clone());
-                    value_map.insert(result, Hlvalue::Variable(var));
-                }
+                let var = seed_variable(result_var);
+                value_to_var.entry(result).or_insert_with(|| var.clone());
+                value_map.insert(result, Hlvalue::Variable(var));
             }
             translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
             if let Some(result) = legacy_op
@@ -2071,8 +2076,9 @@ mod tests {
         while graph.next_value() <= 7 {
             graph.alloc_value();
         }
-        setbinding(&graph.must_variable(ValueId(7)), ValueType::Int);
-        let var = seed_variable(ValueId(7), &graph);
+        let legacy_var = graph.must_variable(ValueId(7));
+        setbinding(&legacy_var, ValueType::Int);
+        let var = seed_variable(&legacy_var);
 
         // Reference semantics: the annotation Rc-shares across clones
         // (flowspace/model.rs:2010-2018), so a clone observes the same
@@ -2089,22 +2095,21 @@ mod tests {
     }
 
     #[test]
-    fn seed_variable_unknown_value_id_leaves_annotation_empty_for_failloud() {
-        // Cat 2.4 fix: missing entries on `graph.variable(vid).annotation`
-        // (either unregistered vid OR registered without a published
-        // shell) MUST NOT fabricate a SomeInstance(classdef=None) — that
-        // would silently bridge an annotation gap to GcRef via the
-        // resolver-stage backfill at the wrong layer. Instead, leave
-        // Variable.annotation empty so `bindingrepr` panics with
-        // `KeyError: no binding for arg`
+    fn seed_variable_unannotated_input_leaves_annotation_empty_for_failloud() {
+        // Cat 2.4 fix: when the legacy Variable carries no published
+        // SomeValue shell, the seed MUST NOT fabricate a
+        // SomeInstance(classdef=None) — that would silently bridge an
+        // annotation gap to GcRef via the resolver-stage backfill at
+        // the wrong layer. Instead, leave Variable.annotation empty so
+        // `bindingrepr` panics with `KeyError: no binding for arg`
         // (annotator/annrpython.rs:418), surfacing the producer-side
         // gap as a fail-loud signal.
-        let graph = LegacyGraph::new("seed_unknown_test");
-        let var = seed_variable(ValueId(42), &graph);
+        let legacy_var = Variable::new();
+        let var = seed_variable(&legacy_var);
         let ann = var.annotation.borrow();
         assert!(
             ann.is_none(),
-            "Unknown ValueId must leave annotation empty (Cat 2.4 fail-loud), \
+            "Unannotated input must leave annotation empty (Cat 2.4 fail-loud), \
              got {:?}",
             ann.as_ref()
         );

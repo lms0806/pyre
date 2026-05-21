@@ -32,7 +32,7 @@
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpCode, OpRc, OpRef};
+use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;

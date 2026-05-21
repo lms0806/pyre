@@ -10,7 +10,7 @@ use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
 };
-use majit_ir::{GcRef, Op, OpCode, OpRc, VecAssoc};
+use majit_ir::{GcRef, Op, OpCode, VecAssoc};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in

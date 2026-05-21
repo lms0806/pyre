@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
-use crate::model::{
-    BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation, ValueId,
-};
+use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
 use crate::regalloc::RegAllocResult;
 
 /// A label in the flattened instruction stream.
@@ -30,7 +28,7 @@ pub struct Label(pub usize);
 ///         return "%%%s%d" % (self.kind[0], self.index)
 /// ```
 ///
-/// `index` is the regalloc-assigned color (NOT the source [`ValueId`]).
+/// `index` is the regalloc-assigned color (NOT the source Variable).
 /// Two register references with the same `(kind, index)` denote the
 /// same physical register slot.  Created lazily by
 /// [`GraphFlattener::getcolor`] which dedups Registers across the
@@ -260,20 +258,17 @@ pub const KINDS: [RegKind; 3] = [RegKind::Int, RegKind::Ref, RegKind::Float];
 ///         self._insns_pos = None     # after being assembled
 /// ```
 ///
-/// Phase 3 dropped the `value_kinds: HashMap<ValueId, RegKind>`
+/// Phase 3 dropped the `value_kinds: HashMap<Variable, RegKind>`
 /// side-table — RPython carries kind on the operand itself via
 /// [`Register`], and after Phase 3 each pyre [`FlatOp`] register
 /// operand is a [`Register`] (Move/Push/Pop/Live) or comes from a
 /// variant whose kind is fixed at the variant level (returns,
-/// guards).  Pyre's auxiliary fields (`num_values`, `num_blocks`)
-/// are kept for downstream consumers that still need pre-regalloc
-/// ValueId-space sizing.
+/// guards).  `num_blocks` is kept for downstream consumers that
+/// still need pre-regalloc block-count sizing.
 #[derive(Debug, Clone)]
 pub struct SSARepr {
     pub name: String,
     pub insns: Vec<FlatOp>,
-    /// Total number of values used (for register allocation).
-    pub num_values: usize,
     /// Number of basic blocks in the source graph.
     pub num_blocks: usize,
     /// flatten.py / assembler.py `ssarepr._insns_pos` — byte position
@@ -359,7 +354,7 @@ fn switch_llexitcase_key(link: &Link) -> Option<i64> {
 /// `regallocs` is the per-kind register-allocation result produced by
 /// the preceding `perform_all_register_allocations` pass. Upstream's
 /// `insert_renamings` reads it via `getcolor(v)` to decide cycle-break
-/// on the assigned color, not on the pre-regalloc ValueId identity.
+/// on the assigned color, not on the pre-regalloc Variable identity.
 pub fn flatten_graph(
     graph: &FunctionGraph,
     regallocs: &mut HashMap<RegKind, RegAllocResult>,
@@ -381,9 +376,7 @@ pub fn flatten_graph(
     let mut flattener = GraphFlattener::new(graph, regallocs, false);
     flattener.enforce_input_args();
     flattener.generate_ssa_form();
-    let mut ssarepr = flattener.ssarepr;
-    ssarepr.num_values = compute_num_values(graph, &ssarepr.insns);
-    ssarepr
+    flattener.ssarepr
 }
 
 /// `flatten.py:88-100 enforce_input_args(self)` — free-function port
@@ -447,9 +440,9 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocR
 /// `make_bytecode_block` walk, and the `block_labels` cache that gives
 /// every visited block a stable [`Label`] for back-edges).
 ///
-/// Kind resolution reads each `ValueId`'s backing
-/// `Variable.concretetype` cell directly via
-/// [`FunctionGraph::concretetype`] (`getkind(v.concretetype)` parity).
+/// Kind resolution reads each `Variable.concretetype` cell directly
+/// via [`FunctionGraph::concretetype_of`] (`getkind(v.concretetype)`
+/// parity).
 /// Test fixtures that build SSARepr by hand without populating those
 /// cells fall through to [`lookup_kind_color`]'s regalloc-class
 /// scan; well-typed production graphs go through the inline-cell
@@ -494,7 +487,6 @@ impl<'a> GraphFlattener<'a> {
             ssarepr: SSARepr {
                 name: graph.name.clone(),
                 insns: Vec::new(),
-                num_values: 0,
                 num_blocks: graph.blocks.len(),
                 insns_pos: None,
             },
@@ -517,12 +509,12 @@ impl<'a> GraphFlattener<'a> {
     /// ```
     ///
     /// `kind` comes from `getkind(v.concretetype)` first via
-    /// [`FunctionGraph::concretetype`], which reads each `ValueId`'s
-    /// backing `Variable.concretetype` cell.  When the cell is
-    /// `Unknown` (test fixtures / hand-built graphs that bypass the
-    /// rtyper), the lookup falls back to scanning regallocs in
-    /// [`KINDS`] order.  The strict path mirrors RPython's
-    /// "kind-then-color" 1:1 invariant.
+    /// [`FunctionGraph::concretetype_of`], which reads the Variable's
+    /// `.concretetype` cell.  When the cell is `Unknown` (test
+    /// fixtures / hand-built graphs that bypass the rtyper), the
+    /// lookup falls back to scanning regallocs in [`KINDS`] order.
+    /// The strict path mirrors RPython's "kind-then-color" 1:1
+    /// invariant.
     pub fn getcolor(&mut self, var: &Variable) -> Register {
         let (kind, color) = self.kind_color_of(var).unwrap_or_else(|| {
             panic!("getcolor: Variable {var:?} not assigned a color by regalloc")
@@ -540,14 +532,12 @@ impl<'a> GraphFlattener<'a> {
     /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
     /// `flatten.py:386` strict 1:1 lookup.
     ///
-    /// The kind comes from `self.graph.concretetype(v)` — which
-    /// reads `getkind(var.concretetype.borrow())` directly off each
-    /// `ValueId`'s backing
-    /// [`crate::flowspace::model::Variable`], the upstream
-    /// `Variable.concretetype` access pattern verbatim.
-    /// `Void` / `Unknown` fall through to the bare regalloc scan
-    /// because both kinds skip regalloc partitioning entirely
-    /// (`flatten.py:325`).
+    /// The kind comes from `FunctionGraph::concretetype_of(&var)` —
+    /// which reads `getkind(var.concretetype.borrow())` directly off
+    /// the Variable's `.concretetype` cell, the upstream
+    /// `Variable.concretetype` access pattern verbatim.  `Void` /
+    /// `Unknown` fall through to the bare regalloc scan because both
+    /// kinds skip regalloc partitioning entirely (`flatten.py:325`).
     fn kind_color_of(&self, var: &Variable) -> Option<(RegKind, usize)> {
         use crate::model::ConcreteType;
         let declared = FunctionGraph::concretetype_of(var);
@@ -644,11 +634,10 @@ impl<'a> GraphFlattener<'a> {
         let block = self.graph.block(bid);
         // `if block.exits == (): self.make_return(block.inputargs); return`.
         if block.exits.is_empty() {
-            let graph = self.graph;
             let final_args: Vec<LinkArg> = block
-                .inputarg_value_ids(graph)
-                .into_iter()
-                .map(|v| LinkArg::Value(graph.must_variable(v)))
+                .inputargs
+                .iter()
+                .map(|v| LinkArg::Value(v.clone()))
                 .collect();
             self.make_return(&final_args);
             return;
@@ -795,8 +784,7 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         // `self.insert_renamings(link); self.make_bytecode_block(link.target, handling_ovf)`.
-        let target_inputargs = target.inputarg_value_ids(self.graph);
-        self.insert_renamings(link, &target_inputargs);
+        self.insert_renamings(link, &target.inputargs);
         self.make_bytecode_block(link.target, handling_ovf);
     }
 
@@ -834,7 +822,7 @@ impl<'a> GraphFlattener<'a> {
     ///                     self.emitline('%s_copy' % kind, v, "->", w)
     ///     self.generate_last_exc(link, link.target.inputargs)
     /// ```
-    pub fn insert_renamings(&mut self, link: &Link, target_inputargs: &[ValueId]) {
+    pub fn insert_renamings(&mut self, link: &Link, target_inputargs: &[Variable]) {
         // `flatten.py:308` requires equal-length link args + inputargs.
         assert_eq!(
             link.args.len(),
@@ -849,18 +837,14 @@ impl<'a> GraphFlattener<'a> {
         // src is `RegOrConst` (Variable→Register, Constant verbatim);
         // dst is always `Register` (Variable inputarg).
         let mut lst: Vec<(RegOrConst, Register)> = Vec::with_capacity(link.args.len());
-        for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        for (v, dst_var) in link.args.iter().zip(target_inputargs.iter()) {
             // `flatten.py:310-311` skip extravars.
             if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
                 continue;
             }
             // Skip Void inputargs (no color assigned by regalloc) — the
             // `flatten.py:309 v.concretetype is not lltype.Void` filter.
-            let Some(dst_var) = self.graph.variable(*w) else {
-                continue;
-            };
-            let dst_var = dst_var.clone();
-            let dst = match self.try_getcolor(&dst_var) {
+            let dst = match self.try_getcolor(dst_var) {
                 Some(r) => r,
                 None => continue,
             };
@@ -944,7 +928,7 @@ impl<'a> GraphFlattener<'a> {
     fn overflow_jump_op(
         &mut self,
         kind: &crate::model::OpKind,
-        result: Option<ValueId>,
+        result: Option<Variable>,
         target: Label,
     ) -> Option<FlatOp> {
         let (name, lhs_var, rhs_var) = match kind {
@@ -957,9 +941,8 @@ impl<'a> GraphFlattener<'a> {
             "mul_ovf" => IntOvfOp::Mul,
             _ => return None,
         };
-        let dst_vid =
+        let dst_var =
             result.expect("overflow-checked arithmetic op needs a result for flatten parity");
-        let dst_var = self.graph.must_variable(dst_vid);
         let lhs = self.getcolor(lhs_var);
         let rhs = self.getcolor(rhs_var);
         let dst = self.getcolor(&dst_var);
@@ -973,27 +956,25 @@ impl<'a> GraphFlattener<'a> {
     }
 
     /// `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`.
-    pub fn generate_last_exc(&mut self, link: &Link, target_inputargs: &[ValueId]) {
+    pub fn generate_last_exc(&mut self, link: &Link, target_inputargs: &[Variable]) {
         if link.last_exception.is_none() && link.last_exc_value.is_none() {
             return;
         }
-        for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        for (v, dst_var) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exception.as_ref() {
-                let dst_var = self.graph.must_variable(*w);
-                let dst = self.getcolor(&dst_var);
+                let dst = self.getcolor(dst_var);
                 self.emitline(FlatOp::LastException { dst });
             }
         }
-        for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        for (v, dst_var) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exc_value.as_ref() {
-                let dst_var = self.graph.must_variable(*w);
-                let dst = self.getcolor(&dst_var);
+                let dst = self.getcolor(dst_var);
                 self.emitline(FlatOp::LastExcValue { dst });
             }
         }
     }
 
-    /// Resolve a [`ValueId`] to its dedup'd [`Register`], returning
+    /// Resolve a Variable to its dedup'd [`Register`], returning
     /// `None` for Void slots that regalloc skipped.  Companion to
     /// [`Self::getcolor`] which panics in that case.
     fn try_getcolor(&mut self, var: &Variable) -> Option<Register> {
@@ -1063,7 +1044,7 @@ impl<'a> GraphFlattener<'a> {
             // matches.
             let ovf_landing_target = Label(self.next_label);
             let ovf_op = last_op_kind.as_ref().and_then(|kind| {
-                self.overflow_jump_op(kind, last_op_result(block, self.graph), ovf_landing_target)
+                self.overflow_jump_op(kind, last_op_result(block), ovf_landing_target)
             });
             if let Some(ovf_op) = ovf_op {
                 self.next_label += 1;
@@ -1264,29 +1245,24 @@ impl<'a> GraphFlattener<'a> {
     }
 }
 
-fn last_op_result(
-    block: &crate::model::Block,
-    graph: &crate::model::FunctionGraph,
-) -> Option<ValueId> {
-    block
-        .operations
-        .last()
-        .and_then(|op| op.result.as_ref().and_then(|v| graph.value_id_of(v)))
+fn last_op_result(block: &crate::model::Block) -> Option<Variable> {
+    block.operations.last().and_then(|op| op.result.clone())
 }
 
 // `overflow_jump_op` was promoted to a method on
 // [`GraphFlattener`] so it can resolve operand `(kind, color)` via
 // `getcolor` for line-by-line `flatten.py:382` parity.
 
-/// Resolve `(kind, color)` for a [`ValueId`] in the per-kind regalloc
+/// Resolve `(kind, color)` for a Variable in the per-kind regalloc
 /// results.
 ///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): the kind comes
 /// from `getkind(v.concretetype)` first, then `regallocs[kind]`
-/// supplies the color.  Pyre's [`ValueId`] does not yet carry
-/// `concretetype`, so this helper recovers the same answer by
-/// walking the per-kind regalloc results in [`KINDS`] order (NOT the
-/// nondeterministic `HashMap` iteration order) and asserting that at
+/// supplies the color.  This helper is the regalloc-class scan
+/// fallback used when the Variable's `.concretetype` cell is
+/// `Unknown` (test fixtures that bypass the rtyper); it walks the
+/// per-kind regalloc results in [`KINDS`] order (NOT the
+/// nondeterministic `HashMap` iteration order) and asserts that at
 /// most one class colors `v`.  Multi-class hits panic — a kind-
 /// provenance bug upstream — to preserve the RPython 1:1 invariant.
 fn lookup_kind_color(
@@ -1311,62 +1287,12 @@ fn lookup_kind_color(
     found
 }
 
-fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
-    let mut max_value = 0usize;
-    for block in &graph.blocks {
-        for arg in block.inputarg_value_ids(graph) {
-            max_value = max_value.max(arg.0 + 1);
-        }
-        for op in &block.operations {
-            if let Some(ValueId(v)) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
-                max_value = max_value.max(v + 1);
-            }
-        }
-    }
-    for op in ops {
-        match op {
-            FlatOp::Op(_) => {}
-            // Move/Push/Pop now carry [`Register`] (post-regalloc
-            // identity), not [`ValueId`], so they no longer contribute
-            // to the pre-regalloc value-id high-water mark.  RPython's
-            // `flatten.py` does not track a `num_values` either —
-            // upstream's max-color metric is computed per-kind off the
-            // regalloc result directly.
-            FlatOp::Move { src, .. } => {
-                if let RegOrConst::Const(_) = src {
-                    // Constant src adds no live ValueId.
-                }
-            }
-            FlatOp::Push(_) | FlatOp::Pop(_) => {}
-            FlatOp::GotoIfNot { .. } | FlatOp::Switch { .. } | FlatOp::IntBinOpJumpIfOvf { .. } => {
-                // Phase 3 — cond/value/lhs/rhs/dst are Register
-                // operands carrying (kind, color); no ValueId
-                // contribution to the pre-regalloc num_values count.
-            }
-            FlatOp::LastException { .. } | FlatOp::LastExcValue { .. } => {
-                // Phase 3 — Register operand carries (kind, color);
-                // no ValueId contribution to the pre-regalloc
-                // num_values count.
-            }
-            FlatOp::IntReturn(_)
-            | FlatOp::RefReturn(_)
-            | FlatOp::FloatReturn(_)
-            | FlatOp::Raise(_) => {
-                // Phase 3 — operand is RegOrConst (Register or
-                // Constant); no ValueId to fold into num_values.
-            }
-            _ => {}
-        }
-    }
-    max_value
-}
-
 // `generate_last_exc` is a method on [`GraphFlattener`] (see
 // `impl<'a> GraphFlattener<'a>::generate_last_exc`).  Mirrors
 // `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`
 // line-by-line.
 
-/// `flatten.py:325` — kind char for a [`ValueId`] derived from the
+/// `flatten.py:325` — kind char for a Variable derived from the
 /// regalloc result.  Iterates [`KINDS`] in fixed order (NOT the
 /// nondeterministic `HashMap` order) and panics on multi-class hits
 /// to mirror RPython's `getkind(v.concretetype)` 1:1 invariant.
@@ -1392,22 +1318,6 @@ fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocResult>) -> c
         Some(RegKind::Ref) => 'r',
         Some(RegKind::Float) => 'f',
         None => 'v',
-    }
-}
-
-/// Kind of a [`LinkArg`] for opname selection — upstream `assembler.py:168-170`
-/// `getkind(x.concretetype)` for `Constant`, `x.kind` for `Register`.
-///
-/// Returns `'i'` / `'r'` / `'f'` / `'v'` matching RPython `KINDS`.
-#[allow(dead_code)]
-pub(crate) fn linkarg_kind(
-    arg: &LinkArg,
-    graph: &FunctionGraph,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-) -> char {
-    match arg {
-        LinkArg::Value(var) => value_kind(var, regallocs),
-        LinkArg::Const(c) => constant_kind(c),
     }
 }
 
@@ -1584,27 +1494,25 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, Constant};
-    use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
+    use crate::model::{
+        ExitCase, FunctionGraph, OpKind, SpaceOperation, ValueId, exception_exitcase,
+    };
 
-    /// Test helper — build a `regallocs` map that assigns each
-    /// `ValueId(n)` the color `n` in `RegKind::Int`.  Pulls the
-    /// backing `Variable` for each `ValueId` from `graph.value_variables`
-    /// so the resulting coloring is keyed on the upstream-orthodox
-    /// Variable identity (matches `RegAllocResult.coloring:
-    /// HashMap<Variable, usize>` shape).  Iterates only the
-    /// ValueIds that already have a backing Variable on the graph;
-    /// callers minting ValueIds past the canonical `[returnvar,
-    /// etype, evalue]` triple need not allocate the entire
-    /// `[0..=max_id]` range up front.
+    /// Test helper — build a `regallocs` map keyed on each populated
+    /// slot's Variable with color matching the slot's dense index.
+    /// Iterates only Variables already registered on the graph via
+    /// [`crate::model::FunctionGraph::iter_variables`]; `num_regs` is
+    /// taken from `max_id + 1` so the register file width covers every
+    /// color produced by the identity mapping.
     fn identity_regallocs(
         graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
         let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
             std::collections::HashMap::new();
-        for n in 0..=max_id {
-            if let Some(var) = graph.variable(ValueId(n)) {
-                coloring.insert(var.clone(), n);
+        for (vid, var) in graph.iter_variables() {
+            if vid.0 <= max_id {
+                coloring.insert(var.clone(), vid.0);
             }
         }
         let num_regs = max_id + 1;
@@ -1977,10 +1885,6 @@ mod tests {
             )),
             "flatten must not serialize input ops: {:?}",
             flat.insns
-        );
-        assert!(
-            flat.num_values >= 3,
-            "input ValueIds must still contribute to num_values"
         );
     }
 
@@ -2439,9 +2343,13 @@ mod tests {
             BlockId(0),
             None,
         );
+        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
+            .iter()
+            .map(|v| graph.must_variable(*v))
+            .collect();
         let regallocs = identity_regallocs(&graph, max_id);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
-        f.insert_renamings(&link, target_inputargs);
+        f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns
     }
 
@@ -2456,9 +2364,13 @@ mod tests {
             graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
         }
         let link = Link::new_mixed(link_args, BlockId(0), None);
+        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
+            .iter()
+            .map(|v| graph.must_variable(*v))
+            .collect();
         let regallocs = identity_regallocs(&graph, max_id);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
-        f.insert_renamings(&link, target_inputargs);
+        f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns
     }
 
@@ -2531,8 +2443,12 @@ mod tests {
             BlockId(0),
             None,
         );
+        let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
+            .iter()
+            .map(|v| graph.must_variable(*v))
+            .collect();
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
-        f.insert_renamings(&link, target_inputargs);
+        f.insert_renamings(&link, &target_input_vars);
         f.ssarepr.insns
     }
 
@@ -2840,7 +2756,7 @@ mod tests {
         let result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
 
-        let mut make_handler = |graph: &mut FunctionGraph, marker_value: i64| {
+        let make_handler = |graph: &mut FunctionGraph, marker_value: i64| {
             let block = graph.create_block();
             let exc_type = graph.alloc_value();
             let exc_value = graph.alloc_value();

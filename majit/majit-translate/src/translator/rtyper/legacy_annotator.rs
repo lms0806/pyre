@@ -590,9 +590,9 @@ mod tests {
         graph.set_return(entry, Some(graph.must_variable(result)));
 
         annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
+        let ret_var = graph.block(graph.returnblock).inputargs[0].clone();
         assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Float);
-        assert_eq!(read_binding(&graph.must_variable(ret)), ValueType::Float);
+        assert_eq!(read_binding(&ret_var), ValueType::Float);
     }
 
     #[test]
@@ -613,8 +613,7 @@ mod tests {
         graph.set_return(entry, None);
 
         annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        let ret_var = graph.must_variable(ret);
+        let ret_var = graph.block(graph.returnblock).inputargs[0].clone();
         assert_eq!(
             read_binding(&ret_var),
             ValueType::Ref,
@@ -623,7 +622,7 @@ mod tests {
 
         legacy_resolve::resolve_types(&graph);
         assert_eq!(
-            graph.concretetype(ret),
+            FunctionGraph::concretetype_of(&ret_var),
             crate::jit_codewriter::type_state::ConcreteType::Void,
             "rtyping-layer projection honours Constant.concretetype=Void from set_return",
         );

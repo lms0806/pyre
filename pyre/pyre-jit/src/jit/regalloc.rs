@@ -38,17 +38,11 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
-use majit_translate::model::ValueId;
 use majit_translate::regalloc::DependencyGraph;
 use majit_translate::tool::algo::unionfind::UnionFind;
 
 use super::flatten::{DescrOperand, Insn, Kind, Operand, Register, SSARepr, TLabel};
 use super::flow::{ExitSwitch, ExitSwitchElement, FlowValue, FunctionGraph as FlowGraph, Variable};
-
-#[inline]
-fn variable_value_id(v: Variable) -> ValueId {
-    ValueId(v.id.0 as usize)
-}
 
 #[derive(Debug, Clone)]
 pub struct GraphAllocationResult {
@@ -62,7 +56,7 @@ pub struct GraphAllocationResult {
 /// is the real `tool/algo/unionfind.py UnionFind` port (`()` info,
 /// matching upstream `info_factory=None`).
 struct FlowGraphRegAllocator {
-    _depgraph: DependencyGraph<ValueId>,
+    _depgraph: DependencyGraph<super::flow::VariableId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
     _coloring: HashMap<super::flow::VariableId, u16>,
 }
@@ -137,10 +131,9 @@ impl FlowGraphRegAllocator {
                 .filter(|v| v.kind == Some(kind))
                 .collect();
             for (i, &v) in livevars.iter().enumerate() {
-                self._depgraph.add_node(variable_value_id(v));
+                self._depgraph.add_node(v.id);
                 for j in 0..i {
-                    self._depgraph
-                        .add_edge(variable_value_id(livevars[j]), variable_value_id(v));
+                    self._depgraph.add_edge(livevars[j].id, v.id);
                 }
             }
             // upstream: `livevars = set(livevars)` — shadow the list
@@ -155,14 +148,13 @@ impl FlowGraphRegAllocator {
                 }
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
-                        self._depgraph.add_node(variable_value_id(result));
+                        self._depgraph.add_node(result.id);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
                         // to `livevars` only *after* the loop, so no
                         // self-edge guard is needed.
                         for &v in &livevars {
-                            self._depgraph
-                                .add_edge(ValueId(v.0 as usize), variable_value_id(result));
+                            self._depgraph.add_edge(v, result.id);
                         }
                         livevars.insert(result.id);
                     }
@@ -182,12 +174,12 @@ impl FlowGraphRegAllocator {
                 let link_borrow = link.borrow();
                 if let Some(v) = link_borrow.last_exception {
                     if v.kind == Some(kind) {
-                        self._depgraph.add_node(variable_value_id(v));
+                        self._depgraph.add_node(v.id);
                     }
                 }
                 if let Some(v) = link_borrow.last_exc_value {
                     if v.kind == Some(kind) {
-                        self._depgraph.add_node(variable_value_id(v));
+                        self._depgraph.add_node(v.id);
                     }
                 }
                 let Some(target) = link_borrow.target.clone() else {
@@ -218,10 +210,7 @@ impl FlowGraphRegAllocator {
         if v0 == w0 {
             return;
         }
-        if self
-            ._depgraph
-            .has_edge(&ValueId(v0.0 as usize), &ValueId(w0.0 as usize))
-        {
+        if self._depgraph.has_edge(&v0, &w0) {
             return;
         }
         let (_, rep) = self._unionfind.union(v0, w0);
@@ -230,13 +219,11 @@ impl FlowGraphRegAllocator {
         debug_assert_eq!(self._unionfind.find_rep(v0), rep);
         debug_assert_eq!(self._unionfind.find_rep(w0), rep);
         if rep == v0 {
-            self._depgraph
-                .coalesce(ValueId(w0.0 as usize), ValueId(v0.0 as usize));
+            self._depgraph.coalesce(w0, v0);
         } else {
             // upstream (`regalloc.py:112`): `assert rep is w0`.
             debug_assert_eq!(rep, w0);
-            self._depgraph
-                .coalesce(ValueId(v0.0 as usize), ValueId(w0.0 as usize));
+            self._depgraph.coalesce(v0, w0);
         }
     }
 
@@ -245,7 +232,7 @@ impl FlowGraphRegAllocator {
             ._depgraph
             .find_node_coloring()
             .into_iter()
-            .map(|(value, color)| (super::flow::VariableId(value.0 as u32), color as u16))
+            .map(|(value, color)| (value, color as u16))
             .collect();
     }
 
@@ -828,7 +815,7 @@ fn perform_register_allocation(
 ///     def swapcolors(self, col1, col2): ...
 /// ```
 struct RegAllocator {
-    depgraph: DependencyGraph<ValueId>,
+    depgraph: DependencyGraph<u16>,
     /// Union-find over register indices (RPython
     /// `tool.algo.unionfind.UnionFind.link_to_parent`). Created
     /// lazily; missing nodes self-rep.
@@ -898,11 +885,10 @@ impl RegAllocator {
         // regalloc.py:54-60 `for i, v in enumerate(livevars):
         //   ... for j in range(i): dg.add_edge(livevars[j], v)`.
         for (i, &v) in external_inputs.iter().enumerate() {
-            self.depgraph.add_node(ValueId(v as usize));
+            self.depgraph.add_node(v);
             for j in 0..i {
                 if external_inputs[j] != v {
-                    self.depgraph
-                        .add_edge(ValueId(external_inputs[j] as usize), ValueId(v as usize));
+                    self.depgraph.add_edge(external_inputs[j], v);
                 }
             }
         }
@@ -941,14 +927,11 @@ impl RegAllocator {
                         // currently alive (regalloc.py:70-76).
                         if let Some(reg) = result {
                             if reg.kind == kind {
-                                self.depgraph.add_node(ValueId(reg.index as usize));
+                                self.depgraph.add_node(reg.index);
                                 for &a in &alive {
                                     if a != reg.index {
-                                        self.depgraph.add_node(ValueId(a as usize));
-                                        self.depgraph.add_edge(
-                                            ValueId(reg.index as usize),
-                                            ValueId(a as usize),
-                                        );
+                                        self.depgraph.add_node(a);
+                                        self.depgraph.add_edge(reg.index, a);
                                     }
                                 }
                                 alive.remove(&reg.index);
@@ -960,14 +943,14 @@ impl RegAllocator {
                             match x {
                                 Operand::Register(reg) if reg.kind == kind => {
                                     alive.insert(reg.index);
-                                    self.depgraph.add_node(ValueId(reg.index as usize));
+                                    self.depgraph.add_node(reg.index);
                                 }
                                 Operand::ListOfKind(lst) if lst.kind == kind => {
                                     for y in &lst.content {
                                         if let Operand::Register(reg) = y {
                                             if reg.kind == kind {
                                                 alive.insert(reg.index);
-                                                self.depgraph.add_node(ValueId(reg.index as usize));
+                                                self.depgraph.add_node(reg.index);
                                             }
                                         }
                                     }
@@ -1045,19 +1028,14 @@ impl RegAllocator {
         if v0 == w0 {
             return;
         }
-        if self
-            .depgraph
-            .has_edge(&ValueId(v0 as usize), &ValueId(w0 as usize))
-        {
+        if self.depgraph.has_edge(&v0, &w0) {
             return;
         }
         let rep = self.union(v0, w0);
         if rep == v0 {
-            self.depgraph
-                .coalesce(ValueId(w0 as usize), ValueId(v0 as usize));
+            self.depgraph.coalesce(w0, v0);
         } else {
-            self.depgraph
-                .coalesce(ValueId(v0 as usize), ValueId(w0 as usize));
+            self.depgraph.coalesce(v0, w0);
         }
     }
 
@@ -1075,11 +1053,11 @@ impl RegAllocator {
             .unionfind
             .keys()
             .copied()
-            .chain(coloring.keys().map(|vid| vid.0 as u16))
+            .chain(coloring.keys().copied())
             .collect();
         for v in all_regs {
             let rep = self.find_rep(v);
-            if let Some(&color) = coloring.get(&ValueId(rep as usize)) {
+            if let Some(&color) = coloring.get(&rep) {
                 self.coloring.insert(v, color as u16);
             }
         }

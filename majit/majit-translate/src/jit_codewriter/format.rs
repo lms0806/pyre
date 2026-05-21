@@ -29,7 +29,6 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::flatten::{FlatOp, Label, RegKind, RegOrConst, SSARepr};
-use crate::model::ValueId;
 
 /// `flatten.py:30 Register.kind[0]` — single-char prefix used in
 /// `int_copy`/`ref_copy`/`float_copy` opnames.
@@ -327,28 +326,13 @@ fn normalize_expected(expected: &str) -> String {
     out
 }
 
-fn register_repr_for_kind(v: ValueId, kind: RegKind) -> String {
+fn register_repr_for_kind(suffix: u64, kind: RegKind) -> String {
     let prefix = match kind {
         RegKind::Int => 'i',
         RegKind::Ref => 'r',
         RegKind::Float => 'f',
     };
-    format!("%{prefix}{}", v.0)
-}
-
-#[allow(dead_code)]
-fn linkarg_repr_for_kind(
-    arg: &crate::model::LinkArg,
-    graph: &crate::model::FunctionGraph,
-    kind: RegKind,
-) -> String {
-    match arg {
-        crate::model::LinkArg::Value(_) => arg
-            .as_value(graph)
-            .map(|v| register_repr_for_kind(v, kind))
-            .unwrap_or_else(|| "<unbound>".to_string()),
-        crate::model::LinkArg::Const(cv) => format!("${}", cv.value),
-    }
+    format!("%{prefix}{suffix}")
 }
 
 /// format.py:26-27 `ListOfKind` formatter.
@@ -357,29 +341,9 @@ fn linkarg_repr_for_kind(
 /// Pyre's call-family `OpKind` variants split args into typed
 /// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot —
 /// it is passed in directly rather than fetched from a side-table.
-fn list_of_kind_repr(kind_char: char, args: &[ValueId]) -> String {
-    let kind = match kind_char.to_ascii_lowercase() {
-        'i' => RegKind::Int,
-        'f' => RegKind::Float,
-        _ => RegKind::Ref,
-    };
-    let parts: Vec<String> = args
-        .iter()
-        .map(|v| register_repr_for_kind(*v, kind))
-        .collect();
-    format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
-}
-
-/// Variable-typed sibling of [`list_of_kind_repr`].  Used by call-family
-/// `OpKind` variants whose argument slots have been flipped from
-/// `Vec<ValueId>` to `Vec<Variable>` per the upstream-orthodox storage
-/// model.  When `graph` is provided, each Variable's render suffix
-/// resolves via `graph.value_id_of(v)` — the graph-local SSA
-/// numbering RPython's `format_assembler` emits.  When it is `None`,
-/// fall back to `Variable.id()` (process-wide identity) which matches
-/// the SSA numbering for graphs constructed through
-/// `alloc_value_with_variable` but is unstable across run-time
-/// allocation order.
+/// Argument storage is `Vec<Variable>` (orthodox per `flowspace/model.py:Variable`);
+/// the Variable's render suffix resolves via `graph.value_id_of(v)`
+/// when a graph is provided, falling back to `Variable.id()`.
 fn list_of_kind_repr_vars(
     kind_char: char,
     args: &[crate::flowspace::model::Variable],
@@ -392,26 +356,26 @@ fn list_of_kind_repr_vars(
     };
     let parts: Vec<String> = args
         .iter()
-        .map(|v| register_repr_for_kind(variable_value_id(v, graph), kind))
+        .map(|v| register_repr_for_kind(variable_register_suffix(v, graph), kind))
         .collect();
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
 }
 
-/// Resolve a [`crate::flowspace::model::Variable`] to its graph-local
-/// SSA [`ValueId`].  When `graph` is provided we look the bridge up
-/// via [`crate::model::FunctionGraph::value_id_of`]; failing that
-/// (and when no graph is supplied) we fall back to
-/// `ValueId(v.id() as usize)`.  The fallback matches the numbering
-/// established by `alloc_value_with_variable` for graphs built
-/// through pyre's frontend — sufficient for tests and JitCode.dump
-/// where the original graph is no longer accessible.
-fn variable_value_id(
+/// Resolve a [`crate::flowspace::model::Variable`] to the numeric
+/// suffix used in `%i<n>`/`%r<n>`/`%f<n>` register renderings.  When
+/// `graph` is provided we look the bridge up via
+/// [`crate::model::FunctionGraph::value_id_of`] for graph-local SSA
+/// numbering; failing that (and when no graph is supplied) we fall
+/// back to `Variable.id()` (process-wide identity counter).  The
+/// fallback is sufficient for tests and `JitCode.dump` where the
+/// original graph is no longer accessible.
+fn variable_register_suffix(
     v: &crate::flowspace::model::Variable,
     graph: Option<&crate::model::FunctionGraph>,
-) -> ValueId {
+) -> u64 {
     graph
-        .and_then(|g| g.value_id_of(v))
-        .unwrap_or(ValueId(v.id() as usize))
+        .and_then(|g| g.value_id_of(v).map(|vid| vid.0 as u64))
+        .unwrap_or(v.id())
 }
 
 /// format.py:20-23 — render a `funcptr` slot.
@@ -419,7 +383,7 @@ fn variable_value_id(
 /// Upstream emits `$<* struct <name>>` for `Constant(lltype.Ptr(Struct))`
 /// and `$<value>` otherwise.  Pyre's codewrite-time funcptr surrogate is
 /// either a symbolic [`crate::model::CallTarget`] or a runtime
-/// [`crate::model::ValueId`].
+/// [`crate::flowspace::model::Variable`].
 fn call_target_repr(target: &crate::model::CallTarget) -> String {
     use crate::model::CallTarget;
     match target {
@@ -460,9 +424,9 @@ fn call_funcptr_repr(
         // kind matches the upstream `getkind(v.concretetype)` slot
         // shape.  Falls back to `Ref` when the cell is unset.
         crate::model::CallFuncPtr::Value(var) => {
-            let vid = variable_value_id(var, graph);
+            let suffix = variable_register_suffix(var, graph);
             let kind = variable_kind(var).unwrap_or(RegKind::Ref);
-            register_repr_for_kind(vid, kind)
+            register_repr_for_kind(suffix, kind)
         }
     }
 }
@@ -571,17 +535,18 @@ fn op_args_repr(
         // unset (anchor-test fixtures that build SSA shapes without
         // running the rtyper).
         OpKind::Call { args, .. } => {
-            // When a graph is provided we resolve Variable→ValueId via
-            // `value_id_of` so the render suffix matches RPython's
-            // graph-local SSA numbering.  Without it we fall back to
-            // `Variable.id()` (process-wide identity) — sufficient for
-            // tests that allocate Variables sequentially.
+            // When a graph is provided we resolve the Variable's
+            // graph-local register suffix via `value_id_of` so the
+            // render matches RPython's graph-local SSA numbering.
+            // Without it we fall back to `Variable.id()` (process-wide
+            // identity) — sufficient for tests that allocate Variables
+            // sequentially.
             let parts: Vec<String> = args
                 .iter()
                 .map(|v| {
-                    let vid = variable_value_id(v, graph);
+                    let suffix = variable_register_suffix(v, graph);
                     let kind = variable_kind(v).unwrap_or(RegKind::Ref);
-                    register_repr_for_kind(vid, kind)
+                    register_repr_for_kind(suffix, kind)
                 })
                 .collect();
             out.push_str(&parts.join(", "));
@@ -700,17 +665,19 @@ fn op_args_repr(
             // test demands it.
         }
     }
-    let result_vid = match graph {
-        Some(g) => op.result.as_ref().and_then(|v| g.value_id_of(v)),
+    let result_suffix: Option<u64> = match graph {
+        Some(g) => op
+            .result
+            .as_ref()
+            .and_then(|v| g.value_id_of(v).map(|vid| vid.0 as u64)),
         // No-graph render path: fall back to the Variable's `id()`
         // (process-wide identity counter) when callers cannot supply a
-        // graph.  Pre-flip the `op.result` field carried the dense
-        // `ValueId`, so this preserves the prior render behaviour for
+        // graph.  Preserves the historical render behaviour for
         // standalone test fixtures that build `SpaceOperation` ahead of
         // any graph context.
-        None => op.result.as_ref().map(|v| ValueId(v.id() as usize)),
+        None => op.result.as_ref().map(|v| v.id()),
     };
-    if let Some(result) = result_vid {
+    if let Some(suffix) = result_suffix {
         if !out.is_empty() {
             out.push(' ');
         }
@@ -724,7 +691,7 @@ fn op_args_repr(
         // last-resort fallback for the small handful of non-result-
         // bearing variants (no debug consumers exercise them today).
         let result_kind = op_result_kind(&op.kind);
-        out.push_str(&register_repr_for_kind(result, result_kind));
+        out.push_str(&register_repr_for_kind(suffix, result_kind));
     }
     out
 }
@@ -813,7 +780,6 @@ mod tests {
         SSARepr {
             name: "test".into(),
             insns: Vec::new(),
-            num_values: 0,
             num_blocks: 0,
             insns_pos: None,
         }
@@ -912,9 +878,7 @@ mod tests {
     fn format_residual_call_emits_descr_and_listofkind() {
         // jtransform.py:414-435 + format.py:27,32-33.
         use crate::call::CallDescriptor;
-        use crate::model::{
-            CallFuncPtr, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueId,
-        };
+        use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, SpaceOperation};
         use majit_ir::descr::EffectInfo;
 
         let mut graph = FunctionGraph::new("format_residual_call");
@@ -928,7 +892,6 @@ mod tests {
         let int_arg_id = int_arg_vid.0;
         let ref_arg_id = ref_arg_vid.0;
         let result_id = result_vid.0;
-        let _ = ValueId(0);
 
         let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);

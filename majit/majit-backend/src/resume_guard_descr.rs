@@ -51,7 +51,6 @@ use majit_ir::{
 
 use crate::CompiledLoopToken;
 use crate::CompiledTraceInfo;
-use crate::ExitRecoveryLayout;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
 

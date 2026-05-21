@@ -1,7 +1,7 @@
 //! AST front-end: build semantic graphs from Rust source.
 //!
 //! RPython equivalent: flowspace/ — converts source to Block/Link/Variable/SpaceOperation.
-//! This module lowers syn AST nodes into FunctionGraph ops with proper data flow (ValueId linking).
+//! This module lowers syn AST nodes into FunctionGraph ops with proper data flow (Variable linking).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2302,9 +2302,10 @@ fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
         .collect()
 }
 
-/// Materialise a `Vec<ValueId>` of per-name link args for a back-edge
+/// Materialise a `Vec<Variable>` of per-name link args for a back-edge
 /// or `continue` close: each name's `ctx.local_value_ids[name].0`
-/// supplies the value the loop header should observe on this edge.
+/// supplies the value the loop header should observe on this edge,
+/// projected through `graph.must_variable` to the backing `Variable`.
 /// Used at the closing predecessor of `Expr::While` / `Expr::Loop`'s
 /// loop header.  RPython parity for the slot-by-slot mapping:
 /// `flowspace/framestate.py:92 getoutputargs`.  Panics if any name is
@@ -2313,7 +2314,11 @@ fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
 /// (or the lazy installer that produced any extra phis) bound each
 /// name into ctx, so a missing entry indicates a broken invariant
 /// upstream of this call.
-fn link_args_from_ctx(ctx: &GraphBuildContext<'_>, header_phi_names: &[String]) -> Vec<ValueId> {
+fn link_arg_vars_from_ctx(
+    graph: &FunctionGraph,
+    ctx: &GraphBuildContext<'_>,
+    header_phi_names: &[String],
+) -> Vec<crate::flowspace::model::Variable> {
     header_phi_names
         .iter()
         .map(|name| {
@@ -2324,7 +2329,7 @@ fn link_args_from_ctx(ctx: &GraphBuildContext<'_>, header_phi_names: &[String]) 
                     name
                 )
             });
-            vid
+            graph.must_variable(vid)
         })
         .collect()
 }
@@ -2370,15 +2375,10 @@ impl<'a> GraphBuildContext<'a> {
     // `stackdepth` / `pushvalue` / `popvalue` / `peekvalue` /
     // `settopvalue` / `popvalues` / `dropvaluesuntil`.  Identifier names
     // and behavioural shapes match upstream exactly.  Pyre's stack
-    // currently holds `ValueId` cells (graph-local Hlvalue identity
-    // surrogate); upstream's polymorphic `Variable | Constant |
-    // FlowSignal` shape is reached when Z4.E activates the SpamBlock
-    // chain at Match merges.
-    //
-    // None of these are wired into `lower_expr` yet (slice Z4.B+
-    // converts leaf variants); they're tested in isolation against
-    // upstream semantics to lock the API surface before consumers
-    // arrive.
+    // holds `StackElem` cells matching upstream's polymorphic
+    // `Variable | Constant | FlowSignal` shape — `StackElem::Value(
+    // Hlvalue::Variable(_))` for live operands and `StackElem::Signal(_)`
+    // for `Return` / `Raise` / `Break` / `Continue` flow signals.
 
     /// `flowcontext.py:317-319` — current value stack size.
     #[allow(dead_code)]
@@ -2864,15 +2864,13 @@ fn lazy_install_local_at_current_block(
     // ctx state.
     {
         let block = graph.block(current_block);
-        let block_inputarg_vids = block.inputarg_value_ids(graph);
         for op in &block.operations {
-            if let (Some(result), OpKind::Input { name: op_name, .. }) = (
-                op.result.as_ref().and_then(|v| graph.value_id_of(v)),
-                &op.kind,
-            ) && op_name == name
-                && block_inputarg_vids.contains(&result)
+            if let (Some(result_var), OpKind::Input { name: op_name, .. }) =
+                (op.result.as_ref(), &op.kind)
+                && op_name == name
+                && block.inputargs.contains(result_var)
             {
-                return Some(result);
+                return graph.value_id_of(result_var);
             }
         }
     }
@@ -6020,11 +6018,7 @@ fn lower_expr(
                 // predecessor link.
                 let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
-                let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
+                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_vars);
                 // Audit Cat 2-1: stamp the body-tail's framestate
                 // so the post-loop lazy installer can thread reads
@@ -6092,11 +6086,7 @@ fn lower_expr(
                 // cycle-safety rationale).
                 let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, body_entry);
-                let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
+                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
                 graph.set_goto(body_tail, body_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
@@ -6198,11 +6188,7 @@ fn lower_expr(
                 // cycle-safety rationale).
                 let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
-                let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
-                let back_edge_vars: Vec<crate::flowspace::model::Variable> = back_edge_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
+                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
@@ -6313,9 +6299,7 @@ fn lower_expr(
                     // idempotency check on `block.inputargs`.
                     let pre_continue_snapshot = ctx.getstate(graph, 0);
                     let header_phi_names = header_phi_name_list(graph, frame.continue_target);
-                    let args = link_args_from_ctx(ctx, &header_phi_names);
-                    let arg_vars: Vec<crate::flowspace::model::Variable> =
-                        args.into_iter().map(|v| graph.must_variable(v)).collect();
+                    let arg_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
                     graph.set_goto(*block, frame.continue_target, arg_vars);
                     graph.block_mut(*block).framestate = Some(pre_continue_snapshot);
                 }
@@ -8204,11 +8188,12 @@ fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueT
 }
 
 fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    let target_var = graph.variable(value)?;
     for target_block in &graph.blocks {
         let Some(arg_index) = target_block
-            .inputarg_value_ids(graph)
+            .inputargs
             .iter()
-            .position(|&inputarg| inputarg == value)
+            .position(|inputarg| inputarg == target_var)
         else {
             continue;
         };
@@ -12461,10 +12446,7 @@ mod tests {
         // RPython `flowcontext.py` emits a fresh Variable on the
         // prevblock side for `return None`; the returnblock's own
         // inputarg stays distinct.
-        let returnblock_arg = func
-            .graph
-            .block(func.graph.returnblock)
-            .inputarg_value_ids(&func.graph)[0];
+        let returnblock_arg = func.graph.block(func.graph.returnblock).inputargs[0].clone();
         // Upstream `flowspace/model.py:171-180` keeps the void return shape
         // in Block.exits: a single Link([fresh_void], graph.returnblock)
         // with exitswitch=None.
@@ -12474,9 +12456,9 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(entry.exits[0].args.len(), 1);
         assert_ne!(
-            entry.exits[0].args[0].as_value(&func.graph),
-            Some(returnblock_arg),
-            "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
+            entry.exits[0].args[0].as_variable(),
+            Some(&returnblock_arg),
+            "void return must allocate a fresh prevblock-side Variable (`flowspace/model.py:114`), \
              not reuse the returnblock's own inputarg"
         );
     }
@@ -12500,11 +12482,11 @@ mod tests {
     }
 
     #[test]
-    fn locals_frame_link_args_preserves_storage_order() {
+    fn locals_frame_iter_preserves_storage_order() {
         // RPython `flowcontext.py:835 LOAD_FAST` reads `frame.locals_w`
         // by slot index.  Pyre stores entries densely at graph-wide
         // first-bind slot positions (`co_varnames` slot order parity),
-        // so `link_args()` must walk that order verbatim, yielding only
+        // so `iter()` must walk that order verbatim, yielding only
         // bound (non-None) slots — every predecessor link feeding a
         // merge block sees the same slot order, so `Link.args[i]` lines
         // up with `inputargs[i]` at the successor.
@@ -12516,10 +12498,11 @@ mod tests {
             ],
             ..Default::default()
         };
+        let walked: Vec<ValueId> = frame.iter().map(|(_, vid)| vid).collect();
         assert_eq!(
-            frame.link_args(),
+            walked,
             vec![ValueId(3), ValueId(1), ValueId(2)],
-            "link_args must walk entries in storage (first-bind) order; \
+            "iter must walk entries in storage (first-bind) order; \
              alphabetisation would break slot-position parity at merges"
         );
     }
@@ -13075,9 +13058,9 @@ mod tests {
         // filtered out (None-killed: not in pre-loop snapshot).
         assert_eq!(header_phi_names, vec!["x".to_string()]);
 
-        let header_inputarg_vids = graph.block(header_entry).inputarg_value_ids(&graph);
-        assert_eq!(header_inputarg_vids.len(), 1);
-        let phi_vid = header_inputarg_vids[0];
+        let header_inputarg_vars = graph.block(header_entry).inputargs.clone();
+        assert_eq!(header_inputarg_vars.len(), 1);
+        let phi_var = header_inputarg_vars[0].clone();
         let header = graph.block(header_entry);
         assert_eq!(header.operations.len(), 1);
         let phi_op = &header.operations[0];
@@ -13088,8 +13071,7 @@ mod tests {
             }
             other => panic!("expected OpKind::Input, got {:?}", other),
         }
-        let phi_vid_var = graph.must_variable(phi_vid);
-        assert_eq!(phi_op.result.as_ref(), Some(&phi_vid_var));
+        assert_eq!(phi_op.result.as_ref(), Some(&phi_var));
 
         let pre_exit = &graph.block(pre_loop_block).exits[0];
         assert_eq!(
@@ -13099,6 +13081,9 @@ mod tests {
         );
 
         let (current_x_vid, current_x_block) = ctx.local_value_ids["x"];
+        let phi_vid = graph
+            .value_id_of(&phi_var)
+            .expect("phi inputarg registered");
         assert_eq!(
             current_x_vid, phi_vid,
             "ctx.local_value_ids[x] must point at the header phi"

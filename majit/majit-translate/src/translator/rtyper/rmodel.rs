@@ -2831,7 +2831,7 @@ mod tests {
         let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "getattr");
-        let mut v_ptr = Variable::new();
+        let v_ptr = Variable::new();
         v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v
             .borrow_mut()
@@ -2869,7 +2869,7 @@ mod tests {
         let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "setattr");
-        let mut v_ptr = Variable::new();
+        let v_ptr = Variable::new();
         v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_ptr),
@@ -2912,7 +2912,7 @@ mod tests {
         let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "simple_call");
-        let mut v_func = Variable::new();
+        let v_func = Variable::new();
         v_func.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_func),
@@ -2972,7 +2972,7 @@ mod tests {
             rtyper.clone(),
             Some(caller_start.clone()),
         )));
-        let mut v_result = Variable::new();
+        let v_result = Variable::new();
         v_result.set_concretetype(Some(func_type.result.clone()));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -3054,7 +3054,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "getitem");
-        let mut v_array = Variable::new();
+        let v_array = Variable::new();
         v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
@@ -3091,7 +3091,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "setitem");
-        let mut v_array = Variable::new();
+        let v_array = Variable::new();
         v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
@@ -3138,7 +3138,7 @@ mod tests {
             "InteriorPtrRepr",
         ));
         let hop = empty_hop(&rtyper, "getitem");
-        let mut v_array = Variable::new();
+        let v_array = Variable::new();
         v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
@@ -3179,9 +3179,9 @@ mod tests {
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "eq");
-        let mut v_left = Variable::new();
+        let v_left = Variable::new();
         v_left.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
-        let mut v_right = Variable::new();
+        let v_right = Variable::new();
         v_right.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v
             .borrow_mut()
@@ -3297,7 +3297,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "getitem");
-        let mut v_self = Variable::new();
+        let v_self = Variable::new();
         v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_self),
@@ -3343,7 +3343,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "setitem");
-        let mut v_self = Variable::new();
+        let v_self = Variable::new();
         v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_self),

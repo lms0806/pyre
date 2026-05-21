@@ -211,7 +211,6 @@ mod tests {
     use crate::{
         flatten::{FlatOp, SSARepr},
         flowspace::model::ConstValue,
-        model::LinkArg,
     };
 
     #[test]
@@ -323,7 +322,6 @@ mod tests {
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
                 crate::flowspace::model::Constant::new(ConstValue::byte_str("hello")),
             ))],
-            num_values: 0,
             num_blocks: 1,
             insns_pos: None,
         };

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef};
+use majit_ir::{InputArg, Op, OpCode, OpRef};
 
 /// A lowered dynasm-backend operation.
 #[derive(Clone, Debug, PartialEq, Eq)]

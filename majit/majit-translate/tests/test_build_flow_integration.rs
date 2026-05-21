@@ -17,7 +17,7 @@
 //! + 1` input and the resulting graph passes checkgraph.
 
 use majit_translate::flowspace::bytecode::{ConstantData, HostCode};
-use majit_translate::flowspace::model::{BlockRefExt, ConstValue, Constant, GraphFunc, checkgraph};
+use majit_translate::flowspace::model::{ConstValue, Constant, GraphFunc, checkgraph};
 use majit_translate::flowspace::objspace::build_flow;
 use rustpython_compiler::{Mode, compile as rp_compile};
 use rustpython_compiler_core::bytecode::CodeObject;

@@ -54,22 +54,19 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::{ConstValue, Constant, GraphFunc, GraphRef, Variable};
+use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
 use crate::flowspace::pygraph::PyGraph;
+#[cfg(test)]
 use crate::front;
 use crate::jit_codewriter::type_state::ConcreteType;
-use crate::model::{FunctionGraph as LegacyGraph, ValueId, ValueType};
+use crate::model::{FunctionGraph as LegacyGraph, ValueId};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::flowspace_adapter::{
-    FlowspaceAdapterOutput, ValueIdToVariable, function_graph_to_flowspace,
-};
-use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, ValueIdToVariable};
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pyre_call_registry::{
     FunctionPathKey, PyreCallRegistry, PyreFunctionEntry,
 };
-use crate::translator::rtyper::rtyper::RPythonTyper;
 
 /// Project a post-`specialize` `LowLevelType` back to the legacy
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
@@ -134,27 +131,27 @@ pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType
 /// dual-gate baseline's `legacy_annotator::annotate` writes from any
 /// subsequent reader on the same graph.  See the `dual_gate_check`
 /// doc for the failure mode this prevents.
-struct LegacyAnnotationGuard<'a> {
-    graph: &'a LegacyGraph,
-    snapshot: Vec<(usize, Option<Rc<crate::annotator::model::SomeValue>>)>,
+struct LegacyAnnotationGuard {
+    snapshot: Vec<(
+        crate::flowspace::model::Variable,
+        Option<Rc<crate::annotator::model::SomeValue>>,
+    )>,
 }
 
-impl<'a> LegacyAnnotationGuard<'a> {
-    fn snapshot(graph: &'a LegacyGraph) -> Self {
+impl LegacyAnnotationGuard {
+    fn snapshot(graph: &LegacyGraph) -> Self {
         let snapshot = graph
             .iter_variables()
-            .map(|(vid, var)| (vid.0, var.annotation.borrow().clone()))
+            .map(|(_, var)| (var.clone(), var.annotation.borrow().clone()))
             .collect();
-        Self { graph, snapshot }
+        Self { snapshot }
     }
 }
 
-impl Drop for LegacyAnnotationGuard<'_> {
+impl Drop for LegacyAnnotationGuard {
     fn drop(&mut self) {
-        for (idx, ann) in self.snapshot.drain(..) {
-            if let Some(var) = self.graph.variable(ValueId(idx)) {
-                *var.annotation.borrow_mut() = ann;
-            }
+        for (var, ann) in self.snapshot.drain(..) {
+            *var.annotation.borrow_mut() = ann;
         }
     }
 }
@@ -899,12 +896,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
 fn signature_for_graph(graph: &LegacyGraph) -> Signature {
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputarg_value_ids(graph)
-        .into_iter()
+        .inputargs
+        .iter()
         .enumerate()
-        .map(|(idx, vid)| {
+        .map(|(idx, var)| {
             graph
-                .value_name(vid)
+                .value_id_of(var)
+                .and_then(|vid| graph.value_name(vid))
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
@@ -1010,6 +1008,7 @@ pub(crate) fn lift_callee_to_pygraph(
 /// identity until host callable identity is available; aligning the
 /// segment shape both sides of the registry is a prerequisite for
 /// that stand-in to function correctly.
+#[cfg(test)]
 fn function_path_key_for(func: &front::SemanticFunction) -> FunctionPathKey {
     let mut segments: Vec<String> = Vec::new();
     if let Some(t) = &func.self_ty_root {
@@ -1028,16 +1027,18 @@ fn function_path_key_for(func: &front::SemanticFunction) -> FunctionPathKey {
 /// these as `value_name(inputarg)` on the startblock; missing names
 /// fall back to `arg{N}` to keep the `FunctionDesc.signature.argnames`
 /// length matched to the actual parameter count.
+#[cfg(test)]
 fn signature_for(func: &front::SemanticFunction) -> Signature {
     let graph = &func.graph;
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputarg_value_ids(graph)
-        .into_iter()
+        .inputargs
+        .iter()
         .enumerate()
-        .map(|(idx, vid)| {
+        .map(|(idx, var)| {
             graph
-                .value_name(vid)
+                .value_id_of(var)
+                .and_then(|vid| graph.value_name(vid))
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
@@ -1070,6 +1071,7 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
 ///
 /// Annotation seeding lives inside [`function_graph_to_flowspace`]
 /// after Slice 12.2; this walker plumbs only the program + registry.
+#[cfg(test)]
 pub(crate) fn populate_call_registry_from_program(
     program: &front::SemanticProgram,
     registry: &PyreCallRegistry,

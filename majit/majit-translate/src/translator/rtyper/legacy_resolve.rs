@@ -25,23 +25,22 @@
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
 
-use std::collections::HashMap;
-
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::jit_codewriter::annotation_state::somevalue_to_valuetype;
 use crate::jit_codewriter::type_state::{
     ConcreteType, kind_char_to_concrete, valuetype_to_concrete,
 };
-use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId};
+use crate::model::{FunctionGraph, Link, LinkArg, OpKind};
 
 /// Resolve annotations to concrete types.
 ///
 /// RPython equivalent: `RPythonTyper.specialize_block()` — walks
 /// each block and converts annotation → Repr → lowleveltype.
 ///
-/// Result is committed through `graph.set_concretetype_inline` for
-/// every populated `ValueId`; downstream consumers read kinds via
-/// `graph.concretetype(v)` (`getkind(v.concretetype)`).
+/// Result is committed through `set_concretetype_of_inline` for
+/// every populated `Variable.concretetype` cell; downstream consumers
+/// read kinds via `FunctionGraph::concretetype_of(&v)`
+/// (`getkind(v.concretetype)`).
 pub fn resolve_types(graph: &FunctionGraph) {
     // Walk the orthodox `Variable.annotation` slot on every registered
     // graph variable (RPython `Variable.annotation`).  `Unknown`-projected
@@ -50,37 +49,34 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // outputs always produce a concrete kind, so every populated cell
     // commits a real
     // `graph.set_concretetype_inline` write.
-    for (vid, var) in graph.iter_variables() {
+    for (_, var) in graph.iter_variables() {
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
             let concrete = valuetype_to_concrete(&vtype);
-            graph.set_concretetype_inline(vid, concrete);
+            FunctionGraph::set_concretetype_of_inline(var, concrete);
         }
     }
 
     // Resolve from ops with explicit type info
     for block in &graph.blocks {
         // Resolve inputargs (Phi nodes) from `Variable.annotation`
-        for vid in block.inputarg_value_ids(graph) {
-            if graph.concretetype(vid) == ConcreteType::Unknown {
-                let vtype = graph
-                    .variable(vid)
-                    .and_then(|v| {
-                        v.annotation
-                            .borrow()
-                            .as_ref()
-                            .map(|rc| somevalue_to_valuetype(rc))
-                    })
+        for var in &block.inputargs {
+            if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
+                let vtype = var
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|rc| somevalue_to_valuetype(rc))
                     .unwrap_or(crate::model::ValueType::Unknown);
                 let concrete = valuetype_to_concrete(&vtype);
                 if concrete != ConcreteType::Unknown {
-                    graph.set_concretetype_inline(vid, concrete);
+                    FunctionGraph::set_concretetype_of_inline(var, concrete);
                 }
             }
         }
         for op in &block.operations {
-            if let Some(result) = op.registered_result_value_id(graph) {
+            if let Some(result_var) = op.result.as_ref() {
                 let inferred = infer_concrete_from_op(&op.kind);
                 if inferred != ConcreteType::Unknown {
                     // The op carries authoritative result kind (post-
@@ -91,7 +87,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
                     // rewrite arm.
-                    graph.set_concretetype_inline(result, inferred);
+                    crate::model::FunctionGraph::set_concretetype_of_inline(result_var, inferred);
                 }
             }
         }
@@ -156,7 +152,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
     fn is_identity_unop(op: &str) -> bool {
         matches!(op, "same_as")
     }
-    // Iterate: a backward-inferred Signed on one ValueId may feed
+    // Iterate: a backward-inferred Signed on one Variable may feed
     // another op's operand through Link propagation, so run until
     // fixed-point.  RPython's `rtyper.py:specialize` is a single
     // forward pass because every Variable has a `concretetype` from
@@ -300,7 +296,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                 }
             }
             // Re-propagate along links after each op round so backward
-            // inferences reach the linked ValueIds. RPython has concrete
+            // inferences reach the linked Variables. RPython has concrete
             // types on both ends by this point and `_convert_link()` emits
             // conversions where needed; this legacy pass has no conversion
             // insertion, so Unknown values joined by a link must converge to
@@ -328,35 +324,38 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // jtransform's `get_value_kind` picks) so `build_value_kinds` +
     // `perform_register_allocation` always produce a coloring for
     // every reachable value.
-    let mut seen: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     for block in &graph.blocks {
-        for v in block.inputarg_value_ids(graph) {
-            seen.insert(v);
+        for var in &block.inputargs {
+            seen.insert(var.clone());
         }
         for op in &block.operations {
-            for v in crate::inline::op_value_refs(&op.kind, Some(graph)) {
-                seen.insert(v);
+            for var in crate::inline::op_variable_refs(&op.kind, graph)
+                .into_iter()
+                .flatten()
+            {
+                seen.insert(var);
             }
-            if let Some(r) = op.registered_result_value_id(graph) {
-                seen.insert(r);
+            if let Some(r) = op.result.as_ref() {
+                seen.insert(r.clone());
             }
         }
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(v) = arg.as_value(graph) {
-                    seen.insert(v);
+                if let Some(var) = arg.as_variable() {
+                    seen.insert(var.clone());
                 }
             }
             for arg in link.last_exception.iter().chain(link.last_exc_value.iter()) {
-                if let Some(v) = arg.as_value(graph) {
-                    seen.insert(v);
+                if let Some(var) = arg.as_variable() {
+                    seen.insert(var.clone());
                 }
             }
         }
     }
-    for v in seen {
-        if graph.concretetype(v) == ConcreteType::Unknown {
-            graph.set_concretetype_inline(v, ConcreteType::GcRef);
+    for var in &seen {
+        if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
+            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
         }
     }
 

@@ -3798,7 +3798,7 @@ mod tests {
         };
 
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let mut vcls = Variable::new();
+        let vcls = Variable::new();
         vcls.set_concretetype(Some(CLASSTYPE.clone()));
         let v = inst
             .fromtypeptr(Hlvalue::Variable(vcls), &mut llops)
@@ -3832,7 +3832,7 @@ mod tests {
         };
 
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let mut vcls = Variable::new();
+        let vcls = Variable::new();
         vcls.set_concretetype(Some(CLASSTYPE.clone()));
         // No clsfield named "missing_attr" anywhere in the chain →
         // routes through F → rbase (RootClassRepr) which terminates
@@ -3867,7 +3867,7 @@ mod tests {
         };
 
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let mut vcls = Variable::new();
+        let vcls = Variable::new();
         vcls.set_concretetype(Some(CLASSTYPE.clone()));
         let err = inst
             .getpbcfield(Hlvalue::Variable(vcls), 0, "missing_pbc_attr", &mut llops)
@@ -3907,7 +3907,7 @@ mod tests {
         // producing a CLASSTYPE-typed Constant whose value is the
         // vtable `_ptr`. The const-branch probe then reads
         // `subclassrange_min/max` off that vtable.
-        let mut v_cls1 = Variable::new();
+        let v_cls1 = Variable::new();
         v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
         let v_cls1_h = Hlvalue::Variable(v_cls1);
 
@@ -3970,9 +3970,9 @@ mod tests {
         // Use rootclass to keep the example simple — the variable
         // branch doesn't need a subclass classdef.
 
-        let mut v_cls1 = Variable::new();
+        let v_cls1 = Variable::new();
         v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
-        let mut v_cls2 = Variable::new();
+        let v_cls2 = Variable::new();
         v_cls2.set_concretetype(Some(CLASSTYPE.clone()));
         let v_cls1_h = Hlvalue::Variable(v_cls1);
         let v_cls2_h = Hlvalue::Variable(v_cls2);
@@ -4047,9 +4047,9 @@ mod tests {
             .expect("initialize_exceptiondata");
         let root = rtyper.rootclass_repr.borrow().clone().unwrap();
 
-        let mut v_cls1 = Variable::new();
+        let v_cls1 = Variable::new();
         v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
-        let mut v_cls2 = Variable::new();
+        let v_cls2 = Variable::new();
         v_cls2.set_concretetype(Some(CLASSTYPE.clone()));
         let v_cls1_h = Hlvalue::Variable(v_cls1);
         let v_cls2_h = Hlvalue::Variable(v_cls2);

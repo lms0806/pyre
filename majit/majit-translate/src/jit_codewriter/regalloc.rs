@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, ConcreteType, FunctionGraph, ValueId};
+use crate::model::{Block, ConcreteType, FunctionGraph};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -27,8 +27,8 @@ use crate::model::{Block, ConcreteType, FunctionGraph, ValueId};
 /// `tool/algo/regalloc.py:31 coloring: dict[Variable, int]`) and
 /// the pyre CPython-bytecode codewriter
 /// (`pyre/pyre-jit/src/jit/regalloc.rs`, which keys on
-/// [`ValueId`] for its detached-index IR) can share the chordal
-/// coloring engine.  Per-kind callers run the coloring
+/// `pyre-jit-trace::flow::VariableId` for its detached-index IR)
+/// can share the chordal coloring engine.  Per-kind callers run the coloring
 /// independently per kind (see `regalloc.py:8`).
 ///
 /// Node identity must be `Eq + Hash + Clone`; the chordal walk
@@ -245,7 +245,7 @@ impl RegAllocator {
         // passes downstream operate on the upstream-orthodox identity
         // (`tool/algo/regalloc.py:31 coloring: dict[Variable, int]`).
         let mut die_at: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
-        for var in block.input_variables(graph) {
+        for var in block.input_variables() {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
@@ -279,7 +279,7 @@ impl RegAllocator {
 
         // inputargs all interfere with each other
         let livevars: Vec<crate::flowspace::model::Variable> = block
-            .input_variables(graph)
+            .input_variables()
             .filter(|var| consider(var))
             .cloned()
             .collect();
@@ -348,13 +348,13 @@ impl RegAllocator {
                 }
                 let target_block = graph.block(link.target);
                 let target_input_vars: Vec<crate::flowspace::model::Variable> =
-                    target_block.input_variables(graph).cloned().collect();
+                    target_block.input_variables().cloned().collect();
                 for (arg, target_var) in link.args.iter().zip(target_input_vars.iter()) {
                     if let Some(arg_var) = arg.as_variable() {
                         if consider(arg_var) {
                             self.depgraph.add_node(arg_var.clone());
                         }
-                        self.try_coalesce(graph, arg_var, target_var, consider);
+                        self.try_coalesce(arg_var, target_var, consider);
                     }
                 }
             }
@@ -367,7 +367,6 @@ impl RegAllocator {
     /// predicate reads off the same Variable handle.
     fn try_coalesce(
         &mut self,
-        _graph: &FunctionGraph,
         v: &crate::flowspace::model::Variable,
         w: &crate::flowspace::model::Variable,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
@@ -414,10 +413,9 @@ impl RegAllocator {
 /// [`crate::flowspace::model::Variable`] —
 /// matching upstream RPython's `coloring: dict[Variable, int]`
 /// (`tool/algo/regalloc.py:31`).  Consumers hold `&Variable` directly
-/// (post-Slice-7.10: `flatten.rs:GraphFlattener::getcolor(&Variable)`,
-/// `liveness::value_to_register_with_graph` projects through
-/// `graph.variable(vid)` once) and call [`Self::color_for_variable`]
-/// / [`Self::contains_variable`].
+/// (`flatten.rs:GraphFlattener::getcolor(&Variable)`,
+/// `liveness::variable_to_register(&Variable, regallocs)`) and call
+/// [`Self::color_for_variable`] / [`Self::contains_variable`].
 #[derive(Debug, Clone)]
 pub struct RegAllocResult {
     pub coloring: HashMap<crate::flowspace::model::Variable, usize>,
@@ -454,11 +452,10 @@ impl RegAllocResult {
     }
 }
 
-// `perform_register_allocation` previously took a
-// `value_kinds: &HashMap<ValueId, RegKind>` side table; it now reads
-// kinds directly from `graph.concretetype(v)`, matching upstream's
-// `regalloc.py::perform_register_allocation(graph, kind)` shape
-// where every Variable's kind comes from `getkind(v.concretetype)`.
+// `perform_register_allocation` reads kinds directly from
+// `graph.concretetype(v)`, matching upstream
+// `regalloc.py::perform_register_allocation(graph, kind)` where
+// every Variable's kind comes from `getkind(v.concretetype)`.
 // See [`perform_register_allocation`] below.
 
 /// Stamp the canonical `exceptblock.inputargs` kinds onto the graph
@@ -477,13 +474,19 @@ impl RegAllocResult {
 /// `Variable.concretetype` cell via `graph.set_concretetype`
 /// instead of returning a transitional HashMap.
 pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
-    let except_args = graph.block(graph.exceptblock).inputarg_value_ids(graph);
+    let except_args = &graph.block(graph.exceptblock).inputargs;
     if except_args.len() == 2 {
-        if matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown) {
-            graph.set_concretetype(except_args[0], ConcreteType::Signed);
+        if matches!(
+            FunctionGraph::concretetype_of(&except_args[0]),
+            ConcreteType::Unknown
+        ) {
+            FunctionGraph::set_concretetype_of_inline(&except_args[0], ConcreteType::Signed);
         }
-        if matches!(graph.concretetype(except_args[1]), ConcreteType::Unknown) {
-            graph.set_concretetype(except_args[1], ConcreteType::GcRef);
+        if matches!(
+            FunctionGraph::concretetype_of(&except_args[1]),
+            ConcreteType::Unknown
+        ) {
+            FunctionGraph::set_concretetype_of_inline(&except_args[1], ConcreteType::GcRef);
         }
     }
 }
@@ -493,10 +496,9 @@ pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
 /// RPython parity: every `Variable.concretetype` is the source of
 /// kind; pyre reads each per-value kind via `graph.concretetype(v)`,
 /// projecting the [`ConcreteType`] enum onto the JIT codewriter's
-/// [`RegKind`] partitioning axis.  Drops the historical
-/// `&HashMap<ValueId, RegKind>` parameter — the graph IS the table
-/// now.  Canonical exceptblock inputargs are stamped on the graph
-/// up-front via [`augment_canonical_exceptblock_on_graph`].
+/// [`RegKind`] partitioning axis.  Canonical exceptblock inputargs
+/// are stamped on the graph up-front via
+/// [`augment_canonical_exceptblock_on_graph`].
 pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKind, RegAllocResult> {
     // Fail loud if the canonical exceptblock inputargs are still
     // `Unknown` — `variable_regkind` silently drops `Unknown` so a
@@ -504,11 +506,16 @@ pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKin
     // leave `last_exception` / `last_exc_value` un-coloured (no
     // register class), and any later flatten/assembler pass would
     // emit ops that reference uncolored values without any diagnostic.
-    let except_args = graph.block(graph.exceptblock).inputarg_value_ids(graph);
+    let except_args = &graph.block(graph.exceptblock).inputargs;
     if except_args.len() == 2 {
         assert!(
-            !matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown)
-                && !matches!(graph.concretetype(except_args[1]), ConcreteType::Unknown),
+            !matches!(
+                FunctionGraph::concretetype_of(&except_args[0]),
+                ConcreteType::Unknown
+            ) && !matches!(
+                FunctionGraph::concretetype_of(&except_args[1]),
+                ConcreteType::Unknown
+            ),
             "perform_all_register_allocations: canonical exceptblock inputargs are still \
              Unknown — caller must run augment_canonical_exceptblock_on_graph() before \
              register allocation (graph: {})",
@@ -710,12 +717,12 @@ mod tests {
 
     #[test]
     fn coloring_unbounded() {
-        let mut dg = DependencyGraph::new();
-        for i in 0..100 {
-            dg.add_node(ValueId(i));
+        let mut dg = DependencyGraph::<u16>::new();
+        for i in 0..100u16 {
+            dg.add_node(i);
         }
-        for i in 0..99 {
-            dg.add_edge(ValueId(i), ValueId(i + 1));
+        for i in 0..99u16 {
+            dg.add_edge(i, i + 1);
         }
         let coloring = dg.find_node_coloring();
         assert_eq!(coloring.len(), 100);

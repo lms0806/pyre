@@ -11,7 +11,7 @@
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
-use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
+use majit_ir::resoperation::{Op, OpCode, OpRef};
 use majit_ir::{VecAssoc, VecSet};
 
 use crate::{GcRewriter, WriteBarrierDescr};
@@ -496,7 +496,7 @@ impl RewriteState {
     /// the structural equivalent, so any newly emitted result op must
     /// populate the table, not only the input-trace ops copied in by
     /// `run_with_constants` (line 2137-2142).
-    fn emit(&mut self, mut op: Op) -> OpRef {
+    fn emit(&mut self, op: Op) -> OpRef {
         let rt = op.result_type();
         let pos = if rt == Type::Void {
             OpRef::NONE
@@ -525,7 +525,7 @@ impl RewriteState {
     /// the input-trace scan, but re-registering is either a no-op
     /// (matching type) or an explicit overwrite when the caller built
     /// a rewritten op with a different type at the same position.
-    fn emit_result(&mut self, mut op: Op, preferred_pos: OpRef) -> OpRef {
+    fn emit_result(&mut self, op: Op, preferred_pos: OpRef) -> OpRef {
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
             let pos = OpRef::op_typed(self.next_pos, rt);
@@ -1210,7 +1210,7 @@ impl GcRewriterImpl {
         let c_zero = st.const_int(0);
         let c_scale_a = st.const_int(scale);
         let c_scale_b = st.const_int(scale);
-        let mut zero_op = Op::new(
+        let zero_op = Op::new(
             OpCode::ZeroArray,
             &[v_arr, c_zero, v_length_scaled, c_scale_a, c_scale_b],
         );
@@ -1271,7 +1271,7 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let kind_ref = st.const_int(kind);
         let itemsize_ref = st.const_int(ad.item_size() as i64);
-        let mut varsize_op = Op::new(
+        let varsize_op = Op::new(
             OpCode::CallMallocNurseryVarsize,
             &[kind_ref, itemsize_ref, v_length],
         );
@@ -1288,7 +1288,7 @@ impl GcRewriterImpl {
         st: &mut RewriteState,
     ) -> OpRef {
         st.emitting_an_operation_that_can_collect();
-        let mut call_op = Op::new(OpCode::CallR, args);
+        let call_op = Op::new(OpCode::CallR, args);
         call_op.setdescr(calldescr);
         let result = st.emit_result(call_op, result_pos);
         st.emit(Op::new(OpCode::CheckMemoryError, &[result]));
@@ -1526,7 +1526,7 @@ impl GcRewriterImpl {
 
         // rewrite.py:1079-1080 — CALL_N(memcpy_fn, i2, i1, arg, descr=memcpy_descr).
         let memcpy_fn_const = st.const_int(memcpy_fn);
-        let mut call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
+        let call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
         call_op.setdescr(memcpy_descr);
         st.emit(call_op);
     }
@@ -2628,7 +2628,7 @@ impl GcRewriterImpl {
         } else {
             vec![frame]
         };
-        let mut call_asm = Op::new(op.opcode, &new_args);
+        let call_asm = Op::new(op.opcode, &new_args);
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }
@@ -3065,13 +3065,13 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
+        let op = Op::new(opcode, args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let mut op = Op::with_descr(opcode, args, descr);
+        let op = Op::with_descr(opcode, args, descr);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
@@ -3234,7 +3234,7 @@ mod tests {
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
         let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
         constants.insert(10_000, 512_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArray, &[len_ref], array_descr_ref());
+        let new_array = Op::with_descr(OpCode::NewArray, &[len_ref], array_descr_ref());
         new_array.pos.set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
@@ -3730,9 +3730,9 @@ mod tests {
         // `OpCode::New` produces a Ref result (resoperation.py:469
         // `RefOp` mixin), so the test mints typed `RefOp` pos rather
         // than the default `Untyped` minted by `mk_op_with_descr`.
-        let mut new_a = Op::with_descr(OpCode::New, &[], size_descr(24, 1));
+        let new_a = Op::with_descr(OpCode::New, &[], size_descr(24, 1));
         new_a.pos.set(OpRef::ref_op(2));
-        let mut new_b = Op::with_descr(OpCode::New, &[], size_descr(16, 2));
+        let new_b = Op::with_descr(OpCode::New, &[], size_descr(16, 2));
         new_b.pos.set(OpRef::ref_op(3));
         let ops = vec![new_a, new_b, mk_op(OpCode::Finish, &[OpRef::ref_op(3)], 4)];
 
@@ -3822,9 +3822,9 @@ mod tests {
         // rewrite the guard's failargs to reference the SAME_AS_I output.
         let rw = make_rewriter();
 
-        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
         int_lt.pos.set(OpRef::int_op(2));
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
+        let guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
         guard.store_final_boxes(vec![OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(1)]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
@@ -3866,9 +3866,9 @@ mod tests {
     fn test_comparison_guard_false_hoists_with_one_constant() {
         // GUARD_FALSE: rewrite.py:463 `value = int(opnum == GUARD_FALSE)` ⇒ 1.
         let rw = make_rewriter();
-        let mut int_eq = Op::new(OpCode::IntEq, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let int_eq = Op::new(OpCode::IntEq, &[OpRef::int_op(0), OpRef::int_op(1)]);
         int_eq.pos.set(OpRef::int_op(2));
-        let mut guard = Op::new(OpCode::GuardFalse, &[OpRef::int_op(2)]);
+        let guard = Op::new(OpCode::GuardFalse, &[OpRef::int_op(2)]);
         guard.store_final_boxes(vec![OpRef::int_op(2)]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
@@ -3892,7 +3892,7 @@ mod tests {
         // GUARD_VALUE(same_as, 1). Failargs are propagated via
         // copy_and_change.
         let rw = make_rewriter();
-        let mut guard = Op::new(OpCode::GuardAlwaysFails, &[]);
+        let guard = Op::new(OpCode::GuardAlwaysFails, &[]);
         guard.store_final_boxes(vec![OpRef::int_op(10), OpRef::int_op(11)]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
@@ -3930,10 +3930,10 @@ mod tests {
         // Guard that does NOT test the previous op's result: merge does
         // not fire, no SAME_AS_I is emitted.
         let rw = make_rewriter();
-        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
         int_lt.pos.set(OpRef::int_op(2));
         // GuardTrue reads some unrelated OpRef::ref_op(5), not OpRef::ref_op(2).
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(5)]);
+        let guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(5)]);
         guard.store_final_boxes(vec![OpRef::int_op(0), OpRef::int_op(1)]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
@@ -3966,7 +3966,7 @@ mod tests {
         // path (rewrite.py:521) that actually emits ZERO_ARRAY.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(
+        let new_array = Op::with_descr(
             OpCode::NewArrayClear,
             &[OpRef::int_op(3)],
             array_descr_int(),
@@ -4017,7 +4017,7 @@ mod tests {
         // Index OpRefs 10/11 are ConstInt 0/1 per rewrite.py:514-518.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(
+        let new_array = Op::with_descr(
             OpCode::NewArrayClear,
             &[OpRef::int_op(4)],
             array_descr_int(),
@@ -4060,7 +4060,7 @@ mod tests {
         // Guard forces pending zero flush even if no indices were SET.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(
+        let new_array = Op::with_descr(
             OpCode::NewArrayClear,
             &[OpRef::int_op(3)],
             array_descr_int(),
@@ -4104,7 +4104,7 @@ mod tests {
         // Index OpRefs 10/12/14 hold ConstInt 0/2/4 per rewrite.py:514-518.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(
+        let new_array = Op::with_descr(
             OpCode::NewArrayClear,
             &[OpRef::int_op(5)],
             array_descr_int(),
@@ -4148,8 +4148,7 @@ mod tests {
     fn test_pending_zero_no_clear() {
         // Plain NEW_ARRAY (not CLEAR) should NOT produce any ZERO_ARRAY.
         let rw = make_rewriter();
-        let mut new_array =
-            Op::with_descr(OpCode::NewArray, &[OpRef::int_op(3)], array_descr_int());
+        let new_array = Op::with_descr(OpCode::NewArray, &[OpRef::int_op(3)], array_descr_int());
         new_array.pos.set(OpRef::ref_op(0));
 
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
@@ -4233,8 +4232,7 @@ mod tests {
             let len_ref = OpRef::int_op(10_000);
             let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
             constants.insert(10_000, num_elem);
-            let mut new_array =
-                Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
+            let new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
             new_array.pos.set(OpRef::ref_op(0));
             let ops = vec![
                 new_array,

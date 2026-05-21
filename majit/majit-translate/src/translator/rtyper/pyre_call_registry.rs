@@ -69,7 +69,6 @@ use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::pygraph::PyGraph;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// Stable hashable key for a function path.
 ///
@@ -530,7 +529,7 @@ impl PyreCallRegistry {
     // contents.  RPython parity: `Variable.concretetype` and
     // `Constant.concretetype` carry the per-variable / per-constant
     // LL type after specialise (`history.py:204` `same_constant`,
-    // `model.py:438`); a parallel `FunctionPathKey -> ValueId` side
+    // `model.py:438`); a parallel `FunctionPathKey -> Variable` side
     // map was a pyre-only divergence with no upstream peer.  Real
     // readers must consult `Variable.concretetype` directly through
     // the `PyGraph.graph` already cached on the `PyreFunctionEntry.
@@ -540,7 +539,6 @@ impl PyreCallRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::Variable;
 
     fn signature(arg_names: &[&str]) -> Signature {
         Signature::new(

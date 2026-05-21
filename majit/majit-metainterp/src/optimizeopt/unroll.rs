@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,

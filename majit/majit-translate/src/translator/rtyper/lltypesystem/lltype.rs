@@ -3776,7 +3776,7 @@ mod tests {
     #[test]
     fn functionptr_keeps_graph_on_funcobj() {
         let start = Rc::new(RefCell::new(Block::new(vec![])));
-        let mut ret = Variable::new();
+        let ret = Variable::new();
         ret.set_concretetype(Some(LowLevelType::Void));
         let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "f",
@@ -3803,11 +3803,11 @@ mod tests {
             Ok(LowLevelType::Void)
         }
 
-        let mut a0 = Variable::new();
+        let a0 = Variable::new();
         a0.set_concretetype(Some(LowLevelType::Signed));
-        let mut a1 = Variable::new();
+        let a1 = Variable::new();
         a1.set_concretetype(Some(LowLevelType::Bool));
-        let mut ret = Variable::new();
+        let ret = Variable::new();
         ret.set_concretetype(Some(LowLevelType::Void));
         let start = Rc::new(RefCell::new(Block::new(vec![
             Hlvalue::Variable(a0),
@@ -3837,7 +3837,7 @@ mod tests {
     #[test]
     fn getfunctionptr_copies_llfnobjattrs_from_graph_func() {
         let start = Rc::new(RefCell::new(Block::new(vec![])));
-        let mut ret = Variable::new();
+        let ret = Variable::new();
         ret.set_concretetype(Some(LowLevelType::Void));
         let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "graph_name",
@@ -4214,7 +4214,7 @@ mod tests {
 
     #[test]
     fn forward_reference_become_rejects_non_container() {
-        let mut forward_ref = ForwardReference::new();
+        let forward_ref = ForwardReference::new();
         let err = forward_ref
             .r#become(LowLevelType::Signed)
             .expect_err("ForwardReference must reject non-container targets");
@@ -4223,7 +4223,7 @@ mod tests {
 
     #[test]
     fn forward_reference_become_rejects_conflicting_gckind() {
-        let mut forward_ref = ForwardReference::gc();
+        let forward_ref = ForwardReference::gc();
         let err = forward_ref
             .r#become(LowLevelType::Struct(Box::new(StructType::new(
                 "S",
@@ -4235,7 +4235,7 @@ mod tests {
 
     #[test]
     fn forward_reference_become_allows_resolved_struct_example() {
-        let mut forward_ref = ForwardReference::new();
+        let forward_ref = ForwardReference::new();
         forward_ref
             .r#become(LowLevelType::Struct(Box::new(StructType::new(
                 "S",
@@ -4253,7 +4253,7 @@ mod tests {
     fn forward_reference_clones_observe_become() {
         // lltype.py:624-625 mutates the ForwardReference object in place;
         // all aliases must observe the resolved container.
-        let mut forward_ref = ForwardReference::new();
+        let forward_ref = ForwardReference::new();
         let alias = forward_ref.clone();
         forward_ref
             .r#become(LowLevelType::Struct(Box::new(StructType::new(
@@ -4278,7 +4278,7 @@ mod tests {
             "S",
             vec![("x".into(), LowLevelType::Signed)],
         )));
-        let mut forward_ref = ForwardReference::new();
+        let forward_ref = ForwardReference::new();
         forward_ref.r#become(real.clone()).unwrap();
         let resolved = LowLevelType::ForwardReference(Box::new(forward_ref));
 
@@ -4377,7 +4377,7 @@ mod tests {
     #[test]
     fn ptr_to_resolved_forward_reference_compares_as_ptr_to_real_container() {
         let real_struct = StructType::new("S", vec![("x".into(), LowLevelType::Signed)]);
-        let mut forward_ref = ForwardReference::new();
+        let forward_ref = ForwardReference::new();
         forward_ref
             .r#become(LowLevelType::Struct(Box::new(real_struct.clone())))
             .unwrap();
@@ -4614,7 +4614,7 @@ mod tests {
 
     #[test]
     fn interior_ptr_obj_uses_actual_index_offset() {
-        let mut parent = StructType::new(
+        let parent = StructType::new(
             "S",
             vec![(
                 "arr".into(),

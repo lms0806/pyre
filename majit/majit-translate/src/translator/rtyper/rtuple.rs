@@ -2087,7 +2087,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let repr = TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap();
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(repr.lowleveltype().clone()));
         let v = repr
             .getitem_internal(&mut llops, Hlvalue::Variable(v_tuple), 1)
@@ -2109,9 +2109,9 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let repr = TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap();
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let mut v_a = Variable::new();
+        let v_a = Variable::new();
         v_a.set_concretetype(Some(LowLevelType::Signed));
-        let mut v_b = Variable::new();
+        let v_b = Variable::new();
         v_b.set_concretetype(Some(LowLevelType::Signed));
         let _ = TupleRepr::newtuple(
             &mut llops,
@@ -2162,7 +2162,7 @@ mod tests {
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
         // Build a HighLevelOp with two args: tuple variable + Int(1) constant.
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
@@ -2219,7 +2219,7 @@ mod tests {
         let r_tup_arc: Arc<dyn Repr> = Arc::new(
             TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone(), r_int.clone()]).unwrap(),
         );
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         // Negative constant index — `-1` should map to last (item2).
@@ -2296,7 +2296,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         let result_var = Variable::new();
@@ -2386,9 +2386,9 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_a = Variable::new();
+        let v_a = Variable::new();
         v_a.set_concretetype(Some(LowLevelType::Signed));
-        let mut v_b = Variable::new();
+        let v_b = Variable::new();
         v_b.set_concretetype(Some(LowLevelType::Signed));
         let v_a_h = Hlvalue::Variable(v_a);
         let v_b_h = Hlvalue::Variable(v_b);
@@ -2451,9 +2451,9 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_a = Variable::new();
+        let v_a = Variable::new();
         v_a.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
-        let mut v_b = Variable::new();
+        let v_b = Variable::new();
         v_b.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_a_h = Hlvalue::Variable(v_a);
         let v_b_h = Hlvalue::Variable(v_b);
@@ -2508,7 +2508,7 @@ mod tests {
         );
         let r_tup2: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup3.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         // start = 1, stop = 3 — slice [1:3] on a 3-tuple yields 2 items.
@@ -2606,10 +2606,10 @@ mod tests {
         let r_tup_result: Arc<dyn Repr> = Arc::new(
             TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone(), r_int.clone()]).unwrap(),
         );
-        let mut v_left = Variable::new();
+        let v_left = Variable::new();
         v_left.set_concretetype(Some(r_tup2.lowleveltype().clone()));
         let v_left_h = Hlvalue::Variable(v_left);
-        let mut v_right = Variable::new();
+        let v_right = Variable::new();
         v_right.set_concretetype(Some(r_tup1.lowleveltype().clone()));
         let v_right_h = Hlvalue::Variable(v_right);
         let result_var = Variable::new();
@@ -2676,7 +2676,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
@@ -2746,7 +2746,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
@@ -2911,10 +2911,10 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_left = Variable::new();
+        let v_left = Variable::new();
         v_left.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_left_h = Hlvalue::Variable(v_left);
-        let mut v_right = Variable::new();
+        let v_right = Variable::new();
         v_right.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_right_h = Hlvalue::Variable(v_right);
         let result_var = Variable::new();
@@ -2976,10 +2976,10 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_left = Variable::new();
+        let v_left = Variable::new();
         v_left.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_left_h = Hlvalue::Variable(v_left);
-        let mut v_right = Variable::new();
+        let v_right = Variable::new();
         v_right.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_right_h = Hlvalue::Variable(v_right);
         let result_var = Variable::new();
@@ -3376,7 +3376,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let r_tup_arc: Arc<dyn Repr> =
             Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
         let result_var = Variable::new();
@@ -3445,10 +3445,10 @@ mod tests {
             r_tup_arc.lowleveltype().clone(),
         ));
         let s_tup = SomeValue::Tuple(s_tup_object);
-        let mut v_tuple = Variable::new();
+        let v_tuple = Variable::new();
         v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
         let v_tuple_h = Hlvalue::Variable(v_tuple);
-        let mut v_item = Variable::new();
+        let v_item = Variable::new();
         v_item.set_concretetype(Some(LowLevelType::Signed));
         let v_item_h = Hlvalue::Variable(v_item);
         let result_var = Variable::new();
@@ -3525,7 +3525,7 @@ mod tests {
         let r_b = TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap();
         // Sanity: same items_r, same TUPLE_TYPE → equal lowleveltype.
         assert_eq!(r_a.lowleveltype(), r_b.lowleveltype());
-        let mut v_in = Variable::new();
+        let v_in = Variable::new();
         v_in.set_concretetype(Some(r_a.lowleveltype().clone()));
         let v_in_h = Hlvalue::Variable(v_in);
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
@@ -3562,7 +3562,7 @@ mod tests {
         let r_2 = TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap();
         let r_3 =
             TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone(), r_int.clone()]).unwrap();
-        let mut v = Variable::new();
+        let v = Variable::new();
         v.set_concretetype(Some(r_2.lowleveltype().clone()));
         let v_h = Hlvalue::Variable(v);
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);

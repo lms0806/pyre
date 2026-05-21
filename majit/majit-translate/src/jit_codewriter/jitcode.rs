@@ -12,7 +12,6 @@
 //! port `BlackholeInterpreter.setup_insns` so the metainterp can consume
 //! this type directly, eliminating the fork.
 
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::OnceLock;
 

@@ -223,24 +223,26 @@ impl CodeWriter {
     /// single source of truth for every slot.  No type side-table
     /// parameter survives across stages: the post-rtyper merge
     /// below (`merge_synth_kinds_into_graph`) stamps each synth
-    /// ValueId via `graph.set_concretetype` (which writes through
-    /// to the backing Variable), then `apply_from_flowspace_variables`
+    /// Variable's `.concretetype` cell via
+    /// `set_concretetype_of_inline`, then `apply_from_flowspace_variables`
     /// rebinds per-Variable from the `value_to_var` map so the
     /// rtyper's authoritative `Variable.concretetype` overrides
     /// any synthetic stamp.  Slots without a rtyper-bound Variable
     /// keep the synthetic canonical type the merge wrote.
     ///
     /// **Remaining structural divergence** — pyre's codewriter still
-    /// consumes [`crate::model::FunctionGraph`] (a `ValueId`-based
+    /// consumes [`crate::model::FunctionGraph`] (a `ValueId`-indexed
     /// IR) instead of [`crate::flowspace::model::FunctionGraph`]
-    /// (the upstream `Variable`-based shape).  The Variable identity
-    /// is now reachable through `graph.value_variables` for every
-    /// slot, but operand identity in `FlatOp` / `SpaceOperation`
-    /// payloads is still `ValueId`.  Migrating to the
-    /// `Variable`-based IR throughout (long-term plan tier 3) would
-    /// let pyre drop the `value_to_var` bridge and consume the
-    /// rtyper's Variable graph directly — multi-week scope tracked
-    /// separately.
+    /// (the upstream `Variable`-based shape).  Operand identity in
+    /// `SpaceOperation` payloads is already `Variable` (Slice 2.9
+    /// onward); `FlatOp` operands are `Register` (regalloc color +
+    /// kind).  What still ties the codewriter to the legacy IR is
+    /// the dense `ValueId` index that `FunctionGraph` uses to key
+    /// `value_variables`, `value_id_of`, and the side tables in
+    /// `value_map`/`alias_map` paths.  Migrating to the
+    /// `Variable`-based IR throughout would let pyre drop the
+    /// `value_to_var` bridge and consume the rtyper's Variable graph
+    /// directly — multi-week scope tracked separately.
     /// Slice 12.2 / 12.4 — shared dual-gate type-resolve entry.
     ///
     /// Runs [`dual_gate_check_with_registry`] against the
@@ -300,9 +302,12 @@ impl CodeWriter {
                 // value table.  Mirrors RPython `rtyper.py:258 v.concretetype = ...`
                 // attribute aliasing; reads via `graph.concretetype(v)`
                 // then match upstream `getkind(v.concretetype)`.
-                for (&vid, var) in real_value_to_var.iter() {
+                for var in real_value_to_var.values() {
                     if let Some(lltype) = var.concretetype().as_ref() {
-                        graph.set_concretetype_inline(vid, crate::model::getkind(lltype));
+                        crate::model::FunctionGraph::set_concretetype_of_inline(
+                            var,
+                            crate::model::getkind(lltype),
+                        );
                     }
                 }
                 Some(real_value_to_var)
@@ -366,7 +371,7 @@ impl CodeWriter {
         // RPython rpbc.py:199-217 emits `indirect_call(funcptr, *args,
         // c_graphs)` during rtype; pyre runs the same pass here so
         // jtransform sees `OpKind::IndirectCall` (with funcptr already
-        // a regular ValueId), never `CallTarget::Indirect`.
+        // a regular Variable), never `CallTarget::Indirect`.
         let mut graph_owned = graph.clone();
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
         #[cfg(debug_assertions)]
@@ -413,7 +418,7 @@ impl CodeWriter {
         //
         // The merge precedence is `stamped > post_result > original`:
         //   - `original` = pre-jtransform `type_state` from the real
-        //     RPythonTyper (already typed every pre-rewrite ValueId).
+        //     RPythonTyper (already typed every pre-rewrite Variable).
         //   - `post_result` = `authoritative_result_types(rewritten)`
         //     reads the rewritten ops' declared `result_ty`/`result_
         //     kind` fields (per-op ground-truth).
@@ -423,12 +428,12 @@ impl CodeWriter {
         // The legacy `resolve_types(rewritten_graph, annotations)`
         // walker that previously fed `merge_synth_kinds`'s `post_
         // resolve` lane is no longer called: every post-rewrite
-        // ValueId either reuses a pre-rewrite identity (covered by
+        // Variable either reuses a pre-rewrite identity (covered by
         // `original`), is an op.result with declared kind (covered by
         // `post_result`), or is a synth jtransform value (covered by
         // `stamped`).  Block inputargs introduced by jtransform pick
         // up types via `original` (jtransform reuses the pre-rewrite
-        // inputarg ValueIds when splicing new control flow).
+        // inputarg Variables when splicing new control flow).
         // Merge the four post-rtyper kind sources directly into
         // each backing `Variable.concretetype` (via
         // `graph.set_concretetype`) — pyre's analogue of RPython's
@@ -487,9 +492,9 @@ impl CodeWriter {
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
-        // Each `ValueId`'s backing `Variable.concretetype` is the
-        // kind source after the merge/hydration steps above; flatten
-        // reads it via `graph.concretetype(v)`.  `flatten_graph`
+        // Each Variable's `.concretetype` cell is the kind source
+        // after the merge/hydration steps above; flatten reads it via
+        // `FunctionGraph::concretetype_of(&var)`.  `flatten_graph`
         // itself runs `enforce_input_args` (flatten.py:88-100) so the
         // startblock inputarg colors land in the dense `0..N` prefix
         // of each kind, and the rotation persists into the assembler
@@ -531,9 +536,9 @@ impl CodeWriter {
             // verbatim.  Reading from the Variable matches the
             // upstream's "type-source" provenance instead of going
             // through regalloc as a side-channel.
-            for arg_id in start_block.inputarg_value_ids(&rewritten.graph) {
+            for arg in &start_block.inputargs {
                 use crate::model::ConcreteType;
-                let class = match rewritten.graph.concretetype(arg_id) {
+                let class = match crate::model::FunctionGraph::concretetype_of(arg) {
                     ConcreteType::Signed => 'i',
                     ConcreteType::GcRef => 'r',
                     ConcreteType::Float => 'f',
@@ -742,12 +747,11 @@ impl Default for CodeWriter {
 /// on the graph's `value_variables`.  The Variable IS the type source.
 fn graph_result_kind(graph: &FunctionGraph) -> char {
     let returnblock = graph.block(graph.returnblock);
-    let returnblock_vids = returnblock.inputarg_value_ids(graph);
-    let Some(&vid) = returnblock_vids.first() else {
+    let Some(arg) = returnblock.inputargs.first() else {
         return 'v';
     };
     use crate::model::ConcreteType;
-    match graph.concretetype(vid) {
+    match FunctionGraph::concretetype_of(arg) {
         ConcreteType::Signed => 'i',
         ConcreteType::GcRef => 'r',
         ConcreteType::Float => 'f',

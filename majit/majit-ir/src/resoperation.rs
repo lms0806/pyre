@@ -1242,7 +1242,6 @@ impl Op {
         // (compile.py:855 `_attrs_`); the descr Arc was already copied
         // above, so newop reads the same payload through descr.fail_descr().
         if opcode.is_guard() || self.opcode.is_guard() {
-            let mut newop = newop;
             *newop.fail_args.borrow_mut() = self.fail_args.borrow().clone();
             *newop.fail_arg_types.borrow_mut() = self.fail_arg_types.borrow().clone();
             newop.rd_resume_position.set(self.rd_resume_position.get());

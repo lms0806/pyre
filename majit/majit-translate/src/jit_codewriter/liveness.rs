@@ -12,7 +12,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
-use crate::model::ValueId;
 use crate::regalloc::RegAllocResult;
 
 /// Compute liveness for a flattened function.
@@ -23,12 +22,13 @@ use crate::regalloc::RegAllocResult;
 /// gets its `live_values` set populated with all [`Register`]s alive
 /// at that point in the instruction sequence.
 ///
-/// `regallocs` supplies the [`ValueId`]→`(kind, color)` mapping used
-/// to convert FlatOp::Op operand [`ValueId`]s to [`Register`]s for
+/// `regallocs` supplies the per-`Variable` `(kind, color)` mapping used
+/// to convert FlatOp::Op operand `Variable`s to [`Register`]s for
 /// the alive set — RPython works directly on Registers because
 /// `serialize_op` already projects `Variable`→`Register` via
-/// `getcolor`; pyre keeps `SpaceOperation` slots as `ValueId` for now,
-/// so the conversion happens here at the liveness boundary.
+/// `getcolor`; pyre still walks the conversion here at the liveness
+/// boundary because `FlatOp::Op` carries the pre-flatten
+/// `SpaceOperation` whose operand reads are kind-driven.
 /// RPython liveness.py:19-23.
 ///
 /// `graph` is required: every `FlatOp::Op` operand's kind reads
@@ -56,7 +56,7 @@ pub fn compute_liveness(
     remove_repeated_live(&mut flattened.insns);
 }
 
-/// Resolve a [`ValueId`] from a `FlatOp::Op` operand to its
+/// Resolve a `Variable` from a `FlatOp::Op` operand to its
 /// [`Register`].
 ///
 /// **Structural divergence (TODO)**: PyPy `liveness.py:67` walks
@@ -64,7 +64,7 @@ pub fn compute_liveness(
 /// [`Register`] / `ListOfKind` because `flatten_list()`
 /// (`flatten.py:355-371`) projected `Variable` → `Register` at
 /// flatten time.  Pyre's `FlatOp::Op` still carries
-/// [`crate::model::SpaceOperation`] with [`ValueId`] slots, so the
+/// [`crate::model::SpaceOperation`] with `Variable` slots, so the
 /// liveness pass has to redo the `getcolor` lookup here.  The fix
 /// is to migrate `SpaceOperation` slots to `Register` so liveness
 /// can read the kind off the operand directly; until that lands
@@ -72,76 +72,59 @@ pub fn compute_liveness(
 ///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
-/// `getkind(v.concretetype)` + `regallocs[kind]`.  When `graph` is
-/// supplied (production path) the lookup reads kind via
-/// `graph.concretetype(v)` and color via
-/// `RegAllocResult::color_for_variable(&var)`, projecting the
-/// `ValueId` to a `&Variable` once via `graph.variable(vid)`; a
-/// miss panics — PyPy
-/// would never fall back to other classes.  Without `graph` (test
-/// fixtures with no kind source), the helper returns `None`
-/// because the new Variable-keyed `coloring` map cannot be queried
-/// by `ValueId` directly without the projection through
-/// `graph.variable(v)`.
-fn value_to_register_with_graph(
-    v: ValueId,
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  Reads kind via
+/// `FunctionGraph::concretetype_of(var)` and color via
+/// `RegAllocResult::color_for_variable(var)`; a miss panics — PyPy
+/// would never fall back to other classes.
+fn variable_to_register(
+    var: &crate::flowspace::model::Variable,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    graph: Option<&crate::model::FunctionGraph>,
 ) -> Option<Register> {
-    let Some(graph) = graph else {
-        // Test fixtures pass empty regallocs without a graph; with no
-        // kind source and no Variable projection there is no register
-        // to surface.  Production callers always supply `graph`.
-        return None;
-    };
     use crate::model::ConcreteType;
-    let declared = graph.concretetype(v);
+    use crate::model::FunctionGraph;
+    let declared = FunctionGraph::concretetype_of(var);
     let kind = match declared {
         ConcreteType::Signed => Some(RegKind::Int),
         ConcreteType::GcRef => Some(RegKind::Ref),
         ConcreteType::Float => Some(RegKind::Float),
         ConcreteType::Void | ConcreteType::Unknown => None,
     };
-    let var = graph.variable(v);
     if let Some(kind) = kind {
         let ra = regallocs.get(&kind).unwrap_or_else(|| {
             panic!(
-                "value_to_register: graph declared kind {kind:?} for {v:?} \
+                "variable_to_register: graph declared kind {kind:?} for {var:?} \
                  but regallocs map is missing the entry",
             )
         });
-        let color = var
-            .and_then(|var| ra.color_for_variable(var))
-            .unwrap_or_else(|| {
-                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                    .iter()
-                    .filter(|k| **k != kind)
-                    .filter(|k| {
-                        regallocs
-                            .get(*k)
-                            .is_some_and(|ra| var.is_some_and(|var| ra.contains_variable(var)))
-                    })
-                    .copied()
-                    .collect();
-                panic!(
-                    "value_to_register: graph declared kind {kind:?} for {v:?} \
-                     but regallocs[{kind:?}] has no coloring (other classes with a \
-                     coloring: {other_classes:?})",
-                )
-            });
+        let color = ra.color_for_variable(var).unwrap_or_else(|| {
+            let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                .iter()
+                .filter(|k| **k != kind)
+                .filter(|k| {
+                    regallocs
+                        .get(*k)
+                        .is_some_and(|ra| ra.contains_variable(var))
+                })
+                .copied()
+                .collect();
+            panic!(
+                "variable_to_register: graph declared kind {kind:?} for {var:?} \
+                 but regallocs[{kind:?}] has no coloring (other classes with a \
+                 coloring: {other_classes:?})",
+            )
+        });
         return Some(Register::new(kind, color));
     }
-    // Void / Unknown — fall through to KINDS scan via Variable
-    // projection.
+    // Void / Unknown — fall through to KINDS scan.
     let mut found: Option<Register> = None;
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         if let Some(ra) = regallocs.get(&kind) {
-            if let Some(color) = var.and_then(|var| ra.color_for_variable(var)) {
+            if let Some(color) = ra.color_for_variable(var) {
                 if let Some(prev) = found {
                     panic!(
-                        "value_to_register: ValueId {v:?} colored in multiple regalloc \
-                         classes ({:?} and {kind:?}) — RPython `getkind` must give \
-                         exactly one",
+                        "variable_to_register: Variable {var:?} colored in multiple \
+                         regalloc classes ({:?} and {kind:?}) — RPython `getkind` must \
+                         give exactly one",
                         prev.kind,
                     );
                 }
@@ -198,11 +181,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 ///
 /// Walks backward through the instruction sequence. At each `-live-`
 /// marker, expands it to include all values alive at that point.
-/// Reads each `FlatOp::Op` operand's kind via `graph.concretetype(v)`
-/// and color via `RegAllocResult::color_for_variable(&var)` — the
-/// `ValueId → &Variable` projection happens once per lookup via
-/// `graph.variable(vid)`, matching upstream `flatten.py:382 getcolor`
-/// line-for-line.
+/// Reads each `FlatOp::Op` operand's kind via
+/// `FunctionGraph::concretetype_of(&var)` and color via
+/// `RegAllocResult::color_for_variable(&var)`, matching upstream
+/// `flatten.py:382 getcolor` line-for-line.
 fn compute_liveness_pass_with_graph(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
@@ -213,18 +195,17 @@ fn compute_liveness_pass_with_graph(
     let mut must_continue = false;
 
     // `def_value` and `use_value` route a `FlatOp::Op`-side
-    // [`ValueId`] through `graph.variable(v)` + regalloc to its
-    // [`Register`] before joining the alive set.  Void /
-    // unallocated values are silently dropped (RPython's
-    // `flatten.py:325 if v.concretetype is not lltype.Void` makes
-    // the same filter at flatten time).
-    let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
+    // [`Variable`] through regalloc to its [`Register`] before
+    // joining the alive set.  Void / unallocated values are silently
+    // dropped (RPython's `flatten.py:325 if v.concretetype is not
+    // lltype.Void` makes the same filter at flatten time).
+    let def_value = |alive: &mut HashSet<Register>, var: &crate::flowspace::model::Variable| {
+        if let Some(r) = variable_to_register(var, regallocs) {
             alive.remove(&r);
         }
     };
-    let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
+    let use_value = |alive: &mut HashSet<Register>, var: &crate::flowspace::model::Variable| {
+        if let Some(r) = variable_to_register(var, regallocs) {
             alive.insert(r);
         }
     };
@@ -265,13 +246,16 @@ fn compute_liveness_pass_with_graph(
                 alive.clear();
             }
             FlatOp::Op(inner_op) => {
-                if let Some(g) = graph {
-                    if let Some(result) = inner_op.result.as_ref().and_then(|v| g.value_id_of(v)) {
-                        def_value(&mut alive, result);
-                    }
+                if let Some(result) = inner_op.result.as_ref() {
+                    def_value(&mut alive, result);
                 }
-                for vid in crate::inline::op_value_refs(&inner_op.kind, graph) {
-                    use_value(&mut alive, vid);
+                if let Some(g) = graph {
+                    for var in crate::inline::op_variable_refs(&inner_op.kind, g)
+                        .into_iter()
+                        .flatten()
+                    {
+                        use_value(&mut alive, &var);
+                    }
                 }
             }
             FlatOp::Jump(label) => {
@@ -343,7 +327,7 @@ fn compute_liveness_pass_with_graph(
             FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
                 // Register operand carries (kind, color); the alive
                 // set is Register-keyed so the def removes the
-                // matching slot directly without any ValueId bridge.
+                // matching slot directly without any Variable bridge.
                 alive.remove(dst);
             }
             FlatOp::Reraise => {}
@@ -510,46 +494,45 @@ mod tests {
         // Return v2
         let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
         let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
-        graph.set_next_value(3);
-        let lhs_var = graph.must_variable(ValueId(0));
-        let rhs_var = graph.must_variable(ValueId(1));
+        let v0 = crate::flowspace::model::Variable::new();
+        let v1 = crate::flowspace::model::Variable::new();
+        let v2 = crate::flowspace::model::Variable::new();
+        graph.alloc_value_with_variable(v0.clone());
+        graph.alloc_value_with_variable(v1.clone());
+        graph.alloc_value_with_variable(v2.clone());
         let mut flat = SSARepr {
             name: "test".into(),
             insns: vec![
                 FlatOp::Label(Label(0)),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(graph.must_variable(ValueId(0))),
+                    result: Some(v0.clone()),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(graph.must_variable(ValueId(1))),
+                    result: Some(v1.clone()),
                     kind: OpKind::ConstInt(42),
                 }),
                 FlatOp::Op(SpaceOperation {
-                    result: Some(graph.must_variable(ValueId(2))),
+                    result: Some(v2),
                     kind: OpKind::BinOp {
                         op: "add".into(),
-                        lhs: lhs_var,
-                        rhs: rhs_var,
+                        lhs: v0,
+                        rhs: v1,
                         result_ty: ValueType::Int,
                     },
                 }),
             ],
-            num_values: 3,
             num_blocks: 1,
             insns_pos: None,
         };
 
         // Should not panic.  Phase 3 added the `regallocs` parameter
-        // for the FlatOp::Op `ValueId → Register` bridge; pass an
+        // for the FlatOp::Op `Variable → Register` bridge; pass an
         // empty map since this fixture has no inputargs that exercise
-        // the conversion.  The graph is required so liveness can
-        // project each operand `ValueId` through its backing
-        // `Variable.concretetype` — supply a fresh FunctionGraph that
-        // covers ValueId(0..=2).
+        // the conversion.
         compute_liveness(&mut flat, &regallocs, &graph);
     }
 

@@ -1204,10 +1204,10 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let block = Block::shared(vec![]);
 
-        let mut s = Variable::new(); // string source
+        let s = Variable::new(); // string source
         let x = Variable::new();
         let y = Variable::new();
-        let mut lst = Variable::new(); // list target
+        let lst = Variable::new(); // list target
         let sliced = Variable::new(); // getslice result
         let result = Variable::new();
 
@@ -1274,9 +1274,9 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let block = Block::shared(vec![]);
 
-        let mut lst = Variable::new();
-        let mut ch = Variable::new();
-        let mut count = Variable::new();
+        let lst = Variable::new();
+        let ch = Variable::new();
+        let count = Variable::new();
         let mul_result = Variable::new();
         let result = Variable::new();
 
@@ -1339,7 +1339,7 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(
@@ -1386,9 +1386,9 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let block = Block::shared(vec![]);
 
-        let mut source = Variable::new();
+        let source = Variable::new();
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         source
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(
@@ -1489,7 +1489,7 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(
@@ -1535,7 +1535,7 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(
@@ -1581,7 +1581,7 @@ mod tests {
         };
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle.annotation.replace(Some(std::rc::Rc::new(needle_s)));
         let result = Variable::new();
 
@@ -1625,7 +1625,7 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(
@@ -1673,7 +1673,7 @@ mod tests {
         };
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle.annotation.replace(Some(std::rc::Rc::new(needle_s)));
         let result = Variable::new();
 
@@ -1744,7 +1744,7 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let list_v = Variable::new();
-        let mut needle = Variable::new();
+        let needle = Variable::new();
         needle
             .annotation
             .replace(Some(std::rc::Rc::new(SomeValue::Integer(

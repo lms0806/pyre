@@ -39,7 +39,7 @@
 //! This is strictly a parity-verification harness. No production code
 //! is touched.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use majit_translate::{
     ParsedInterpreter, TraitImplInfo, build_semantic_program_from_parsed_files,

@@ -1253,7 +1253,6 @@ impl CallControl {
         // parity-correct response is to skip cache publish and mint
         // fresh per call so shape-coincident-but-logically-distinct
         // ARRAYs do not alias.
-        use majit_ir::descr::Descr;
         let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> = match array_type_id.as_deref()
         {
             Some(atid) => {
@@ -1618,7 +1617,7 @@ impl CallControl {
         array_type_id: &Option<String>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
-        use majit_ir::descr::{ArrayFlag, SimpleArrayDescr, SimpleInteriorFieldDescr};
+        use majit_ir::descr::ArrayFlag;
         let array_str = array_type_id.as_deref()?;
         // ARRAY.OF.fieldname — extract the element type from the
         // container type, then look up field info in `self.struct_fields`.
@@ -1764,7 +1763,6 @@ impl CallControl {
         // Both arms of `make_simple_descr_group`'s array-of-struct
         // population (Task D) and this analyzer mint must hit the same
         // cache slot for `cpu.interiorfielddescrof` per-tuple identity.
-        use majit_ir::descr::Descr;
         // `field_descr` is already `Arc<dyn FieldDescr>` (post B-4):
         // either PyreFieldDescr from the runtime publish walk OR
         // SimpleFieldDescr from the analyzer-only mint.  Matches
@@ -2710,7 +2708,7 @@ fn return_type_string_to_kind(s: &str) -> char {
 /// (RPython `flowspace/model.py` Block), populated by the front-end at
 /// `front/ast.rs:706-769` parameter registration.  The `OpKind::Input`
 /// ops co-emitted with each parameter carry the declared type which we
-/// recover by chasing each inputarg ValueId back to its defining op.
+/// recover by chasing each inputarg Variable back to its defining op.
 /// Unknown/ambiguous slots default to `Ref`, matching
 /// `resolve_non_void_arg_types`' fallback.
 ///
@@ -2736,13 +2734,10 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         _ => Some(Type::Ref),
     };
     if !start.inputargs.is_empty() {
-        // Walk the raw `inputargs` list, not the
-        // `inputarg_value_ids(graph)` projection — the latter drops
-        // entries whose reverse `Variable → ValueId` bridge is
-        // missing, which would shorten the descriptor vec and
-        // surface as a bogus arity mismatch in `getcalldescr()`.
-        // Treat unresolved slots conservatively as `Type::Ref`
-        // (the same default the wildcard arm uses below).
+        // Walk `inputargs` (`Vec<Variable>`) directly — orthodox per
+        // `flowspace/model.py:Block.inputargs`.  Treat unresolved
+        // slots conservatively as `Type::Ref` (the same default the
+        // wildcard arm uses below).
         return start
             .inputargs
             .iter()
@@ -4730,19 +4725,18 @@ fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
 /// 3. Phi/link source chain (limited depth)
 /// 4. None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
-    graph: &crate::model::FunctionGraph,
-    base: &crate::model::ValueId,
+    base: &crate::flowspace::model::Variable,
     op_array_type_id: &Option<String>,
-    value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
-    phi_sources: &HashMap<crate::model::ValueId, Option<LinkArg>>,
+    value_producers: &HashMap<crate::flowspace::model::Variable, &crate::model::OpKind>,
+    phi_sources: &HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
     cc: &CallControl,
 ) -> Option<String> {
     fn producer_array_identity(
-        value: crate::model::ValueId,
-        value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+        value: &crate::flowspace::model::Variable,
+        value_producers: &HashMap<crate::flowspace::model::Variable, &crate::model::OpKind>,
         cc: &CallControl,
     ) -> Option<String> {
-        let producer = value_producers.get(&value)?;
+        let producer = value_producers.get(value)?;
         match producer {
             // FieldRead: self.array → full ARRAY type from struct registry.
             // RPython: op.args[0].concretetype is the ARRAY lltype directly.
@@ -4782,25 +4776,22 @@ fn resolve_array_identity(
         return op_array_type_id.clone();
     }
     // 2. Trace back to producer — RPython: op.args[0].concretetype.
-    if let Some(identity) = producer_array_identity(*base, value_producers, cc) {
+    if let Some(identity) = producer_array_identity(base, value_producers, cc) {
         return Some(identity);
     }
     // 3. Phi/link: RPython concretetype propagates through block boundaries.
     // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
-    let mut source = LinkArg::Value(graph.must_variable(*base));
+    let mut source = LinkArg::Value(base.clone());
     for _ in 0..4 {
         match &source {
             LinkArg::Value(var) => {
-                let Some(vid) = graph.value_id_of(var) else {
-                    break;
-                };
-                if let Some(identity) = producer_array_identity(vid, value_producers, cc) {
+                if let Some(identity) = producer_array_identity(var, value_producers, cc) {
                     return Some(identity);
                 }
                 // `None` entries mark inputargs merged from multiple
                 // predecessors — stop chasing and fall back to the
                 // `item_ty`-only path so the descr stays conservative.
-                let Some(Some(next)) = phi_sources.get(&vid) else {
+                let Some(Some(next)) = phi_sources.get(var) else {
                     break;
                 };
                 source = next.clone();
@@ -4921,18 +4912,14 @@ fn collect_readwrite_effects(
     };
 
     // RPython: the rtyped graph gives op.args[0].concretetype directly.
-    // In majit, we build a producer map to resolve ValueId → producing OpKind,
-    // so we can determine the array identity from the base operand's provenance.
-    let value_producers: HashMap<crate::model::ValueId, &crate::model::OpKind> = graph
+    // In majit, build a Variable-keyed producer map so the array
+    // identity follows from each defining op's result Variable
+    // (orthodox per `flowspace/model.py:Variable` identity).
+    let value_producers: HashMap<crate::flowspace::model::Variable, &crate::model::OpKind> = graph
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
-        .filter_map(|op| {
-            op.result
-                .as_ref()
-                .and_then(|v| graph.value_id_of(v))
-                .map(|vid| (vid, &op.kind))
-        })
+        .filter_map(|op| op.result.as_ref().map(|v| (v.clone(), &op.kind)))
         .collect();
 
     // RPython: phi/link args carry concretetype through block boundaries.
@@ -4941,14 +4928,8 @@ fn collect_readwrite_effects(
     // self.exits: link.args`), so resolve_array_identity can trace through
     // control-flow merges of any exit fan-out.
     // Build the phi-sources map by walking each exit link's args
-    // against the unfiltered `Block.inputargs` list rather than the
-    // `inputarg_value_ids` projection — the latter drops entries when
-    // a Variable has no reverse `ValueId` mapping yet, which would
-    // shift every later `link.args[i]` onto the wrong destination
-    // slot and corrupt phi provenance.  RPython parity:
-    // `flowspace/model.py:244 renamevariables` walks `link.args`
-    // and `link.target.inputargs` positionally; missing-mapping
-    // entries are simply skipped here, never re-indexed.
+    // positionally against the `Block.inputargs` list (`Vec<Variable>`,
+    // orthodox per `flowspace/model.py:244 renamevariables`).
     // Conservative phi-source map: an inputarg with exactly one
     // incoming edge gets `Some(src)`; an inputarg merged from two or
     // more predecessors is demoted to `None` so `resolve_array_identity`
@@ -4957,17 +4938,16 @@ fn collect_readwrite_effects(
     // last-writer-wins insert would make the array descr selection
     // depend on HashMap iteration order, which can stamp the wrong
     // effect bits on cross-block merges.
-    let mut phi_sources: HashMap<crate::model::ValueId, Option<LinkArg>> = HashMap::new();
+    let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
+        HashMap::new();
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
                 for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    if let Some(ia) = graph.value_id_of(target_arg) {
-                        phi_sources
-                            .entry(ia)
-                            .and_modify(|entry| *entry = None)
-                            .or_insert_with(|| Some(src.clone()));
-                    }
+                    phi_sources
+                        .entry(target_arg.clone())
+                        .and_modify(|entry| *entry = None)
+                        .or_insert_with(|| Some(src.clone()));
                 }
             }
         }
@@ -5018,23 +4998,17 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY).
-                    // When the reverse `Variable → ValueId` bridge is missing,
-                    // stay conservative — `resolve_array_identity` already
-                    // documents `None` as the "fall back to item_ty-only
-                    // keying" path, so propagate that instead of panicking.
-                    let resolved_id = graph
-                        .value_id_of(base)
-                        .and_then(|base_vid| {
-                            resolve_array_identity(
-                                graph,
-                                &base_vid,
-                                array_type_id,
-                                &value_producers,
-                                &phi_sources,
-                                cc,
-                            )
-                        })
-                        .or_else(|| array_type_id.clone());
+                    // `resolve_array_identity` documents `None` as the
+                    // "fall back to item_ty-only keying" path; the
+                    // `or_else` covers that.
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    )
+                    .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -5075,21 +5049,15 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
-                    // Conservative fall-through when the reverse bridge is
-                    // missing — see the matching `ArrayRead` arm above.
-                    let resolved_id = graph
-                        .value_id_of(base)
-                        .and_then(|base_vid| {
-                            resolve_array_identity(
-                                graph,
-                                &base_vid,
-                                array_type_id,
-                                &value_producers,
-                                &phi_sources,
-                                cc,
-                            )
-                        })
-                        .or_else(|| array_type_id.clone());
+                    // See the matching `ArrayRead` arm above.
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    )
+                    .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -5134,21 +5102,15 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    // Conservative fall-through when the reverse bridge is
-                    // missing — see the matching `ArrayRead` arm above.
-                    let resolved_id = graph
-                        .value_id_of(base)
-                        .and_then(|base_vid| {
-                            resolve_array_identity(
-                                graph,
-                                &base_vid,
-                                array_type_id,
-                                &value_producers,
-                                &phi_sources,
-                                cc,
-                            )
-                        })
-                        .or_else(|| array_type_id.clone());
+                    // See the matching `ArrayRead` arm above.
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    )
+                    .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -5211,21 +5173,15 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    // Conservative fall-through when the reverse bridge is
-                    // missing — see the matching `ArrayRead` arm above.
-                    let resolved_id = graph
-                        .value_id_of(base)
-                        .and_then(|base_vid| {
-                            resolve_array_identity(
-                                graph,
-                                &base_vid,
-                                array_type_id,
-                                &value_producers,
-                                &phi_sources,
-                                cc,
-                            )
-                        })
-                        .or_else(|| array_type_id.clone());
+                    // See the matching `ArrayRead` arm above.
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    )
+                    .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -5363,7 +5319,7 @@ fn all_interiorfielddescrs(
     array_key: majit_ir::descr::LLType,
     array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
 ) -> (Vec<majit_ir::descr::DescrRef>, usize) {
-    use majit_ir::descr::{Descr, LLType, path_hash};
+    use majit_ir::descr::{LLType, path_hash};
     // `descr.py:423-438 get_interiorfield_descr` reuses
     // `gc_cache._cache_field[REALARRAY.OF][name]` for the inner
     // FieldDescr and `gc_cache._cache_interiorfield[(ARRAY, name,
@@ -5837,34 +5793,28 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
 }
 
 fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
-    use crate::model::LinkArg;
-
     // Read the exceptblock's `evalue` slot from the unfiltered
-    // `inputargs` so a missing reverse ValueId mapping does not shift
-    // index 1 onto the wrong Variable.  Same correctness concern as
-    // the `phi_sources` zip above.
+    // `inputargs`.  RPython `flowspace/model.py:Variable` is the
+    // operand identity, so the UnionFind families key on Variable
+    // directly.
     let exceptblock_args = &graph.block(graph.exceptblock).inputargs;
-    let Some(except_value) = exceptblock_args
-        .get(1)
-        .and_then(|arg| graph.value_id_of(arg))
-    else {
+    let Some(except_value) = exceptblock_args.get(1).cloned() else {
         return false;
     };
 
-    let mut families =
-        crate::tool::algo::unionfind::UnionFind::<crate::model::ValueId, ()>::new(|_| ());
+    let mut families = crate::tool::algo::unionfind::UnionFind::<
+        crate::flowspace::model::Variable,
+        (),
+    >::new(|_| ());
     for block in &graph.blocks {
         for link in &block.exits {
-            // Zip link args against the target block's raw `inputargs`
-            // (Variable identities) so unresolved entries are skipped
-            // in place, never re-indexed.
+            // Zip link args against the target block's raw
+            // `inputargs` (Variable identities, positional per
+            // `flowspace/model.py:244 renamevariables`).
             let target_inputargs = &graph.block(link.target).inputargs;
             for (arg, target_arg) in link.args.iter().zip(target_inputargs.iter()) {
-                let Some(target_vid) = graph.value_id_of(target_arg) else {
-                    continue;
-                };
-                if let Some(value) = arg.as_value(graph) {
-                    families.union(value, target_vid);
+                if let Some(value) = arg.as_variable() {
+                    families.union(value.clone(), target_arg.clone());
                 }
             }
         }
@@ -5877,9 +5827,9 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         .filter_map(|link| {
             link.last_exc_value
                 .as_ref()
-                .and_then(|arg| arg.as_value(graph))
+                .and_then(|arg| arg.as_variable())
         })
-        .any(|value| families.find_rep(value) == except_rep)
+        .any(|value| families.find_rep(value.clone()) == except_rep)
 }
 
 /// Map ValueType to a small integer for array descriptor indexing.
@@ -6218,9 +6168,7 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        ExitSwitch, FunctionGraph, Link, LinkArg, ValueId, ValueType, exception_exitcase,
-    };
+    use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
 
     /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
     /// helpers that pass a pre-built `SpaceOperation('direct_call', ...)`
@@ -6991,14 +6939,13 @@ mod tests {
 
     #[test]
     fn resolve_array_identity_follows_phi_chain_to_constant_link_arg() {
+        use crate::flowspace::model::Variable;
         let cc = CallControl::new();
-        let mut graph = FunctionGraph::new("phi_chain_test");
-        graph.set_next_value(3);
-        let base = ValueId(1);
-        let forwarded = ValueId(2);
-        let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
-        let mut phi_sources: HashMap<ValueId, Option<LinkArg>> = HashMap::new();
-        phi_sources.insert(base, Some(LinkArg::Value(graph.must_variable(forwarded))));
+        let base = Variable::new();
+        let forwarded = Variable::new();
+        let value_producers: HashMap<Variable, &OpKind> = HashMap::new();
+        let mut phi_sources: HashMap<Variable, Option<LinkArg>> = HashMap::new();
+        phi_sources.insert(base.clone(), Some(LinkArg::Value(forwarded.clone())));
         phi_sources.insert(
             forwarded,
             Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
@@ -7008,7 +6955,6 @@ mod tests {
 
         assert_eq!(
             resolve_array_identity(
-                &graph,
                 &base,
                 &Option::<String>::None,
                 &value_producers,

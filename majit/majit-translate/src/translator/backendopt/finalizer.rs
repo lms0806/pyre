@@ -279,7 +279,7 @@ mod tests {
         Block, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, SpaceOperation, Variable,
     };
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, LowLevelType, Ptr, PtrTarget, StructType,
+        LowLevelType, Ptr, PtrTarget, StructType,
     };
     use crate::translator::translator::TranslationContext;
     use std::cell::RefCell;

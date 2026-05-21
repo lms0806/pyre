@@ -16,7 +16,7 @@
 //! inside `SpaceOperation.args` (`flowspace/model.py:436` — `args` is
 //! a mixed `Variable | Constant` list), so `simple_call.args[0]` is
 //! the class Constant in upstream.  Pyre's `OpKind::Call.args` is
-//! still `Vec<ValueId>` — migrating it to `Vec<LinkArg>` is the
+//! still `Vec<Variable>` — migrating it to `Vec<LinkArg>` is the
 //! orthodox fix and is a multi-session port.  Until that lands, the
 //! AST helper carries the constant exception class as the *second
 //! segment* of the `simple_call` Call's `FunctionPath` target —
@@ -72,8 +72,8 @@ fn parse_fn(src: &str) -> syn::ItemFn {
 fn find_raise_args(
     graph: &majit_translate::model::FunctionGraph,
 ) -> (
-    majit_translate::model::ValueId,
-    majit_translate::model::ValueId,
+    majit_translate::flowspace::model::Variable,
+    majit_translate::flowspace::model::Variable,
 ) {
     let exceptblock = graph.exceptblock;
     let mut seen: Vec<_> = Vec::new();
@@ -81,11 +81,13 @@ fn find_raise_args(
         for link in &block.exits {
             if link.target == exceptblock && link.args.len() == 2 {
                 let etype = link.args[0]
-                    .as_value(graph)
-                    .expect("raise link etype must be a ValueId, not a Const");
+                    .as_variable()
+                    .cloned()
+                    .expect("raise link etype must be a Variable, not a Const");
                 let evalue = link.args[1]
-                    .as_value(graph)
-                    .expect("raise link evalue must be a ValueId, not a Const");
+                    .as_variable()
+                    .cloned()
+                    .expect("raise link evalue must be a Variable, not a Const");
                 seen.push((etype, evalue));
             }
         }
@@ -96,18 +98,18 @@ fn find_raise_args(
         "expected exactly one raising link to exceptblock, got {}",
         seen.len()
     );
-    seen[0]
+    seen.remove(0)
 }
 
 fn lookup_op_by_result<'a>(
     graph: &'a majit_translate::model::FunctionGraph,
-    v: majit_translate::model::ValueId,
+    v: &majit_translate::flowspace::model::Variable,
 ) -> Option<&'a majit_translate::model::SpaceOperation> {
     graph
         .blocks
         .iter()
         .flat_map(|b| b.operations.iter())
-        .find(|op| op.result.as_ref().and_then(|var| graph.value_id_of(var)) == Some(v))
+        .find(|op| op.result.as_ref() == Some(v))
 }
 
 /// PRE-EXISTING-ADAPTATION shape check — pins the
@@ -124,15 +126,15 @@ fn assert_exc_from_raise_shape(
     graph: &majit_translate::model::FunctionGraph,
     expected_exc_class: &str,
 ) -> (
-    majit_translate::model::ValueId,
-    majit_translate::model::ValueId,
+    majit_translate::flowspace::model::Variable,
+    majit_translate::flowspace::model::Variable,
     Vec<majit_translate::flowspace::model::Variable>,
 ) {
     let (etype, evalue) = find_raise_args(graph);
-    let evalue_op = lookup_op_by_result(graph, evalue)
+    let evalue_op = lookup_op_by_result(graph, &evalue)
         .expect("evalue must be produced by a real op (op.simple_call)");
     let etype_op =
-        lookup_op_by_result(graph, etype).expect("etype must be produced by a real op (op.type)");
+        lookup_op_by_result(graph, &etype).expect("etype must be produced by a real op (op.type)");
     // evalue = op.simple_call(...) with the constant exception class
     // encoded as path segment 1 (PRE-EXISTING-ADAPTATION — see the
     // file-level docstring for the rejected attempts to put the
@@ -180,7 +182,7 @@ fn assert_exc_from_raise_shape(
             );
             assert_eq!(
                 args,
-                &vec![graph.must_variable(evalue)],
+                &vec![evalue.clone()],
                 "etype Call must take evalue as its single input (mirrors \
                  `op.type(w_value)` at flowcontext.py:600 tail)"
             );

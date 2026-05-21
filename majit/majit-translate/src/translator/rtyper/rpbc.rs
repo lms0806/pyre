@@ -9,7 +9,7 @@
 //! full row-of-graphs as the trailing Constant. Pyre's rtyper-equivalent
 //! does the same shape over `OpKind::Call { target: CallTarget::Indirect
 //! { trait_root, method_name }, .. }` sites: insert a `VtableMethodPtr`
-//! to materialise the funcptr ValueId, then replace the original Call
+//! to materialise the funcptr Variable, then replace the original Call
 //! with an `OpKind::IndirectCall` carrying funcptr + args + the family
 //! `graphs` (full `c_graphs`, not yet filtered by JIT candidates —
 //! that filtering happens later in `call.py::graphs_from(op)`).
@@ -312,7 +312,7 @@ pub fn select_call_family_row(
 /// rewrite it into the RPython-orthodox pair:
 ///
 /// 1. `OpKind::VtableMethodPtr { receiver, trait_root, method_name }`
-///    → produces `funcptr: ValueId` (Int kind)
+///    → produces `funcptr: Variable` (Int kind)
 /// 2. `OpKind::IndirectCall { funcptr, args, graphs, result_ty }`
 ///    → mirrors RPython `indirect_call(funcptr, *args, c_graphs)`
 ///
@@ -445,7 +445,7 @@ pub(crate) mod tests {
         Constant as FlowConstant, FunctionGraph as FlowFunctionGraph, GraphFunc as FlowGraphFunc,
         Hlvalue as FlowHlvalue, Link as FlowLink, Variable as FlowVariable,
     };
-    use crate::model::{FunctionGraph, OpKind, ValueType};
+    use crate::model::{OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, functionptr};
 
     fn make_rtyper() -> (Rc<RPythonAnnotator>, RPythonTyper) {
@@ -456,14 +456,14 @@ pub(crate) mod tests {
 
     pub(crate) fn make_pygraph(name: &str) -> Rc<PyGraph> {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        let mut arg_var = FlowVariable::named("x");
+        let arg_var = FlowVariable::named("x");
         arg_var.set_concretetype(Some(LowLevelType::Signed));
         arg_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));
         let arg = FlowHlvalue::Variable(arg_var);
         let startblock = FlowBlock::shared(vec![arg.clone()]);
-        let mut ret_var = FlowVariable::new();
+        let ret_var = FlowVariable::new();
         ret_var.set_concretetype(Some(LowLevelType::Void));
         ret_var
             .annotation
@@ -7146,7 +7146,7 @@ mod pbc_repr_tests {
         // Build a Variable carrying the repr's multi-row lowleveltype
         // (Ptr(Struct('specfunc', ...))) — upstream `assert
         // v.concretetype == self.lowleveltype` (rpbc.py:301).
-        let mut v_var = Variable::new();
+        let v_var = Variable::new();
         v_var.set_concretetype(Some(r.lowleveltype().clone()));
         let v = Hlvalue::Variable(v_var);
 
@@ -8196,7 +8196,7 @@ mod pbc_repr_tests {
     /// pass first to drive the live setup end-to-end.
     #[test]
     fn classes_pbc_repr_get_access_set_returns_family_and_commonbase_class_repr() {
-        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        use crate::annotator::classdesc::ClassDesc;
         use crate::annotator::description::DescKey;
         use crate::flowspace::model::HostObject;
         use crate::translator::rtyper::normalizecalls::merge_classpbc_getattr_into_classdef;
@@ -8383,7 +8383,7 @@ mod pbc_repr_tests {
             .borrow()
             .clone()
             .expect("rootclass_repr must be initialised");
-        let mut v_recv = Variable::new();
+        let v_recv = Variable::new();
         v_recv.set_concretetype(Some(root_repr_arc.lowleveltype().clone()));
         hop.args_v.borrow_mut().push(Hlvalue::Variable(v_recv));
         hop.args_s.borrow_mut().push(SomeValue::Impossible);
@@ -8539,13 +8539,13 @@ mod pbc_repr_tests {
     }
 
     fn void_variable() -> crate::flowspace::model::Hlvalue {
-        let mut v = crate::flowspace::model::Variable::new();
+        let v = crate::flowspace::model::Variable::new();
         v.set_concretetype(Some(LowLevelType::Void));
         crate::flowspace::model::Hlvalue::Variable(v)
     }
 
     fn signed_variable() -> crate::flowspace::model::Hlvalue {
-        let mut v = crate::flowspace::model::Variable::new();
+        let v = crate::flowspace::model::Variable::new();
         v.set_concretetype(Some(LowLevelType::Signed));
         crate::flowspace::model::Hlvalue::Variable(v)
     }
@@ -8729,14 +8729,14 @@ mod pbc_repr_tests {
         let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
 
         // SpaceOperation: result_var = simple_call(receiver, c_int)
-        let mut receiver = Variable::new();
+        let receiver = Variable::new();
         receiver.set_concretetype(Some(LowLevelType::Void));
         let receiver_h = Hlvalue::Variable(receiver);
 
         let int_const = FlowConstant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
         let int_const_h = Hlvalue::Constant(int_const);
 
-        let mut result_var = Variable::new();
+        let result_var = Variable::new();
         result_var.set_concretetype(Some(LowLevelType::Void));
         let result_h = Hlvalue::Variable(result_var);
 
@@ -8812,14 +8812,14 @@ mod pbc_repr_tests {
         // The receiver carries the PBCRepr's lowleveltype = Ptr(FuncType(...)),
         // mirroring upstream's `vfn = hop.inputarg(self, arg=0)` path
         // where `self` is the FunctionsPBCRepr.
-        let mut receiver = Variable::new();
+        let receiver = Variable::new();
         receiver.set_concretetype(Some(funcptr_lltype.clone()));
         let receiver_h = Hlvalue::Variable(receiver);
 
         let int_const = FlowConstant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
         let int_const_h = Hlvalue::Constant(int_const);
 
-        let mut result_var = Variable::new();
+        let result_var = Variable::new();
         result_var.set_concretetype(Some(LowLevelType::Void));
         let result_h = Hlvalue::Variable(result_var);
 
@@ -9299,7 +9299,7 @@ mod pbc_repr_tests {
             std::sync::Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());
 
         // Input arg: a Ptr-typed Variable (matches FunctionsPBCRepr lowleveltype).
-        let mut arg_var = Variable::new();
+        let arg_var = Variable::new();
         arg_var.set_concretetype(Some(r.lowleveltype().clone()));
         let arg = Hlvalue::Variable(arg_var);
         let spaceop = SpaceOperation::new(
