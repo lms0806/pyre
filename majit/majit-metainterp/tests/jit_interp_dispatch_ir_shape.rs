@@ -1802,15 +1802,16 @@ mod oparg_with_body_local_state_le_green {
             "BC_INT_LE must precede BC_JIT_MERGE_POINT"
         );
 
-        // BC_INT_LE encoding: [opcode][result_reg][lhs_reg][rhs_reg]; the result
-        // reg is byte int_le_pos + 1 and is `g`'s int register byte.
+        // BC_INT_LE canonical encoding (`assembler.py:165-174` argcode
+        // `ii>i`): [opcode][lhs_reg][rhs_reg][dst_reg]; the dst (result)
+        // reg is byte int_le_pos + 3 and is `g`'s int register byte.
         assert!(
             int_le_pos + 3 < mp_pos,
             "BC_INT_LE payload truncated; int_le_pos={}, mp_pos={}",
             int_le_pos,
             mp_pos
         );
-        let g_reg_byte = code[int_le_pos + 1];
+        let g_reg_byte = code[int_le_pos + 3];
 
         // A.3.5 promote_greens: BC_INT_GUARD_VALUE for `g` must precede the
         // merge point and reference `g`'s int reg.
@@ -2070,25 +2071,22 @@ mod oparg_with_body_local_method_call_green {
             int_le_pos
         );
 
-        // BC_INT_LE encoding (`assembler.rs:799-833 record_binop_i`):
-        //   [opcode][dst u16 LE][lhs u16 LE][rhs u16 LE]
-        // Each reg is `push_u16` (2-byte LE), so the low byte at
-        // `int_le_pos + 1 / +3 / +5` is the actual reg index for
-        // reg < 256 (high byte at +2 / +4 / +6 is zero).
+        // BC_INT_LE canonical encoding (`assembler.py:165-174` argcode
+        // `ii>i`): [opcode][lhs_reg][rhs_reg][dst_reg], 1 byte per reg.
         assert!(
-            int_le_pos + 7 <= mp_pos,
+            int_le_pos + 4 <= mp_pos,
             "BC_INT_LE payload truncated; int_le_pos={}, mp_pos={}",
             int_le_pos,
             mp_pos
         );
-        let g_reg_byte = code[int_le_pos + 1];
+        let g_reg_byte = code[int_le_pos + 3];
         assert_eq!(
-            code[int_le_pos + 3],
+            code[int_le_pos + 1],
             call_result_reg_byte,
-            "A.3.6.3: BC_INT_LE lhs reg (at int_le_pos+3, low byte of \
-             u16 LE) must equal the canonical call result reg; got \
+            "A.3.6.3: BC_INT_LE lhs reg (at int_le_pos+1, 1-byte \
+             canonical) must equal the canonical call result reg; got \
              int_le_lhs={} call_result_reg={}",
-            code[int_le_pos + 3],
+            code[int_le_pos + 1],
             call_result_reg_byte,
         );
 

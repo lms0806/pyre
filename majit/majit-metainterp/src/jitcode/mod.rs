@@ -544,12 +544,15 @@ impl JitCodeRuntimeExt for JitCode {
     fn trailing_return_info(&self) -> Option<(JitArgKind, u16)> {
         let body = self.try_body()?;
         let code = &body.code;
-        if code.last().copied() == Some(insns::BC_VOID_RETURN) || code.len() < 3 {
+        if code.last().copied() == Some(insns::BC_VOID_RETURN) || code.len() < 2 {
             return None;
         }
-        let opcode_pos = code.len() - 3;
+        // A2 epic (Task #155): typed-return opcodes carry a 1-byte
+        // register source operand (`int_return/i`, `ref_return/r`,
+        // `float_return/f` per RPython argcode contract).
+        let opcode_pos = code.len() - 2;
         let opcode = code[opcode_pos];
-        let src = u16::from_le_bytes([code[opcode_pos + 1], code[opcode_pos + 2]]);
+        let src = code[opcode_pos + 1] as u16;
         match opcode {
             insns::BC_INT_RETURN => Some((JitArgKind::Int, src)),
             insns::BC_REF_RETURN => Some((JitArgKind::Ref, src)),

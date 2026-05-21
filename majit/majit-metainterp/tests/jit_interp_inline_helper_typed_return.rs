@@ -7,8 +7,8 @@ fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
         .unwrap_or_else(|| panic!("missing wellknown opcode for {key}"));
     assert_eq!(
         jitcode.code.len(),
-        3,
-        "helper should emit one return opcode"
+        2,
+        "helper should emit one return opcode (1 byte) + 1-byte register operand"
     );
     assert_eq!(jitcode.code[0], opcode, "helper should end with {key}");
 }

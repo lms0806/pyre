@@ -2168,6 +2168,8 @@ where
             jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
             jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
             jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+                // Canonical `iL` encoding (`assembler.py:165-174`):
+                // [cond:u8][target:u16].
                 let (opcode_pc, cond_idx, target) = {
                     let frame = self.frames.current_mut();
                     // RPython `pyjitpl.py:3713 orgpc = position` parity: the
@@ -2181,7 +2183,7 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2203,12 +2205,13 @@ where
             // i.e. record int_is_zero on the operand, then branch as if the
             // result were a plain bool exitswitch.
             jitcode::insns::BC_GOTO_IF_NOT_INT_IS_ZERO => {
+                // Canonical `iL` encoding: [src:u8][target:u16].
                 let (opcode_pc, src_idx, target) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2232,13 +2235,14 @@ where
             | jitcode::insns::BC_GOTO_IF_NOT_INT_NE
             | jitcode::insns::BC_GOTO_IF_NOT_INT_GT
             | jitcode::insns::BC_GOTO_IF_NOT_INT_GE => {
+                // Canonical `iiL` encoding: [a:u8][b:u8][target:u16].
                 let (opcode_pc, lhs_idx, rhs_idx, target) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2272,13 +2276,14 @@ where
             | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_NE
             | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GT
             | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GE => {
+                // Canonical `ffL` encoding: [a:u8][b:u8][target:u16].
                 let (opcode_pc, lhs_idx, rhs_idx, target) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2308,13 +2313,14 @@ where
                 }
             }
             jitcode::insns::BC_GOTO_IF_NOT_PTR_EQ | jitcode::insns::BC_GOTO_IF_NOT_PTR_NE => {
+                // Canonical `rrL` encoding: [a:u8][b:u8][target:u16].
                 let (opcode_pc, lhs_idx, rhs_idx, target) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2343,12 +2349,13 @@ where
             }
             jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO
             | jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => {
+                // Canonical `rL` encoding: [src:u8][target:u16].
                 let (opcode_pc, src_idx, target) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u16() as usize,
+                        frame.next_u8() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -2379,7 +2386,7 @@ where
                 let _target = self.frames.current_mut().next_u16();
             }
             jitcode::insns::BC_LAST_EXCEPTION => {
-                let dst = self.frames.current_mut().next_u16() as usize;
+                let dst = self.frames.current_mut().next_u8() as usize;
                 let exc_value = self.last_exception_value;
                 // pyjitpl.py:1707-1714 opimpl_last_exception:
                 //     exc_value = self.metainterp.last_exc_value
@@ -2400,7 +2407,7 @@ where
                 self.set_int_reg(dst, Some(ctx.const_int(typeptr)), Some(typeptr));
             }
             jitcode::insns::BC_LAST_EXC_VALUE => {
-                let dst = self.frames.current_mut().next_u16() as usize;
+                let dst = self.frames.current_mut().next_u8() as usize;
                 // pyjitpl.py:1716-1719 opimpl_last_exc_value:
                 //     exc_value = self.metainterp.last_exc_value
                 //     assert exc_value
@@ -2433,9 +2440,10 @@ where
             // a trace-time decision (matches the legacy
             // `int_values[vtable_idx]` Const slot read).
             jitcode::insns::BC_GOTO_IF_EXCEPTION_MISMATCH => {
+                // Canonical `iL` encoding: [vtable:u8][target:u16].
                 let (vtable_idx, target) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                    (frame.next_u8() as usize, frame.next_u16() as usize)
                 };
                 let exc_value = self.last_exception_value;
                 assert!(
@@ -2854,7 +2862,7 @@ where
             // RPython `self.last_exc_value = lltype.nullptr(...)`).
             jitcode::insns::BC_INT_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
                 self.pop_exception_frame(ctx);
@@ -2879,7 +2887,7 @@ where
             }
             jitcode::insns::BC_REF_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
                 self.pop_exception_frame(ctx);
@@ -2904,7 +2912,7 @@ where
             }
             jitcode::insns::BC_FLOAT_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
                 self.pop_exception_frame(ctx);
@@ -4349,7 +4357,7 @@ where
             jitcode::insns::BC_MOVE_I => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                    (frame.next_u8() as usize, frame.next_u8() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
@@ -4424,7 +4432,7 @@ where
             jitcode::insns::BC_MOVE_R => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                    (frame.next_u8() as usize, frame.next_u8() as usize)
                 };
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
@@ -4494,7 +4502,7 @@ where
             jitcode::insns::BC_MOVE_F => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                    (frame.next_u8() as usize, frame.next_u8() as usize)
                 };
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
@@ -4581,7 +4589,7 @@ where
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
             jitcode::insns::BC_INT_GUARD_VALUE => {
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let promoted = ctx.promote_int(opref, concrete, 0);
                 self.set_int_reg(src, Some(promoted), Some(concrete));
@@ -4618,14 +4626,14 @@ where
             }
             // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
             jitcode::insns::BC_REF_GUARD_VALUE => {
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let promoted = ctx.promote_ref(opref, concrete, 0);
                 self.set_ref_reg(src, Some(promoted), Some(concrete));
             }
             // pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
             jitcode::insns::BC_FLOAT_GUARD_VALUE => {
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let promoted = ctx.promote_float(opref, concrete, 0);
                 self.set_float_reg(src, Some(promoted), Some(concrete));
@@ -4649,7 +4657,7 @@ where
                 // of opimpl_raise itself — what `generate_guard(...,
                 // resumepc=orgpc)` records.
                 let opcode_pc = self.frames.current_mut().code_cursor - 1;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 if concrete == 0 {
                     return TraceAction::Abort;
@@ -4868,12 +4876,14 @@ where
     }
 
     fn trace_binop_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
-        let (dst, lhs_idx, rhs_idx) = {
+        // `[lhs][rhs][dst]` canonical argcode order matching the
+        // `bhhandler_ii_i!` blackhole decoder.
+        let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let lhs_idx = frame.next_u16() as usize;
-            let rhs_idx = frame.next_u16() as usize;
-            (dst, lhs_idx, rhs_idx)
+            let lhs_idx = frame.next_u8() as usize;
+            let rhs_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
@@ -4893,11 +4903,15 @@ where
     }
 
     fn trace_unary_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
-        let (dst, src_idx) = {
+        // RPython `assembler.py:165-174` argcode order: `[src][dst]`
+        // for `int_neg/i>i` / `int_invert/i>i` (`bhhandler_i_i!`
+        // canonical decoder reads `code[position]=src`,
+        // `code[position+1]=dst`).
+        let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let src_idx = frame.next_u16() as usize;
-            (dst, src_idx)
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
@@ -4907,13 +4921,15 @@ where
     }
 
     /// Ref binop tracer helper returning an int result.
+    /// `[lhs][rhs][dst]` canonical argcode order, matching the
+    /// `bhhandler_rr_i!` blackhole decoder.
     fn trace_binop_r_to_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
-        let (dst, lhs_idx, rhs_idx) = {
+        let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let lhs_idx = frame.next_u16() as usize;
-            let rhs_idx = frame.next_u16() as usize;
-            (dst, lhs_idx, rhs_idx)
+            let lhs_idx = frame.next_u8() as usize;
+            let rhs_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
@@ -4934,12 +4950,14 @@ where
     }
 
     /// Unary ref nullity checks trace as PTR_EQ/PTR_NE against CONST_NULL.
+    /// `[src][dst]` canonical argcode order, matching the
+    /// `bhhandler_r_i!` blackhole decoder.
     fn trace_ptr_nullity(&mut self, ctx: &mut TraceCtx, nonzero: bool) {
-        let (dst, src_idx) = {
+        let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let src_idx = frame.next_u16() as usize;
-            (dst, src_idx)
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
         };
         let (src, src_value) = self.read_ref_reg(src_idx);
         let null = ctx.const_null();
@@ -4959,13 +4977,15 @@ where
     }
 
     /// Per-opname float binop tracer helper.
+    /// `[lhs][rhs][dst]` canonical argcode order, matching the
+    /// `bhhandler_ff_f!` blackhole decoder.
     fn trace_binop_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
-        let (dst, lhs_idx, rhs_idx) = {
+        let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let lhs_idx = frame.next_u16() as usize;
-            let rhs_idx = frame.next_u16() as usize;
-            (dst, lhs_idx, rhs_idx)
+            let lhs_idx = frame.next_u8() as usize;
+            let rhs_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
@@ -4976,11 +4996,13 @@ where
     }
 
     fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
-        let (dst, src_idx) = {
+        // `[src][dst]` canonical argcode order, matching the
+        // `bhhandler_f_f!` blackhole decoder.
+        let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let dst = frame.next_u16() as usize;
-            let src_idx = frame.next_u16() as usize;
-            (dst, src_idx)
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
         };
         let (src, src_value) = self.read_float_reg(src_idx);
         let value = eval_unary_f(opcode, src_value);

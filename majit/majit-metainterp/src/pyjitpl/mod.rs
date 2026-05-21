@@ -3825,7 +3825,13 @@ impl<M: Clone> MetaInterp<M> {
             Some(Value::Ref(r)) => r.as_usize(),
             _ => lastbox_ptr,
         };
-        debug_assert_eq!(
+        // pyjitpl.py:1825 `assert box.getref_base() == lastbox.getref_base()`
+        // — RPython's plain `assert` fires in both untranslated and
+        // translated builds (the latter via the same fail-fast on
+        // invariant break); the Rust port mirrors that with `assert_eq!`
+        // so release builds also fail at the divergence point rather
+        // than silently corrupting the vref stack.
+        assert_eq!(
             virtual_obj_ptr, lastbox_ptr,
             "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
              (virtual_obj={:?}, lastbox={:?})",
@@ -14374,23 +14380,21 @@ impl MetaInterpStaticData {
 
         // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
         //
-        // PRE-EXISTING-ADAPTATION: the literal assignment is intentionally
-        // omitted because pyre's `VirtualRefInfo` is constructed at module-
-        // init time via cached generators (`vref_size_descr()` +
-        // `make_vref_field_descr_typed(...)`) that yield process-singleton
-        // `DescrRef` Arcs, while `callcontrol.virtualref_info` carries the
-        // separate codewriter-time
+        // `callcontrol.virtualref_info` carries the codewriter-time
         // [`majit_translate::jit_codewriter::call::VirtualRefInfoHandle`]
-        // representation (`u32` descr indices for the dispatch encoder).
-        // Both sides therefore reference the SAME underlying descriptors —
-        // the metainterp side via `Arc::ptr_eq`, the translate side via the
-        // `0x1000_0081 / 0x1000_0101 / 0x7F10` constants in
-        // `DefaultVirtualRefInfoHandle` — and the staticdata slot's
-        // `VirtualRefInfo::default()` already matches what the literal
-        // assignment would install.  Convergence to the literal shape
-        // requires the handle trait to expose `DescrRef` Arcs (currently
-        // blocked by the `majit-translate` ⊥ `majit-metainterp` crate
-        // boundary, since `VirtualRefInfo` is a metainterp type).
+        // (u32 descr indices for the dispatch encoder); the metainterp-side
+        // `VirtualRefInfo` carries the process-singleton `DescrRef` Arcs
+        // produced by `vref_size_descr()` +
+        // `make_vref_field_descr_typed(...)`.  Both sides reference the
+        // same underlying descriptors, so rebuilding
+        // `VirtualRefInfo::new()` whenever the handle was installed
+        // mirrors the RPython assignment: `staticdata.virtualref_info`
+        // becomes a fresh copy keyed off the `callcontrol.virtualref_info
+        // is not None` precondition that `setup_vrefinfo`
+        // (`codewriter.py:91-94`) establishes.
+        if callcontrol.virtualref_info.is_some() {
+            self.virtualref_info = crate::virtualref::VirtualRefInfo::new();
+        }
 
         // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol.callinfocollection`
         self.callinfocollection = callcontrol.callinfocollection.clone();

@@ -1759,9 +1759,30 @@ impl TraceCtx {
         // pyjitpl.py:3502-3505 virtualref_boxes walk.  RPython runs
         // this before the virtualizable_boxes walk; pyre matches the
         // order.
+        //
+        // The `(OpRef, usize)` sidecar caches the concrete
+        // `JitVirtualRef*` pointer next to the SSA OpRef so
+        // `vrefs_before/after_residual_call` can read the live token
+        // field without an extra OpRef->ptr resolution step.  When the
+        // OpRef is swapped, the cached pointer must follow.  For Const
+        // replacements (CONST_NULL after stop_tracking_virtualref or a
+        // promoted ConstPtr after guard_value), the constant's raw
+        // value is the new pointer.  For non-Const replacements (the
+        // current callers all alias to an OpRef that points at the
+        // same concrete ref), the cached pointer stays — matching the
+        // RPython box-getref-base invariant where the two boxes share
+        // `getref_base()`.
+        let new_ptr_for_const = if newbox.is_constant() {
+            self.constants.raw_bits(newbox).map(|v| v as usize)
+        } else {
+            None
+        };
         for slot in self.virtualref_boxes.iter_mut() {
             if slot.0 == oldbox {
                 slot.0 = newbox;
+                if let Some(p) = new_ptr_for_const {
+                    slot.1 = p;
+                }
             }
         }
         // pyjitpl.py:3506-3511 virtualizable_boxes walk.

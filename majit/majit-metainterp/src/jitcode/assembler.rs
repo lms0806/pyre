@@ -333,10 +333,10 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         self.write_insn("int_copy/i>i");
         let src_offset = self.code.len();
-        self.push_u16(0);
-        self.const_patches
+        self.push_u8(0);
+        self.const_patches_u8
             .push((src_offset, ConstKind::Int, const_idx));
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     // ── State field access (register/tape machines) ──
@@ -1105,13 +1105,19 @@ impl JitCodeBuilder {
         self.touch_reg(lhs);
         self.touch_reg(rhs);
         self.write_insn(key);
-        self.push_u16(dst);
-        self.push_u16(lhs);
-        self.push_u16(rhs);
+        // RPython `assembler.py:165-174` argcode `ii>i` byte order:
+        // `[lhs][rhs][dst]`, matching the canonical `bhhandler_ii_i!`
+        // decoder.
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}` per-opname
     /// handlers. See `record_binop_i` for the keying rationale.
+    /// Byte layout follows `assembler.py:165-174`: each `Register` is
+    /// emitted in argcode order, so `int_neg/i>i` stores `[src][dst]`
+    /// matching the canonical `bhhandler_i_i!` decoder.
     pub fn record_unary_i(&mut self, dst: u16, opcode: OpCode, src: u16) {
         let key = match opcode {
             OpCode::IntNeg => "int_neg/i>i",
@@ -1121,12 +1127,14 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         self.touch_reg(src);
         self.write_insn(key);
-        self.push_u16(dst);
-        self.push_u16(src);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:584-610` ref comparisons returning int:
     /// `ptr_eq`, `ptr_ne`, `instance_ptr_eq`, `instance_ptr_ne`.
+    /// Byte layout follows `assembler.py:165-174`: `[lhs][rhs][dst]`
+    /// matching the canonical `bhhandler_rr_i!` decoder.
     pub fn record_binop_r(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let key = match opcode {
             OpCode::PtrEq => "ptr_eq/rr>i",
@@ -1139,26 +1147,27 @@ impl JitCodeBuilder {
         self.touch_ref_reg(lhs);
         self.touch_ref_reg(rhs);
         self.write_insn(key);
-        self.push_u16(dst);
-        self.push_u16(lhs);
-        self.push_u16(rhs);
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:591-596` unary ptr nullity checks returning int.
+    /// Byte layout `[src][dst]` per canonical `bhhandler_r_i!` decoder.
     pub fn ptr_iszero(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
         self.touch_ref_reg(src);
         self.write_insn("ptr_iszero/r>i");
-        self.push_u16(dst);
-        self.push_u16(src);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     pub fn ptr_nonzero(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
         self.touch_ref_reg(src);
         self.write_insn("ptr_nonzero/r>i");
-        self.push_u16(dst);
-        self.push_u16(src);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     pub fn new_label(&mut self) -> u16 {
@@ -1187,7 +1196,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
         self.write_insn("goto_if_not/iL");
-        self.push_u16(reg);
+        self.push_u8(reg as u8);
         self.push_label_ref(label);
     }
 
@@ -1196,12 +1205,15 @@ impl JitCodeBuilder {
     // emitted by flatten.py:247-250 as `goto_if_not_int_lt/iiL`.
     // blackhole.py:864-911 semantics: take branch iff comparison is
     // false, i.e. `int_lt(a, b) == False` → `position = target`.
+    // Canonical layout (`assembler.py:165-174` argcode `iiL`):
+    // [a:u8][b:u8][target:u16]. Float and ref variants share the same
+    // shape with their respective reg classes.
     pub fn goto_if_not_int_lt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_lt/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1209,8 +1221,8 @@ impl JitCodeBuilder {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_le/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1218,8 +1230,8 @@ impl JitCodeBuilder {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_eq/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1227,8 +1239,8 @@ impl JitCodeBuilder {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_ne/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1236,8 +1248,8 @@ impl JitCodeBuilder {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_gt/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1245,8 +1257,8 @@ impl JitCodeBuilder {
         self.touch_reg(a);
         self.touch_reg(b);
         self.write_insn("goto_if_not_int_ge/iiL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1255,8 +1267,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_lt/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1264,8 +1276,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_le/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1273,8 +1285,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_eq/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1282,8 +1294,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_ne/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1291,8 +1303,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_gt/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1300,8 +1312,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
         self.write_insn("goto_if_not_float_ge/ffL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1310,8 +1322,8 @@ impl JitCodeBuilder {
         self.touch_ref_reg(a);
         self.touch_ref_reg(b);
         self.write_insn("goto_if_not_ptr_eq/rrL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
@@ -1319,22 +1331,22 @@ impl JitCodeBuilder {
         self.touch_ref_reg(a);
         self.touch_ref_reg(b);
         self.write_insn("goto_if_not_ptr_ne/rrL");
-        self.push_u16(a);
-        self.push_u16(b);
+        self.push_u8(a as u8);
+        self.push_u8(b as u8);
         self.push_label_ref(label);
     }
 
     pub fn goto_if_not_ptr_iszero(&mut self, a: u16, label: u16) {
         self.touch_ref_reg(a);
         self.write_insn("goto_if_not_ptr_iszero/rL");
-        self.push_u16(a);
+        self.push_u8(a as u8);
         self.push_label_ref(label);
     }
 
     pub fn goto_if_not_ptr_nonzero(&mut self, a: u16, label: u16) {
         self.touch_ref_reg(a);
         self.write_insn("goto_if_not_ptr_nonzero/rL");
-        self.push_u16(a);
+        self.push_u8(a as u8);
         self.push_label_ref(label);
     }
 
@@ -1345,7 +1357,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_is_zero(&mut self, a: u16, label: u16) {
         self.touch_reg(a);
         self.write_insn("goto_if_not_int_is_zero/iL");
-        self.push_u16(a);
+        self.push_u8(a as u8);
         self.push_label_ref(label);
     }
 
@@ -1549,14 +1561,14 @@ impl JitCodeBuilder {
     pub fn last_exc_value(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
         self.write_insn("last_exc_value/>r");
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// RPython blackhole.py:987 `last_exception/>i`.
     pub fn last_exception(&mut self, dst: u16) {
         self.touch_reg(dst);
         self.write_insn("last_exception/>i");
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
@@ -1567,7 +1579,7 @@ impl JitCodeBuilder {
     /// register, so we intentionally do not call `touch_reg()` here.
     pub fn goto_if_exception_mismatch(&mut self, vtable: u16, label: u16) {
         self.write_insn("goto_if_exception_mismatch/iL");
-        self.push_u16(vtable);
+        self.push_u8(vtable as u8);
         self.push_label_ref(label);
     }
 
@@ -1656,19 +1668,19 @@ impl JitCodeBuilder {
     pub fn int_return(&mut self, src: u16) {
         self.touch_reg(src);
         self.write_insn("int_return/i");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     pub fn ref_return(&mut self, src: u16) {
         self.touch_ref_reg(src);
         self.write_insn("ref_return/r");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     pub fn float_return(&mut self, src: u16) {
         self.touch_float_reg(src);
         self.write_insn("float_return/f");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     pub fn void_return(&mut self) {
@@ -1686,7 +1698,7 @@ impl JitCodeBuilder {
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
     pub fn emit_raise(&mut self, src: u16) {
         self.write_insn("raise/r");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// blackhole.py bhimpl_reraise(): re-raise exception_last_value.
@@ -1700,7 +1712,7 @@ impl JitCodeBuilder {
     /// Tracing: emits GUARD_VALUE to specialize the trace on this value.
     pub fn int_guard_value(&mut self, src: u16) {
         self.write_insn("int_guard_value/i");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// pyjitpl.py:385-391 opimpl_assert_not_none: record that `src` is
@@ -1735,13 +1747,13 @@ impl JitCodeBuilder {
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
         self.write_insn("ref_guard_value/r");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// pyjitpl.py opimpl_float_guard_value: promote float register to constant.
     pub fn float_guard_value(&mut self, src: u16) {
         self.write_insn("float_guard_value/f");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     pub fn inline_call(&mut self, sub_jitcode_idx: u16) {
@@ -3124,8 +3136,8 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         self.touch_reg(src);
         self.write_insn("int_copy/i>i");
-        self.push_u16(src);
-        self.push_u16(dst);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     /// `flatten.py:329` `self.emitline('int_push', v)` / `blackhole.py:662-663`
@@ -3133,7 +3145,7 @@ impl JitCodeBuilder {
     pub fn push_i(&mut self, src: u16) {
         self.touch_reg(src);
         self.write_insn("int_push/i");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// `flatten.py:331` `self.emitline('int_pop', "->", w)` / `blackhole.py:672-673`
@@ -3141,7 +3153,7 @@ impl JitCodeBuilder {
     pub fn pop_i(&mut self, dst: u16) {
         self.touch_reg(dst);
         self.write_insn("int_pop/>i");
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     pub fn ensure_i_regs(&mut self, count: u16) {
@@ -3178,10 +3190,10 @@ impl JitCodeBuilder {
         self.touch_ref_reg(dst);
         self.write_insn("ref_copy/r>r");
         let src_offset = self.code.len();
-        self.push_u16(0);
-        self.const_patches
+        self.push_u8(0);
+        self.const_patches_u8
             .push((src_offset, ConstKind::Ref, const_idx));
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:641-643` `bhimpl_ref_copy(a) returns=r`.
@@ -3190,8 +3202,8 @@ impl JitCodeBuilder {
         self.touch_ref_reg(dst);
         self.touch_ref_reg(src);
         self.write_insn("ref_copy/r>r");
-        self.push_u16(src);
-        self.push_u16(dst);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     /// `flatten.py:329` `self.emitline('ref_push', v)` / `blackhole.py:665-666`
@@ -3199,7 +3211,7 @@ impl JitCodeBuilder {
     pub fn push_r(&mut self, src: u16) {
         self.touch_ref_reg(src);
         self.write_insn("ref_push/r");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// `flatten.py:331` `self.emitline('ref_pop', "->", w)` / `blackhole.py:675-676`
@@ -3207,7 +3219,7 @@ impl JitCodeBuilder {
     pub fn pop_r(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
         self.write_insn("ref_pop/>r");
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// Parity #14 Slice C.4: see
@@ -3291,10 +3303,10 @@ impl JitCodeBuilder {
         self.touch_float_reg(dst);
         self.write_insn("float_copy/f>f");
         let src_offset = self.code.len();
-        self.push_u16(0);
-        self.const_patches
+        self.push_u8(0);
+        self.const_patches_u8
             .push((src_offset, ConstKind::Float, const_idx));
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:644-646` `bhimpl_float_copy(a) returns=f`.
@@ -3303,8 +3315,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
         self.write_insn("float_copy/f>f");
-        self.push_u16(src);
-        self.push_u16(dst);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     /// `flatten.py:329` `self.emitline('float_push', v)` / `blackhole.py:668-669`
@@ -3312,7 +3324,7 @@ impl JitCodeBuilder {
     pub fn push_f(&mut self, src: u16) {
         self.touch_float_reg(src);
         self.write_insn("float_push/f");
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// `flatten.py:331` `self.emitline('float_pop', "->", w)` / `blackhole.py:678-679`
@@ -3320,7 +3332,7 @@ impl JitCodeBuilder {
     pub fn pop_f(&mut self, dst: u16) {
         self.touch_float_reg(dst);
         self.write_insn("float_pop/>f");
-        self.push_u16(dst);
+        self.push_u8(dst as u8);
     }
 
     /// Parity #14 Slice C.4: see
@@ -3406,12 +3418,15 @@ impl JitCodeBuilder {
         self.touch_float_reg(lhs);
         self.touch_float_reg(rhs);
         self.write_insn(key);
-        self.push_u16(dst);
-        self.push_u16(lhs);
-        self.push_u16(rhs);
+        // `assembler.py:165-174` argcode `ff>f` byte order `[lhs][rhs][dst]`,
+        // matching the canonical `bhhandler_ff_f!` decoder.
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
     }
 
     /// RPython `blackhole.py:689-695` `bhimpl_float_{neg,abs}` per-opname handlers.
+    /// `[src][dst]` byte layout per the canonical `bhhandler_f_f!` decoder.
     pub fn record_unary_f(&mut self, dst: u16, opcode: OpCode, src: u16) {
         let key = match opcode {
             OpCode::FloatNeg => "float_neg/f>f",
@@ -3421,8 +3436,8 @@ impl JitCodeBuilder {
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
         self.write_insn(key);
-        self.push_u16(dst);
-        self.push_u16(src);
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
     }
 
     /// Append a sub-JitCode descriptor and return its runtime
@@ -3863,23 +3878,69 @@ impl JitCodeBuilder {
     }
 
     fn touch_reg(&mut self, reg: u16) {
+        // RPython `assembler.py:72-74` `emit_reg(reg)` asserts
+        // `reg.index < count_regs[kind]`.  The bytecode operand byte is
+        // 1 byte (`chr(reg.index)`), so any reg outside `[0, 256)` would
+        // silently truncate via `as u8` at the matching push site.
+        //
+        // Pyre callers route `Const*` operands through the constants
+        // pool as `num_regs_kind + pool_idx` (see
+        // `pyre/pyre-jit/src/jit/assembler.rs::expect_int_reg_or_pool`),
+        // so the legal upper bound at emit time is
+        // `num_regs_kind + num_consts_kind`. RPython keeps the two
+        // emit paths separate (`emit_reg` vs `emit_const`); pyre fuses
+        // them through `touch_reg`/`push_u8`, so the assert mirrors the
+        // union of both bounds.
+        let limit = self
+            .num_regs_i
+            .saturating_add(self.constants_i.len() as u16);
         if self.num_regs_frozen {
+            assert!(
+                reg < limit && reg < 256,
+                "int reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+            );
             return;
         }
+        assert!(
+            reg < 256,
+            "int reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
         self.num_regs_i = max(self.num_regs_i, reg.saturating_add(1));
     }
 
     fn touch_ref_reg(&mut self, reg: u16) {
+        let limit = self
+            .num_regs_r
+            .saturating_add(self.constants_r.len() as u16);
         if self.num_regs_frozen {
+            assert!(
+                reg < limit && reg < 256,
+                "ref reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+            );
             return;
         }
+        assert!(
+            reg < 256,
+            "ref reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
         self.num_regs_r = max(self.num_regs_r, reg.saturating_add(1));
     }
 
     fn touch_float_reg(&mut self, reg: u16) {
+        let limit = self
+            .num_regs_f
+            .saturating_add(self.constants_f.len() as u16);
         if self.num_regs_frozen {
+            assert!(
+                reg < limit && reg < 256,
+                "float reg {reg} out of bounds {limit} (assembler.py:72-74 emit_reg parity)"
+            );
             return;
         }
+        assert!(
+            reg < 256,
+            "float reg {reg} out of u8 range (assembler.py:72 chr() parity)"
+        );
         self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
     }
 

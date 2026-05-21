@@ -2210,8 +2210,8 @@ mod tests {
             .expect("int_copy must be registered in wellknown insns");
         assert_eq!(jitcode.constants_i, vec![42]);
         assert_eq!(jitcode.code[0], copy_opcode);
-        assert_eq!(u16::from_le_bytes([jitcode.code[1], jitcode.code[2]]), 1);
-        assert_eq!(u16::from_le_bytes([jitcode.code[3], jitcode.code[4]]), 0);
+        assert_eq!(jitcode.code[1], 1);
+        assert_eq!(jitcode.code[2], 0);
     }
 
     #[test]
@@ -2270,9 +2270,11 @@ mod tests {
         let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
             .get("ptr_nonzero/r>i")
             .expect("ptr_nonzero must be registered in wellknown insns");
+        // Canonical `r>i` 1-byte encoding (`assembler.py:165-174`):
+        // [opcode][src_reg][dst_reg].
         assert_eq!(jitcode.code[0], opcode);
-        assert_eq!(u16::from_le_bytes([jitcode.code[1], jitcode.code[2]]), 0);
-        assert_eq!(u16::from_le_bytes([jitcode.code[3], jitcode.code[4]]), 0);
+        assert_eq!(jitcode.code[1], 0);
+        assert_eq!(jitcode.code[2], 0);
     }
 
     #[test]
@@ -2308,7 +2310,9 @@ mod tests {
             .get("goto_if_not_ptr_nonzero/rL")
             .expect("ptr_nonzero branch must be registered in wellknown insns");
         assert_eq!(jitcode.code[0], opcode);
-        assert_eq!(jitcode.follow_jump(5), 5);
+        // Canonical `rL` encoding: [opcode:1][src:u8][target:u16] = 4
+        // bytes; L1 lands at position 4 (the ref_return start).
+        assert_eq!(jitcode.follow_jump(4), 4);
     }
 
     #[test]

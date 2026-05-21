@@ -3889,38 +3889,33 @@ mod tests {
         /// is wired before `dispatch_loop` runs (`blackhole.py:66-100
         /// setup_insns` resolving every key via `_get_method`).
         ///
-        /// PRE-EXISTING-ADAPTATION: the keys carry the `_pyre_u16`
-        /// suffix because `JitCodeBuilder::push_u16` emits 2-byte
-        /// register operands instead of RPython's 1-byte operands.
-        /// `wire_bhimpl_handlers` resolves these suffixed keys to the
-        /// `handler_*_pyre_u16` family and stores them at the same
-        /// `BC_*` slots that `JitCodeBuilder::write_insn` writes via
-        /// `insn_byte`.
+        /// All emit helpers (`record_binop_i`, `goto_if_not_*`,
+        /// `int/ref/float_guard_value`, etc.) now push 1-byte register
+        /// operands matching the canonical `bhhandler_*` decoders, so
+        /// every key here is the upstream-canonical opname/argcodes
+        /// pair (no `_pyre_u16` suffix).
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
             use majit_translate::insns;
             let mut builder = BlackholeInterpBuilder::new();
             let mut entries: majit_ir::vec_assoc::VecAssoc<String, u8> =
                 majit_ir::vec_assoc::VecAssoc::new();
-            entries.insert("int_copy_pyre_u16/i>i".to_string(), insns::BC_MOVE_I);
-            entries.insert("ref_copy_pyre_u16/r>r".to_string(), insns::BC_MOVE_R);
-            entries.insert("int_add_pyre_u16/ii>i".to_string(), insns::BC_INT_ADD);
-            entries.insert("int_mul_pyre_u16/ii>i".to_string(), insns::BC_INT_MUL);
-            entries.insert("int_neg_pyre_u16/i>i".to_string(), insns::BC_INT_NEG);
-            entries.insert(
-                "ptr_nonzero_pyre_u16/r>i".to_string(),
-                insns::BC_PTR_NONZERO,
-            );
+            entries.insert("int_copy/i>i".to_string(), insns::BC_MOVE_I);
+            entries.insert("ref_copy/r>r".to_string(), insns::BC_MOVE_R);
+            entries.insert("int_add/ii>i".to_string(), insns::BC_INT_ADD);
+            entries.insert("int_mul/ii>i".to_string(), insns::BC_INT_MUL);
+            entries.insert("int_neg/i>i".to_string(), insns::BC_INT_NEG);
+            entries.insert("ptr_nonzero/r>i".to_string(), insns::BC_PTR_NONZERO);
             entries.insert("goto/L".to_string(), insns::BC_JUMP);
             entries.insert(
-                "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
+                "goto_if_not_int_is_true/iL".to_string(),
                 insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
             );
             // Canonical `goto_if_not/iL` alias — `bhimpl_goto_if_not_int_is_true =
             // bhimpl_goto_if_not` (`blackhole.py:913`) routes both bytes to
             // the same handler body.
-            entries.insert("goto_if_not_pyre_u16/iL".to_string(), insns::BC_GOTO_IF_NOT);
+            entries.insert("goto_if_not/iL".to_string(), insns::BC_GOTO_IF_NOT);
             entries.insert(
-                "goto_if_not_ptr_nonzero_pyre_u16/rL".to_string(),
+                "goto_if_not_ptr_nonzero/rL".to_string(),
                 insns::BC_GOTO_IF_NOT_PTR_NONZERO,
             );
             builder.setup_insns(&entries);
@@ -6691,553 +6686,10 @@ fn handler_residual_call_r_v(
     Ok(p)
 }
 
-// ── pyre-u16 register-width adapters (Sub-slice C.1) ────────────────
-//
-// PRE-EXISTING-ADAPTATION (pyre register-width axis):
-// pyre's `JitCodeBuilder::push_u16` (`assembler.rs:3300`) writes 2
-// bytes per register operand because pyre lifts RPython's 256-register
-// cap.  RPython's argcode contract (`blackhole.py:107`) reads 1 byte
-// per register (`code[position] as usize`).  These `*_pyre_u16`
-// handlers decode pyre's 2-byte register layout for the inline-call-
-// only production builder's `setup_insns` entries.  Each variant is
-// otherwise byte-for-byte identical to its canonical sister handler.
-// Convergence path: revisit only if pyre's register allocator caps
-// under 256 (Task #45 Sub-slice C-A, currently rejected as
-// register-rich pyre jitcodes panic at 256+).
-
-fn handler_int_copy_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    bh.registers_i[dst] = bh.registers_i[src];
-    Ok(position + 4)
-}
-
-fn handler_ref_copy_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    bh.registers_r[dst] = bh.registers_r[src];
-    Ok(position + 4)
-}
-
-fn handler_ref_return_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_r = bh.registers_r[src];
-    bh.return_type = BhReturnType::Ref;
-    bh.position = position + 2;
-    Err(DispatchError::LeaveFrame)
-}
-
-fn handler_raise_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
-    let exc = bh.registers_r[src];
-    bh.position = p + 2;
-    // `blackhole.py:1000` `bhimpl_raise(excvalue)` — `assert e` requires
-    // a non-null exception object.  Pyre's flat `BC_RAISE` encoding keeps
-    // the existing null-exception behavior by routing a null `exc` through
-    // `aborted = true` + `LeaveFrame`.
-    if exc != 0 {
-        Err(DispatchError::RaiseException(exc))
-    } else {
-        bh.aborted = true;
-        Err(DispatchError::LeaveFrame)
-    }
-}
-
-fn handler_last_exc_value_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let dst = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
-    bh.registers_r[dst] = bh.exception_last_value;
-    Ok(p + 2)
-}
-
-fn handler_goto_if_not_int_is_true_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let a = bh.registers_i[reg];
-    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    let pc = position + 4;
-    if a != 0 { Ok(pc) } else { Ok(target) }
-}
-
-// Sub-slice C.5: extra pyre-u16 handlers wired into
-// `build_inline_call_only_bh_builder` so its `setup_insns` covers
-// every BC_* the inline_call test fixtures emit.  Register-width
-// rationale lives at the C.1 block-header.
-
-fn handler_int_return_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_i = bh.registers_i[src];
-    bh.return_type = BhReturnType::Int;
-    bh.position = position + 2;
-    Err(DispatchError::LeaveFrame)
-}
-
-fn handler_float_return_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_f = bh.registers_f[src];
-    bh.return_type = BhReturnType::Float;
-    bh.position = position + 2;
-    Err(DispatchError::LeaveFrame)
-}
-
-fn handler_float_copy_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    bh.registers_f[dst] = bh.registers_f[src];
-    Ok(position + 4)
-}
-
-/// pyre-u16 mirror of `bhhandler_ii_i!` for `record_binop_i` emit
-/// shape (`assembler.rs:746`): `dst, lhs, rhs` as 2-byte register
-/// indices each (6 bytes total), opposite to the canonical
-/// `lhs, rhs, dst` 1-byte order.  Generates a fn-pointer handler for
-/// every `int_*/ii>i` and `uint_*/ii>i` opname JitCodeBuilder ever
-/// produces.
-macro_rules! bhhandler_ii_i_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let lhs = bh.registers_i[a];
-            let rhs = bh.registers_i[b];
-            bh.registers_i[dst] = $bhimpl(lhs, rhs);
-            Ok(position + 6)
-        }
-    };
-}
-
-bhhandler_ii_i_pyre_u16!(handler_int_add_pyre_u16, bhimpl_int_add);
-bhhandler_ii_i_pyre_u16!(handler_int_sub_pyre_u16, bhimpl_int_sub);
-bhhandler_ii_i_pyre_u16!(handler_int_mul_pyre_u16, bhimpl_int_mul);
-// `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
-// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
-// `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
-// jitcode emission, so neither opcode nor handler exists.
-bhhandler_ii_i_pyre_u16!(handler_int_and_pyre_u16, bhimpl_int_and);
-bhhandler_ii_i_pyre_u16!(handler_int_or_pyre_u16, bhimpl_int_or);
-bhhandler_ii_i_pyre_u16!(handler_int_xor_pyre_u16, bhimpl_int_xor);
-bhhandler_ii_i_pyre_u16!(handler_int_lshift_pyre_u16, bhimpl_int_lshift);
-bhhandler_ii_i_pyre_u16!(handler_int_rshift_pyre_u16, bhimpl_int_rshift);
-bhhandler_ii_i_pyre_u16!(handler_int_eq_pyre_u16, bhimpl_int_eq);
-bhhandler_ii_i_pyre_u16!(handler_int_ne_pyre_u16, bhimpl_int_ne);
-bhhandler_ii_i_pyre_u16!(handler_int_lt_pyre_u16, bhimpl_int_lt);
-bhhandler_ii_i_pyre_u16!(handler_int_le_pyre_u16, bhimpl_int_le);
-bhhandler_ii_i_pyre_u16!(handler_int_gt_pyre_u16, bhimpl_int_gt);
-bhhandler_ii_i_pyre_u16!(handler_int_ge_pyre_u16, bhimpl_int_ge);
-bhhandler_ii_i_pyre_u16!(handler_uint_lt_pyre_u16, bhimpl_uint_lt);
-bhhandler_ii_i_pyre_u16!(handler_uint_le_pyre_u16, bhimpl_uint_le);
-bhhandler_ii_i_pyre_u16!(handler_uint_gt_pyre_u16, bhimpl_uint_gt);
-bhhandler_ii_i_pyre_u16!(handler_uint_ge_pyre_u16, bhimpl_uint_ge);
-bhhandler_ii_i_pyre_u16!(handler_uint_rshift_pyre_u16, bhimpl_uint_rshift);
-bhhandler_ii_i_pyre_u16!(handler_uint_mul_high_pyre_u16, bhimpl_uint_mul_high);
-
-/// pyre-u16 mirror of `bhhandler_i_i!` for `record_unary_i` emit
-/// shape (`assembler.rs:784`): `dst, src` as 2-byte register indices
-/// each (4 bytes total), opposite to the canonical `src, dst` 1-byte
-/// order.
-macro_rules! bhhandler_i_i_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            bh.registers_i[dst] = $bhimpl(bh.registers_i[src]);
-            Ok(position + 4)
-        }
-    };
-}
-
-bhhandler_i_i_pyre_u16!(handler_int_neg_pyre_u16, bhimpl_int_neg);
-bhhandler_i_i_pyre_u16!(handler_int_invert_pyre_u16, bhimpl_int_invert);
-
-/// pyre-u16 mirror of `bhhandler_ff_f!` for `record_binop_f` emit
-/// shape (`assembler.rs:2956`): `dst, lhs, rhs` as 2-byte register
-/// indices each (6 bytes total).  `registers_f` stores f64 bit
-/// patterns as i64; helpers reinterpret-cast each direction.
-macro_rules! bhhandler_ff_f_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let lhs = f64::from_bits(bh.registers_f[a] as u64);
-            let rhs = f64::from_bits(bh.registers_f[b] as u64);
-            bh.registers_f[dst] = $bhimpl(lhs, rhs).to_bits() as i64;
-            Ok(position + 6)
-        }
-    };
-}
-
-bhhandler_ff_f_pyre_u16!(handler_float_add_pyre_u16, bhimpl_float_add);
-bhhandler_ff_f_pyre_u16!(handler_float_sub_pyre_u16, bhimpl_float_sub);
-bhhandler_ff_f_pyre_u16!(handler_float_mul_pyre_u16, bhimpl_float_mul);
-bhhandler_ff_f_pyre_u16!(handler_float_truediv_pyre_u16, bhimpl_float_truediv);
-
-/// pyre-u16 mirror of `bhhandler_f_f!` for `record_unary_f` emit shape
-/// (`assembler.rs:2974`): `dst, src` as 2-byte register indices each
-/// (4 bytes total).
-macro_rules! bhhandler_f_f_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let a = f64::from_bits(bh.registers_f[src] as u64);
-            bh.registers_f[dst] = $bhimpl(a).to_bits() as i64;
-            Ok(position + 4)
-        }
-    };
-}
-
-bhhandler_f_f_pyre_u16!(handler_float_neg_pyre_u16, bhimpl_float_neg);
-bhhandler_f_f_pyre_u16!(handler_float_abs_pyre_u16, bhimpl_float_abs);
-
-/// pyre-u16 mirror of `bhhandler_rr_i!` for `record_binop_r` emit
-/// shape (`assembler.rs:799`): `dst, lhs, rhs` as 2-byte register
-/// indices each (6 bytes total).  `registers_r` stores raw GcRef
-/// pointer bits.
-macro_rules! bhhandler_rr_i_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let lhs = bh.registers_r[a];
-            let rhs = bh.registers_r[b];
-            bh.registers_i[dst] = $bhimpl(lhs, rhs);
-            Ok(position + 6)
-        }
-    };
-}
-
-// `instance_ptr_eq` / `instance_ptr_ne` reuse `bhimpl_ptr_eq` /
-// `bhimpl_ptr_ne` mirroring the canonical wiring at `bhhandler_rr_i`
-// invocations near the bhimpl definitions.
-bhhandler_rr_i_pyre_u16!(handler_ptr_eq_pyre_u16, bhimpl_ptr_eq);
-bhhandler_rr_i_pyre_u16!(handler_ptr_ne_pyre_u16, bhimpl_ptr_ne);
-bhhandler_rr_i_pyre_u16!(handler_instance_ptr_eq_pyre_u16, bhimpl_ptr_eq);
-bhhandler_rr_i_pyre_u16!(handler_instance_ptr_ne_pyre_u16, bhimpl_ptr_ne);
-
-/// pyre-u16 mirror of the canonical `r>i` 1-byte handler shape used
-/// by `ptr_iszero` / `ptr_nonzero` (`assembler.rs:817,825`):
-/// `dst, src` as 2-byte register indices each (4 bytes total).
-macro_rules! bhhandler_r_i_pyre_u16 {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            bh.registers_i[dst] = $bhimpl(bh.registers_r[src]);
-            Ok(position + 4)
-        }
-    };
-}
-
-bhhandler_r_i_pyre_u16!(handler_ptr_iszero_pyre_u16, bhimpl_ptr_iszero);
-bhhandler_r_i_pyre_u16!(handler_ptr_nonzero_pyre_u16, bhimpl_ptr_nonzero);
-
-/// pyre-u16 mirror of `bhhandler_goto_if_not_ii!` for `iiL` argcode
-/// shape (`assembler.rs:880`-): `a, b, target` as 2-byte indices each
-/// (6 bytes total), opposite to canonical 1-byte registers + 2-byte
-/// label.  RPython parity: `blackhole.py:871-911 bhimpl_goto_if_not_*`.
-macro_rules! bhhandler_goto_if_not_ii_pyre_u16 {
-    ($name:ident, $cmp:expr) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let a = bh.registers_i[a_idx];
-            let b = bh.registers_i[b_idx];
-            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let pc = position + 6;
-            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
-        }
-    };
-}
-
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_lt_pyre_u16, |a: i64, b: i64| a < b);
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_le_pyre_u16, |a: i64, b: i64| a <= b);
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_eq_pyre_u16, |a: i64, b: i64| a == b);
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_ne_pyre_u16, |a: i64, b: i64| a != b);
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_gt_pyre_u16, |a: i64, b: i64| a > b);
-bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_ge_pyre_u16, |a: i64, b: i64| a >= b);
-
-/// pyre-u16 mirror of `bhhandler_goto_if_not_ff!` for `ffL` argcode
-/// shape: `a, b, target` as 2-byte indices each (6 bytes total).
-/// `registers_f` stores f64 bit patterns as i64.  RPython parity:
-/// `blackhole.py:751-798 bhimpl_goto_if_not_float_*`.
-macro_rules! bhhandler_goto_if_not_ff_pyre_u16 {
-    ($name:ident, $cmp:expr) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let a = f64::from_bits(bh.registers_f[a_idx] as u64);
-            let b = f64::from_bits(bh.registers_f[b_idx] as u64);
-            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let pc = position + 6;
-            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
-        }
-    };
-}
-
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_lt_pyre_u16, |a: f64, b: f64| a
-    < b);
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_le_pyre_u16, |a: f64, b: f64| a
-    <= b);
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_eq_pyre_u16, |a: f64, b: f64| a
-    == b);
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_ne_pyre_u16, |a: f64, b: f64| a
-    != b);
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_gt_pyre_u16, |a: f64, b: f64| a
-    > b);
-bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_ge_pyre_u16, |a: f64, b: f64| a
-    >= b);
-
-/// pyre-u16 mirror for `rrL` argcode shape: `a, b, target` as 2-byte
-/// indices each (6 bytes total), reading ref registers.  RPython
-/// parity: `blackhole.py:806-815 bhimpl_goto_if_not_ptr_{eq,ne}`.
-macro_rules! bhhandler_goto_if_not_rr_pyre_u16 {
-    ($name:ident, $cmp:expr) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-            let a = bh.registers_r[a_idx];
-            let b = bh.registers_r[b_idx];
-            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
-            let pc = position + 6;
-            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
-        }
-    };
-}
-
-bhhandler_goto_if_not_rr_pyre_u16!(handler_goto_if_not_ptr_eq_pyre_u16, |a: i64, b: i64| a == b);
-bhhandler_goto_if_not_rr_pyre_u16!(handler_goto_if_not_ptr_ne_pyre_u16, |a: i64, b: i64| a != b);
-
-fn handler_goto_if_not_int_is_zero_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let a = bh.registers_i[reg];
-    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    let pc = position + 4;
-    // blackhole.py:916-920: fall through iff `not a` (a == 0).
-    if a == 0 { Ok(pc) } else { Ok(target) }
-}
-
-fn handler_goto_if_not_ptr_iszero_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let a = bh.registers_r[reg];
-    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    let pc = position + 4;
-    if a == 0 { Ok(pc) } else { Ok(target) }
-}
-
-fn handler_goto_if_not_ptr_nonzero_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let a = bh.registers_r[reg];
-    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
-    let pc = position + 4;
-    if a != 0 { Ok(pc) } else { Ok(target) }
-}
-
-/// pyre-u16 mirror of `handler_goto_if_exception_mismatch` reading a
-/// 2-byte register index for the bounding vtable register and a 2-byte
-/// label.  Mirrors the canonical handler at `blackhole.rs` (uses
-/// `cpu.bh_classof` + `cpu.bh_issubclass`).
-fn handler_goto_if_exception_mismatch_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let reg = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
-    let bounding_vtable = bh.registers_i[reg];
-    let target = u16::from_le_bytes([code[p + 2], code[p + 3]]) as usize;
-    let pc = p + 4;
-    let exc_obj = bh.exception_last_value;
-    let exc_typeptr = if let Some(cpu) = bh.cpu {
-        cpu.bh_classof(exc_obj)
-    } else {
-        exc_obj
-    };
-    let is_match = if let Some(cpu) = bh.cpu {
-        cpu.bh_issubclass(exc_typeptr, bounding_vtable)
-    } else {
-        exc_typeptr == bounding_vtable
-    };
-    if is_match { Ok(pc) } else { Ok(target) }
-}
-
-// P7 — push/pop/guard_value/last_exception pyre-u16 family.  pyre
-// emits these with 2-byte register operands (assembler.rs:1306,1352,
-// 2692,2738); canonical 1-byte handlers would mis-decode the second
-// operand byte as an opcode.
-
-fn handler_int_push_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_i = bh.registers_i[src];
-    Ok(position + 2)
-}
-
-fn handler_ref_push_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_r = bh.registers_r[src];
-    Ok(position + 2)
-}
-
-fn handler_float_push_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.tmpreg_f = bh.registers_f[src];
-    Ok(position + 2)
-}
-
-fn handler_int_pop_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.registers_i[dst] = bh.tmpreg_i;
-    Ok(position + 2)
-}
-
-fn handler_ref_pop_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.registers_r[dst] = bh.tmpreg_r;
-    Ok(position + 2)
-}
-
-fn handler_float_pop_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    bh.registers_f[dst] = bh.tmpreg_f;
-    Ok(position + 2)
-}
-
-/// `int_guard_value/i` / `ref_guard_value/r` / `float_guard_value/f`
-/// — blackhole-time no-op (the trace-side promotion is a tracing-only
-/// concern).  Just consume the 2-byte u16 register operand.
-fn handler_guard_value_noop_pyre_u16(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 2)
-}
-
-/// `last_exception/>i` pyre-u16 — read 2-byte dst register, write the
-/// classof(exception_last_value) typeptr.  Mirror of
-/// `handler_last_exception` (`blackhole.rs:9536`) with widened operand.
-fn handler_last_exception_pyre_u16(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
-    let exc_obj = bh.exception_last_value;
-    let typeptr = if let Some(cpu) = bh.cpu {
-        cpu.bh_classof(exc_obj)
-    } else {
-        exc_obj
-    };
-    bh.registers_i[dst] = typeptr;
-    Ok(position + 2)
-}
+// Task #45 A1-A8: every BC_* emitted by pyre now follows the canonical
+// RPython argcode contract (1-byte register operands per
+// `blackhole.py:107`).  All `*_pyre_u16` width adapters have been
+// retired; canonical `handler_*` decoders own every dispatch slot.
 
 /// Per-thread Backend instance for blackhole's `bh_getfield_gc_*` /
 /// `bh_setfield_gc_*` / `bh_getarrayitem_gc_*` / `bh_arraylen_gc` reads.
@@ -7304,10 +6756,9 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 ///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` (Slice 3.1)
 ///   - Sub-slice B byte-identical canonical: `live/`, `loop_header/i`,
 ///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
-///   - Sub-slice C.1 misc-family pyre-u16: `int_copy_pyre_u16/i>i`,
-///     `ref_copy_pyre_u16/r>r`, `ref_return_pyre_u16/r`,
-///     `raise_pyre_u16/r`, `last_exc_value_pyre_u16/>r`,
-///     `goto_if_not_int_is_true_pyre_u16/iL`
+///   - A1-A8 canonical-encoded: every `JitCodeBuilder`-emitted BC_*
+///     now pushes 1-byte register operands matching the canonical
+///     RPython argcode contract; no `_pyre_u16` width adapters remain.
 /// The pyre-jit production thread-locals (`BH_BUILDER3`,
 /// `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
 /// shape.
@@ -7409,34 +6860,28 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "jit_merge_point/cIRFIRF".to_string(),
         majit_translate::insns::BC_JIT_MERGE_POINT_C,
     );
-    // Sub-slice C.1 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
-    // misc family — six BC_* whose `JitCodeBuilder` emit-side payload
-    // uses pyre's u16 register-width layout that diverges from the
-    // canonical 1-byte argcode contract.  Each `*_pyre_u16` handler
-    // decodes 2-byte register operands; labels remain u16 in both
-    // pyre and RPython, so only register operands needed widening.
+    // A1/A2 canonical-encoded family — `int_copy/i>i`, `ref_copy/r>r`,
+    // `ref_return/r`, `raise/r`, `last_exc_value/>r` all emit 1-byte
+    // register operands matching the canonical bhhandler decoders.
     insns.insert(
-        "int_copy_pyre_u16/i>i".to_string(),
+        "int_copy/i>i".to_string(),
         majit_translate::insns::BC_MOVE_I,
     );
     insns.insert(
-        "ref_copy_pyre_u16/r>r".to_string(),
+        "ref_copy/r>r".to_string(),
         majit_translate::insns::BC_MOVE_R,
     );
     insns.insert(
-        "ref_return_pyre_u16/r".to_string(),
+        "ref_return/r".to_string(),
         majit_translate::insns::BC_REF_RETURN,
     );
+    insns.insert("raise/r".to_string(), majit_translate::insns::BC_RAISE);
     insns.insert(
-        "raise_pyre_u16/r".to_string(),
-        majit_translate::insns::BC_RAISE,
-    );
-    insns.insert(
-        "last_exc_value_pyre_u16/>r".to_string(),
+        "last_exc_value/>r".to_string(),
         majit_translate::insns::BC_LAST_EXC_VALUE,
     );
     insns.insert(
-        "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
+        "goto_if_not_int_is_true/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
     );
     // `blackhole.py:913 bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`
@@ -7445,24 +6890,22 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // canonical key `goto_if_not/iL` its own byte (`BC_GOTO_IF_NOT`)
     // distinct from the alias byte (`BC_GOTO_IF_NOT_INT_IS_TRUE`).
     insns.insert(
-        "goto_if_not_pyre_u16/iL".to_string(),
+        "goto_if_not/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT,
     );
     // Sub-slice C.5: cover the BC_* set the inline_call-only test
     // fixtures emit (`int_return`, `float_return`, `int_add`,
     // `float_copy`, `void_return`, `abort`, `abort_permanent`) so the
     // production builder is closed over every opname pyre's
-    // `JitCodeBuilder` can produce.  The first four use new pyre-u16
-    // handlers (defined alongside the C.1 misc family) for 2-byte
-    // register operands; the last three carry no register operands and
-    // reuse the existing canonical handlers (`handler_void_return`,
-    // `handler_abort_marker_pyre`, `handler_abort_permanent`).
+    // `JitCodeBuilder` can produce.  All A-slice migrations complete:
+    // every key here is canonical (1-byte register operands) and reuses
+    // canonical `handler_*` decoders wired in `wire_bhimpl_handlers`.
     insns.insert(
-        "int_return_pyre_u16/i".to_string(),
+        "int_return/i".to_string(),
         majit_translate::insns::BC_INT_RETURN,
     );
     insns.insert(
-        "float_return_pyre_u16/f".to_string(),
+        "float_return/f".to_string(),
         majit_translate::insns::BC_FLOAT_RETURN,
     );
     insns.insert(
@@ -7470,46 +6913,34 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         majit_translate::insns::BC_VOID_RETURN,
     );
     insns.insert(
-        "float_copy_pyre_u16/f>f".to_string(),
+        "float_copy/f>f".to_string(),
         majit_translate::insns::BC_MOVE_F,
     );
-    // P4 — full int binop+cmp+uint family (`record_binop_i` emit shape).
-    // 22 keys covering every `ii>i` opname JitCodeBuilder produces.
+    // A5 epic: full int binop+cmp+uint family (`record_binop_i` emit
+    // shape), canonical 1-byte register encoding with `[lhs][rhs][dst]`
+    // operand order matching `bhhandler_ii_i!`.
     for (key, byte) in [
-        ("int_add_pyre_u16/ii>i", majit_translate::insns::BC_INT_ADD),
-        ("int_sub_pyre_u16/ii>i", majit_translate::insns::BC_INT_SUB),
-        ("int_mul_pyre_u16/ii>i", majit_translate::insns::BC_INT_MUL),
-        // `int_floordiv_pyre_u16` / `int_mod_pyre_u16` setup_insns
-        // entries removed: byte-reservation constants `BC_INT_FLOORDIV`
-        // / `BC_INT_MOD` were retired in main's `5bcfcb3efbf` parity
-        // fix, and no producer emits the `_pyre_u16` opname variants.
-        ("int_and_pyre_u16/ii>i", majit_translate::insns::BC_INT_AND),
-        ("int_or_pyre_u16/ii>i", majit_translate::insns::BC_INT_OR),
-        ("int_xor_pyre_u16/ii>i", majit_translate::insns::BC_INT_XOR),
+        ("int_add/ii>i", majit_translate::insns::BC_INT_ADD),
+        ("int_sub/ii>i", majit_translate::insns::BC_INT_SUB),
+        ("int_mul/ii>i", majit_translate::insns::BC_INT_MUL),
+        ("int_and/ii>i", majit_translate::insns::BC_INT_AND),
+        ("int_or/ii>i", majit_translate::insns::BC_INT_OR),
+        ("int_xor/ii>i", majit_translate::insns::BC_INT_XOR),
+        ("int_lshift/ii>i", majit_translate::insns::BC_INT_LSHIFT),
+        ("int_rshift/ii>i", majit_translate::insns::BC_INT_RSHIFT),
+        ("int_eq/ii>i", majit_translate::insns::BC_INT_EQ),
+        ("int_ne/ii>i", majit_translate::insns::BC_INT_NE),
+        ("int_lt/ii>i", majit_translate::insns::BC_INT_LT),
+        ("int_le/ii>i", majit_translate::insns::BC_INT_LE),
+        ("int_gt/ii>i", majit_translate::insns::BC_INT_GT),
+        ("int_ge/ii>i", majit_translate::insns::BC_INT_GE),
+        ("uint_lt/ii>i", majit_translate::insns::BC_UINT_LT),
+        ("uint_le/ii>i", majit_translate::insns::BC_UINT_LE),
+        ("uint_gt/ii>i", majit_translate::insns::BC_UINT_GT),
+        ("uint_ge/ii>i", majit_translate::insns::BC_UINT_GE),
+        ("uint_rshift/ii>i", majit_translate::insns::BC_UINT_RSHIFT),
         (
-            "int_lshift_pyre_u16/ii>i",
-            majit_translate::insns::BC_INT_LSHIFT,
-        ),
-        (
-            "int_rshift_pyre_u16/ii>i",
-            majit_translate::insns::BC_INT_RSHIFT,
-        ),
-        ("int_eq_pyre_u16/ii>i", majit_translate::insns::BC_INT_EQ),
-        ("int_ne_pyre_u16/ii>i", majit_translate::insns::BC_INT_NE),
-        ("int_lt_pyre_u16/ii>i", majit_translate::insns::BC_INT_LT),
-        ("int_le_pyre_u16/ii>i", majit_translate::insns::BC_INT_LE),
-        ("int_gt_pyre_u16/ii>i", majit_translate::insns::BC_INT_GT),
-        ("int_ge_pyre_u16/ii>i", majit_translate::insns::BC_INT_GE),
-        ("uint_lt_pyre_u16/ii>i", majit_translate::insns::BC_UINT_LT),
-        ("uint_le_pyre_u16/ii>i", majit_translate::insns::BC_UINT_LE),
-        ("uint_gt_pyre_u16/ii>i", majit_translate::insns::BC_UINT_GT),
-        ("uint_ge_pyre_u16/ii>i", majit_translate::insns::BC_UINT_GE),
-        (
-            "uint_rshift_pyre_u16/ii>i",
-            majit_translate::insns::BC_UINT_RSHIFT,
-        ),
-        (
-            "uint_mul_high_pyre_u16/ii>i",
+            "uint_mul_high/ii>i",
             majit_translate::insns::BC_UINT_MUL_HIGH,
         ),
     ] {
@@ -7519,132 +6950,106 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // 14 keys covering record_unary_i/f, record_binop_f, record_binop_r,
     // and ptr_iszero/nonzero (`assembler.rs:784,817,825,2956,2974,799`).
     for (key, byte) in [
-        ("int_neg_pyre_u16/i>i", majit_translate::insns::BC_INT_NEG),
+        ("int_neg/i>i", majit_translate::insns::BC_INT_NEG),
+        ("int_invert/i>i", majit_translate::insns::BC_INT_INVERT),
+        ("float_add/ff>f", majit_translate::insns::BC_FLOAT_ADD),
+        ("float_sub/ff>f", majit_translate::insns::BC_FLOAT_SUB),
+        ("float_mul/ff>f", majit_translate::insns::BC_FLOAT_MUL),
         (
-            "int_invert_pyre_u16/i>i",
-            majit_translate::insns::BC_INT_INVERT,
-        ),
-        (
-            "float_add_pyre_u16/ff>f",
-            majit_translate::insns::BC_FLOAT_ADD,
-        ),
-        (
-            "float_sub_pyre_u16/ff>f",
-            majit_translate::insns::BC_FLOAT_SUB,
-        ),
-        (
-            "float_mul_pyre_u16/ff>f",
-            majit_translate::insns::BC_FLOAT_MUL,
-        ),
-        (
-            "float_truediv_pyre_u16/ff>f",
+            "float_truediv/ff>f",
             majit_translate::insns::BC_FLOAT_TRUEDIV,
         ),
+        ("float_neg/f>f", majit_translate::insns::BC_FLOAT_NEG),
+        ("float_abs/f>f", majit_translate::insns::BC_FLOAT_ABS),
+        ("ptr_eq/rr>i", majit_translate::insns::BC_PTR_EQ),
+        ("ptr_ne/rr>i", majit_translate::insns::BC_PTR_NE),
         (
-            "float_neg_pyre_u16/f>f",
-            majit_translate::insns::BC_FLOAT_NEG,
-        ),
-        (
-            "float_abs_pyre_u16/f>f",
-            majit_translate::insns::BC_FLOAT_ABS,
-        ),
-        ("ptr_eq_pyre_u16/rr>i", majit_translate::insns::BC_PTR_EQ),
-        ("ptr_ne_pyre_u16/rr>i", majit_translate::insns::BC_PTR_NE),
-        (
-            "instance_ptr_eq_pyre_u16/rr>i",
+            "instance_ptr_eq/rr>i",
             majit_translate::insns::BC_INSTANCE_PTR_EQ,
         ),
         (
-            "instance_ptr_ne_pyre_u16/rr>i",
+            "instance_ptr_ne/rr>i",
             majit_translate::insns::BC_INSTANCE_PTR_NE,
         ),
-        (
-            "ptr_iszero_pyre_u16/r>i",
-            majit_translate::insns::BC_PTR_ISZERO,
-        ),
-        (
-            "ptr_nonzero_pyre_u16/r>i",
-            majit_translate::insns::BC_PTR_NONZERO,
-        ),
+        ("ptr_iszero/r>i", majit_translate::insns::BC_PTR_ISZERO),
+        ("ptr_nonzero/r>i", majit_translate::insns::BC_PTR_NONZERO),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // P6 — branch pyre-u16 family.  Every `goto_if_not_*` opname
-    // JitCodeBuilder emits, decoding 2-byte register operands +
-    // 2-byte label.  17 keys; the existing `goto_if_not_int_is_true_pyre_u16/iL`
-    // and `goto_if_not_ptr_nonzero_pyre_u16/rL` are registered above
-    // (Sub-slice C.1 + C.5.1).
+    // A7 — branch family canonical 1-byte register + 2-byte label
+    // encoding.  Every `goto_if_not_*` opname JitCodeBuilder emits,
+    // matching the canonical `bhhandler_goto_if_not_*` decoders.
     for (key, byte) in [
         (
-            "goto_if_not_int_lt_pyre_u16/iiL",
+            "goto_if_not_int_lt/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_LT,
         ),
         (
-            "goto_if_not_int_le_pyre_u16/iiL",
+            "goto_if_not_int_le/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_LE,
         ),
         (
-            "goto_if_not_int_eq_pyre_u16/iiL",
+            "goto_if_not_int_eq/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_EQ,
         ),
         (
-            "goto_if_not_int_ne_pyre_u16/iiL",
+            "goto_if_not_int_ne/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_NE,
         ),
         (
-            "goto_if_not_int_gt_pyre_u16/iiL",
+            "goto_if_not_int_gt/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_GT,
         ),
         (
-            "goto_if_not_int_ge_pyre_u16/iiL",
+            "goto_if_not_int_ge/iiL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_GE,
         ),
         (
-            "goto_if_not_float_lt_pyre_u16/ffL",
+            "goto_if_not_float_lt/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LT,
         ),
         (
-            "goto_if_not_float_le_pyre_u16/ffL",
+            "goto_if_not_float_le/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LE,
         ),
         (
-            "goto_if_not_float_eq_pyre_u16/ffL",
+            "goto_if_not_float_eq/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_EQ,
         ),
         (
-            "goto_if_not_float_ne_pyre_u16/ffL",
+            "goto_if_not_float_ne/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_NE,
         ),
         (
-            "goto_if_not_float_gt_pyre_u16/ffL",
+            "goto_if_not_float_gt/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GT,
         ),
         (
-            "goto_if_not_float_ge_pyre_u16/ffL",
+            "goto_if_not_float_ge/ffL",
             majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GE,
         ),
         (
-            "goto_if_not_ptr_eq_pyre_u16/rrL",
+            "goto_if_not_ptr_eq/rrL",
             majit_translate::insns::BC_GOTO_IF_NOT_PTR_EQ,
         ),
         (
-            "goto_if_not_ptr_ne_pyre_u16/rrL",
+            "goto_if_not_ptr_ne/rrL",
             majit_translate::insns::BC_GOTO_IF_NOT_PTR_NE,
         ),
         (
-            "goto_if_not_int_is_zero_pyre_u16/iL",
+            "goto_if_not_int_is_zero/iL",
             majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_ZERO,
         ),
         (
-            "goto_if_not_ptr_iszero_pyre_u16/rL",
+            "goto_if_not_ptr_iszero/rL",
             majit_translate::insns::BC_GOTO_IF_NOT_PTR_ISZERO,
         ),
         (
-            "goto_if_exception_mismatch_pyre_u16/iL",
+            "goto_if_exception_mismatch/iL",
             majit_translate::insns::BC_GOTO_IF_EXCEPTION_MISMATCH,
         ),
         (
-            "goto_if_not_ptr_nonzero_pyre_u16/rL",
+            "goto_if_not_ptr_nonzero/rL",
             majit_translate::insns::BC_GOTO_IF_NOT_PTR_NONZERO,
         ),
     ] {
@@ -7680,35 +7085,31 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             "store_state_varray/dii",
             majit_translate::insns::BC_STORE_STATE_VARRAY,
         ),
-        // push/pop pyre-u16 — 2-byte register operand.
-        ("int_push_pyre_u16/i", majit_translate::insns::BC_INT_PUSH),
-        ("int_pop_pyre_u16/>i", majit_translate::insns::BC_INT_POP),
-        ("ref_push_pyre_u16/r", majit_translate::insns::BC_REF_PUSH),
-        ("ref_pop_pyre_u16/>r", majit_translate::insns::BC_REF_POP),
+        // A3 epic: push/pop family migrated to canonical 1-byte register
+        // encoding; handlers wired in `wire_bhimpl_handlers` decode via
+        // `code[position]` (`bhhandler_push_*` / `bhhandler_pop_*`).
+        ("int_push/i", majit_translate::insns::BC_INT_PUSH),
+        ("int_pop/>i", majit_translate::insns::BC_INT_POP),
+        ("ref_push/r", majit_translate::insns::BC_REF_PUSH),
+        ("ref_pop/>r", majit_translate::insns::BC_REF_POP),
+        ("float_push/f", majit_translate::insns::BC_FLOAT_PUSH),
+        ("float_pop/>f", majit_translate::insns::BC_FLOAT_POP),
+        // guard_value canonical — 1-byte register, blackhole no-op.
         (
-            "float_push_pyre_u16/f",
-            majit_translate::insns::BC_FLOAT_PUSH,
-        ),
-        (
-            "float_pop_pyre_u16/>f",
-            majit_translate::insns::BC_FLOAT_POP,
-        ),
-        // guard_value pyre-u16 — 2-byte register, blackhole no-op.
-        (
-            "int_guard_value_pyre_u16/i",
+            "int_guard_value/i",
             majit_translate::insns::BC_INT_GUARD_VALUE,
         ),
         (
-            "ref_guard_value_pyre_u16/r",
+            "ref_guard_value/r",
             majit_translate::insns::BC_REF_GUARD_VALUE,
         ),
         (
-            "float_guard_value_pyre_u16/f",
+            "float_guard_value/f",
             majit_translate::insns::BC_FLOAT_GUARD_VALUE,
         ),
-        // last_exception pyre-u16 — 2-byte dst register.
+        // last_exception canonical — 1-byte dst register.
         (
-            "last_exception_pyre_u16/>i",
+            "last_exception/>i",
             majit_translate::insns::BC_LAST_EXCEPTION,
         ),
         // operand-less canonical (byte-identical between pyre and RPython).
@@ -8061,6 +7462,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler(
         "goto_if_not_ptr_nonzero/rL",
         handler_goto_if_not_ptr_nonzero,
+    );
+    // `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` alias
+    // (`blackhole.py:913`) — both opcode bytes route to the same body.
+    builder.wire_handler("goto_if_not_int_is_true/iL", handler_goto_if_not);
+    builder.wire_handler(
+        "goto_if_exception_mismatch/iL",
+        handler_goto_if_exception_mismatch,
     );
     builder.wire_handler("unreachable/", handler_unreachable);
 
@@ -8416,196 +7824,37 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("float_return/f", handler_float_return);
     builder.wire_handler("void_return/", handler_void_return);
 
-    // PRE-EXISTING-ADAPTATION: pyre-u16 register-width adapters (Sub-slice C.1).
-    // See the block-header comment on `handler_int_copy_pyre_u16` for the
-    // RPython argcode contract divergence rationale.  These wirings are
-    // inert for builders whose `setup_insns` does not register the
-    // matching opname (`build_default_bh_builder` etc.); they only
-    // become live in `build_inline_call_only_bh_builder`'s
-    // pyre-namespaced insns map.
-    builder.wire_handler("int_copy_pyre_u16/i>i", handler_int_copy_pyre_u16);
-    builder.wire_handler("ref_copy_pyre_u16/r>r", handler_ref_copy_pyre_u16);
-    builder.wire_handler("ref_return_pyre_u16/r", handler_ref_return_pyre_u16);
-    builder.wire_handler("raise_pyre_u16/r", handler_raise_pyre_u16);
-    builder.wire_handler(
-        "last_exc_value_pyre_u16/>r",
-        handler_last_exc_value_pyre_u16,
-    );
-    builder.wire_handler(
-        "goto_if_not_int_is_true_pyre_u16/iL",
-        handler_goto_if_not_int_is_true_pyre_u16,
-    );
-    // Canonical `goto_if_not/iL` alias — `bhimpl_goto_if_not_int_is_true =
-    // bhimpl_goto_if_not` (`blackhole.py:913`) routes both bytes to the
-    // same handler body.
-    builder.wire_handler(
-        "goto_if_not_pyre_u16/iL",
-        handler_goto_if_not_int_is_true_pyre_u16,
-    );
-    // Sub-slice C.5: pyre-u16 variants for the inline_call test
-    // surface — int/float return, float_copy.  See block
-    // header comment near `handler_int_return_pyre_u16` definition.
-    builder.wire_handler("int_return_pyre_u16/i", handler_int_return_pyre_u16);
-    builder.wire_handler("float_return_pyre_u16/f", handler_float_return_pyre_u16);
-    builder.wire_handler("float_copy_pyre_u16/f>f", handler_float_copy_pyre_u16);
-    // P5 — int unary `i>i` family (`record_unary_i` emit shape).
-    builder.wire_handler("int_neg_pyre_u16/i>i", handler_int_neg_pyre_u16);
-    builder.wire_handler("int_invert_pyre_u16/i>i", handler_int_invert_pyre_u16);
-    // P5 — float arithmetic `ff>f` family (`record_binop_f` emit shape).
-    builder.wire_handler("float_add_pyre_u16/ff>f", handler_float_add_pyre_u16);
-    builder.wire_handler("float_sub_pyre_u16/ff>f", handler_float_sub_pyre_u16);
-    builder.wire_handler("float_mul_pyre_u16/ff>f", handler_float_mul_pyre_u16);
-    builder.wire_handler(
-        "float_truediv_pyre_u16/ff>f",
-        handler_float_truediv_pyre_u16,
-    );
-    // P5 — float unary `f>f` family (`record_unary_f` emit shape).
-    builder.wire_handler("float_neg_pyre_u16/f>f", handler_float_neg_pyre_u16);
-    builder.wire_handler("float_abs_pyre_u16/f>f", handler_float_abs_pyre_u16);
-    // P5 — ref binop `rr>i` family (`record_binop_r` emit shape).
-    builder.wire_handler("ptr_eq_pyre_u16/rr>i", handler_ptr_eq_pyre_u16);
-    builder.wire_handler("ptr_ne_pyre_u16/rr>i", handler_ptr_ne_pyre_u16);
-    builder.wire_handler(
-        "instance_ptr_eq_pyre_u16/rr>i",
-        handler_instance_ptr_eq_pyre_u16,
-    );
-    builder.wire_handler(
-        "instance_ptr_ne_pyre_u16/rr>i",
-        handler_instance_ptr_ne_pyre_u16,
-    );
-    // P5 — ref unary `r>i` family (ptr_iszero / ptr_nonzero).
-    builder.wire_handler("ptr_iszero_pyre_u16/r>i", handler_ptr_iszero_pyre_u16);
-    builder.wire_handler("ptr_nonzero_pyre_u16/r>i", handler_ptr_nonzero_pyre_u16);
-    builder.wire_handler(
-        "goto_if_not_ptr_nonzero_pyre_u16/rL",
-        handler_goto_if_not_ptr_nonzero_pyre_u16,
-    );
-    // P6 — branch pyre-u16 family (`record_binop_i`/`record_binop_f`/
-    // `record_binop_r` + `goto_if_not_*` emit shapes).
+    // A3 epic: push/pop family wires the canonical 1-byte register
+    // handlers (`handler_int_push`/`pop` and ref/float kin) defined
+    // alongside the canonical bhimpl bodies.  Branch family (A7),
+    // guard_value / last_exception family (A8), and every other
+    // `JitCodeBuilder`-emitted BC_* are wired in the canonical block
+    // above.
     for (key, handler) in [
-        (
-            "goto_if_not_int_lt_pyre_u16/iiL",
-            handler_goto_if_not_int_lt_pyre_u16 as BhOpcodeHandler,
-        ),
-        (
-            "goto_if_not_int_le_pyre_u16/iiL",
-            handler_goto_if_not_int_le_pyre_u16,
-        ),
-        (
-            "goto_if_not_int_eq_pyre_u16/iiL",
-            handler_goto_if_not_int_eq_pyre_u16,
-        ),
-        (
-            "goto_if_not_int_ne_pyre_u16/iiL",
-            handler_goto_if_not_int_ne_pyre_u16,
-        ),
-        (
-            "goto_if_not_int_gt_pyre_u16/iiL",
-            handler_goto_if_not_int_gt_pyre_u16,
-        ),
-        (
-            "goto_if_not_int_ge_pyre_u16/iiL",
-            handler_goto_if_not_int_ge_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_lt_pyre_u16/ffL",
-            handler_goto_if_not_float_lt_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_le_pyre_u16/ffL",
-            handler_goto_if_not_float_le_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_eq_pyre_u16/ffL",
-            handler_goto_if_not_float_eq_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_ne_pyre_u16/ffL",
-            handler_goto_if_not_float_ne_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_gt_pyre_u16/ffL",
-            handler_goto_if_not_float_gt_pyre_u16,
-        ),
-        (
-            "goto_if_not_float_ge_pyre_u16/ffL",
-            handler_goto_if_not_float_ge_pyre_u16,
-        ),
-        (
-            "goto_if_not_ptr_eq_pyre_u16/rrL",
-            handler_goto_if_not_ptr_eq_pyre_u16,
-        ),
-        (
-            "goto_if_not_ptr_ne_pyre_u16/rrL",
-            handler_goto_if_not_ptr_ne_pyre_u16,
-        ),
-        (
-            "goto_if_not_int_is_zero_pyre_u16/iL",
-            handler_goto_if_not_int_is_zero_pyre_u16,
-        ),
-        (
-            "goto_if_not_ptr_iszero_pyre_u16/rL",
-            handler_goto_if_not_ptr_iszero_pyre_u16,
-        ),
-        (
-            "goto_if_exception_mismatch_pyre_u16/iL",
-            handler_goto_if_exception_mismatch_pyre_u16,
-        ),
-        // P7 — push/pop/guard_value/last_exception pyre-u16 family.
-        ("int_push_pyre_u16/i", handler_int_push_pyre_u16),
-        ("ref_push_pyre_u16/r", handler_ref_push_pyre_u16),
-        ("float_push_pyre_u16/f", handler_float_push_pyre_u16),
-        ("int_pop_pyre_u16/>i", handler_int_pop_pyre_u16),
-        ("ref_pop_pyre_u16/>r", handler_ref_pop_pyre_u16),
-        ("float_pop_pyre_u16/>f", handler_float_pop_pyre_u16),
-        (
-            "int_guard_value_pyre_u16/i",
-            handler_guard_value_noop_pyre_u16,
-        ),
-        (
-            "ref_guard_value_pyre_u16/r",
-            handler_guard_value_noop_pyre_u16,
-        ),
-        (
-            "float_guard_value_pyre_u16/f",
-            handler_guard_value_noop_pyre_u16,
-        ),
-        (
-            "last_exception_pyre_u16/>i",
-            handler_last_exception_pyre_u16,
-        ),
+        // A3 epic: push/pop family wires the canonical 1-byte register
+        // handlers (`handler_int_push`/`pop` and ref/float kin) defined
+        // alongside the canonical bhimpl bodies.
+        ("int_push/i", handler_int_push as BhOpcodeHandler),
+        ("ref_push/r", handler_ref_push),
+        ("float_push/f", handler_float_push),
+        ("int_pop/>i", handler_int_pop),
+        ("ref_pop/>r", handler_ref_pop),
+        ("float_pop/>f", handler_float_pop),
     ] {
         builder.wire_handler(key, handler);
     }
-    // P4 — full int binop+cmp+uint family (`record_binop_i` emit shape).
-    // 22 keys covering every `ii>i` opname JitCodeBuilder produces.
-    builder.wire_handler("int_add_pyre_u16/ii>i", handler_int_add_pyre_u16);
-    builder.wire_handler("int_sub_pyre_u16/ii>i", handler_int_sub_pyre_u16);
-    builder.wire_handler("int_mul_pyre_u16/ii>i", handler_int_mul_pyre_u16);
-    // `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
-    // `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
-    // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
-    // jitcode emission, so neither key reaches `wire_handler`.
-    builder.wire_handler("int_and_pyre_u16/ii>i", handler_int_and_pyre_u16);
-    builder.wire_handler("int_or_pyre_u16/ii>i", handler_int_or_pyre_u16);
-    builder.wire_handler("int_xor_pyre_u16/ii>i", handler_int_xor_pyre_u16);
-    builder.wire_handler("int_lshift_pyre_u16/ii>i", handler_int_lshift_pyre_u16);
-    builder.wire_handler("int_rshift_pyre_u16/ii>i", handler_int_rshift_pyre_u16);
-    builder.wire_handler("int_eq_pyre_u16/ii>i", handler_int_eq_pyre_u16);
-    builder.wire_handler("int_ne_pyre_u16/ii>i", handler_int_ne_pyre_u16);
-    builder.wire_handler("int_lt_pyre_u16/ii>i", handler_int_lt_pyre_u16);
-    builder.wire_handler("int_le_pyre_u16/ii>i", handler_int_le_pyre_u16);
-    builder.wire_handler("int_gt_pyre_u16/ii>i", handler_int_gt_pyre_u16);
-    builder.wire_handler("int_ge_pyre_u16/ii>i", handler_int_ge_pyre_u16);
-    builder.wire_handler("uint_lt_pyre_u16/ii>i", handler_uint_lt_pyre_u16);
-    builder.wire_handler("uint_le_pyre_u16/ii>i", handler_uint_le_pyre_u16);
-    builder.wire_handler("uint_gt_pyre_u16/ii>i", handler_uint_gt_pyre_u16);
-    builder.wire_handler("uint_ge_pyre_u16/ii>i", handler_uint_ge_pyre_u16);
-    builder.wire_handler("uint_rshift_pyre_u16/ii>i", handler_uint_rshift_pyre_u16);
-    builder.wire_handler(
-        "uint_mul_high_pyre_u16/ii>i",
-        handler_uint_mul_high_pyre_u16,
-    );
+    // A8 — guard_value + last_exception canonical handlers
+    // (`handler_int_guard_value` etc.) are wired in the canonical block
+    // above (`wire_handler("int_guard_value/i", ...)`); nothing else to
+    // wire here.
+    // A5 epic: int binop+cmp+uint family migrated to canonical 1-byte
+    // encoding (`[lhs][rhs][dst]` argcode order via `bhhandler_ii_i!`);
+    // the per-opname wire_handler calls at blackhole.rs:7658-7723 above
+    // bind the canonical handlers directly.  `int_floordiv` /
+    // `int_mod` have no `bhimpl_*` upstream: `jtransform.py:576-577`
+    // rewrites both via `_do_builtin_call` to
+    // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)`
+    // before jitcode emission, so neither key reaches `wire_handler`.
 }
 
 // ── goto_if_not_float (blackhole.py:751-798) ────────────────────────
@@ -8898,6 +8147,12 @@ fn handler_raise(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let exc = bh.registers_r[code[p] as usize];
+    // RPython blackhole.py:999-1003 `bhimpl_raise(self, excvalue)`
+    // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
+    assert!(
+        exc != 0,
+        "blackhole.py:1002 raise: excvalue must be non-null"
+    );
     // RPython blackhole.py:169 `_get_method` stores the decoded position
     // back to `self.position` before invoking the bhimpl_*. Required here
     // because `run_inner`'s RaiseException arm calls
@@ -8931,6 +8186,12 @@ fn handler_last_exception(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let exc_obj = bh.exception_last_value;
+    // blackhole.py:990 `assert real_instance` — last_exception must
+    // only fire while an active caught exception is in scope.
+    assert!(
+        exc_obj != 0,
+        "blackhole.py:990 last_exception: exception_last_value must be non-null"
+    );
     // RPython: ptr2int(real_instance.typeptr) — get class pointer
     let typeptr = if let Some(cpu) = bh.cpu {
         cpu.bh_classof(exc_obj)
@@ -8951,6 +8212,12 @@ fn handler_last_exc_value(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    // blackhole.py:996 `assert real_instance` — last_exc_value must
+    // only fire while an active caught exception is in scope.
+    assert!(
+        bh.exception_last_value != 0,
+        "blackhole.py:996 last_exc_value: exception_last_value must be non-null"
+    );
     bh.registers_r[code[p] as usize] = bh.exception_last_value;
     Ok(p + 1)
 }
@@ -8977,6 +8244,13 @@ fn handler_goto_if_exception_mismatch(
     let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
     let pc = p + 3;
     let exc_obj = bh.exception_last_value;
+    // blackhole.py:981 `assert real_instance` —
+    // goto_if_exception_mismatch must only fire while an active caught
+    // exception is in scope.
+    assert!(
+        exc_obj != 0,
+        "blackhole.py:981 goto_if_exception_mismatch: exception_last_value must be non-null"
+    );
     let exc_typeptr = if let Some(cpu) = bh.cpu {
         cpu.bh_classof(exc_obj)
     } else {
