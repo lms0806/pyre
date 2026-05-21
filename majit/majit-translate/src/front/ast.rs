@@ -8973,19 +8973,16 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 return ValueType::Ref;
             }
             match name.as_str() {
-                // `lltype.Signed` family.  Unsigned parity for u* is
-                // blocked on (a) PyFrame's Rust-struct → classdef
-                // pipeline propagating Unsigned fields without
-                // collapsing the receiver's classdef to None (panics
-                // at `annotator/unaryop.rs:444` with
-                // `getattr "locals_cells_stack_w" on Instance(classdef:
-                // None)`) and (b) `setinteriorfield_gc_r` coercion
-                // bridging Ref/Int kinds at join points (panics at
-                // `assembler.rs:964` with
-                // `encode_regorconst_source: Register kind Ref does
-                // not match variant-expected kind Int`).
-                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-                | "char" => ValueType::Int,
+                // `lltype.Signed` family.
+                "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
+                // `lltype.Unsigned` family — `getkind(Unsigned) == 'int'`
+                // collapses storage to the int register class
+                // (`rpython/jit/codewriter/flatten.py:getkind`).  The
+                // producer-side type tag stays Unsigned so the annotator
+                // selects `SomeInteger(unsigned=True)` and the
+                // rtyper-side `signed_repr_of` / `intmask` cast paths
+                // distinguish signed vs unsigned at the LL boundary.
+                "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
                 // `lltype.Bool` annotates as `SomeBool(SomeInteger)`
                 // (`annotator/model.py:185-198`, distinct lattice node).
                 // `getkind(Bool) == 'int'` so register-class code paths

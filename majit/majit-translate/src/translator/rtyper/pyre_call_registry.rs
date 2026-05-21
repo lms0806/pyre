@@ -198,6 +198,17 @@ pub struct PyreCallRegistry {
             Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
         )>,
     >,
+    /// Per-source-file `use <path> as alias` map, keyed by
+    /// `(source_module, alias)` and aggregated from every parsed file
+    /// at `lib.rs::analyze_files`.  RPython equivalent: each
+    /// `FunctionDesc.pyobj.__globals__` carries the caller's
+    /// per-function lexical scope, which `flowcontext.py:845-866
+    /// LOAD_GLOBAL` consults before the `builtins` fallback.  Pyre
+    /// stores the aggregate here so `flowspace_adapter::translate_op`
+    /// can recover the calling graph's per-file `use` set when
+    /// resolving an `OpKind::Call::FunctionPath` whose segments are
+    /// not a [`PyreCallRegistry`] hit.
+    use_imports: RefCell<HashMap<(String, String), String>>,
 }
 
 impl PyreCallRegistry {
@@ -208,7 +219,34 @@ impl PyreCallRegistry {
             entries: RefCell::new(HashMap::new()),
             aliases: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
+            use_imports: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Replace the `(source_module, alias) -> full_path` map.  Called
+    /// once from `dual_gate_registry` after `PyreCallRegistry::new`
+    /// with `CallControl::use_imports.clone()`.  Mirrors the
+    /// upstream where every `FunctionDesc.pyobj.__globals__` is
+    /// already populated at the moment the function is bound — pyre
+    /// populates lazily through a single setter because the
+    /// CallControl-side aggregation is the program-wide source of
+    /// truth.
+    pub fn set_use_imports(&self, map: HashMap<(String, String), String>) {
+        *self.use_imports.borrow_mut() = map;
+    }
+
+    /// Look up the fully-qualified path that `alias` resolves to in
+    /// the lexical scope of `source_module`.  Returns `Some(full)` if
+    /// the source file imported `alias` (or `use <full> as alias`)
+    /// at top level, `None` otherwise.  Mirrors
+    /// `flowcontext.py:845-866`'s `frame.globals[name]` consultation
+    /// — `None` here is the upstream `KeyError` that triggers the
+    /// `builtins` fallback.
+    pub fn lookup_use_import(&self, source_module: &str, alias: &str) -> Option<String> {
+        self.use_imports
+            .borrow()
+            .get(&(source_module.to_string(), alias.to_string()))
+            .cloned()
     }
 
     /// Get-or-construct the shared `(annotator, rtyper)` pair.

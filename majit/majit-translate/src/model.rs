@@ -26,20 +26,14 @@ pub enum ValueType {
     /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
     /// via `Int | Unsigned` arms.
     ///
-    /// SCAFFOLDED, NOT YET REACHED FROM PYRE SOURCE.  The producer
-    /// (`front/ast.rs:classify_fn_arg_ty`) currently folds Rust
-    /// `u8`/`u16`/`u32`/`u64`/`usize` into `Int` because flipping
-    /// them onto this arm cascades into pyre-source analysis
-    /// regressions (`annotator/unaryop.rs:445` getattr,
-    /// `assembler.rs:581` kind-mismatch in `setinteriorfield_gc_r`).
-    /// `front/ast.rs::cast_builtin_name` now routes the eight
-    /// Unsigned `(source, target)` pairs through
-    /// `simple_call(__builtin__.float/bool, v_uint)`,
+    /// Produced by `front/ast.rs::classify_fn_arg_ty` for Rust
+    /// `u8`/`u16`/`u32`/`u64`/`usize` typed args.  Cast routing
+    /// through `simple_call(__builtin__.float/bool, v_uint)`,
     /// `simple_call(rarithmetic.intmask, v_uint)`, and
-    /// `simple_call(rarithmetic.r_uint, v)` per upstream
+    /// `simple_call(rarithmetic.r_uint, v)` lives in
+    /// `front/ast.rs::cast_builtin_name` per
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
-    /// `rarithmetic.py:600` — see `front/ast.rs:classify_fn_arg_ty`
-    /// TODO(unsigned-producer-flip) for the producer-side flip.
+    /// `rarithmetic.py:600`.
     Unsigned,
     /// RPython `SomeBool` (`annotator/model.py:185-198`): a Python `bool`
     /// at the annotator level.  Distinct from `Int` (RPython `SomeInteger`,

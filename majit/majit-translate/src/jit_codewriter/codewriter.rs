@@ -142,6 +142,15 @@ impl CodeWriter {
                 crate::annotator::bookkeeper::Bookkeeper::new(),
             )),
         );
+        // Thread the program-wide `use_imports` aggregate (one entry
+        // per `(source_module, alias)` pair across all parsed files,
+        // built in `lib.rs::analyze_files`) into the registry so
+        // `flowspace_adapter::translate_op` can recover the caller's
+        // per-file lexical scope when resolving an
+        // `OpKind::Call::FunctionPath` (mirrors RPython
+        // `flowcontext.py:845-866 LOAD_GLOBAL` consulting
+        // `func.__globals__` before the builtins fallback).
+        registry.set_use_imports(callcontrol.use_imports.clone());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
         // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
         // mirrors that propagation by routing the populate `TyperError`

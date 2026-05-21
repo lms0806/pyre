@@ -291,13 +291,17 @@ impl ExtRegistryEntry {
             // `ForTypeEntry` inherits `compute_annotation` returning
             // `SomeBuiltin(self.compute_result_annotation,
             //              methodname=getattr(self.instance, '__name__', None))`.
-            // The actual `compute_result_annotation` runs at simple_call
-            // time via [`Self::compute_annotation_with_kwds`].
+            // `__name__` is the short class name (e.g. "r_uint"), not
+            // the dotted qualified path; `HostObject::simple_name` is
+            // the canonical short-name accessor (`flowspace/model.rs:
+            // 237-242`).  The actual `compute_result_annotation` runs
+            // at simple_call time via
+            // [`Self::compute_annotation_with_kwds`].
             ExtRegistryEntry::ForType { instance, .. } => {
                 let mut result = SomeBuiltin::new(
                     instance.qualname().to_string(),
                     None,
-                    Some(instance.qualname().to_string()),
+                    Some(instance.simple_name().to_string()),
                 );
                 result.base.const_box = Some(crate::flowspace::model::Constant::new(
                     ConstValue::HostObject(instance.clone()),
@@ -404,11 +408,15 @@ impl ExtRegistryEntry {
                 ))
             }
             // upstream rarithmetic.py:579-582 — `ForTypeEntry.\
-            // specialize_call(self, hop)` reads `hop.inputarg(hop.r_result.\
-            // lowleveltype, arg=1)` and returns it directly.  Pyre's
-            // `rtype_r_uint` (rbuiltin.rs) mirrors this verbatim;
-            // returning the function pointer here completes the
-            // extregistry dispatch surface end-to-end.
+            // specialize_call(self, hop)`:
+            //     v_result, = hop.inputargs(hop.r_result.lowleveltype)
+            //     hop.exception_cannot_occur()
+            //     return v_result
+            // Pyre's `rtype_r_uint` (rbuiltin.rs) mirrors this
+            // verbatim — single `inputargs` call against
+            // `hop.r_result.lowleveltype`, exception_cannot_occur,
+            // then return.  Returning the function pointer here
+            // completes the extregistry dispatch surface end-to-end.
             ExtRegistryEntry::ForType { instance, .. } => {
                 if instance.qualname() == "rarithmetic.r_uint" {
                     Ok(super::rbuiltin::rtype_r_uint as BuiltinTyperFn)

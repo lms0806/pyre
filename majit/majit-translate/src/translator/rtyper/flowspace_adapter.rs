@@ -885,50 +885,91 @@ pub fn translate_op(
                     //    resolution still respects the same scope
                     //    boundary.
                     //
-                    // PRE-EXISTING-ADAPTATION: Layer 3 is wider than upstream's
-                    // LOAD_GLOBAL + LOAD_ATTR chain.  Upstream requires the leading
-                    // module (`lltype`, `rarithmetic`, ...) to be in the caller's
-                    // per-function `frame.globals`, populated by the function's
-                    // `from ... import` statements (`flowcontext.py:845-866`).
-                    // Pyre's frontend reads `syn::Expr::Path` segments verbatim
-                    // (`front/ast.rs::canonical_call_target` at line 7572) — it
-                    // qualifies 1-segment paths with the file's `module_prefix` but
-                    // does NOT consult `use_imports`, so the typer here cannot tell
-                    // which caller's import scope a path came from.  Implicit
-                    // gating exists at the Rust compilation layer (the path must
-                    // resolve at compile time, requiring a `use` statement, an
-                    // absolute path, or the prelude), but that gating is
-                    // file-scoped (Rust `use` is module-level), not
-                    // function-scoped like upstream's `frame.globals`.  An
-                    // unregistered prefix routes to the explicit `TyperError`
-                    // below; an HOST_ENV-curated path resolves without the
-                    // per-function gate that upstream's bytecode loop applies.
-                    // Convergence path: thread per-file `use_imports`
-                    // (`ParsedInterpreter.use_imports`, aggregated in
-                    // `CallControl::use_imports`) to `translate_op` via the
-                    // graph's source-file identity, then gate Layer 3 on
-                    // `segments[0]` membership in the caller's `use_imports`.
+                    // Layer 3 — host module attribute lookup.  Upstream
+                    // `LOAD_GLOBAL <module>` + `LOAD_ATTR <attr>` chain
+                    // (`flowcontext.py:845-866`) consults the caller's
+                    // per-function `frame.globals` first, falling back
+                    // to `builtins` if absent.  Pyre's equivalent of
+                    // `frame.globals` is the caller graph's per-file
+                    // `use_imports` map (program-wide aggregate on
+                    // [`PyreCallRegistry::use_imports`], keyed by
+                    // `(source_module, alias)`), populated from
+                    // `ParsedInterpreter.use_imports` at lib.rs
+                    // `analyze_files`.  Resolution order:
+                    //
+                    // 3a. `segments[0]` is an alias the caller graph's
+                    //     source file imported via `use X::Y as alias`
+                    //     or `use X::Y::alias` — `lookup_use_import`
+                    //     returns the canonical dotted module prefix
+                    //     (`rpython.rtyper.lltypesystem.lltype`), then
+                    //     `HOST_ENV.import_module(prefix).module_get(
+                    //     attr)` produces the attribute HostObject.
+                    //     Mirrors upstream's `frame.globals[<alias>]`
+                    //     hit branch.
+                    //
+                    // 3b. PRE-EXISTING-ADAPTATION: `segments` already
+                    //     spell out the fully-qualified Rust path
+                    //     (`rpython::rtyper::lltypesystem::lltype::
+                    //     cast_ptr_to_int`) without a matching `use`
+                    //     statement — Rust compiles such paths
+                    //     directly, so pyre source frequently writes
+                    //     them inline.  Upstream has no exact analog
+                    //     (Python source uniformly imports before
+                    //     calling), so the legacy HOST_ENV fallback
+                    //     stays in place for backward-compat with
+                    //     existing pyre callsites.  Probed removal
+                    //     (2026-05-21): the strict gate fires on
+                    //     cranelift fib_recursive + fannkuch
+                    //     (TIMEOUT — production dependency exists),
+                    //     so a one-shot removal is out of scope.
+                    //     Convergence path: locate the production
+                    //     callsite that still relies on Branch 3b
+                    //     (a tracing-time `OpKind::Call::FunctionPath`
+                    //     with segments spelling a curated HOST_ENV
+                    //     module without a matching `use_imports`
+                    //     entry), add the proper `use` to the source
+                    //     file, then gate this branch off and update
+                    //     the corresponding test fixture.
+                    //
+                    // 3c. Unknown prefix — `TyperError` (caller must
+                    //     register the path or import the prefix).
+                    let resolve_via_use_imports =
+                        || -> Option<crate::flowspace::model::HostObject> {
+                            if segments.len() < 2 {
+                                return None;
+                            }
+                            let source_module = graph.source_module.as_deref()?;
+                            let dotted_prefix =
+                                call_registry.lookup_use_import(source_module, &segments[0])?;
+                            let mut full_segments: Vec<String> =
+                                dotted_prefix.split('.').map(str::to_string).collect();
+                            full_segments.extend(segments[1..].iter().cloned());
+                            if full_segments.len() < 2 {
+                                return None;
+                            }
+                            let module = HOST_ENV.import_module(
+                                &full_segments[..full_segments.len() - 1].join("."),
+                            )?;
+                            module.module_get(&full_segments[full_segments.len() - 1])
+                        };
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
                         entry.host_object.clone()
                     } else if segments.len() == 1
                         && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
                     {
                         builtin
+                    } else if let Some(attr) = resolve_via_use_imports() {
+                        // Branch 3a — caller imported `segments[0]`;
+                        // upstream-orthodox `frame.globals[<alias>]`
+                        // resolution path.
+                        attr
                     } else if segments.len() >= 2
                         && let Some(module) =
                             HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
                         && let Some(attr) = module.module_get(&segments[segments.len() - 1])
                     {
-                        // Layer 3 — host module attribute lookup.
-                        // `HOST_ENV.import_module("rpython.rtyper.\
-                        // lltypesystem.lltype").module_get("cast_ptr_\
-                        // to_int")` returns the same shared HostObject
-                        // that the BUILTIN_TYPER `module_entries` loop
-                        // keyed its `rtype_cast_ptr_to_int` typer on
-                        // (`rbuiltin.py:543-548`).  Only fires for
-                        // module roots curated in `populate_host_env`;
-                        // unknown prefixes return `None` and route to
-                        // the explicit `TyperError` below.
+                        // Branch 3b — fully-qualified inline path,
+                        // PRE-EXISTING-ADAPTATION as documented above.
                         attr
                     } else {
                         return Err(TyperError::message(format!(
