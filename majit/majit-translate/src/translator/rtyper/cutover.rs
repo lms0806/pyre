@@ -162,9 +162,9 @@ impl Drop for LegacyAnnotationGuard {
 ///
 /// - the real path errors out (typer error from an unported `OpKind`
 ///   arm), OR
-/// - a legacy-known `ValueId` is missing / `Unknown` / different in
+/// - a legacy-known slot is missing / `Unknown` / different in
 ///   the real path, OR
-/// - the real path produced a definite kind for a `ValueId` the legacy
+/// - the real path produced a definite kind for a slot the legacy
 ///   resolver did not resolve.
 ///
 /// Returns `Ok(())` only when the legacy `legacy_graph.concretetype`
@@ -314,7 +314,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// (`cutover.rs:312`); test-time anchor invariants still run
 /// [`dual_gate_check`] for legacy-baseline regression checks against
 /// hand-built fixtures, but production no longer compares per
-/// ValueId — `Match` means the real path succeeded, full stop.
+/// slot — `Match` means the real path succeeded, full stop.
 /// PyPy `codewriter.py:33` consumes the rtyper-produced graph
 /// directly, with no dual-gate equivalent; pyre's `Skip` arm is the
 /// transitional scaffolding that retires once every owning epic in
@@ -323,9 +323,9 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 pub(crate) enum DualGateOutcome {
     /// Real path completed without panicking and (when the legacy
     /// walker also succeeded as defensive baseline) every legacy-
-    /// known `ValueId` carried the same `ConcreteType` in the real
+    /// known slot carried the same `ConcreteType` in the real
     /// path's projection.  Production consumes `real_state`
-    /// authoritatively.  Per-`ValueId` diff against the legacy
+    /// authoritatively.  Per-slot diff against the legacy
     /// baseline runs whenever the legacy walker can produce a
     /// state — divergence routes the graph through
     /// `Skip("dual-gate divergence: ...")` so the codewriter falls
@@ -432,7 +432,7 @@ pub(crate) fn dual_gate_check_with_registry(
         }
     };
     // Defensive baseline diff against the legacy walker.  Mirror of
-    // main's pre-Slice-12.2 contract: every definite `ValueId` is
+    // main's pre-Slice-12.2 contract: every definite slot is
     // compared, and the first divergence becomes a `Skip` so the
     // production caller falls back to the legacy walker for that
     // function rather than silently shipping a real-path result that
@@ -630,11 +630,11 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // lookup time — `ValueType::Unknown` has no
         // annotation-stage shell and `valuetype_to_someshell` returns
         // `None` for it (intentionally fail-loud for "annotation gap"
-        // so producers know which ValueId missed seeding, see
+        // so producers know which slot missed seeding, see
         // `seed_variable` at `flowspace_adapter.rs:96-115`).  Closing
         // the gap means
         // tightening the front-end / annotator producers so every
-        // ValueId has a non-`Unknown` annotation; the gate skips
+        // slot has a non-`Unknown` annotation; the gate skips
         // until then.
         || msg.contains("KeyError: no binding for arg")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
@@ -948,7 +948,7 @@ pub(crate) fn lift_callee_to_pygraph(
     // already carry the per-variable / per-constant LL type after
     // specialise; downstream readers must consult those fields directly
     // (`history.py:204` `same_constant`, `model.py:438` `Variable.
-    // concretetype`).  The ByValueId side map was a pyre-only divergence.
+    // concretetype`).  The by-slot side map was a pyre-only divergence.
     //
     // Test fixtures that hand-roll minimal SSA shapes must seed
     // `callee_graph.variable(vid).annotation` directly via
@@ -1124,7 +1124,7 @@ pub fn specialize_legacy_graph(
 }
 
 /// `specialize_legacy_graph_with_registry` extended return shape that
-/// also surfaces the [`SlotToVariable`] map and the per-`ValueId`
+/// also surfaces the [`SlotToVariable`] map and the per-slot
 /// `Constant.concretetype` table produced by the flowspace adapter.
 /// Codewriter callers consume `value_to_var` directly (the rtyper's
 /// `Variable.concretetype` writes propagate via
@@ -1317,7 +1317,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // session-prologue), keeping the per-subject body unchanged.
     rtyper.specialize_more_blocks()?;
 
-    // ── Step 4 — validate per-ValueId lltype projection ───────────
+    // ── Step 4 — validate per-slot lltype projection ──────────────
     //
     // The eager side-table build was retired in Slice 4.31 and the
     // struct itself deleted in Slice 4.38.  Each callable that needs
@@ -1724,16 +1724,16 @@ mod tests {
         let _lock = anchor_lock();
         // Cat 3.2 first slice: a body `Expr::Path` whose name resolves
         // to a same-block local definition reuses the existing
-        // `ValueId` instead of emitting a fresh `OpKind::Input`.
+        // slot instead of emitting a fresh `OpKind::Input`.
         // RPython `flowspace/flowcontext.py:835 LOAD_FAST` reads the
         // existing locals-stack entry; pyre's analogue forwards the
-        // bound `ValueId`.
+        // bound slot.
         //
         // The graph for `fn id(x: &Foo) -> &Foo { x }` lifts the
         // parameter as a single `OpKind::Input { name: "x", .. }` in
         // the entry block.  The body's `x` reference is in the same
         // block as the parameter binding, so the lookup returns the
-        // existing `ValueId` and the graph carries exactly one
+        // existing slot and the graph carries exactly one
         // `OpKind::Input` named `"x"` — not two.
         let graph = build_anchor_graph(
             r#"
@@ -1756,7 +1756,7 @@ fn id(x: &Foo) -> &Foo { x }
         assert_eq!(
             input_x_count, 1,
             "Cat 3.2 same-block dedup must collapse the body Path read \
-             into the parameter's existing ValueId — expected exactly \
+             into the parameter's existing slot — expected exactly \
              one OpKind::Input{{name:\"x\"}}, got {input_x_count}"
         );
     }
@@ -2437,7 +2437,7 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         // point of `if cond { x = 1 } else { x = 2 }; x`, the post-
         // merge `LOAD_FAST x` resolves to a fresh phi inputarg in
         // the merge block whose `Link.args` from each arm carry the
-        // arm-rebound `ValueId`.
+        // arm-rebound slot.
         //
         // Stage A1-A3 + B1-B2 + C1 minimal land the foundations: per-
         // block `framestate`, first-bind positional slot order, union
@@ -2446,7 +2446,7 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         // lazy installer (Slice 2) handles the cross-block read of
         // the rebound `x` at the post-merge use site, allocating a
         // single merge-block inputarg + threading each arm's rebound
-        // `ValueId` back through that arm's `Link.args`.
+        // slot back through that arm's `Link.args`.
         //
         // This anchor pins the both-open-arm + rebind shape end-to-
         // end via `dual_gate_check`.  Per-block `Link.args` arity =
@@ -2499,7 +2499,7 @@ fn rebind_both_arms(cond: bool) -> i64 {
         // promotes it to `inputargs`, and walks back to every
         // predecessor edge whose `set_branch` / `set_goto` recorded a
         // `LocalsFrameState` snapshot, appending the predecessor-side
-        // `ValueId` to that link's `args` so `len(link.args) ==
+        // slot to that link's `args` so `len(link.args) ==
         // len(target.inputargs)` per `flowspace/model.py:114
         // Link.__init__`.
         //
