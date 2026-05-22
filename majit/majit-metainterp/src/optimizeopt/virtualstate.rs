@@ -20,10 +20,9 @@
 /// position-numbered enum_forced_boxes dedup (virtualstate.py:196, 274,
 /// 352) prevents revisiting it.
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::rc::Rc;
-
-use majit_ir::vec_set::VecSet;
 
 use majit_ir::descr::descr_identity;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
@@ -77,7 +76,7 @@ pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
     pub renum: crate::optimizeopt::vec_assoc::VecAssoc<i32, i32>,
-    pub bad: VecSet<*const VirtualStateInfoNode>,
+    pub bad: HashSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
 
@@ -934,10 +933,11 @@ impl VirtualState {
                 //         raise VirtualStatesCantMatch()
                 //     else:
                 //         assert isinstance(info, AbstractStructPtrInfo)
+                let resolved = ctx.get_box_replacement(opref);
                 // BoxRef-routing reader; cached once so the per-field walk below
                 // doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_box(resolved)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
@@ -987,10 +987,11 @@ impl VirtualState {
             }
             VirtualStateInfo::VArray { items, .. } => {
                 // virtualstate.py:263-275 VArrayStateInfo.enum_forced_boxes
+                let resolved = ctx.get_box_replacement(opref);
                 // BoxRef-routing reader; cached once so the per-item walk
                 // below doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_box(resolved)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
@@ -1050,8 +1051,9 @@ impl VirtualState {
                 // None" case corresponds to a field_idx present in the
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
+                let resolved = ctx.get_box_replacement(opref);
                 let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_box(resolved)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b))
                 {
@@ -1117,7 +1119,7 @@ impl VirtualState {
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_box_replacement(opref);
                 let forced = match ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_box(resolved)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b))
                 {
@@ -1247,7 +1249,7 @@ impl VirtualState {
             ctx,
             extra_guards: &mut guards,
             renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            bad: VecSet::new(),
+            bad: HashSet::new(),
             force_boxes,
         };
         // virtualstate.py:24-37 `GenerateGuardState.renum` and :84-94
@@ -2919,9 +2921,7 @@ mod tests {
         // seeded with Type::Ref so getptrinfo's `op.type == 'r'`
         // assertion (info.py:885) holds.
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
-        let b0 = ctx
-            .ensure_box(boxes[0])
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b0 = ctx.ensure_box_at_typed(boxes[0].raw() as usize, Type::Ref);
         ctx.set_ptr_info(
             &b0,
             crate::optimizeopt::info::PtrInfo::known_class(GcRef(0x100), false),
