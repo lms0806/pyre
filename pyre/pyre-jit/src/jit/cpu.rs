@@ -26,17 +26,20 @@
 #[derive(Debug)]
 pub struct Cpu {
     /// `bhimpl_residual_call` general entry point.
-    pub call_fn: extern "C" fn(i64, i64) -> i64,
+    /// `(frame, callable, arg0) → result`.
+    pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Per-arity `bhimpl_residual_call_<n>` helpers
-    /// (call_fn_0(callable) ... call_fn_8(callable, a0..a7)).
-    pub call_fn_0: extern "C" fn(i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    /// (`call_fn_0(frame, callable)` ... `call_fn_8(frame, callable,
+    /// a0..a7)`).  The leading `frame` slot carries the active portal
+    /// `PyFrame*` so the body receives it explicitly.
+    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
+    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
@@ -56,7 +59,9 @@ pub struct Cpu {
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
     pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
-    pub normalize_raise_varargs_fn: extern "C" fn(i64, i64) -> i64,
+    /// `(frame: Ref, exc: Ref, cause: Ref) → Ref` — the explicit frame
+    /// pointer feeds `frame.execution_context` directly.
+    pub normalize_raise_varargs_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Read per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`.
     pub get_current_exception_fn: extern "C" fn() -> i64,
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
@@ -146,7 +151,7 @@ impl Cpu {
             store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
-            normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_fn,
+            normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             rtyper,

@@ -1061,13 +1061,6 @@ thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-// pyre residual-call helpers need the parent virtualizable pointer to
-// reconstruct a PyFrame for call_user_function_plain. This TLS is not
-// used by canonical vable field/array bytecodes anymore.
-thread_local! {
-    pub static BH_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-}
-
 // rvmprof integration lives in the `rvmprof::cintf` module — the
 // structural analog of RPython's `rpython.rlib.rvmprof.cintf`. Blackhole
 // calls through `rvmprof::cintf::jit_rvmprof_code` directly, matching
@@ -1897,14 +1890,11 @@ impl BlackholeInterpreter {
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> Option<MergePointArgs> {
-        let saved_bh_vable = BH_VABLE_PTR.with(|c| c.get());
-        BH_VABLE_PTR.with(|c| c.set(self.virtualizable_ptr));
         let bh_depth = unsafe {
             majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r)
         };
         let result = self.run_inner();
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
-        BH_VABLE_PTR.with(|c| c.set(saved_bh_vable));
         result
     }
 

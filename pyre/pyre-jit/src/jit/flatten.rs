@@ -2813,8 +2813,10 @@ pub struct LoweringContext {
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
     /// codewriter.rs:3206-3245 for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
-    /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
-    /// Descr) → reg` via [`build_call_fn_residual_call_r_r_insn`].
+    /// `residual_call_r_r(call_fn_N_idx, [frame, callable, arg0, ...],
+    /// Descr) → reg`; `simple_call` itself carries only
+    /// `(callable, args...)` and the lowering arm prepends the pyre
+    /// explicit-frame ABI operand.
     /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
     /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
     /// statically-known 0..=8 arity range position-indexed.
@@ -2823,6 +2825,20 @@ pub struct LoweringContext {
     /// HLOp record), so the lowering arm returns `None`
     /// (passthrough) on nargs > 8.
     pub call_fn_idx_by_nargs: [u16; 9],
+    /// Portal red `frame` Variable's pre-regalloc slot — seeded by
+    /// `transform_graph_to_jitcode` (codewriter.rs:3432
+    /// `portal_red_pre_regalloc_slots`) so `lower_simple_call_hlop_to_insn`
+    /// can prepend it to the residual_call_r_r ListR, matching the
+    /// inline walker emit at codewriter.rs:6784-6788.  Pyre adaptation:
+    /// `bh_call_fn_N(frame, callable, args...)` helpers receive the
+    /// parent frame as the leading ref operand (see call_jit.rs's
+    /// `bh_call_fn_impl_with_frame`); the graph-side `simple_call` HLOp
+    /// itself carries only `(callable, args...)` to match RPython
+    /// `jtransform.py:414 rewrite_call`, so flatten supplies the
+    /// frame from this slot.  `u16::MAX` indicates an unseeded
+    /// fixture context — `lower_simple_call_hlop_to_insn` asserts a
+    /// real slot was wired before lowering production traces.
+    pub portal_frame_reg: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3136,30 +3152,34 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
 /// dual-write at codewriter.rs:5760-5777 stays in place — this slice
 /// is incremental factor refactor, not retirement.
 ///
-/// `call_fn_N` has signature `(callable: Ref, arg0: Ref, ..., arg_
-/// {N-1}: Ref) → Ref` with `CallFlavor::MayForce` for every
+/// `call_fn_N` has signature `(frame: Ref, callable: Ref, arg0: Ref,
+/// ..., arg_{N-1}: Ref) → Ref` with `CallFlavor::MayForce` for every
 /// arity-specific variant `call_fn_0` / `call_fn` (= nargs=1) /
 /// `call_fn_2` / ... / `call_fn_8` (per codewriter.rs:2175 and
 /// 2238-2245).  All-Ref call_args produce a different SSARepr
 /// shape from the `_ir_r` family: `args_i = []`, `args_r =
-/// [Reg(callable), Reg(arg0), ..., Reg(arg_{N-1})]`, `args_f = []`
-/// → opname `residual_call_r_r` (kinds `"r"` + reskind `'r'`)
-/// with NO leading `ListI` (`emit_residual_call_shape` at
-/// codewriter.rs:2745-2802 omits the per-kind list when `args_K`
-/// is empty).
+/// [Reg(frame), Reg(callable), Reg(arg0), ..., Reg(arg_{N-1})]`,
+/// `args_f = []` → opname `residual_call_r_r` (kinds `"r"` +
+/// reskind `'r'`) with NO leading `ListI`
+/// (`emit_residual_call_shape` at codewriter.rs:2745-2802 omits the
+/// per-kind list when `args_K` is empty).  The frame operand is the
+/// active portal red variable (`portal_frame_reg`), mirroring
+/// `bh_load_global_fn`'s frame-as-arg ABI.
 ///
 /// `arg_regs.len()` is the call's `nargs`; the resulting
-/// `arg_kinds = vec![Kind::Ref; nargs + 1]` (callable + nargs
-/// args).  Caller must ensure `nargs <= 8` — the codewriter falls
-/// through to `emit_abort_permanent!` for `nargs > 8` and never
-/// invokes this helper (no matching `call_fn_N` exists).
+/// `arg_kinds = vec![Kind::Ref; nargs + 2]` (frame + callable +
+/// nargs args).  Caller must ensure `nargs <= 8` — the codewriter
+/// falls through to `emit_abort_permanent!` for `nargs > 8` and
+/// never invokes this helper (no matching `call_fn_N` exists).
 pub fn build_call_fn_residual_call_r_r_insn(
     call_fn_idx: u16,
+    frame_reg: u16,
     callable_reg: u16,
     arg_regs: &[u16],
     dst_reg: u16,
 ) -> Insn {
-    let mut ref_operands: Vec<Operand> = Vec::with_capacity(1 + arg_regs.len());
+    let mut ref_operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+    ref_operands.push(Operand::Register(Register::new(Kind::Ref, frame_reg)));
     ref_operands.push(Operand::Register(Register::new(Kind::Ref, callable_reg)));
     for &reg in arg_regs {
         ref_operands.push(Operand::Register(Register::new(Kind::Ref, reg)));
@@ -3238,11 +3258,13 @@ pub fn build_residual_call_r_r_insn_from_operands(
 /// `normalize_raise_varargs_fn` (the graph carries an `emit_raise!`
 /// edge instead).
 ///
-/// `normalize_raise_varargs_fn` has signature `(exc: Ref, cause:
-/// Ref) → Ref` with `CallFlavor::MayForce` (per codewriter.rs:2227-
-/// 2236 — `bh_normalize_raise_varargs_fn` instantiates user
-/// `__init__` and may observe virtualizables; matches
-/// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).
+/// `normalize_raise_varargs_fn` has signature `(frame: Ref, exc: Ref,
+/// cause: Ref) → Ref` with `CallFlavor::MayForce` (per
+/// codewriter.rs:2227-2236 — `bh_normalize_raise_varargs_with_frame`
+/// instantiates user `__init__` and may observe virtualizables;
+/// matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).  The frame operand
+/// is the active portal red variable (`portal_frame_reg`), matching
+/// PyPy's `RAISE_VARARGS(self, ...)` receiver.
 ///
 /// The `cause` operand is polymorphic at the callsite: when the
 /// RAISE_VARARGS opcode arrives with `argc=2` the cause is a
@@ -3252,7 +3274,8 @@ pub fn build_residual_call_r_r_insn_from_operands(
 /// `Kind::Ref` so the bucket lands in `args_r` regardless and the
 /// produced shape is `residual_call_r_r` — same opname as the CALL
 /// family (`build_call_fn_residual_call_r_r_insn`), distinguished
-/// only by being fixed-arity 2 vs CALL's variable arity.
+/// only by carrying 3 ref operands (frame, exc, cause) vs CALL's
+/// variable arity.
 ///
 /// The shared shape constructor
 /// `build_residual_call_r_r_insn_from_operands` accepts arbitrary
@@ -3261,13 +3284,18 @@ pub fn build_residual_call_r_r_insn_from_operands(
 /// passes `MayForce` matching the production source.
 pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
     normalize_raise_varargs_fn_idx: u16,
+    frame_reg: u16,
     exc_reg: u16,
     cause: Operand,
     dst_reg: u16,
 ) -> Insn {
     build_residual_call_r_r_insn_from_operands(
         normalize_raise_varargs_fn_idx,
-        vec![Operand::Register(Register::new(Kind::Ref, exc_reg)), cause],
+        vec![
+            Operand::Register(Register::new(Kind::Ref, frame_reg)),
+            Operand::Register(Register::new(Kind::Ref, exc_reg)),
+            cause,
+        ],
         CallFlavor::MayForce,
         Register::new(Kind::Ref, dst_reg),
     )
@@ -3762,7 +3790,7 @@ where
 
 /// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
 /// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
-/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
+/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([frame, callable,
 /// arg0, ...]), Descr) → reg` Insn.  Mirrors the inline emit at
 /// codewriter.rs:6171-6179 (`build_call_fn_residual_call_r_r_insn`).
 ///
@@ -3795,13 +3823,25 @@ where
     if nargs > 8 {
         return None;
     }
+    assert_ne!(
+        ctx.portal_frame_reg,
+        u16::MAX,
+        "lower_simple_call_hlop_to_insn requires LoweringContext::portal_frame_reg \
+         to be seeded from portal_red_pre_regalloc_slots; see codewriter.rs:3432"
+    );
     // First arg is the callable, rest are call arguments.  All Ref.
-    // Constant args are accepted via `lower_constant` (matches
-    // `flatten.py:340-345 flatten_arg`'s Constant arm); upstream
-    // RPython's rtype pass would have rewritten Constant args to
-    // pre-loaded Variables, but pyre's graph carries the un-rewritten
-    // Constants per [[project-flatten-graph-canonical-driver-2026-05-17]].
-    let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
+    // The lowered ListR is `[portal_frame, callable, args...]` because
+    // `bh_call_fn_N(frame, callable, args...)` receives the parent
+    // frame as the leading ref operand.  The graph-side `simple_call`
+    // HLOp carries only `(callable, args...)` to match RPython
+    // `jtransform.py:414 rewrite_call`; flatten prepends the frame
+    // here so the production ListR matches the inline walker emit at
+    // codewriter.rs:6784-6788 byte-for-byte.
+    let mut operands: Vec<Operand> = Vec::with_capacity(1 + op.args.len());
+    operands.push(Operand::Register(Register::new(
+        Kind::Ref,
+        ctx.portal_frame_reg,
+    )));
     for arg in &op.args {
         let operand = match arg {
             super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
@@ -5043,6 +5083,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -5163,6 +5204,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -5287,6 +5329,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -5456,6 +5499,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         });
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
@@ -5662,6 +5706,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5746,6 +5791,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5774,6 +5820,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -5870,6 +5917,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5930,6 +5978,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5956,6 +6005,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -5989,6 +6039,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6049,6 +6100,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6072,6 +6124,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6109,6 +6162,7 @@ mod tests {
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6162,6 +6216,7 @@ mod tests {
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6200,6 +6255,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -6233,6 +6289,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6262,6 +6319,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6291,6 +6349,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6325,6 +6384,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6373,6 +6433,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6706,12 +6767,13 @@ mod tests {
         // helper must produce the same `residual_call_r_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
         // codewriter.rs:5747-5754 before the refactor.  For nargs=2:
-        // `[ConstInt(fn_idx), ListR([Reg(callable), Reg(arg0),
-        // Reg(arg1)]), Descr(CallDescrStub{MayForce, [Ref, Ref, Ref]
-        // })] → Reg(Ref, dst)`.  No leading `ListI` — `args_i` is
-        // empty for all-Ref call_args.
+        // `[ConstInt(fn_idx), ListR([Reg(frame), Reg(callable),
+        // Reg(arg0), Reg(arg1)]), Descr(CallDescrStub{MayForce, [Ref,
+        // Ref, Ref, Ref]})] → Reg(Ref, dst)`.  No leading `ListI` —
+        // `args_i` is empty for all-Ref call_args.
         let insn = build_call_fn_residual_call_r_r_insn(
             /* call_fn_idx */ 21,
+            /* frame_reg */ 4,
             /* callable_reg */ 5,
             /* arg_regs */ &[6, 7],
             /* dst_reg */ 8,
@@ -6734,36 +6796,46 @@ mod tests {
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
-                        // nargs+1 = 3: callable + 2 args.
-                        assert_eq!(list.content.len(), 3);
+                        // nargs+2 = 4: frame + callable + 2 args.
+                        assert_eq!(list.content.len(), 4);
                         assert!(matches!(
                             &list.content[0],
                             Operand::Register(Register {
                                 kind: Kind::Ref,
-                                index: 5
+                                index: 4
                             })
                         ));
                         assert!(matches!(
                             &list.content[1],
                             Operand::Register(Register {
                                 kind: Kind::Ref,
-                                index: 6
+                                index: 5
                             })
                         ));
                         assert!(matches!(
                             &list.content[2],
                             Operand::Register(Register {
                                 kind: Kind::Ref,
+                                index: 6
+                            })
+                        ));
+                        assert!(matches!(
+                            &list.content[3],
+                            Operand::Register(Register {
+                                kind: Kind::Ref,
                                 index: 7
                             })
                         ));
                     }
-                    other => panic!("expected ListOfKind(Ref, 3), got {other:?}"),
+                    other => panic!("expected ListOfKind(Ref, 4), got {other:?}"),
                 }
                 match &args[2] {
                     Operand::Descr(rc) => match &**rc {
                         DescrOperand::CallDescrStub(stub) => {
-                            assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Ref, Kind::Ref]);
+                            assert_eq!(
+                                stub.arg_kinds,
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref]
+                            );
                             assert_eq!(
                                 stub.effect_info,
                                 effect_info_for_call_flavor(CallFlavor::MayForce),
@@ -6780,21 +6852,25 @@ mod tests {
 
     #[test]
     fn build_call_fn_residual_call_r_r_insn_handles_nargs_0_and_8_boundaries() {
-        // Boundary cases: nargs=0 (just callable, ListR len=1,
-        // arg_kinds=[Ref]) and nargs=8 (callable + 8 args, ListR
-        // len=9, arg_kinds=[Ref;9]).  nargs > 8 falls through to
-        // emit_abort_permanent at the codewriter level and never
+        // Boundary cases: nargs=0 (frame + callable, ListR len=2,
+        // arg_kinds=[Ref;2]) and nargs=8 (frame + callable + 8 args,
+        // ListR len=10, arg_kinds=[Ref;10]).  nargs > 8 falls through
+        // to emit_abort_permanent at the codewriter level and never
         // invokes this helper, so 8 is the maximum we test.
-        let nargs_0 = build_call_fn_residual_call_r_r_insn(10, 1, &[], 2);
+        let nargs_0 = build_call_fn_residual_call_r_r_insn(10, 0, 1, &[], 2);
         if let Insn::Op { args, .. } = &nargs_0 {
             if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 1, "nargs=0 → ListR len=1 (callable)");
+                assert_eq!(
+                    list.content.len(),
+                    2,
+                    "nargs=0 → ListR len=2 (frame + callable)"
+                );
             } else {
                 panic!("expected ListOfKind at args[1]");
             }
             if let Operand::Descr(rc) = &args[2] {
                 if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(stub.arg_kinds, vec![Kind::Ref]);
+                    assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Ref]);
                 } else {
                     panic!("expected CallDescrStub");
                 }
@@ -6805,20 +6881,20 @@ mod tests {
             panic!("expected Insn::Op");
         }
 
-        let nargs_8 = build_call_fn_residual_call_r_r_insn(11, 1, &[2, 3, 4, 5, 6, 7, 8, 9], 10);
+        let nargs_8 = build_call_fn_residual_call_r_r_insn(11, 0, 1, &[2, 3, 4, 5, 6, 7, 8, 9], 10);
         if let Insn::Op { args, .. } = &nargs_8 {
             if let Operand::ListOfKind(list) = &args[1] {
                 assert_eq!(
                     list.content.len(),
-                    9,
-                    "nargs=8 → ListR len=9 (callable + 8)"
+                    10,
+                    "nargs=8 → ListR len=10 (frame + callable + 8)"
                 );
             } else {
                 panic!("expected ListOfKind at args[1]");
             }
             if let Operand::Descr(rc) = &args[2] {
                 if let DescrOperand::CallDescrStub(stub) = &**rc {
-                    assert_eq!(stub.arg_kinds, vec![Kind::Ref; 9]);
+                    assert_eq!(stub.arg_kinds, vec![Kind::Ref; 10]);
                 } else {
                     panic!("expected CallDescrStub");
                 }
@@ -6835,9 +6911,11 @@ mod tests {
         // Byte-equivalence cross-check: the Insn produced by the
         // production helper must match the Insn produced by feeding
         // the equivalent `residual_call_r_r` SpaceOperation through
-        // `flatten_op_to_insn`.  Tested at nargs=3 (callable + 3
-        // args) — the inline `emit_residual_call_shape` produces an
-        // Insn with ListR=[callable, arg0, arg1, arg2], no ListI.
+        // `flatten_op_to_insn`.  Tested at nargs=3 (frame + callable
+        // + 3 args) — the inline `emit_residual_call_shape` produces
+        // an Insn with ListR=[frame, callable, arg0, arg1, arg2], no
+        // ListI.
+        let frame = Variable::new(VariableId(4), Kind::Ref);
         let callable = Variable::new(VariableId(5), Kind::Ref);
         let arg0 = Variable::new(VariableId(6), Kind::Ref);
         let arg1 = Variable::new(VariableId(7), Kind::Ref);
@@ -6845,7 +6923,7 @@ mod tests {
         let dst = Variable::new(VariableId(9), Kind::Ref);
         let descr = intern_call_descr_stub(
             effect_info_for_call_flavor(CallFlavor::MayForce),
-            vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref],
+            vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref],
             Some(Kind::Ref),
         );
         let dual_op = SpaceOperation::new(
@@ -6854,7 +6932,13 @@ mod tests {
                 Constant::signed(33).into(),
                 FlowListOfKind::new(
                     Kind::Ref,
-                    vec![callable.into(), arg0.into(), arg1.into(), arg2.into()],
+                    vec![
+                        frame.into(),
+                        callable.into(),
+                        arg0.into(),
+                        arg1.into(),
+                        arg2.into(),
+                    ],
                 )
                 .into(),
                 descr.into(),
@@ -6869,7 +6953,7 @@ mod tests {
             &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
-        let prod = build_call_fn_residual_call_r_r_insn(33, 5, &[6, 7, 8], 9);
+        let prod = build_call_fn_residual_call_r_r_insn(33, 4, 5, &[6, 7, 8], 9);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
 
@@ -7240,12 +7324,13 @@ mod tests {
 
     #[test]
     fn build_normalize_raise_varargs_fn_residual_call_r_r_insn_with_reg_cause() {
-        // Task #48 micro-slice 14: `(exc:Ref, cause:Ref) → Ref`
-        // MayForce.  Argc=2 callsite uses `Operand::Register(Ref,
-        // cause_reg)` for the cause arg.
+        // `(frame:Ref, exc:Ref, cause:Ref) → Ref` MayForce.  Argc=2
+        // callsite uses `Operand::Register(Ref, cause_reg)` for the
+        // cause arg.
         let cause = Operand::Register(Register::new(Kind::Ref, 4));
         let insn = build_normalize_raise_varargs_fn_residual_call_r_r_insn(
-            /* fn_idx */ 25, /* exc_reg */ 3, cause, /* dst_reg */ 3,
+            /* fn_idx */ 25, /* frame_reg */ 2, /* exc_reg */ 3, cause,
+            /* dst_reg */ 3,
         );
         match insn {
             Insn::Op {
@@ -7263,16 +7348,23 @@ mod tests {
                 }
                 if let Operand::ListOfKind(list) = &args[1] {
                     assert_eq!(list.kind, Kind::Ref);
-                    assert_eq!(list.content.len(), 2);
+                    assert_eq!(list.content.len(), 3);
                     assert!(matches!(
                         &list.content[0],
+                        Operand::Register(Register {
+                            kind: Kind::Ref,
+                            index: 2
+                        })
+                    ));
+                    assert!(matches!(
+                        &list.content[1],
                         Operand::Register(Register {
                             kind: Kind::Ref,
                             index: 3
                         })
                     ));
                     assert!(matches!(
-                        &list.content[1],
+                        &list.content[2],
                         Operand::Register(Register {
                             kind: Kind::Ref,
                             index: 4
@@ -7283,7 +7375,7 @@ mod tests {
                 }
                 if let Operand::Descr(rc) = &args[2] {
                     if let DescrOperand::CallDescrStub(stub) = &**rc {
-                        assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Ref]);
+                        assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Ref, Kind::Ref]);
                         assert_eq!(
                             stub.effect_info,
                             effect_info_for_call_flavor(CallFlavor::MayForce),
@@ -7303,20 +7395,27 @@ mod tests {
     fn build_normalize_raise_varargs_fn_residual_call_r_r_insn_with_const_ref_cause() {
         // argc=1 callsite passes `Operand::ConstRef(PY_NULL)` for the
         // cause arg.  ConstRef has Kind::Ref so the Insn shape stays
-        // `residual_call_r_r` with arg_kinds=[Ref, Ref].
+        // `residual_call_r_r` with arg_kinds=[Ref, Ref, Ref].
         let cause = Operand::ConstRef(0); // PY_NULL stand-in
-        let insn = build_normalize_raise_varargs_fn_residual_call_r_r_insn(25, 3, cause, 3);
+        let insn = build_normalize_raise_varargs_fn_residual_call_r_r_insn(25, 2, 3, cause, 3);
         if let Insn::Op { args, .. } = &insn {
             if let Operand::ListOfKind(list) = &args[1] {
-                assert_eq!(list.content.len(), 2);
+                assert_eq!(list.content.len(), 3);
                 assert!(matches!(
                     &list.content[0],
+                    Operand::Register(Register {
+                        kind: Kind::Ref,
+                        index: 2
+                    })
+                ));
+                assert!(matches!(
+                    &list.content[1],
                     Operand::Register(Register {
                         kind: Kind::Ref,
                         index: 3
                     })
                 ));
-                assert!(matches!(&list.content[1], Operand::ConstRef(0)));
+                assert!(matches!(&list.content[2], Operand::ConstRef(0)));
             } else {
                 panic!("expected ListOfKind(Ref) at args[1]");
             }
@@ -7494,6 +7593,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            portal_frame_reg: u16::MAX,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr

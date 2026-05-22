@@ -483,7 +483,23 @@ pub fn call_user_function_plain(
 }
 
 /// Call a user function with an explicit execution context pointer.
-/// Used by MIFrame Box tracking when concrete_frame is unavailable.
+///
+/// ctx-driven port of `call_user_function_plain`: same body except the
+/// caller hands the `PyExecutionContext` directly instead of supplying a
+/// parent `PyFrame`.  Used by MIFrame Box tracking when concrete_frame is
+/// unavailable.  Future blackhole residual-call helpers
+/// (`bh_call_fn_impl` etc.) will route through this entry once their
+/// parent_frame dependency narrows to execution_context only.
+///
+/// Function-body parity with `call_user_function_with_eval` (line 230-333):
+/// positional defaults fill, kwdefaults fill, `pack_varargs`,
+/// generator/coroutine wrapping, callee `FrameLocalsRoot`.  Like
+/// `call_user_function_plain`, this entry does not bump `CALL_DEPTH`;
+/// call-depth policy stays with the non-plain call entries.  The caller
+/// `FrameLocalsRoot::new(frame)` is intentionally omitted because no
+/// parent frame exists in the ctx-only caller — blackhole's register
+/// space (`BlackholeInterpreter::registers_r`) owns the parent roots
+/// through its own channel.
 pub fn call_user_function_plain_with_ctx(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -492,16 +508,91 @@ pub fn call_user_function_plain_with_ctx(
     let w_code = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
     let closure = unsafe { function_get_closure(callable) };
-    let mut func_frame =
-        PyFrame::new_for_call_with_closure(w_code, args, globals, execution_context, closure);
+    let defaults = unsafe { crate::function_get_defaults(callable) };
+    let func_code = unsafe {
+        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
+    };
+
+    let code_ref = unsafe { &*func_code };
+    let nparams = code_ref.arg_count as usize;
+    let nargs = args.len();
+    let filled_args = if nargs < nparams && !defaults.is_null() {
+        let defaults = crate::baseobjspace::unwrap_cell(defaults);
+        let mut full = Vec::with_capacity(nparams);
+        full.extend_from_slice(args);
+        let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+            unsafe { pyre_object::w_tuple_len(defaults) }
+        } else {
+            0
+        };
+        let first_default = nparams - ndefaults;
+        for i in nargs..nparams {
+            if i >= first_default {
+                let default_idx = i - first_default;
+                if let Some(val) =
+                    unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
+                {
+                    full.push(val);
+                } else {
+                    full.push(pyre_object::PY_NULL);
+                }
+            } else {
+                full.push(pyre_object::PY_NULL);
+            }
+        }
+        full
+    } else {
+        args.to_vec()
+    };
+
+    let nkwonly = code_ref.kwonlyarg_count as usize;
+    let mut filled_args = filled_args;
+    if nkwonly > 0 {
+        let kwdefaults = unsafe { crate::function_get_kwdefaults(callable) };
+        while filled_args.len() < nparams + nkwonly {
+            filled_args.push(pyre_object::PY_NULL);
+        }
+        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            for ki in 0..nkwonly {
+                let slot = nparams + ki;
+                if filled_args[slot].is_null() {
+                    let param_name = &code_ref.varnames[slot];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                        filled_args[slot] = val;
+                    }
+                }
+            }
+        }
+    }
+
+    let final_args = pack_varargs(code_ref, filled_args);
+
+    if code_ref
+        .flags
+        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
+    {
+        let mut gen_frame = PyFrame::new_for_call_with_closure(
+            w_code,
+            &final_args,
+            globals,
+            execution_context,
+            closure,
+        );
+        gen_frame.fix_array_ptrs();
+        return gen_frame.run();
+    }
+
+    let mut func_frame = PyFrame::new_for_call_with_closure(
+        w_code,
+        &final_args,
+        globals,
+        execution_context,
+        closure,
+    );
     func_frame.fix_array_ptrs();
-    // pyframe.py:268-273 run — wrap as generator/coroutine when the code
-    // carries CO_GENERATOR / CO_COROUTINE / CO_ASYNC_GENERATOR.  The
-    // generator-flag dispatch site for the normal call path lives at
-    // call.rs:1260; this MIFrame Box tracking entry must mirror it so
-    // calls dispatched without a concrete_frame produce the same result
-    // as calls dispatched with one.
-    func_frame.run()
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    eval_frame_plain(&mut func_frame)
 }
 
 /// Explicit residual-call protocol used by JIT inline framestack concrete

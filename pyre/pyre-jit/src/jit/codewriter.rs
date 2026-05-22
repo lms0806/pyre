@@ -3121,7 +3121,7 @@ fn register_helper_fn_pointers(
         cpu.build_slice_fn as *const (),
         CallFlavor::Plain,
     );
-    // `bh_normalize_raise_varargs_fn` walks the exception class /
+    // `bh_normalize_raise_varargs_with_frame` walks the exception class /
     // value pair and instantiates user `__init__` — arbitrary
     // user code that may observe virtualizables.  Matches
     // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (`effectinfo.py:23`)
@@ -4001,6 +4001,7 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
+                portal_frame_reg,
             });
         }
 
@@ -7029,8 +7030,9 @@ impl CodeWriter {
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
 
                             // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
-                            // call_fn(callable, arg0, ...) → result
-                            // Parent frame accessed via BH_VABLE_PTR thread-local.
+                            // call_fn(frame, callable, arg0, ...) → result
+                            // Parent frame is passed explicitly as the leading
+                            // ref operand; no thread-local indirection.
                             // The flatten.rs helper consumes `callable_reg` and
                             // `&arg_regs` directly; no intermediate Vec needed.
                             // Select the correct arity-specific call helper.
@@ -7041,7 +7043,14 @@ impl CodeWriter {
                             let call_result_value = if nargs > 8 {
                                 fresh_ref_value(&mut graph)
                             } else {
-                                let graph_call_args: Vec<_> =
+                                // Graph-side `simple_call(callable, args...)`
+                                // carries only the RPython rewrite_call shape
+                                // (jtransform.py:414 — no hidden frame arg).
+                                // `lower_simple_call_hlop_to_insn` prepends
+                                // `ctx.portal_frame_reg` to the ListR at flatten
+                                // time so the lowered Insn matches the inline
+                                // walker emit at codewriter.rs:6784-6788.
+                                let graph_call_args: Vec<super::flow::FlowValue> =
                                     graph_arg_values_rev.iter().rev().cloned().collect();
                                 let result = emit_frontend_simple_call(
                                     &mut graph,
@@ -7077,9 +7086,10 @@ impl CodeWriter {
                                 // call is replaced by a single direct push
                                 // of `build_call_fn_residual_call_r_r_insn`,
                                 // which produces the same `residual_call_r_r(
-                                // ConstInt(fn_idx), ListR([Reg(callable),
-                                // Reg(arg0), ..., Reg(arg_{N-1})]), Descr) →
-                                // Reg(dst)` Insn shape
+                                // ConstInt(fn_idx), ListR([Reg(frame),
+                                // Reg(callable), Reg(arg0), ...,
+                                // Reg(arg_{N-1})]), Descr) → Reg(dst)`
+                                // Insn shape
                                 // `emit_residual_call_shape` would have
                                 // produced (no leading `ListI` because
                                 // `args_i` is empty for all-Ref call_args).
@@ -7123,7 +7133,13 @@ impl CodeWriter {
                                     )
                                 };
                                 let mut ref_operands: Vec<super::flatten::Operand> =
-                                    Vec::with_capacity(1 + arg_regs.len());
+                                    Vec::with_capacity(2 + arg_regs.len());
+                                ref_operands.push(super::flatten::Operand::Register(
+                                    super::flatten::Register::new(
+                                        super::flatten::Kind::Ref,
+                                        portal_frame_reg,
+                                    ),
+                                ));
                                 ref_operands.push(to_operand(&callable_value, callable_reg));
                                 for (value, reg) in arg_values.iter().zip(arg_regs.iter()) {
                                     ref_operands.push(to_operand(value, *reg));
@@ -7518,8 +7534,9 @@ impl CodeWriter {
                                 // replaced by a single direct push of
                                 // `build_normalize_raise_varargs_fn_residual_call_r_r_insn`,
                                 // which produces the same `residual_call_r_r(
-                                // ConstInt(fn_idx), ListR([Reg(exc),
-                                // cause]), Descr) → Reg(exc)` Insn shape.
+                                // ConstInt(fn_idx), ListR([Reg(frame),
+                                // Reg(exc), cause]), Descr) → Reg(exc)`
+                                // Insn shape.
                                 // Helper hardcodes `CallFlavor::MayForce`
                                 // matching the production source at
                                 // codewriter.rs:2235.  The polymorphic
@@ -7528,6 +7545,7 @@ impl CodeWriter {
                                 push_walker_emit(&current_block,
                                 super::flatten::build_normalize_raise_varargs_fn_residual_call_r_r_insn(
                                     normalize_raise_varargs_fn_idx,
+                                    portal_frame_reg,
                                     exc_reg,
                                     cause,
                                     exc_reg,
@@ -7536,16 +7554,16 @@ impl CodeWriter {
                                 // Graph-side `residual_call_r_r` dual-write so the
                                 // canonical `flatten_graph` driver sees the same
                                 // op via passthrough.  `normalize_raise_varargs_fn`
-                                // takes `(exc:Ref, cause:Ref) → Ref` MayForce.
+                                // takes `(frame:Ref, exc:Ref, cause:Ref) → Ref` MayForce.
                                 let normalized_var = record_residual_call_graph_op(
                                     &mut graph,
                                     &current_block.block(),
                                     normalize_raise_varargs_fn_idx,
                                     CallFlavor::MayForce,
                                     vec![],
-                                    vec![exc_fv.into(), cause_fv.into()],
+                                    vec![frame_var.into(), exc_fv.into(), cause_fv.into()],
                                     vec![],
-                                    vec![Kind::Ref, Kind::Ref],
+                                    vec![Kind::Ref, Kind::Ref, Kind::Ref],
                                     ResKind::Ref,
                                     py_pc as i64,
                                 );
