@@ -84,7 +84,7 @@
 //! 2. **`FunctionGraph.constants` side table + `alloc_const`** — gave
 //!    each constant a real `Variable` with no producer op, mirroring
 //!    upstream's "Constant has no producer".  Broke regalloc /
-//!    assembler `lookup_coloring` because the downstream pipeline
+//!    assembler `lookup_coloring_var` because the downstream pipeline
 //!    requires every `args` `Variable` to have a regalloc coloring,
 //!    which non-Variable Constants don't have.  Plumbing constants
 //!    through liveness / regalloc / assembler is multi-session.
@@ -165,8 +165,8 @@ pub fn lower_exc_from_raise(
     // the module-level docstring for why it stands until the
     // `Vec<Variable>` → `Vec<LinkArg>` migration lands.
     let simple_call_target = CallTarget::function_path(["simple_call", exc_class_name]);
-    let evalue = graph
-        .push_op(
+    let evalue_var = graph
+        .push_op_var(
             block,
             OpKind::Call {
                 target: simple_call_target,
@@ -176,12 +176,11 @@ pub fn lower_exc_from_raise(
             true,
         )
         .expect("op.simple_call(exc_class, ...) must produce a Ref exception instance");
-    let evalue_var = graph.must_variable(evalue);
     // `op.type(evalue)` — upstream `flowcontext.py:600` tail line
     // (`w_type = op.type(w_value).eval(self)`).
     let type_target = CallTarget::function_path(["type"]);
-    let etype = graph
-        .push_op(
+    let etype_var = graph
+        .push_op_var(
             block,
             OpKind::Call {
                 target: type_target,
@@ -194,6 +193,5 @@ pub fn lower_exc_from_raise(
     // `flowspace/flowcontext.py:1253 Raise.nomoreblocks` — close
     // the block with the `(etype, evalue)` Link to the graph's
     // `exceptblock`.
-    let etype_var = graph.must_variable(etype);
     graph.set_raise_values(block, etype_var, evalue_var);
 }

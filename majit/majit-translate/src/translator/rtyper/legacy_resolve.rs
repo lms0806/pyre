@@ -48,8 +48,8 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // the slot on `Unknown` — non-`Unknown` `valuetype_to_concrete`
     // outputs always produce a concrete kind, so every populated cell
     // commits a real
-    // `graph.set_concretetype_inline` write.
-    for (_, var) in graph.iter_variables() {
+    // `FunctionGraph::set_concretetype_of_inline` write.
+    for (_, var) in graph.iter_variable_slots() {
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
@@ -330,10 +330,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
             seen.insert(var.clone());
         }
         for op in &block.operations {
-            for var in crate::inline::op_variable_refs(&op.kind, graph)
-                .into_iter()
-                .flatten()
-            {
+            for var in crate::inline::op_variable_refs(&op.kind) {
                 seen.insert(var);
             }
             if let Some(r) = op.result.as_ref() {
@@ -359,7 +356,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
         }
     }
 
-    // RPython parity: every `graph.set_concretetype_inline(vid, ct)`
+    // RPython parity: every `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     // above publishes the resolved kind on each Variable's
     // `concretetype` cell, matching `rtyper.py:258 v.concretetype = ...`.
     // Downstream consumers read kinds via `graph.concretetype(v)`
@@ -649,22 +646,23 @@ mod tests {
     fn resolves_int_types() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        let v_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(v), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Signed);
     }
 
     #[test]
     fn resolves_ref_field() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let v = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let v_var = graph
+            .push_op_var(
                 entry,
                 OpKind::FieldRead {
                     base: base_var,
@@ -675,35 +673,37 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        graph.set_return(entry, Some(v_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(v), ConcreteType::GcRef);
+        assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::GcRef);
     }
 
     #[test]
     fn resolves_phi_through_link_args() {
         let mut graph = FunctionGraph::new("phi");
         let entry = graph.startblock;
-        let val = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
-        let (target, phi_args) = graph.create_block_with_args(1);
-        let phi = phi_args[0];
-        let val_var = graph.must_variable(val);
+        let val_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let (target, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi_var = phi_args[0].clone();
         graph.set_goto(entry, target, vec![val_var]);
-        graph.set_return(target, Some(graph.must_variable(phi)));
+        graph.set_return(target, Some(phi_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(phi), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&phi_var),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
     fn backward_constraint_types_unknown_int_binop_operands_as_signed() {
         let mut graph = FunctionGraph::new("int_backprop");
         let entry = graph.startblock;
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "lhs".to_string(),
@@ -712,8 +712,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "rhs".to_string(),
@@ -722,35 +722,42 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(result)));
+        graph.set_return(entry, Some(result_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(lhs), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(rhs), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(result), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&lhs_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&rhs_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
     fn backward_constraint_types_frontend_bitop_operands_as_signed() {
         let mut graph = FunctionGraph::new("bitxor_backprop");
         let entry = graph.startblock;
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "lhs".to_string(),
@@ -759,8 +766,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "rhs".to_string(),
@@ -769,35 +776,42 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "bitxor".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(result)));
+        graph.set_return(entry, Some(result_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(lhs), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(rhs), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(result), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&lhs_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&rhs_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
     fn same_as_preserves_ref_classification() {
         let mut graph = FunctionGraph::new("same_as_ref");
         let entry = graph.startblock;
-        let value = graph
-            .push_op(
+        let value_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "obj".to_string(),
@@ -806,57 +820,67 @@ mod tests {
                 true,
             )
             .unwrap();
-        let value_var = graph.must_variable(value);
-        let alias = graph
-            .push_op(
+        let alias_var = graph
+            .push_op_var(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value_var,
+                    operand: value_var.clone(),
                     result_ty: ValueType::Unknown,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(alias)));
+        graph.set_return(entry, Some(alias_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(value), ConcreteType::GcRef);
-        assert_eq!(graph.concretetype(alias), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&value_var),
+            ConcreteType::GcRef
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&alias_var),
+            ConcreteType::GcRef
+        );
     }
 
     #[test]
     fn same_as_propagates_signed_without_forcing_unknown_identity_to_int() {
         let mut graph = FunctionGraph::new("same_as_int");
         let entry = graph.startblock;
-        let value = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
-        let value_var = graph.must_variable(value);
-        let alias = graph
-            .push_op(
+        let value_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let alias_var = graph
+            .push_op_var(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value_var,
+                    operand: value_var.clone(),
                     result_ty: ValueType::Unknown,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(alias)));
+        graph.set_return(entry, Some(alias_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(value), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(alias), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&value_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&alias_var),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
     fn backward_constraint_propagates_signed_back_through_link_source() {
         let mut graph = FunctionGraph::new("link_backprop");
         let entry = graph.startblock;
-        let src = graph
-            .push_op(
+        let src_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "x".to_string(),
@@ -865,40 +889,46 @@ mod tests {
                 true,
             )
             .unwrap();
-        let one = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
-        let (target, phi_args) = graph.create_block_with_args(1);
-        let phi = phi_args[0];
-        let src_var = graph.must_variable(src);
-        graph.set_goto(entry, target, vec![src_var]);
-        let phi_var = graph.must_variable(phi);
-        let one_var = graph.must_variable(one);
-        let result = graph
-            .push_op(
+        let one_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let (target, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi_var = phi_args[0].clone();
+        graph.set_goto(entry, target, vec![src_var.clone()]);
+        let result_var = graph
+            .push_op_var(
                 target,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: phi_var,
+                    lhs: phi_var.clone(),
                     rhs: one_var,
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(target, Some(graph.must_variable(result)));
+        graph.set_return(target, Some(result_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(phi), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(src), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(result), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&phi_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&src_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
     fn unknown_input_without_integer_constraint_backfills_as_gcref() {
         let mut graph = FunctionGraph::new("unknown_backfill");
         let entry = graph.startblock;
-        let value = graph
-            .push_op(
+        let value_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "obj".to_string(),
@@ -907,22 +937,27 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(value)));
+        graph.set_return(entry, Some(value_var.clone()));
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(value), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&value_var),
+            ConcreteType::GcRef
+        );
     }
 
     #[test]
     fn resolves_raise_link_exception_pair() {
         let mut graph = FunctionGraph::new("raise_link");
         let entry = graph.startblock;
-        let (exc_block, etype, evalue) = graph.exceptblock_args();
-        let last_exception = graph.alloc_value();
-        let last_exc_value = graph.alloc_value();
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
+        let exc_block = graph.exceptblock;
+        let (etype_var, evalue_var) = {
+            let inputargs = &graph.block(exc_block).inputargs;
+            (inputargs[0].clone(), inputargs[1].clone())
+        };
+        let last_exception_var = graph.alloc_value_var();
+        let last_exc_value_var = graph.alloc_value_var();
         graph.set_control_flow_metadata(
             entry,
             Some(ExitSwitch::LastException),
@@ -934,17 +969,29 @@ mod tests {
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::Value(last_exception_var)),
-                    Some(LinkArg::Value(last_exc_value_var)),
+                    Some(LinkArg::Value(last_exception_var.clone())),
+                    Some(LinkArg::Value(last_exc_value_var.clone())),
                 ),
             ],
         );
 
         annotate::annotate(&graph);
         resolve_types(&graph);
-        assert_eq!(graph.concretetype(last_exception), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(last_exc_value), ConcreteType::GcRef);
-        assert_eq!(graph.concretetype(etype), ConcreteType::Signed);
-        assert_eq!(graph.concretetype(evalue), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&last_exception_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&last_exc_value_var),
+            ConcreteType::GcRef
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&etype_var),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&evalue_var),
+            ConcreteType::GcRef
+        );
     }
 }

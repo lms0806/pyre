@@ -203,7 +203,7 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
     // ------------------------------------------------------------------
     // Canonical payload check: verify each JitMergePoint / LoopHeader
     // SSA op produces the upstream-shaped bytecode slice. Without this,
-    // the generic fallback (which only serialises op_value_refs()) would
+    // the generic fallback (which only serialises op_variable_refs()) would
     // silently pass the assembler without emitting jdindex + typed lists,
     // misaligning blackhole.rs:2012 / pyjitpl/dispatch.rs:1089 cursors.
     //

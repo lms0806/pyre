@@ -231,23 +231,23 @@ impl CodeWriter {
     /// keep the synthetic canonical type the merge wrote.
     ///
     /// **Remaining structural divergence** — pyre's codewriter still
-    /// consumes [`crate::model::FunctionGraph`] (a `ValueId`-indexed
-    /// IR) instead of [`crate::flowspace::model::FunctionGraph`]
-    /// (the upstream `Variable`-based shape).  Operand identity in
+    /// consumes [`crate::model::FunctionGraph`] (a slot-indexed legacy
+    /// IR) instead of [`crate::flowspace::model::FunctionGraph`] (the
+    /// upstream `Variable`-based shape).  Operand identity in
     /// `SpaceOperation` payloads is already `Variable` (Slice 2.9
     /// onward); `FlatOp` operands are `Register` (regalloc color +
-    /// kind).  What still ties the codewriter to the legacy IR is
-    /// the dense `ValueId` index that `FunctionGraph` uses to key
-    /// `value_variables`, `value_id_of`, and the side tables in
-    /// `value_map`/`alias_map` paths.  Migrating to the
-    /// `Variable`-based IR throughout would let pyre drop the
-    /// `value_to_var` bridge and consume the rtyper's Variable graph
-    /// directly — multi-week scope tracked separately.
+    /// kind).  What still ties the codewriter to the legacy IR is the
+    /// dense slot index that `FunctionGraph` uses to key
+    /// `value_variables` and the side tables in `value_map` /
+    /// `alias_map` paths.  Migrating to the `Variable`-based IR
+    /// throughout would let pyre drop the `value_to_var` bridge and
+    /// consume the rtyper's Variable graph directly — multi-week
+    /// scope tracked separately.
     /// Slice 12.2 / 12.4 — shared dual-gate type-resolve entry.
     ///
     /// Runs [`dual_gate_check_with_registry`] against the
     /// program-wide `PyreCallRegistry`; on Match the real path's
-    /// `ValueIdToVariable` map (with each `Variable.concretetype`
+    /// `SlotToVariable` map (with each `Variable.concretetype`
     /// cell populated by `RPythonTyper::specialize`) is returned
     /// directly, on Skip the legacy walker (`legacy_annotator::annotate` +
     /// `legacy_resolve::resolve_types`) commits kinds to
@@ -261,7 +261,7 @@ impl CodeWriter {
     /// Run the dual-gate type resolver and commit every resolved kind
     /// to each backing `Variable.concretetype` cell on `graph` (RPython
     /// `rtyper.py:258 v.concretetype = ...`).  Returns the
-    /// `ValueIdToVariable` map produced by the Match arm so the
+    /// `SlotToVariable` map produced by the Match arm so the
     /// post-jtransform path can rebind operand Variables to the
     /// upstream-typed ones; Skip arm returns `None`.
     pub fn dual_gate_publish_concretetypes(
@@ -269,7 +269,7 @@ impl CodeWriter {
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
         diag_label: &str,
-    ) -> Option<crate::translator::rtyper::flowspace_adapter::ValueIdToVariable> {
+    ) -> Option<crate::translator::rtyper::flowspace_adapter::SlotToVariable> {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
             crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
@@ -479,7 +479,7 @@ impl CodeWriter {
             }
         }
         // Long-term parity hydration: when the dual-gate Match arm
-        // surfaced a `ValueIdToVariable` map, rebind each slot to the
+        // surfaced a `SlotToVariable` map, rebind each slot to the
         // upstream-typed `Variable` so `graph.concretetype(v)` reads
         // its `concretetype` cell directly.  Upstream parity:
         // `history.py:46-71 getkind` reads `v.concretetype` from the
@@ -768,7 +768,7 @@ impl Default for CodeWriter {
 /// slices C4-C6 retire it.
 fn stamp_classdef_hints_on_graph(
     graph: &mut FunctionGraph,
-    value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::SlotToVariable,
     callcontrol: &mut CallControl,
 ) {
     use crate::annotator::description::ClassDefKey;
@@ -793,10 +793,10 @@ fn stamp_classdef_hints_on_graph(
             let Some(receiver) = args.first() else {
                 continue;
             };
-            let Some(vid) = graph.value_id_of(receiver) else {
+            let Some(slot) = graph.slot_of(receiver) else {
                 continue;
             };
-            let Some(annotated_var) = value_to_var.get(&vid) else {
+            let Some(annotated_var) = value_to_var.get(&slot) else {
                 continue;
             };
             let annotation = annotated_var.annotation.borrow();
@@ -917,7 +917,8 @@ mod stamp_classdef_hints_tests {
         ))));
 
         let mut graph = FunctionGraph::new("producer_test");
-        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        graph.ensure_variable_registered_void(&recv_var);
+        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         let _result_vid = graph
             .push_op(
                 graph.startblock,
@@ -930,7 +931,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_vid, recv_var.clone());
+        value_to_var.insert(recv_slot, recv_var.clone());
 
         let mut callcontrol = CallControl::new();
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
@@ -959,7 +960,8 @@ mod stamp_classdef_hints_tests {
         let recv_var = Variable::new();
         // No annotation bound.
         let mut graph = FunctionGraph::new("producer_test");
-        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        graph.ensure_variable_registered_void(&recv_var);
+        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
             .push_op(
                 graph.startblock,
@@ -972,7 +974,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_vid, recv_var.clone());
+        value_to_var.insert(recv_slot, recv_var.clone());
 
         let mut callcontrol = CallControl::new();
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);
@@ -1048,7 +1050,8 @@ mod stamp_classdef_hints_tests {
         ))));
 
         let mut graph = FunctionGraph::new("producer_test");
-        let recv_vid = graph.ensure_variable_registered(&recv_var);
+        graph.ensure_variable_registered_void(&recv_var);
+        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
             .push_op(
                 graph.startblock,
@@ -1061,7 +1064,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_vid, recv_var.clone());
+        value_to_var.insert(recv_slot, recv_var.clone());
 
         let mut callcontrol = CallControl::new();
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var, &mut callcontrol);

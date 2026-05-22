@@ -229,7 +229,7 @@ impl RegAllocator {
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
         for block in &graph.blocks {
-            self.process_block(block, graph, consider);
+            self.process_block(block, consider);
         }
     }
 
@@ -237,7 +237,6 @@ impl RegAllocator {
     fn process_block(
         &mut self,
         block: &Block,
-        graph: &FunctionGraph,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
         // die_at: last usage index of each variable in this block.
@@ -249,10 +248,7 @@ impl RegAllocator {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
-            for var in crate::inline::op_variable_refs(&op.kind, graph)
-                .into_iter()
-                .flatten()
-            {
+            for var in crate::inline::op_variable_refs(&op.kind) {
                 die_at.insert(var, i);
             }
             if let Some(result_var) = op.result.clone() {
@@ -547,7 +543,7 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     // concretetype lands in `kind`.  `getcolor` projects through the
     // unionfind rep to recover the chordal coloring entry — matches
     // upstream `regalloc.py:118 self.coloring[self.unionfind.find_rep(v)]`.
-    for (_vid, var) in graph.iter_variables() {
+    for (_slot, var) in graph.iter_variable_slots() {
         if variable_regkind(var) == Some(kind) {
             if let Some(color) = allocator.getcolor(var) {
                 coloring.insert(var.clone(), color);
@@ -598,8 +594,8 @@ mod tests {
         // v0 dies when v1 is defined → no interference → can share register.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v0 = graph
-            .push_op(
+        let v0_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "a".into(),
@@ -608,23 +604,22 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v0_var = graph.must_variable(v0);
-        let v1 = graph
-            .push_op(
+        let v1_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
                     lhs: v0_var.clone(),
-                    rhs: v0_var,
+                    rhs: v0_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v1)));
+        graph.set_return(entry, Some(v1_var.clone()));
 
-        graph.set_concretetype(v0, ConcreteType::Signed);
-        graph.set_concretetype(v1, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v0_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v1_var, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
         // v0 and v1 don't overlap → can share
         assert_eq!(result.num_regs, 1);
@@ -636,8 +631,8 @@ mod tests {
         // v0 and v1 are both alive when v2 is defined → v0 and v1 interfere
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v0 = graph
-            .push_op(
+        let v0_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "a".into(),
@@ -646,8 +641,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v1 = graph
-            .push_op(
+        let v1_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "b".into(),
@@ -656,29 +651,27 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v0_var = graph.must_variable(v0);
-        let v1_var = graph.must_variable(v1);
-        let v2 = graph
-            .push_op(
+        let v2_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: v0_var,
-                    rhs: v1_var,
+                    lhs: v0_var.clone(),
+                    rhs: v1_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v2)));
+        graph.set_return(entry, Some(v2_var.clone()));
 
-        graph.set_concretetype(v0, ConcreteType::Signed);
-        graph.set_concretetype(v1, ConcreteType::Signed);
-        graph.set_concretetype(v2, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v0_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v1_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v2_var, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
         assert_ne!(
-            result.color_for_variable(&graph.must_variable(v0)),
-            result.color_for_variable(&graph.must_variable(v1)),
+            result.color_for_variable(&v0_var),
+            result.color_for_variable(&v1_var),
             "v0 and v1 are simultaneously alive → different registers"
         );
         // v2 can share with v0 or v1 (they die before v2's definition)
@@ -689,8 +682,8 @@ mod tests {
     fn goto_link_coalescing() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v0 = graph
-            .push_op(
+        let v0_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "a".into(),
@@ -699,18 +692,17 @@ mod tests {
                 true,
             )
             .unwrap();
-        let (block1, block1_args) = graph.create_block_with_args(1);
-        let v1 = block1_args[0];
-        let v0_var = graph.must_variable(v0);
-        graph.set_goto(entry, block1, vec![v0_var]);
-        graph.set_return(block1, Some(graph.must_variable(v1)));
+        let (block1, block1_args) = graph.create_block_with_arg_vars(1);
+        let v1_var = block1_args[0].clone();
+        graph.set_goto(entry, block1, vec![v0_var.clone()]);
+        graph.set_return(block1, Some(v1_var.clone()));
 
-        graph.set_concretetype(v0, ConcreteType::Signed);
-        graph.set_concretetype(v1, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v0_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v1_var, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
         assert_eq!(
-            result.color_for_variable(&graph.must_variable(v0)),
-            result.color_for_variable(&graph.must_variable(v1)),
+            result.color_for_variable(&v0_var),
+            result.color_for_variable(&v1_var),
         );
         assert_eq!(result.num_regs, 1);
     }

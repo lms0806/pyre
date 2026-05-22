@@ -85,8 +85,7 @@ pub fn class_get_method_ptr(
     trait_root: String,
     method_name: String,
 ) -> Variable {
-    let funcptr_vid = graph.alloc_value();
-    let funcptr_var = graph.must_variable(funcptr_vid);
+    let funcptr_var = graph.alloc_value_var();
     let op = SpaceOperation {
         result: Some(funcptr_var.clone()),
         kind: OpKind::VtableMethodPtr {

@@ -68,12 +68,6 @@ pub struct Lowered {
 }
 
 impl Lowered {
-    pub fn value(v: ValueId) -> Self {
-        Lowered {
-            value: Some(v),
-            path_closed: false,
-        }
-    }
     pub fn no_value() -> Self {
         Lowered {
             value: None,
@@ -84,6 +78,35 @@ impl Lowered {
         Lowered {
             value: None,
             path_closed: true,
+        }
+    }
+
+    /// Project [`Self::value`] (still ValueId-keyed) into the backing
+    /// `Variable` via [`FunctionGraph::must_variable_at`].  Lets call
+    /// sites that hand the lowered result straight into a
+    /// Variable-accepting sink (e.g. [`FunctionGraph::set_return`])
+    /// skip the local `.map(|v| graph.must_variable_at(v.0))` chain.
+    /// Once the Lowered.value carrier itself flips to `Option<Variable>`,
+    /// the body collapses to `self.value.clone()` and the bridge
+    /// disappears.
+    pub fn value_var(&self, graph: &FunctionGraph) -> Option<crate::flowspace::model::Variable> {
+        self.value.map(|v| graph.must_variable_at(v.0))
+    }
+
+    /// Variable-direct constructor sibling of [`Self::value`] — projects
+    /// `var` through `graph.slot_of` once at construction so call
+    /// sites that already hold the Variable handle (e.g. from
+    /// `popvid_var` / `push_op_var`) skip the explicit
+    /// `graph.slot_of(&var).expect(...)` bridge.  Once the
+    /// Lowered.value carrier flips to `Option<Variable>`, the body
+    /// collapses to `Lowered { value: Some(var.clone()), .. }`.
+    pub fn from_value_var(graph: &FunctionGraph, var: &crate::flowspace::model::Variable) -> Self {
+        let vid = graph
+            .value_id_of(var)
+            .expect("Lowered::from_value_var: var must be registered on the graph");
+        Lowered {
+            value: Some(vid),
+            path_closed: false,
         }
     }
 }
@@ -1584,7 +1607,7 @@ pub fn lower_expr_into_graph_with_signature(
                     let self_ty = classify_fn_arg_ty(&recv.ty);
                     ctx.local_value_types
                         .insert("self".to_string(), self_ty.clone());
-                    if let Some(vid) = graph.push_op(
+                    if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: "self".to_string(),
@@ -1592,9 +1615,9 @@ pub fn lower_expr_into_graph_with_signature(
                         },
                         true,
                     ) {
-                        graph.name_value(vid, "self".to_string());
-                        graph.push_inputarg(block, vid);
-                        ctx.bind_local_id("self".to_string(), vid, block);
+                        graph.name_value_var(&var, "self".to_string());
+                        graph.push_inputarg_var(block, var.clone());
+                        ctx.bind_local_id_var("self".to_string(), &var, graph, block);
                     }
                 }
                 syn::FnArg::Typed(pat_type) => {
@@ -1604,7 +1627,7 @@ pub fn lower_expr_into_graph_with_signature(
                     }
                     let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                     ctx.local_value_types.insert(name.clone(), arg_ty.clone());
-                    if let Some(vid) = graph.push_op(
+                    if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: name.clone(),
@@ -1612,9 +1635,9 @@ pub fn lower_expr_into_graph_with_signature(
                         },
                         true,
                     ) {
-                        graph.name_value(vid, name.clone());
-                        graph.push_inputarg(block, vid);
-                        ctx.bind_local_id(name, vid, block);
+                        graph.name_value_var(&var, name.clone());
+                        graph.push_inputarg_var(block, var.clone());
+                        ctx.bind_local_id_var(name, &var, graph, block);
                     }
                 }
             }
@@ -1630,7 +1653,7 @@ pub fn lower_expr_into_graph_with_signature(
     )?;
     ctx.assert_stack_empty_at_stmt_boundary("lower_expr_into_graph exit");
     if graph.block(block).is_open() {
-        graph.set_return(block, lowered.value.map(|v| graph.must_variable(v)));
+        graph.set_return(block, lowered.value_var(graph));
     }
     Ok(())
 }
@@ -1797,9 +1820,11 @@ struct GraphBuildContext<'a> {
     /// be ported in advance and validated in isolation.  Cell type is
     /// `StackElem` (Hlvalue cells per `flowcontext.py:285 self.stack`,
     /// a polymorphic `Variable | Constant | FlowSignal` list).
-    /// `pushvalue(vid)` mints a fresh `Variable` and registers
-    /// `(variable, vid)` so the cell ID round-trips through
-    /// `bridge_variable`; `popvalue() -> ValueId` reverses the bridge.
+    /// The cfg(test) `pushvid(vid)` helper mints a fresh `Variable` and
+    /// registers `(variable, vid)` so the cell ID round-trips through
+    /// `bridge_variable`; cfg(test) `popvid() -> ValueId` reverses the
+    /// bridge. Production code uses `pushvalue(cell: StackElem)` /
+    /// `popvalue() -> StackElem` directly without ValueId projection.
     /// `Hlvalue::Constant` and `FlowSignal` arms become callable once
     /// the Z4 walker (slice Z4.B+) introduces a non-Variable push site.
     #[allow(dead_code)]
@@ -2245,18 +2270,16 @@ fn allocate_loop_header_phis(
     // immutable `graph` borrow held by `locals_w_view` (derivation
     // fallback through `graph.variable`) releases before the mutable
     // `push_op` / `push_inputarg` / `block_mut` calls below.
-    let pre_loop_pairs: Vec<(usize, ValueId)> = pre_loop_snapshot
+    let pre_loop_pairs: Vec<(usize, crate::flowspace::model::Variable)> = pre_loop_snapshot
         .locals_w_view(graph)
         .iter()
         .enumerate()
         .filter_map(|(i, slot)| match slot {
-            Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
-                graph.value_id_of(v).map(|vid| (i, vid))
-            }
+            Some(crate::flowspace::model::Hlvalue::Variable(v)) => Some((i, v.clone())),
             _ => None,
         })
         .collect();
-    for (slot_idx, entry_vid) in pre_loop_pairs {
+    for (slot_idx, entry_var) in pre_loop_pairs {
         let name = &ctx.local_first_bind_order[slot_idx];
         // `flowcontext.py:430 mergeblock` allocates a phi for every
         // mergeable local; `simplify.transform_dead_op_vars` then
@@ -2266,12 +2289,12 @@ fn allocate_loop_header_phis(
         if !must_merge.read_names.contains(name) && !must_merge.rebound_names.contains(name) {
             continue;
         }
-        // Type lives on the op that produced `entry_vid` (mirrors
+        // Type lives on the op that produced `entry_var` (mirrors
         // upstream `Variable.concretetype` access pattern post-rtyper).
-        let value_type = graph_value_type(graph, entry_vid).unwrap_or(ValueType::Unknown);
+        let value_type = graph_value_type_var(graph, &entry_var).unwrap_or(ValueType::Unknown);
         let name = name.clone();
-        let phi_vid = graph
-            .push_op(
+        let phi_var = graph
+            .push_op_var(
                 header_entry,
                 OpKind::Input {
                     name: name.clone(),
@@ -2280,13 +2303,13 @@ fn allocate_loop_header_phis(
                 true,
             )
             .expect("OpKind::Input always produces a result");
-        graph.name_value(phi_vid, name.clone());
-        graph.push_inputarg(header_entry, phi_vid);
-        let entry_arg = LinkArg::Value(graph.must_variable(entry_vid));
+        graph.name_value_var(&phi_var, name.clone());
+        graph.push_inputarg_var(header_entry, phi_var.clone());
+        let entry_arg = LinkArg::Value(entry_var);
         graph.block_mut(pre_loop_block).exits[0]
             .args
             .push(entry_arg);
-        ctx.bind_local_id(name.clone(), phi_vid, header_entry);
+        ctx.bind_local_id_var(name.clone(), &phi_var, graph, header_entry);
         ctx.local_value_types.insert(name.clone(), value_type);
         header_phi_names.push(name);
     }
@@ -2345,7 +2368,7 @@ fn link_arg_vars_from_ctx(
                     name
                 )
             });
-            graph.must_variable(vid)
+            graph.must_variable_at(vid.0)
         })
         .collect()
 }
@@ -2431,13 +2454,13 @@ impl<'a> GraphBuildContext<'a> {
     /// upstream's Variable carries its identity inline, so the
     /// SpaceOperation `result` cell is what reaches the stack.  Pyre
     /// keys identity through ValueId; the bridge through
-    /// `graph.variable(vid)` recovers the matching Variable so
+    /// `graph.variable_at(vid.0)` recovers the matching Variable so
     /// stack-merge participants (`FrameState::union`,
     /// `set_goto_from_framestate`) see the same identity downstream.
     ///
     /// Currently unused by production lower_expr / lower_stmt — the
     /// Z4.B.1+ leaf-push migration consumes this once individual
-    /// `Expr` variants flip from return-Lowered::value to
+    /// `Expr` variants flip from return-Lowered::from_value_var to
     /// push-onto-value_stack.  Test fixtures route through the
     /// equivalent `z4a_push_vid` helper that mints + binds a fresh
     /// Variable to a chosen vid; this production variant assumes the
@@ -2447,13 +2470,13 @@ impl<'a> GraphBuildContext<'a> {
         use crate::flowspace::framestate::StackElem;
         use crate::flowspace::model::Hlvalue;
         let var = graph
-            .variable(vid)
+            .variable_at(vid.0)
             .unwrap_or_else(|| {
                 panic!(
-                    "pushvid: ValueId {vid:?} has no backing Variable on graph {:?}; \
-                     callers must mint the vid via `alloc_value` / \
+                    "pushvid: slot {} has no backing Variable on graph {:?}; \
+                     callers must mint the slot via `alloc_value` / \
                      `alloc_value_with_variable` before pushing onto value_stack",
-                    graph.name,
+                    vid.0, graph.name,
                 )
             })
             .clone();
@@ -2468,13 +2491,13 @@ impl<'a> GraphBuildContext<'a> {
     /// Pyre's analogue of upstream's `w_obj = self.popvalue()` followed
     /// by `op.result = w_obj` — upstream consumes Variables directly,
     /// pyre threads them back to the pyre IR's `ValueId` carrier via
-    /// `graph.bridge_variable(&var)`.
+    /// `graph.slot_of(&var)`.
     ///
     /// The Variable-only restriction matches the Z4.B.1 push contract
     /// (only `pushvid`-style cells today); once Z4.G+ activates
     /// Constant-cell pushes the helper will widen with a matching
     /// `LinkArg::Const`-style return.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn popvid(&mut self, graph: &FunctionGraph) -> ValueId {
         use crate::flowspace::framestate::StackElem;
         use crate::flowspace::model::Hlvalue;
@@ -2482,6 +2505,27 @@ impl<'a> GraphBuildContext<'a> {
             StackElem::Value(Hlvalue::Variable(v)) => graph.bridge_variable(&v),
             other => panic!(
                 "popvid: expected StackElem::Value(Hlvalue::Variable), got {other:?} \
+                 (graph {:?})",
+                graph.name,
+            ),
+        }
+    }
+
+    /// Variable-returning sibling of [`Self::popvid`] — pops the same
+    /// `StackElem::Value(Hlvalue::Variable(_))` cell but returns the
+    /// `Variable` directly so callers can skip the
+    /// `graph.slot_of(&var).expect(...)` → `graph.must_variable_at(slot)`
+    /// round-trip and feed the carrier straight into ops that already
+    /// take `Vec<Variable>` (e.g. `OpKind::Call.args`,
+    /// `OpKind::IndirectCall.args`).
+    #[allow(dead_code)]
+    fn popvid_var(&mut self, graph: &FunctionGraph) -> crate::flowspace::model::Variable {
+        use crate::flowspace::framestate::StackElem;
+        use crate::flowspace::model::Hlvalue;
+        match self.popvalue() {
+            StackElem::Value(Hlvalue::Variable(v)) => v,
+            other => panic!(
+                "popvid_var: expected StackElem::Value(Hlvalue::Variable), got {other:?} \
                  (graph {:?})",
                 graph.name,
             ),
@@ -2593,15 +2637,16 @@ impl<'a> GraphBuildContext<'a> {
         // `entries` — `flowcontext.py:346 getstate` carries
         // `self.locals_w` directly into the new FrameState.  Pyre's
         // locals projection currently keys identity through ValueId, so
-        // the matching Hlvalue cell is recovered via `graph.variable(
-        // vid)`; the same derivation `FrameState::union` performs on the
-        // merged side so all production-captured states are filled.
+        // the matching Hlvalue cell is recovered via
+        // `graph.variable_at(vid.0)`; the same derivation
+        // `FrameState::union` performs on the merged side so all
+        // production-captured states are filled.
         let locals_w: Vec<Option<crate::flowspace::model::Hlvalue>> = entries
             .iter()
             .map(|slot| {
                 slot.and_then(|vid| {
                     graph
-                        .variable(vid)
+                        .variable_at(vid.0)
                         .cloned()
                         .map(crate::flowspace::model::Hlvalue::Variable)
                 })
@@ -2947,6 +2992,36 @@ impl<'a> GraphBuildContext<'a> {
             }
         }
     }
+
+    /// cfg(test) sibling of [`Self::bind_local_id`] that accepts the
+    /// raw dense-slot index — lets test fixtures spell the local
+    /// binding as `ctx.bind_local_id_at(name, N, block)` instead of
+    /// `ctx.bind_local_id(name, ValueId(N), block)`, retiring
+    /// caller-side `ValueId(N)` literal surface during the Task #56
+    /// sweep.
+    #[cfg(test)]
+    fn bind_local_id_at(&mut self, name: String, idx: usize, defining_block: BlockId) {
+        self.bind_local_id(name, ValueId(idx), defining_block);
+    }
+
+    /// Variable-direct sibling of [`Self::bind_local_id`] — projects
+    /// the backing slot from `var` and forwards to the existing
+    /// `local_value_ids` side-table.  Lets production call sites that
+    /// hold the fresh `Variable` (from `push_op_var`) skip the
+    /// `graph.slot_of(...)` projection while the side-table is
+    /// still keyed on `ValueId`.
+    fn bind_local_id_var(
+        &mut self,
+        name: String,
+        var: &crate::flowspace::model::Variable,
+        graph: &crate::model::FunctionGraph,
+        defining_block: BlockId,
+    ) {
+        let vid = graph
+            .value_id_of(var)
+            .expect("bind_local_id_var: var must be registered on the graph");
+        self.bind_local_id(name, vid, defining_block);
+    }
 }
 
 #[derive(Clone)]
@@ -3044,20 +3119,20 @@ impl LocalBindingSnapshot {
 /// widens disagreeing concrete kinds to Unknown instead).  The call
 /// site falls back to the legacy naked-`Input` emit when `None` is
 /// returned.
-/// `pre_allocated_vid`: when `Some(vid)`, use the caller-supplied
-/// ValueId for the fresh phi instead of allocating a new one.  Used
-/// by union callers (`Expr::If`, `Expr::Match`) that pre-allocate
-/// phi vids inside `FrameState::union(_into)` so the merged state
-/// can be returned with vids materialised; the install is then
-/// emitted with the same vid the merged state already carries.
-/// `None` preserves the legacy behaviour (allocate inside).
-fn lazy_install_local_at_current_block(
+/// `pre_allocated_var`: when `Some(var)`, use the caller-supplied
+/// `Variable` for the fresh phi instead of allocating a new one.
+/// Used by union callers (`Expr::If`, `Expr::Match`) that pre-allocate
+/// phi variables inside `FrameState::union(_into)` so the merged
+/// state can be returned with variables materialised; the install is
+/// then emitted with the same `Variable` the merged state already
+/// carries.  `None` preserves the legacy behaviour (allocate inside).
+fn lazy_install_local_at_current_block_var(
     graph: &mut crate::model::FunctionGraph,
     ctx: &mut GraphBuildContext<'_>,
     current_block: BlockId,
     name: &str,
-    pre_allocated_vid: Option<ValueId>,
-) -> Option<ValueId> {
+    pre_allocated_var: Option<crate::flowspace::model::Variable>,
+) -> Option<crate::flowspace::model::Variable> {
     // Reuse — `name` may already have been installed at `current_block`
     // by an earlier read in the same block (prior recursion into a
     // shared predecessor, etc.).  Treat the same-block hit as the
@@ -3065,7 +3140,7 @@ fn lazy_install_local_at_current_block(
     if let Some(&(vid, def_block)) = ctx.local_value_ids.get(name)
         && def_block == current_block
     {
-        return Some(vid);
+        return Some(graph.must_variable_at(vid.0));
     }
 
     // Idempotency by graph state: if a prior lazy install for `name`
@@ -3089,7 +3164,7 @@ fn lazy_install_local_at_current_block(
                 && op_name == name
                 && block.inputargs.contains(result_var)
             {
-                return graph.value_id_of(result_var);
+                return Some(result_var.clone());
             }
         }
     }
@@ -3137,7 +3212,7 @@ fn lazy_install_local_at_current_block(
     struct PredSnap {
         pred_block: BlockId,
         exit_idx: usize,
-        snap_vid: ValueId,
+        snap_var: crate::flowspace::model::Variable,
         needs_recurse: bool,
     }
     let mut pred_snaps: Vec<PredSnap> = Vec::with_capacity(pred_edges.len());
@@ -3148,24 +3223,25 @@ fn lazy_install_local_at_current_block(
         // `set_branch` share the same close-time state; the per-edge
         // `ctx.exit_snapshots` HashMap is gone.  RPython parity:
         // `flowspace/flowcontext.py:38 SpamBlock.framestate`.
-        let snap_vid = {
+        let snap_var = {
             // `framestate.py:locals_w` is a positional slot vector;
             // resolve `name → slot_idx` via the graph-wide first-bind
             // order, mirroring upstream's `co_varnames.index(name)`
             // lookup pattern.  Consult `snap.locals_w` per upstream's
             // source of truth — pyre's `getstate` populates the
-            // `Hlvalue` carrier in lockstep with `entries`, so a
-            // `locals_w`-driven lookup recovers the same ValueId.
+            // `Hlvalue` carrier in lockstep with `entries`, so the
+            // `locals_w`-driven lookup recovers the same Variable
+            // identity the framestate captured.
             let slot_idx = ctx.local_first_bind_order.iter().position(|n| n == name)?;
             let snap = graph.block(*pred_block).framestate.as_ref()?;
             let view = snap.locals_w_view(graph);
             let cell = view.get(slot_idx)?;
             match cell {
-                Some(crate::flowspace::model::Hlvalue::Variable(v)) => graph.value_id_of(v)?,
+                Some(crate::flowspace::model::Hlvalue::Variable(v)) => v.clone(),
                 _ => return None,
             }
         };
-        let needs_recurse = !value_id_defined_in_block(graph, snap_vid, *pred_block);
+        let needs_recurse = !graph.variable_defined_in_block(*pred_block, &snap_var);
         // Type folds across predecessors via the wildcard rule:
         // concrete-vs-Unknown carries the concrete kind through;
         // concrete-vs-different-concrete widens to Unknown so the
@@ -3178,7 +3254,7 @@ fn lazy_install_local_at_current_block(
         // was retired in slice P2 after a dry-run audit confirmed
         // zero fixture / production conflicts (cargo lib 2557/0/3
         // + check.py 14/14×2 PASS).
-        let observed_type = graph_value_type(graph, snap_vid).unwrap_or(ValueType::Unknown);
+        let observed_type = graph_value_type_var(graph, &snap_var).unwrap_or(ValueType::Unknown);
         match (&shared_value_type, &observed_type) {
             (None, _) => shared_value_type = Some(observed_type.clone()),
             (Some(prior), new) if prior == new => {}
@@ -3189,7 +3265,7 @@ fn lazy_install_local_at_current_block(
         pred_snaps.push(PredSnap {
             pred_block: *pred_block,
             exit_idx: *exit_idx,
-            snap_vid,
+            snap_var,
             needs_recurse,
         });
     }
@@ -3237,18 +3313,18 @@ fn lazy_install_local_at_current_block(
     // header).
     let prior_ctx_lvi = ctx.local_value_ids.get(name).copied();
     let prior_ctx_lvt = ctx.local_value_types.get(name).cloned();
-    let new_vid = if let Some(vid) = pre_allocated_vid {
-        graph.push_op_with_result(
+    let new_var = if let Some(var) = pre_allocated_var {
+        graph.push_op_with_result_var(
             current_block,
             OpKind::Input {
                 name: name.to_string(),
                 ty: value_type.clone(),
             },
-            vid,
+            var.clone(),
         );
-        vid
+        var
     } else {
-        graph.push_op(
+        graph.push_op_var(
             current_block,
             OpKind::Input {
                 name: name.to_string(),
@@ -3257,9 +3333,9 @@ fn lazy_install_local_at_current_block(
             true,
         )?
     };
-    graph.name_value(new_vid, name.to_string());
-    graph.push_inputarg(current_block, new_vid);
-    ctx.bind_local_id(name.to_string(), new_vid, current_block);
+    graph.name_value_var(&new_var, name.to_string());
+    graph.push_inputarg_var(current_block, new_var.clone());
+    ctx.bind_local_id_var(name.to_string(), &new_var, graph, current_block);
     ctx.local_value_types
         .insert(name.to_string(), value_type.clone());
     // Predecessor source vids whose graph result type was Unknown when
@@ -3271,20 +3347,21 @@ fn lazy_install_local_at_current_block(
     // but a predecessor's source op still produces an Unknown-banked
     // value, tripping the assembler's `int_copy` / `ref_copy` /
     // `float_copy` same-kind invariant.
-    let mut unknown_predecessor_vids: Vec<ValueId> = Vec::new();
-    let mut pred_link_args: Vec<(BlockId, usize, ValueId)> = Vec::with_capacity(pred_snaps.len());
+    let mut unknown_predecessor_vars: Vec<crate::flowspace::model::Variable> = Vec::new();
+    let mut pred_link_args: Vec<(BlockId, usize, crate::flowspace::model::Variable)> =
+        Vec::with_capacity(pred_snaps.len());
     let mut rollback = false;
     for snap in pred_snaps {
-        let resolved_vid = if snap.needs_recurse {
-            match lazy_install_local_at_current_block(graph, ctx, snap.pred_block, name, None) {
-                Some(v) => v,
+        let resolved_var = if snap.needs_recurse {
+            match lazy_install_local_at_current_block_var(graph, ctx, snap.pred_block, name, None) {
+                Some(var) => var,
                 None => {
                     rollback = true;
                     break;
                 }
             }
         } else {
-            snap.snap_vid
+            snap.snap_var
         };
         // Phase 2 type-validation: retired in slice P2.  Phase 1's
         // wildcard fold (`(Some(_), _) => Unknown` arm) widens
@@ -3296,13 +3373,14 @@ fn lazy_install_local_at_current_block(
         // Types are downstream concerns (annotator + rtyper);
         // flowspace's job is the merge shape, not the kind
         // reconciliation.  The Unknown-source-pred retag below
-        // (driven by `unknown_predecessor_vids`) survives as the
+        // (driven by `unknown_predecessor_vars`) survives as the
         // wildcard widening's link-arg side.
-        let resolved_type = graph_value_type(graph, resolved_vid).unwrap_or(ValueType::Unknown);
+        let resolved_type =
+            graph_value_type_var(graph, &resolved_var).unwrap_or(ValueType::Unknown);
         if matches!(resolved_type, ValueType::Unknown) {
-            unknown_predecessor_vids.push(resolved_vid);
+            unknown_predecessor_vars.push(resolved_var.clone());
         }
-        pred_link_args.push((snap.pred_block, snap.exit_idx, resolved_vid));
+        pred_link_args.push((snap.pred_block, snap.exit_idx, resolved_var));
     }
 
     if rollback {
@@ -3320,12 +3398,7 @@ fn lazy_install_local_at_current_block(
             "rollback expected Input op for {name:?} at the operations tail",
         );
         let popped_inputarg = block.inputargs.pop();
-        debug_assert_eq!(
-            popped_inputarg
-                .as_ref()
-                .and_then(|var| graph.value_id_of(var)),
-            Some(new_vid),
-        );
+        debug_assert_eq!(popped_inputarg.as_ref(), Some(&new_var));
         match prior_ctx_lvi {
             Some((vid, def_block)) => {
                 ctx.bind_local_id(name.to_string(), vid, def_block);
@@ -3353,44 +3426,17 @@ fn lazy_install_local_at_current_block(
     // driven by cross-arm wildcard widening rather than the
     // type-extractor's `Ok`-arm narrowing.
     if !matches!(value_type, ValueType::Unknown) {
-        for vid in &unknown_predecessor_vids {
-            retag_result_value_type(graph, *vid, value_type.clone());
+        for var in &unknown_predecessor_vars {
+            retag_result_value_type(graph, var, value_type.clone());
         }
     }
 
-    for (pred_block, exit_idx, pred_vid) in pred_link_args {
-        let arg = crate::model::LinkArg::Value(graph.must_variable(pred_vid));
+    for (pred_block, exit_idx, pred_var) in pred_link_args {
+        let arg = crate::model::LinkArg::Value(pred_var);
         graph.block_mut(pred_block).exits[exit_idx].args.push(arg);
     }
 
-    Some(new_vid)
-}
-
-/// `true` iff `vid` is defined inside `block_id` — either as an entry
-/// in the block's `inputargs` or as the result of one of its
-/// `operations`.  RPython's `flowspace/model.py:checkgraph`
-/// "variable used in more than one block" assertion (lines
-/// 3886-3893 in the Rust port) requires every operand referenced from
-/// a block to be defined in that block, so the lazy installer uses
-/// this predicate to decide whether a snapshot vid can be threaded
-/// directly or whether the predecessor needs its own inputarg
-/// allocation first.
-fn value_id_defined_in_block(
-    graph: &crate::model::FunctionGraph,
-    vid: ValueId,
-    block_id: BlockId,
-) -> bool {
-    let block = graph.block(block_id);
-    let Some(target) = graph.variable(vid).cloned() else {
-        return false;
-    };
-    if block.inputargs.contains(&target) {
-        return true;
-    }
-    block
-        .operations
-        .iter()
-        .any(|op| op.result.as_ref() == Some(&target))
+    Some(new_var)
 }
 
 // Build a SemanticFunction from a Rust function AST. Mirrors RPython
@@ -3474,7 +3520,7 @@ fn build_function_graph(
                 let self_ty = classify_fn_arg_ty(&recv.ty);
                 ctx.local_value_types
                     .insert("self".to_string(), self_ty.clone());
-                if let Some(vid) = graph.push_op(
+                if let Some(var) = graph.push_op_var(
                     entry,
                     OpKind::Input {
                         name: "self".to_string(),
@@ -3482,16 +3528,16 @@ fn build_function_graph(
                     },
                     true,
                 ) {
-                    graph.name_value(vid, "self".to_string());
-                    graph.push_inputarg(entry, vid);
+                    graph.name_value_var(&var, "self".to_string());
+                    graph.push_inputarg_var(entry, var.clone());
                     // RPython `LOAD_FAST` parity: record the receiver
                     // binding so a body `Expr::Path` reference to
                     // `self` within the entry block reuses this
-                    // `ValueId` instead of emitting a fresh
+                    // Variable instead of emitting a fresh
                     // `OpKind::Input` — same treatment as typed
                     // parameters on the `FnArg::Typed` arm below
                     // (`flowspace/flowcontext.py:835`).
-                    ctx.bind_local_id("self".to_string(), vid, entry);
+                    ctx.bind_local_id_var("self".to_string(), &var, &graph, entry);
                 }
             }
             syn::FnArg::Typed(pat_type) => {
@@ -3540,7 +3586,7 @@ fn build_function_graph(
                 // `getfield_gc_*/id>*` `_intbase` aliases.
                 let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                 ctx.local_value_types.insert(name.clone(), arg_ty.clone());
-                if let Some(vid) = graph.push_op(
+                if let Some(var) = graph.push_op_var(
                     entry,
                     OpKind::Input {
                         name: name.clone(),
@@ -3548,14 +3594,14 @@ fn build_function_graph(
                     },
                     true,
                 ) {
-                    graph.name_value(vid, name.clone());
-                    graph.push_inputarg(entry, vid);
+                    graph.name_value_var(&var, name.clone());
+                    graph.push_inputarg_var(entry, var.clone());
                     // RPython `LOAD_FAST` parity: record the parameter
                     // binding so a body `Expr::Path` reference within
-                    // the entry block reuses this `ValueId` instead of
+                    // the entry block reuses this Variable instead of
                     // emitting a fresh `OpKind::Input`
                     // (`flowspace/flowcontext.py:835`).
-                    ctx.bind_local_id(name.clone(), vid, entry);
+                    ctx.bind_local_id_var(name.clone(), &var, &graph, entry);
                 }
             }
         }
@@ -3592,7 +3638,7 @@ fn build_function_graph(
     // only statement-only / empty bodies synthesize the void return
     // value.
     if !lowered.path_closed && graph.block(entry).is_open() {
-        graph.set_return(entry, lowered.value.map(|v| graph.must_variable(v)));
+        graph.set_return(entry, lowered.value_var(&graph));
     }
 
     // RPython: op.result.concretetype — module-qualified for exact type identity.
@@ -3932,7 +3978,7 @@ fn lower_stmt_inner(
                     return Ok(true);
                 }
                 // Record variable name (RPython Variable._name)
-                if let Some(vid) = lowered.value {
+                if let Some(var) = lowered.value_var(graph) {
                     let name = if let syn::Pat::Ident(pat_ident) = &local.pat {
                         Some(pat_ident.ident.to_string())
                     } else if let syn::Pat::Type(pat_type) = &local.pat {
@@ -3941,10 +3987,10 @@ fn lower_stmt_inner(
                         None
                     };
                     if let syn::Pat::Ident(pat_ident) = &local.pat {
-                        graph.name_value(vid, pat_ident.ident.to_string());
+                        graph.name_value_var(&var, pat_ident.ident.to_string());
                     } else if let syn::Pat::Type(pat_type) = &local.pat {
                         let name = canonical_pat_name(&pat_type.pat);
-                        graph.name_value(vid, name);
+                        graph.name_value_var(&var, name);
                     }
                     if let Some(name) = name {
                         // Prefer the statically-bool classification when
@@ -3964,16 +4010,16 @@ fn lower_stmt_inner(
                         let bool_override = expr_is_statically_bool(&init.expr, ctx);
                         if bool_override {
                             ctx.local_value_types.insert(name.clone(), ValueType::Bool);
-                        } else if let Some(ty) = graph_value_type(graph, vid) {
+                        } else if let Some(ty) = graph_value_type_var(graph, &var) {
                             ctx.local_value_types.insert(name.clone(), ty);
                         }
                         // RPython `LOAD_FAST` parity: record the
-                        // let-binding's `(ValueId, defining BlockId)`
+                        // let-binding's `(Variable, defining BlockId)`
                         // so a same-block `Expr::Path` reference
-                        // reuses this `ValueId` instead of emitting a
+                        // reuses this Variable instead of emitting a
                         // fresh `OpKind::Input`
                         // (`flowspace/flowcontext.py:835`).
-                        ctx.bind_local_id(name.clone(), vid, *block);
+                        ctx.bind_local_id_var(name.clone(), &var, graph, *block);
                         if let Some(type_string) = init_type_string {
                             // Mirror `bind_ident_type` on let-with-annotation:
                             // record the receiver root so subsequent
@@ -4167,13 +4213,13 @@ fn lower_if_expr(
     // upstream `flowcontext.py:1095 if_jump` where the cond was pushed
     // by the prior `COMPARE_OP` / `LOAD_FAST` / `POP_JUMP_IF_FALSE`
     // pops it (`flowcontext.py:1097 cond = self.popvalue()`).  Pyre's
-    // `lower_expr` still returns `Lowered::value`; the pushvid/popvid
+    // `lower_expr` still returns `Lowered::from_value_var`; the pushvid/popvid
     // pair exercises the production stack helpers so a later slice can
     // flip `lower_expr` to push internally and drop the explicit
     // push side here, leaving only the `popvid` consume.
     let cond_pre = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
     ctx.pushvid(graph, cond_pre);
-    let cond = ctx.popvid(graph);
+    let cond_var = ctx.popvid_var(graph);
 
     let mut then_block = graph.create_block();
     let mut else_block = graph.create_block();
@@ -4189,7 +4235,6 @@ fn lower_if_expr(
     // RPython parity: `flowspace/flowcontext.py:38
     // SpamBlock.framestate`.
     let pre_branch_snapshot = ctx.getstate(graph, 0);
-    let cond_var = graph.must_variable(cond);
     graph.set_branch(*block, cond_var, then_block, vec![], else_block, vec![]);
     graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
 
@@ -4258,21 +4303,21 @@ fn lower_if_expr(
     // shape; arity is kept consistent by skipping the closed
     // arm's goto so only the open arm sends a `vec![value]` to
     // the one-inputarg merge block.
-    let then_value = then_lowered.value;
-    let else_value = else_lowered.value;
+    let then_value_var = then_lowered.value_var(graph);
+    let else_value_var = else_lowered.value_var(graph);
     let then_open = graph.block(then_block).is_open();
     let else_open = graph.block(else_block).is_open();
-    let want_phi = then_value.is_some() && else_value.is_some();
+    let want_phi = then_value_var.is_some() && else_value_var.is_some();
 
     let (merge_block, phi_result) = if want_phi {
         let (merge, phi_args) = graph.create_block_with_args(1);
         if then_open {
-            let then_var = graph.must_variable(then_value.unwrap());
+            let then_var = then_value_var.clone().unwrap();
             graph.set_goto(then_block, merge, vec![then_var]);
             graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
         }
         if else_open {
-            let else_var = graph.must_variable(else_value.unwrap());
+            let else_var = else_value_var.clone().unwrap();
             graph.set_goto(else_block, merge, vec![else_var]);
             graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
         }
@@ -4338,36 +4383,36 @@ fn lower_if_expr(
         // so the immutable `graph` borrow inside the locals_w walk
         // releases before the mutable `lazy_install_local_at_current_block`
         // call below.
-        let phi_candidates: Vec<(usize, ValueId, Option<ValueId>)> = merged_locals_w
+        let phi_candidates: Vec<(
+            usize,
+            crate::flowspace::model::Variable,
+            Option<crate::flowspace::model::Variable>,
+        )> = merged_locals_w
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| match slot {
                 Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
-                    graph.value_id_of(v).map(|vid| {
-                        let then_vid = then_locals_w.get(i).and_then(|slot| match slot {
-                            Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
-                                graph.value_id_of(v)
-                            }
-                            _ => None,
-                        });
-                        (i, vid, then_vid)
-                    })
+                    let then_var = then_locals_w.get(i).and_then(|slot| match slot {
+                        Some(crate::flowspace::model::Hlvalue::Variable(v)) => Some(v.clone()),
+                        _ => None,
+                    });
+                    Some((i, v.clone(), then_var))
                 }
                 _ => None,
             })
             .collect();
         drop(merged_locals_w);
         drop(then_locals_w);
-        for (slot_idx, slot_vid, then_vid) in phi_candidates {
-            let is_fresh_phi = then_vid != Some(slot_vid);
+        for (slot_idx, slot_var, then_var) in phi_candidates {
+            let is_fresh_phi = then_var.as_ref() != Some(&slot_var);
             if is_fresh_phi {
                 let name = ctx.local_first_bind_order[slot_idx].clone();
-                let _ = lazy_install_local_at_current_block(
+                let _ = lazy_install_local_at_current_block_var(
                     graph,
                     ctx,
                     merge_block,
                     &name,
-                    Some(slot_vid),
+                    Some(slot_var.clone()),
                 );
             }
         }
@@ -4450,31 +4495,29 @@ fn lower_expr(
     // walk continues without raising `FlowingError`.
     let continue_with_unknown =
         |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedExprKind| -> Lowered {
-            let v = graph.push_op(
-                block,
-                OpKind::Abort {
-                    kind: UnknownKind::UnsupportedExpr { variant },
-                },
-                true,
-            );
-            Lowered {
-                value: v,
-                path_closed: false,
-            }
+            let var = graph
+                .push_op_var(
+                    block,
+                    OpKind::Abort {
+                        kind: UnknownKind::UnsupportedExpr { variant },
+                    },
+                    true,
+                )
+                .expect("OpKind::Abort has has_result=true");
+            Lowered::from_value_var(graph, &var)
         };
     let continue_with_unknown_literal =
         |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedLiteralKind| -> Lowered {
-            let v = graph.push_op(
-                block,
-                OpKind::Abort {
-                    kind: UnknownKind::UnsupportedLiteral { variant },
-                },
-                true,
-            );
-            Lowered {
-                value: v,
-                path_closed: false,
-            }
+            let var = graph
+                .push_op_var(
+                    block,
+                    OpKind::Abort {
+                        kind: UnknownKind::UnsupportedLiteral { variant },
+                    },
+                    true,
+                )
+                .expect("OpKind::Abort has has_result=true");
+            Lowered::from_value_var(graph, &var)
         };
     match expr {
         // ── receiver.field / arr[i].field ──
@@ -4485,10 +4528,8 @@ fn lower_expr(
                 ctx.pushvid(graph, base_pre);
                 let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                 ctx.pushvid(graph, index_pre);
-                let index = ctx.popvid(graph);
-                let base = ctx.popvid(graph);
-                let base_var = graph.must_variable(base);
-                let index_var = graph.must_variable(index);
+                let index_var = ctx.popvid_var(graph);
+                let base_var = ctx.popvid_var(graph);
                 let field_name = member_name(&field.member);
                 let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                 // Element struct type is the field owner for interiorfield descriptors.
@@ -4512,26 +4553,24 @@ fn lower_expr(
                     .as_deref()
                     .map(type_string_to_value_type)
                     .unwrap_or(ValueType::Unknown);
-                let result = graph.push_op(
-                    *block,
-                    OpKind::InteriorFieldRead {
-                        base: base_var,
-                        index: index_var,
-                        field: crate::model::FieldDescriptor::new(field_name, elem_type),
-                        item_ty,
-                        array_type_id,
-                    },
-                    true,
-                );
-                Ok(Lowered {
-                    value: result,
-                    path_closed: false,
-                })
+                let var = graph
+                    .push_op_var(
+                        *block,
+                        OpKind::InteriorFieldRead {
+                            base: base_var,
+                            index: index_var,
+                            field: crate::model::FieldDescriptor::new(field_name, elem_type),
+                            item_ty,
+                            array_type_id,
+                        },
+                        true,
+                    )
+                    .expect("OpKind::InteriorFieldRead has has_result=true");
+                Ok(Lowered::from_value_var(graph, &var))
             } else {
                 let base_pre = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
                 ctx.pushvid(graph, base_pre);
-                let base = ctx.popvid(graph);
-                let base_var = graph.must_variable(base);
+                let base_var = ctx.popvid_var(graph);
                 let field_name = member_name(&field.member);
                 let field_type_string =
                     field_type_string_from_expr(&field.base, &field.member, ctx);
@@ -4539,23 +4578,22 @@ fn lower_expr(
                     .as_deref()
                     .map(type_string_to_value_type)
                     .unwrap_or(ValueType::Unknown);
-                let result = graph.push_op(
-                    *block,
-                    OpKind::FieldRead {
-                        base: base_var,
-                        field: crate::model::FieldDescriptor::new(
-                            field_name,
-                            receiver_type_root(&field.base, ctx),
-                        ),
-                        ty,
-                        pure: false,
-                    },
-                    true,
-                );
-                Ok(Lowered {
-                    value: result,
-                    path_closed: false,
-                })
+                let var = graph
+                    .push_op_var(
+                        *block,
+                        OpKind::FieldRead {
+                            base: base_var,
+                            field: crate::model::FieldDescriptor::new(
+                                field_name,
+                                receiver_type_root(&field.base, ctx),
+                            ),
+                            ty,
+                            pure: false,
+                        },
+                        true,
+                    )
+                    .expect("OpKind::FieldRead has has_result=true");
+                Ok(Lowered::from_value_var(graph, &var))
             }
         }
 
@@ -4565,28 +4603,25 @@ fn lower_expr(
             ctx.pushvid(graph, base_pre);
             let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
             ctx.pushvid(graph, index_pre);
-            let index = ctx.popvid(graph);
-            let base = ctx.popvid(graph);
-            let base_var = graph.must_variable(base);
-            let index_var = graph.must_variable(index);
+            let index_var = ctx.popvid_var(graph);
+            let base_var = ctx.popvid_var(graph);
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
                 .unwrap_or(ValueType::Unknown);
-            let result = graph.push_op(
-                *block,
-                OpKind::ArrayRead {
-                    base: base_var,
-                    index: index_var,
-                    item_ty,
-                    nolength: nolength_from_array_type_id(array_type_id.as_deref()),
-                    array_type_id,
-                },
-                true,
-            );
-            Ok(Lowered {
-                value: result,
-                path_closed: false,
-            })
+            let var = graph
+                .push_op_var(
+                    *block,
+                    OpKind::ArrayRead {
+                        base: base_var,
+                        index: index_var,
+                        item_ty,
+                        nolength: nolength_from_array_type_id(array_type_id.as_deref()),
+                        array_type_id,
+                    },
+                    true,
+                )
+                .expect("OpKind::ArrayRead has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── lhs = rhs ──
@@ -4597,7 +4632,7 @@ fn lower_expr(
             // (`Ok(Lowered { path_closed: true })`) up the walk.
             let value_pre = get_value!(lower_expr(graph, block, &assign.right, options, ctx)?);
             ctx.pushvid(graph, value_pre);
-            let value = ctx.popvid(graph);
+            let value_var = ctx.popvid_var(graph);
 
             match &*assign.left {
                 syn::Expr::Field(field) => {
@@ -4609,11 +4644,8 @@ fn lower_expr(
                         let index_pre =
                             get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                         ctx.pushvid(graph, index_pre);
-                        let index = ctx.popvid(graph);
-                        let base = ctx.popvid(graph);
-                        let base_var = graph.must_variable(base);
-                        let index_var = graph.must_variable(index);
-                        let value_var = graph.must_variable(value);
+                        let index_var = ctx.popvid_var(graph);
+                        let base_var = ctx.popvid_var(graph);
                         let field_name = member_name(&field.member);
                         let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                         let elem_type = array_type_id
@@ -4649,9 +4681,7 @@ fn lower_expr(
                         let base_pre =
                             get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
                         ctx.pushvid(graph, base_pre);
-                        let base = ctx.popvid(graph);
-                        let base_var = graph.must_variable(base);
-                        let value_var = graph.must_variable(value);
+                        let base_var = ctx.popvid_var(graph);
                         let field_name = member_name(&field.member);
                         let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                             .unwrap_or(ValueType::Unknown);
@@ -4675,11 +4705,8 @@ fn lower_expr(
                     ctx.pushvid(graph, base_pre);
                     let index_pre = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                     ctx.pushvid(graph, index_pre);
-                    let index = ctx.popvid(graph);
-                    let base = ctx.popvid(graph);
-                    let base_var = graph.must_variable(base);
-                    let index_var = graph.must_variable(index);
-                    let value_var = graph.must_variable(value);
+                    let index_var = ctx.popvid_var(graph);
+                    let base_var = ctx.popvid_var(graph);
                     let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                     let item_ty =
                         array_item_value_type_from_array_type_id(array_type_id.as_deref())
@@ -4716,11 +4743,7 @@ fn lower_expr(
                     // (`ast.rs:1389 local_value_ids.insert`) caches
                     // `(let-rhs ValueId, defining block)`; without
                     // this STORE_FAST update a later `x` read returns
-                    // the stale let value.  RPython only renames
-                    // when the rhs `is Variable`; the
-                    // `is_constant_define_value` gate skips the
-                    // ValueId-keyed `name_value` for `ConstInt`/
-                    // `ConstFloat` define-ops (RPython `Constant`).
+                    // the stale let value.
                     let name = path
                         .path
                         .segments
@@ -4728,7 +4751,7 @@ fn lower_expr(
                         .map(|seg| seg.ident.to_string())
                         .collect::<Vec<_>>()
                         .join("::");
-                    ctx.bind_local_id(name, value, *block);
+                    ctx.bind_local_id_var(name, &value_var, graph, *block);
                 }
                 _ => {
                     // Generic assignment — value already lowered
@@ -4743,11 +4766,12 @@ fn lower_expr(
                 let v_pre = get_value!(lower_expr(graph, block, a, options, ctx)?);
                 ctx.pushvid(graph, v_pre);
             }
-            let mut args: Vec<ValueId> = Vec::with_capacity(call.args.len());
+            let mut args_vars: Vec<crate::flowspace::model::Variable> =
+                Vec::with_capacity(call.args.len());
             for _ in 0..call.args.len() {
-                args.push(ctx.popvid(graph));
+                args_vars.push(ctx.popvid_var(graph));
             }
-            args.reverse();
+            args_vars.reverse();
             let target = canonical_call_target(&call.func, ctx);
             // RPython parity: same rationale as the MethodCall arm above
             // — `op.result.concretetype` is set from the registered
@@ -4784,21 +4808,18 @@ fn lower_expr(
             } else {
                 ValueType::Unknown
             };
-            let args_vars: Vec<crate::flowspace::model::Variable> =
-                args.iter().map(|v| graph.must_variable(*v)).collect();
-            let result = graph.push_op(
-                *block,
-                OpKind::Call {
-                    target,
-                    args: args_vars,
-                    result_ty,
-                },
-                true,
-            );
-            Ok(Lowered {
-                value: result,
-                path_closed: false,
-            })
+            let var = graph
+                .push_op_var(
+                    *block,
+                    OpKind::Call {
+                        target,
+                        args: args_vars,
+                        result_ty,
+                    },
+                    true,
+                )
+                .expect("OpKind::Call has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── method call ──
@@ -4810,11 +4831,11 @@ fn lower_expr(
                 ctx.pushvid(graph, v_pre);
             }
             let total = 1 + mc.args.len();
-            let mut args: Vec<ValueId> = Vec::with_capacity(total);
+            let mut args_vars: Vec<crate::flowspace::model::Variable> = Vec::with_capacity(total);
             for _ in 0..total {
-                args.push(ctx.popvid(graph));
+                args_vars.push(ctx.popvid_var(graph));
             }
-            args.reverse();
+            args_vars.reverse();
             // RPython `jtransform.py:410-412`: a polymorphic receiver
             // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
             // Detect via the collected local_dyn_trait_roots map so
@@ -4842,29 +4863,26 @@ fn lower_expr(
                         lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method)
                     })
                     .cloned();
-            let result_ty = primitive_method_result_type(graph, &args, &mc.method)
-                .or_else(|| transparent_option_method_result_type(graph, &args, &mc.method))
+            let result_ty = primitive_method_result_type(graph, &args_vars, &mc.method)
+                .or_else(|| transparent_option_method_result_type(graph, &args_vars, &mc.method))
                 .or_else(|| {
                     method_return_type_string
                         .as_deref()
                         .map(type_string_to_value_type)
                 })
                 .unwrap_or(ValueType::Unknown);
-            let args_vars: Vec<crate::flowspace::model::Variable> =
-                args.iter().map(|v| graph.must_variable(*v)).collect();
-            let result = graph.push_op(
-                *block,
-                OpKind::Call {
-                    target,
-                    args: args_vars,
-                    result_ty,
-                },
-                true,
-            );
-            Ok(Lowered {
-                value: result,
-                path_closed: false,
-            })
+            let var = graph
+                .push_op_var(
+                    *block,
+                    OpKind::Call {
+                        target,
+                        args: args_vars,
+                        result_ty,
+                    },
+                    true,
+                )
+                .expect("OpKind::Call has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── if/else → block split (RPython FlowContext.guessbool) ──
@@ -4882,16 +4900,16 @@ fn lower_expr(
             // path_closed / FlowingError), then `set_return(..)` closes
             // the block and `Lowered::path_closed()` tells the caller
             // to stop walking this path.
-            let val = if let Some(e) = &ret.expr {
+            let val_var = if let Some(e) = &ret.expr {
                 let lowered = lower_expr(graph, block, e, options, ctx)?;
                 if lowered.path_closed {
                     return Ok(Lowered::path_closed());
                 }
-                lowered.value
+                lowered.value_var(graph)
             } else {
                 None
             };
-            graph.set_return(*block, val.map(|v| graph.must_variable(v)));
+            graph.set_return(*block, val_var);
             Ok(Lowered::path_closed())
         }
 
@@ -4911,10 +4929,10 @@ fn lower_expr(
             match &lit.lit {
                 syn::Lit::Int(int_lit) => {
                     if let Ok(v) = int_lit.base10_parse::<i64>() {
-                        return Ok(Lowered {
-                            value: graph.push_op(*block, OpKind::ConstInt(v), true),
-                            path_closed: false,
-                        });
+                        let var = graph
+                            .push_op_var(*block, OpKind::ConstInt(v), true)
+                            .expect("ConstInt has has_result=true");
+                        return Ok(Lowered::from_value_var(graph, &var));
                     }
                 }
                 // RPython lowers `True`/`False` to `Constant(True/False)`
@@ -4925,26 +4943,26 @@ fn lower_expr(
                 // distinction (SomeBool vs SomeInteger) is preserved by
                 // emitting the dedicated `OpKind::ConstBool` variant.
                 syn::Lit::Bool(b) => {
-                    return Ok(Lowered {
-                        value: graph.push_op(*block, OpKind::ConstBool(b.value), true),
-                        path_closed: false,
-                    });
+                    let var = graph
+                        .push_op_var(*block, OpKind::ConstBool(b.value), true)
+                        .expect("ConstBool has has_result=true");
+                    return Ok(Lowered::from_value_var(graph, &var));
                 }
                 // RPython treats `chr(x)` / single-char byte literals as
                 // `lltype.Char` which is also kind `'int'` (single unsigned
                 // byte).  Rust `b'x'` (syn::Lit::Byte) and `'x'`
                 // (syn::Lit::Char as u32) map to the same shape.
                 syn::Lit::Byte(b) => {
-                    return Ok(Lowered {
-                        value: graph.push_op(*block, OpKind::ConstInt(b.value() as i64), true),
-                        path_closed: false,
-                    });
+                    let var = graph
+                        .push_op_var(*block, OpKind::ConstInt(b.value() as i64), true)
+                        .expect("ConstInt has has_result=true");
+                    return Ok(Lowered::from_value_var(graph, &var));
                 }
                 syn::Lit::Char(c) => {
-                    return Ok(Lowered {
-                        value: graph.push_op(*block, OpKind::ConstInt(c.value() as i64), true),
-                        path_closed: false,
-                    });
+                    let var = graph
+                        .push_op_var(*block, OpKind::ConstInt(c.value() as i64), true)
+                        .expect("ConstInt has has_result=true");
+                    return Ok(Lowered::from_value_var(graph, &var));
                 }
                 // RPython `flowmodel.py:Constant(rfloat)`: float literals
                 // become `Constant` nodes with `lltype.Float` concretetype.
@@ -4954,10 +4972,10 @@ fn lower_expr(
                 // existing `constants_f` pool with a `float_copy` op.
                 syn::Lit::Float(f) => {
                     if let Ok(v) = f.base10_parse::<f64>() {
-                        return Ok(Lowered {
-                            value: graph.push_op(*block, OpKind::ConstFloat(v.to_bits()), true),
-                            path_closed: false,
-                        });
+                        let var = graph
+                            .push_op_var(*block, OpKind::ConstFloat(v.to_bits()), true)
+                            .expect("ConstFloat has has_result=true");
+                        return Ok(Lowered::from_value_var(graph, &var));
                     }
                 }
                 _ => {}
@@ -5027,20 +5045,17 @@ fn lower_expr(
                     .local_value_ids
                     .get(&name)
                     .is_some_and(|&(_, defining_block)| defining_block != *block)
-                && let Some(threaded_vid) =
-                    lazy_install_local_at_current_block(graph, ctx, *block, &name, None)
+                && let Some(threaded_var) =
+                    lazy_install_local_at_current_block_var(graph, ctx, *block, &name, None)
             {
-                return Ok(Lowered {
-                    value: Some(threaded_vid),
-                    path_closed: false,
-                });
+                return Ok(Lowered::from_value_var(graph, &threaded_var));
             }
             let ty = ctx
                 .local_value_types
                 .get(&name)
                 .cloned()
                 .unwrap_or(ValueType::Unknown);
-            let value = graph.push_op(
+            let value_var = graph.push_op_var(
                 *block,
                 OpKind::Input {
                     name: name.clone(),
@@ -5059,23 +5074,23 @@ fn lower_expr(
             // graph-recoverable kind disagreement at
             // `lazy_install_local_at_current_block:1751-1757`); we
             // register the freshly-emitted `Input` result as the
-            // authoritative `(ValueId, current_block)` so further reads
-            // of `name` within the same block dedup against this
+            // authoritative `(Variable, current_block)` so further
+            // reads of `name` within the same block dedup against this
             // synthetic Input.
             //
             // `LocalBindingSnapshot` saves and restores
             // `ctx.local_value_ids` across `If` / `Match` / `Loop` /
             // `While` / `ForLoop` boundaries, so the cached `(vid,
             // block)` does not leak into a sibling control-flow arm.
-            if let Some(vid) = value {
-                if path.path.segments.len() == 1 && path.qself.is_none() {
-                    ctx.bind_local_id(name.clone(), vid, *block);
-                }
+            if let Some(ref var) = value_var
+                && path.path.segments.len() == 1
+                && path.qself.is_none()
+            {
+                ctx.bind_local_id_var(name.clone(), var, graph, *block);
             }
-            Ok(Lowered {
-                value,
-                path_closed: false,
-            })
+            Ok(value_var
+                .map(|var| Lowered::from_value_var(graph, &var))
+                .unwrap_or_else(Lowered::no_value))
         }
 
         // ── reference &expr ──
@@ -5193,7 +5208,7 @@ fn lower_expr(
                         let operand_pre =
                             get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
                         ctx.pushvid(graph, operand_pre);
-                        let operand = ctx.popvid(graph);
+                        let operand_var = ctx.popvid_var(graph);
                         // The classifier returns `Int` for both
                         // primitive integer kinds (lowered as
                         // `ValueType::Int`) and arbitrary-precision
@@ -5202,18 +5217,17 @@ fn lower_expr(
                         // `IntegerRepr.rtype_invert` /
                         // `LongRepr.rtype_invert` dispatch on the
                         // operand's lattice node; pyre projects that
-                        // through `graph_value_type(operand)` so the
-                        // emitted `OpKind::UnaryOp.result_ty` matches
+                        // through `graph_value_type_var(operand_var)` so
+                        // the emitted `OpKind::UnaryOp.result_ty` matches
                         // the operand's actual lowered shape and the
                         // function's declared return type
                         // (`bigint_invert(a: BigInt) -> BigInt` →
                         // `Ref`).
-                        let result_ty = graph_value_type(graph, operand)
+                        let result_ty = graph_value_type_var(graph, &operand_var)
                             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref))
                             .unwrap_or(ValueType::Int);
-                        let operand_var = graph.must_variable(operand);
-                        return Ok(Lowered {
-                            value: graph.push_op(
+                        let var = graph
+                            .push_op_var(
                                 *block,
                                 OpKind::UnaryOp {
                                     op: "invert".into(),
@@ -5221,9 +5235,9 @@ fn lower_expr(
                                     result_ty,
                                 },
                                 true,
-                            ),
-                            path_closed: false,
-                        });
+                            )
+                            .expect("OpKind::UnaryOp has has_result=true");
+                        return Ok(Lowered::from_value_var(graph, &var));
                     }
                     UnaryNotOperandKind::Bool => {}
                     UnaryNotOperandKind::Unknown => {
@@ -5248,10 +5262,9 @@ fn lower_expr(
                 }
                 let operand_pre = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
                 ctx.pushvid(graph, operand_pre);
-                let operand = ctx.popvid(graph);
-                let operand_var = graph.must_variable(operand);
-                let cond = graph
-                    .push_op(
+                let operand_var = ctx.popvid_var(graph);
+                let cond_var = graph
+                    .push_op_var(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
@@ -5266,11 +5279,11 @@ fn lower_expr(
                 // (`!false == true`); the true arm produces `False`
                 // (`!true == false`).  Emit as `ConstBool` so the
                 // annotator picks `SomeBool` rather than `SomeInteger`.
-                let const_true = graph
-                    .push_op(*block, OpKind::ConstBool(true), true)
+                let const_true_var = graph
+                    .push_op_var(*block, OpKind::ConstBool(true), true)
                     .expect("ConstBool produces a value");
-                let const_false = graph
-                    .push_op(*block, OpKind::ConstBool(false), true)
+                let const_false_var = graph
+                    .push_op_var(*block, OpKind::ConstBool(false), true)
                     .expect("ConstBool produces a value");
                 // ── Locals threading ──
                 // RPython `flowcontext.py:531-538 UNARY_NOT` propagates
@@ -5284,30 +5297,23 @@ fn lower_expr(
                 let pre_fork_locals = ctx.local_value_ids.clone();
                 let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
                 merged_names.sort();
-                let pre_fork_local_args: Vec<ValueId> = merged_names
+                let pre_fork_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
                     .iter()
-                    .map(|name| pre_fork_locals[name].0)
+                    .map(|name| graph.must_variable_at(pre_fork_locals[name].0.0))
                     .collect();
 
                 let (join_block, join_args) = graph.create_block_with_args(merged_names.len() + 1);
                 let tail = join_args[0];
                 let join_local_args: Vec<ValueId> = join_args[1..].to_vec();
 
-                let mut false_arm_args: Vec<ValueId> = Vec::with_capacity(merged_names.len() + 1);
-                false_arm_args.push(const_false);
-                false_arm_args.extend(pre_fork_local_args.iter().cloned());
-                let mut true_arm_args: Vec<ValueId> = Vec::with_capacity(merged_names.len() + 1);
-                true_arm_args.push(const_true);
-                true_arm_args.extend(pre_fork_local_args.iter().cloned());
-                let false_arm_vars: Vec<crate::flowspace::model::Variable> = false_arm_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
-                let true_arm_vars: Vec<crate::flowspace::model::Variable> = true_arm_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
-                let cond_var = graph.must_variable(cond);
+                let mut false_arm_vars: Vec<crate::flowspace::model::Variable> =
+                    Vec::with_capacity(merged_names.len() + 1);
+                false_arm_vars.push(const_false_var);
+                false_arm_vars.extend(pre_fork_local_vars.iter().cloned());
+                let mut true_arm_vars: Vec<crate::flowspace::model::Variable> =
+                    Vec::with_capacity(merged_names.len() + 1);
+                true_arm_vars.push(const_true_var);
+                true_arm_vars.extend(pre_fork_local_vars.iter().cloned());
 
                 // Two Links into the same join: cond truthy → tail
                 // is `0` (false); cond falsy → tail is `1` (true).
@@ -5335,10 +5341,9 @@ fn lower_expr(
             }
             let operand_pre = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
             ctx.pushvid(graph, operand_pre);
-            let operand = ctx.popvid(graph);
-            let operand_var = graph.must_variable(operand);
-            Ok(Lowered {
-                value: graph.push_op(
+            let operand_var = ctx.popvid_var(graph);
+            let var = graph
+                .push_op_var(
                     *block,
                     OpKind::UnaryOp {
                         op: unary_op_name(&u.op).into(),
@@ -5346,9 +5351,9 @@ fn lower_expr(
                         result_ty: ValueType::Unknown,
                     },
                     true,
-                ),
-                path_closed: false,
-            })
+                )
+                .expect("OpKind::UnaryOp has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── binary a + b ──
@@ -5388,14 +5393,13 @@ fn lower_expr(
 
                 let lhs_raw_pre = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
                 ctx.pushvid(graph, lhs_raw_pre);
-                let lhs_raw = ctx.popvid(graph);
-                let lhs_raw_var = graph.must_variable(lhs_raw);
-                let cond = graph
-                    .push_op(
+                let lhs_raw_var = ctx.popvid_var(graph);
+                let cond_var = graph
+                    .push_op_var(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
-                            operand: lhs_raw_var,
+                            operand: lhs_raw_var.clone(),
                             result_ty: ValueType::Bool,
                         },
                         true,
@@ -5429,9 +5433,9 @@ fn lower_expr(
                 let pre_fork_locals = ctx.local_value_ids.clone();
                 let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
                 merged_names.sort();
-                let pre_fork_local_args: Vec<ValueId> = merged_names
+                let pre_fork_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
                     .iter()
-                    .map(|name| pre_fork_locals[name].0)
+                    .map(|name| graph.must_variable_at(pre_fork_locals[name].0.0))
                     .collect();
 
                 let (mut rhs_block, rhs_local_args) =
@@ -5442,20 +5446,12 @@ fn lower_expr(
 
                 // Short-circuit Link.args = [lhs_raw, ...pre_fork_locals];
                 // rhs Link.args         = [...pre_fork_locals].
-                let mut shortcut_link_args: Vec<ValueId> =
+                let mut shortcut_link_vars: Vec<crate::flowspace::model::Variable> =
                     Vec::with_capacity(merged_names.len() + 1);
-                shortcut_link_args.push(lhs_raw);
-                shortcut_link_args.extend(pre_fork_local_args.iter().cloned());
-                let rhs_link_args = pre_fork_local_args.clone();
-                let shortcut_link_vars: Vec<crate::flowspace::model::Variable> = shortcut_link_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
-                let rhs_link_vars: Vec<crate::flowspace::model::Variable> = rhs_link_args
-                    .into_iter()
-                    .map(|v| graph.must_variable(v))
-                    .collect();
-                let cond_var = graph.must_variable(cond);
+                shortcut_link_vars.push(lhs_raw_var.clone());
+                shortcut_link_vars.extend(pre_fork_local_vars.iter().cloned());
+                let rhs_link_vars: Vec<crate::flowspace::model::Variable> =
+                    pre_fork_local_vars.clone();
 
                 if is_and {
                     // `&&`: cond truthy → eval rhs; cond falsy →
@@ -5500,14 +5496,17 @@ fn lower_expr(
                 if graph.block(rhs_block).is_open() {
                     // `rhs_lowered.value` is `None` only when rhs was a
                     // statement-form sub-expression with no value;
-                    // `lhs_raw` keeps the join arity-correct in that
+                    // `lhs_raw_var` keeps the join arity-correct in that
                     // unusual case (defensive, mirrors `lower_if`'s
                     // arity guard).
-                    let rhs_raw = rhs_lowered.value.unwrap_or(lhs_raw);
-                    let rhs_exit_local_args: Vec<ValueId> = merged_names
+                    let rhs_raw_var = rhs_lowered
+                        .value_var(graph)
+                        .unwrap_or_else(|| lhs_raw_var.clone());
+                    let rhs_exit_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
                         .iter()
                         .map(|name| {
-                            ctx.local_value_ids
+                            let vid = ctx
+                                .local_value_ids
                                 .get(name)
                                 .map(|&(vid, _)| vid)
                                 .unwrap_or_else(|| {
@@ -5515,17 +5514,14 @@ fn lower_expr(
                                         .get(name)
                                         .map(|&(vid, _)| vid)
                                         .expect("local must remain in scope after rhs lower")
-                                })
+                                });
+                            graph.must_variable_at(vid.0)
                         })
                         .collect();
-                    let mut rhs_to_join_args: Vec<ValueId> =
+                    let mut rhs_to_join_vars: Vec<crate::flowspace::model::Variable> =
                         Vec::with_capacity(merged_names.len() + 1);
-                    rhs_to_join_args.push(rhs_raw);
-                    rhs_to_join_args.extend(rhs_exit_local_args);
-                    let rhs_to_join_vars: Vec<crate::flowspace::model::Variable> = rhs_to_join_args
-                        .into_iter()
-                        .map(|v| graph.must_variable(v))
-                        .collect();
+                    rhs_to_join_vars.push(rhs_raw_var);
+                    rhs_to_join_vars.extend(rhs_exit_local_vars);
                     graph.set_goto(rhs_block, join_block, rhs_to_join_vars);
                 }
 
@@ -5551,13 +5547,11 @@ fn lower_expr(
             ctx.pushvid(graph, lhs_pre);
             let rhs_pre = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
             ctx.pushvid(graph, rhs_pre);
-            let rhs = ctx.popvid(graph);
-            let lhs = ctx.popvid(graph);
+            let rhs_var = ctx.popvid_var(graph);
+            let lhs_var = ctx.popvid_var(graph);
             let op_name = binary_op_name(&bin.op);
-            let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
-            let lhs_var = graph.must_variable(lhs);
-            let rhs_var = graph.must_variable(rhs);
-            let value = graph.push_op(
+            let result_ty = binary_result_value_type_var(graph, &lhs_var, &rhs_var, op_name);
+            let value_var = graph.push_op_var(
                 *block,
                 OpKind::BinOp {
                     op: op_name.into(),
@@ -5575,51 +5569,47 @@ fn lower_expr(
             // the local name.  Without the local_value_ids update,
             // the same-block dedup cache (`ast.rs:1389` let arm,
             // `:1724` simple-assign arm) still points at the
-            // pre-inplace ValueId, so a later same-block read of
+            // pre-inplace Variable, so a later same-block read of
             // `x` returns the stale value.  Without the
-            // `graph.name_value` rename, the adapter's
+            // `graph.name_value_var` rename, the adapter's
             // `name_to_value` lookup continues to resolve `x` to the
             // pre-inplace Variable.  Simple assignment `x = y` is
             // handled at the Expr::Assign arm above; this branch
             // owns the compound path that lowers as Expr::Binary.
             // The compound BinOp result is always a Variable (not a
-            // `ConstInt`/`ConstFloat` define-op), but the
-            // `is_constant_define_value` gate is kept symmetrical
-            // with the simple-assign arm to mirror upstream's
-            // `if isinstance(w_newvalue, Variable):` predicate.
-            if op_name.ends_with("_assign") {
-                if let (Some(vid), syn::Expr::Path(path)) = (value, &*bin.left) {
-                    if path.path.segments.len() == 1 && path.qself.is_none() {
-                        let name = path
-                            .path
-                            .segments
-                            .iter()
-                            .map(|seg| seg.ident.to_string())
-                            .collect::<Vec<_>>()
-                            .join("::");
-                        ctx.bind_local_id(name, vid, *block);
-                    }
-                }
+            // `ConstInt`/`ConstFloat` define-op).
+            if op_name.ends_with("_assign")
+                && let (Some(var), syn::Expr::Path(path)) = (&value_var, &*bin.left)
+                && path.path.segments.len() == 1
+                && path.qself.is_none()
+            {
+                let name = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                ctx.bind_local_id_var(name, var, graph, *block);
             }
-            Ok(Lowered {
-                value,
-                path_closed: false,
-            })
+            Ok(value_var
+                .map(|var| Lowered::from_value_var(graph, &var))
+                .unwrap_or_else(Lowered::no_value))
         }
 
         // ── cast: expr as T ──
         syn::Expr::Cast(cast) => {
             let operand_pre = get_value!(lower_expr(graph, block, &cast.expr, options, ctx)?);
             ctx.pushvid(graph, operand_pre);
-            let operand = ctx.popvid(graph);
+            let operand_var = ctx.popvid_var(graph);
             let result_ty = classify_fn_arg_ty(&cast.ty);
             if result_ty == ValueType::Unknown {
-                return Ok(Lowered::value(operand));
+                return Ok(Lowered::from_value_var(graph, &operand_var));
             }
             if result_ty == ValueType::Void {
                 return Ok(Lowered::no_value());
             }
-            let source_ty = graph_value_type(graph, operand);
+            let source_ty = graph_value_type_var(graph, &operand_var);
             // `Ref → Unsigned` has no single-call canonical in upstream
             // RPython.  `llmemory.cast_adr_to_uint(addr)` is defined as
             // `r_uint(cast_adr_to_int(addr))` (llmemory.py), and
@@ -5633,9 +5623,8 @@ fn lower_expr(
             // an integer operand (Task #141 / Task #85 lock-in at
             // `pyre-jit-trace/src/jitcode_runtime.rs:1340`).
             if source_ty.as_ref() == Some(&ValueType::Ref) && result_ty == ValueType::Unsigned {
-                let operand_var = graph.must_variable(operand);
-                let intermediate = graph
-                    .push_op(
+                let intermediate_var = graph
+                    .push_op_var(
                         *block,
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -5655,10 +5644,9 @@ fn lower_expr(
                         },
                         true,
                     )
-                    .expect("cast_ptr_to_int call op must produce a result ValueId");
-                let intermediate_var = graph.must_variable(intermediate);
-                return Ok(Lowered {
-                    value: graph.push_op(
+                    .expect("cast_ptr_to_int call op must produce a result slot");
+                let var = graph
+                    .push_op_var(
                         *block,
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -5671,9 +5659,9 @@ fn lower_expr(
                             result_ty: ValueType::Unsigned,
                         },
                         true,
-                    ),
-                    path_closed: false,
-                });
+                    )
+                    .expect("OpKind::Call has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
             }
             // RPython has no `expr as T` syntax — numeric conversions go
             // through `int(v)` / `float(v)` / `bool(v)` builtin calls
@@ -5691,9 +5679,8 @@ fn lower_expr(
             // `BuiltinFunctionRepr.rtype_simple_call →
             // BUILTIN_TYPER[...]`.
             if let Some(segments) = cast_builtin_name(source_ty.as_ref(), &result_ty) {
-                let operand_var = graph.must_variable(operand);
-                return Ok(Lowered {
-                    value: graph.push_op(
+                let var = graph
+                    .push_op_var(
                         *block,
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -5703,9 +5690,9 @@ fn lower_expr(
                             result_ty,
                         },
                         true,
-                    ),
-                    path_closed: false,
-                });
+                    )
+                    .expect("OpKind::Call has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
             }
             // Identity / source-type-unknown casts: emit
             // `OpKind::UnaryOp { op: "same_as", result_ty, .. }` so
@@ -5724,9 +5711,8 @@ fn lower_expr(
             // operand's lltype.  Backendopt's `removenoops::\
             // remove_same_as` collapses identity copies post-rtyper
             // when safe (removenoops.py:47-48).
-            let operand_var = graph.must_variable(operand);
-            Ok(Lowered {
-                value: graph.push_op(
+            let var = graph
+                .push_op_var(
                     *block,
                     OpKind::UnaryOp {
                         op: "same_as".to_string(),
@@ -5734,9 +5720,9 @@ fn lower_expr(
                         result_ty,
                     },
                     true,
-                ),
-                path_closed: false,
-            })
+                )
+                .expect("OpKind::UnaryOp has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── match expr { arms } → multi-block (RPython switch) ──
@@ -5748,7 +5734,7 @@ fn lower_expr(
             // producing opcode and the dispatching opimpl pops it.
             let scrutinee_pre = get_value!(lower_expr(graph, block, &m.expr, options, ctx)?);
             ctx.pushvid(graph, scrutinee_pre);
-            let scrutinee = ctx.popvid(graph);
+            let scrutinee_var = ctx.popvid_var(graph);
             let scrutinee_type_string = expression_type_string(&m.expr, ctx);
 
             if m.arms.is_empty() {
@@ -5796,8 +5782,12 @@ fn lower_expr(
             // desugars to a 2-arm match where only the open arm
             // contributes bindings, and the bound `x` must be
             // visible past the merge.
-            let mut arm_tails: Vec<(BlockId, Option<ValueId>, FrameState, LocalBindingSnapshot)> =
-                Vec::with_capacity(m.arms.len());
+            let mut arm_tails: Vec<(
+                BlockId,
+                Option<crate::flowspace::model::Variable>,
+                FrameState,
+                LocalBindingSnapshot,
+            )> = Vec::with_capacity(m.arms.len());
             for arm in &m.arms {
                 let entry = graph.create_block();
                 let mut tail = entry;
@@ -5830,7 +5820,8 @@ fn lower_expr(
                 // sibling walks continue irrespective of this arm's
                 // closure.
                 arm_entries.push(entry);
-                arm_tails.push((tail, arm_lowered.value, arm_exit_snapshot, arm_exit_locals));
+                let arm_lowered_var = arm_lowered.value_var(graph);
+                arm_tails.push((tail, arm_lowered_var, arm_exit_snapshot, arm_exit_locals));
             }
 
             // Merge gets a Phi inputarg iff every arm that actually
@@ -5874,7 +5865,7 @@ fn lower_expr(
                 {
                     // Safe: the filter above guarantees every open arm's
                     // `result` is `Some`.
-                    vec![graph.must_variable(result.unwrap())]
+                    vec![result.clone().unwrap()]
                 } else {
                     Vec::new()
                 };
@@ -5903,7 +5894,6 @@ fn lower_expr(
                         );
                     }
                 }
-                let scrutinee_var = graph.must_variable(scrutinee);
                 graph.set_control_flow_metadata(
                     *block,
                     Some(ExitSwitch::Value(scrutinee_var)),
@@ -5924,7 +5914,6 @@ fn lower_expr(
                         );
                     }
                 }
-                let scrutinee_var = graph.must_variable(scrutinee);
                 graph.set_control_flow_metadata(
                     *block,
                     Some(ExitSwitch::Value(scrutinee_var)),
@@ -5939,7 +5928,6 @@ fn lower_expr(
                 // the existing two-arm truthy split for those cases rather
                 // than inventing a fake switch key. Primitive literal
                 // patterns use the switch path above.
-                let scrutinee_var = graph.must_variable(scrutinee);
                 graph.set_branch(
                     *block,
                     scrutinee_var,
@@ -6084,37 +6072,38 @@ fn lower_expr(
                 // tuples up front so the immutable `graph` borrow inside
                 // the locals_w walk releases before
                 // `lazy_install_local_at_current_block`'s mutable call.
-                let phi_candidates: Vec<(usize, ValueId, Option<ValueId>)> = merged_locals_w
+                let phi_candidates: Vec<(
+                    usize,
+                    crate::flowspace::model::Variable,
+                    Option<crate::flowspace::model::Variable>,
+                )> = merged_locals_w
                     .iter()
                     .enumerate()
                     .filter_map(|(i, slot)| match slot {
                         Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
-                            graph.value_id_of(v).map(|vid| {
-                                let first_vid =
-                                    first_arm_locals_w.get(i).and_then(|slot| match slot {
-                                        Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
-                                            graph.value_id_of(v)
-                                        }
-                                        _ => None,
-                                    });
-                                (i, vid, first_vid)
-                            })
+                            let first_var = first_arm_locals_w.get(i).and_then(|slot| match slot {
+                                Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                                    Some(v.clone())
+                                }
+                                _ => None,
+                            });
+                            Some((i, v.clone(), first_var))
                         }
                         _ => None,
                     })
                     .collect();
                 drop(merged_locals_w);
                 drop(first_arm_locals_w);
-                for (slot_idx, slot_vid, first_vid) in phi_candidates {
-                    let is_fresh_phi = first_vid != Some(slot_vid);
+                for (slot_idx, slot_var, first_var) in phi_candidates {
+                    let is_fresh_phi = first_var.as_ref() != Some(&slot_var);
                     if is_fresh_phi {
                         let name = ctx.local_first_bind_order[slot_idx].clone();
-                        let _ = lazy_install_local_at_current_block(
+                        let _ = lazy_install_local_at_current_block_var(
                             graph,
                             ctx,
                             merge,
                             &name,
-                            Some(slot_vid),
+                            Some(slot_var.clone()),
                         );
                     }
                 }
@@ -6196,10 +6185,9 @@ fn lower_expr(
             let mut header_tail = header_entry;
             let cond_pre = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
             ctx.pushvid(graph, cond_pre);
-            let cond = ctx.popvid(graph);
+            let cond_var = ctx.popvid_var(graph);
             let body_entry = graph.create_block();
             let header_branch_snapshot = ctx.getstate(graph, 0);
-            let cond_var = graph.must_variable(cond);
             graph.set_branch(header_tail, cond_var, body_entry, vec![], exit, vec![]);
             graph.block_mut(header_tail).framestate = Some(header_branch_snapshot);
 
@@ -6337,7 +6325,7 @@ fn lower_expr(
             // install — no special-casing needed.
             let iterable_pre = get_value!(lower_expr(graph, block, &f.expr, options, ctx)?);
             ctx.pushvid(graph, iterable_pre);
-            let iterable = ctx.popvid(graph);
+            let iterable = ctx.popvid_var(graph);
             let _ = iterable;
 
             let header_entry = graph.create_block();
@@ -6364,7 +6352,7 @@ fn lower_expr(
             // make `exit` reachable from the normal control-flow
             // fallthrough (without it, loops without `break` would
             // leave every statement after the `for` unreachable).
-            let for_cond = graph.push_op(
+            let for_cond_var = graph.push_op_var(
                 header_entry,
                 OpKind::Abort {
                     kind: UnknownKind::UnsupportedExpr {
@@ -6379,8 +6367,7 @@ fn lower_expr(
             // its exit-time snapshot (which already includes the
             // eager phis bound to ctx).
             let header_branch_snapshot = ctx.getstate(graph, 0);
-            if let Some(cond) = for_cond {
-                let cond_var = graph.must_variable(cond);
+            if let Some(cond_var) = for_cond_var {
                 graph.set_branch(header_entry, cond_var, body_entry, vec![], exit, vec![]);
             } else {
                 graph.set_goto(header_entry, body_entry, vec![]);
@@ -6617,21 +6604,18 @@ fn lower_expr(
                 .map(type_string_to_value_type);
             let inner_pre = get_value!(lower_expr(graph, block, &t.expr, options, ctx)?);
             ctx.pushvid(graph, inner_pre);
-            let inner = ctx.popvid(graph);
+            let inner_var = ctx.popvid_var(graph);
             if let Some(ok_ty) = ok_ty {
-                retag_result_value_type(graph, inner, ok_ty);
+                retag_result_value_type(graph, &inner_var, ok_ty);
             }
             let continuation = graph.create_block();
-            let continuation_arg = graph.alloc_value();
-            graph.push_inputarg(continuation, continuation_arg);
+            let continuation_arg = graph.alloc_value_var();
+            graph.push_inputarg_var(continuation, continuation_arg.clone());
             // RPython `flowcontext.py:130-133` — fresh prevblock-side
             // `Variable('last_exception')` + `Variable('last_exc_value')`.
-            let last_exception = graph.alloc_value();
-            let last_exc_value = graph.alloc_value();
+            let last_exception_var = graph.alloc_value_var();
+            let last_exc_value_var = graph.alloc_value_var();
             let exc_block = graph.exceptblock;
-            let inner_var = graph.must_variable(inner);
-            let last_exception_var = graph.must_variable(last_exception);
-            let last_exc_value_var = graph.must_variable(last_exc_value);
             graph.set_goto(*block, continuation, vec![inner_var.clone()]);
             let normal_link = Link::from_variables(graph, vec![inner_var], continuation, None);
             let exc_link = Link::from_variables(
@@ -6650,7 +6634,7 @@ fn lower_expr(
                 vec![normal_link, exc_link],
             );
             *block = continuation;
-            Ok(Lowered::value(continuation_arg))
+            Ok(Lowered::from_value_var(graph, &continuation_arg))
         }
 
         // ── unsafe { stmts } ──
@@ -6761,13 +6745,13 @@ fn lower_expr(
                         syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
                     ) {
                         let mut it = args.iter();
-                        let cond_opt: Option<ValueId> = if is_assert {
+                        let cond_opt: Option<crate::flowspace::model::Variable> = if is_assert {
                             if let Some(cond_expr) = it.next() {
                                 let lowered = lower_expr(graph, block, cond_expr, options, ctx)?;
                                 if lowered.path_closed {
                                     return Ok(Lowered::path_closed());
                                 }
-                                lowered.value
+                                lowered.value_var(graph)
                             } else {
                                 None
                             }
@@ -6782,16 +6766,14 @@ fn lower_expr(
                                     let rhs_pre =
                                         get_value!(lower_expr(graph, block, re, options, ctx)?);
                                     ctx.pushvid(graph, rhs_pre);
-                                    let rhs = ctx.popvid(graph);
-                                    let lhs = ctx.popvid(graph);
+                                    let rhs_var = ctx.popvid_var(graph);
+                                    let lhs_var = ctx.popvid_var(graph);
                                     let op_name = if macro_name.contains("_ne") {
                                         "ne"
                                     } else {
                                         "eq"
                                     };
-                                    let lhs_var = graph.must_variable(lhs);
-                                    let rhs_var = graph.must_variable(rhs);
-                                    graph.push_op(
+                                    graph.push_op_var(
                                         *block,
                                         OpKind::BinOp {
                                             op: op_name.into(),
@@ -6805,7 +6787,7 @@ fn lower_expr(
                                 _ => None,
                             }
                         };
-                        if let Some(cond) = cond_opt {
+                        if let Some(cond_var) = cond_opt {
                             // Split into pass/fail arms BEFORE walking
                             // the message expressions.  Per RPython
                             // `flowspace/flowcontext.py:107`
@@ -6827,7 +6809,6 @@ fn lower_expr(
                             // order).
                             let pass_block = graph.create_block();
                             let mut fail_block = graph.create_block();
-                            let cond_var = graph.must_variable(cond);
                             graph.set_branch(
                                 *block,
                                 cond_var,
@@ -6866,8 +6847,8 @@ fn lower_expr(
                                 // `?`.
                                 let lowered =
                                     lower_expr(graph, &mut fail_block, rest, options, ctx)?;
-                                if let Some(v) = lowered.value {
-                                    message_args.push(graph.must_variable(v));
+                                if let Some(var) = lowered.value_var(graph) {
+                                    message_args.push(var);
                                 }
                             }
                             let _ = &macro_name; // name is only used for diagnostics; class is fixed.
@@ -6935,8 +6916,8 @@ fn lower_expr(
                                 // stops.
                                 return Ok(Lowered::path_closed());
                             }
-                            if let Some(v) = lowered.value {
-                                message_args.push(graph.must_variable(v));
+                            if let Some(var) = lowered.value_var(graph) {
+                                message_args.push(var);
                             }
                         }
                     }
@@ -8091,29 +8072,38 @@ fn binary_op_name(op: &syn::BinOp) -> &'static str {
     }
 }
 
-fn binary_result_value_type(
+/// Variable-keyed BinOp result type oracle.
+///
+/// RPython `flowspace/operation.py:505-510` registers `lt`, `le`,
+/// `eq`, `ne`, `ge`, `gt` as 2-arg operators returning lltype.Bool;
+/// the annotator stamps the result `SomeBool(SomeInteger)`
+/// (`annotator/model.py:185-198` — distinct lattice node from
+/// SomeInteger).  Pyre mirrors that with `ValueType::Bool`, which
+/// `valuetype_to_someshell` projects to `SomeValue::Bool` and the
+/// rtyper picks `BoolRepr` for (`rmodel.rs:2204`).  Downstream
+/// jit_codewriter sites that key off `ValueType::Int` already alias
+/// Bool to Int (commit 4318ebb51b2 added the 9 wildcard / explicit
+/// arms — assembler getkind, call array-descr / ir_type, jtransform
+/// stamp/kind/ir).
+fn binary_result_value_type_var(
     graph: &FunctionGraph,
-    lhs: ValueId,
-    rhs: ValueId,
+    lhs: &crate::flowspace::model::Variable,
+    rhs: &crate::flowspace::model::Variable,
     op: &str,
 ) -> ValueType {
-    // RPython `flowspace/operation.py:505-510` registers `lt`, `le`,
-    // `eq`, `ne`, `ge`, `gt` as 2-arg operators returning lltype.Bool;
-    // the annotator stamps the result `SomeBool(SomeInteger)`
-    // (`annotator/model.py:185-198` — distinct lattice node from
-    // SomeInteger).  Pyre mirrors that with `ValueType::Bool`, which
-    // `valuetype_to_someshell` projects to `SomeValue::Bool` and the
-    // rtyper picks `BoolRepr` for (`rmodel.rs:2204`).  Downstream
-    // jit_codewriter sites that key off `ValueType::Int` already
-    // alias Bool to Int (commit 4318ebb51b2 added the 9 wildcard /
-    // explicit arms — assembler getkind, call array-descr / ir_type,
-    // jtransform stamp/kind/ir).
     if matches!(op, "eq" | "ne" | "lt" | "le" | "gt" | "ge") {
         return ValueType::Bool;
     }
+    let lhs_ty = graph_value_type_var(graph, lhs);
+    let rhs_ty = graph_value_type_var(graph, rhs);
+    binary_result_value_type_inner(lhs_ty, rhs_ty, op)
+}
 
-    let lhs_ty = graph_value_type(graph, lhs);
-    let rhs_ty = graph_value_type(graph, rhs);
+fn binary_result_value_type_inner(
+    lhs_ty: Option<ValueType>,
+    rhs_ty: Option<ValueType>,
+    op: &str,
+) -> ValueType {
     match (lhs_ty, rhs_ty) {
         (Some(ValueType::Float), Some(ValueType::Float))
         | (Some(ValueType::Float), Some(ValueType::Int))
@@ -8377,15 +8367,26 @@ fn bare_type_root_from_type_str(s: &str) -> Option<String> {
     }
 }
 
-fn graph_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
-    graph_result_value_type(graph, value).or_else(|| graph_link_input_value_type(graph, value))
+/// Variable-direct lookup that walks the op-result chain first then the
+/// link-arg unification fold (`graph_result_value_type_var` →
+/// `graph_link_input_value_type_var`).  No ValueId projection; the
+/// upstream-orthodox carrier is `op.result: Variable` and
+/// `inputarg == Variable` identity-compare per `flowspace/model.py:140`.
+fn graph_value_type_var(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<ValueType> {
+    graph_result_value_type_var(graph, var).or_else(|| graph_link_input_value_type_var(graph, var))
 }
 
-fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueType) {
-    let target_var = graph.variable(value).cloned();
+fn retag_result_value_type(
+    graph: &mut FunctionGraph,
+    target_var: &crate::flowspace::model::Variable,
+    ty: ValueType,
+) {
     for block in &mut graph.blocks {
         for op in &mut block.operations {
-            if op.result.as_ref() != target_var.as_ref() {
+            if op.result.as_ref() != Some(target_var) {
                 continue;
             }
             match &mut op.kind {
@@ -8406,8 +8407,16 @@ fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueT
     }
 }
 
-fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
-    let target_var = graph.variable(value)?;
+/// Link-arg unification loop driven by Variable identity (the
+/// upstream-orthodox carrier per `flowspace/model.py:140`).  Walks
+/// every block's `inputargs` to find one matching `target_var`, then
+/// folds every predecessor link's matching arg position via
+/// `graph_result_value_type_var`/`const_value_value_type` and returns
+/// the unified `ValueType` if every contributor agrees.
+fn graph_link_input_value_type_var(
+    graph: &FunctionGraph,
+    target_var: &crate::flowspace::model::Variable,
+) -> Option<ValueType> {
     for target_block in &graph.blocks {
         let Some(arg_index) = target_block
             .inputargs
@@ -8424,10 +8433,10 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
                 }
                 let source_ty = match link.args.get(arg_index)? {
                     arg @ LinkArg::Value(_) => {
-                        let Some(source) = arg.as_value(graph) else {
+                        let Some(source_var) = arg.as_variable() else {
                             continue;
                         };
-                        match graph_result_value_type(graph, source) {
+                        match graph_result_value_type_var(graph, source_var) {
                             Some(ty) => ty,
                             None => continue,
                         }
@@ -8505,14 +8514,19 @@ fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
     }
 }
 
-fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
-    let target = graph.variable(value).cloned();
+/// Op-result scan driven by Variable identity (`op.result == Some(var)`
+/// across every block's operations).  Returns the producing op's
+/// declared `ValueType` via [`op_result_value_type`].
+fn graph_result_value_type_var(
+    graph: &FunctionGraph,
+    target_var: &crate::flowspace::model::Variable,
+) -> Option<ValueType> {
     graph
         .blocks
         .iter()
         .flat_map(|block| block.operations.iter())
         .find_map(|op| {
-            if op.result.as_ref() == target.as_ref() && target.is_some() {
+            if op.result.as_ref() == Some(target_var) {
                 op_result_value_type(&op.kind)
             } else {
                 None
@@ -8561,7 +8575,7 @@ fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
 
 fn transparent_option_method_result_type(
     graph: &FunctionGraph,
-    args: &[ValueId],
+    args: &[crate::flowspace::model::Variable],
     method: &syn::Ident,
 ) -> Option<ValueType> {
     match method.to_string().as_str() {
@@ -8575,7 +8589,7 @@ fn transparent_option_method_result_type(
         "is_empty" | "is_null" => Some(ValueType::Bool),
         "unwrap_or" => args
             .get(1)
-            .and_then(|&default| graph_value_type(graph, default)),
+            .and_then(|default| graph_value_type_var(graph, default)),
         _ => None,
     }
 }
@@ -8603,12 +8617,12 @@ fn transparent_option_method_result_type(
 /// this inference applies.
 fn primitive_method_result_type(
     graph: &FunctionGraph,
-    args: &[ValueId],
+    args: &[crate::flowspace::model::Variable],
     method: &syn::Ident,
 ) -> Option<ValueType> {
     let receiver = args
         .first()
-        .and_then(|&recv| graph_value_type(graph, recv))?;
+        .and_then(|recv| graph_value_type_var(graph, recv))?;
     match (receiver, method.to_string().as_str()) {
         (ValueType::Float, "abs" | "floor" | "ceil" | "trunc" | "round" | "sqrt" | "powf") => {
             Some(ValueType::Float)
@@ -12700,6 +12714,10 @@ mod tests {
         Some(ValueId(vid))
     }
 
+    fn entry_slots(entries: &[Option<ValueId>]) -> Vec<Option<usize>> {
+        entries.iter().map(|e| e.map(|v| v.0)).collect()
+    }
+
     #[test]
     fn locals_frame_iter_preserves_storage_order() {
         // RPython `flowcontext.py:835 LOAD_FAST` reads `frame.locals_w`
@@ -12717,10 +12735,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let walked: Vec<ValueId> = frame.iter().map(|(_, vid)| vid).collect();
+        let walked: Vec<usize> = frame.iter_slots().map(|(_, slot)| slot).collect();
         assert_eq!(
             walked,
-            vec![ValueId(3), ValueId(1), ValueId(2)],
+            vec![3, 1, 2],
             "iter must walk entries in storage (first-bind) order; \
              alphabetisation would break slot-position parity at merges"
         );
@@ -12748,10 +12766,10 @@ mod tests {
         // entries [b=vid2, a=vid1] at slots [0, 1] so the iter walks
         // the same positions; verifying the (slot, vid) pairs is the
         // direct equivalent of the pre-Slice-2.2 (name, vid) check.
-        let collected: Vec<(usize, ValueId)> = frame.iter().collect();
+        let collected: Vec<(usize, usize)> = frame.iter_slots().collect();
         assert_eq!(
             collected,
-            vec![(0, ValueId(2)), (1, ValueId(1))],
+            vec![(0, 2), (1, 1)],
             "iter must walk stored (first-bind positional) order"
         );
     }
@@ -12772,7 +12790,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(merged.entries, vec![Some(ValueId(7))]);
+        assert_eq!(entry_slots(&merged.entries), vec![Some(7)]);
         // No fresh allocation: `next_value` cursor stays at 100.
         assert_eq!(graph.next_value(), 100);
     }
@@ -12793,7 +12811,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(merged.entries, vec![Some(ValueId(100))]);
+        assert_eq!(entry_slots(&merged.entries), vec![Some(100)]);
         // Fresh allocation consumed exactly one vid.
         assert_eq!(graph.next_value(), 101);
     }
@@ -12908,10 +12926,10 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let merged = inferred.union(&annotated, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(merged.entries, vec![Some(ValueId(1))]);
+        assert_eq!(entry_slots(&merged.entries), vec![Some(1)]);
         // Symmetric.
         let merged_swap = annotated.union(&inferred, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(merged_swap.entries, vec![Some(ValueId(1))]);
+        assert_eq!(entry_slots(&merged_swap.entries), vec![Some(1)]);
     }
 
     #[test]
@@ -12937,7 +12955,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
         graph.set_next_value(100);
         let acc = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)").union(&c, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(acc.entries, vec![Some(ValueId(7))]);
+        assert_eq!(entry_slots(&acc.entries), vec![Some(7)]);
         assert_eq!(graph.next_value(), 100, "no fresh allocation expected");
     }
 
@@ -12970,7 +12988,7 @@ mod tests {
             "carry-through step must not allocate"
         );
         let acc = acc.union(&c, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
-        assert_eq!(acc.entries, vec![Some(ValueId(100))]);
+        assert_eq!(entry_slots(&acc.entries), vec![Some(100)]);
         assert_eq!(
             graph.next_value(),
             101,
@@ -13049,10 +13067,9 @@ mod tests {
         // positional vids.  Slot 0 = c (vid 3), slot 1 = a (vid 1),
         // slot 2 = b (vid 2) — direct port of upstream's positional
         // `_union(locals_w_self, locals_w_other)` zip.
-        let vids: Vec<Option<ValueId>> = merged.entries.clone();
         assert_eq!(
-            vids,
-            vec![Some(ValueId(3)), Some(ValueId(1)), Some(ValueId(2))],
+            entry_slots(&merged.entries),
+            vec![Some(3), Some(1), Some(2)],
             "merged slot order must follow graph-wide first-bind order"
         );
     }
@@ -13085,17 +13102,17 @@ mod tests {
         graph.set_next_value(100);
         let merged = pred.union(&other, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         let link_args = pred.getoutputargs(&merged, &graph);
-        let link_arg_vids: Vec<ValueId> = link_args
+        let link_arg_slots: Vec<usize> = link_args
             .iter()
             .map(|a| {
-                a.as_value(&graph)
+                a.slot_in(&graph)
                     .expect("locals projection is Variable-only")
             })
             .collect();
         assert_eq!(
-            link_arg_vids,
-            vec![ValueId(10), ValueId(20), ValueId(30)],
-            "getoutputargs must yield self's ValueIds in target slot order"
+            link_arg_slots,
+            vec![10, 20, 30],
+            "getoutputargs must yield self's slot indices in target slot order"
         );
     }
 
@@ -13125,16 +13142,16 @@ mod tests {
         graph.set_next_value(100);
         let merged = a.union(&b, &mut graph).expect("test invariant: AST frontend union is total — entries domain has no UnionError, vestigial stack/exc/blocklist/next_offset (framestate.py:78)");
         let link_args = a.getoutputargs(&merged, &graph);
-        let link_arg_vids: Vec<ValueId> = link_args
+        let link_arg_slots: Vec<usize> = link_args
             .iter()
             .map(|a| {
-                a.as_value(&graph)
+                a.slot_in(&graph)
                     .expect("locals projection is Variable-only")
             })
             .collect();
         assert_eq!(
-            link_arg_vids,
-            vec![ValueId(11)],
+            link_arg_slots,
+            vec![11],
             "only surviving slots emit link args; None-killed slots are skipped"
         );
     }
@@ -13210,7 +13227,7 @@ mod tests {
         // `OpKind::Input` at the start block; this approximates the
         // pre-loop state Slice 5c.1 will hand to the allocator.
         let pre_x = graph
-            .push_op(
+            .push_op_var(
                 pre_loop_block,
                 OpKind::Input {
                     name: "x".into(),
@@ -13218,7 +13235,7 @@ mod tests {
                 },
                 true,
             )
-            .expect("OpKind::Input must produce a vid");
+            .expect("OpKind::Input must produce a Variable");
         let pre_y = graph
             .push_op(
                 pre_loop_block,
@@ -13245,7 +13262,7 @@ mod tests {
             &empty_names,
             &empty_trait_names,
         );
-        ctx.bind_local_id("x".into(), pre_x, pre_loop_block);
+        ctx.bind_local_id_var("x".into(), &pre_x, &graph, pre_loop_block);
         ctx.local_value_types.insert("x".into(), ValueType::Int);
         ctx.bind_local_id("y".into(), pre_y, pre_loop_block);
         ctx.local_value_types.insert("y".into(), ValueType::Int);
@@ -13295,16 +13312,14 @@ mod tests {
         let pre_exit = &graph.block(pre_loop_block).exits[0];
         assert_eq!(
             pre_exit.args,
-            vec![LinkArg::Value(graph.must_variable(pre_x))],
-            "forward-edge link arg for `x` must carry the pre-loop vid"
+            vec![LinkArg::Value(pre_x.clone())],
+            "forward-edge link arg for `x` must carry the pre-loop Variable"
         );
 
         let (current_x_vid, current_x_block) = ctx.local_value_ids["x"];
-        let phi_vid = graph
-            .value_id_of(&phi_var)
-            .expect("phi inputarg registered");
+        let phi_slot = graph.slot_of(&phi_var).expect("phi inputarg registered");
         assert_eq!(
-            current_x_vid, phi_vid,
+            current_x_vid.0, phi_slot,
             "ctx.local_value_ids[x] must point at the header phi"
         );
         assert_eq!(
@@ -13844,7 +13859,7 @@ mod tests {
             .expect("example graph")
             .graph;
         // Find the return block: ends with `Return` and reads `y`.
-        let (returnblock_id, _ret_arg) = graph.returnblock_arg();
+        let returnblock_id = graph.returnblock;
         // The closing predecessor of the returnblock is the post-loop
         // exit block that produces the return value (`y`).  In the
         // canonical Slice-2 lazy-install path, the post-loop block
@@ -13862,28 +13877,28 @@ mod tests {
         // an inputarg of the post-loop block (i.e. lazy install
         // succeeded).  Pre-fix, the vid would be the result of a
         // standalone `OpKind::Input` op NOT in inputargs.
-        let pred_link: Option<(BlockId, ValueId)> = graph.blocks.iter().find_map(|b| {
-            b.exits.iter().find_map(|exit| {
-                if exit.target == returnblock_id {
-                    let arg_vid = exit.args[0].as_value(&graph)?;
-                    Some((b.id, arg_vid))
-                } else {
-                    None
-                }
-            })
-        });
-        let (post_loop_id, ret_value_vid) =
+        let pred_link: Option<(BlockId, crate::flowspace::model::Variable)> =
+            graph.blocks.iter().find_map(|b| {
+                b.exits.iter().find_map(|exit| {
+                    if exit.target == returnblock_id {
+                        let arg_var = exit.args[0].as_variable()?;
+                        Some((b.id, arg_var.clone()))
+                    } else {
+                        None
+                    }
+                })
+            });
+        let (post_loop_id, ret_value_var) =
             pred_link.expect("returnblock must have one closing predecessor");
         let post_loop_block = graph.block(post_loop_id);
-        let post_loop_vids = post_loop_block.inputarg_value_ids(&graph);
-        let is_inputarg = post_loop_vids.contains(&ret_value_vid);
+        let is_inputarg = post_loop_block.inputargs.contains(&ret_value_var);
         assert!(
             is_inputarg,
             "post-loop block must own `y` as an inputarg threaded back to \
-             pre-loop; got naked-`Input` fallback (vid {:?} not in \
+             pre-loop; got naked-`Input` fallback (var {:?} not in \
              inputargs {:?}). graph:\n{}",
-            ret_value_vid,
-            post_loop_vids,
+            ret_value_var,
+            post_loop_block.inputargs,
             graph.dump()
         );
         // Audit Cat 2-1 also stamps continue + body_tail framestate
@@ -14358,29 +14373,32 @@ mod tests {
     }
 
     /// Test-only push helper — mints a fresh `Variable`, binds it to
-    /// `vid` via `bind_variable`, and pushes the
+    /// `vid` via `bind_variable_at`, and pushes the
     /// `StackElem::Value(Hlvalue::Variable(...))` cell.  Mirrors how
     /// production op-emission would push the SpaceOperation result
     /// once leaves migrate to `value_stack` (Z4.B.1+).
-    fn z4a_push_vid(ctx: &mut GraphBuildContext, graph: &mut FunctionGraph, vid: ValueId) {
+    fn z4a_push_vid(ctx: &mut GraphBuildContext, graph: &mut FunctionGraph, vid: usize) {
         use crate::flowspace::framestate::StackElem;
         use crate::flowspace::model::{Hlvalue, Variable};
         let v = Variable::new();
-        graph.bind_variable(vid, v.clone());
+        graph.bind_variable_at(vid, v.clone());
         ctx.pushvalue(StackElem::Value(Hlvalue::Variable(v)));
     }
 
     /// Bridge a `StackElem::Value(Hlvalue::Variable)` cell back to
-    /// `ValueId` via `bridge_variable`, panicking on a non-Variable
-    /// shape (Constant / FlowSignal arms unused in current tests).
+    /// its registered slot index via `slot_of`, panicking on a
+    /// non-Variable shape (Constant / FlowSignal arms unused in
+    /// current tests) or an unregistered Variable.
     fn z4a_cell_to_vid(
         graph: &mut FunctionGraph,
         elem: &crate::flowspace::framestate::StackElem,
-    ) -> ValueId {
+    ) -> usize {
         use crate::flowspace::framestate::StackElem;
         use crate::flowspace::model::Hlvalue;
         match elem {
-            StackElem::Value(Hlvalue::Variable(v)) => graph.bridge_variable(v),
+            StackElem::Value(Hlvalue::Variable(v)) => graph
+                .slot_of(v)
+                .expect("Variable cell must be registered on graph"),
             other => panic!("expected Variable cell, got {other:?}"),
         }
     }
@@ -14394,22 +14412,22 @@ mod tests {
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
         assert_eq!(ctx.stackdepth(), 0);
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(7));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(11));
+        z4a_push_vid(&mut ctx, &mut graph, 7);
+        z4a_push_vid(&mut ctx, &mut graph, 11);
         assert_eq!(ctx.stackdepth(), 2);
         // `popvalue` returns the topmost cell — LIFO per
         // `flowcontext.py:325 self.stack.pop()`.
         let top = ctx.popvalue();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top), ValueId(11));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top), 11);
         let bottom = ctx.popvalue();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), ValueId(7));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), 7);
         assert_eq!(ctx.stackdepth(), 0);
     }
 
     /// Production-side `pushvid` / `popvid` round-trip — pyre IR's
     /// `ValueId` threads through `value_stack` as
-    /// `StackElem::Value(Hlvalue::Variable(graph.variable(vid)))` and
-    /// recovers back through `graph.bridge_variable`.  Z4.B.1+ leaf
+    /// `StackElem::Value(Hlvalue::Variable(graph.variable_at(slot)))` and
+    /// recovers back through `graph.slot_of`.  Z4.B.1+ leaf
     /// migrations consume this pair; the test pins the contract before
     /// any production caller relies on it.
     #[test]
@@ -14434,7 +14452,7 @@ mod tests {
     /// `pushvid` panics when the vid was minted outside the canonical
     /// allocation path (no backing Variable at `graph.value_variables`).
     #[test]
-    #[should_panic(expected = "pushvid: ValueId")]
+    #[should_panic(expected = "pushvid: slot")]
     fn pushvid_panics_when_vid_has_no_backing_variable() {
         let registry = StructFieldRegistry::default();
         let fn_ret = HashMap::new();
@@ -14442,7 +14460,7 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let graph = FunctionGraph::new("pushvid_unbacked");
-        // ValueId(42) was never allocated — graph.variable(42) returns None.
+        // slot 42 was never allocated — graph.variable(42) returns None.
         ctx.pushvid(&graph, ValueId(42));
     }
 
@@ -14454,17 +14472,17 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(3));
+        z4a_push_vid(&mut ctx, &mut graph, 1);
+        z4a_push_vid(&mut ctx, &mut graph, 2);
+        z4a_push_vid(&mut ctx, &mut graph, 3);
         // `peekvalue(0)` is the top per upstream's `~0 == -1` indexing
         // (`flowcontext.py:329`).
         let top0 = ctx.peekvalue(0).clone();
         let top1 = ctx.peekvalue(1).clone();
         let top2 = ctx.peekvalue(2).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(3));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(2));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), ValueId(1));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), 3);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), 2);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), 1);
         // peekvalue is non-destructive.
         assert_eq!(ctx.stackdepth(), 3);
     }
@@ -14479,19 +14497,19 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(3));
-        // Replace index_from_top=1 with a fresh cell paired to ValueId(99).
+        z4a_push_vid(&mut ctx, &mut graph, 1);
+        z4a_push_vid(&mut ctx, &mut graph, 2);
+        z4a_push_vid(&mut ctx, &mut graph, 3);
+        // Replace index_from_top=1 with a fresh cell paired to slot 99.
         let v99 = Variable::new();
-        graph.bind_variable(ValueId(99), v99.clone());
+        graph.bind_variable_at(99, v99.clone());
         ctx.settopvalue(StackElem::Value(Hlvalue::Variable(v99)), 1);
         let top0 = ctx.peekvalue(0).clone();
         let top1 = ctx.peekvalue(1).clone();
         let top2 = ctx.peekvalue(2).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(3));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(99));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), ValueId(1));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), 3);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), 99);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top2), 1);
     }
 
     #[test]
@@ -14504,7 +14522,7 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
+        z4a_push_vid(&mut ctx, &mut graph, 1);
         let popped = ctx.popvalues(0);
         assert!(popped.is_empty());
         assert_eq!(ctx.stackdepth(), 1);
@@ -14521,19 +14539,19 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(10));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(20));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(30));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(40));
+        z4a_push_vid(&mut ctx, &mut graph, 10);
+        z4a_push_vid(&mut ctx, &mut graph, 20);
+        z4a_push_vid(&mut ctx, &mut graph, 30);
+        z4a_push_vid(&mut ctx, &mut graph, 40);
         let popped = ctx.popvalues(3);
-        let popped_vids: Vec<ValueId> = popped
+        let popped_vids: Vec<usize> = popped
             .iter()
             .map(|e| z4a_cell_to_vid(&mut graph, e))
             .collect();
-        assert_eq!(popped_vids, vec![ValueId(20), ValueId(30), ValueId(40)]);
+        assert_eq!(popped_vids, vec![20, 30, 40]);
         assert_eq!(ctx.stackdepth(), 1);
         let bottom = ctx.peekvalue(0).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), ValueId(10));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &bottom), 10);
     }
 
     #[test]
@@ -14549,14 +14567,14 @@ mod tests {
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
         for v in 1..=5 {
-            z4a_push_vid(&mut ctx, &mut graph, ValueId(v));
+            z4a_push_vid(&mut ctx, &mut graph, v);
         }
         ctx.dropvaluesuntil(2);
         assert_eq!(ctx.stackdepth(), 2);
         let top0 = ctx.peekvalue(0).clone();
         let top1 = ctx.peekvalue(1).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(2));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(1));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), 2);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), 1);
     }
 
     #[test]
@@ -14571,14 +14589,14 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        z4a_push_vid(&mut ctx, &mut graph, 1);
+        z4a_push_vid(&mut ctx, &mut graph, 2);
         let popped = ctx.popvalues(5);
-        let popped_vids: Vec<ValueId> = popped
+        let popped_vids: Vec<usize> = popped
             .iter()
             .map(|e| z4a_cell_to_vid(&mut graph, e))
             .collect();
-        assert_eq!(popped_vids, vec![ValueId(1), ValueId(2)]);
+        assert_eq!(popped_vids, vec![1, 2]);
         assert_eq!(ctx.stackdepth(), 0);
     }
 
@@ -14595,14 +14613,14 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(1));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(2));
+        z4a_push_vid(&mut ctx, &mut graph, 1);
+        z4a_push_vid(&mut ctx, &mut graph, 2);
         ctx.dropvaluesuntil(10);
         assert_eq!(ctx.stackdepth(), 2);
         let top0 = ctx.peekvalue(0).clone();
         let top1 = ctx.peekvalue(1).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), ValueId(2));
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), ValueId(1));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top0), 2);
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top1), 1);
     }
 
     #[test]
@@ -14638,14 +14656,14 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.bind_local_id("x".into(), ValueId(7), BlockId(0));
-        ctx.bind_local_id("y".into(), ValueId(11), BlockId(0));
+        ctx.bind_local_id_at("x".into(), 7, BlockId(0));
+        ctx.bind_local_id_at("y".into(), 11, BlockId(0));
         let graph = FunctionGraph::new("z4a2_getstate_demo");
         // last_exception + blockstack stay at defaults (None, []);
         // value_stack stays empty so the stack projection round-trips
         // as an empty Vec.
         let state = ctx.getstate(&graph, 42);
-        assert_eq!(state.entries, vec![Some(ValueId(7)), Some(ValueId(11))]);
+        assert_eq!(entry_slots(&state.entries), vec![Some(7), Some(11)]);
         assert!(
             state.stack.is_empty(),
             "empty value_stack must project to empty FrameState.stack"
@@ -14670,8 +14688,8 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a2_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(101));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(202));
+        z4a_push_vid(&mut ctx, &mut graph, 101);
+        z4a_push_vid(&mut ctx, &mut graph, 202);
         let state = ctx.getstate(&graph, 0);
         assert_eq!(state.stack.len(), 2);
         let StackElem::Value(Hlvalue::Variable(v0)) = &state.stack[0] else {
@@ -14680,8 +14698,8 @@ mod tests {
         let StackElem::Value(Hlvalue::Variable(v1)) = &state.stack[1] else {
             panic!("expected Variable cell at stack[1]");
         };
-        assert_eq!(graph.bridge_variable(v0), ValueId(101));
-        assert_eq!(graph.bridge_variable(v1), ValueId(202));
+        assert_eq!(graph.slot_of(v0).expect("v0 registered"), 101);
+        assert_eq!(graph.slot_of(v1).expect("v1 registered"), 202);
     }
 
     #[test]
@@ -14697,31 +14715,31 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4a2_demo");
-        ctx.bind_local_id("x".into(), ValueId(1), BlockId(0));
-        ctx.bind_local_id("y".into(), ValueId(2), BlockId(0));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(50));
+        ctx.bind_local_id_at("x".into(), 1, BlockId(0));
+        ctx.bind_local_id_at("y".into(), 2, BlockId(0));
+        z4a_push_vid(&mut ctx, &mut graph, 50);
         let captured = ctx.getstate(&graph, 7);
         // Mutate ctx after capture: rebind x, push a different cell.
-        ctx.bind_local_id("x".into(), ValueId(99), BlockId(1));
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(123));
+        ctx.bind_local_id_at("x".into(), 99, BlockId(1));
+        z4a_push_vid(&mut ctx, &mut graph, 123);
         assert_eq!(ctx.stackdepth(), 2);
         ctx.setstate(&captured);
         // Locals back to captured shape.
         assert_eq!(
-            ctx.local_value_ids.get("x").map(|&(vid, _)| vid),
-            Some(ValueId(1)),
+            ctx.local_value_ids.get("x").map(|&(vid, _)| vid.0),
+            Some(1),
             "x must be restored to captured vid"
         );
         assert_eq!(
-            ctx.local_value_ids.get("y").map(|&(vid, _)| vid),
-            Some(ValueId(2)),
+            ctx.local_value_ids.get("y").map(|&(vid, _)| vid.0),
+            Some(2),
             "y must be restored to captured vid"
         );
         // value_stack restored to single-cell captured shape carrying
-        // ValueId(50).
+        // slot 50.
         assert_eq!(ctx.stackdepth(), 1);
         let top = ctx.peekvalue(0).clone();
-        assert_eq!(z4a_cell_to_vid(&mut graph, &top), ValueId(50));
+        assert_eq!(z4a_cell_to_vid(&mut graph, &top), 50);
     }
 
     #[test]
@@ -14755,7 +14773,7 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = FunctionGraph::new("z4b0_demo");
-        z4a_push_vid(&mut ctx, &mut graph, ValueId(42));
+        z4a_push_vid(&mut ctx, &mut graph, 42);
         ctx.assert_stack_empty_at_stmt_boundary("z4b0_negative_test");
     }
 
@@ -14806,11 +14824,11 @@ mod tests {
         let names = std::collections::HashSet::new();
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
-        ctx.bind_local_id("x".into(), ValueId(1), BlockId(0));
-        ctx.bind_local_id("y".into(), ValueId(2), BlockId(0));
+        ctx.bind_local_id_at("x".into(), 1, BlockId(0));
+        ctx.bind_local_id_at("y".into(), 2, BlockId(0));
         // Build a FrameState whose y slot is None-killed.
         let killed_state = FrameState {
-            entries: vec![Some(ValueId(1)), None],
+            entries: FrameState::entries_from_slots(&[Some(1), None]),
             ..Default::default()
         };
         ctx.setstate(&killed_state);
@@ -14844,9 +14862,16 @@ mod tests {
     /// Variables backing the entries must already be registered with
     /// `graph` so `create_block_from_framestate` / `getvariables` /
     /// `set_goto_from_framestate` round-trip correctly.
-    fn mergeblock_test_state_single(vid: ValueId, next_offset: i64) -> FrameState {
+    fn mergeblock_test_state_single(
+        graph: &mut crate::model::FunctionGraph,
+        next_offset: i64,
+    ) -> FrameState {
+        let var = graph.alloc_value_var();
+        let slot = graph
+            .slot_of(&var)
+            .expect("alloc_value_var registered the slot");
         FrameState {
-            entries: vec![Some(vid)],
+            entries: FrameState::entries_from_slots(&[Some(slot)]),
             locals_w: Vec::new(),
             stack: Vec::new(),
             last_exception: None,
@@ -14866,8 +14891,7 @@ mod tests {
         let trait_names = std::collections::HashSet::new();
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = crate::model::FunctionGraph::new("test");
-        let v1 = graph.alloc_value();
-        let currentstate = mergeblock_test_state_single(v1, 10);
+        let currentstate = mergeblock_test_state_single(&mut graph, 10);
         let current = graph.create_block_from_framestate(&currentstate);
 
         let merge = ctx.mergeblock(&mut graph, current, currentstate.clone());
@@ -14902,8 +14926,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test");
 
         // Predecessor #1.
-        let v1 = graph.alloc_value();
-        let state1 = mergeblock_test_state_single(v1, 20);
+        let state1 = mergeblock_test_state_single(&mut graph, 20);
         let current1 = graph.create_block_from_framestate(&state1);
         let cand = ctx.mergeblock(&mut graph, current1, state1);
 
@@ -14911,8 +14934,7 @@ mod tests {
         // next_offset.  Per `framestate.py:113-114`, the per-cell union
         // mints a fresh Variable; `matches` accepts the pair as both-
         // Variables, so we take the direct-link arm.
-        let v2 = graph.alloc_value();
-        let state2 = mergeblock_test_state_single(v2, 20);
+        let state2 = mergeblock_test_state_single(&mut graph, 20);
         let current2 = graph.create_block_from_framestate(&state2);
         let merge = ctx.mergeblock(&mut graph, current2, state2);
 
@@ -14955,9 +14977,8 @@ mod tests {
         let mut ctx = z4a_test_ctx(&registry, &fn_ret, &names, &trait_names);
         let mut graph = crate::model::FunctionGraph::new("test");
 
-        // Predecessor #1 binds slot 0 to v1.
-        let v1 = graph.alloc_value();
-        let state1 = mergeblock_test_state_single(v1, 30);
+        // Predecessor #1 binds a fresh slot.
+        let state1 = mergeblock_test_state_single(&mut graph, 30);
         let current1 = graph.create_block_from_framestate(&state1);
         let cand = ctx.mergeblock(&mut graph, current1, state1);
 

@@ -53,13 +53,13 @@ pub(crate) fn analyze_function(func: &SemanticFunction, config: &PipelineConfig)
     // tracks the orthodox `Variable.annotation` slot directly.  Test
     // gate is `> 0`.
     let annotations_count = graph
-        .iter_variables()
+        .iter_variable_slots()
         .filter(|(_, v)| v.annotation.borrow().is_some())
         .count();
 
     // Pass 2: Type resolution (RPython rtyper) — commits per-Variable
-    // `concretetype` cells via `graph.set_concretetype_inline`, so
-    // downstream consumers read kinds via `graph.concretetype(v)`.
+    // `concretetype` cells via `FunctionGraph::set_concretetype_of_inline`,
+    // so downstream consumers read kinds via `graph.concretetype(v)`.
     // The returned scratch state is unused here (legacy_pipeline does
     // not run the dual-gate comparison).
     resolve_types(graph);

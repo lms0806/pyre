@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::call::CallDescriptor;
 use crate::jit_codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
-    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueId,
-    ValueType, remap_control_flow_metadata,
+    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType,
+    remap_control_flow_metadata_var,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -420,9 +420,9 @@ impl<'a> Transformer<'a> {
     /// `getkind(v.concretetype)`).  Callers commit kinds to each
     /// backing `Variable.concretetype` cell upstream — through
     /// `legacy_resolve::resolve_types` (which writes through
-    /// `graph.set_concretetype_inline` per-set) or
-    /// `dual_gate_publish_concretetypes`.  Test fixtures that need
-    /// to hand-set kinds call `graph.set_concretetype_inline(vid, ct)`
+    /// `FunctionGraph::set_concretetype_of_inline(&var, ct)` per-set)
+    /// or `dual_gate_publish_concretetypes`.  Test fixtures that need
+    /// to hand-set kinds call `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
@@ -472,16 +472,10 @@ impl<'a> Transformer<'a> {
 
         let (exitswitch, exits) = {
             let block = &graph.blocks[block_idx];
-            remap_control_flow_metadata(
-                graph,
-                graph,
+            remap_control_flow_metadata_var(
                 &block.exitswitch,
                 &block.exits,
-                |vid| {
-                    let var = graph.must_variable(vid);
-                    let remapped = remap_value(&var, &self.aliases);
-                    graph.value_id_of(&remapped).unwrap_or(vid)
-                },
+                |var| remap_value(var, &self.aliases),
                 |b| b,
             )
         };
@@ -505,26 +499,12 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// Allocate a fresh synthetic SSA slot; its backing `Variable`'s
-    /// `concretetype` cell is the authoritative kind source (set up-front
-    /// via `graph.alloc_value_with_type`). Mirrors RPython's
-    /// `Variable(concretetype=T)` (`flowmodel.py:Variable.__init__`).
-    /// Returns the dense ValueId for callers that still need it; the
-    /// Variable-returning sibling is `fresh_synthetic_variable_typed`.
-    fn fresh_synthetic_value_typed(
-        &mut self,
-        graph: &mut FunctionGraph,
-        ty: crate::jit_codewriter::type_state::ConcreteType,
-    ) -> ValueId {
-        graph.alloc_value_with_type(ty)
-    }
-
-    /// Variable-returning sibling of [`Self::fresh_synthetic_value_typed`] —
+    /// Variable-returning helper —
     /// allocates a fresh synthetic slot, stamps its `concretetype` cell
     /// to `ty`, and hands back the backing
     /// [`crate::flowspace::model::Variable`].  Call sites that hold the
     /// fresh slot only as a Variable handle (`op.result.clone()`
-    /// downstream) use this overload to skip the local `must_variable`
+    /// downstream) use this to skip the local `must_variable`
     /// projection.  RPython parity:
     /// `Variable(concretetype=T)` (`flowspace/model.py:Variable.__init__`).
     fn fresh_synthetic_variable_typed(
@@ -532,8 +512,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         ty: crate::jit_codewriter::type_state::ConcreteType,
     ) -> crate::flowspace::model::Variable {
-        let vid = graph.alloc_value_with_type(ty);
-        graph.must_variable(vid)
+        graph.alloc_value_var_with_type(ty)
     }
 
     /// RPython parity: `Variable.concretetype = ty` (`flowmodel.py
@@ -705,15 +684,7 @@ impl<'a> Transformer<'a> {
                 args,
                 result_ty,
             } if self.config.classify_calls => {
-                let args_vids: Vec<ValueId> = args
-                    .iter()
-                    .map(|v| {
-                        graph
-                            .value_id_of(v)
-                            .expect("Call arg must have a backing ValueId")
-                    })
-                    .collect();
-                self.rewrite_op_direct_call(op, target, &args_vids, result_ty, graph_name, graph)
+                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
             // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
@@ -728,25 +699,15 @@ impl<'a> Transformer<'a> {
                 args,
                 graphs,
                 result_ty,
-            } if self.config.classify_calls => {
-                let args_vids: Vec<ValueId> = args
-                    .iter()
-                    .map(|v| {
-                        graph
-                            .value_id_of(v)
-                            .expect("IndirectCall arg must have a backing ValueId")
-                    })
-                    .collect();
-                self.lower_indirect_call_op(
-                    op,
-                    funcptr,
-                    &args_vids,
-                    graphs.as_deref(),
-                    result_ty,
-                    graph_name,
-                    graph,
-                )
-            }
+            } if self.config.classify_calls => self.lower_indirect_call_op(
+                op,
+                funcptr,
+                args,
+                graphs.as_deref(),
+                result_ty,
+                graph_name,
+                graph,
+            ),
             // ── abort placeholders ──
             OpKind::Abort { kind } => {
                 self.notes.push(GraphTransformNote {
@@ -1506,10 +1467,9 @@ impl<'a> Transformer<'a> {
     /// RPython: `add_in_correct_list(v, lst_i, lst_r, lst_f)` checks
     /// `getkind(v.concretetype)` and appends to the matching list.
     /// Void args are skipped.
-    fn make_three_lists_vars(
+    fn make_three_lists_from_vars(
         &self,
-        graph: &FunctionGraph,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
     ) -> (
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
@@ -1518,15 +1478,14 @@ impl<'a> Transformer<'a> {
         let mut args_i = Vec::new();
         let mut args_r = Vec::new();
         let mut args_f = Vec::new();
-        for &v in args {
-            let var = graph.must_variable(v);
-            let kind = self.get_value_kind_var(&var);
+        for var in args {
+            let kind = self.get_value_kind_var(var);
             match kind {
-                'i' => args_i.push(var),
-                'r' => args_r.push(var),
-                'f' => args_f.push(var),
-                'v' => {}              // void — skip (RPython jtransform.py:449)
-                _ => args_r.push(var), // unknown → ref
+                'i' => args_i.push(var.clone()),
+                'r' => args_r.push(var.clone()),
+                'f' => args_f.push(var.clone()),
+                'v' => {}                      // void — skip (RPython jtransform.py:449)
+                _ => args_r.push(var.clone()), // unknown → ref
             }
         }
         (args_i, args_r, args_f)
@@ -1715,11 +1674,10 @@ impl<'a> Transformer<'a> {
         if self.get_value_kind_var(value) != 'r' {
             return (value.clone(), Vec::new());
         }
-        let coerced_vid = self.fresh_synthetic_value_typed(
+        let coerced = self.fresh_synthetic_variable_typed(
             graph,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        let coerced = graph.must_variable(coerced_vid);
         (
             coerced.clone(),
             vec![SpaceOperation {
@@ -2273,7 +2231,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -2299,7 +2257,7 @@ impl<'a> Transformer<'a> {
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
         if let Some(key) = jit_marker_key_from_target(target) {
-            if let Some(ops) = self.try_handle_jit_marker(key, args, graph) {
+            if let Some(ops) = self.try_handle_jit_marker(key, args) {
                 return RewriteResult::Replace(ops);
             }
         }
@@ -2325,8 +2283,8 @@ impl<'a> Transformer<'a> {
         // [`Self::is_synthetic_result_option_ctor`]. The frontend must
         // already have resolved this to `CallTarget::SyntheticTransparentCtor`;
         // jtransform does not perform name-only matching.
-        if self.is_synthetic_result_option_ctor(graph, target, args, result_ty) {
-            return RewriteResult::Identity(graph.must_variable(args[0]));
+        if self.is_synthetic_result_option_ctor(target, args, result_ty) {
+            return RewriteResult::Identity(args[0].clone());
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
@@ -2346,7 +2304,7 @@ impl<'a> Transformer<'a> {
                     // RPython call.py:220-222: NON_VOID_ARGS + RESULT. Even
                     // for a configured effect override, keep the signature from
                     // getcalldescr() instead of accepting an effect-only descr.
-                    let non_void_args = resolve_non_void_arg_types(graph, args);
+                    let non_void_args = resolve_non_void_arg_types_from_vars(args);
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), result_ty)
                         .ir_type;
@@ -2383,7 +2341,7 @@ impl<'a> Transformer<'a> {
             &self.config.call_effects,
             self.callcontrol.as_deref(),
         ) {
-            let non_void_args = resolve_non_void_arg_types(graph, args);
+            let non_void_args = resolve_non_void_arg_types_from_vars(args);
             let descriptor = descriptor.with_signature(
                 &non_void_args,
                 self.resolve_call_result(op.result.as_ref(), result_ty)
@@ -2408,7 +2366,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -2437,13 +2395,12 @@ impl<'a> Transformer<'a> {
             if let Some(cc) = self.callcontrol.as_deref() {
                 if cc.get_oopspec(target).is_some() {
                     let (name, normalized) = decode_builtin_call(op, cc);
-                    let mut eff = Vec::with_capacity(normalized.len());
+                    let mut eff: Vec<crate::flowspace::model::Variable> =
+                        Vec::with_capacity(normalized.len());
                     let mut prefix: Vec<SpaceOperation> = Vec::new();
                     for slot in normalized {
                         match slot {
-                            NormalizedArg::Pass(var) => eff.push(graph.value_id_of(&var).expect(
-                                "NormalizedArg::Pass Variable must be backed by a ValueId on graph",
-                            )),
+                            NormalizedArg::Pass(var) => eff.push(var),
                             // `support.py:723 Constant(obj, lltype.Signed)`.
                             // Only integer literals (`lltype.Signed`-tagged)
                             // reach this arm — `parse_literal_slot` panics
@@ -2451,27 +2408,25 @@ impl<'a> Transformer<'a> {
                             // `ConcreteType` analogue) and routes float
                             // literals to `ConstFloat` below.
                             NormalizedArg::ConstInt(v) => {
-                                let vid = self.fresh_synthetic_value_typed(
-                                    graph,
+                                let var = graph.alloc_value_var_with_type(
                                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                                 );
                                 prefix.push(SpaceOperation {
-                                    result: Some(graph.must_variable(vid)),
+                                    result: Some(var.clone()),
                                     kind: OpKind::ConstInt(v),
                                 });
-                                eff.push(vid);
+                                eff.push(var);
                             }
                             // `support.py:723 Constant(obj, lltype.Float)`
                             NormalizedArg::ConstFloat(bits) => {
-                                let vid = self.fresh_synthetic_value_typed(
-                                    graph,
+                                let var = graph.alloc_value_var_with_type(
                                     crate::jit_codewriter::type_state::ConcreteType::Float,
                                 );
                                 prefix.push(SpaceOperation {
-                                    result: Some(graph.must_variable(vid)),
+                                    result: Some(var.clone()),
                                     kind: OpKind::ConstFloat(bits),
                                 });
-                                eff.push(vid);
+                                eff.push(var);
                             }
                         }
                     }
@@ -2482,7 +2437,7 @@ impl<'a> Transformer<'a> {
             } else {
                 (None, args.to_vec(), Vec::new())
             };
-        let args: &[ValueId] = &effective_args;
+        let args: &[crate::flowspace::model::Variable] = &effective_args;
         let user_oopspec: Option<String> = decoded_oopspec.clone();
 
         // jtransform.py:487-511 — oopspec dispatch by prefix.
@@ -2539,7 +2494,7 @@ impl<'a> Transformer<'a> {
         // OptHeap::_optimize_call_dict_lookup returns false on None extradescrs
         // and the call falls through emit_residual_call (heap.py:472-475 emit
         // → force_from_effectinfo on the call's own effectinfo).
-        let non_void_args = resolve_non_void_arg_types(graph, args);
+        let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = self
             .resolve_call_result(op.result.as_ref(), result_ty)
             .ir_type;
@@ -2598,7 +2553,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -2625,7 +2580,7 @@ impl<'a> Transformer<'a> {
         };
         // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -2661,7 +2616,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -2692,8 +2647,8 @@ impl<'a> Transformer<'a> {
         } else {
             &[]
         };
-        let (greens_i, greens_r, greens_f) = self.make_three_lists_vars(graph, green_args);
-        let (reds_i, reds_r, reds_f) = self.make_three_lists_vars(graph, red_args);
+        let (greens_i, greens_r, greens_f) = self.make_three_lists_from_vars(green_args);
+        let (reds_i, reds_r, reds_f) = self.make_three_lists_from_vars(red_args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -2707,7 +2662,7 @@ impl<'a> Transformer<'a> {
 
         // RPython jtransform.py:526: promote_greens emits guard_value
         // for each non-void green arg before the recursive_call.
-        let mut ops = self.promote_greens(green_args, graph);
+        let mut ops = self.promote_greens(green_args);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
         ops.push(SpaceOperation {
@@ -2738,13 +2693,11 @@ impl<'a> Transformer<'a> {
     /// RPython jtransform.py:1646-1656.
     fn promote_greens(
         &self,
-        green_args: &[ValueId],
-        graph: &crate::model::FunctionGraph,
+        green_args: &[crate::flowspace::model::Variable],
     ) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
-        for &v in green_args {
-            let var = graph.must_variable(v);
-            let kind = self.get_value_kind_var(&var);
+        for var in green_args {
+            let kind = self.get_value_kind_var(var);
             if kind == 'v' {
                 continue; // skip void
             }
@@ -2756,7 +2709,7 @@ impl<'a> Transformer<'a> {
             ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::GuardValue {
-                    value: var,
+                    value: var.clone(),
                     kind_char: kind,
                 },
             });
@@ -2771,7 +2724,7 @@ impl<'a> Transformer<'a> {
         oopspec_name: &str,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -2786,13 +2739,13 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: None,
                     kind: OpKind::JitDebug {
-                        args: args.iter().map(|&v| graph.must_variable(v)).collect(),
+                        args: args.to_vec(),
                     },
                 }])
             }
             // jtransform.py:1733-1735
             "jit.assert_green" => {
-                let value_var = graph.must_variable(args[0]);
+                let value_var = args[0].clone();
                 let kind_char = self.get_value_kind_var(&value_var);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
@@ -2819,7 +2772,7 @@ impl<'a> Transformer<'a> {
             }
             // jtransform.py:1738-1740
             "jit.isconstant" => {
-                let value_var = graph.must_variable(args[0]);
+                let value_var = args[0].clone();
                 let kind_char = self.get_value_kind_var(&value_var);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
@@ -2835,7 +2788,7 @@ impl<'a> Transformer<'a> {
             }
             // jtransform.py:1741-1743
             "jit.isvirtual" => {
-                let value_var = graph.must_variable(args[0]);
+                let value_var = args[0].clone();
                 let kind_char = self.get_value_kind_var(&value_var);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
@@ -2897,7 +2850,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         oopspecindex: OopSpecIndex,
@@ -2905,7 +2858,7 @@ impl<'a> Transformer<'a> {
         extradescrs: Option<Vec<majit_ir::DescrRef>>,
     ) -> RewriteResult {
         // jtransform.py:1990-1993
-        let non_void_args = resolve_non_void_arg_types(graph, args);
+        let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = self
             .resolve_call_result(op.result.as_ref(), result_ty)
             .ir_type;
@@ -2969,15 +2922,14 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         is_value: bool,
     ) -> RewriteResult {
         // jtransform.py:1666-1672: validate no floats, ≤4+2 args
-        for &arg in args {
-            let arg_var = graph.must_variable(arg);
-            if self.get_value_kind_var(&arg_var) == 'f' {
+        for arg in args {
+            if self.get_value_kind_var(arg) == 'f' {
                 panic!("Conditional call does not support floats");
             }
         }
@@ -2985,9 +2937,10 @@ impl<'a> Transformer<'a> {
             panic!("Conditional call does not support more than 4 arguments");
         }
         // jtransform.py:1673-1676: calldescr from function call (args[1:] → result)
-        let condition_or_value = args[0];
-        let func_args = if args.len() > 1 { &args[1..] } else { &[] };
-        let non_void_args = resolve_non_void_arg_types(graph, func_args);
+        let condition_or_value_var = args[0].clone();
+        let func_args: &[crate::flowspace::model::Variable] =
+            if args.len() > 1 { &args[1..] } else { &[] };
+        let non_void_args = resolve_non_void_arg_types_from_vars(func_args);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_ir_type = resolved_result.ir_type;
         let descriptor = {
@@ -3010,7 +2963,7 @@ impl<'a> Transformer<'a> {
             "conditional_call target must not force virtualizable"
         );
         // jtransform.py:1678-1680: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, func_args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(func_args);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
@@ -3027,7 +2980,6 @@ impl<'a> Transformer<'a> {
             detail: format!("{rewritten_opname} → {rewritten_opname}_ir_{result_kind}"),
         });
         self.calls_classified += 1;
-        let condition_or_value_var = graph.must_variable(condition_or_value);
         let call_kind = if is_value {
             OpKind::ConditionalCallValue {
                 value: condition_or_value_var,
@@ -3071,7 +3023,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
@@ -3087,7 +3039,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
@@ -3109,8 +3061,7 @@ impl<'a> Transformer<'a> {
     fn try_handle_jit_marker(
         &mut self,
         key: JitMarkerKey,
-        args: &[ValueId],
-        graph: &crate::model::FunctionGraph,
+        args: &[crate::flowspace::model::Variable],
     ) -> Option<Vec<SpaceOperation>> {
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
@@ -3140,12 +3091,9 @@ impl<'a> Transformer<'a> {
                 // jtransform.py:1695 `ops = self.promote_greens(...)` —
                 // prepends per-green `-live-` + `{kind}_guard_value` pairs.
                 let greens_raw = &user_args[..num_greens];
-                let mut ops = self.promote_greens(greens_raw, graph);
-                let user_args_var: Vec<crate::flowspace::model::Variable> =
-                    user_args.iter().map(|v| graph.must_variable(*v)).collect();
-                let (greens_i, greens_r, greens_f) =
-                    split_args_by_kind(&user_args_var[..num_greens]);
-                let (reds_i, reds_r, reds_f) = split_args_by_kind(&user_args_var[num_greens..]);
+                let mut ops = self.promote_greens(greens_raw);
+                let (greens_i, greens_r, greens_f) = split_args_by_kind(greens_raw);
+                let (reds_i, reds_r, reds_f) = split_args_by_kind(&user_args[num_greens..]);
                 // jtransform.py:1712 final shape is `ops + [op3, op1, op2]`.
                 ops.extend(self.handle_jit_marker__jit_merge_point(
                     greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
@@ -3225,25 +3173,25 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_record_known_result(
         &mut self,
-        graph: &FunctionGraph,
+        _graph: &FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         _result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
         // jtransform.py:293-295: validate no floats
-        for &arg in args {
-            let arg_var = graph.must_variable(arg);
-            if self.get_value_kind_var(&arg_var) == 'f' {
+        for arg in args {
+            if self.get_value_kind_var(arg) == 'f' {
                 panic!("record_known_result does not support floats");
             }
         }
         // jtransform.py:298-300: calldescr from function (args[1:] → args[0])
         // args[0] = known result, args[1..] = function args
-        let result_value = args[0];
-        let func_args = if args.len() > 1 { &args[1..] } else { &[] };
-        let result_kind = self.get_value_kind_var(&graph.must_variable(result_value));
+        let result_value = args[0].clone();
+        let func_args: &[crate::flowspace::model::Variable] =
+            if args.len() > 1 { &args[1..] } else { &[] };
+        let result_kind = self.get_value_kind_var(&result_value);
         let result_ir_type = match result_kind {
             'i' => majit_ir::value::Type::Int,
             'r' => majit_ir::value::Type::Ref,
@@ -3251,7 +3199,7 @@ impl<'a> Transformer<'a> {
                 panic!("record_known_result: unsupported result kind '{result_kind}'");
             }
         };
-        let non_void_args = resolve_non_void_arg_types(graph, func_args);
+        let non_void_args = resolve_non_void_arg_types_from_vars(func_args);
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -3272,7 +3220,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
         // jtransform.py:308-310: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, func_args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(func_args);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in record_known_result"
@@ -3286,7 +3234,7 @@ impl<'a> Transformer<'a> {
         let mut ops = vec![SpaceOperation {
             result: None, // record_known_result produces void
             kind: OpKind::RecordKnownResult {
-                result_value: graph.must_variable(result_value),
+                result_value,
                 funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
@@ -3315,7 +3263,7 @@ impl<'a> Transformer<'a> {
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
@@ -3336,7 +3284,7 @@ impl<'a> Transformer<'a> {
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         indirect_targets: Option<crate::model::IndirectCallTargets>,
@@ -3354,7 +3302,7 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         // RPython reads `op.result.concretetype` directly because rtyper
         // has typed every Variable. Pyre's front-end can leave a callee's
         // declared return as `ValueType::Unknown` (re-export shadowing,
@@ -3416,17 +3364,17 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         funcptr: &crate::flowspace::model::Variable,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         graphs: Option<&[crate::parse::CallPath]>,
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-        let non_void_args = resolve_non_void_arg_types(graph, args);
+        let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
             .callcontrol
@@ -3543,7 +3491,7 @@ impl<'a> Transformer<'a> {
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
@@ -3552,7 +3500,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → elidable"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -3583,7 +3531,7 @@ impl<'a> Transformer<'a> {
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
@@ -3592,7 +3540,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → may_force"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
+        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -3631,9 +3579,8 @@ impl<'a> Transformer<'a> {
     ///    Rust call is doing real boxing and must not be elided.
     fn is_synthetic_result_option_ctor(
         &self,
-        graph: &FunctionGraph,
         target: &CallTarget,
-        args: &[ValueId],
+        args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
     ) -> bool {
         if args.len() != 1 {
@@ -3645,12 +3592,12 @@ impl<'a> Transformer<'a> {
         if !matches!(name.as_str(), "Ok" | "Err" | "Some") {
             return false;
         }
-        // arg/result IR-kind parity. `resolve_non_void_arg_types`
+        // arg/result IR-kind parity. `resolve_non_void_arg_types_from_vars`
         // returns `Type::Ref` when type_state is missing or the
         // value is unknown — that's the same default
         // `value_type_to_kind` applies for an `Unknown` result, so
         // the comparison stays sound under partial type info.
-        let arg_types = resolve_non_void_arg_types(graph, args);
+        let arg_types = resolve_non_void_arg_types_from_vars(args);
         let arg_ir = arg_types
             .first()
             .copied()
@@ -3671,13 +3618,12 @@ impl<'a> Transformer<'a> {
 /// (call.py:220-221).
 ///
 /// Resolve the IR types of call arguments, skipping Void.
-fn resolve_non_void_arg_types(
-    graph: &FunctionGraph,
-    args: &[ValueId],
+fn resolve_non_void_arg_types_from_vars(
+    args: &[crate::flowspace::model::Variable],
 ) -> Vec<majit_ir::value::Type> {
     args.iter()
-        .filter_map(|&v| {
-            let kind = match graph.concretetype(v) {
+        .filter_map(|var| {
+            let kind = match crate::model::FunctionGraph::concretetype_of(var) {
                 crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
                 crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
                 crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
@@ -4395,12 +4341,10 @@ mod tests {
     #[test]
     fn rewrite_graph_canonicalizes_frontend_bitops() {
         let mut graph = FunctionGraph::new("bitops");
-        let lhs = graph.alloc_value();
-        let rhs = graph.alloc_value();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let lhs_var = graph.alloc_value_var();
+        let rhs_var = graph.alloc_value_var();
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "bitxor".to_string(),
@@ -4411,7 +4355,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var));
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         match &transformed.graph.block(graph.startblock).operations[0].kind {
@@ -4423,8 +4367,8 @@ mod tests {
     #[test]
     fn rewrite_graph_removes_same_as_and_remaps_return() {
         let mut graph = FunctionGraph::new("same_as_identity");
-        let input = graph
-            .push_op(
+        let input_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "x".into(),
@@ -4433,19 +4377,18 @@ mod tests {
                 true,
             )
             .unwrap();
-        let input_var = graph.must_variable(input);
-        let alias = graph
-            .push_op(
+        let alias_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::UnaryOp {
                     op: "same_as".into(),
-                    operand: input_var,
+                    operand: input_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(alias)));
+        graph.set_return(graph.startblock, Some(alias_var));
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let block = transformed.graph.block(graph.startblock);
@@ -4460,17 +4403,14 @@ mod tests {
         );
         assert_eq!(block.exits.len(), 1);
         assert_eq!(block.exits[0].target, transformed.graph.returnblock);
-        assert_eq!(
-            block.exits[0].args,
-            vec![LinkArg::Value(graph.must_variable(input))]
-        );
+        assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
     }
 
     #[test]
     fn rewrite_graph_remaps_guard_value_after_same_as_identity() {
         let mut graph = FunctionGraph::new("same_as_then_guard");
-        let input = graph
-            .push_op(
+        let input_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "x".into(),
@@ -4479,12 +4419,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let alias = graph
-            .push_op(
+        let alias_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::UnaryOp {
                     op: "same_as".into(),
-                    operand: graph.must_variable(input),
+                    operand: input_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -4493,12 +4433,13 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::GuardValue {
-                value: graph.must_variable(alias),
+                value: alias_var,
                 kind_char: 'i',
             },
             false,
         );
         graph.set_return(graph.startblock, None);
+        let input_slot = graph.slot_of(&input_var).expect("input must be registered");
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let guard = transformed
@@ -4513,8 +4454,8 @@ mod tests {
             .expect("GuardValue must survive the transform");
 
         assert_eq!(
-            transformed.graph.value_id_of(guard),
-            Some(input),
+            transformed.graph.slot_of(guard),
+            Some(input_slot),
             "GuardValue.value must follow PyPy _do_renaming through same_as"
         );
     }
@@ -4522,8 +4463,8 @@ mod tests {
     #[test]
     fn rewrite_graph_remaps_vtable_method_receiver_after_same_as_identity() {
         let mut graph = FunctionGraph::new("same_as_then_vtable_method");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "receiver".into(),
@@ -4532,12 +4473,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let alias = graph
-            .push_op(
+        let alias_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::UnaryOp {
                     op: "same_as".into(),
-                    operand: graph.must_variable(receiver),
+                    operand: receiver_var.clone(),
                     result_ty: ValueType::Ref,
                 },
                 true,
@@ -4546,13 +4487,16 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::VtableMethodPtr {
-                receiver: graph.must_variable(alias),
+                receiver: alias_var,
                 trait_root: "Handler".into(),
                 method_name: "run".into(),
             },
             true,
         );
         graph.set_return(graph.startblock, None);
+        let receiver_slot = graph
+            .slot_of(&receiver_var)
+            .expect("receiver must be registered");
 
         let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
         let vtable_receiver = transformed
@@ -4567,8 +4511,8 @@ mod tests {
             .expect("VtableMethodPtr must survive the transform");
 
         assert_eq!(
-            transformed.graph.value_id_of(vtable_receiver),
-            Some(receiver),
+            transformed.graph.slot_of(vtable_receiver),
+            Some(receiver_slot),
             "VtableMethodPtr.receiver must follow PyPy _do_renaming through same_as"
         );
     }
@@ -4576,8 +4520,8 @@ mod tests {
     #[test]
     fn rewrite_graph_coerces_mixed_float_add() {
         let mut graph = FunctionGraph::new("mixed_float_add");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -4586,8 +4530,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -4596,10 +4540,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "add".into(),
@@ -4610,11 +4552,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Float);
-        graph.set_concretetype_inline(result, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config).transform(&graph);
@@ -4652,8 +4594,8 @@ mod tests {
     #[test]
     fn rewrite_graph_coerces_mixed_float_comparison() {
         let mut graph = FunctionGraph::new("mixed_float_eq");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -4662,8 +4604,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -4672,10 +4614,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "eq".into(),
@@ -4686,11 +4626,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Float);
-        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config).transform(&graph);
@@ -4728,8 +4668,8 @@ mod tests {
     #[test]
     fn rewrite_graph_lowers_float_mod_to_ll_math_fmod_residual_call() {
         let mut graph = FunctionGraph::new("float_mod");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -4738,8 +4678,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -4748,10 +4688,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod".into(),
@@ -4762,11 +4700,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Float);
-        graph.set_concretetype_inline(result, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Float);
 
         let config = GraphTransformConfig::default();
         let transformed = Transformer::new(&config).transform(&graph);
@@ -4806,7 +4744,6 @@ mod tests {
                 assert!(args_i.is_empty());
                 assert!(args_r.is_empty());
                 let cast_result_var = cast_result;
-                let rhs_var = transformed.graph.must_variable(rhs);
                 assert_eq!(args_f, &vec![cast_result_var, rhs_var]);
                 assert_eq!(*result_kind, 'f');
                 assert!(indirect_targets.is_none());
@@ -4819,8 +4756,8 @@ mod tests {
     #[test]
     fn rewrite_graph_tags_vable_fields() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
+        let base_var = graph.alloc_value_var();
+        let base = graph.slot_of(&base_var).expect("base registered");
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -4854,17 +4791,17 @@ mod tests {
             panic!("expected VableFieldRead, got {:?}", rewritten_op.kind);
         };
         assert_eq!(*field_index, 0);
-        assert_eq!(result.graph.value_id_of(rewritten_base), Some(base));
+        assert_eq!(result.graph.slot_of(rewritten_base), Some(base));
     }
 
     #[test]
     fn rewrite_graph_tags_vable_arrays_with_explicit_base() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let index = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let array = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let base = graph.slot_of(&base_var).expect("base registered");
+        let array_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::FieldRead {
                     base: base_var,
@@ -4878,8 +4815,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let array_var = graph.must_variable(array);
-        let index_var = graph.must_variable(index);
         graph.push_op(
             graph.startblock,
             OpKind::ArrayRead {
@@ -4918,14 +4853,13 @@ mod tests {
             );
         };
         assert_eq!(*array_index, 0);
-        assert_eq!(result.graph.value_id_of(rewritten_base), Some(base));
+        assert_eq!(result.graph.slot_of(rewritten_base), Some(base));
     }
 
     #[test]
     fn rewrite_graph_requires_matching_field_owner_root() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
+        let base_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -4957,23 +4891,21 @@ mod tests {
     #[test]
     fn rewrite_graph_types_fieldwrite_from_value_kind() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let value = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let value_var = graph.must_variable(value);
+        let base_var = graph.alloc_value_var();
+        let value_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var,
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
-                value: value_var,
+                value: value_var.clone(),
                 ty: ValueType::Unknown,
             },
             false,
         );
         graph.set_return(graph.startblock, None);
-        graph.set_concretetype_inline(
-            value,
+        FunctionGraph::set_concretetype_of_inline(
+            &value_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -4989,18 +4921,15 @@ mod tests {
     #[test]
     fn rewrite_graph_types_arraywrite_from_value_kind() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let index = graph.alloc_value();
-        let value = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let index_var = graph.must_variable(index);
-        let value_var = graph.must_variable(value);
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let value_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
                 base: base_var,
                 index: index_var,
-                value: value_var,
+                value: value_var.clone(),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
@@ -5008,8 +4937,8 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, None);
-        graph.set_concretetype_inline(
-            value,
+        FunctionGraph::set_concretetype_of_inline(
+            &value_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -5025,10 +4954,9 @@ mod tests {
     #[test]
     fn rewrite_graph_types_fieldread_from_result_kind() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let result = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::FieldRead {
                     base: base_var,
@@ -5039,9 +4967,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
-        graph.set_concretetype_inline(
-            result,
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &result_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -5057,12 +4985,10 @@ mod tests {
     #[test]
     fn rewrite_graph_types_arrayread_from_result_kind() {
         let mut graph = FunctionGraph::new("test");
-        let base = graph.alloc_value();
-        let index = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let index_var = graph.must_variable(index);
-        let result = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::ArrayRead {
                     base: base_var,
@@ -5074,9 +5000,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
-        graph.set_concretetype_inline(
-            result,
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &result_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -5121,8 +5047,8 @@ mod tests {
     #[test]
     fn residual_call_unknown_result_uses_resolved_type_for_opcode_and_descr() {
         let mut graph = FunctionGraph::new("outer");
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::function_path(["unknown_external_int"]),
@@ -5132,9 +5058,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
 
         let mut cc = crate::call::CallControl::new();
         let config = GraphTransformConfig::default();
@@ -5164,8 +5090,8 @@ mod tests {
     #[test]
     fn int_mod_unknown_ast_result_rewrites_when_type_state_proves_signed() {
         let mut graph = FunctionGraph::new("int_mod_body");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -5174,8 +5100,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -5184,25 +5110,23 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Unknown,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5228,8 +5152,6 @@ mod tests {
             })
             .expect("mod must rewrite to residual helper call");
         assert_eq!(residual.1, 'i');
-        let lhs_var = transformed.graph.must_variable(lhs);
-        let rhs_var = transformed.graph.must_variable(rhs);
         assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
         assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
         assert_eq!(residual.0.get_extra_info().oopspecindex, OopSpecIndex::None);
@@ -5248,8 +5170,8 @@ mod tests {
         // the same pass — leaving a bare `mod` here would leak past
         // the jtransform rewrite gate.
         let mut graph = FunctionGraph::new("mod_assign_body");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -5258,8 +5180,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -5268,25 +5190,23 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod_assign".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5314,8 +5234,6 @@ mod tests {
             })
             .expect("mod_assign must rewrite to residual _ll_2_int_mod call");
         assert_eq!(residual.1, 'i');
-        let lhs_var = transformed.graph.must_variable(lhs);
-        let rhs_var = transformed.graph.must_variable(rhs);
         assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
         assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
     }
@@ -5332,8 +5250,8 @@ mod tests {
         // aliases `"div"` to `floordiv` and emits the residual
         // directly so no bare `div` / `floordiv` survives this pass.
         let mut graph = FunctionGraph::new("div_assign_body");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -5342,8 +5260,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -5352,25 +5270,23 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "div_assign".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5399,8 +5315,6 @@ mod tests {
             })
             .expect("div_assign must rewrite to residual _ll_2_int_floordiv call");
         assert_eq!(residual.1, 'i');
-        let lhs_var = transformed.graph.must_variable(lhs);
-        let rhs_var = transformed.graph.must_variable(rhs);
         assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
         assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
     }
@@ -5413,8 +5327,8 @@ mod tests {
         // residual as `floordiv`.  RPython has no `int_div` op; the
         // rtyper aliases `div` to `floordiv` for integer reprs.
         let mut graph = FunctionGraph::new("int_div_body");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -5423,8 +5337,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -5433,25 +5347,23 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "div".to_string(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        graph.set_concretetype_inline(lhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(rhs, ConcreteType::Signed);
-        graph.set_concretetype_inline(result, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         let transformed = Transformer::new(&config)
@@ -5479,8 +5391,6 @@ mod tests {
             })
             .expect("int div must rewrite to residual _ll_2_int_floordiv call");
         assert_eq!(residual.1, 'i');
-        let lhs_var = transformed.graph.must_variable(lhs);
-        let rhs_var = transformed.graph.must_variable(rhs);
         assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
         assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
     }
@@ -5490,8 +5400,8 @@ mod tests {
         let mut cc = crate::call::CallControl::new();
         let target = CallTarget::function_path(["custom_reader"]);
         let mut graph = FunctionGraph::new("test");
-        let arg = graph
-            .push_op(
+        let arg_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "arg".into(),
@@ -5500,7 +5410,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let arg_var = graph.must_variable(arg);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -5595,10 +5504,9 @@ mod tests {
     #[test]
     fn rewrite_graph_consumes_identity_virtualizable_hints() {
         let mut graph = FunctionGraph::new("demo");
-        let frame = graph.alloc_value();
-        let hinted = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, frame);
-        let frame_var = graph.must_variable(frame);
+        let frame_var = graph.alloc_value_var();
+        let hinted_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -5613,11 +5521,11 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(graph.must_variable(hinted));
+            .result = Some(hinted_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: graph.must_variable(hinted),
+                base: hinted_var,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5648,15 +5556,14 @@ mod tests {
     #[test]
     fn rewrite_graph_rewrites_hint_force_virtualizable() {
         let mut graph = FunctionGraph::new("demo");
-        let frame = graph.alloc_value();
-        let forced = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, frame);
-        let frame_var = graph.must_variable(frame);
+        let frame_var = graph.alloc_value_var();
+        let forced_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
-                args: vec![frame_var],
+                args: vec![frame_var.clone()],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -5666,11 +5573,11 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(graph.must_variable(forced));
+            .result = Some(forced_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: graph.must_variable(forced),
+                base: forced_var,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5695,7 +5602,7 @@ mod tests {
         let OpKind::VableForce { base } = &ops[0].kind else {
             panic!("expected ops[0] to be VableForce, got {:?}", ops[0].kind);
         };
-        assert_eq!(result.graph.value_id_of(base), Some(frame));
+        assert_eq!(base, &frame_var);
         assert!(matches!(
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
@@ -5712,18 +5619,17 @@ mod tests {
     #[test]
     fn rewrite_graph_rewrites_hint_promote() {
         let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        let promoted = graph.alloc_value();
-        let consumed = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, v);
-        let v_var = graph.must_variable(v);
+        let v_var = graph.alloc_value_var();
+        let promoted_var = graph.alloc_value_var();
+        let consumed_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
         // `hint_promote(v)` — mirrors `rlib/jit.py:101 promote(x)` after
         // lowering to the operator-level helper name.
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v_var],
+                args: vec![v_var.clone()],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -5733,13 +5639,13 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(graph.must_variable(promoted));
+            .result = Some(promoted_var.clone());
         // A downstream op that names the promote result so we can
         // observe that `optimize_block` aliased it back to `v`.
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: graph.must_variable(promoted),
+                base: promoted_var,
                 field: crate::model::FieldDescriptor::new("payload", Some("Box".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5751,7 +5657,7 @@ mod tests {
             .operations
             .last_mut()
             .unwrap()
-            .result = Some(graph.must_variable(consumed));
+            .result = Some(consumed_var);
         graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(&graph, &GraphTransformConfig::default());
@@ -5763,11 +5669,7 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(
-                    result.graph.value_id_of(value),
-                    Some(v),
-                    "guard target must remain the input arg"
-                );
+                assert_eq!(value, &v_var, "guard target must remain the input arg");
                 assert_eq!(*kind_char, 'r', "default kind without type-state");
             }
             other => panic!("expected GuardValue, got {other:?}"),
@@ -5776,11 +5678,7 @@ mod tests {
         // the `promoted` result, must have its base resolved back to `v`.
         match &ops[2].kind {
             OpKind::FieldRead { base, .. } => {
-                assert_eq!(
-                    result.graph.value_id_of(base),
-                    Some(v),
-                    "promote result must alias back to input arg"
-                );
+                assert_eq!(base, &v_var, "promote result must alias back to input arg");
             }
             other => panic!("expected FieldRead, got {other:?}"),
         }
@@ -5792,14 +5690,13 @@ mod tests {
     #[test]
     fn rewrite_graph_keeps_hint_promote_on_void_arg() {
         let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, v);
-        let v_var = graph.must_variable(v);
+        let v_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v_var],
+                args: vec![v_var.clone()],
                 result_ty: ValueType::Void,
             },
             false,
@@ -5809,7 +5706,10 @@ mod tests {
         let config = GraphTransformConfig::default();
         // Mark `v` as void-kind on its backing Variable before
         // rewriting (mirrors RPython's `v.concretetype = lltype.Void`).
-        graph.set_concretetype(v, crate::jit_codewriter::type_state::ConcreteType::Void);
+        FunctionGraph::set_concretetype_of_inline(
+            &v_var,
+            crate::jit_codewriter::type_state::ConcreteType::Void,
+        );
         let mut transformer = Transformer::new(&config);
         // Direct call to rewrite_operation — without setting up the
         // optimize_block plumbing — verifies the Keep result for the
@@ -5842,8 +5742,8 @@ mod tests {
         );
 
         let mut graph = FunctionGraph::new("read_cell");
-        let base = graph
-            .push_op(
+        let base_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "cell".to_string(),
@@ -5852,7 +5752,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -5913,8 +5812,8 @@ mod tests {
         );
 
         let mut graph = FunctionGraph::new("read_x");
-        let base = graph
-            .push_op(
+        let base_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "p".to_string(),
@@ -5923,7 +5822,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -6041,9 +5939,8 @@ mod tests {
     fn try_handle_jit_marker_can_enter_jit_aliases_to_loop_header() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));
-        let graph = crate::model::FunctionGraph::new("test_can_enter_jit_fixture");
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[], &graph)
+            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[])
             .expect("can_enter_jit should dispatch when portal_jd is set");
         assert_eq!(ops.len(), 1);
         match &ops[0].kind {
@@ -6059,10 +5956,11 @@ mod tests {
         // back to kind 'r'.
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
-        let greens = vec![ValueId(0), ValueId(1), ValueId(2)];
         let mut graph = crate::model::FunctionGraph::new("test_promote_greens_fixture");
         graph.set_next_value(3);
-        let ops = transformer.promote_greens(&greens, &graph);
+        let greens: Vec<crate::flowspace::model::Variable> =
+            (0..3).map(|i| graph.must_variable_at(i)).collect();
+        let ops = transformer.promote_greens(&greens);
         assert_eq!(ops.len(), 6, "expect 2 ops per green");
         for i in 0..greens.len() {
             assert!(
@@ -6073,7 +5971,7 @@ mod tests {
                 OpKind::GuardValue {
                     value, kind_char, ..
                 } => {
-                    assert_eq!(graph.value_id_of(value), Some(greens[i]));
+                    assert_eq!(value, &greens[i]);
                     assert_eq!(*kind_char, 'r');
                 }
                 other => panic!("slot {i} expected GuardValue, got {other:?}"),
@@ -6085,19 +5983,17 @@ mod tests {
     fn promote_greens_empty_input_yields_empty_output() {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
-        let graph = crate::model::FunctionGraph::new("test_promote_greens_empty");
-        assert!(transformer.promote_greens(&[], &graph).is_empty());
+        assert!(transformer.promote_greens(&[]).is_empty());
     }
 
     #[test]
     fn try_handle_jit_marker_returns_none_without_portal() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
-        let graph = crate::model::FunctionGraph::new("test_no_portal_fixture");
         // No portal_jd set → dispatch is a no-op (caller falls through).
         assert!(
             transformer
-                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[], &graph)
+                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
                 .is_none()
         );
     }
@@ -6123,7 +6019,7 @@ mod tests {
     ///
     /// Input: `try_handle_jit_marker(JitMergePoint, [receiver, g1, g2,
     /// r1])` with two greens and one red, all int-typed via direct
-    /// `graph.set_concretetype_inline`. Expected output (`promote_greens` +
+    /// `FunctionGraph::set_concretetype_of_inline`. Expected output (`promote_greens` +
     /// `handle_jit_marker__jit_merge_point`):
     ///
     /// ```text
@@ -6147,10 +6043,10 @@ mod tests {
         use crate::jit_codewriter::type_state::ConcreteType;
         use crate::parse::CallPath;
 
-        let g1 = ValueId(10);
-        let g2 = ValueId(11);
-        let r1 = ValueId(12);
-        let receiver = ValueId(99);
+        let g1_slot: usize = 10;
+        let g2_slot: usize = 11;
+        let r1_slot: usize = 12;
+        let receiver_slot: usize = 99;
 
         let mut cc = CallControl::new();
         cc.setup_jitdriver(
@@ -6166,21 +6062,24 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_portal_jd(Some(0));
 
-        let args = [receiver, g1, g2, r1];
-        // promote_greens projects each green ValueId through
-        // graph.must_variable to populate the GuardValue.value field —
-        // grow the backing Variable table to cover ValueId(99).
+        // promote_greens reads Variable.concretetype directly to populate
+        // the GuardValue.value field — grow the backing Variable table
+        // to cover slot 99 (the receiver slot index used below).
         let mut graph = crate::model::FunctionGraph::new("test_jit_merge_point_fixture");
         graph.set_next_value(100);
-        // jtransform now reads operand kinds via graph.concretetype;
-        // hydrate Variable.concretetype before invoking the handler so
-        // the green/red classifier picks `'i'` instead of the
-        // Unknown-defaulted `'r'`.
-        graph.set_concretetype_inline(g1, ConcreteType::Signed);
-        graph.set_concretetype_inline(g2, ConcreteType::Signed);
-        graph.set_concretetype_inline(r1, ConcreteType::Signed);
+        // jtransform now reads operand kinds via Variable.concretetype;
+        // hydrate it before invoking the handler so the green/red
+        // classifier picks `'i'` instead of the Unknown-defaulted `'r'`.
+        let receiver_var = graph.must_variable_at(receiver_slot);
+        let g1_var = graph.must_variable_at(g1_slot);
+        let g2_var = graph.must_variable_at(g2_slot);
+        let r1_var = graph.must_variable_at(r1_slot);
+        FunctionGraph::set_concretetype_of_inline(&g1_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&g2_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&r1_var, ConcreteType::Signed);
+        let args_vars = vec![receiver_var, g1_var.clone(), g2_var.clone(), r1_var.clone()];
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args, &graph)
+            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars)
             .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
 
         assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
@@ -6191,7 +6090,7 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(graph.value_id_of(value), Some(g1));
+                assert_eq!(value, &g1_var);
                 assert_eq!(*kind_char, 'i');
             }
             other => panic!("ops[1] expected GuardValue(g1, 'i'), got {other:?}"),
@@ -6201,7 +6100,7 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(graph.value_id_of(value), Some(g2));
+                assert_eq!(value, &g2_var);
                 assert_eq!(*kind_char, 'i');
             }
             other => panic!("ops[3] expected GuardValue(g2, 'i'), got {other:?}"),
@@ -6219,13 +6118,10 @@ mod tests {
                 reds_f,
             } => {
                 assert_eq!(*jitdriver_index, 0);
-                let g1_var = graph.must_variable(g1);
-                let g2_var = graph.must_variable(g2);
-                let r1_var = graph.must_variable(r1);
-                assert_eq!(greens_i, &vec![g1_var, g2_var]);
+                assert_eq!(greens_i, &vec![g1_var.clone(), g2_var.clone()]);
                 assert!(greens_r.is_empty());
                 assert!(greens_f.is_empty());
-                assert_eq!(reds_i, &vec![r1_var]);
+                assert_eq!(reds_i, &vec![r1_var.clone()]);
                 assert!(reds_r.is_empty());
                 assert!(reds_f.is_empty());
             }
@@ -6245,10 +6141,9 @@ mod tests {
     fn synthetic_result_ctor_identity_accepts_prelude_ok() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("synth_ctor_ok");
-        let arg = graph.alloc_value_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let transformer = Transformer::new(&config);
         assert!(transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::synthetic_transparent_ctor("Ok"),
             &[arg],
             &ValueType::Ref,
@@ -6262,10 +6157,9 @@ mod tests {
     fn synthetic_result_ctor_identity_rejects_function_path_ok() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("synth_ctor_fn_path");
-        let arg = graph.alloc_value_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let transformer = Transformer::new(&config);
         assert!(!transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::function_path(["Ok"]),
             &[arg],
             &ValueType::Ref,
@@ -6278,10 +6172,9 @@ mod tests {
     fn synthetic_result_ctor_identity_rejects_name_only_matching() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("synth_ctor_name_only");
-        let arg = graph.alloc_value_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let transformer = Transformer::new(&config);
         assert!(!transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::function_path(["Ok"]),
             &[arg],
             &ValueType::Ref,
@@ -6294,10 +6187,9 @@ mod tests {
     fn synthetic_result_ctor_identity_rejects_kind_mismatch() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("synth_ctor_kind_mismatch");
-        let arg = graph.alloc_value_with_type(ConcreteType::Signed);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let transformer = Transformer::new(&config);
         assert!(!transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::synthetic_transparent_ctor("Ok"),
             &[arg],
             &ValueType::Ref,
@@ -6311,28 +6203,24 @@ mod tests {
     fn synthetic_result_ctor_identity_rejects_other_names() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("synth_ctor_other_names");
-        let arg = graph.alloc_value_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let transformer = Transformer::new(&config);
         assert!(!transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::function_path(["Result", "Ok"]),
-            &[arg],
+            &[arg.clone()],
             &ValueType::Ref,
         ));
         assert!(!transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::synthetic_transparent_ctor("Foo"),
-            &[arg],
+            &[arg.clone()],
             &ValueType::Ref,
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::synthetic_transparent_ctor("Err"),
-            &[arg],
+            &[arg.clone()],
             &ValueType::Ref,
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
-            &graph,
             &CallTarget::synthetic_transparent_ctor("Some"),
             &[arg],
             &ValueType::Ref,
@@ -6421,8 +6309,8 @@ mod tests {
         cc.find_all_graphs_for_tests();
 
         let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "handler".to_string(),
@@ -6431,7 +6319,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -6515,8 +6402,8 @@ mod tests {
         cc.find_all_graphs_for_tests();
 
         let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "handler".to_string(),
@@ -6525,7 +6412,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -6655,8 +6541,8 @@ mod tests {
         cc.find_all_graphs_for_tests();
 
         let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "self".into(),
@@ -6665,11 +6551,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args = vec![receiver];
+        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
         for (i, ty) in extras.iter().enumerate() {
-            args.push(
+            args_vars.push(
                 graph
-                    .push_op(
+                    .push_op_var(
                         graph.startblock,
                         OpKind::Input {
                             name: format!("a{i}"),
@@ -6681,8 +6567,6 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        let args_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable(*v)).collect();
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -6908,8 +6792,8 @@ mod tests {
         // `graphs_from(op) is None` fall-through.
 
         let mut graph = FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "self".into(),
@@ -6918,11 +6802,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args = vec![receiver];
+        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
         for (i, ty) in extras.iter().enumerate() {
-            args.push(
+            args_vars.push(
                 graph
-                    .push_op(
+                    .push_op_var(
                         graph.startblock,
                         OpKind::Input {
                             name: format!("a{i}"),
@@ -6934,8 +6818,6 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        let args_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable(*v)).collect();
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -7081,9 +6963,8 @@ mod tests {
     #[test]
     fn rewrite_graph_promote_or_string_picks_ref_guard_value_for_ref_arg() {
         let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, v);
-        let v_var = graph.must_variable(v);
+        let v_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -7113,14 +6994,13 @@ mod tests {
     #[test]
     fn rewrite_graph_promote_or_string_picks_int_guard_value_for_int_arg() {
         let mut graph = FunctionGraph::new("demo");
-        let v = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, v);
-        let v_var = graph.must_variable(v);
+        let v_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
-                args: vec![v_var],
+                args: vec![v_var.clone()],
                 result_ty: ValueType::Int,
             },
             false,
@@ -7131,7 +7011,7 @@ mod tests {
         // seed `v` as `Signed` so the dual-hint arm sees an Int arg
         // and routes through the plain `<kind>_guard_value` path
         // instead of the str_guard_value helper chain.
-        graph.set_concretetype_inline(v, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v_var, ConcreteType::Signed);
         let config = GraphTransformConfig::default();
         let result = Transformer::new(&config).transform(&graph);
         let ops = &result.graph.block(graph.startblock).operations;

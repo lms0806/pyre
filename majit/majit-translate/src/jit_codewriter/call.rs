@@ -6644,14 +6644,12 @@ mod tests {
         let mut g = FunctionGraph::new(name);
         let entry = g.startblock;
         let continuation = g.create_block();
-        let continuation_arg = g.alloc_value();
-        g.push_inputarg(continuation, continuation_arg);
-        let last_exception = g.alloc_value();
-        let last_exc_value = g.alloc_value();
-        let continuation_arg_var = g.must_variable(continuation_arg);
-        let last_exception_var = g.must_variable(last_exception);
-        let last_exc_value_var = g.must_variable(last_exc_value);
-        let normal_link = Link::from_variables(&g, vec![continuation_arg_var], continuation, None);
+        let continuation_arg_var = g.alloc_value_var();
+        g.push_inputarg_var(continuation, continuation_arg_var.clone());
+        let last_exception_var = g.alloc_value_var();
+        let last_exc_value_var = g.alloc_value_var();
+        let normal_link =
+            Link::from_variables(&g, vec![continuation_arg_var.clone()], continuation, None);
         let exc_link = Link::from_variables(
             &g,
             vec![last_exception_var.clone(), last_exc_value_var.clone()],
@@ -6667,7 +6665,7 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![normal_link, exc_link],
         );
-        g.set_return(continuation, Some(g.must_variable(continuation_arg)));
+        g.set_return(continuation, Some(continuation_arg_var));
         g
     }
 
@@ -6943,9 +6941,8 @@ mod tests {
         // A function with VableForce → ForcesVirtualOrVirtualizable.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("forcer");
-        let frame = graph.alloc_value();
-        graph.push_inputarg(graph.startblock, frame);
-        let frame_var = graph.must_variable(frame);
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_op(
             graph.startblock,
             OpKind::VableForce { base: frame_var },
@@ -7065,8 +7062,7 @@ mod tests {
         // A function with FieldRead/FieldWrite → bitsets populated.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
+        let base_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
@@ -7154,8 +7150,7 @@ mod tests {
         // RPython effectinfo.py:181-186: ignore writes for elidable.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
+        let base_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
@@ -7248,8 +7243,7 @@ mod tests {
         // if there's no corresponding write ("struct") for that field.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
+        let base_var = graph.alloc_value_var();
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
         graph.push_op(
@@ -7316,10 +7310,8 @@ mod tests {
         // RPython: LL_OPERATIONS[int_floordiv].canraise = (ZeroDivisionError,)
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("divider");
-        let a = graph.alloc_value();
-        let b = graph.alloc_value();
-        let a_var = graph.must_variable(a);
-        let b_var = graph.must_variable(b);
+        let a_var = graph.alloc_value_var();
+        let b_var = graph.alloc_value_var();
         graph.push_op(
             graph.startblock,
             OpKind::BinOp {

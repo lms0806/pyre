@@ -1494,25 +1494,23 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, Constant};
-    use crate::model::{
-        ExitCase, FunctionGraph, OpKind, SpaceOperation, ValueId, exception_exitcase,
-    };
+    use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
 
     /// Test helper — build a `regallocs` map keyed on each populated
     /// slot's Variable with color matching the slot's dense index.
     /// Iterates only Variables already registered on the graph via
-    /// [`crate::model::FunctionGraph::iter_variables`]; `num_regs` is
-    /// taken from `max_id + 1` so the register file width covers every
-    /// color produced by the identity mapping.
+    /// [`crate::model::FunctionGraph::iter_variable_slots`]; `num_regs`
+    /// is taken from `max_id + 1` so the register file width covers
+    /// every color produced by the identity mapping.
     fn identity_regallocs(
         graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
         let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
             std::collections::HashMap::new();
-        for (vid, var) in graph.iter_variables() {
-            if vid.0 <= max_id {
-                coloring.insert(var.clone(), vid.0);
+        for (slot, var) in graph.iter_variable_slots() {
+            if slot <= max_id {
+                coloring.insert(var.clone(), slot);
             }
         }
         let num_regs = max_id + 1;
@@ -1528,8 +1526,10 @@ mod tests {
     fn flatten_single_block() {
         let mut graph = FunctionGraph::new("simple");
         let entry = graph.startblock;
-        let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        let v = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
+        graph.set_return(entry, Some(v));
 
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten(&graph, &mut regallocs);
@@ -1543,12 +1543,11 @@ mod tests {
     fn flatten_if_else_produces_jumps() {
         let mut graph = FunctionGraph::new("branch");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let then_block = graph.create_block();
         let else_block = graph.create_block();
         let merge = graph.create_block();
 
-        let cond_var = graph.must_variable(cond);
         graph.set_branch(entry, cond_var, then_block, vec![], else_block, vec![]);
         graph.set_goto(then_block, merge, vec![]);
         graph.set_goto(else_block, merge, vec![]);
@@ -1579,21 +1578,21 @@ mod tests {
     fn flatten_bool_branch_orders_by_llexitcase() {
         let mut graph = FunctionGraph::new("branch_llexitcase");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let true_block = graph.create_block();
         let false_block = graph.create_block();
         // Body markers so we can distinguish which block ran first in
         // the flattened stream.  ConstInt(70) is true-side, ConstInt(80)
         // is false-side.  RPython uses real ops here; the marker keeps
         // the test behaviour-driven without requiring the rtyper.
-        let true_marker = graph
-            .push_op(true_block, OpKind::ConstInt(70), true)
+        let true_marker_var = graph
+            .push_op_var(true_block, OpKind::ConstInt(70), true)
             .unwrap();
-        let false_marker = graph
-            .push_op(false_block, OpKind::ConstInt(80), true)
+        let false_marker_var = graph
+            .push_op_var(false_block, OpKind::ConstInt(80), true)
             .unwrap();
-        graph.set_return(true_block, Some(graph.must_variable(true_marker)));
-        graph.set_return(false_block, Some(graph.must_variable(false_marker)));
+        graph.set_return(true_block, Some(true_marker_var));
+        graph.set_return(false_block, Some(false_marker_var));
         let true_link =
             Link::from_variables(&graph, Vec::new(), true_block, Some(ExitCase::Bool(false)))
                 .with_llexitcase(ConstValue::Bool(true));
@@ -1602,7 +1601,7 @@ mod tests {
                 .with_llexitcase(ConstValue::Bool(false));
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![true_link, false_link],
         );
 
@@ -1641,7 +1640,8 @@ mod tests {
     fn flatten_integer_switch_emits_switch_op() {
         let mut graph = FunctionGraph::new("switch");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond = graph.slot_of(&cond_var).expect("cond registered");
         let case0 = graph.create_block();
         let case1 = graph.create_block();
         let default = graph.create_block();
@@ -1650,7 +1650,7 @@ mod tests {
         graph.set_return(default, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),
@@ -1666,7 +1666,7 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten(&graph, &mut regallocs);
-        let expected_value = Register::new(RegKind::Int, cond.0);
+        let expected_value = Register::new(RegKind::Int, cond);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1683,14 +1683,14 @@ mod tests {
     fn flatten_integer_switch_sorts_and_keys_by_llexitcase() {
         let mut graph = FunctionGraph::new("switch_llexitcase");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let case_lowlevel_2 = graph.create_block();
         let case_lowlevel_1 = graph.create_block();
         graph.set_return(case_lowlevel_2, None);
         graph.set_return(case_lowlevel_1, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![
                 Link::new_mixed(
                     Vec::new(),
@@ -1724,14 +1724,14 @@ mod tests {
     fn flatten_integer_zero_one_switch_is_not_bool_branch() {
         let mut graph = FunctionGraph::new("switch_zero_one");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let case0 = graph.create_block();
         let case1 = graph.create_block();
         graph.set_return(case0, None);
         graph.set_return(case1, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),
@@ -1768,8 +1768,9 @@ mod tests {
         let exit = graph.create_block();
 
         graph.set_goto(entry, header, vec![]);
-        let cond = graph.push_op(header, OpKind::ConstInt(1), true).unwrap();
-        let cond_var = graph.must_variable(cond);
+        let cond_var = graph
+            .push_op_var(header, OpKind::ConstInt(1), true)
+            .unwrap();
         graph.set_branch(header, cond_var, body, vec![], exit, vec![]);
         graph.set_goto(body, header, vec![]);
         graph.set_return(exit, None);
@@ -1819,17 +1820,18 @@ mod tests {
         // emit a `{kind}_copy` Move op for Phi resolution.
         let mut graph = FunctionGraph::new("phi");
         let entry = graph.startblock;
-        let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+        let val_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
 
-        let (target, phi_args) = graph.create_block_with_args(1);
-        let phi = phi_args[0];
+        let (target, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi_var = phi_args[0].clone();
 
         // target → returnblock, so target is NOT a final block
         // (`target.exits.is_empty()` is false once a Goto to returnblock
         // is installed).
-        graph.set_return(target, Some(graph.must_variable(phi)));
+        graph.set_return(target, Some(phi_var));
 
-        let val_var = graph.must_variable(val);
         graph.set_goto(entry, target, vec![val_var]);
 
         let mut regallocs = identity_regallocs(&graph, 8);
@@ -1846,8 +1848,8 @@ mod tests {
     fn flatten_skips_input_ops() {
         let mut graph = FunctionGraph::new("inputs");
         let entry = graph.startblock;
-        let input = graph
-            .push_op(
+        let input_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "a".into(),
@@ -1856,11 +1858,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        let value = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        let input_var = graph.must_variable(input);
-        let value_var = graph.must_variable(value);
-        let sum = graph
-            .push_op(
+        let value_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
+        let sum_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
@@ -1871,7 +1873,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(sum)));
+        graph.set_return(entry, Some(sum_var));
 
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten(&graph, &mut regallocs);
@@ -1892,17 +1894,14 @@ mod tests {
     fn flatten_call_with_exception_emits_catch_and_reraise() {
         let mut graph = FunctionGraph::new("canraise");
         let entry = graph.startblock;
-        let call_result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
         let continuation = graph.create_block();
-        let phi = graph.alloc_value();
-        graph.push_inputarg(continuation, phi);
-        graph.set_return(continuation, Some(graph.must_variable(phi)));
+        let phi_var = graph.alloc_value_var();
+        graph.push_inputarg_var(continuation, phi_var.clone());
+        graph.set_return(continuation, Some(phi_var));
 
-        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
-        let call_result_var = graph.must_variable(call_result);
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
         graph.set_goto(entry, continuation, vec![call_result_var.clone()]);
         let normal_link =
             crate::model::Link::from_variables(&graph, vec![call_result_var], continuation, None);
@@ -1940,26 +1939,28 @@ mod tests {
     fn flatten_typed_exception_links_emit_mismatch_and_last_exc_value() {
         let mut graph = FunctionGraph::new("typed_canraise");
         let entry = graph.startblock;
-        let call_result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
 
         let handler = graph.create_block();
-        let handler_exc_type = graph.alloc_value();
-        let handler_exc_value = graph.alloc_value();
-        graph.push_inputarg(handler, handler_exc_type);
-        graph.push_inputarg(handler, handler_exc_value);
+        let handler_exc_type_var = graph.alloc_value_var();
+        let handler_exc_value_var = graph.alloc_value_var();
+        let handler_exc_type = graph
+            .slot_of(&handler_exc_type_var)
+            .expect("handler_exc_type registered");
+        let handler_exc_value = graph
+            .slot_of(&handler_exc_value_var)
+            .expect("handler_exc_value registered");
+        graph.push_inputarg_var(handler, handler_exc_type_var);
+        graph.push_inputarg_var(handler, handler_exc_value_var.clone());
         // Upstream invariant: typed catch handlers are not empty blocks.
         // Keep one op in the handler so the bare-reraise collapse remains
         // reserved for the empty exception block shape from flatten.py.
         graph.push_op(handler, OpKind::Live, false);
-        let handler_exc_value_var = graph.must_variable(handler_exc_value);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value_var]);
 
-        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
         let value_error = ConstValue::builtin("ValueError");
-        let call_result_var = graph.must_variable(call_result);
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
         graph.set_goto(entry, graph.returnblock, vec![call_result_var.clone()]);
         let normal_link = crate::model::Link::from_variables(
             &graph,
@@ -2008,12 +2009,12 @@ mod tests {
             )),
             "typed exception link should emit goto_if_exception_mismatch"
         );
-        // identity_regallocs maps ValueId(n) → Int color n.  After
-        // Phase 3, LastException/LastExcValue carry [`Register`]
+        // identity_regallocs maps each Variable at slot n → Int color n.
+        // After Phase 3, LastException/LastExcValue carry [`Register`]
         // operands so the assertion compares against the materialized
         // Register identity directly.
-        let expected_exc_type_reg = Register::new(RegKind::Int, handler_exc_type.0);
-        let expected_exc_value_reg = Register::new(RegKind::Int, handler_exc_value.0);
+        let expected_exc_type_reg = Register::new(RegKind::Int, handler_exc_type);
+        let expected_exc_value_reg = Register::new(RegKind::Int, handler_exc_value);
         assert!(
             flat.insns.iter().any(
                 |op| matches!(op, FlatOp::LastException { dst } if *dst == expected_exc_type_reg)
@@ -2035,9 +2036,10 @@ mod tests {
     fn flatten_final_exceptblock_emits_live_before_raise() {
         let mut graph = FunctionGraph::new("final_exceptblock");
         let entry = graph.startblock;
-        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
+        let last_exc_value = graph
+            .slot_of(&last_exc_value_var)
+            .expect("last_exc_value registered");
         graph.set_goto(
             entry,
             exc_block,
@@ -2046,11 +2048,11 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 16);
         let flat = flatten(&graph, &mut regallocs);
-        // identity_regallocs colors ValueId(n) as Int n; Raise carries
-        // the exception value's Register (always Ref-kinded).  The
-        // test fixture uses identity coloring so the matching Register
+        // identity_regallocs colors each Variable at slot n as Int n;
+        // Raise carries the exception value's Register (always Ref-kinded).
+        // The test fixture uses identity coloring so the matching Register
         // is `Register::new(Int, last_exc_value.0)`.
-        let expected_raise_reg = Register::new(RegKind::Int, last_exc_value.0);
+        let expected_raise_reg = Register::new(RegKind::Int, last_exc_value);
         let raise_idx = flat
             .insns
             .iter()
@@ -2100,13 +2102,13 @@ mod tests {
     fn flatten_int_add_ovf_uses_jump_if_ovf() {
         let mut graph = FunctionGraph::new("add_ovf");
         let entry = graph.startblock;
-        let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
-        let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let sum = graph
-            .push_op(
+        let lhs = graph.slot_of(&lhs_var).expect("lhs registered");
+        let rhs = graph.slot_of(&rhs_var).expect("rhs registered");
+        let sum_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add_ovf".into(),
@@ -2117,33 +2119,33 @@ mod tests {
                 true,
             )
             .unwrap();
+        let sum = graph.slot_of(&sum_var).expect("sum registered");
 
         let handler = graph.create_block();
-        let handler_exc_type = graph.alloc_value();
-        let handler_exc_value = graph.alloc_value();
-        graph.push_inputarg(handler, handler_exc_type);
-        graph.push_inputarg(handler, handler_exc_value);
-        let forty_two = graph.push_op(handler, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(handler, Some(graph.must_variable(forty_two)));
+        let handler_exc_type_var = graph.alloc_value_var();
+        let handler_exc_value_var = graph.alloc_value_var();
+        graph.push_inputarg_var(handler, handler_exc_type_var);
+        graph.push_inputarg_var(handler, handler_exc_value_var);
+        let forty_two_var = graph
+            .push_op_var(handler, OpKind::ConstInt(42), true)
+            .unwrap();
+        graph.set_return(handler, Some(forty_two_var));
 
-        let (_, _, last_exc_value) = graph.exceptblock_args();
+        let (_, _, last_exc_value_var) = graph.exceptblock_arg_vars();
         let overflow_error = ConstValue::builtin("OverflowError");
-        let sum_var = graph.must_variable(sum);
         let normal_link =
             crate::model::Link::from_variables(&graph, vec![sum_var], graph.returnblock, None);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
-        let last_exc_value_var2 = graph.must_variable(last_exc_value);
         let typed_link = crate::model::Link::new_mixed(
             vec![
                 LinkArg::from(overflow_error.clone()),
-                LinkArg::Value(last_exc_value_var),
+                LinkArg::Value(last_exc_value_var.clone()),
             ],
             handler,
             Some(ExitCase::Const(overflow_error.clone())),
         )
         .extravars(
             Some(LinkArg::from(overflow_error)),
-            Some(LinkArg::Value(last_exc_value_var2)),
+            Some(LinkArg::Value(last_exc_value_var)),
         );
         graph.set_control_flow_metadata(
             entry,
@@ -2153,9 +2155,9 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 16);
         let flat = flatten(&graph, &mut regallocs);
-        let expected_lhs = Register::new(RegKind::Int, lhs.0);
-        let expected_rhs = Register::new(RegKind::Int, rhs.0);
-        let expected_dst = Register::new(RegKind::Int, sum.0);
+        let expected_lhs = Register::new(RegKind::Int, lhs);
+        let expected_rhs = Register::new(RegKind::Int, rhs);
+        let expected_dst = Register::new(RegKind::Int, sum);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2182,13 +2184,11 @@ mod tests {
     fn flatten_ovf_reraise_emits_constant_raise() {
         let mut graph = FunctionGraph::new("ovf_reraise");
         let entry = graph.startblock;
-        let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
-        let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let sum = graph
-            .push_op(
+        let sum_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add_ovf".into(),
@@ -2200,24 +2200,21 @@ mod tests {
             )
             .unwrap();
 
-        let (exc_block, _, last_exc_value) = graph.exceptblock_args();
+        let (exc_block, _, last_exc_value_var) = graph.exceptblock_arg_vars();
         let overflow_error = ConstValue::builtin("OverflowError");
-        let sum_var = graph.must_variable(sum);
         let normal_link =
             crate::model::Link::from_variables(&graph, vec![sum_var], graph.returnblock, None);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
-        let last_exc_value_var2 = graph.must_variable(last_exc_value);
         let typed_link = crate::model::Link::new_mixed(
             vec![
                 LinkArg::from(overflow_error.clone()),
-                LinkArg::Value(last_exc_value_var),
+                LinkArg::Value(last_exc_value_var.clone()),
             ],
             exc_block,
             Some(ExitCase::Const(overflow_error.clone())),
         )
         .extravars(
             Some(LinkArg::from(overflow_error)),
-            Some(LinkArg::Value(last_exc_value_var2)),
+            Some(LinkArg::Value(last_exc_value_var)),
         );
         graph.set_control_flow_metadata(
             entry,
@@ -2319,25 +2316,25 @@ mod tests {
     // operands; `run_insert_renamings` provides a parameterised harness
     // that builds a flattener over an empty graph, runs the helper,
     // and returns the produced ops for comparison.
-    /// Test helper: build link args from raw ValueIds, project to
+    /// Test helper: build link args from raw slot indices, project to
     /// the freshly-built graph's Variables.  Each test-fixture call
     /// site uses this directly to avoid the cross-graph Variable
     /// mismatch that a standalone `plain_link` helper would
     /// introduce (the link's Variables would belong to a throwaway
     /// graph, not the renamings runner's graph).
-    fn run_insert_renamings(args: &[ValueId], target_inputargs: &[ValueId]) -> Vec<FlatOp> {
+    fn run_insert_renamings(args: &[usize], target_inputargs: &[usize]) -> Vec<FlatOp> {
         let max_id = args
             .iter()
             .chain(target_inputargs.iter())
-            .map(|v| v.0)
+            .copied()
             .max()
             .unwrap_or(0);
         let mut graph = FunctionGraph::new("renamings_test");
         while graph.next_value() <= max_id {
-            graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
+            let _ = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
         }
         let arg_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable(*v)).collect();
+            args.iter().map(|v| graph.must_variable_at(*v)).collect();
         let link = Link::new_mixed(
             arg_vars.into_iter().map(LinkArg::Value).collect(),
             BlockId(0),
@@ -2345,7 +2342,7 @@ mod tests {
         );
         let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
             .iter()
-            .map(|v| graph.must_variable(*v))
+            .map(|v| graph.must_variable_at(*v))
             .collect();
         let regallocs = identity_regallocs(&graph, max_id);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
@@ -2356,17 +2353,17 @@ mod tests {
     /// `run_insert_renamings` variant for constant-source link args.
     fn run_insert_renamings_with_const(
         link_args: Vec<LinkArg>,
-        target_inputargs: &[ValueId],
+        target_inputargs: &[usize],
     ) -> Vec<FlatOp> {
-        let max_id = target_inputargs.iter().map(|v| v.0).max().unwrap_or(0);
+        let max_id = target_inputargs.iter().copied().max().unwrap_or(0);
         let mut graph = FunctionGraph::new("renamings_test");
         while graph.next_value() <= max_id {
-            graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
+            let _ = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
         }
         let link = Link::new_mixed(link_args, BlockId(0), None);
         let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
             .iter()
-            .map(|v| graph.must_variable(*v))
+            .map(|v| graph.must_variable_at(*v))
             .collect();
         let regallocs = identity_regallocs(&graph, max_id);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
@@ -2377,17 +2374,17 @@ mod tests {
     /// `run_insert_renamings` variant that lets the test author
     /// stamp arbitrary per-Variable colorings (used by the coalesce /
     /// cycle / multi-kind tests).  Builds a graph with enough
-    /// ValueIds, then constructs each kind's `coloring` from
+    /// slots, then constructs each kind's `coloring` from
     /// `graph.value_variables` so the Variable-keyed lookup matches.
     fn run_insert_renamings_with_coloring(
-        args: &[ValueId],
-        target_inputargs: &[ValueId],
+        args: &[usize],
+        target_inputargs: &[usize],
         kind_colors: &[(RegKind, &[(usize, usize)])],
     ) -> Vec<FlatOp> {
         let max_id = args
             .iter()
             .chain(target_inputargs.iter())
-            .map(|v| v.0)
+            .copied()
             .chain(
                 kind_colors
                     .iter()
@@ -2395,10 +2392,10 @@ mod tests {
             )
             .max()
             .unwrap_or(0);
-        // Per-ValueId kind: walk the spec so we can stamp each
+        // Per-slot kind: walk the spec so we can stamp each
         // backing Variable's `concretetype` with the matching
         // `ConcreteType` (Signed/GcRef/Float).  Without this stamp,
-        // `graph.concretetype(v)` would default to `Unknown` and
+        // `graph.concretetype_of(&var)` would default to `Unknown` and
         // `kind_color_of` would skip the strict path.
         let mut value_kinds: HashMap<usize, RegKind> = HashMap::new();
         for (kind, pairs) in kind_colors {
@@ -2415,14 +2412,14 @@ mod tests {
                 RegKind::Ref => crate::model::ConcreteType::GcRef,
                 RegKind::Float => crate::model::ConcreteType::Float,
             };
-            graph.alloc_value_with_type(concrete);
+            let _ = graph.alloc_value_var_with_type(concrete);
         }
         let mut regallocs = HashMap::new();
         for (kind, pairs) in kind_colors {
             let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
             let mut max_color = 0usize;
             for (vid, color) in *pairs {
-                let var = graph.variable(ValueId(*vid)).unwrap().clone();
+                let var = graph.must_variable_at(*vid);
                 coloring.insert(var, *color);
                 if *color + 1 > max_color {
                     max_color = *color + 1;
@@ -2437,7 +2434,7 @@ mod tests {
             );
         }
         let arg_vars: Vec<crate::flowspace::model::Variable> =
-            args.iter().map(|v| graph.must_variable(*v)).collect();
+            args.iter().map(|v| graph.must_variable_at(*v)).collect();
         let link = Link::new_mixed(
             arg_vars.into_iter().map(LinkArg::Value).collect(),
             BlockId(0),
@@ -2445,7 +2442,7 @@ mod tests {
         );
         let target_input_vars: Vec<crate::flowspace::model::Variable> = target_inputargs
             .iter()
-            .map(|v| graph.must_variable(*v))
+            .map(|v| graph.must_variable_at(*v))
             .collect();
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
         f.insert_renamings(&link, &target_input_vars);
@@ -2462,14 +2459,14 @@ mod tests {
     #[test]
     fn insert_renamings_emits_nothing_for_identity() {
         // `for i, v in enumerate(link.args): if v == w: continue`.
-        let args = [ValueId(0), ValueId(1), ValueId(2)];
+        let args = [0, 1, 2];
         let ops = run_insert_renamings(&args, &args);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
     #[test]
     fn insert_renamings_emits_move_for_acyclic_rename() {
-        let ops = run_insert_renamings(&[ValueId(0)], &[ValueId(1)]);
+        let ops = run_insert_renamings(&[0], &[1]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2481,8 +2478,7 @@ mod tests {
 
     #[test]
     fn insert_renamings_emits_move_for_constant_source() {
-        let ops =
-            run_insert_renamings_with_const(vec![LinkArg::from(ConstValue::Int(7))], &[ValueId(1)]);
+        let ops = run_insert_renamings_with_const(vec![LinkArg::from(ConstValue::Int(7))], &[1]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2494,7 +2490,7 @@ mod tests {
 
     #[test]
     fn insert_renamings_breaks_swap_cycle_with_push_pop() {
-        let ops = run_insert_renamings(&[ValueId(0), ValueId(1)], &[ValueId(1), ValueId(0)]);
+        let ops = run_insert_renamings(&[0, 1], &[1, 0]);
         assert_eq!(
             ops,
             vec![
@@ -2508,16 +2504,13 @@ mod tests {
         );
     }
 
-    /// Two ValueIds that regalloc coalesced to the same color must NOT
+    /// Two Variables that regalloc coalesced to the same color must NOT
     /// emit a Move — upstream `flatten.py:314` `if v == w: continue`
-    /// tests color identity, not ValueId identity.
+    /// tests color identity, not Variable identity.
     #[test]
     fn insert_renamings_skips_coalesced_same_color() {
-        let ops = run_insert_renamings_with_coloring(
-            &[ValueId(0)],
-            &[ValueId(1)],
-            &[(RegKind::Int, &[(0, 7), (1, 7)])],
-        );
+        let ops =
+            run_insert_renamings_with_coloring(&[0], &[1], &[(RegKind::Int, &[(0, 7), (1, 7)])]);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
@@ -2525,8 +2518,8 @@ mod tests {
     #[test]
     fn insert_renamings_detects_cycle_at_color_level() {
         let ops = run_insert_renamings_with_coloring(
-            &[ValueId(0), ValueId(2)],
-            &[ValueId(1), ValueId(3)],
+            &[0, 2],
+            &[1, 3],
             &[(RegKind::Int, &[(0, 0), (1, 1), (2, 1), (3, 0)])],
         );
         assert!(
@@ -2546,8 +2539,8 @@ mod tests {
     #[test]
     fn insert_renamings_groups_by_kind_and_sorts_by_dst() {
         let ops = run_insert_renamings_with_coloring(
-            &[ValueId(0), ValueId(10), ValueId(2)],
-            &[ValueId(1), ValueId(11), ValueId(3)],
+            &[0, 10, 2],
+            &[1, 11, 3],
             &[
                 (RegKind::Int, &[(0, 0), (1, 3), (2, 1), (3, 2)]),
                 (RegKind::Ref, &[(10, 0), (11, 5)]),
@@ -2611,8 +2604,9 @@ mod tests {
         let exit = graph.create_block();
 
         graph.set_goto(entry, header, vec![]);
-        let cond = graph.push_op(header, OpKind::ConstInt(1), true).unwrap();
-        let cond_var = graph.must_variable(cond);
+        let cond_var = graph
+            .push_op_var(header, OpKind::ConstInt(1), true)
+            .unwrap();
         graph.set_branch(header, cond_var, header, vec![], exit, vec![]);
         graph.set_return(exit, None);
 
@@ -2643,8 +2637,10 @@ mod tests {
     fn parity_final_block_collapses_into_make_return() {
         let mut graph = FunctionGraph::new("simple");
         let entry = graph.startblock;
-        let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        let v_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
+        graph.set_return(entry, Some(v_var));
 
         let text = flat_to_text(&graph);
         assert!(
@@ -2667,17 +2663,17 @@ mod tests {
     fn parity_bool_branch_lays_true_body_before_false_landing() {
         let mut graph = FunctionGraph::new("if_else");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let true_block = graph.create_block();
         let false_block = graph.create_block();
-        let true_marker = graph
-            .push_op(true_block, OpKind::ConstInt(70), true)
+        let true_marker_var = graph
+            .push_op_var(true_block, OpKind::ConstInt(70), true)
             .unwrap();
-        let false_marker = graph
-            .push_op(false_block, OpKind::ConstInt(80), true)
+        let false_marker_var = graph
+            .push_op_var(false_block, OpKind::ConstInt(80), true)
             .unwrap();
-        graph.set_return(true_block, Some(graph.must_variable(true_marker)));
-        graph.set_return(false_block, Some(graph.must_variable(false_marker)));
+        graph.set_return(true_block, Some(true_marker_var));
+        graph.set_return(false_block, Some(false_marker_var));
         // exits order: [true_link, false_link] with matching llexitcase.
         let true_link =
             Link::from_variables(&graph, Vec::new(), true_block, Some(ExitCase::Bool(true)))
@@ -2687,7 +2683,7 @@ mod tests {
                 .with_llexitcase(ConstValue::Bool(false));
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![true_link, false_link],
         );
 
@@ -2712,16 +2708,20 @@ mod tests {
     fn parity_switch_without_default_emits_unreachable_and_case_landings() {
         let mut graph = FunctionGraph::new("switch_nodefault");
         let entry = graph.startblock;
-        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let cond_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
         let case0 = graph.create_block();
         let case1 = graph.create_block();
-        let m0 = graph.push_op(case0, OpKind::ConstInt(100), true).unwrap();
-        let m1 = graph.push_op(case1, OpKind::ConstInt(200), true).unwrap();
-        graph.set_return(case0, Some(graph.must_variable(m0)));
-        graph.set_return(case1, Some(graph.must_variable(m1)));
+        let m0_var = graph
+            .push_op_var(case0, OpKind::ConstInt(100), true)
+            .unwrap();
+        let m1_var = graph
+            .push_op_var(case1, OpKind::ConstInt(200), true)
+            .unwrap();
+        graph.set_return(case0, Some(m0_var));
+        graph.set_return(case1, Some(m1_var));
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(graph.must_variable(cond))),
+            Some(ExitSwitch::Value(cond_var)),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),
@@ -2753,34 +2753,29 @@ mod tests {
     fn parity_typed_exception_chain_ends_with_reraise() {
         let mut graph = FunctionGraph::new("exc_chain");
         let entry = graph.startblock;
-        let result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
 
         let make_handler = |graph: &mut FunctionGraph, marker_value: i64| {
             let block = graph.create_block();
-            let exc_type = graph.alloc_value();
-            let exc_value = graph.alloc_value();
-            graph.push_inputarg(block, exc_type);
-            graph.push_inputarg(block, exc_value);
-            let marker = graph
-                .push_op(block, OpKind::ConstInt(marker_value), true)
+            let exc_type_var = graph.alloc_value_var();
+            let exc_value_var = graph.alloc_value_var();
+            graph.push_inputarg_var(block, exc_type_var);
+            graph.push_inputarg_var(block, exc_value_var.clone());
+            let marker_var = graph
+                .push_op_var(block, OpKind::ConstInt(marker_value), true)
                 .unwrap();
-            graph.set_return(block, Some(graph.must_variable(marker)));
-            (block, exc_type, exc_value)
+            graph.set_return(block, Some(marker_var));
+            (block, exc_value_var)
         };
-        let (handler_a, _ha_t, ha_v) = make_handler(&mut graph, 10);
-        let (handler_b, _hb_t, hb_v) = make_handler(&mut graph, 20);
+        let (handler_a, ha_v_var) = make_handler(&mut graph, 10);
+        let (handler_b, hb_v_var) = make_handler(&mut graph, 20);
 
-        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
         let value_error = ConstValue::builtin("ValueError");
         let key_error = ConstValue::builtin("KeyError");
-        let result_var = graph.must_variable(result);
         graph.set_goto(entry, graph.returnblock, vec![result_var.clone()]);
         let normal_link = Link::from_variables(&graph, vec![result_var], graph.returnblock, None);
-        let handler_a_last_exc_value = graph.must_variable(last_exc_value);
-        let handler_b_last_exc_value = graph.must_variable(last_exc_value);
-        let ha_v_var = graph.must_variable(ha_v);
-        let hb_v_var = graph.must_variable(hb_v);
         let typed_a = Link::new_mixed(
             vec![LinkArg::from(value_error.clone()), LinkArg::Value(ha_v_var)],
             handler_a,
@@ -2789,7 +2784,7 @@ mod tests {
         .with_llexitcase(ConstValue::Int(1))
         .extravars(
             Some(LinkArg::from(value_error)),
-            Some(LinkArg::Value(handler_a_last_exc_value)),
+            Some(LinkArg::Value(last_exc_value_var.clone())),
         );
         let typed_b = Link::new_mixed(
             vec![LinkArg::from(key_error.clone()), LinkArg::Value(hb_v_var)],
@@ -2799,10 +2794,8 @@ mod tests {
         .with_llexitcase(ConstValue::Int(2))
         .extravars(
             Some(LinkArg::from(key_error)),
-            Some(LinkArg::Value(handler_b_last_exc_value)),
+            Some(LinkArg::Value(last_exc_value_var.clone())),
         );
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
         let catchall_link = Link::from_variables(
             &graph,
             vec![last_exception_var.clone(), last_exc_value_var.clone()],

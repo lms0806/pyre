@@ -13,24 +13,18 @@ use std::collections::HashMap;
 
 use crate::call::{CallControl, CallKind};
 use crate::model::{
-    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, ValueId,
-    remap_control_flow_metadata,
+    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, remap_control_flow_metadata_var,
 };
 
-fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(
+fn remap_call_funcptr<
+    F: Fn(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
+>(
     funcptr: &CallFuncPtr,
-    remap: &F,
-    source_graph: &FunctionGraph,
-    target_graph: &FunctionGraph,
+    remap_var: &F,
 ) -> CallFuncPtr {
     match funcptr {
         CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
-        CallFuncPtr::Value(var) => {
-            let vid = source_graph
-                .value_id_of(var)
-                .expect("CallFuncPtr::Value must have a backing ValueId in source");
-            CallFuncPtr::Value(target_graph.must_variable(remap(&vid)))
-        }
+        CallFuncPtr::Value(var) => CallFuncPtr::Value(remap_var(var)),
     }
 }
 
@@ -116,20 +110,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let block = &graph.blocks[block_id.0];
     let call_op = &block.operations[op_index];
     let (call_args, call_result) = match &call_op.kind {
-        OpKind::Call { args, .. } => {
-            let arg_vids: Vec<ValueId> = args
-                .iter()
-                .map(|v| {
-                    graph
-                        .value_id_of(v)
-                        .expect("Call arg must have a backing ValueId on caller graph")
-                })
-                .collect();
-            (
-                arg_vids,
-                call_op.result.as_ref().and_then(|v| graph.value_id_of(v)),
-            )
-        }
+        OpKind::Call { args, .. } => (args.clone(), call_op.result.clone()),
         _ => unreachable!("InlineSite should point to a Call op"),
     };
 
@@ -158,38 +139,41 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // guard.)
     let caller_was_closed = !after_exits.is_empty() || after_exitswitch.is_some();
     let merge_block_id = if !after_ops.is_empty() || caller_was_closed || call_result.is_some() {
-        let (merge_id, merge_args) = if let Some(original_result) = call_result {
-            let (id, args) = graph.create_block_with_args(1);
+        let (merge_id, merge_args) = if let Some(original_result_var) = call_result {
+            let (id, arg_vars) = graph.create_block_with_arg_vars(1);
             // The merge block's inputarg replaces the original call result.
-            // Remap every reference to `original_result` → `args[0]` in
+            // Remap every reference to `original_result_var` → `arg_vars[0]` in
             // after-call ops and exit metadata so the phi-node-style
             // merge carries the callee's return value forward.
+            let merge_inputarg_var = arg_vars[0].clone();
             let remapped_after_ops =
-                remap_value_in_ops(&after_ops, original_result, args[0], graph);
+                remap_value_in_ops(&after_ops, &original_result_var, &merge_inputarg_var);
             graph.blocks[id.0].operations = remapped_after_ops;
-            let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
-                graph,
-                graph,
+            let (remapped_switch, remapped_exits) = remap_control_flow_metadata_var(
                 &after_exitswitch,
                 &after_exits,
-                |v| if v == original_result { args[0] } else { v },
+                |var| {
+                    if var == &original_result_var {
+                        merge_inputarg_var.clone()
+                    } else {
+                        var.clone()
+                    }
+                },
                 |b| b,
             );
             graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
-            (id, args)
+            (id, arg_vars)
         } else {
             let id = graph.create_block();
             graph.blocks[id.0].operations = after_ops;
-            let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
-                graph,
-                graph,
+            let (remapped_switch, remapped_exits) = remap_control_flow_metadata_var(
                 &after_exitswitch,
                 &after_exits,
-                |v| v,
+                |var| var.clone(),
                 |b| b,
             );
             graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
-            (id, vec![])
+            (id, Vec::<crate::flowspace::model::Variable>::new())
         };
 
         Some((merge_id, merge_args))
@@ -203,20 +187,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     for callee_block in &callee.blocks {
         let new_block_id = block_map[&callee_block.id];
 
-        // Remap inputargs (callee ValueIds → caller-graph ValueIds
-        // via value_map, then project to the caller's backing
-        // Variable for the upstream-orthodox `Vec<Variable>`
-        // storage shape).
+        // Remap inputargs (callee Variables → caller-graph Variables
+        // via value_map).
         let new_inputargs: Vec<crate::flowspace::model::Variable> = callee_block
-            .inputarg_value_ids(&callee)
-            .into_iter()
-            .map(|v| {
-                let mapped = value_map[&v];
-                graph
-                    .variable(mapped)
-                    .expect("alloc_value mints backing Variable")
-                    .clone()
-            })
+            .inputargs
+            .iter()
+            .map(|var| value_map[var].clone())
             .collect();
         graph.blocks[new_block_id.0].inputargs = new_inputargs;
 
@@ -224,7 +200,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         let new_ops: Vec<SpaceOperation> = callee_block
             .operations
             .iter()
-            .map(|op| remap_op(op, &value_map, &callee, graph))
+            .map(|op| remap_op(op, &value_map))
             .collect();
         graph.blocks[new_block_id.0].operations = new_ops;
 
@@ -246,13 +222,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // the inlined function's return value becomes the caller's
             // return value — still a Goto into a final block, matching
             // upstream's `exits=[Link(..., returnblock)]` shape.
-            let ret_val = callee_block
-                .inputarg_value_ids(&callee)
+            let ret_val: Option<crate::flowspace::model::Variable> = callee_block
+                .inputargs
                 .first()
-                .copied()
-                .map(|v| value_map[&v]);
+                .map(|var| value_map[var].clone());
             let caller_returnblock = graph.returnblock;
-            let (target, args) = match (&merge_block_id, ret_val) {
+            let (target, arg_vars) = match (&merge_block_id, ret_val) {
                 (Some((merge_id, merge_args)), Some(remapped_ret)) => {
                     if merge_args.is_empty() {
                         (*merge_id, vec![])
@@ -264,8 +239,6 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
                 (None, Some(remapped_ret)) => (caller_returnblock, vec![remapped_ret]),
                 (None, None) => (caller_returnblock, vec![]),
             };
-            let arg_vars: Vec<crate::flowspace::model::Variable> =
-                args.into_iter().map(|v| graph.must_variable(v)).collect();
             graph.set_goto(new_block_id, target, arg_vars);
         } else {
             // Preserve the callee block's upstream CFG shape (single
@@ -273,12 +246,10 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // renamed values and blocks.  `set_control_flow_metadata`
             // stamps `prevblock` on every link per
             // `flowspace/model.py:120`.
-            let (exitswitch, exits) = remap_control_flow_metadata(
-                &callee,
-                graph,
+            let (exitswitch, exits) = remap_control_flow_metadata_var(
                 &callee_block.exitswitch,
                 &callee_block.exits,
-                |v| value_map[&v],
+                |var| value_map[var].clone(),
                 |b| block_map[&b],
             );
             graph.set_control_flow_metadata(new_block_id, exitswitch, exits);
@@ -289,23 +260,23 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // Map call arguments to callee's Input ops.
     // Callee's Input ops correspond to its entry block's first N ops.
     let callee_entry_block = &callee.blocks[callee.startblock.0];
-    let input_values: Vec<ValueId> = callee_entry_block
+    let input_vars: Vec<crate::flowspace::model::Variable> = callee_entry_block
         .operations
         .iter()
         .filter(|op| matches!(&op.kind, OpKind::Input { .. }))
-        .filter_map(|op| op.result.as_ref().and_then(|v| callee.value_id_of(v)))
+        .filter_map(|op| op.result.clone())
         .collect();
 
     // Map call args to callee input values
-    for (i, &callee_input) in input_values.iter().enumerate() {
-        let remapped_input = value_map[&callee_input];
-        if let Some(&call_arg) = call_args.get(i) {
+    for (i, callee_input_var) in input_vars.iter().enumerate() {
+        let remapped_input_var = value_map[callee_input_var].clone();
+        if let Some(call_arg_var) = call_args.get(i) {
             // Add alias: remapped callee input = call argument
             // We do this by prepending a "move" in the callee entry block
             // Actually, we set the entry block's inputargs and jump with call args
             // But callee entry doesn't have inputargs for Input ops...
             // Instead, remap all uses of remapped_input to call_arg in the callee blocks
-            remap_value_in_graph(graph, &block_map, remapped_input, call_arg);
+            remap_value_in_graph(graph, &block_map, &remapped_input_var, call_arg_var);
         }
     }
 
@@ -334,68 +305,69 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // empty inputarg list yields empty `entry_args`, so the prior
     // behaviour is preserved bit-for-bit when the callee has no
     // inputargs.
-    let entry_args: Vec<ValueId> = callee_entry_block
-        .inputarg_value_ids(&callee)
-        .iter()
-        .enumerate()
-        .filter_map(|(i, _)| call_args.get(i).copied())
-        .collect();
-    let entry_arg_vars: Vec<crate::flowspace::model::Variable> = entry_args
-        .into_iter()
-        .map(|v| graph.must_variable(v))
-        .collect();
+    let inputarg_count = callee_entry_block.inputargs.len();
+    let entry_arg_vars: Vec<crate::flowspace::model::Variable> =
+        call_args.iter().take(inputarg_count).cloned().collect();
     graph.set_goto(block_id, callee_entry, entry_arg_vars);
 }
 
-/// Allocate fresh ValueIds for all values in the callee graph.
+/// Allocate fresh caller-graph Variables for every callee-graph
+/// Variable referenced inside the callee.  Returns the callee-Variable
+/// → caller-Variable rename map consumed by [`remap_op`] and the
+/// cross-graph remap closures in [`inline_call_site`].
 fn remap_callee_values(
     graph: &mut FunctionGraph,
     callee: &FunctionGraph,
-) -> HashMap<ValueId, ValueId> {
-    let mut map = HashMap::new();
-    // Collect all ValueIds used in the callee
+) -> HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Variable> {
+    let mut map: HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Variable> =
+        HashMap::new();
+    // Collect all Variables used in the callee
     for block in &callee.blocks {
-        for v in block.inputarg_value_ids(&callee) {
-            map.entry(v).or_insert_with(|| graph.alloc_value());
+        for var in block.inputargs.iter() {
+            map.entry(var.clone())
+                .or_insert_with(|| graph.alloc_value_var());
         }
         for op in &block.operations {
-            if let Some(result) = op.result.as_ref().and_then(|v| callee.value_id_of(v)) {
-                map.entry(result).or_insert_with(|| graph.alloc_value());
+            if let Some(result) = op.result.as_ref() {
+                map.entry(result.clone())
+                    .or_insert_with(|| graph.alloc_value_var());
             }
-            for v in op_value_refs(&op.kind, Some(callee)) {
-                map.entry(v).or_insert_with(|| graph.alloc_value());
+            for var in op_variable_refs(&op.kind) {
+                map.entry(var).or_insert_with(|| graph.alloc_value_var());
             }
         }
         // Upstream `rpython/flowspace/model.py:224-229 getvariables`
         // walks `link.args` for every exit in addition to ops.  The
         // exitswitch variable is always a block-local value referenced
         // by the raising op / branch condition, so it is already in
-        // `op_value_refs` — but the per-link args must be copied here.
+        // `op_variable_refs` — but the per-link args must be copied here.
         // Upstream `rpython/translator/backendopt/inline.py:268-269
         // copy_link` also renames `link.last_exception` and
         // `link.last_exc_value`, so the extravars must be present in
         // the value map before `remap_control_flow_metadata` runs.
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(v) = arg.as_value(callee) {
-                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                if let Some(var) = arg.as_variable() {
+                    map.entry(var.clone())
+                        .or_insert_with(|| graph.alloc_value_var());
                 }
             }
             if let Some(arg) = &link.last_exception {
-                if let Some(v) = arg.as_value(callee) {
-                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                if let Some(var) = arg.as_variable() {
+                    map.entry(var.clone())
+                        .or_insert_with(|| graph.alloc_value_var());
                 }
             }
             if let Some(arg) = &link.last_exc_value {
-                if let Some(v) = arg.as_value(callee) {
-                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                if let Some(var) = arg.as_variable() {
+                    map.entry(var.clone())
+                        .or_insert_with(|| graph.alloc_value_var());
                 }
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
-            if let Some(cond_vid) = callee.value_id_of(cond) {
-                map.entry(cond_vid).or_insert_with(|| graph.alloc_value());
-            }
+            map.entry(cond.clone())
+                .or_insert_with(|| graph.alloc_value_var());
         }
     }
     map
@@ -414,35 +386,27 @@ fn remap_callee_blocks(
     map
 }
 
-/// Remap a single Op's values.  Each variant field carries a
-/// `flowspace::Variable`; the body projects every operand across
-/// graphs as `source_graph.value_id_of(var) → value_map → target_graph.must_variable(remapped_vid)`.
-/// `value_map` itself is still keyed on the legacy dense `ValueId`
-/// index; the surrounding `inline_call_site` builds it that way
-/// because the callee/caller renaming is the canonical step where
-/// fresh `ValueId`s are allocated.
+/// Remap a single Op's operand and result Variables across the
+/// inline boundary.  `value_map` carries the callee Variable →
+/// caller Variable rename allocated by [`remap_callee_values`];
+/// every operand Variable is looked up directly (falling back to
+/// the source Variable if it is not in the map — e.g. a Constant
+/// or an external-graph reference).
 fn remap_op(
     op: &SpaceOperation,
-    value_map: &HashMap<ValueId, ValueId>,
-    source_graph: &FunctionGraph,
-    target_graph: &FunctionGraph,
+    value_map: &HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Variable>,
 ) -> SpaceOperation {
-    let remap = |v: &ValueId| *value_map.get(v).unwrap_or(v);
-    let result_vid = op
-        .result
-        .as_ref()
-        .and_then(|v| source_graph.value_id_of(v))
-        .map(|v| remap(&v));
-    let result = result_vid.map(|vid| target_graph.must_variable(vid));
-    let kind = remap_op_kind(&op.kind, &remap, source_graph, target_graph);
+    let remap_var = |var: &crate::flowspace::model::Variable| {
+        value_map.get(var).cloned().unwrap_or_else(|| var.clone())
+    };
+    let result = op.result.as_ref().map(|v| remap_var(v));
+    let kind = remap_op_kind(&op.kind, &remap_var);
     SpaceOperation { result, kind }
 }
 
 fn remap_op_kind(
     kind: &OpKind,
-    remap: &impl Fn(&ValueId) -> ValueId,
-    source_graph: &FunctionGraph,
-    target_graph: &FunctionGraph,
+    remap_var: &impl Fn(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
 ) -> OpKind {
     match kind {
         OpKind::Input { name, ty } => OpKind::Input {
@@ -457,57 +421,36 @@ fn remap_op_kind(
             field,
             ty,
             pure,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("FieldRead.base must have a backing ValueId in source");
-            OpKind::FieldRead {
-                base: target_graph.must_variable(remap(&base_vid)),
-                field: field.clone(),
-                ty: ty.clone(),
-                pure: *pure,
-            }
-        }
+        } => OpKind::FieldRead {
+            base: remap_var(base),
+            field: field.clone(),
+            ty: ty.clone(),
+            pure: *pure,
+        },
         OpKind::FieldWrite {
             base,
             field,
             value,
             ty,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("FieldWrite.base must have a backing ValueId in source");
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("FieldWrite.value must have a backing ValueId in source");
-            OpKind::FieldWrite {
-                base: target_graph.must_variable(remap(&base_vid)),
-                field: field.clone(),
-                value: target_graph.must_variable(remap(&value_vid)),
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::FieldWrite {
+            base: remap_var(base),
+            field: field.clone(),
+            value: remap_var(value),
+            ty: ty.clone(),
+        },
         OpKind::ArrayRead {
             base,
             index,
             item_ty,
             array_type_id,
             nolength,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("ArrayRead.base must have a backing ValueId in source");
-            let index_vid = source_graph
-                .value_id_of(index)
-                .expect("ArrayRead.index must have a backing ValueId in source");
-            OpKind::ArrayRead {
-                base: target_graph.must_variable(remap(&base_vid)),
-                index: target_graph.must_variable(remap(&index_vid)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-                nolength: *nolength,
-            }
-        }
+        } => OpKind::ArrayRead {
+            base: remap_var(base),
+            index: remap_var(index),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
+        },
         OpKind::ArrayWrite {
             base,
             index,
@@ -515,46 +458,27 @@ fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("ArrayWrite.base must have a backing ValueId in source");
-            let index_vid = source_graph
-                .value_id_of(index)
-                .expect("ArrayWrite.index must have a backing ValueId in source");
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("ArrayWrite.value must have a backing ValueId in source");
-            OpKind::ArrayWrite {
-                base: target_graph.must_variable(remap(&base_vid)),
-                index: target_graph.must_variable(remap(&index_vid)),
-                value: target_graph.must_variable(remap(&value_vid)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-                nolength: *nolength,
-            }
-        }
+        } => OpKind::ArrayWrite {
+            base: remap_var(base),
+            index: remap_var(index),
+            value: remap_var(value),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
+        },
         OpKind::InteriorFieldRead {
             base,
             index,
             field,
             item_ty,
             array_type_id,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("InteriorFieldRead.base must have a backing ValueId in source");
-            let index_vid = source_graph
-                .value_id_of(index)
-                .expect("InteriorFieldRead.index must have a backing ValueId in source");
-            OpKind::InteriorFieldRead {
-                base: target_graph.must_variable(remap(&base_vid)),
-                index: target_graph.must_variable(remap(&index_vid)),
-                field: field.clone(),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-            }
-        }
+        } => OpKind::InteriorFieldRead {
+            base: remap_var(base),
+            index: remap_var(index),
+            field: field.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::InteriorFieldWrite {
             base,
             index,
@@ -562,147 +486,82 @@ fn remap_op_kind(
             value,
             item_ty,
             array_type_id,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("InteriorFieldWrite.base must have a backing ValueId in source");
-            let index_vid = source_graph
-                .value_id_of(index)
-                .expect("InteriorFieldWrite.index must have a backing ValueId in source");
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("InteriorFieldWrite.value must have a backing ValueId in source");
-            OpKind::InteriorFieldWrite {
-                base: target_graph.must_variable(remap(&base_vid)),
-                index: target_graph.must_variable(remap(&index_vid)),
-                field: field.clone(),
-                value: target_graph.must_variable(remap(&value_vid)),
-                item_ty: item_ty.clone(),
-                array_type_id: array_type_id.clone(),
-            }
-        }
+        } => OpKind::InteriorFieldWrite {
+            base: remap_var(base),
+            index: remap_var(index),
+            field: field.clone(),
+            value: remap_var(value),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::Call {
             target,
             args,
             result_ty,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("Call arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::Call {
-                target: target.clone(),
-                args: args.iter().map(remap_var).collect(),
-                result_ty: result_ty.clone(),
-            }
-        }
-        OpKind::GuardTrue { cond } => {
-            let cond_vid = source_graph
-                .value_id_of(cond)
-                .expect("GuardTrue.cond must have a backing ValueId in source graph");
-            OpKind::GuardTrue {
-                cond: target_graph.must_variable(remap(&cond_vid)),
-            }
-        }
-        OpKind::GuardFalse { cond } => {
-            let cond_vid = source_graph
-                .value_id_of(cond)
-                .expect("GuardFalse.cond must have a backing ValueId in source graph");
-            OpKind::GuardFalse {
-                cond: target_graph.must_variable(remap(&cond_vid)),
-            }
-        }
-        OpKind::GuardValue { value, kind_char } => {
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("GuardValue.value must have a backing ValueId in source graph");
-            OpKind::GuardValue {
-                value: target_graph.must_variable(remap(&value_vid)),
-                kind_char: *kind_char,
-            }
-        }
+        } => OpKind::Call {
+            target: target.clone(),
+            args: args.iter().map(&remap_var).collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::GuardTrue { cond } => OpKind::GuardTrue {
+            cond: remap_var(cond),
+        },
+        OpKind::GuardFalse { cond } => OpKind::GuardFalse {
+            cond: remap_var(cond),
+        },
+        OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
+            value: remap_var(value),
+            kind_char: *kind_char,
+        },
         OpKind::VtableMethodPtr {
             receiver,
             trait_root,
             method_name,
-        } => {
-            let receiver_vid = source_graph
-                .value_id_of(receiver)
-                .expect("VtableMethodPtr.receiver must have a backing ValueId in source");
-            OpKind::VtableMethodPtr {
-                receiver: target_graph.must_variable(remap(&receiver_vid)),
-                trait_root: trait_root.clone(),
-                method_name: method_name.clone(),
-            }
-        }
+        } => OpKind::VtableMethodPtr {
+            receiver: remap_var(receiver),
+            trait_root: trait_root.clone(),
+            method_name: method_name.clone(),
+        },
         OpKind::IndirectCall {
             funcptr,
             args,
             graphs,
             result_ty,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("IndirectCall arg/funcptr must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::IndirectCall {
-                funcptr: remap_var(funcptr),
-                args: args.iter().map(remap_var).collect(),
-                graphs: graphs.clone(),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::IndirectCall {
+            funcptr: remap_var(funcptr),
+            args: args.iter().map(&remap_var).collect(),
+            graphs: graphs.clone(),
+            result_ty: result_ty.clone(),
+        },
         OpKind::RecordQuasiImmutField {
             base,
             field,
             mutate_field,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("RecordQuasiImmutField.base must have a backing ValueId in source");
-            OpKind::RecordQuasiImmutField {
-                base: target_graph.must_variable(remap(&base_vid)),
-                field: field.clone(),
-                mutate_field: mutate_field.clone(),
-            }
-        }
+        } => OpKind::RecordQuasiImmutField {
+            base: remap_var(base),
+            field: field.clone(),
+            mutate_field: mutate_field.clone(),
+        },
         OpKind::VableFieldRead {
             base,
             field_index,
             ty,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("VableFieldRead.base must have a backing ValueId in source");
-            OpKind::VableFieldRead {
-                base: target_graph.must_variable(remap(&base_vid)),
-                field_index: *field_index,
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::VableFieldRead {
+            base: remap_var(base),
+            field_index: *field_index,
+            ty: ty.clone(),
+        },
         OpKind::VableFieldWrite {
             base,
             field_index,
             value,
             ty,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("VableFieldWrite.base must have a backing ValueId in source");
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("VableFieldWrite.value must have a backing ValueId in source");
-            OpKind::VableFieldWrite {
-                base: target_graph.must_variable(remap(&base_vid)),
-                field_index: *field_index,
-                value: target_graph.must_variable(remap(&value_vid)),
-                ty: ty.clone(),
-            }
-        }
+        } => OpKind::VableFieldWrite {
+            base: remap_var(base),
+            field_index: *field_index,
+            value: remap_var(value),
+            ty: ty.clone(),
+        },
         OpKind::VableArrayRead {
             base,
             array_index,
@@ -710,22 +569,14 @@ fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("VableArrayRead.base must have a backing ValueId in source");
-            let elem_vid = source_graph
-                .value_id_of(elem_index)
-                .expect("VableArrayRead.elem_index must have a backing ValueId in source");
-            OpKind::VableArrayRead {
-                base: target_graph.must_variable(remap(&base_vid)),
-                array_index: *array_index,
-                elem_index: target_graph.must_variable(remap(&elem_vid)),
-                item_ty: item_ty.clone(),
-                array_itemsize: *array_itemsize,
-                array_is_signed: *array_is_signed,
-            }
-        }
+        } => OpKind::VableArrayRead {
+            base: remap_var(base),
+            array_index: *array_index,
+            elem_index: remap_var(elem_index),
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -734,80 +585,40 @@ fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("VableArrayWrite.base must have a backing ValueId in source");
-            let elem_vid = source_graph
-                .value_id_of(elem_index)
-                .expect("VableArrayWrite.elem_index must have a backing ValueId in source");
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("VableArrayWrite.value must have a backing ValueId in source");
-            OpKind::VableArrayWrite {
-                base: target_graph.must_variable(remap(&base_vid)),
-                array_index: *array_index,
-                elem_index: target_graph.must_variable(remap(&elem_vid)),
-                value: target_graph.must_variable(remap(&value_vid)),
-                item_ty: item_ty.clone(),
-                array_itemsize: *array_itemsize,
-                array_is_signed: *array_is_signed,
-            }
-        }
+        } => OpKind::VableArrayWrite {
+            base: remap_var(base),
+            array_index: *array_index,
+            elem_index: remap_var(elem_index),
+            value: remap_var(value),
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::BinOp {
             op,
             lhs,
             rhs,
             result_ty,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("BinOp operand must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::BinOp {
-                op: op.clone(),
-                lhs: remap_var(lhs),
-                rhs: remap_var(rhs),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::BinOp {
+            op: op.clone(),
+            lhs: remap_var(lhs),
+            rhs: remap_var(rhs),
+            result_ty: result_ty.clone(),
+        },
         OpKind::UnaryOp {
             op,
             operand,
             result_ty,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("UnaryOp operand must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::UnaryOp {
-                op: op.clone(),
-                operand: remap_var(operand),
-                result_ty: result_ty.clone(),
-            }
-        }
-        OpKind::VableForce { base } => {
-            let base_vid = source_graph
-                .value_id_of(base)
-                .expect("VableForce.base must have a backing ValueId in source graph");
-            OpKind::VableForce {
-                base: target_graph.must_variable(remap(&base_vid)),
-            }
-        }
+        } => OpKind::UnaryOp {
+            op: op.clone(),
+            operand: remap_var(operand),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::VableForce { base } => OpKind::VableForce {
+            base: remap_var(base),
+        },
         OpKind::JitDebug { args } => OpKind::JitDebug {
-            args: args
-                .iter()
-                .map(|var| {
-                    let vid = source_graph
-                        .value_id_of(var)
-                        .expect("JitDebug arg must have a backing ValueId in source");
-                    target_graph.must_variable(remap(&vid))
-                })
-                .collect(),
+            args: args.iter().map(&remap_var).collect(),
         },
         OpKind::RecordKnownResult {
             result_value,
@@ -817,51 +628,28 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph.value_id_of(var).expect(
-                    "RecordKnownResult arg/result_value must have a backing ValueId in source",
-                );
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::RecordKnownResult {
-                result_value: remap_var(result_value),
-                funcptr: funcptr.clone(),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
-        OpKind::AssertGreen { value, kind_char } => {
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("AssertGreen.value must have a backing ValueId in source");
-            OpKind::AssertGreen {
-                value: target_graph.must_variable(remap(&value_vid)),
-                kind_char: *kind_char,
-            }
-        }
+        } => OpKind::RecordKnownResult {
+            result_value: remap_var(result_value),
+            funcptr: funcptr.clone(),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
+        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
+            value: remap_var(value),
+            kind_char: *kind_char,
+        },
         OpKind::CurrentTraceLength => OpKind::CurrentTraceLength,
-        OpKind::IsConstant { value, kind_char } => {
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("IsConstant.value must have a backing ValueId in source");
-            OpKind::IsConstant {
-                value: target_graph.must_variable(remap(&value_vid)),
-                kind_char: *kind_char,
-            }
-        }
-        OpKind::IsVirtual { value, kind_char } => {
-            let value_vid = source_graph
-                .value_id_of(value)
-                .expect("IsVirtual.value must have a backing ValueId in source");
-            OpKind::IsVirtual {
-                value: target_graph.must_variable(remap(&value_vid)),
-                kind_char: *kind_char,
-            }
-        }
+        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
+            value: remap_var(value),
+            kind_char: *kind_char,
+        },
+        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
+            value: remap_var(value),
+            kind_char: *kind_char,
+        },
         OpKind::Live => OpKind::Live,
         OpKind::JitMergePoint {
             jitdriver_index,
@@ -871,23 +659,15 @@ fn remap_op_kind(
             reds_i,
             reds_r,
             reds_f,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("JitMergePoint arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::JitMergePoint {
-                jitdriver_index: *jitdriver_index,
-                greens_i: greens_i.iter().map(remap_var).collect(),
-                greens_r: greens_r.iter().map(remap_var).collect(),
-                greens_f: greens_f.iter().map(remap_var).collect(),
-                reds_i: reds_i.iter().map(remap_var).collect(),
-                reds_r: reds_r.iter().map(remap_var).collect(),
-                reds_f: reds_f.iter().map(remap_var).collect(),
-            }
-        }
+        } => OpKind::JitMergePoint {
+            jitdriver_index: *jitdriver_index,
+            greens_i: greens_i.iter().map(&remap_var).collect(),
+            greens_r: greens_r.iter().map(&remap_var).collect(),
+            greens_f: greens_f.iter().map(&remap_var).collect(),
+            reds_i: reds_i.iter().map(&remap_var).collect(),
+            reds_r: reds_r.iter().map(&remap_var).collect(),
+            reds_f: reds_f.iter().map(&remap_var).collect(),
+        },
         OpKind::LoopHeader { jitdriver_index } => OpKind::LoopHeader {
             jitdriver_index: *jitdriver_index,
         },
@@ -898,22 +678,14 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("CallElidable arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::CallElidable {
-                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
+        } => OpKind::CallElidable {
+            funcptr: remap_call_funcptr(funcptr, remap_var),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::CallResidual {
             funcptr,
             descriptor,
@@ -922,23 +694,15 @@ fn remap_op_kind(
             args_f,
             result_kind,
             indirect_targets,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("CallResidual arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::CallResidual {
-                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-                indirect_targets: indirect_targets.clone(),
-            }
-        }
+        } => OpKind::CallResidual {
+            funcptr: remap_call_funcptr(funcptr, remap_var),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+            indirect_targets: indirect_targets.clone(),
+        },
         OpKind::CallMayForce {
             funcptr,
             descriptor,
@@ -946,43 +710,27 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("CallMayForce arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::CallMayForce {
-                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
+        } => OpKind::CallMayForce {
+            funcptr: remap_call_funcptr(funcptr, remap_var),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::InlineCall {
             jitcode,
             args_i,
             args_r,
             args_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("InlineCall arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::InlineCall {
-                jitcode: jitcode.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
+        } => OpKind::InlineCall {
+            jitcode: jitcode.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::RecursiveCall {
             jd_index,
             greens_i,
@@ -992,24 +740,16 @@ fn remap_op_kind(
             reds_r,
             reds_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("RecursiveCall arg must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::RecursiveCall {
-                jd_index: *jd_index,
-                greens_i: greens_i.iter().map(remap_var).collect(),
-                greens_r: greens_r.iter().map(remap_var).collect(),
-                greens_f: greens_f.iter().map(remap_var).collect(),
-                reds_i: reds_i.iter().map(remap_var).collect(),
-                reds_r: reds_r.iter().map(remap_var).collect(),
-                reds_f: reds_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
+        } => OpKind::RecursiveCall {
+            jd_index: *jd_index,
+            greens_i: greens_i.iter().map(&remap_var).collect(),
+            greens_r: greens_r.iter().map(&remap_var).collect(),
+            greens_f: greens_f.iter().map(&remap_var).collect(),
+            reds_i: reds_i.iter().map(&remap_var).collect(),
+            reds_r: reds_r.iter().map(&remap_var).collect(),
+            reds_f: reds_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::ConditionalCall {
             condition,
             funcptr,
@@ -1017,22 +757,14 @@ fn remap_op_kind(
             args_i,
             args_r,
             args_f,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("ConditionalCall arg/condition must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::ConditionalCall {
-                condition: remap_var(condition),
-                funcptr: funcptr.clone(),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-            }
-        }
+        } => OpKind::ConditionalCall {
+            condition: remap_var(condition),
+            funcptr: funcptr.clone(),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+        },
         OpKind::ConditionalCallValue {
             value,
             funcptr,
@@ -1041,35 +773,29 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("ConditionalCallValue arg/value must have a backing ValueId in source");
-                target_graph.must_variable(remap(&vid))
-            };
-            OpKind::ConditionalCallValue {
-                value: remap_var(value),
-                funcptr: funcptr.clone(),
-                descriptor: descriptor.clone(),
-                args_i: args_i.iter().map(remap_var).collect(),
-                args_r: args_r.iter().map(remap_var).collect(),
-                args_f: args_f.iter().map(remap_var).collect(),
-                result_kind: *result_kind,
-            }
-        }
+        } => OpKind::ConditionalCallValue {
+            value: remap_var(value),
+            funcptr: funcptr.clone(),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(&remap_var).collect(),
+            args_r: args_r.iter().map(&remap_var).collect(),
+            args_f: args_f.iter().map(&remap_var).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::Abort { kind } => OpKind::Abort { kind: kind.clone() },
     }
 }
 
-/// Collect all `ValueId` references used in an `OpKind` (not including result).
+/// Variable-identity primary walker — clones every `Variable` operand
+/// directly out of [`OpKind`]'s arm fields.
 ///
-/// Each variant field carries a `flowspace::Variable`; this function
-/// projects every Variable operand back to its dense `ValueId` via
-/// `graph.value_id_of`.  Callers without a graph context (deprecated
-/// test-only paths) pass `None` — they must only be used for variants
-/// that carry no Variable operands (e.g. `ConstInt`, `Live`).
-pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>) -> Vec<ValueId> {
+/// RPython parity — upstream `SpaceOperation.args` is already a
+/// `Vec<Hlvalue>` where each `Hlvalue::Variable` carries the
+/// authoritative operand identity (`flowspace/model.py:140`).  Pyre's
+/// `OpKind` already stores `flowspace::model::Variable` per operand,
+/// so this walker needs no graph round-trip.
+pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable> {
+    let clone_var = |var: &crate::flowspace::model::Variable| var.clone();
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
@@ -1081,12 +807,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         | OpKind::Abort { .. } => {
             vec![]
         }
-        OpKind::VableForce { base } => vec![
-            graph
-                .expect("VableForce requires a graph to project its Variable to ValueId")
-                .value_id_of(base)
-                .expect("VableForce.base must be a known Variable on graph"),
-        ],
+        OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::JitMergePoint {
             greens_i,
             greens_r,
@@ -1096,11 +817,6 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             reds_f,
             ..
         } => {
-            let g = graph.expect("JitMergePoint requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("JitMergePoint arg must be a known Variable on graph")
-            };
             let mut v = Vec::with_capacity(
                 greens_i.len()
                     + greens_r.len()
@@ -1109,193 +825,51 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                     + reds_r.len()
                     + reds_f.len(),
             );
-            v.extend(greens_i.iter().map(project));
-            v.extend(greens_r.iter().map(project));
-            v.extend(greens_f.iter().map(project));
-            v.extend(reds_i.iter().map(project));
-            v.extend(reds_r.iter().map(project));
-            v.extend(reds_f.iter().map(project));
+            v.extend(greens_i.iter().map(&clone_var));
+            v.extend(greens_r.iter().map(&clone_var));
+            v.extend(greens_f.iter().map(&clone_var));
+            v.extend(reds_i.iter().map(&clone_var));
+            v.extend(reds_r.iter().map(&clone_var));
+            v.extend(reds_f.iter().map(&clone_var));
             v
         }
-        OpKind::FieldRead { base, .. } => vec![
-            graph
-                .expect("FieldRead requires a graph to project Variable to ValueId")
-                .value_id_of(base)
-                .expect("FieldRead.base must be a known Variable on graph"),
-        ],
-        OpKind::FieldWrite { base, value, .. } => {
-            let g = graph.expect("FieldWrite requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("FieldWrite.base must be a known Variable on graph"),
-                g.value_id_of(value)
-                    .expect("FieldWrite.value must be a known Variable on graph"),
-            ]
-        }
-        OpKind::ArrayRead { base, index, .. } => {
-            let g = graph.expect("ArrayRead requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("ArrayRead.base must be a known Variable on graph"),
-                g.value_id_of(index)
-                    .expect("ArrayRead.index must be a known Variable on graph"),
-            ]
-        }
+        OpKind::FieldRead { base, .. } => vec![clone_var(base)],
+        OpKind::FieldWrite { base, value, .. } => vec![clone_var(base), clone_var(value)],
+        OpKind::ArrayRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::ArrayWrite {
             base, index, value, ..
-        } => {
-            let g = graph.expect("ArrayWrite requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("ArrayWrite.base must be a known Variable on graph"),
-                g.value_id_of(index)
-                    .expect("ArrayWrite.index must be a known Variable on graph"),
-                g.value_id_of(value)
-                    .expect("ArrayWrite.value must be a known Variable on graph"),
-            ]
-        }
-        OpKind::InteriorFieldRead { base, index, .. } => {
-            let g =
-                graph.expect("InteriorFieldRead requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("InteriorFieldRead.base must be a known Variable on graph"),
-                g.value_id_of(index)
-                    .expect("InteriorFieldRead.index must be a known Variable on graph"),
-            ]
-        }
+        } => vec![clone_var(base), clone_var(index), clone_var(value)],
+        OpKind::InteriorFieldRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::InteriorFieldWrite {
             base, index, value, ..
-        } => {
-            let g =
-                graph.expect("InteriorFieldWrite requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("InteriorFieldWrite.base must be a known Variable on graph"),
-                g.value_id_of(index)
-                    .expect("InteriorFieldWrite.index must be a known Variable on graph"),
-                g.value_id_of(value)
-                    .expect("InteriorFieldWrite.value must be a known Variable on graph"),
-            ]
-        }
-        OpKind::Call { args, .. } => {
-            let g = graph.expect("Call requires a graph to project Variable to ValueId");
-            args.iter()
-                .map(|v| {
-                    g.value_id_of(v)
-                        .expect("Call arg must be a known Variable on graph")
-                })
-                .collect()
-        }
-        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![
-            graph
-                .expect("Guard{True,False} requires a graph to project Variable to ValueId")
-                .value_id_of(cond)
-                .expect("Guard{True,False}.cond must be a known Variable on graph"),
-        ],
-        OpKind::GuardValue { value, .. } => vec![
-            graph
-                .expect("GuardValue requires a graph to project Variable to ValueId")
-                .value_id_of(value)
-                .expect("GuardValue.value must be a known Variable on graph"),
-        ],
+        } => vec![clone_var(base), clone_var(index), clone_var(value)],
+        OpKind::Call { args, .. } => args.iter().map(&clone_var).collect(),
+        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![clone_var(cond)],
+        OpKind::GuardValue { value, .. } => vec![clone_var(value)],
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
-        | OpKind::IsVirtual { value, .. } => vec![
-            graph
-                .expect("AssertGreen/IsConstant/IsVirtual require a graph to project Variable")
-                .value_id_of(value)
-                .expect("AssertGreen/IsConstant/IsVirtual.value must be a known Variable on graph"),
-        ],
-        OpKind::VtableMethodPtr { receiver, .. } => vec![
-            graph
-                .expect("VtableMethodPtr requires a graph to project Variable to ValueId")
-                .value_id_of(receiver)
-                .expect("VtableMethodPtr.receiver must be a known Variable on graph"),
-        ],
+        | OpKind::IsVirtual { value, .. } => vec![clone_var(value)],
+        OpKind::VtableMethodPtr { receiver, .. } => vec![clone_var(receiver)],
         OpKind::IndirectCall { funcptr, args, .. } => {
-            let g = graph.expect("IndirectCall requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("IndirectCall arg/funcptr must be a known Variable on graph")
-            };
-            let mut v = vec![project(funcptr)];
-            v.extend(args.iter().map(project));
+            let mut v = vec![clone_var(funcptr)];
+            v.extend(args.iter().map(&clone_var));
             v
         }
-        OpKind::RecordQuasiImmutField { base, .. } => vec![
-            graph
-                .expect("RecordQuasiImmutField requires a graph to project Variable to ValueId")
-                .value_id_of(base)
-                .expect("RecordQuasiImmutField.base must be a known Variable on graph"),
-        ],
-        OpKind::JitDebug { args, .. } => {
-            let g = graph.expect("JitDebug requires a graph to project Variable to ValueId");
-            args.iter()
-                .map(|var| {
-                    g.value_id_of(var)
-                        .expect("JitDebug arg must be a known Variable on graph")
-                })
-                .collect()
-        }
-        OpKind::VableFieldRead { base, .. } => vec![
-            graph
-                .expect("VableFieldRead requires a graph to project Variable to ValueId")
-                .value_id_of(base)
-                .expect("VableFieldRead.base must be a known Variable on graph"),
-        ],
-        OpKind::VableFieldWrite { base, value, .. } => {
-            let g = graph.expect("VableFieldWrite requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("VableFieldWrite.base must be a known Variable on graph"),
-                g.value_id_of(value)
-                    .expect("VableFieldWrite.value must be a known Variable on graph"),
-            ]
-        }
+        OpKind::RecordQuasiImmutField { base, .. } => vec![clone_var(base)],
+        OpKind::JitDebug { args, .. } => args.iter().map(&clone_var).collect(),
+        OpKind::VableFieldRead { base, .. } => vec![clone_var(base)],
+        OpKind::VableFieldWrite { base, value, .. } => vec![clone_var(base), clone_var(value)],
         OpKind::VableArrayRead {
             base, elem_index, ..
-        } => {
-            let g = graph.expect("VableArrayRead requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("VableArrayRead.base must be a known Variable on graph"),
-                g.value_id_of(elem_index)
-                    .expect("VableArrayRead.elem_index must be a known Variable on graph"),
-            ]
-        }
+        } => vec![clone_var(base), clone_var(elem_index)],
         OpKind::VableArrayWrite {
             base,
             elem_index,
             value,
             ..
-        } => {
-            let g = graph.expect("VableArrayWrite requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(base)
-                    .expect("VableArrayWrite.base must be a known Variable on graph"),
-                g.value_id_of(elem_index)
-                    .expect("VableArrayWrite.elem_index must be a known Variable on graph"),
-                g.value_id_of(value)
-                    .expect("VableArrayWrite.value must be a known Variable on graph"),
-            ]
-        }
-        OpKind::BinOp { lhs, rhs, .. } => {
-            let g = graph.expect("BinOp requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(lhs)
-                    .expect("BinOp.lhs must be a known Variable on graph"),
-                g.value_id_of(rhs)
-                    .expect("BinOp.rhs must be a known Variable on graph"),
-            ]
-        }
-        OpKind::UnaryOp { operand, .. } => {
-            let g = graph.expect("UnaryOp requires a graph to project Variable to ValueId");
-            vec![
-                g.value_id_of(operand)
-                    .expect("UnaryOp.operand must be a known Variable on graph"),
-            ]
-        }
+        } => vec![clone_var(base), clone_var(elem_index), clone_var(value)],
+        OpKind::BinOp { lhs, rhs, .. } => vec![clone_var(lhs), clone_var(rhs)],
+        OpKind::UnaryOp { operand, .. } => vec![clone_var(operand)],
         OpKind::CallElidable {
             funcptr,
             args_i,
@@ -1317,20 +891,13 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph.expect(
-                "Call{Elidable,Residual,MayForce} requires a graph to project Variable to ValueId",
-            );
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("Call arg must be a known Variable on graph")
-            };
             let mut refs = match funcptr {
                 CallFuncPtr::Target(_) => Vec::new(),
-                CallFuncPtr::Value(var) => vec![project(var)],
+                CallFuncPtr::Value(var) => vec![clone_var(var)],
             };
-            refs.extend(args_i.iter().map(project));
-            refs.extend(args_r.iter().map(project));
-            refs.extend(args_f.iter().map(project));
+            refs.extend(args_i.iter().map(&clone_var));
+            refs.extend(args_r.iter().map(&clone_var));
+            refs.extend(args_f.iter().map(&clone_var));
             refs
         }
         OpKind::InlineCall {
@@ -1339,14 +906,10 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph.expect("InlineCall requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("InlineCall arg must be a known Variable on graph")
-            };
-            let mut refs: Vec<ValueId> = args_i.iter().map(project).collect();
-            refs.extend(args_r.iter().map(project));
-            refs.extend(args_f.iter().map(project));
+            let mut refs: Vec<crate::flowspace::model::Variable> =
+                args_i.iter().map(&clone_var).collect();
+            refs.extend(args_r.iter().map(&clone_var));
+            refs.extend(args_f.iter().map(&clone_var));
             refs
         }
         OpKind::ConditionalCall {
@@ -1356,15 +919,10 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph.expect("ConditionalCall requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("ConditionalCall arg/condition must be a known Variable on graph")
-            };
-            let mut refs = vec![project(condition)];
-            refs.extend(args_i.iter().map(project));
-            refs.extend(args_r.iter().map(project));
-            refs.extend(args_f.iter().map(project));
+            let mut refs = vec![clone_var(condition)];
+            refs.extend(args_i.iter().map(&clone_var));
+            refs.extend(args_r.iter().map(&clone_var));
+            refs.extend(args_f.iter().map(&clone_var));
             refs
         }
         OpKind::ConditionalCallValue {
@@ -1374,16 +932,10 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph
-                .expect("ConditionalCallValue requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("ConditionalCallValue arg/value must be a known Variable on graph")
-            };
-            let mut refs = vec![project(value)];
-            refs.extend(args_i.iter().map(project));
-            refs.extend(args_r.iter().map(project));
-            refs.extend(args_f.iter().map(project));
+            let mut refs = vec![clone_var(value)];
+            refs.extend(args_i.iter().map(&clone_var));
+            refs.extend(args_r.iter().map(&clone_var));
+            refs.extend(args_f.iter().map(&clone_var));
             refs
         }
         OpKind::RecordKnownResult {
@@ -1393,16 +945,10 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g =
-                graph.expect("RecordKnownResult requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("RecordKnownResult arg must be a known Variable on graph")
-            };
-            let mut refs = vec![project(result_value)];
-            refs.extend(args_i.iter().map(project));
-            refs.extend(args_r.iter().map(project));
-            refs.extend(args_f.iter().map(project));
+            let mut refs = vec![clone_var(result_value)];
+            refs.extend(args_i.iter().map(&clone_var));
+            refs.extend(args_r.iter().map(&clone_var));
+            refs.extend(args_f.iter().map(&clone_var));
             refs
         }
         OpKind::RecursiveCall {
@@ -1414,43 +960,16 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             reds_f,
             ..
         } => {
-            let g = graph.expect("RecursiveCall requires a graph to project Variable to ValueId");
-            let project = |var: &crate::flowspace::model::Variable| {
-                g.value_id_of(var)
-                    .expect("RecursiveCall arg must be a known Variable on graph")
-            };
-            let mut refs: Vec<ValueId> = greens_i.iter().map(project).collect();
-            refs.extend(greens_r.iter().map(project));
-            refs.extend(greens_f.iter().map(project));
-            refs.extend(reds_i.iter().map(project));
-            refs.extend(reds_r.iter().map(project));
-            refs.extend(reds_f.iter().map(project));
+            let mut refs: Vec<crate::flowspace::model::Variable> =
+                greens_i.iter().map(&clone_var).collect();
+            refs.extend(greens_r.iter().map(&clone_var));
+            refs.extend(greens_f.iter().map(&clone_var));
+            refs.extend(reds_i.iter().map(&clone_var));
+            refs.extend(reds_r.iter().map(&clone_var));
+            refs.extend(reds_f.iter().map(&clone_var));
             refs
         }
     }
-}
-
-/// Variable-identity sibling of [`op_value_refs`] —
-/// each `ValueId` operand is projected through
-/// [`crate::model::FunctionGraph::variable`] to its backing
-/// [`crate::flowspace::model::Variable`].  Slots without a backing
-/// Variable surface as `None` so callers can decide whether the gap
-/// is acceptable (e.g. format diagnostics) or should panic
-/// (e.g. assembler that requires upstream-typed identity).
-///
-/// RPython parity — upstream `SpaceOperation.args` is already a
-/// `Vec<Hlvalue>` where each `Hlvalue::Variable` carries the
-/// authoritative operand identity (`flowspace/model.py:140`).  This
-/// helper is pyre's bridge from the legacy `ValueId`-keyed shape to
-/// the upstream-orthodox Variable-keyed reads.
-pub fn op_variable_refs(
-    kind: &OpKind,
-    graph: &crate::model::FunctionGraph,
-) -> Vec<Option<crate::flowspace::model::Variable>> {
-    op_value_refs(kind, Some(graph))
-        .into_iter()
-        .map(|vid| graph.variable(vid).cloned())
-        .collect()
 }
 
 /// `true` iff `kind` is side-effect-free and may be removed from the
@@ -1770,27 +1289,31 @@ fn is_pure_unary_opname(opname: &str) -> bool {
     )
 }
 
-/// Replace all occurrences of `old` with `new` in ops within the specified blocks.
+/// Replace all occurrences of `old_var` with `new_var` in ops within the specified blocks.
 fn remap_value_in_graph(
     graph: &mut FunctionGraph,
     block_map: &HashMap<BlockId, BlockId>,
-    old: ValueId,
-    new: ValueId,
+    old_var: &crate::flowspace::model::Variable,
+    new_var: &crate::flowspace::model::Variable,
 ) {
     let target_blocks: Vec<BlockId> = block_map.values().copied().collect();
     for &bid in &target_blocks {
         let (exitswitch, exits) = {
             let block = &graph.blocks[bid.0];
-            remap_control_flow_metadata(
-                graph,
-                graph,
+            remap_control_flow_metadata_var(
                 &block.exitswitch,
                 &block.exits,
-                |v| if v == old { new } else { v },
+                |var| {
+                    if var == old_var {
+                        new_var.clone()
+                    } else {
+                        var.clone()
+                    }
+                },
                 |b| b,
             )
         };
-        let new_ops = remap_value_in_ops(&graph.blocks[bid.0].operations, old, new, graph);
+        let new_ops = remap_value_in_ops(&graph.blocks[bid.0].operations, old_var, new_var);
         let block = &mut graph.blocks[bid.0];
         block.operations = new_ops;
         block.exitswitch = exitswitch;
@@ -1798,20 +1321,23 @@ fn remap_value_in_graph(
     }
 }
 
-/// Replace all occurrences of `old` with `new` in a list of ops.
-/// `graph` is threaded so [`remap_op_kind`] can project Variable
-/// operands once the OpKind storage flip lands.
+/// Replace all occurrences of `old_var` with `new_var` in a list of ops.
 fn remap_value_in_ops(
     ops: &[SpaceOperation],
-    old: ValueId,
-    new: ValueId,
-    graph: &FunctionGraph,
+    old_var: &crate::flowspace::model::Variable,
+    new_var: &crate::flowspace::model::Variable,
 ) -> Vec<SpaceOperation> {
-    let remap = |v: &ValueId| if *v == old { new } else { *v };
+    let remap_var = |var: &crate::flowspace::model::Variable| {
+        if var == old_var {
+            new_var.clone()
+        } else {
+            var.clone()
+        }
+    };
     ops.iter()
         .map(|op| SpaceOperation {
             result: op.result.clone(),
-            kind: remap_op_kind(&op.kind, &remap, graph, graph),
+            kind: remap_op_kind(&op.kind, &remap_var),
         })
         .collect()
 }
@@ -1827,18 +1353,18 @@ mod tests {
         // Callee: fn callee(base) -> value { ArrayRead(base, const(0)) }
         let mut g = FunctionGraph::new("callee");
         let entry = g.startblock;
-        let base = g.push_op(
-            entry,
-            OpKind::Input {
-                name: "base".into(),
-                ty: ValueType::Ref,
-            },
-            true,
-        );
-        let idx = g.push_op(entry, OpKind::ConstInt(0), true);
-        let base_var = g.must_variable(base.unwrap());
-        let idx_var = g.must_variable(idx.unwrap());
-        let result = g.push_op(
+        let base_var = g
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "base".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let idx_var = g.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let result = g.push_op_var(
             entry,
             OpKind::ArrayRead {
                 base: base_var,
@@ -1849,7 +1375,7 @@ mod tests {
             },
             true,
         );
-        g.set_return(entry, result.map(|v| g.must_variable(v)));
+        g.set_return(entry, result);
         g
     }
 
@@ -1858,16 +1384,17 @@ mod tests {
         // Caller: fn caller() { v = Call("callee", [base]); Return v }
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
-        let base = caller.push_op(
-            entry,
-            OpKind::Input {
-                name: "base".into(),
-                ty: ValueType::Ref,
-            },
-            true,
-        );
-        let base_var = caller.must_variable(base.unwrap());
-        let result = caller.push_op(
+        let base_var = caller
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "base".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let result = caller.push_op_var(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
@@ -1876,7 +1403,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
+        caller.set_return(entry, result);
 
         let callee = make_simple_callee();
 
@@ -1911,7 +1438,7 @@ mod tests {
     fn inline_preserves_residual_calls() {
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
-        let result = caller.push_op(
+        let result = caller.push_op_var(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["unknown_fn"]),
@@ -1920,7 +1447,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
+        caller.set_return(entry, result);
 
         let cc = CallControl::new(); // empty — no graphs registered
         let count = inline_graph(&mut caller, &cc, 3);
@@ -1943,16 +1470,17 @@ mod tests {
         // outer: fn outer(base) -> Call("callee", [base])
         let mut outer = FunctionGraph::new("outer");
         let entry = outer.startblock;
-        let base = outer.push_op(
-            entry,
-            OpKind::Input {
-                name: "base".into(),
-                ty: ValueType::Ref,
-            },
-            true,
-        );
-        let base_var = outer.must_variable(base.unwrap());
-        let result = outer.push_op(
+        let base_var = outer
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "base".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let result = outer.push_op_var(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
@@ -1961,21 +1489,22 @@ mod tests {
             },
             true,
         );
-        outer.set_return(entry, result.map(|v| outer.must_variable(v)));
+        outer.set_return(entry, result);
 
         // caller: fn caller(x) -> Call("outer", [x])
         let mut caller = FunctionGraph::new("caller");
         let centry = caller.startblock;
-        let x = caller.push_op(
-            centry,
-            OpKind::Input {
-                name: "x".into(),
-                ty: ValueType::Ref,
-            },
-            true,
-        );
-        let x_var = caller.must_variable(x.unwrap());
-        let result = caller.push_op(
+        let x_var = caller
+            .push_op_var(
+                centry,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let result = caller.push_op_var(
             centry,
             OpKind::Call {
                 target: CallTarget::function_path(["outer"]),
@@ -1984,7 +1513,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(centry, result.map(|v| caller.must_variable(v)));
+        caller.set_return(centry, result);
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), inner);
@@ -2019,16 +1548,17 @@ mod tests {
 
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
-        let base = caller.push_op(
-            entry,
-            OpKind::Input {
-                name: "base".into(),
-                ty: ValueType::Ref,
-            },
-            true,
-        );
-        let base_var = caller.must_variable(base.unwrap());
-        let result = caller.push_op(
+        let base_var = caller
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "base".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let result = caller.push_op_var(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
@@ -2037,7 +1567,7 @@ mod tests {
             },
             true,
         );
-        caller.set_return(entry, result.map(|v| caller.must_variable(v)));
+        caller.set_return(entry, result);
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), callee);
@@ -2069,34 +1599,6 @@ mod tests {
                     link.target
                 );
             }
-        }
-    }
-
-    #[test]
-    fn op_variable_refs_projects_each_value_id_to_its_backing_variable() {
-        // ArrayRead(base, index) — two operand ValueIds, each minted by
-        // alloc_value_with_type so the graph holds a backing
-        // flowspace::Variable per slot.  op_variable_refs must surface
-        // those Variables in the same order op_value_refs returns the
-        // ValueIds.
-        let g = make_simple_callee();
-        let entry = g.block(g.startblock);
-        let array_read = entry
-            .operations
-            .iter()
-            .find(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
-            .expect("simple callee has the ArrayRead op");
-        let value_ids = op_value_refs(&array_read.kind, Some(&g));
-        let variables = op_variable_refs(&array_read.kind, &g);
-        assert_eq!(value_ids.len(), variables.len(), "len parity");
-        for (vid, var_opt) in value_ids.iter().zip(variables.iter()) {
-            let direct = g
-                .variable(*vid)
-                .expect("alloc_value_with_type binds a Variable per slot");
-            let projected = var_opt
-                .as_ref()
-                .expect("op_variable_refs preserves the bound Variable");
-            assert_eq!(direct.id(), projected.id(), "Variable identity preserved");
         }
     }
 }

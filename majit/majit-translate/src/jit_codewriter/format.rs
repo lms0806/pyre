@@ -62,7 +62,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
 
 /// Graph-aware sibling of [`format_assembler`].  When `graph` is
 /// supplied, Variable-typed operands resolve their render suffix via
-/// `graph.value_id_of(v)` (graph-local SSA numbering) rather than
+/// `graph.slot_of(v)` (graph-local SSA numbering) rather than
 /// `Variable.id()` (process-wide identity).  Tests that need stable
 /// RPython-shaped `%i<n>` suffixes across runs should route through
 /// this entry point.
@@ -342,7 +342,7 @@ fn register_repr_for_kind(suffix: u64, kind: RegKind) -> String {
 /// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot —
 /// it is passed in directly rather than fetched from a side-table.
 /// Argument storage is `Vec<Variable>` (orthodox per `flowspace/model.py:Variable`);
-/// the Variable's render suffix resolves via `graph.value_id_of(v)`
+/// the Variable's render suffix resolves via `graph.slot_of(v)`
 /// when a graph is provided, falling back to `Variable.id()`.
 fn list_of_kind_repr_vars(
     kind_char: char,
@@ -364,7 +364,7 @@ fn list_of_kind_repr_vars(
 /// Resolve a [`crate::flowspace::model::Variable`] to the numeric
 /// suffix used in `%i<n>`/`%r<n>`/`%f<n>` register renderings.  When
 /// `graph` is provided we look the bridge up via
-/// [`crate::model::FunctionGraph::value_id_of`] for graph-local SSA
+/// [`crate::model::FunctionGraph::slot_of`] for graph-local SSA
 /// numbering; failing that (and when no graph is supplied) we fall
 /// back to `Variable.id()` (process-wide identity counter).  The
 /// fallback is sufficient for tests and `JitCode.dump` where the
@@ -374,7 +374,7 @@ fn variable_register_suffix(
     graph: Option<&crate::model::FunctionGraph>,
 ) -> u64 {
     graph
-        .and_then(|g| g.value_id_of(v).map(|vid| vid.0 as u64))
+        .and_then(|g| g.slot_of(v).map(|slot| slot as u64))
         .unwrap_or(v.id())
 }
 
@@ -536,7 +536,7 @@ fn op_args_repr(
         // running the rtyper).
         OpKind::Call { args, .. } => {
             // When a graph is provided we resolve the Variable's
-            // graph-local register suffix via `value_id_of` so the
+            // graph-local register suffix via `slot_of` so the
             // render matches RPython's graph-local SSA numbering.
             // Without it we fall back to `Variable.id()` (process-wide
             // identity) — sufficient for tests that allocate Variables
@@ -669,7 +669,7 @@ fn op_args_repr(
         Some(g) => op
             .result
             .as_ref()
-            .and_then(|v| g.value_id_of(v).map(|vid| vid.0 as u64)),
+            .and_then(|v| g.slot_of(v).map(|slot| slot as u64)),
         // No-graph render path: fall back to the Variable's `id()`
         // (process-wide identity counter) when callers cannot supply a
         // graph.  Preserves the historical render behaviour for
@@ -765,7 +765,7 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
-        // only reaches this fall-through when `op.result.as_ref().and_then(|v| graph.value_id_of(v)) == Some(_)`,
+        // only reaches this fall-through when `op.result.as_ref().and_then(|v| graph.slot_of(v)) == Some(_)`,
         // so any miss surfaces as a real coverage gap to extend.
         _ => RegKind::Ref,
     }
@@ -858,9 +858,8 @@ mod tests {
         // format.py:23 `'$%r' % (x.value,)`.
         use crate::model::{FunctionGraph, OpKind, SpaceOperation};
         let mut graph = FunctionGraph::new("format_constint");
-        let vid = graph.alloc_value();
-        let suffix = vid.0;
-        let result_var = graph.must_variable(vid);
+        let result_var = graph.alloc_value_var();
+        let suffix = graph.slot_of(&result_var).expect("result registered");
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::ConstInt(42),
@@ -882,16 +881,13 @@ mod tests {
         use majit_ir::descr::EffectInfo;
 
         let mut graph = FunctionGraph::new("format_residual_call");
-        let int_arg_vid = graph.alloc_value();
-        let ref_arg_vid = graph.alloc_value();
-        let _funcptr_vid = graph.alloc_value();
-        let result_vid = graph.alloc_value();
-        let int_arg = graph.must_variable(int_arg_vid);
-        let ref_arg = graph.must_variable(ref_arg_vid);
-        let result_var = graph.must_variable(result_vid);
-        let int_arg_id = int_arg_vid.0;
-        let ref_arg_id = ref_arg_vid.0;
-        let result_id = result_vid.0;
+        let int_arg = graph.alloc_value_var();
+        let ref_arg = graph.alloc_value_var();
+        let _funcptr_var = graph.alloc_value_var();
+        let result_var = graph.alloc_value_var();
+        let int_arg_id = graph.slot_of(&int_arg).expect("int_arg registered");
+        let ref_arg_id = graph.slot_of(&ref_arg).expect("ref_arg registered");
+        let result_id = graph.slot_of(&result_var).expect("result registered");
 
         let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);

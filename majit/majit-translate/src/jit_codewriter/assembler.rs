@@ -245,7 +245,7 @@ impl Assembler {
     ///
     /// `graph` is mandatory because PyPy's `Assembler.assemble` always
     /// runs against a fully-typed `ssarepr` (every Variable has
-    /// `.concretetype`).  [`Self::lookup_coloring`] reads the kind
+    /// `.concretetype`).  [`Self::lookup_coloring_var`] reads the kind
     /// source via `graph.concretetype(v)` exactly like RPython's
     /// `flatten.py:382 getcolor` reads `getkind(v.concretetype)`, and
     /// [`crate::liveness::compute_liveness`] needs the same projection
@@ -290,7 +290,7 @@ impl Assembler {
         // no graph-less path because every `ssarepr` arriving here is
         // produced by `flatten_graph(graph, …)` upstream, so the kind
         // source projection is always available.
-        crate::liveness::compute_liveness(ssarepr, regallocs, graph);
+        crate::liveness::compute_liveness(ssarepr, regallocs);
         self.current_graph_name = Some(ssarepr.name.clone());
         // Snapshot `value_variables` so per-Variable lookups can keep
         // their `&Variable` lifetime independent of the graph borrow
@@ -311,7 +311,7 @@ impl Assembler {
         // the invariant is guaranteed by rtyper's `concretetype`
         // annotation so the lookup cannot miss.
         if std::env::var("MAJIT_COVERAGE_AUDIT").is_ok() {
-            self.run_coverage_audit(ssarepr, regallocs, graph);
+            self.run_coverage_audit(ssarepr, regallocs);
         }
 
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
@@ -350,7 +350,7 @@ impl Assembler {
             if debug_enabled {
                 self.current_flatop_debug = Some(format!("{op:?}"));
             }
-            self.write_insn(op, regallocs, &mut state, callcontrol, graph);
+            self.write_insn(op, regallocs, &mut state, callcontrol);
         }
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
@@ -452,7 +452,6 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
-        graph: &crate::model::FunctionGraph,
     ) {
         match op {
             // RPython assembler.py:143-144: Label → record bytecode position
@@ -513,7 +512,7 @@ impl Assembler {
 
             // RPython assembler.py:159-223: regular operation
             FlatOp::Op(inner_op) => {
-                self.encode_op(inner_op, regallocs, state, callcontrol, graph);
+                self.encode_op(inner_op, regallocs, state, callcontrol);
             }
 
             // RPython flatten.py: 'goto' + TLabel
@@ -566,7 +565,7 @@ impl Assembler {
                 // `eval_loop_jit`'s portal bool branches).  The
                 // `cond.index` byte still encodes the regalloc color
                 // correctly so emission proceeds; the parity gap is
-                // tracked above lookup_coloring rather than asserted
+                // tracked above lookup_coloring_var rather than asserted
                 // here.
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
@@ -963,7 +962,6 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
-        graph: &crate::model::FunctionGraph,
     ) {
         use crate::model::OpKind;
 
@@ -1640,7 +1638,7 @@ impl Assembler {
             // returns `num_regs_i + pool_idx` which the runtime resolves
             // back to the constant via `registers_i[byte]`. Emitting via
             // the generic fallback would push zero operand bytes (because
-            // `op_value_refs(LoopHeader)` is empty), misaligning the
+            // `op_variable_refs(LoopHeader)` is empty), misaligning the
             // dispatch cursor.
             OpKind::LoopHeader { jitdriver_index } => {
                 let reg_byte = self.emit_const_i(*jitdriver_index as i64, state);
@@ -1703,10 +1701,7 @@ impl Assembler {
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 let mut operand_kinds = String::new();
-                for v in crate::inline::op_variable_refs(other, graph)
-                    .into_iter()
-                    .flatten()
-                {
+                for v in crate::inline::op_variable_refs(other) {
                     let (reg, kind_char) = self.lookup_reg_with_kind_var(&v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
@@ -1742,7 +1737,7 @@ impl Assembler {
     /// construction (`flatten.py:35-51 ListOfKind` carries `kind` as
     /// an attribute and the constructors only accept matching
     /// Registers).  Pyre asserts the same invariant strictly: each
-    /// item resolves through `lookup_coloring` and its kind must
+    /// item resolves through `lookup_coloring_var` and its kind must
     /// equal the list's `kind`.  A mismatch surfaces as a hard panic
     /// — the upstream contract has no escape hatch.
     fn emit_list_of_kind(
@@ -2047,12 +2042,7 @@ impl Assembler {
     ///
     /// Output goes through `cargo:warning=` so the build script
     /// runner (`build.rs`) surfaces each line to the user.
-    fn run_coverage_audit(
-        &self,
-        ssarepr: &SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
-        graph: &crate::model::FunctionGraph,
-    ) {
+    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
         // For each Variable, track: has a def site (result of some op),
         // count of direct operand uses, count of Live markers mentioning
         // it.  Live-only gaps (no def, no operand use) point at backward
@@ -2124,12 +2114,8 @@ impl Assembler {
                     }
                     // `op_variable_refs` walks the orthodox Variable
                     // operands (RPython `SpaceOperation.args:
-                    // Vec<Hlvalue>`); slots without a backing Variable
-                    // surface as `None` and are skipped.
-                    for v in crate::inline::op_variable_refs(&inner.kind, graph)
-                        .into_iter()
-                        .flatten()
-                    {
+                    // Vec<Hlvalue>`) directly out of OpKind.
+                    for v in crate::inline::op_variable_refs(&inner.kind) {
                         let s = sites.entry(v).or_default();
                         s.use_count += 1;
                         s.first_use_tag.get_or_insert(tag);
@@ -3884,8 +3870,8 @@ mod tests {
         // Build graph for regalloc (regalloc operates on graph, not SSARepr)
         let mut graph = FunctionGraph::new("add");
         let entry = graph.startblock;
-        let v0 = graph
-            .push_op(
+        let v0_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "a".into(),
@@ -3894,21 +3880,20 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v0_var = graph.must_variable(v0);
-        let v1 = graph
-            .push_op(
+        let v1_var = graph
+            .push_op_var(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
                     lhs: v0_var.clone(),
-                    rhs: v0_var,
+                    rhs: v0_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        let v2 = graph
-            .push_op(
+        let v2_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Input {
                     name: "r".into(),
@@ -3917,11 +3902,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v1)));
+        graph.set_return(entry, Some(v1_var.clone()));
 
-        graph.set_concretetype(v0, crate::model::ConcreteType::Signed);
-        graph.set_concretetype(v1, crate::model::ConcreteType::Signed);
-        graph.set_concretetype(v2, crate::model::ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&v0_var, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v1_var, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&v2_var, crate::model::ConcreteType::GcRef);
 
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let regallocs = regalloc::perform_all_register_allocations(&graph);
@@ -3959,8 +3944,8 @@ mod tests {
         );
 
         let mut graph = FunctionGraph::new("read_cell");
-        let base = graph
-            .push_op(
+        let base_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "cell".to_string(),
@@ -3969,12 +3954,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        let base_var = graph.must_variable(base);
-        let result = graph
-            .push_op(
+        let result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base: base_var,
+                    base: base_var.clone(),
                     field: FieldDescriptor::new("value", Some("Cell".to_string())),
                     ty: ValueType::Int,
                     pure: false,
@@ -3982,20 +3966,20 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(result)));
+        graph.set_return(graph.startblock, Some(result_var.clone()));
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let mut rewritten = transformer.transform(&graph).graph;
 
-        rewritten.set_concretetype(base, crate::model::ConcreteType::GcRef);
-        rewritten.set_concretetype(result, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, crate::model::ConcreteType::Signed);
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
         // exceptblock-augmented map — `flatten_graph` (without type
-        // state) leaves it empty, but the Slice C-3 lookup_coloring
+        // state) leaves it empty, but the Slice C-3 lookup_coloring_var
         // contract requires the same authoritative table that
         // `perform_all_register_allocations` consumed.
         let mut asm = Assembler::new();
@@ -4047,8 +4031,8 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_writes");
-        let base = graph
-            .push_op(
+        let base_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "obj".into(),
@@ -4057,8 +4041,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let index = graph
-            .push_op(
+        let index_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "i".into(),
@@ -4067,8 +4051,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let value = graph
-            .push_op(
+        let value_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "v".into(),
@@ -4077,25 +4061,22 @@ mod tests {
                 true,
             )
             .unwrap();
-        let base_var = graph.must_variable(base);
-        let value_var = graph.must_variable(value);
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
                 base: base_var.clone(),
                 field: FieldDescriptor::new("x", Some("Point".into())),
-                value: value_var,
+                value: value_var.clone(),
                 ty: ValueType::Unknown,
             },
             false,
         );
-        let index_var = graph.must_variable(index);
         graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
-                base: base_var,
-                index: index_var,
-                value: graph.must_variable(value),
+                base: base_var.clone(),
+                index: index_var.clone(),
+                value: value_var.clone(),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
@@ -4107,13 +4088,16 @@ mod tests {
         // Publish kinds to graph cells before jtransform.  Variable
         // Rc-shares the concretetype cell across clones, so the
         // cloned rewritten graph picks up the same kinds.
-        graph.set_concretetype_inline(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        graph.set_concretetype_inline(
-            index,
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::jit_codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &index_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        graph.set_concretetype_inline(
-            value,
+        FunctionGraph::set_concretetype_of_inline(
+            &value_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -4170,8 +4154,8 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_reads");
-        let base = graph
-            .push_op(
+        let base_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "obj".into(),
@@ -4180,8 +4164,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let index = graph
-            .push_op(
+        let index_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "i".into(),
@@ -4190,12 +4174,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        let base_var = graph.must_variable(base);
-        let field_result = graph
-            .push_op(
+        let field_result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base: base_var,
+                    base: base_var.clone(),
                     field: FieldDescriptor::new("x", Some("Point".into())),
                     ty: ValueType::Unknown,
                     pure: false,
@@ -4203,14 +4186,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let index_var = graph.must_variable(index);
-        let base_var2 = graph.must_variable(base);
-        let array_result = graph
-            .push_op(
+        let array_result_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::ArrayRead {
-                    base: base_var2,
-                    index: index_var,
+                    base: base_var.clone(),
+                    index: index_var.clone(),
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
@@ -4218,22 +4199,25 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(array_result)));
+        graph.set_return(graph.startblock, Some(array_result_var.clone()));
 
         // Publish kinds to graph cells before jtransform.  Variable
         // Rc-shares the concretetype cell across clones, so the
         // cloned rewritten graph picks up the same kinds.
-        graph.set_concretetype_inline(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
-        graph.set_concretetype_inline(
-            index,
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::jit_codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &index_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        graph.set_concretetype_inline(
-            field_result,
+        FunctionGraph::set_concretetype_of_inline(
+            &field_result_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
-        graph.set_concretetype_inline(
-            array_result,
+        FunctionGraph::set_concretetype_of_inline(
+            &array_result_var,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
@@ -4289,8 +4273,8 @@ mod tests {
         use crate::model::{FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("input_free_bytecode");
-        let lhs = graph
-            .push_op(
+        let lhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "lhs".into(),
@@ -4299,8 +4283,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let rhs = graph
-            .push_op(
+        let rhs_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "rhs".into(),
@@ -4309,25 +4293,23 @@ mod tests {
                 true,
             )
             .unwrap();
-        let lhs_var = graph.must_variable(lhs);
-        let rhs_var = graph.must_variable(rhs);
-        let sum = graph
-            .push_op(
+        let sum_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: lhs_var,
-                    rhs: rhs_var,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(graph.must_variable(sum)));
+        graph.set_return(graph.startblock, Some(sum_var.clone()));
 
-        graph.set_concretetype(lhs, crate::model::ConcreteType::Signed);
-        graph.set_concretetype(rhs, crate::model::ConcreteType::Signed);
-        graph.set_concretetype(sum, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&sum_var, crate::model::ConcreteType::Signed);
 
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
@@ -4358,8 +4340,7 @@ mod tests {
     #[should_panic(expected = "OpKind::Input must be eliminated before assembly")]
     fn assemble_rejects_input_ops() {
         let mut graph = crate::model::FunctionGraph::new("bad_input");
-        let vid = graph.alloc_value();
-        let vid_var = graph.must_variable(vid);
+        let vid_var = graph.alloc_value_var();
         let mut flat = SSARepr {
             name: "bad_input".into(),
             insns: vec![FlatOp::Op(crate::model::SpaceOperation {

@@ -9,7 +9,7 @@
 //! `:355 Constant.__slots__ = ["concretetype"]`) — set inline by the
 //! rtyper via `RPythonTyper.setconcretetype()`
 //! (`rpython/rtyper/rtyper.py:258 v.concretetype = ...`).  Pyre
-//! reproduces this through `FunctionGraph::set_concretetype_inline`
+//! reproduces this through `FunctionGraph::set_concretetype_of_inline`
 //! writes followed by `graph.concretetype(v)` reads (which routes to
 //! the backing `Variable.concretetype` cell).  No external slot table
 //! survives.
@@ -48,29 +48,30 @@ pub use crate::model::ConcreteType;
 /// state.
 pub fn apply_from_flowspace_variables(
     graph: &mut FunctionGraph,
-    value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::SlotToVariable,
 ) {
-    for (vid, var) in value_to_var.iter() {
+    for (idx, var) in value_to_var.iter() {
         // Honour the docstring contract above: a source `Variable`
         // whose `concretetype` is still `None` represents the pre-
         // `setconcretetype` window in RPython, where the graph slot
-        // must remain untouched.  `bind_variable` is defensive about
-        // this (it only copies a `Some` concretetype onto the
+        // must remain untouched.  `bind_variable_at` is defensive
+        // about this (it only copies a `Some` concretetype onto the
         // placeholder), but invoking it with an untyped source still
-        // registers a spurious `variable_to_vid[var.id()] -> vid`
-        // entry that subsequent `value_id_of(&var)` lookups would
+        // registers a spurious `variable_to_vid[var.id()] -> slot`
+        // entry that subsequent `slot_of(&var)` lookups would
         // resolve unexpectedly.  Skip the call outright so the
         // docstring claim holds bit-for-bit.
         if var.concretetype().is_none() {
             continue;
         }
-        // `bind_variable` merges the rtyper Variable's `concretetype`
-        // onto the existing placeholder in `value_variables[vid]`,
-        // preserving Variable identity across every graph slot that
-        // holds the placeholder (Block.inputargs, op operands,
-        // Link.args, exitswitch, last_exception, last_exc_value).
-        // Mirrors upstream `v.concretetype = T` attribute aliasing.
-        graph.bind_variable(*vid, var.clone());
+        // `bind_variable_at` merges the rtyper Variable's
+        // `concretetype` onto the existing placeholder in
+        // `value_variables[slot]`, preserving Variable identity
+        // across every graph slot that holds the placeholder
+        // (Block.inputargs, op operands, Link.args, exitswitch,
+        // last_exception, last_exc_value).  Mirrors upstream
+        // `v.concretetype = T` attribute aliasing.
+        graph.bind_variable_at(*idx, var.clone());
     }
 }
 

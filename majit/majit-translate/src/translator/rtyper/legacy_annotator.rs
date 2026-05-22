@@ -32,9 +32,9 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 ///
 /// RPython equivalent: `RPythonAnnotator.complete()` — processes all
 /// blocks until no annotation changes.  All bindings land on
-/// `graph.variable(vid).annotation`; callers that want a flat
+/// `graph.variable_at(slot).annotation`; callers that want a flat
 /// `ValueType` discriminator read via `read_binding` (tests) or
-/// `somevalue_to_valuetype(&graph.variable(vid).annotation.borrow())`
+/// `somevalue_to_valuetype(&graph.variable_at(slot).annotation.borrow())`
 /// (production).
 pub fn annotate(graph: &FunctionGraph) {
     // RPython parity gap: `annrpython.py:RPythonAnnotator.complete()`
@@ -420,21 +420,22 @@ mod tests {
     fn annotates_const_int() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        let v_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
 
         annotate(&graph);
-        assert_eq!(read_binding(&graph.must_variable(v)), ValueType::Int);
+        assert_eq!(read_binding(&v_var), ValueType::Int);
     }
 
     #[test]
     fn annotates_field_read_type() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let v = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let v_var = graph
+            .push_op_var(
                 entry,
                 OpKind::FieldRead {
                     base: base_var,
@@ -445,49 +446,45 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(v)));
+        graph.set_return(entry, Some(v_var.clone()));
 
         annotate(&graph);
-        assert_eq!(read_binding(&graph.must_variable(v)), ValueType::Int);
+        assert_eq!(read_binding(&v_var), ValueType::Int);
     }
 
     #[test]
     fn annotates_call_with_int_args() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
-        let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
-        let a_var = graph.must_variable(a);
-        let b_var = graph.must_variable(b);
-        let result = graph
-            .push_op(
+        let a_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let b_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let result_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["w_int_add"]),
-                    args: vec![a_var, b_var],
+                    args: vec![a_var.clone(), b_var.clone()],
                     result_ty: ValueType::Unknown,
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(result)));
+        graph.set_return(entry, Some(result_var.clone()));
 
         annotate(&graph);
-        assert_eq!(read_binding(&graph.must_variable(a)), ValueType::Int);
-        assert_eq!(read_binding(&graph.must_variable(b)), ValueType::Int);
-        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Int);
+        assert_eq!(read_binding(&a_var), ValueType::Int);
+        assert_eq!(read_binding(&b_var), ValueType::Int);
+        assert_eq!(read_binding(&result_var), ValueType::Int);
     }
 
     #[test]
     fn annotates_path_like_int_helper_call() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
-        let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
-        let a_var = graph.must_variable(a);
-        let b_var = graph.must_variable(b);
-        let result = graph
-            .push_op(
+        let a_var = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let b_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let result_var = graph
+            .push_op_var(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["crate", "math", "w_int_add"]),
@@ -497,10 +494,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(result)));
+        graph.set_return(entry, Some(result_var.clone()));
 
         annotate(&graph);
-        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Int);
+        assert_eq!(read_binding(&result_var), ValueType::Int);
     }
 
     #[test]
@@ -510,21 +507,22 @@ mod tests {
         let entry = graph.startblock;
 
         // Entry: produce an Int value
-        let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+        let val_var = graph
+            .push_op_var(entry, OpKind::ConstInt(42), true)
+            .unwrap();
 
         // Create target block with one inputarg (Phi node)
-        let (target, phi_args) = graph.create_block_with_args(1);
-        let phi = phi_args[0];
+        let (target, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi_var = phi_args[0].clone();
 
         // Link: entry → target, passing val as the Phi arg
-        let val_var = graph.must_variable(val);
         graph.set_goto(entry, target, vec![val_var]);
-        graph.set_return(target, Some(graph.must_variable(phi)));
+        graph.set_return(target, Some(phi_var.clone()));
 
         annotate(&graph);
         // Phi should inherit Int from val via Link propagation
         assert_eq!(
-            read_binding(&graph.must_variable(phi)),
+            read_binding(&phi_var),
             ValueType::Int,
             "Phi node should receive Int annotation from Link args"
         );
@@ -534,11 +532,13 @@ mod tests {
     fn raise_link_propagates_exception_pair_with_special_types() {
         let mut graph = FunctionGraph::new("raise_link");
         let entry = graph.startblock;
-        let (exc_block, etype, evalue) = graph.exceptblock_args();
-        let last_exception = graph.alloc_value();
-        let last_exc_value = graph.alloc_value();
-        let last_exception_var = graph.must_variable(last_exception);
-        let last_exc_value_var = graph.must_variable(last_exc_value);
+        let exc_block = graph.exceptblock;
+        let (etype_var, evalue_var) = {
+            let inputargs = &graph.block(exc_block).inputargs;
+            (inputargs[0].clone(), inputargs[1].clone())
+        };
+        let last_exception_var = graph.alloc_value_var();
+        let last_exc_value_var = graph.alloc_value_var();
         graph.set_control_flow_metadata(
             entry,
             Some(ExitSwitch::LastException),
@@ -550,33 +550,26 @@ mod tests {
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::Value(last_exception_var)),
-                    Some(LinkArg::Value(last_exc_value_var)),
+                    Some(LinkArg::Value(last_exception_var.clone())),
+                    Some(LinkArg::Value(last_exc_value_var.clone())),
                 ),
             ],
         );
 
         annotate(&graph);
-        assert_eq!(
-            read_binding(&graph.must_variable(last_exception)),
-            ValueType::Int
-        );
-        assert_eq!(
-            read_binding(&graph.must_variable(last_exc_value)),
-            ValueType::Ref
-        );
-        assert_eq!(read_binding(&graph.must_variable(etype)), ValueType::Int);
-        assert_eq!(read_binding(&graph.must_variable(evalue)), ValueType::Ref);
+        assert_eq!(read_binding(&last_exception_var), ValueType::Int);
+        assert_eq!(read_binding(&last_exc_value_var), ValueType::Ref);
+        assert_eq!(read_binding(&etype_var), ValueType::Int);
+        assert_eq!(read_binding(&evalue_var), ValueType::Ref);
     }
 
     #[test]
     fn propagates_float_return_into_returnblock() {
         let mut graph = FunctionGraph::new("float_return");
         let entry = graph.startblock;
-        let base = graph.alloc_value();
-        let base_var = graph.must_variable(base);
-        let result = graph
-            .push_op(
+        let base_var = graph.alloc_value_var();
+        let result_var = graph
+            .push_op_var(
                 entry,
                 OpKind::FieldRead {
                     base: base_var,
@@ -587,11 +580,11 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(graph.must_variable(result)));
+        graph.set_return(entry, Some(result_var.clone()));
 
         annotate(&graph);
         let ret_var = graph.block(graph.returnblock).inputargs[0].clone();
-        assert_eq!(read_binding(&graph.must_variable(result)), ValueType::Float);
+        assert_eq!(read_binding(&result_var), ValueType::Float);
         assert_eq!(read_binding(&ret_var), ValueType::Float);
     }
 

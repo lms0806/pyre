@@ -40,8 +40,8 @@ use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 // `lower_indirect_calls` records the inserted `VtableMethodPtr` funcptr
 // as Signed for downstream regalloc / flatten via
-// `graph.set_concretetype_inline(vid, ConcreteType::Signed)` — the
-// rtyper-orthodox `v.concretetype = lltype` write
+// `FunctionGraph::set_concretetype_of_inline(&var, ConcreteType::Signed)` —
+// the rtyper-orthodox `v.concretetype = lltype` write
 // (`rpython/rtyper/rtyper.py:258`).
 
 /// RPython `ConcreteCallTableRow(dict)` (rpbc.py:71-82).
@@ -746,8 +746,8 @@ pub(crate) mod tests {
 
     fn build_indirect_graph() -> crate::model::FunctionGraph {
         let mut graph = crate::model::FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "h".to_string(),
@@ -756,7 +756,6 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
-        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -860,8 +859,8 @@ pub(crate) mod tests {
         );
 
         let mut graph = crate::model::FunctionGraph::new("outer");
-        let receiver = graph
-            .push_op(
+        let receiver_var = graph
+            .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "f".to_string(),
@@ -870,7 +869,6 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
-        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {

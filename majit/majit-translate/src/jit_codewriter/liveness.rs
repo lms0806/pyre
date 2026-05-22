@@ -31,25 +31,15 @@ use crate::regalloc::RegAllocResult;
 /// `SpaceOperation` whose operand reads are kind-driven.
 /// RPython liveness.py:19-23.
 ///
-/// `graph` is required: every `FlatOp::Op` operand's kind reads
-/// through `graph.concretetype(v)` (the upstream
-/// `Variable.concretetype` source of truth), so a `None` here would
-/// silently strip operand uses from the alive set — that regressed
-/// `main`-shaped parity before this API became graph-only.
-pub fn compute_liveness(
-    flattened: &mut SSARepr,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-    graph: &crate::model::FunctionGraph,
-) {
+/// Operand kinds read through `Variable.concretetype` directly via
+/// `variable_to_register`, so this entry no longer needs the
+/// surrounding `FunctionGraph` — the kind lives on every operand
+/// Variable itself (upstream `Variable.concretetype` parity).
+pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
     loop {
-        if !compute_liveness_pass_with_graph(
-            &mut flattened.insns,
-            &mut label2alive,
-            regallocs,
-            Some(graph),
-        ) {
+        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs) {
             break;
         }
     }
@@ -185,11 +175,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 /// `FunctionGraph::concretetype_of(&var)` and color via
 /// `RegAllocResult::color_for_variable(&var)`, matching upstream
 /// `flatten.py:382 getcolor` line-for-line.
-fn compute_liveness_pass_with_graph(
+fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    graph: Option<&crate::model::FunctionGraph>,
 ) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
@@ -249,13 +238,8 @@ fn compute_liveness_pass_with_graph(
                 if let Some(result) = inner_op.result.as_ref() {
                     def_value(&mut alive, result);
                 }
-                if let Some(g) = graph {
-                    for var in crate::inline::op_variable_refs(&inner_op.kind, g)
-                        .into_iter()
-                        .flatten()
-                    {
-                        use_value(&mut alive, &var);
-                    }
+                for var in crate::inline::op_variable_refs(&inner_op.kind) {
+                    use_value(&mut alive, &var);
                 }
             }
             FlatOp::Jump(label) => {
@@ -493,13 +477,9 @@ mod tests {
         // v2 = BinOp(v0, v1)
         // Return v2
         let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
-        let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
         let v0 = crate::flowspace::model::Variable::new();
         let v1 = crate::flowspace::model::Variable::new();
         let v2 = crate::flowspace::model::Variable::new();
-        graph.alloc_value_with_variable(v0.clone());
-        graph.alloc_value_with_variable(v1.clone());
-        graph.alloc_value_with_variable(v2.clone());
         let mut flat = SSARepr {
             name: "test".into(),
             insns: vec![
@@ -533,7 +513,7 @@ mod tests {
         // for the FlatOp::Op `Variable → Register` bridge; pass an
         // empty map since this fixture has no inputargs that exercise
         // the conversion.
-        compute_liveness(&mut flat, &regallocs, &graph);
+        compute_liveness(&mut flat, &regallocs);
     }
 
     #[test]
