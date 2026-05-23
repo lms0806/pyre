@@ -770,6 +770,7 @@ impl MIFrame {
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -1633,7 +1634,12 @@ impl MIFrame {
             let portal_frame_reg = jc.payload.metadata.portal_frame_reg as u32;
             let portal_ec_reg = jc.payload.metadata.portal_ec_reg as u32;
             let sym_frame = self.sym().frame;
-            let sym_ec = self.sym().execution_context;
+            // [frame, ec] portal-reds contract: `sym.execution_context`
+            // may be OpRef::NONE on adapter paths (CALL_ASSEMBLER bridge
+            // attach, bridge-from-guard). `ensure_execution_context`
+            // recovers it via GETFIELD_GC(frame, execution_context_descr)
+            // when needed; otherwise returns the seeded value.
+            let sym_ec = self.ensure_execution_context(ctx);
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
                 let opref = if reg_idx == portal_frame_reg {
@@ -2871,6 +2877,10 @@ impl MIFrame {
         // current pc so `stack_only` reflects the actual JUMP-source
         // stack depth instead of the stale symbolic counter.
         let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
+        // [frame, ec] portal-reds contract: recover ec before the sym()
+        // snapshot below so JUMP args never carry OpRef::NONE in the ec
+        // slot on adapter / bridge-from-guard paths.
+        let recovered_ec = self.ensure_execution_context(ctx);
         let (
             frame,
             execution_context,
@@ -2958,7 +2968,7 @@ impl MIFrame {
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
             (
                 s.frame,
-                s.execution_context,
+                recovered_ec,
                 s.vable_last_instr,
                 s.vable_pycode,
                 s.vable_valuestackdepth,
@@ -3226,13 +3236,17 @@ impl MIFrame {
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
+        // [frame, ec] portal-reds contract. Recover ec before snapshotting
+        // sym fields so guard fail_args never carry OpRef::NONE in the ec
+        // slot (adapter/bridge-from-guard paths).
+        let ec = self.ensure_execution_context(ctx);
         let s = self.sym();
         let mut fa =
             Vec::with_capacity(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + active_boxes.len());
         fa.push(s.frame);
         // NUM_EXTRA_REDS == 1 (crate const-assert in `lib.rs`).
         // `interp_jit.py:67 reds = ['frame', 'ec']`.
-        fa.push(s.execution_context);
+        fa.push(ec);
         fa.extend_from_slice(&[
             s.vable_last_instr,
             s.vable_pycode,
@@ -6353,6 +6367,14 @@ impl MIFrame {
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         self.suppress_guard_no_exception_for_opcode = false;
+        // Snapshot op count so handle_possible_exception can detect
+        // whether this bytecode emitted any CALL_* family op. PyPy
+        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
+        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
+        // that gating so inlined primitive bodies (int_*_ovf + boxing
+        // + guards) don't accrete orphan exception guards.
+        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
+        self.pre_opcode_op_count = Some(pre_op_count);
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -6585,10 +6607,32 @@ impl MIFrame {
             // RERAISE-issuing site is the only producer of reraise_lasti.
             self.finishframe_exception(code, pc, -1)
         } else {
-            // pyjitpl.py:3397: GUARD_NO_EXCEPTION
-            self.with_ctx(|this, ctx| {
-                this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
-            });
+            // pyjitpl.py:3397: GUARD_NO_EXCEPTION.
+            //
+            // PyPy emits `GUARD_NO_EXCEPTION` only inside `do_residual_call`
+            // (pyjitpl.py:2082), so the guard exists only when the bytecode
+            // actually recorded a CALL_* family op that could have set the
+            // exception flag. Pyre's `handle_possible_exception` runs at
+            // every may-raise bytecode end regardless of the inner
+            // dispatch's structure, which leaves orphan exception guards
+            // after bytecodes whose body inlined entirely to primitives
+            // (e.g., `int_mul_ovf` + boxing/guards from `mul(x, x)`). Skip
+            // the emit when the bytecode's recording window contains no
+            // CALL_* op — mirrors PyPy's structural invariant at recording
+            // time, avoiding the post-opt `optimize_GUARD_NO_EXCEPTION`
+            // dependency on the `last_emitted_operation is REMOVED`
+            // sentinel (optimizeopt/heap.py:692) which pyre's per-pass
+            // `last_emitted_was_removed` flag cannot preserve across
+            // intermediate is_always_pure ops.
+            let skip = match self.pre_opcode_op_count {
+                Some(start) => self.with_ctx(|_this, ctx| !ctx.any_call_recorded_since(start)),
+                None => false,
+            };
+            if !skip {
+                self.with_ctx(|this, ctx| {
+                    this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                });
+            }
             TraceAction::Continue
         }
     }
@@ -6858,6 +6902,14 @@ impl MIFrame {
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         self.suppress_guard_no_exception_for_opcode = false;
+        // Snapshot op count so handle_possible_exception can detect
+        // whether this bytecode emitted any CALL_* family op. PyPy
+        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
+        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
+        // that gating so inlined primitive bodies (int_*_ovf + boxing
+        // + guards) don't accrete orphan exception guards.
+        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
+        self.pre_opcode_op_count = Some(pre_op_count);
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
@@ -8213,6 +8265,7 @@ mod tests {
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
@@ -8289,6 +8342,7 @@ mod tests {
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
             pre_opcode_semantic_depth: Some(3),
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
