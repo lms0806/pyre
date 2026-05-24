@@ -1872,7 +1872,107 @@ impl TraceCtx {
         jitcode_index: u32,
         pc: u32,
     ) {
-        let boxes: Vec<crate::recorder::SnapshotTagged> = active_boxes
+        self.capture_snapshot_for_last_guard_with_vable_vref(
+            active_boxes,
+            jitcode_index,
+            pc,
+            &[],
+            &[],
+        );
+    }
+
+    /// `capture_snapshot_for_last_guard` extended with virtualizable /
+    /// virtualref payloads.  Mirrors `opencoder.py:767-784 create_top_snapshot`
+    /// which prefixes the frame snapshot with a vable_array and a
+    /// vref_array; both arrays end up in `Snapshot.vable_boxes` /
+    /// `Snapshot.vref_boxes`, are consumed by `resume.rs::number()`, and
+    /// surface at resume time via `consume_vable_info` /
+    /// `consume_virtualref_info` (`resume.py:1404` / `resume.py:1417`).
+    ///
+    /// Callers carrying a live virtualizable or live virtualrefs at the
+    /// guard point (currently only the walker-snapshot path via
+    /// `walker_capture_snapshot_for_last_guard`) supply the pre-shaped
+    /// `vable_boxes` / `vref_boxes` slices; `_list_of_boxes_virtualizable`
+    /// identity-front reordering is the caller's responsibility (see
+    /// `pyjitpl/dispatch.rs::build_state_field_snapshot` for the upstream-
+    /// matching shape).
+    pub fn capture_snapshot_for_last_guard_with_vable_vref(
+        &mut self,
+        active_boxes: &[OpRef],
+        jitcode_index: u32,
+        pc: u32,
+        vable_boxes: &[crate::recorder::SnapshotTagged],
+        vref_boxes: &[crate::recorder::SnapshotTagged],
+    ) {
+        let boxes = self.encode_snapshot_boxes(active_boxes);
+        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index,
+                pc,
+                boxes,
+            }],
+            vable_boxes: vable_boxes.to_vec(),
+            vref_boxes: vref_boxes.to_vec(),
+        });
+        self.set_last_guard_resume_position(snapshot_id);
+    }
+
+    /// Multi-frame variant of [`capture_snapshot_for_last_guard`].
+    ///
+    /// Mirrors `opencoder.py:819-832 capture_resumedata` which walks
+    /// `framestack[-1] .. framestack[0]` and emits one `SnapshotFrame`
+    /// per `MIFrame`.  `frames[0]` is the TOP frame (currently
+    /// executing); `frames[1..]` are the paused parents in walker-call-
+    /// order (immediate caller, then its caller, etc.).
+    ///
+    /// Each frame triple `(jitcode_index, py_pc, boxes)` is encoded
+    /// into `Snapshot.frames` in the order given.  Callers are
+    /// responsible for deduplicating box positions across frames
+    /// (RPython's `_number_boxes` does this implicitly via the memo
+    /// table; pyre's `Snapshot.encode` does the same in
+    /// `resume.rs:1898 _number_boxes`).
+    pub fn capture_snapshot_for_last_guard_multi_frame(&mut self, frames: &[(u32, u32, &[OpRef])]) {
+        self.capture_snapshot_for_last_guard_multi_frame_with_vable_vref(frames, &[], &[]);
+    }
+
+    /// `capture_snapshot_for_last_guard_multi_frame` extended with
+    /// virtualizable / virtualref payloads — see
+    /// [`capture_snapshot_for_last_guard_with_vable_vref`] for the
+    /// upstream parity rationale.  Multi-frame snapshots that capture a
+    /// guard with a live virtualizable need to carry vable/vref boxes on
+    /// the top (currently-executing) frame so the resume reader's
+    /// `consume_vable_info` finds the same array length and box identities
+    /// it sees in the trace-time MIFrame stack.
+    pub fn capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+        &mut self,
+        frames: &[(u32, u32, &[OpRef])],
+        vable_boxes: &[crate::recorder::SnapshotTagged],
+        vref_boxes: &[crate::recorder::SnapshotTagged],
+    ) {
+        let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
+            .iter()
+            .map(|(jitcode_index, py_pc, boxes)| {
+                let encoded = self.encode_snapshot_boxes(boxes);
+                crate::recorder::SnapshotFrame {
+                    jitcode_index: *jitcode_index,
+                    pc: *py_pc,
+                    boxes: encoded,
+                }
+            })
+            .collect();
+        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            frames: recorder_frames,
+            vable_boxes: vable_boxes.to_vec(),
+            vref_boxes: vref_boxes.to_vec(),
+        });
+        self.set_last_guard_resume_position(snapshot_id);
+    }
+
+    fn encode_snapshot_boxes(
+        &self,
+        active_boxes: &[OpRef],
+    ) -> Vec<crate::recorder::SnapshotTagged> {
+        active_boxes
             .iter()
             .map(|opref| {
                 let tp = self
@@ -1887,17 +1987,7 @@ impl TraceCtx {
                     crate::recorder::SnapshotTagged::Box(*opref, tp)
                 }
             })
-            .collect();
-        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
-            frames: vec![crate::recorder::SnapshotFrame {
-                jitcode_index,
-                pc,
-                boxes,
-            }],
-            vable_boxes: Vec::new(),
-            vref_boxes: Vec::new(),
-        });
-        self.set_last_guard_resume_position(snapshot_id);
+            .collect()
     }
 
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.

@@ -10,7 +10,8 @@ pub use dispatch::{
     trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };
-pub(crate) use dispatch::{call_int_function, call_ref_function, call_void_function};
+pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
+pub use dispatch::{call_int_function, call_ref_function, call_void_function};
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
@@ -363,6 +364,14 @@ impl StoredExitLayout {
 /// shadow expects. Mirrors the inverse of `Const::as_raw_i64()` so the
 /// shadow never disagrees with the register-shadow encoding.
 fn heap_value_for(ty: Type, bits: i64) -> Value {
+    heap_value_for_pub(ty, bits)
+}
+
+/// Public wrapper of `heap_value_for` for crate-internal callers that
+/// can't access the private helper directly (the wrapper keeps the
+/// private-by-default discipline while letting `trace_ctx::refresh
+/// _virtualizable_shadow_from_heap` reuse the same decode rule).
+pub(crate) fn heap_value_for_pub(ty: Type, bits: i64) -> Value {
     match ty {
         Type::Int => Value::Int(bits),
         Type::Float => Value::Float(f64::from_bits(bits as u64)),

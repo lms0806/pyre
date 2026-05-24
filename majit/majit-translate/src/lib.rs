@@ -709,11 +709,51 @@ fn analyze_pipeline_from_parsed(
                     .return_types
                     .insert(path.clone(), ret_type.clone());
             }
+            // Mirror RPython `func._elidable_function_` / `func._jit_*_`:
+            // `register_trait_method` populates `function_graphs` only, so
+            // the BFS sees hint-less SemanticFunctions for trait methods
+            // and inlines elidable methods that should remain residual.
+            // `register_function_hints_for` is a side-table-only write
+            // (no graph re-insertion) that fills `function_hints` keyed
+            // on the same `[impl_type, method_name]` path the BFS uses.
+            if !method.hints.is_empty() {
+                call_control.register_function_hints_for(path.clone(), method.hints.clone());
+                // Default-method bodies also register under `[trait_name,
+                // method_name]` (see the `register_function_graph(direct_path,
+                // direct_graph)` branch above); mirror the hint registration
+                // so the BFS reaches the same `_reject_function("elidable")`
+                // verdict regardless of which path it walks.
+                if impl_info.for_type.starts_with("<default methods of ") {
+                    let direct_path = crate::parse::CallPath::from_segments([
+                        impl_info.trait_name.as_str(),
+                        method.name.as_str(),
+                    ]);
+                    call_control.register_function_hints_for(direct_path, method.hints.clone());
+                }
+            }
             // RPython: hints bound to graph identity.
+            let default_direct_path = if impl_info.for_type.starts_with("<default methods of ") {
+                Some(crate::parse::CallPath::from_segments([
+                    impl_info.trait_name.as_str(),
+                    method.name.as_str(),
+                ]))
+            } else {
+                None
+            };
             for hint in &method.hints {
                 match hint.as_str() {
-                    "elidable" => call_control.mark_elidable(path.clone()),
-                    "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
+                    "elidable" => {
+                        call_control.mark_elidable(path.clone());
+                        if let Some(ref dp) = default_direct_path {
+                            call_control.mark_elidable(dp.clone());
+                        }
+                    }
+                    "loopinvariant" => {
+                        call_control.mark_loopinvariant(path.clone());
+                        if let Some(ref dp) = default_direct_path {
+                            call_control.mark_loopinvariant(dp.clone());
+                        }
+                    }
                     "close_stack" => call_control.mark_close_stack(path.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
                     "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
@@ -731,7 +771,21 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
-        call_control.register_function_graph(path.clone(), method_info.graph.clone());
+        // Pair the graph with the method's hints so the BFS-driven
+        // `look_inside_graph` synthesises a `SemanticFunction` whose
+        // `_reject_function("elidable")` mirrors RPython's
+        // `getattr(func, "_elidable_function_", False)`.  Without this
+        // the BFS sees impl methods as hint-less and inlines elidable
+        // methods (e.g. `PyFrame::nlocals`) that should remain residual.
+        if method_info.hints.is_empty() {
+            call_control.register_function_graph(path.clone(), method_info.graph.clone());
+        } else {
+            call_control.register_function_graph_with_hints(
+                path.clone(),
+                method_info.graph.clone(),
+                method_info.hints.clone(),
+            );
+        }
         if let Some(ref ret_type) = method_info.return_type {
             call_control
                 .return_types
@@ -788,6 +842,22 @@ fn analyze_pipeline_from_parsed(
             let mut crate_segs = vec!["crate"];
             crate_segs.extend(segments.iter().copied());
             paths.push(crate::parse::CallPath::from_segments(crate_segs));
+            // Module-qualified alias for in-module bare calls qualified
+            // by `canonical_call_target:7494-7502`.  Without this every
+            // `#[majit_macros::elidable*]` (and `#[oopspec]` /
+            // `#[loop_invariant]` / etc.) hint on a free fn would be
+            // silently dropped by every same-module call site that
+            // spells the callee as a single identifier.
+            if !func.module_path.is_empty() && segments.len() == 1 {
+                let mut mod_segs: Vec<&str> = func.module_path.split("::").collect();
+                mod_segs.extend(segments.iter().copied());
+                paths.push(crate::parse::CallPath::from_segments(
+                    mod_segs.iter().copied(),
+                ));
+                let mut crate_mod_segs = vec!["crate"];
+                crate_mod_segs.extend(mod_segs.iter().copied());
+                paths.push(crate::parse::CallPath::from_segments(crate_mod_segs));
+            }
         }
         for hint in &func.hints {
             for p in &paths {

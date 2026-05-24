@@ -443,6 +443,80 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::jit_range_iter_new as *const (),
     );
 
+    // `@jit.elidable`-decorated inherent methods that show up as
+    // `residual_call_*` in the codewriter (`call.py:181-187
+    // getfunctionptr(graph)` parity).  Without an entry here
+    // `direct_funcptr_value` (`jtransform.rs:614-623`) falls back to
+    // `symbolic_fnaddr_for_path`, which is a deterministic hash but NOT
+    // a valid function address — invoking it at the walker's
+    // `execute_residual_call` (`jitcode_dispatch.rs:3192-3239`) is an
+    // immediate SEGV.  Path shape matches
+    // `target_to_path` for inherent method calls
+    // (`call.rs:3024-3028 CallPath::for_impl_method(impl_type_joined,
+    // method)`): the `register_macro_helper_trace_fnaddr` string-strip
+    // drops the leading crate segment, leaving `[module, Type, method]`
+    // which is the exact 3-segment shape `for_impl_method` produces.
+    //
+    // PyFrame::nlocals — invoked by `eval.rs:840 pop_value` and is the
+    // funcptr the walker reaches when dispatching `PopTop`'s nested
+    // `pop_value` sub-jitcode.
+    let pyframe_nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::nlocals",
+        pyframe_nlocals as *const (),
+    );
+
+    // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
+    // at `eval.rs:844 Ok(PyFrame::pop(self))`. The codewriter resolves
+    // the qualified `PyFrame::pop(self)` syntax to a 2-segment CallPath
+    // `["PyFrame", "pop"]` (without the `pyframe::` module prefix that a
+    // bare method call like `self.nlocals()` would have).
+    // `register_macro_helper_trace_fnaddr` strips the leading segment,
+    // so the 3-segment input string `pyre_interpreter::PyFrame::pop`
+    // produces the matching 2-segment canonical form.
+    let pyframe_pop: fn(&mut crate::pyframe::PyFrame) -> pyre_object::PyObjectRef =
+        crate::pyframe::PyFrame::pop;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyFrame::pop",
+        pyframe_pop as *const (),
+    );
+
+    // `pop_value`'s underflow guard returns `stack_underflow_error(...)`
+    // when the value stack is empty (`eval.rs:840-845` +
+    // `eval.rs:847-852 peek_at`). The codewriter follows that call edge
+    // into the `stack_underflow_error` helper jitcode, whose `constants_i[0]`
+    // is the function pointer the walker invokes at residual_call time.
+    // Without this binding the codewriter falls back to
+    // `symbolic_fnaddr_for_path`, which is a deterministic hash and
+    // SEGVs when called.  `lib.rs:72 pub use shared_opcode::*` re-exports
+    // the helper at the crate root, so the codewriter resolves
+    // `stack_underflow_error` to `pyre_interpreter::stack_underflow_error`
+    // when it appears as a bare identifier in `eval.rs`; register both
+    // the module-qualified path and the root re-export path via
+    // [`push_alias_pair`].
+    let stack_underflow: fn(&str) -> crate::PyError = crate::shared_opcode::stack_underflow_error;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::shared_opcode::stack_underflow_error",
+        "pyre_interpreter::stack_underflow_error",
+        stack_underflow as *const (),
+    );
+
+    // `PyError::type_error` — invoked by `stack_underflow_error`'s body
+    // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
+    // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
+    // type segment + method segment).  `register_macro_helper_trace_fnaddr`
+    // strips the leading crate segment, so the input string must have
+    // exactly 3 segments to produce the desired 2-segment canonical form.
+    let pyerror_type_error: fn(String) -> crate::PyError = |msg| crate::PyError::type_error(msg);
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyError::type_error",
+        pyerror_type_error as *const (),
+    );
+
     // RPython convention (cross-reference `support.py:255-271` for
     // the C-trunc helpers, `rint.py:398/495` for the Python-floor
     // ones) is to keep the two semantic flavours under DISTINCT

@@ -67,7 +67,13 @@ pub struct Snapshot {
 pub struct SnapshotFrame {
     /// Index of the jitcode (or 0 for the root portal).
     pub jitcode_index: u32,
-    /// Program counter within the jitcode.
+    /// Program counter within the jitcode.  In RPython, the MIFrame's
+    /// `pc` field IS the JitCode byte offset (`pyjitpl.py:185
+    /// setposition`).  Pyre's tracer populates this slot with the Python
+    /// bytecode PC because pyre traces Python bytecode rather than JitCode
+    /// — see `[[project-issue73-phase5-design]]` for the broader deviation
+    /// context; the runtime translates `py_pc` through `pc_map` at resume
+    /// time until pyre's walker-as-tracer epic lands.
     pub pc: u32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,

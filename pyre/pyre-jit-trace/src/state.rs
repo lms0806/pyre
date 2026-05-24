@@ -768,7 +768,8 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             None => return 0,
         };
         let payload = &jc.payload;
-        if let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) {
+        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
+        if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
             if off + 2 < all_liveness.len() {
@@ -977,7 +978,8 @@ pub fn frame_liveness_reg_indices_by_bank_at(
                 float: Vec::new(),
             };
         }
-        let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) else {
+        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
+        let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
@@ -5798,7 +5800,7 @@ impl JitState for PyreJitState {
                 }
                 return true;
             }
-            let Some(&jit_pc) = payload.metadata.pc_map.get(live_pc) else {
+            let Some(jit_pc) = payload.resume_jitcode_pc_for(live_pc) else {
                 return false;
             };
             let all_liveness = liveness_info_snapshot();

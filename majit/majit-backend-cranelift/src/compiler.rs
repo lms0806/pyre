@@ -674,7 +674,7 @@ fn caller_prefix_recovery_layout(
             // Placeholder: this caller-prefix identity layout is replaced by
             // the resume_layout-derived layout via
             // `compile::patch_guard_recovery_layouts_for_trace`
-            // (compile.rs:1596) before any guard can fire. The
+            // (compile.rs:1596) before any guard can fire.  The
             // resume_layout carries the authoritative jitcode_index
             // threaded from `Snapshot::single_frame`.
             jitcode_index: 0,

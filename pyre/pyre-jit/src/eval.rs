@@ -2980,21 +2980,36 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // Runtime no-op. Only handles trace feed when tracing is active.
+        let mut walker_dispatched_this_opcode = false;
         if is_portal {
             let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
-            if let Some(depth) = tracing_depth {
-                if call_depth() == depth {
-                    if let Some(loop_result) =
-                        jit_merge_point_hook(frame, code, pc, driver, info, &env)
-                    {
-                        return loop_result;
-                    }
-                }
-            } else if driver.is_tracing() {
-                // First merge_point after trace start — depth not yet set.
+            let merge_point_active = if let Some(depth) = tracing_depth {
+                call_depth() == depth
+            } else {
+                driver.is_tracing()
+            };
+            if merge_point_active {
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
                     return loop_result;
+                }
+                // Issue #73 Phase 5 partial flip (per-opcode).  When the
+                // tracer's `trace_code_step` routed the opcode through
+                // `dispatch_via_walker_for_opcode`, the walker arm's
+                // emitted IR ran through `vable_setfield` /
+                // `vable_setarrayitem_indexed` → `synchronize_virtualizable`
+                // (trace_ctx.rs:1224..1265), which writes the shadow
+                // back to the live heap PyFrame.  Running
+                // `execute_opcode_step` below would mutate the same
+                // PyFrame state a second time (double-decrement of
+                // `valuestackdepth`, etc.).  RPython doesn't see this
+                // because MetaInterp.interpret IS the execution loop —
+                // there is no separate `eval_loop_jit`.  Until Phase 5
+                // retires `execute_opcode_step` from this loop entirely,
+                // the per-opcode skip below brings the gating in line
+                // with RPython for the allow-listed instructions only.
+                if pyre_jit_trace::production_walker_handles(&instruction) {
+                    walker_dispatched_this_opcode = true;
                 }
             }
         }
@@ -3049,7 +3064,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         let mut next_instr = frame.next_instr();
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+        let step_result = if walker_dispatched_this_opcode {
+            // Walker arm already advanced PyFrame via
+            // `synchronize_virtualizable`; skip the interpreter-side
+            // execute step to avoid double-mutation.  pc advancement
+            // already happened above via `set_last_instr_from_next_instr
+            // (opcode_pc + 1)`.
+            Ok(StepResult::Continue)
+        } else {
+            execute_opcode_step(frame, code, instruction, op_arg, next_instr)
+        };
+        match step_result {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
                 // every traced step to prevent infinite trace recording.
@@ -6116,27 +6141,9 @@ fn build_resumed_frames(
             // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
-        // Pre-translate py_pc → jitcode_pc when the writer can resolve
-        // the pyjitcode + pc_map entry.  Mirrors upstream
-        // `blackhole.py:1712 setposition(miframe.jitcode, miframe.pc)`
-        // shape where the JitCode PC is what reaches the resume site.
-        // Pseudo-instruction adjustment (Cache / ExtendedArg / NotTaken
-        // backtracking, `call_jit.rs:793-803`) still runs at read time
-        // because it depends on the raw `py_pc` and the live code
-        // object — pre-applying it here would require duplicating the
-        // adjustment loop, so the cache stores the unadjusted lookup
-        // and falls through to the read-time path when the adjusted
-        // py_pc differs.
-        let jitcode_pc = if !w_code.is_null() {
-            pyre_jit_trace::state::pyjitcode_for_code(w_code)
-                .and_then(|pjc| pjc.resume_jitcode_pc_for(py_pc))
-        } else {
-            None
-        };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
-            jitcode_pc,
             rd_numb_pc: if frame.pc >= 0 {
                 Some(frame.pc as usize)
             } else {
@@ -7856,7 +7863,7 @@ mod tests {
         // target PC needs depth=2 (post-Task #158 force-add removal,
         // stack-slot colors no longer always appear in `live_r`, so a
         // depth-based locator is needed instead of `&[1, 2]` regs).
-        let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
+        let (mut frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
             "def f(x):\n    return (x, x)\nf(1)\n",
             "f",
             2,
@@ -7864,6 +7871,14 @@ mod tests {
                 frame.locals_w_mut()[0] = w_int_new(7);
             },
         );
+        // Issue #73 Phase 4.5: `live_args_shape_at` and
+        // `close_loop_args_at` both derive their JUMP-args shape from
+        // `concrete_valuestackdepth()`.  The symbolic state below
+        // advertises `valuestackdepth=3` (one local + two stack slots);
+        // seed the concrete `PyFrame.valuestackdepth` to match so the
+        // shape derivation reflects the same user-side stack the
+        // symbolic mirror is testing.
+        frame.valuestackdepth = 3;
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(0);

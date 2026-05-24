@@ -256,7 +256,10 @@ impl From<majit_ir::OpRef> for SnapshotBox {
 pub struct SnapshotFrame {
     /// Index into the jitcode table (resume.py:250 jitcode_index).
     pub jitcode_index: i32,
-    /// Bytecode program counter (resume.py:250 pc).
+    /// Bytecode program counter (resume.py:250 pc).  In RPython this
+    /// is the JitCode byte offset; pyre stores the Python bytecode PC
+    /// here as a deviation (see `[[project-issue73-phase5-design]]`).
+    /// Resume readers translate via `PyJitCode::resume_jitcode_pc_for`.
     pub pc: i32,
     /// Live boxes for this frame's registers (resume.py:253).
     pub boxes: Vec<SnapshotBox>,
@@ -4888,9 +4891,9 @@ mod tests {
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
 
-        assert_eq!(items[5], 0);
-        assert_eq!(items[6], 0);
-        assert_eq!(items[7], 8);
+        assert_eq!(items[5], 0); // vref_array_length
+        assert_eq!(items[6], 0); // jitcode_index
+        assert_eq!(items[7], 8); // pc
 
         // The frame slot reuses the payload tag because numbering follows
         // Box identity exactly: upstream dedups only when the same Box object
@@ -4906,7 +4909,7 @@ mod tests {
         use crate::jitcode::JitCodeBuilder;
         use crate::jitcode::insns::{BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
 
-        let mut writer = crate::resumecode::Writer::new(6);
+        let mut writer = crate::resumecode::Writer::new(7);
         writer.append_int(0); // items_resume_section (patched below)
         writer.append_int(0); // count: no failargs
         writer.append_int(0); // vable_array length
@@ -6137,7 +6140,7 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
 
-    /// resume.py:928 read_jitcode_pos_pc
+    /// resume.py:928 read_jitcode_pos_pc.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
         let pc = self.resumecodereader.next_item();

@@ -927,6 +927,38 @@ impl MIFrame {
         self.sym().valuestackdepth
     }
 
+    /// Read `PyFrame.valuestackdepth` directly from the concrete frame at
+    /// `concrete_frame_addr`.  Issue #73 Phase 4.5 slice 1: the orthodox
+    /// PyPy-parity replacement for `self.sym().valuestackdepth`.
+    ///
+    /// RPython has no symbolic mirror of the Python stack — `MIFrame` only
+    /// holds the per-jitcode-invocation register banks (`registers_r/i/f`),
+    /// and the user-side stack lives in `PyFrame.locals_cells_stack_w` /
+    /// `PyFrame.valuestackdepth` accessed via IR `getfield/setfield` on the
+    /// virtualizable.  Pyre's `PyreSym.valuestackdepth` is a newly
+    /// introduced divergence (a symbolic mirror) that drifts from
+    /// `PyFrame.valuestackdepth` whenever the production walker handles an
+    /// opcode that mutates the concrete stack (the walker records the
+    /// residual_call but does not run `MIFrame::pop_value`'s `sym.valuestackdepth -= 1`).
+    ///
+    /// Returns `None` when:
+    /// 1. `concrete_frame_addr == 0` (tests constructing a sym-only `MIFrame`)
+    /// 2. `self.parent_frames` is non-empty (this MIFrame is an inline
+    ///    callee — its `concrete_frame_addr` is the heap PyFrame snapshot
+    ///    frozen at CALL entry and does not advance during inline body
+    ///    tracing.  The live traced depth for an inline frame lives only in
+    ///    `sym.valuestackdepth`, which the walker / trait dispatch update
+    ///    via `push_typed_value` / `pop_value` as the inline body executes).
+    ///
+    /// Production tracer paths always seed `concrete_frame_addr` from the
+    /// live `PyFrame` for the top frame.
+    pub(crate) fn concrete_valuestackdepth(&self) -> Option<usize> {
+        if !self.parent_frames.is_empty() {
+            return None;
+        }
+        crate::state::concrete_stack_depth(self.concrete_frame_addr)
+    }
+
     #[doc(hidden)]
     pub fn symbolic_registers_r(&self) -> &[OpRef] {
         &self.sym().registers_r
@@ -993,6 +1025,14 @@ impl MIFrame {
         // the actual live extent at the current opcode, not the stale
         // symbolic counter.
         let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
+        // Issue #73 Phase 4.5: prefix_len fallback reads
+        // `PyFrame.valuestackdepth` rather than the symbolic mirror.
+        // `capture_pre_opcode_state` runs at the orgpc anchor where
+        // PyFrame holds the pre-opcode state (the interpreter step has
+        // not run yet) — exactly what the prefix snapshot needs.
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
         let s = self.sym();
         let owns_shadow = s.owns_virtualizable_shadow();
         let nlocals = s.nlocals;
@@ -1011,7 +1051,7 @@ impl MIFrame {
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
         // operand stack.
-        let prefix_len = portal_vsd.unwrap_or(s.valuestackdepth);
+        let prefix_len = portal_vsd.unwrap_or(concrete_vsd);
         let snapshot = if owns_shadow && prefix_len >= nlocals {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut snapshot = Vec::with_capacity(prefix_len);
@@ -1041,9 +1081,26 @@ impl MIFrame {
         self.pre_opcode_semantic_depth = None;
     }
 
+    /// Pre-opcode stack depth: snapshot-captured `pre_opcode_semantic_depth`
+    /// when available, otherwise the concrete `PyFrame.valuestackdepth`
+    /// (which holds the same pre-opcode state because the interpreter step
+    /// for this opcode has not run yet); falls back to the symbolic
+    /// `sym.valuestackdepth` only when `concrete_frame_addr == 0`
+    /// (unit tests constructing sym-only `MIFrame`s).
+    ///
+    /// Issue #73 Phase 4.5: replaces the `pre_opcode_depth_or(self.sym().valuestackdepth)`
+    /// pattern.  The `pre_opcode_*` machinery exists precisely because
+    /// pyre's `MIFrame::pop_value` / `push_typed_value` mutate
+    /// `sym.valuestackdepth` mid-opcode and the guard/snapshot writers
+    /// need the *pre-mutation* value.  Reading directly from PyFrame
+    /// makes that pre-mutation guarantee structural rather than
+    /// snapshot-bookkeeping-dependent.
     #[inline]
-    fn pre_opcode_depth_or(&self, fallback: usize) -> usize {
-        self.pre_opcode_semantic_depth.unwrap_or(fallback)
+    fn pre_opcode_concrete_depth(&self) -> usize {
+        self.pre_opcode_semantic_depth.unwrap_or_else(|| {
+            self.concrete_valuestackdepth()
+                .unwrap_or_else(|| self.sym().valuestackdepth)
+        })
     }
 
     fn materialize_fail_arg_slot(
@@ -1163,7 +1220,10 @@ impl MIFrame {
                 // stack can hold an OpRef before the kind bank has been
                 // populated, so collect every listed bank/index and complete
                 // the matching bank immediately before the direct snapshot.
-                let jit_pc = jc.payload.metadata.pc_map[live_pc];
+                let jit_pc = jc
+                    .payload
+                    .resume_jitcode_pc_for(live_pc)
+                    .expect("pc_map non-empty branch above ensures lookup hits");
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
                 let all_liveness = crate::state::liveness_info_snapshot();
@@ -1619,10 +1679,7 @@ impl MIFrame {
         // contract (`all_liveness` byte layout).
         let jit_pc = jc
             .payload
-            .metadata
-            .pc_map
-            .get(live_pc)
-            .copied()
+            .resume_jitcode_pc_for(live_pc)
             .unwrap_or_else(|| {
                 panic!(
                     "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
@@ -1938,14 +1995,25 @@ impl MIFrame {
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        let (top_idx, other_idx) = {
-            let s = self.sym();
-            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-            if depth == 0 || stack_only < depth {
-                return Err(PyError::type_error("stack underflow during trace swap"));
-            }
-            (stack_only - 1, stack_only - depth)
-        };
+        // Issue #73 Phase 4.5 slice 1: read the stack depth from the
+        // concrete `PyFrame` at `concrete_frame_addr` rather than the
+        // symbolic mirror `sym.valuestackdepth`.  This is the first reader
+        // migration toward eliminating the `PyreSym.valuestackdepth`
+        // mirror (a pyre-introduced divergence with no PyPy counterpart —
+        // RPython's `MIFrame` holds only per-jitcode register banks, and
+        // user-side stack state lives on `PyFrame` accessed via IR
+        // getfield/setfield).  Falls back to the symbolic value when the
+        // concrete frame is absent (test harnesses constructing sym-only
+        // `MIFrame`s); production traces always seed `concrete_frame_addr`.
+        let nlocals = self.sym().nlocals;
+        let vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
+        let stack_only = vsd.saturating_sub(nlocals);
+        if depth == 0 || stack_only < depth {
+            return Err(PyError::type_error("stack underflow during trace swap"));
+        }
+        let (top_idx, other_idx) = (stack_only - 1, stack_only - depth);
         swap_stack_slots(self.sym_mut(), ctx, top_idx, other_idx);
         Ok(())
     }
@@ -2227,6 +2295,33 @@ impl MIFrame {
     /// All guards within this opcode will use orgpc as their resume PC.
     pub(crate) fn set_orgpc(&mut self, pc: usize) {
         self.orgpc = pc;
+        // Pyre-only shadow refresh.  RPython's metainterp owns every opcode
+        // boundary so `metainterp.virtualizable_boxes` stays in lockstep with
+        // heap automatically.  Pyre splits dispatch between the walker (which
+        // mirrors via `vable_setfield → synchronize_virtualizable`) and
+        // `execute_opcode_step` (which mutates the heap PyFrame directly via
+        // `PyFrame::push` / `PyFrame::pop` etc.), so the shadow can lag the
+        // heap between opcodes.  Pull the heap values into the shadow at the
+        // opcode boundary so any walker arm body that reads `getfield_vable_*`
+        // or that triggers `synchronize_virtualizable` sees the up-to-date
+        // values rather than a seed-time stale copy.  When dispatch unification
+        // retires `execute_opcode_step`, this call becomes a no-op and can be
+        // removed.
+        //
+        // Inline-frame guard: when `self.parent_frames` is non-empty we are
+        // running `trace_code_step_inline` on a callee MIFrame.  The shared
+        // `TraceCtx.virtualizable_boxes` shadow still belongs to the portal
+        // (caller) frame; refreshing it from heap mid-inline would overwrite
+        // any caller-side updates that the walker pushed into the shadow
+        // before the inline call but has not yet written back to heap, and a
+        // guard raised in the callee would then capture stale caller state
+        // for `materialize_parent_snapshot_state` /
+        // `get_list_of_active_boxes`.  Skip the refresh for inline frames —
+        // the caller's last opcode boundary already ran the refresh from its
+        // own `set_orgpc` call.
+        if self.parent_frames.is_empty() {
+            self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
+        }
         self.publish_last_instr_to_vable(pc);
     }
 
@@ -2303,9 +2398,18 @@ impl MIFrame {
         // stack_base`, leaving the resumed PyFrame with vsd ≤ stack_base
         // and crashing the next pop. Recompute from the per-PC user-side
         // depth metadata derived in `install_portal_for` (G.4.2).
-        let vsd = self
-            .portal_bridge_vable_vsd(resume_pc)
-            .unwrap_or_else(|| self.sym().valuestackdepth as i64);
+        //
+        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // read from the concrete `PyFrame.valuestackdepth` rather than the
+        // stale `sym.valuestackdepth`.  `resume_pc == self.orgpc` (the
+        // start PC of the current opcode) so PyFrame holds the correct
+        // pre-opcode value (the interpreter step for this opcode has not
+        // run yet).  Falls back to the symbolic value only when
+        // `concrete_frame_addr == 0` (test-only sym-only MIFrames).
+        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
+            self.concrete_valuestackdepth()
+                .unwrap_or_else(|| self.sym().valuestackdepth) as i64
+        });
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
@@ -2412,10 +2516,9 @@ impl MIFrame {
         // RPython capture_resumedata(resumepc=orgpc) parity:
         // Always use orgpc (opcode start PC) as the resume PC.
         let resume_pc = self.orgpc;
-        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
-            let s = self.sym();
-            self.pre_opcode_depth_or(s.valuestackdepth) as i64
-        });
+        let vsd = self
+            .portal_bridge_vable_vsd(resume_pc)
+            .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64);
         // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
         // `metainterp.virtualizable_boxes` without mutating it. The two
         // fields that advance per-opcode (`last_instr`, `valuestackdepth`)
@@ -2729,7 +2832,15 @@ impl MIFrame {
     pub(crate) fn live_args_shape_at(&self, ctx: &TraceCtx) -> usize {
         let extra_reds = crate::virtualizable_gen::NUM_EXTRA_REDS;
         let nlocals = self.sym().nlocals;
-        let stack_only = self.sym().valuestackdepth.saturating_sub(nlocals);
+        // Issue #73 Phase 4.5 slice 2: pure-read of stack depth comes from
+        // the concrete `PyFrame` (no symbolic mirror).  RPython's
+        // pyjitpl.py:2957-2965 `live_arg_boxes` shape derives directly
+        // from PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
+        // — there is no symbolic mirror to consult.
+        let vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
+        let stack_only = vsd.saturating_sub(nlocals);
         let target_array_capacity = ctx
             .virtualizable_array_lengths()
             .map(|lengths| lengths.iter().copied().sum::<usize>())
@@ -2756,8 +2867,20 @@ impl MIFrame {
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
         // read_boxes) are carried into the JUMP unchanged, including
         // stack slots. Do NOT truncate to nlocals here.
+        //
+        // Issue #73 Phase 4.5 slice 2 parity: read the user-side
+        // `valuestackdepth` from the concrete `PyFrame` to match
+        // `live_args_shape_at`'s reader.  Both helpers share the same
+        // shape derivation; reading from different sources lets the two
+        // diverge whenever the symbolic mirror drifts from PyFrame.
+        // RPython's pyjitpl.py:2957-2965 derives `live_arg_boxes` from
+        // PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
+        // — no symbolic mirror in the loop.
         let concrete_nlocals = self.sym().nlocals;
-        let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth)
+            .max(concrete_nlocals);
         {
             let s = self.sym_mut();
             s.nlocals = concrete_nlocals;
@@ -2935,6 +3058,14 @@ impl MIFrame {
         // snapshot below so JUMP args never carry OpRef::NONE in the ec
         // slot on adapter / bridge-from-guard paths.
         let recovered_ec = self.ensure_execution_context(ctx);
+        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // the stack depth fallback reads from `PyFrame.valuestackdepth`
+        // (via `concrete_valuestackdepth()`) rather than the symbolic
+        // mirror.  `close_loop_args_at` runs at the orgpc anchor where
+        // PyFrame still holds the pre-opcode state.
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
         let (
             frame,
             execution_context,
@@ -2952,9 +3083,7 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let nlocals = s.nlocals;
-            let stack_only = portal_vsd
-                .unwrap_or(s.valuestackdepth)
-                .saturating_sub(s.nlocals);
+            let stack_only = portal_vsd.unwrap_or(concrete_vsd).saturating_sub(s.nlocals);
             // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
             // `reached_loop_header`: `virtualizable_boxes` length is the
             // target vable array capacity (`nlocals + ncells + co_stacksize`),
@@ -3894,10 +4023,10 @@ impl MIFrame {
         };
         let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
             let resume_pc = self.orgpc;
-            Some(self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
-                let s = self.sym();
-                self.pre_opcode_depth_or(s.valuestackdepth) as i64
-            }))
+            Some(
+                self.portal_bridge_vable_vsd(resume_pc)
+                    .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64),
+            )
         } else {
             None
         };
@@ -3937,8 +4066,7 @@ impl MIFrame {
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;
         let symbolic_stack_len = if self.pre_opcode_registers_r.is_some() {
-            self.pre_opcode_depth_or(sym.valuestackdepth)
-                .saturating_sub(sym.nlocals)
+            self.pre_opcode_concrete_depth().saturating_sub(sym.nlocals)
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
@@ -3974,7 +4102,7 @@ impl MIFrame {
                         + pyre_interpreter::pyframe::ncells(code)
                         + code.max_stackdepth as usize
                 } else {
-                    let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
+                    let current_vsd = self.pre_opcode_concrete_depth();
                     let stack_depth = current_vsd
                         .saturating_sub(sym.nlocals)
                         .min(symbolic_stack_len);
@@ -6377,6 +6505,154 @@ impl MIFrame {
         trace_step_result_to_action(self, result)
     }
 
+    /// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
+    /// each opcode through `staticdata.opcode_implementations[opnum]`,
+    /// which is the jitcode-bytecode interpreter (the only dispatch path
+    /// upstream).  Pyre's transient deviation is the dual trait/walker
+    /// dispatch pair: `pyre_interpreter::execute_opcode_step` runs the
+    /// trait-driven Python-opcode interpreter while
+    /// `jitcode_dispatch::dispatch_via_miframe` walks the codewriter-
+    /// emitted jitcode arm.  Phase 5 retires the trait path opcode-by-
+    /// opcode; this helper is the per-opcode walker entry that production
+    /// dispatch (`trace_code_step` / `trace_code_step_inline`) calls for
+    /// allow-listed instructions.
+    ///
+    /// `is_top_level=false` so the arm's `ref_return/r` terminator
+    /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
+    /// `Finish` (the outer Python frame's `Finish` is owned by the
+    /// trace_opcode dispatch's higher-level Return/Yield/CloseLoop
+    /// handling, not the per-opcode arm).
+    pub(crate) fn dispatch_via_walker_for_opcode(
+        &mut self,
+        instruction: &Instruction,
+    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+        let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {
+            Some(jc) => jc,
+            None => {
+                // The production-walker allow-list (`production_walker_handles`)
+                // expanded ahead of `jitcode_for_instruction` registering an
+                // arm for `instruction`; degrade to a trace abort so the
+                // outer tracer can fall back instead of crashing.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         no_codewriter_arm instr={:?}",
+                        instruction,
+                    );
+                }
+                return Err(trace_abort_error(
+                    "production walker allow-listed instruction has no codewriter arm",
+                ));
+            }
+        };
+
+        let (done_void, done_int, done_ref, done_float, exit_exc_ref) =
+            {
+                let sd = self.ctx().metainterp_sd();
+                let void = sd.done_with_this_frame_descr_void.clone().expect(
+                    "done_with_this_frame_descr_void must be wired before production walker",
+                );
+                let int = sd.done_with_this_frame_descr_int.clone().expect(
+                    "done_with_this_frame_descr_int must be wired before production walker",
+                );
+                let ref_ = sd.done_with_this_frame_descr_ref.clone().expect(
+                    "done_with_this_frame_descr_ref must be wired before production walker",
+                );
+                let float = sd.done_with_this_frame_descr_float.clone().expect(
+                    "done_with_this_frame_descr_float must be wired before production walker",
+                );
+                let exc = sd.exit_frame_with_exception_descr_ref.clone().expect(
+                    "exit_frame_with_exception_descr_ref must be wired before production walker",
+                );
+                (void, int, ref_, float, exc)
+            };
+
+        let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+            let all = crate::jitcode_runtime::all_jitcodes();
+            all.get(idx)
+                .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                    code: jc.code.as_slice(),
+                    num_regs_r: jc.num_regs_r() as usize,
+                    num_regs_i: jc.num_regs_i() as usize,
+                    num_regs_f: jc.num_regs_f() as usize,
+                    constants_i: jc.constants_i.as_slice(),
+                    constants_r: jc.constants_r.as_slice(),
+                    constants_f: jc.constants_f.as_slice(),
+                })
+        };
+
+        // Issue #73 Phase 5.B: per-opcode arm entry allocates fresh
+        // per-jitcode register banks and seeds r0 = sym.frame.  This
+        // matches RPython MIFrame.setup (`pyjitpl.py:74-91`) and breaks
+        // the prior alias of sym.registers_r (semantic frame mirror)
+        // into the walker's r0..rN — the structural blocker documented
+        // in `project_issue73_phase5_design.md`.  `jitcode_for_instruction`
+        // returns an Arc<JitCode> over the registry's `'static`
+        // collection; the leak below upgrades the borrow to `'static`
+        // for the duration of this call.
+        let entry_jitcode: &'static majit_translate::jitcode::JitCode =
+            unsafe { &*(jitcode.as_ref() as *const majit_translate::jitcode::JitCode) };
+        let walk_result = crate::jitcode_dispatch::dispatch_via_miframe_at_opcode_entry(
+            self,
+            entry_jitcode,
+            crate::jitcode_runtime::all_descr_refs(),
+            &sub_jitcode_lookup,
+            done_ref,
+            done_int,
+            done_float,
+            done_void,
+            exit_exc_ref,
+        );
+
+        use crate::jitcode_dispatch::DispatchOutcome;
+        match walk_result {
+            Ok((DispatchOutcome::SubReturn { .. }, _)) => {
+                // Issue #73 Phase 4.5: the walker arm records IR for the
+                // opcode but does NOT run the trait dispatch's
+                // `MIFrame::pop_value` / `push_typed_value` paths that
+                // mutate `sym.valuestackdepth`.  Apply the opcode's net
+                // stack effect here so the symbolic mirror stays
+                // consistent with the IR the walker just emitted, matching
+                // how the trait dispatch advances `sym.valuestackdepth` via
+                // its own push/pop trait methods.
+                apply_walker_stack_effect(self, instruction);
+                Ok(pyre_interpreter::StepResult::Continue)
+            }
+            Ok((outcome, _)) => {
+                // Allow-list expansion let an opcode through whose arm
+                // returns something other than `SubReturn` (e.g. an arm
+                // that emits `Finish` or `Goto`); the walker leg cannot
+                // unify with `trace_code_step`'s top-level control flow
+                // for those, so abort the trace and let `trace_code_step`
+                // fall back to the trait dispatch.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         unexpected_outcome instr={:?} outcome={:?}",
+                        instruction, outcome,
+                    );
+                }
+                Err(trace_abort_error(
+                    "production walker received unexpected dispatch outcome",
+                ))
+            }
+            Err(e) => {
+                // Walker dispatch raised a structured error (e.g.
+                // `GotoIfNotValueNotConcrete`, register-bank size
+                // mismatch).  Surface as a trace abort so production
+                // recovers rather than crashing the process.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         walker_error instr={:?} err={:?}",
+                        instruction, e,
+                    );
+                }
+                Err(trace_abort_error("production walker dispatch failed"))
+            }
+        }
+    }
+
     pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
             if majit_metainterp::majit_log_enabled() {
@@ -6487,15 +6763,19 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                let shadow_outcome =
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                if result.is_ok() {
-                    if let Some(outcome) = shadow_outcome {
-                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                if production_walker_handles(&instruction) {
+                    self.dispatch_via_walker_for_opcode(&instruction)
+                } else {
+                    let shadow_outcome =
+                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                    if result.is_ok() {
+                        if let Some(outcome) = shadow_outcome {
+                            crate::shadow_walker::shadow_validate_post(self, outcome);
+                        }
                     }
+                    result
                 }
-                result
             }
         };
         // Clear pre-opcode snapshot immediately after opcode execution.
@@ -7019,15 +7299,19 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                let shadow_outcome =
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                if result.is_ok() {
-                    if let Some(outcome) = shadow_outcome {
-                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                if production_walker_handles(&instruction) {
+                    self.dispatch_via_walker_for_opcode(&instruction)
+                } else {
+                    let shadow_outcome =
+                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                    if result.is_ok() {
+                        if let Some(outcome) = shadow_outcome {
+                            crate::shadow_walker::shadow_validate_post(self, outcome);
+                        }
                     }
+                    result
                 }
-                result
             }
         };
         if needs_pre_opcode_snapshot {
@@ -7188,6 +7472,113 @@ unsafe fn trace_check_exc_match_against(
         return false;
     };
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
+}
+
+/// Production-walker allow-list for issue #73 Phase 5 cutover.
+///
+/// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
+/// every opcode through the single jitcode-bytecode path; there is no
+/// dual trait/walker split upstream.  This predicate names the Python
+/// instructions for which pyre has already retired the trait dispatch
+/// — for those, `trace_code_step{,_inline}` route directly through
+/// `MIFrame::dispatch_via_walker_for_opcode` and the trait path is
+/// dead code at runtime (Phase 6 removes the trait impl once every
+/// opcode is in this set).
+///
+/// Phase 5.A initial set: the Nop family of 5 zero-op opcodes
+/// (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`).  All share
+/// arm bytes `ref_return/r r0` (decode via `dump_nop_arm_bytes`) —
+/// walker emits zero IR ops and `SubReturn`s with `r0`'s contents; the
+/// trait dispatch returns `Ok(StepResult::Continue)` with zero op
+/// emission.  Walker ≡ trait for this batch by construction.
+///
+/// Subsequent Phase 5 batches (5.B PopTop + drop `check_is_elidable`
+/// gate, 5.C..N per-opcode batches) grow this set until it covers every
+/// Python opcode, at which point Phase 6 deletes the trait infra.
+///
+/// PopTop is intentionally NOT in this set: 2026-05-21 diagnostic
+/// (synth/set_membership SIGBUS, exit 138) traced the failure to the
+/// walker's heap-based concrete read for `PyFrame.valuestackdepth`.
+/// PopTop's arm body inlines `eval.rs pop_value`'s `if vsd <= nlocals
+/// { return Err(stack_underflow_error(...)) }` underflow check.  The
+/// codewriter lowers `self.valuestackdepth` to `getfield_gc_i(frame,
+/// vsd_descr)`; the walker's `field_read_concrete` reads HEAP
+/// `PyFrame.valuestackdepth` at offset 24.  During tracing, the JIT
+/// trait-dispatch leg updates only the symbolic mirror (`sym.
+/// valuestackdepth`) and the `virtualizable_boxes` shadow via
+/// `push_typed_value` (`trace_opcode.rs:1796`) — it does NOT write
+/// through to the heap field.  Heap vsd therefore stays at its
+/// trace-entry value (= `nlocals` in a loop body with empty entry
+/// stack), the walker's `IntLe(vsd, nlocals)` evaluates `Int(3) <=
+/// Int(3) = 1`, and `goto_if_not/iL` records `GuardTrue(v39)` — the
+/// underflow path.  After the optimizer rewrites the GetfieldGcI to
+/// the JIT-tracked vable shadow (which IS correct at runtime), the
+/// guard direction is baked in: every loop iteration the runtime vsd
+/// is `nlocals + 1` (one Call result on stack), `IntLe(4, 3) = 0`,
+/// `GuardTrue` fails, deopt fires.  Repeated deopt eventually SIGBUSes
+/// in the recovery path.
+///
+/// RPython-orthodox fix: the codewriter must emit `getfield_vable_i`
+/// (not `getfield_gc_i`) for inlined vable field accesses (PyPy's
+/// `pyjitpl.py:1167-1186 opimpl_getfield_vable_i` reads from
+/// `metainterp.virtualizable_boxes[index]`, matching the JIT shadow).
+/// That codewriter slice is the next prerequisite; until it lands,
+/// PopTop walker activation is structurally blocked.  Documented in
+/// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
+pub fn production_walker_handles(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Nop
+            | Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Cache
+            | Instruction::NotTaken
+    )
+}
+
+/// Apply the symbolic-tracker side effects of a walker-handled opcode.
+///
+/// The walker arm records IR ops for stack pushes/pops by walking the
+/// per-opcode arm body (which contains `setarrayitem_vable_r` /
+/// `setfield_vable_i` against the user-side virtualizable).  Those IR
+/// ops correctly mutate the live `PyFrame` at trace-execution time.
+/// What the walker arm does NOT do is update the tracer's symbolic
+/// shadow that subsequent trait-dispatched opcodes consult:
+///
+/// * `sym.valuestackdepth` — the symbolic mirror of
+///   `PyFrame.valuestackdepth`.  Trait dispatch advances it via
+///   `MIFrame::push_typed_value` / `MIFrame::pop_value` (trace_opcode.rs
+///   :1797..1925); the walker arm bypasses both.
+/// * `sym.vable_valuestackdepth` — the IR `OpRef` cache pointing at
+///   the current `const_int(vsd)` value.  Snapshot encoders read this
+///   OpRef into the guard's resume-data scalar header; if it lags the
+///   IR the blackhole resume restores a stale vsd into PyFrame.
+/// * `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` — the
+///   heap-mirror shadow for the pushed/popped stack slot.  `pop_value`
+///   clears the popped slot to NULL (line 1901-1906); `push_typed_value`
+///   writes the new value via `write_stack_slot` (line 572-611).  The
+///   walker arm's `setarrayitem_vable_r` IR op updates the runtime
+///   heap, but the tracer's shadow needs the same update applied here.
+///
+/// Mirrors `liveness.rs:528..588 _opcode_stack_effect` (Python
+/// `dis.stack_effect` parity).  Walker-handled opcodes must remain a
+/// closed set listed here AND in `production_walker_handles`.
+fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
+    let _ = state;
+    match instruction {
+        Instruction::Nop
+        | Instruction::ExtendedArg
+        | Instruction::Resume { .. }
+        | Instruction::Cache
+        | Instruction::NotTaken => {
+            // delta = 0, no shadow mutation.
+        }
+        other => panic!(
+            "apply_walker_stack_effect: missing handler for {:?}; every entry \
+             in production_walker_handles must list its symbolic effect here",
+            other,
+        ),
+    }
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
@@ -7397,9 +7788,7 @@ impl TraceHelperAccess for MIFrame {
 // (see majit/majit-translate/src/codegen.rs::generate_trait_impls).
 
 impl OpcodeStepExecutor for MIFrame {
-    type Error = PyError;
-
-    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), PyError> {
         let value = SharedOpcodeHandler::pop_value(self)?;
         if self.value_type(value.opref) != Type::Ref {
             return Err(PyError::type_error("pop_jump_if_none expects a ref value"));
@@ -7434,7 +7823,7 @@ impl OpcodeStepExecutor for MIFrame {
         })
     }
 
-    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), PyError> {
         let value = SharedOpcodeHandler::pop_value(self)?;
         if self.value_type(value.opref) != Type::Ref {
             return Err(PyError::type_error(
@@ -7479,7 +7868,7 @@ impl OpcodeStepExecutor for MIFrame {
         _name1: &str,
         idx2: usize,
         _name2: &str,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         let c1 = self
             .sym()
             .concrete_locals
@@ -7499,7 +7888,7 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    fn to_bool(&mut self) -> Result<(), Self::Error> {
+    fn to_bool(&mut self) -> Result<(), PyError> {
         Ok(())
     }
 
@@ -7508,7 +7897,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// Mirror eval.rs:1543-1608: push `(attr, null_or_self)` where
     /// `null_or_self` is the bound receiver for instance/class methods and
     /// `PY_NULL` for already-bound methods / static methods / plain attrs.
-    fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn load_method(&mut self, name: &str) -> Result<(), PyError> {
         let obj = SharedOpcodeHandler::pop_value(self)?;
         let concrete_obj = obj.concrete.to_pyobj();
         let attr = <Self as SharedOpcodeHandler>::load_attr(self, obj, name)?;
@@ -7593,7 +7982,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// interpreter override in eval.rs:1640-1652 prepends it for instance
     /// method calls. Trace-time execution must do the same so `CALL` after
     /// `LOAD_METHOD` sees the same argument list as the interpreter.
-    fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call(&mut self, nargs: usize) -> Result<(), PyError> {
         let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
             args.push(<Self as SharedOpcodeHandler>::pop_value(self)?);
@@ -7613,7 +8002,7 @@ impl OpcodeStepExecutor for MIFrame {
         <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
-    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call_kw(&mut self, nargs: usize) -> Result<(), PyError> {
         use pyre_interpreter::bytecode::CodeFlags;
 
         let kwarg_names_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
@@ -7879,7 +8268,7 @@ impl OpcodeStepExecutor for MIFrame {
     //                     clear tracer last_exc_value (pyopcode.py:778 /
     //                     eval.rs:1243-1249)
 
-    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+    fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         let exc_obj = exc.concrete.to_pyobj();
         // Emit the residual save/restore pair BEFORE mutating concrete
@@ -7933,7 +8322,7 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    fn pop_except(&mut self) -> Result<(), Self::Error> {
+    fn pop_except(&mut self) -> Result<(), PyError> {
         let prev_exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         // Emit the residual restore so the compiled bridge writes back the
         // saved sys_exc_info at runtime (pyopcode.py:778 / eval.rs:1243-1249).
@@ -7978,7 +8367,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// `pyjitpl.py:1680-1681` asserts last_exc_value + class_of_last_exc
     /// are both set; pyre aborts tracing instead of silently emitting a
     /// constant True if either operand is null at trace time.
-    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+    fn check_exc_match(&mut self) -> Result<(), PyError> {
         let exc_type_val = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         let exc_type_obj = exc_type_val
             .as_ref()
@@ -7999,7 +8388,7 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // pyopcode.py:1034-1039 validity gate. The PyError raised here
-        // is `Self::Error = PyError` at trace_opcode.rs:7091 and aborts
+        // is `PyError = PyError` at trace_opcode.rs:7091 and aborts
         // the trace (the interpreter re-runs CHECK_EXC_MATCH freshly to
         // surface the TypeError without baking it into the recorded
         // trace). Matches `pyre_interpreter::eval::check_exc_match` BC
@@ -8034,7 +8423,7 @@ impl OpcodeStepExecutor for MIFrame {
     ///    state (pyjitpl.py:1690-1696) from the trace-time concrete
     ///    value so `handle_raise_varargs` → `finishframe_exception`
     ///    keeps seeing a pending exception on both paths.
-    fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
+    fn raise_varargs(&mut self, argc: usize) -> Result<(), PyError> {
         if argc == 0 {
             // `eval.rs:1032-1048 RAISE_VARARGS 0` — reraise from the
             // active exception. Prefer the tracer-seeded
@@ -8137,7 +8526,7 @@ impl OpcodeStepExecutor for MIFrame {
     }
 
     /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
-    fn reraise(&mut self, oparg: u32) -> Result<(), Self::Error> {
+    fn reraise(&mut self, oparg: u32) -> Result<(), PyError> {
         // pyopcode.py:1357-1363
         let reraise_lasti: i32 = if oparg != 0 {
             // pyopcode.py:1361 — self.space.int_w(self.peekvalue(oparg))
@@ -8203,7 +8592,7 @@ impl OpcodeStepExecutor for MIFrame {
     fn unsupported(
         &mut self,
         instruction: &Instruction,
-    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, Self::Error> {
+    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
         Err(PyError::type_error(format!(
             "unsupported instruction during trace: {instruction:?}"
         )))

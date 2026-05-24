@@ -1405,6 +1405,68 @@ impl TraceCtx {
         self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
     }
 
+    /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
+    /// field values into the JIT-tracked shadow (`virtualizable_values`).
+    ///
+    /// pyre-only sync hook.  RPython's metainterp IS the execution loop —
+    /// every opcode flows through `_opimpl_*` which mutates
+    /// `metainterp.virtualizable_boxes` in lockstep with the implicit heap
+    /// write, so the shadow never drifts.  Pyre's tracer dispatches some
+    /// opcodes through the walker (which mirrors via
+    /// `vable_setfield → synchronize_virtualizable`) and others through
+    /// `execute_opcode_step` (which mutates the heap PyFrame directly
+    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the shadow).
+    /// Between any pair of those dispatch paths the shadow can lag heap.
+    ///
+    /// Calling this at each `trace_code_step` entry — *before* the walker
+    /// arm body reads any shadow slot or `synchronize_virtualizable` writes
+    /// stale shadow back to heap — restores the RPython invariant that
+    /// shadow == heap at every opcode boundary.  When dispatch unification
+    /// retires `execute_opcode_step`, this hook becomes a no-op (every
+    /// mutation already lands in shadow) and can be deleted.
+    pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        if self.virtualizable_values.is_none() {
+            return;
+        }
+        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+            return;
+        };
+        let array_lengths = lengths.clone();
+        let (static_bits, array_bits) = unsafe { info.read_all_boxes(heap_ptr, &array_lengths) };
+        let static_count = info.num_static_extra_boxes;
+        let info = info.clone();
+        let Some(values) = self.virtualizable_values.as_mut() else {
+            return;
+        };
+        for (i, bits) in static_bits.iter().enumerate().take(static_count) {
+            if i >= values.len() {
+                break;
+            }
+            let ty = info.static_fields[i].field_type;
+            values[i] = crate::pyjitpl::heap_value_for_pub(ty, *bits);
+        }
+        let mut cursor = static_count;
+        for (a, items) in array_bits.iter().enumerate() {
+            if a >= info.array_fields.len() {
+                break;
+            }
+            let ty = info.array_fields[a].item_type;
+            for bits in items {
+                if cursor >= values.len() {
+                    break;
+                }
+                values[cursor] = crate::pyjitpl::heap_value_for_pub(ty, *bits);
+                cursor += 1;
+            }
+        }
+    }
+
     /// pyjitpl.py:3446-3450 `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
@@ -1592,6 +1654,26 @@ impl TraceCtx {
     /// `set_virtualizable_entry_at` panics.
     pub fn virtualizable_boxes_len(&self) -> Option<usize> {
         self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
+    }
+
+    /// `opencoder.py:767-784 create_top_snapshot` parity for callers that
+    /// need to feed `vable_boxes` / `vref_boxes` into
+    /// `capture_snapshot_for_last_guard_with_vable_vref`.  Returns the
+    /// pre-shaped `(vable_boxes, vref_boxes)` ready to attach to a top
+    /// snapshot — identity-front reorder for vable, verbatim opref order
+    /// for vref.  Empty vectors when neither a virtualizable nor any
+    /// virtualref is live (matches RPython's `_list_of_boxes_virtualizable`
+    /// / `_list_of_boxes` returning a 0-length array).
+    pub fn build_snapshot_vable_vref_boxes(
+        &self,
+    ) -> (
+        Vec<crate::recorder::SnapshotTagged>,
+        Vec<crate::recorder::SnapshotTagged>,
+    ) {
+        let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        let vable_boxes = crate::pyjitpl::build_vable_snapshot_boxes(vable_slice);
+        let vref_boxes = crate::pyjitpl::build_vref_snapshot_boxes(&self.virtualref_boxes);
+        (vable_boxes, vref_boxes)
     }
 
     /// Concrete shadow of the standard virtualizable — the raw heap pointer

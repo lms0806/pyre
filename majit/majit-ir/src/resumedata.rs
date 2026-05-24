@@ -20,6 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static FRAME_VALUE_COUNT_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the global frame_value_count callback.
+///
+/// Signature: `(jitcode_index, py_pc) -> count`.  The implementation
+/// translates `py_pc` through `pc_map` to look up `get_live_vars_info`;
+/// pyre's portal-bridge fallback (`PyJitCodeMetadata.depth_at_py_pc`) is
+/// py_pc-keyed pending its own NEW-DEVIATION retirement.
 pub fn set_frame_value_count_fn(f: fn(i32, i32) -> usize) {
     FRAME_VALUE_COUNT_FN.store(f as usize, Ordering::Relaxed);
 }
@@ -300,6 +305,10 @@ pub enum RebuiltValue {
 #[derive(Debug, Clone)]
 pub struct RebuiltFrame {
     pub jitcode_index: i32,
+    /// resume.py:250 `pc` — RPython carries the JitCode byte offset
+    /// here; pyre's deviation populates this with the Python bytecode
+    /// PC because pyre traces Python bytecode rather than JitCode.  See
+    /// `[[project-issue73-phase5-design]]`.
     pub pc: i32,
     pub values: Vec<RebuiltValue>,
 }
