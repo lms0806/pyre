@@ -4,7 +4,7 @@ PyPy v7.3.22: release of python 2.7, 3.11, released 2026-xx-xx
 
 
 ..
-  updated to f4feb6d6aed088072034d84a9257747853000a22
+  updated to ad87cbd9a6f27a94ae759905c171e87478490326
 
 .. note::
        This is a pre-release announcement. When the release actually happens, it
@@ -98,8 +98,8 @@ For all versions
 Bugfixes
 ~~~~~~~~
 
-- Fix a ``SystemError`` when ``OSError`` is raised in ``gc.dump_rpy_heap`` (issue 5118)
-- Fix bug in ``inline_short_preamble`` (issue 5462)
+- Fix a ``SystemError`` when ``OSError`` is raised in ``gc.dump_rpy_heap`` (:issue:`5118`)
+- Fix bug in ``inline_short_preamble`` (:issue:`5462`)
 
 Speedups and enhancements
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -120,20 +120,22 @@ Python 3.11
 Bugfixes including missing compatibility with CPython 3.11
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Fix module and name for builtin classes with deeper hierarchies (issue 5296)
+- Fix module and name for builtin classes with deeper hierarchies (:issue:`5296`)
 - Remove over-eager warning emitted when cr_frame is accessed on a not started
-  coroutine (issue 5454)
-- Fix ``typedef.doc`` to reject getset (issue 5458)
-- Fix more ``__text_signature__`` incompatibilities (issue 5458)
+  coroutine (:issue:`5454`)
+- Fix ``typedef.doc`` to reject getset (:issue:`5458`)
+- Fix more ``__text_signature__`` incompatibilities (:issue:`5458`)
 - Fix module name of ``_sqlite3`` exceptions to ``sqlite3`` like CPython
 - ``datetime:fromisoformat`` raises without setting a context in
   ``_datetime.c``, do the same in datetime.py
 - Use ``exceptiontable`` in the bytecode interpreter like CPython does
 - Add ``_Py_NO_RETURN`` to ``_Py_FatalErrorFunc``
-- Fix ``_pypyjson`` encoding of int subclasses (issue 5478)
+- Fix ``_pypyjson`` encoding of int subclasses (:issue:`5478`)
 - Fixing a bug in computation of ``tp_basicsize`` for mixed python/c-extension
   types caused a bug in multiple inheritance with c-extension types used in
-  pybind11. More closely follow the logic of CPython (issue 5481)
+  pybind11. More closely follow the logic of CPython (:issue:`5481`)
+- initialize ``MultibyteIncrementalDecoder.state`` to 0
+- detect imcomplete decorator input in the parser (:issue:`5484`)
 
 
 Speedups and enhancements
@@ -142,5 +144,5 @@ Speedups and enhancements
 - Improve the performance of ``str.splitlines``
 - Restore lost ``heapq.merge()`` using a linked tournament tree which is slower
   in CPython but faster in PyPy. The code was lost in an stdlib update and
-  reverted to the CPython version (issue 5466)
+  reverted to the CPython version (:issue:`5466`)
 
