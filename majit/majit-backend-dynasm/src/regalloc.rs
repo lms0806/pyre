@@ -2586,10 +2586,17 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         match kind {
-            IntUnaryKind::Neg
-            | IntUnaryKind::Invert
-            | IntUnaryKind::IsTrue
-            | IntUnaryKind::IsZero => self.consider_unary_int_j2(dst, arg, i, output),
+            IntUnaryKind::Neg | IntUnaryKind::Invert => {
+                self.consider_unary_int_j2(dst, arg, i, output)
+            }
+            // x86/regalloc.py:1199 `consider_int_is_true` — arg stays in
+            // memory/imm (no force-into-reg), result goes through
+            // `force_allocate_reg_or_cc`. AArch64 wraps to its 3-op unary
+            // handler since `neg`/`mvn` already keep arg and result in
+            // distinct registers.
+            IntUnaryKind::IsTrue | IntUnaryKind::IsZero => {
+                self.consider_int_is_true_j2(dst, arg, i, output)
+            }
         }
     }
 
@@ -4865,8 +4872,13 @@ impl<'a> RegAlloc<'a> {
         // that before_call just synced to the jitframe.  In particular,
         // call_assembler frame helpers allocate PyFrames and can collect
         // before the following vable_token materialization reads inputarg 0.
+        //
+        // x86/callbuilder.py:93 + aarch64/callbuilder.py:70 exclude the
+        // call_result_gpr from the gcmap so its post-call payload is not
+        // mistaken for a live Ref root before the result-extension step
+        // narrows it to the declared result type.
         let gcmap = if calldescr.get_extra_info().check_can_collect() {
-            Some(self.get_gcmap(&[], false) as usize)
+            Some(self.get_gcmap(&[call_result_gpr()], false) as usize)
         } else {
             None
         };
@@ -4958,9 +4970,11 @@ impl<'a> RegAlloc<'a> {
         // Same gcmap snapshot as `consider_call` above. The j2 dispatch
         // handles the same Call*/CallMayForce*/CallReleaseGil* opcodes,
         // so a collecting callee must record the live Ref slots that
-        // before_call just synced to the jitframe.
+        // before_call just synced to the jitframe.  call_result_gpr is
+        // excluded for the same reason as `consider_call`
+        // (x86/callbuilder.py:93, aarch64/callbuilder.py:70).
         let gcmap = if can_collect {
-            Some(self.get_gcmap(&[], false) as usize)
+            Some(self.get_gcmap(&[call_result_gpr()], false) as usize)
         } else {
             None
         };

@@ -20,12 +20,16 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 /// aarch64/regalloc.py:169 `check_imm_box`. PyPy accepts only
 /// `ConstInt` values in the AArch64 immediate range; non-Int
 /// constants (ConstFloat/ConstPtr) and box references fall through
-/// to the register form.
-fn check_imm_box(arg: OpRef, val: i64) -> bool {
+/// to the register form. PyPy reads `arg.getint()` directly because
+/// the int is inlined on `ConstInt`; pyre's `OpRef::ConstInt` carries
+/// only a const-pool slot, so the actual i64 must be looked up. A
+/// missing pool entry is *not* the same as `#0` — it falls through
+/// to the register path.
+fn check_imm_box(arg: OpRef, val: Option<i64>) -> bool {
     if !matches!(arg, OpRef::ConstInt(_)) {
         return false;
     }
-    val >= 0 && val < DEFAULT_IMM_SIZE
+    matches!(val, Some(v) if v >= 0 && v < DEFAULT_IMM_SIZE)
 }
 
 /// aarch64/registers.py:14
@@ -181,7 +185,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let imm_rhs = check_imm_box(rhs, self.constants.get(&rhs.raw()).copied());
         let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
         let rhs_loc = if imm_rhs {
             self.loc(rhs, Type::Int)
@@ -248,7 +252,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        debug_assert!(
+        assert!(
             !arg.is_constant(),
             "prepare_unary expects a non-const arg; got constant OpRef {arg:?} (should have been folded earlier)"
         );
@@ -256,6 +260,19 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(arg, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
         self.perform(i, vec![arg_loc], Some(Loc::Reg(res)), output);
+    }
+
+    /// aarch64 `int_is_true` / `int_is_zero`: shares the 3-op `prepare_unary`
+    /// shape from regalloc.py:456 since `cmp Xn, #0 ; cset Wd, ne` keeps
+    /// the input register live while writing a fresh destination.
+    pub(crate) fn consider_int_is_true_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_unary_int_j2(dst, arg, i, output);
     }
 
     /// aarch64/regalloc.py:397 `prepare_op_uint_mul_high = prepare_op_int_mul`.
@@ -286,8 +303,8 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_lhs = check_imm_box(lhs, self.const_value(lhs));
-        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let imm_lhs = check_imm_box(lhs, self.constants.get(&lhs.raw()).copied());
+        let imm_rhs = check_imm_box(rhs, self.constants.get(&rhs.raw()).copied());
         let (l0, l1) = if !imm_lhs && imm_rhs {
             let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
             let r1 = self.loc(rhs, Type::Int);
