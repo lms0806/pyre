@@ -1595,7 +1595,7 @@ impl VirtualState {
                 // self.known_class. No guard emitted; pass-or-fail decides.
                 // The runtime_box gate at :601/:608 is absent here because
                 // the constant's class is statically known from `r` itself.
-                let const_cls = PtrInfo::Constant(*r).get_known_class();
+                let const_cls = PtrInfo::Constant(*r).get_known_class(state.ctx.cpu.as_ref());
                 if const_cls.as_ref() == Some(class_ptr) {
                     Ok(())
                 } else {

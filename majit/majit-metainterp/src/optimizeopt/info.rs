@@ -864,7 +864,7 @@ impl PtrInfo {
     ///   `check_is_object` call entirely and still returns
     ///   `cls_of_box(self._const)`; this port follows that.
     /// - Everything else: `None`.
-    pub fn get_known_class(&self) -> Option<GcRef> {
+    pub fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<GcRef> {
         match self {
             PtrInfo::Instance(v) => v.known_class,
             PtrInfo::Virtual(v) => v.known_class,
@@ -880,13 +880,15 @@ impl PtrInfo {
                 if majit_gc::supports_guard_gc_type() && !majit_gc::check_is_object(*gcref) {
                     return None;
                 }
-                // info.py:768 / llmodel.py:556-561 `cls_of_box`: read
-                // the typeptr at offset 0 of the payload.
-                let vtable = unsafe { *(gcref.0 as *const usize) };
+                // info.py:768 `return cpu.cls_of_box(self._const)` —
+                // routes through the Cpu trait so backends that override
+                // the typeptr-at-offset-0 read (e.g. `gcremovetypeptr`)
+                // are honored here too.
+                let vtable = cpu.cls_of_gcref(*gcref);
                 if vtable == 0 {
                     None
                 } else {
-                    Some(GcRef(vtable))
+                    Some(GcRef(vtable as usize))
                 }
             }
             _ => None,
@@ -3031,7 +3033,8 @@ mod tests {
 
         let kc = PtrInfo::known_class(GcRef(0x2000), true);
         assert!(kc.is_nonnull());
-        assert!(kc.get_known_class().is_some());
+        // Instance arm — no cpu read; DefaultCpu is a placeholder.
+        assert!(kc.get_known_class(&crate::cpu::DefaultCpu).is_some());
     }
 
     #[test]

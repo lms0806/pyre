@@ -299,6 +299,15 @@ pub(crate) fn execute_one(
             OpResult::Value(f64::to_bits(a * b) as i64)
         }
         OpCode::FloatTrueDiv => {
+            // blackhole.py:714-718 `bhimpl_float_truediv = a / b` raises
+            // Python `ZeroDivisionError` when `b == 0.0`.  Rust IEEE
+            // division returns `inf` / `nan` instead.  Without a
+            // ZeroDivisionError class-pointer slot on `ExceptionState`
+            // the runtime cannot signal the exception, so the IEEE
+            // result is the structural adaptation (matching the same
+            // policy as runtime CastFloatToInt at executor.rs:313+).
+            // The constant-fold guard at `execute_binary_float_const`
+            // declines fold on `b == 0.0` so the trace emits the op.
             let (a, b) = float_binop(values, op);
             OpResult::Value(f64::to_bits(a / b) as i64)
         }
@@ -311,6 +320,20 @@ pub(crate) fn execute_one(
             OpResult::Value(f64::to_bits(a.abs()) as i64)
         }
         OpCode::CastFloatToInt => {
+            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`
+            // raises Python `OverflowError` on ±Inf / out-of-range and
+            // `ValueError` on NaN.  Rust's `as i64` saturates to the
+            // i64 bound for non-finite inputs.  The constant-fold gate
+            // at `execute_cast_const` (executor.rs:1634-1649) skips
+            // fold for those values so the trace still emits the op;
+            // here at runtime, with no `OverflowError`/`ValueError`
+            // class-pointer infrastructure on `ExceptionState`, the
+            // saturating cast is the structural adaptation matching
+            // the rest of the runtime's lenient-IEEE policy
+            // (FLOAT_TRUEDIV by zero yields `inf`/`nan` rather than
+            // `ZeroDivisionError`).  Documented as PRE-EXISTING-
+            // ADAPTATION pending an OverflowError class-pointer slot
+            // on `ExceptionState`.
             let a = float_unop(values, op);
             OpResult::Value(a as i64)
         }
@@ -761,10 +784,48 @@ pub(crate) fn execute_one(
             OpResult::Value((a != b) as i64)
         }
         OpCode::CastPtrToInt => {
+            // blackhole.py:603-606 `bhimpl_cast_ptr_to_int`:
+            //     i = lltype.cast_ptr_to_int(a)
+            //     ll_assert((i & 1) == 1, "...not an odd int")
+            //
+            // **Structural divergence**, *not* a missed adaptation.
+            // PyPy enforces the AddressAsInt low-bit tag at THREE
+            // layers simultaneously — `lltype.cast_ptr_to_int` tags
+            // the int, JIT backend codegen emits machine code that
+            // tags during PTR→INT moves, and `lltype.cast_int_to_ptr`
+            // untags + asserts.  The optimizer also relies on
+            // `CastPtrToInt(p) ↔ CastIntToPtr(i)` being a free
+            // inverse pair (`rewrite.py:807-813`, mirrored at
+            // `optimizeopt/rewrite.rs:3078-3083`).
+            //
+            // Pyre's `GcRef(usize)` is a raw aligned pointer with no
+            // tag.  Applying `i | 1` here in the blackhole replay
+            // would diverge from the JIT-emitted machine code (which
+            // currently does a raw register copy for this opcode),
+            // and would break the optimizer's `CastPtrToInt ↔
+            // CastIntToPtr` inverse-pair registration because re-
+            // application of `| 1` is no longer idempotent.
+            //
+            // Bringing the assert in is therefore a multi-session
+            // epic: `GcRef` encoding rework (tag-on-construct), every
+            // backend's PTR↔INT codegen (`majit-backend-dynasm`,
+            // `majit-backend-cranelift`), blackhole handler_*
+            // (`blackhole.rs:8279-8294`), and the inverse-pair
+            // optimizer's tag-aware comparison.  Until those land
+            // together the trio (runtime + fold + blackhole) is
+            // intentionally raw-aligned, matching pyre's internal
+            // invariant rather than PyPy's.
             let a = unop(values, op);
             OpResult::Value(a)
         }
         OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
+            // blackhole.py:608-611 `bhimpl_cast_int_to_ptr` — same
+            // AddressAsInt invariant as cast_ptr_to_int above.  See
+            // the structural-divergence note on `CastPtrToInt`; the
+            // `(i & 1) == 1` assert cannot be added in isolation
+            // without breaking the optimizer's free-inverse pair
+            // (`optimizeopt/rewrite.rs:3082-3083`) and the JIT-emitted
+            // codegen for the opcode.
             let a = unop(values, op);
             OpResult::Value(a)
         }
@@ -1569,6 +1630,26 @@ pub fn execute_nonspec_const(
                 };
             }
         }
+        // ARRAYLEN_GC — withdescr arity-1.
+        // `executor.py:do_arraylen_gc` → `cpu.bh_arraylen_gc(array, ad)`.
+        if let (Value::Ref(array), Some(d)) = (a, descr) {
+            if let Some(ad) = d.as_array_descr() {
+                if opnum == OpCode::ArraylenGc {
+                    return cpu.bh_arraylen_gc(array, ad).map(Value::Int);
+                }
+            }
+        }
+        // STRLEN / UNICODELEN — pyre's default Cpu has no fold-time
+        // str/unicode layout, so `bh_strlen / bh_unicodelen` return
+        // `None` and the fold declines.  Backends that wire a typed
+        // string layout can override the trait methods to enable fold.
+        if let Value::Ref(s) = a {
+            match opnum {
+                OpCode::Strlen => return cpu.bh_strlen(s).map(Value::Int),
+                OpCode::Unicodelen => return cpu.bh_unicodelen(s).map(Value::Int),
+                _ => {}
+            }
+        }
     }
 
     // ── arity == 2 row of EXECUTE_BY_NUM_ARGS ──
@@ -1591,6 +1672,37 @@ pub fn execute_nonspec_const(
                 return Some(Value::Int(folded));
             }
         }
+        // GETARRAYITEM_GC_PURE_I/R/F — withdescr arity-2 (array, index).
+        // `executor.py:do_getarrayitem_gc_pure_*` →
+        //   `cpu.bh_getarrayitem_gc_*(array, index, ad)`.
+        if let (Value::Ref(array), Value::Int(index), Some(d)) = (argboxes[0], argboxes[1], descr) {
+            if let Some(ad) = d.as_array_descr() {
+                return match opnum {
+                    OpCode::GetarrayitemGcPureI => {
+                        cpu.bh_getarrayitem_gc_i(array, index, ad).map(Value::Int)
+                    }
+                    OpCode::GetarrayitemGcPureR => Some(majit_ir::Value::Ref(
+                        cpu.bh_getarrayitem_gc_r(array, index, ad),
+                    )),
+                    OpCode::GetarrayitemGcPureF => Some(majit_ir::Value::Float(
+                        cpu.bh_getarrayitem_gc_f(array, index, ad),
+                    )),
+                    _ => None,
+                };
+            }
+        }
+        // STRGETITEM / UNICODEGETITEM — pyre's default Cpu has no
+        // fold-time str/unicode layout, so `bh_strgetitem /
+        // bh_unicodegetitem` return `None` and the fold declines.
+        // Backends that wire a typed string layout can override the
+        // trait methods to enable fold here.
+        if let (Value::Ref(s), Value::Int(index)) = (argboxes[0], argboxes[1]) {
+            match opnum {
+                OpCode::Strgetitem => return cpu.bh_strgetitem(s, index).map(Value::Int),
+                OpCode::Unicodegetitem => return cpu.bh_unicodegetitem(s, index).map(Value::Int),
+                _ => {}
+            }
+        }
     }
 
     // ── arity == 3 row of EXECUTE_BY_NUM_ARGS ──
@@ -1607,16 +1719,18 @@ pub fn execute_nonspec_const(
     }
 
     // executor.py:610 `raise NotImplementedError` only fires for opnums
-    // with no EXECUTE_BY_NUM_ARGS entry — every always-pure op in PyPy
-    // has an entry, so the call simply returns. Pyre's helpers also
-    // return `None` on safety-guard skips (OVF overflow, FLOAT_TRUEDIV
-    // by zero, CAST_FLOAT_TO_INT non-finite, invalid shift counts,
-    // Slice H opcodes pending dedicated ports — ArraylenGc / Strlen /
-    // Strgetitem / Unicodelen / Unicodegetitem / GetarrayitemGcPure[IRF]
-    // / LoadFromGcTable / LoadEffectiveAddress). All routes converge
-    // here as a plain `None`; the caller (`OptContext::constant_fold`
-    // → `pure.rs:1002`) treats `None` as "do not fold" and emits the
-    // op verbatim.
+    // with no EXECUTE_BY_NUM_ARGS entry.  Every always-pure op in PyPy
+    // has an entry; pyre's helpers fan out into the dedicated
+    // execute_*_const helpers above plus the `cpu.bh_*` reads for
+    // GETFIELD_GC_PURE_*, GETARRAYITEM_GC_PURE_*, ARRAYLEN_GC.  The
+    // remaining always-pure opcodes (STRGETITEM, UNICODEGETITEM,
+    // LOAD_FROM_GC_TABLE, LOAD_EFFECTIVE_ADDRESS) require runtime layout
+    // infrastructure pyre does not yet expose — they fall through
+    // unfolded.  Helpers also return `None` on safety-guard skips
+    // (OVF overflow, FLOAT_TRUEDIV by zero, CAST_FLOAT_TO_INT
+    // non-finite, invalid shift counts, out-of-range array index).
+    // The caller (`OptContext::constant_fold` → `pure.rs:1002`) treats
+    // `None` as "do not fold" and emits the op verbatim.
     None
 }
 
@@ -1661,6 +1775,15 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
         (OpCode::ConvertLonglongBytesToFloat, Value::Int(i)) => {
             Some(Value::Float(f64::from_bits(i as u64)))
         }
+        // blackhole.py:603-611 — see the runtime `CastPtrToInt` /
+        // `CastIntToPtr` structural-divergence note at
+        // executor.rs:786 for why the AddressAsInt low-bit tag is
+        // not applied here (PyPy enforces it across lltype + JIT
+        // codegen + blackhole; pyre's raw-aligned `GcRef` cannot
+        // host it without a multi-session encoding rework).  The
+        // fold preserves the roundtrip identity
+        // `cast_int_to_ptr(cast_ptr_to_int(p)) == p` and stays in
+        // lockstep with the runtime + blackhole behavior.
         (OpCode::CastPtrToInt, Value::Ref(r)) => Some(Value::Int(r.0 as i64)),
         (OpCode::CastIntToPtr, Value::Int(i)) => Some(Value::Ref(GcRef(i as usize))),
         _ => None,

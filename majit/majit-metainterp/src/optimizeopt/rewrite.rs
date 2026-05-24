@@ -1443,8 +1443,12 @@ impl OptRewrite {
 
         // rewrite.py:535-553: instance comparison — different classes → not same
         if instance {
-            let cls0 = info0.as_ref().and_then(|i| i.get_known_class());
-            let cls1 = info1.as_ref().and_then(|i| i.get_known_class());
+            let cls0 = info0
+                .as_ref()
+                .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
+            let cls1 = info1
+                .as_ref()
+                .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
             if let (Some(c0), Some(c1)) = (cls0, cls1) {
                 if c0 != c1 {
                     ctx.make_constant(op.pos.get(), Value::Int(expect_isnot as i64));
@@ -1761,7 +1765,7 @@ impl OptRewrite {
                     // get_known_class on the c_value side dispatches through
                     // getptrinfo → ConstPtrInfo.get_known_class (info.py:763-772)
                     // which is exactly cls_of_box for constant pointers.
-                    if let Some(prev_cls) = info.get_known_class() {
+                    if let Some(prev_cls) = info.get_known_class(ctx.cpu.as_ref()) {
                         if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
                             if let Some(expected_cls) = ctx.get_known_class(&arg1_box) {
                                 if prev_cls != expected_cls {
@@ -1846,7 +1850,9 @@ impl OptRewrite {
             .get_box_replacement_box(obj)
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b));
-        if let Some(known_class) = obj_info_for_class.and_then(|i| i.get_known_class()) {
+        if let Some(known_class) =
+            obj_info_for_class.and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
+        {
             if op.num_args() >= 2 {
                 // Class pointer may be Value::Int or Value::Ref.
                 let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
@@ -3299,7 +3305,7 @@ impl Optimization for OptRewrite {
                         if let Some(known) = obj_box
                             .as_ref()
                             .and_then(|b| ctx.getptrinfo(b))
-                            .and_then(|i| i.get_known_class())
+                            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
                         {
                             debug_assert_eq!(known.0 as i64, expected_class);
                             return OptimizationResult::Remove;

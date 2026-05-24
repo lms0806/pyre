@@ -261,11 +261,11 @@ impl CachedField {
         let class1 = b1
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
-            .and_then(|i| i.get_known_class());
+            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
         let class2 = b2
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
-            .and_then(|i| i.get_known_class());
+            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
         matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
     }
 

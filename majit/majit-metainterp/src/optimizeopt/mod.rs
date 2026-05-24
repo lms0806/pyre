@@ -995,7 +995,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         resolved_box
             .as_ref()
             .and_then(|b| self.ctx.peek_ptr_info(b))
-            .and_then(|info| info.get_known_class())
+            .and_then(|info| info.get_known_class(self.ctx.cpu.as_ref()))
             .is_some()
     }
 
@@ -3092,7 +3092,7 @@ impl OptContext {
         }
 
         // unroll.py:75-77: known_class → make_constant_class(op, class, False)
-        if let Some(cls) = preamble_info.get_known_class() {
+        if let Some(cls) = preamble_info.get_known_class(self.cpu.as_ref()) {
             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                 self,
                 &op_box,
@@ -5404,23 +5404,132 @@ impl OptContext {
         )
     }
 
-    /// optimizer.py:791-840: protect_speculative_operation(op).
-    /// Validates that constant GcRef args are safe to dereference.
-    /// Returns None (SpeculativeError) if validation fails.
+    /// optimizer.py:818-867 `protect_speculative_operation(op)` — when
+    /// constant-folding a pure operation that reads memory from a
+    /// gcref, validate the gcref is non-null and of a valid type;
+    /// raise `SpeculativeError` otherwise.  Pyre signals that with
+    /// `None`, which `constant_fold` short-circuits on so `pure.rs`
+    /// re-emits the op verbatim.
+    ///
+    /// Branches mirror the upstream `if / elif / elif / elif / else`
+    /// chain line-for-line:
+    ///  - pure GETFIELD_GC_PURE_*  → `protect_speculative_field`
+    ///  - GETARRAYITEM_GC_PURE_* / ARRAYLEN_GC → `protect_speculative_array`
+    ///  - STRGETITEM / STRLEN → `protect_speculative_string`
+    ///  - UNICODEGETITEM / UNICODELEN → `protect_speculative_unicode`
+    ///  - default → no validation needed (return early).
+    ///
+    /// For the get*item branches, `cpu.bh_arraylen_gc / bh_strlen /
+    /// bh_unicodelen` reads the container length and the routine
+    /// checks `0 <= index < length`.  When `bh_strlen / bh_unicodelen`
+    /// returns `None` (pyre has no fold-time str/unicode layout), the
+    /// bounds check is skipped — equivalent to RPython where the
+    /// optimizer falls back to runtime evaluation in that case.
     fn protect_speculative_operation(&self, op: &Op) -> Option<()> {
-        // llmodel.py:555-567: protect_speculative_field.
-        // When supports_guard_gc_type is false (majit has no GC type registry),
-        // only null check is performed (llmodel.py:556-557).
-        if op.opcode.is_getfield() {
-            // BoxRef shim for `get_constant_box` — read-only, non-materializing.
+        use majit_ir::OpCode;
+
+        let opnum = op.opcode;
+        let arraylength: i64;
+
+        let descr = op.getdescr();
+        if opnum.is_getfield() {
+            // optimizer.py:829-832 pure-getfield branch.
             let arg0 = self.get_box_replacement_box(op.arg(0))?;
             let gcref = match self.get_constant_box(&arg0)? {
                 Value::Ref(r) => r,
                 _ => return None,
             };
-            if gcref.is_null() {
-                return None; // SpeculativeError
+            let fd = descr.as_ref().and_then(|d| d.as_field_descr())?;
+            self.cpu.protect_speculative_field(gcref, fd).ok()?;
+            return Some(());
+        } else if matches!(
+            opnum,
+            OpCode::GetarrayitemGcPureI
+                | OpCode::GetarrayitemGcPureR
+                | OpCode::GetarrayitemGcPureF
+                | OpCode::ArraylenGc
+                | OpCode::Strgetitem
+                | OpCode::Strlen
+                | OpCode::Unicodegetitem
+                | OpCode::Unicodelen
+        ) {
+            // optimizer.py:822-825 comment: "if cpu.supports_guard_gc_type
+            // is false, we can't really do this check at all, but then we
+            // don't unroll in that case."  Upstream gates the entire
+            // protect_speculative_operation entry on the unroll pass; pyre's
+            // constant_fold is called outside of unrolling too, so the
+            // memory-reading array/string/unicode fold must decline here
+            // when speculative type validation is impossible.  Without
+            // this gate a wrong-type non-null const gcref would be deref'd
+            // at fold time via cpu.bh_arraylen_gc / bh_getarrayitem_gc_*,
+            // a regression vs main (which did not fold these ops at all).
+            //
+            // The pure-getfield branch above keeps its main-era behavior
+            // (null-only when supports_guard_gc_type is false) so this
+            // gate is scoped to the newly-enabled memory-reading folds.
+            if !majit_gc::supports_guard_gc_type() {
+                return None;
             }
+        }
+
+        if matches!(
+            opnum,
+            OpCode::GetarrayitemGcPureI
+                | OpCode::GetarrayitemGcPureR
+                | OpCode::GetarrayitemGcPureF
+                | OpCode::ArraylenGc
+        ) {
+            // optimizer.py:834-841 array branch.
+            let arg0 = self.get_box_replacement_box(op.arg(0))?;
+            let array = match self.get_constant_box(&arg0)? {
+                Value::Ref(r) => r,
+                _ => return None,
+            };
+            let ad = descr.as_ref().and_then(|d| d.as_array_descr())?;
+            self.cpu.protect_speculative_array(array, ad).ok()?;
+            if opnum == OpCode::ArraylenGc {
+                return Some(());
+            }
+            arraylength = self.cpu.bh_arraylen_gc(array, ad)?;
+        } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
+            // optimizer.py:843-848 string branch.
+            let arg0 = self.get_box_replacement_box(op.arg(0))?;
+            let string = match self.get_constant_box(&arg0)? {
+                Value::Ref(r) => r,
+                _ => return None,
+            };
+            self.cpu.protect_speculative_string(string).ok()?;
+            if opnum == OpCode::Strlen {
+                return Some(());
+            }
+            arraylength = self.cpu.bh_strlen(string)?;
+        } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
+            // optimizer.py:850-855 unicode branch.
+            let arg0 = self.get_box_replacement_box(op.arg(0))?;
+            let unicode = match self.get_constant_box(&arg0)? {
+                Value::Ref(r) => r,
+                _ => return None,
+            };
+            self.cpu.protect_speculative_unicode(unicode).ok()?;
+            if opnum == OpCode::Unicodelen {
+                return Some(());
+            }
+            arraylength = self.cpu.bh_unicodelen(unicode)?;
+        } else {
+            // optimizer.py:857-858 else: return — nothing to validate.
+            return Some(());
+        }
+
+        // optimizer.py:860-862 shared bounds check:
+        //   index = self.get_constant_box(op.getarg(1)).getint()
+        //   if not (0 <= index < arraylength): raise SpeculativeError
+        let arg1 = self.get_box_replacement_box(op.arg(1))?;
+        let index = match self.get_constant_box(&arg1)? {
+            Value::Int(i) => i,
+            _ => return None,
+        };
+        if !(0 <= index && index < arraylength) {
+            return None;
         }
         Some(())
     }
@@ -6110,7 +6219,7 @@ impl OptContext {
     /// constant pointers are handled via `cls_of_box` the same way
     /// `Instance` / `Virtual` read their stored `known_class`.
     pub fn get_known_class(&self, op: &crate::r#box::BoxRef) -> Option<majit_ir::GcRef> {
-        self.getptrinfo(op)?.get_known_class()
+        self.getptrinfo(op)?.get_known_class(self.cpu.as_ref())
     }
 
     /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
