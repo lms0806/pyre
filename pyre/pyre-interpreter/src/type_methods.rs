@@ -1626,11 +1626,13 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
     }
 }
 
-/// `pypy/objspace/std/dictmultiobject.py descr_copy` — shallow copy
-/// returning a fresh `W_DictObject` with the same (k, v) pairs.  Used
-/// by `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
-/// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).  Mirrors
-/// the inline closure that previously lived in `init_dict_type`.
+/// `pypy/objspace/std/dictmultiobject.py:585-587 descr_copy` —
+/// `return w_dict.copy()` which delegates to `strategy.copy(w_dict)`
+/// (`:1152 AbstractTypedStrategy.copy`).  Typed strategies preserve
+/// their backing shape by cloning the typed storage box and wrapping
+/// it in a fresh W_DictObject with the same strategy.  Used by
+/// `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
+/// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).
 pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_dict_new());
@@ -1639,16 +1641,7 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if src.is_null() {
         return Ok(pyre_object::w_dict_new());
     }
-    let dst = pyre_object::w_dict_new();
-    unsafe {
-        // Walk the union view so storage-proxy entries (e.g. on a
-        // `module.__dict__` source) make it into the copy alongside
-        // entries Vec slots.
-        for (k, v) in pyre_object::w_dict_items(src) {
-            w_dict_store(dst, k, v);
-        }
-    }
-    Ok(dst)
+    unsafe { Ok(pyre_object::dictmultiobject::w_dict_copy(src)) }
 }
 
 /// PyPy: dictobject.py descr_update — dict.update([other], **kwargs).
@@ -1689,14 +1682,31 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 && pyre_object::is_dict(other_raw)
                 && dict_subclass_uses_default_iter(other);
             if fast_path_eligible {
-                // `dictmultiobject.py:1382-1387 update1_dict_dict` —
-                // fast path when the source is a real dict and no
-                // subclass override is on the table.  Walk the union
-                // view so updates from a storage-proxied source dict
-                // (e.g. `module.__dict__`) include entries that live
-                // only in the proxy storage.
-                for (k, v) in pyre_object::w_dict_items(other_raw) {
-                    w_dict_store(dict, k, v);
+                // `dictmultiobject.py:1401-1406 update1_dict_dict` —
+                // when the destination is on EmptyDictStrategy,
+                // transplant the source's strategy + dstorage instead
+                // of iterating items.  Skipped for module dicts and
+                // proxy-attached dicts (NEW-DEVIATION) because their
+                // Rust layouts / storage mirrors are not self-contained.
+                // Falls through to the item-loop otherwise (matches
+                // `:1407 else: rev_update1_dict_dict`).
+                let dst_is_empty =
+                    pyre_object::dictmultiobject::w_dict_is_regular_empty_no_proxy(dict);
+                let src_proxy_free =
+                    pyre_object::w_dict_get_dict_storage_proxy(other_raw).is_null();
+                if dst_is_empty && src_proxy_free {
+                    let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
+                    pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
+                        dict, w_copy,
+                    );
+                } else {
+                    // `dictmultiobject.py:1407 rev_update1_dict_dict` —
+                    // walk the source items.  Proxy-attached source
+                    // dicts route through the union-view item walk so
+                    // entries living only in the proxy survive.
+                    for (k, v) in pyre_object::w_dict_items(other_raw) {
+                        w_dict_store(dict, k, v);
+                    }
                 }
             } else {
                 // `dictmultiobject.py:1388-1398 update1` — when the
@@ -1810,10 +1820,10 @@ fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
         }
         let ns = &mut *(ns_ptr as *mut crate::DictStorage);
         let entries = pyre_object::dictmultiobject::w_dict_object_storage(dict);
-        for &(k, v) in entries {
-            if pyre_object::is_str(k) {
-                let name = pyre_object::w_str_get_value(k);
-                crate::dict_storage_store(ns, name, v);
+        for (k, v) in entries {
+            if pyre_object::is_str(k.obj) {
+                let name = pyre_object::w_str_get_value(k.obj);
+                crate::dict_storage_store(ns, name, *v);
             }
         }
     }

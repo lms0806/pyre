@@ -49,6 +49,30 @@ impl Op {
     // source analyzer can resolve the bool return type when callers
     // appear in `!op.has_descr()` patterns inside that file.
 
+    /// `resoperation.py:156-200 VectorizationInfo` slot accessor —
+    /// returns an owned clone of the per-op vector metadata installed
+    /// by the vectorizer.
+    pub fn get_vecinfo(&self) -> Option<crate::resoperation::VectorizationInfo> {
+        self.vecinfo.borrow().as_deref().cloned()
+    }
+
+    /// Overwrite the per-op vector metadata slot.  Takes `&self` —
+    /// interior mutability through `RefCell` matches RPython's
+    /// `op._vector_info = …` write on a shared object.
+    pub fn set_vecinfo(&self, vecinfo: crate::resoperation::VectorizationInfo) {
+        *self.vecinfo.borrow_mut() = Some(Box::new(vecinfo));
+    }
+
+    /// Clear the per-op vector metadata slot.
+    pub fn clear_vecinfo(&self) {
+        *self.vecinfo.borrow_mut() = None;
+    }
+
+    /// True iff the per-op vector metadata slot is populated.
+    pub fn has_vecinfo(&self) -> bool {
+        self.vecinfo.borrow().is_some()
+    }
+
     /// Project the descr (if any) through a closure operating on a
     /// `&dyn Descr`. `f` may freely return owned values derived from
     /// borrowed projections (`as_field_descr`, `as_array_descr`, etc.).
@@ -236,33 +260,6 @@ impl Op {
     /// True iff the per-failarg type vector slot is populated.
     pub fn has_fail_arg_types(&self) -> bool {
         self.fail_arg_types.borrow().is_some()
-    }
-
-    /// `resoperation.py:156-200 VectorizationInfo` slot accessor —
-    /// returns an owned clone of the per-op vector metadata installed
-    /// by the vectorizer.  `VectorizationInfo` is `Copy`-sized POD, so
-    /// the clone-on-read keeps the API ergonomic now that the slot is
-    /// `RefCell`-wrapped (callers no longer hold a borrow across other
-    /// `Op` accesses).
-    pub fn get_vecinfo(&self) -> Option<crate::resoperation::VectorizationInfo> {
-        self.vecinfo.borrow().as_deref().cloned()
-    }
-
-    /// Overwrite the per-op vector metadata slot.  Takes `&self` —
-    /// interior mutability through `RefCell` matches RPython's
-    /// `op._vector_info = …` write on a shared object.
-    pub fn set_vecinfo(&self, vecinfo: crate::resoperation::VectorizationInfo) {
-        *self.vecinfo.borrow_mut() = Some(Box::new(vecinfo));
-    }
-
-    /// Clear the per-op vector metadata slot.
-    pub fn clear_vecinfo(&self) {
-        *self.vecinfo.borrow_mut() = None;
-    }
-
-    /// True iff the per-op vector metadata slot is populated.
-    pub fn has_vecinfo(&self) -> bool {
-        self.vecinfo.borrow().is_some()
     }
 
     /// `resoperation.py:281 AbstractResOp.getarglist` parity — returns

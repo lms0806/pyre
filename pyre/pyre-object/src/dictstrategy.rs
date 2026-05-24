@@ -174,6 +174,26 @@ pub trait DictStrategy {
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn clear(&self, w_dict: PyObjectRef);
 
+    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+    /// (plus `:732 EmptyDictStrategy.switch_to_object_strategy`,
+    /// `:1195+ ObjectDictStrategy` no-op).  Polymorphic dispatch lets
+    /// callers that hold only `&dyn DictStrategy` (e.g. the storage
+    /// back-mirror `*_no_proxy` helpers) demote typed storage to
+    /// ObjectDictStrategy without inspecting strategy identity.
+    ///
+    /// Default just relabels the strategy pointer: correct for
+    /// `ObjectDictStrategy` (already object) and `UnicodeDictStrategy`
+    /// (storage shape matches `Vec<(PyObjectRef, PyObjectRef)>`).
+    /// Strategies with typed storage layouts override to rebuild the
+    /// object Vec before swapping the pointer.
+    ///
+    /// # Safety
+    /// `w_dict` must point at a valid `W_DictObject` whose
+    /// `dstrategy` is `self`.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+    }
+
     /// `dictmultiobject.py:559-560 listview_bytes` — default returns
     /// `None`; bytes/str strategies override to expose backing list.
     fn listview_bytes(&self, _w_dict: PyObjectRef) -> Option<Vec<Vec<u8>>> {
@@ -234,7 +254,12 @@ pub trait DictStrategy {
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_object_storage_mut(w_dict);
         for (key, value) in entries.iter_mut() {
-            visitor(key as *mut PyObjectRef);
+            // See `w_dict_walk_entries_mut` — ObjectKey.hash is precomputed
+            // and identity-stable across GC moves, so writing through the
+            // raw obj slot does not desync the IndexMap bucket index.
+            let key_ptr = key as *const crate::dictmultiobject::ObjectKey
+                as *mut crate::dictmultiobject::ObjectKey;
+            visitor(std::ptr::addr_of_mut!((*key_ptr).obj));
             visitor(value as *mut PyObjectRef);
         }
     }
@@ -350,7 +375,7 @@ impl EmptyDictStrategy {
                 return;
             }
         }
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        self.switch_to_object_strategy(w_dict);
     }
 
     /// `dictmultiobject.py:719-723 switch_to_int_strategy`:
@@ -376,7 +401,8 @@ impl EmptyDictStrategy {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         if !dict.dstorage.is_null() {
             drop(Box::from_raw(
-                dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>,
+                dict.dstorage
+                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
             ));
         }
         dict.dstorage = INT_DICT_STRATEGY.get_empty_storage();
@@ -403,7 +429,8 @@ impl EmptyDictStrategy {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         if !dict.dstorage.is_null() {
             drop(Box::from_raw(
-                dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>,
+                dict.dstorage
+                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
             ));
         }
         dict.dstorage = BYTES_DICT_STRATEGY.get_empty_storage();
@@ -432,7 +459,8 @@ impl EmptyDictStrategy {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         if !dict.dstorage.is_null() {
             drop(Box::from_raw(
-                dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>,
+                dict.dstorage
+                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
             ));
         }
         dict.dstorage = crate::identitydict::IDENTITY_DICT_STRATEGY.get_empty_storage();
@@ -502,7 +530,12 @@ impl EmptyKwargsDictStrategy {
                 return;
             }
         }
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        // `kwargsdict.py:13-22` inherits the parent's
+        // `switch_to_object_strategy` (`dictmultiobject.py:732-736`),
+        // which allocates ObjectDictStrategy's empty Vec. Routing
+        // through the parent avoids leaving `w_dict_new_kwargs`'s
+        // null `dstorage` in place when the first key isn't unicode.
+        EMPTY_DICT_STRATEGY.switch_to_object_strategy(w_dict);
     }
 }
 
@@ -567,6 +600,26 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     ) -> (Option<Vec<PyObjectRef>>, Option<Vec<PyObjectRef>>) {
         EMPTY_DICT_STRATEGY.view_as_kwargs(w_dict)
     }
+
+    /// `kwargsdict.py:13-22` inherits the parent's
+    /// `switch_to_object_strategy` (`dictmultiobject.py:732-736`).
+    /// Delegate to `EMPTY_DICT_STRATEGY` so the null `dstorage` from
+    /// `w_dict_new_kwargs` is replaced by ObjectDictStrategy's empty
+    /// Vec — without this, the typed parent's relabel-only default
+    /// would leave the null pointer in place.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        EMPTY_DICT_STRATEGY.switch_to_object_strategy(w_dict);
+    }
+
+    /// `kwargsdict.py:13-22` inherits empty-dict behavior: copying an
+    /// empty kwargs dict returns a fresh empty kwargs dict on the
+    /// EmptyKwargsDictStrategy so the first unicode setitem still
+    /// promotes directly to KwargsDictStrategy (skipping the regular
+    /// EmptyDictStrategy intermediate that goes through
+    /// UnicodeDictStrategy).
+    unsafe fn copy(&self, _w_dict: PyObjectRef) -> PyObjectRef {
+        crate::dictmultiobject::w_dict_new_kwargs()
+    }
 }
 
 impl DictStrategy for EmptyDictStrategy {
@@ -580,11 +633,40 @@ impl DictStrategy for EmptyDictStrategy {
         std::ptr::null_mut()
     }
 
-    unsafe fn getitem(&self, _w_dict: PyObjectRef, _w_key: PyObjectRef) -> Option<PyObjectRef> {
-        // `dictmultiobject.py:738-743` — hash the key (would raise
-        // for unhashable types), then return None.  Pyre's hash
-        // raise path is wired via `crate::baseobjspace::hash` when
-        // the W_DictObject migration consumes this trait.
+    /// `dictmultiobject.py:732-736 EmptyDictStrategy.switch_to_object_strategy`
+    /// — `storage = strategy.get_empty_storage(); w_dict.set_strategy(strategy);
+    /// w_dict.dstorage = storage`.  Allocates a fresh Object-shape Vec
+    /// so subclasses whose `dstorage` is null (`w_dict_new_kwargs`)
+    /// don't end up with an OBJECT_DICT_STRATEGY label over a null
+    /// pointer.  Regular `w_dict_new` already keeps a non-null legacy
+    /// Vec; the drop+replace mirrors PyPy's `dstorage = storage`
+    /// assignment.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        if !dict.dstorage.is_null() {
+            drop(Box::from_raw(
+                dict.dstorage
+                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
+            ));
+        }
+        dict.dstorage = OBJECT_DICT_STRATEGY.get_empty_storage();
+        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    }
+
+    unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+        // `dictmultiobject.py:738-743 EmptyDictStrategy.getitem`:
+        //   # in case the key is unhashable, try to hash it
+        //   self.space.hash(w_key)
+        //   # return None anyway
+        //   return None
+        // Force a hash dispatch so user-defined `__hash__` side effects
+        // fire and unhashable types surface a TypeError up through the
+        // hook trampoline.  Partial parity: `dict_eq_hook::try_hash_w`
+        // currently swallows hash errors (returns `0` for unhashable),
+        // so the TypeError surfaces only if the hook is installed and
+        // routed through a future Result-aware variant.  Tracked in
+        // MEMORY as the "hash hook error propagation" epic.
+        let _ = crate::dict_eq_hook::try_hash_w(w_key);
         None
     }
 
@@ -606,9 +688,16 @@ impl DictStrategy for EmptyDictStrategy {
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
-    unsafe fn delitem(&self, _w_dict: PyObjectRef, _w_key: PyObjectRef) -> bool {
-        // `dictmultiobject.py:763-766` — KeyError.  Pyre returns
-        // false here; the caller raises.
+    unsafe fn delitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
+        // `dictmultiobject.py:763-766 EmptyDictStrategy.delitem`:
+        //   # in case the key is unhashable, try to hash it
+        //   self.space.hash(w_key)
+        //   raise KeyError
+        // Pyre returns false; the caller raises KeyError.  Same hash
+        // dispatch ordering as `getitem` above so unhashable types
+        // surface TypeError before KeyError once the hash hook
+        // propagates errors (see "hash hook error propagation" epic).
+        let _ = crate::dict_eq_hook::try_hash_w(w_key);
         false
     }
 
@@ -648,6 +737,13 @@ impl DictStrategy for EmptyDictStrategy {
         _w_dict: PyObjectRef,
     ) -> (Option<Vec<PyObjectRef>>, Option<Vec<PyObjectRef>>) {
         (Some(Vec::new()), Some(Vec::new()))
+    }
+
+    /// Copying an empty dict yields a fresh empty dict on the same
+    /// `EmptyDictStrategy` so the first setitem still triggers
+    /// `switch_to_correct_strategy` per `dictmultiobject.py:755-757`.
+    unsafe fn copy(&self, _w_dict: PyObjectRef) -> PyObjectRef {
+        crate::dictmultiobject::w_dict_new()
     }
 }
 
@@ -689,10 +785,13 @@ pub struct ObjectDictStrategy;
 
 impl DictStrategy for ObjectDictStrategy {
     fn get_empty_storage(&self) -> *mut u8 {
-        // `dictmultiobject.py:1209-1212`: erased empty r_dict.  Pyre's
-        // current storage is a `Vec<(PyObjectRef, PyObjectRef)>` heap
-        // alloc — same erased shape via `Box::into_raw`.
-        let v: Box<Vec<(PyObjectRef, PyObjectRef)>> = Box::new(Vec::new());
+        // `dictmultiobject.py:1209-1212`: erased `r_dict(dict_keys_equal,
+        // hash_w)`.  Pyre's typed map is
+        // `IndexMap<ObjectKey, PyObjectRef>` — hash bucket for O(1)
+        // lookup that also preserves insertion order (CPython 3.7+ /
+        // PyPy3 dict semantics).
+        let v: Box<indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>> =
+            Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
     }
 
@@ -780,6 +879,24 @@ impl DictStrategy for ObjectDictStrategy {
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_dict_clear_object_strategy(w_dict);
     }
+
+    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` —
+    /// `W_DictObject(space, self, self.erase(dstorage.copy()))`.
+    /// Clone the IndexMap backing and wrap with the same
+    /// ObjectDictStrategy.  Proxy-attached W_DictObjects bypass this
+    /// override in `w_dict_copy` so str-key entries that live only in
+    /// the proxy survive.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        let storage = &*(dict.dstorage
+            as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
+        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        crate::dictmultiobject::w_dict_new_with(
+            &OBJECT_DICT_STRATEGY,
+            new_storage as *mut u8,
+            dict.len,
+        )
+    }
 }
 
 /// `dictmultiobject.py:1229-1278 BytesDictStrategy`.
@@ -820,35 +937,32 @@ impl DictStrategy for ObjectDictStrategy {
 /// retired.
 pub struct BytesDictStrategy;
 
-impl BytesDictStrategy {
+impl DictStrategy for BytesDictStrategy {
     /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
     /// instantiation for BytesDictStrategy — `wrap = newbytes` (`:1234`).
-    /// Walks the typed `Vec<(Vec<u8>, _)>`, rebuilds
-    /// `Vec<(PyObjectRef, _)>` with each `Vec<u8>` wrapped via
+    /// Walks the typed `IndexMap<Vec<u8>, _>`, rebuilds
+    /// `IndexMap<ObjectKey, _>` with each `Vec<u8>` wrapped via
     /// `w_bytes_from_bytes`, drops the typed box.
-    ///
-    /// # Safety
-    /// `w_dict` must point at a valid `W_DictObject` on
-    /// [`BYTES_DICT_STRATEGY`].
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut Vec<(Vec<u8>, PyObjectRef)>);
-        let mut new_vec: Vec<(PyObjectRef, PyObjectRef)> = Vec::with_capacity(old.len());
+        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
+        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
+            indexmap::IndexMap::with_capacity(old.len());
         for (k, v) in old.iter() {
-            new_vec.push((crate::w_bytes_from_bytes(k.as_slice()), *v));
+            let w_key = crate::w_bytes_from_bytes(k.as_slice());
+            new_map.insert(crate::dictmultiobject::object_key_for(w_key), *v);
         }
-        dict.dstorage = Box::into_raw(Box::new(new_vec)) as *mut u8;
+        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
-}
 
-impl DictStrategy for BytesDictStrategy {
     /// `dictmultiobject.py:1244-1247 get_empty_storage` — erased `{}`
-    /// with `mark_dict_non_null` hint.  Pyre uses a linear-scan
-    /// `Vec<(Vec<u8>, PyObjectRef)>` matching ObjectDictStrategy's
-    /// shape pattern.
+    /// with `mark_dict_non_null` hint.  Pyre stores the typed map as
+    /// `IndexMap<Vec<u8>, PyObjectRef>`: a hash bucket for O(1) lookup
+    /// that also preserves insertion order (CPython 3.7+ / PyPy3 dict
+    /// semantics).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<Vec<(Vec<u8>, PyObjectRef)>> = Box::new(Vec::new());
+        let v: Box<indexmap::IndexMap<Vec<u8>, PyObjectRef>> = Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
     }
 
@@ -925,7 +1039,7 @@ impl DictStrategy for BytesDictStrategy {
     /// of keys directly from the typed storage.
     fn listview_bytes(&self, w_dict: PyObjectRef) -> Option<Vec<Vec<u8>>> {
         let entries = unsafe { crate::dictmultiobject::w_dict_bytes_storage(w_dict) };
-        Some(entries.iter().map(|(k, _)| k.clone()).collect())
+        Some(entries.keys().cloned().collect())
     }
 
     /// PyPy traces `Dict[str (bytes), W_Root]` only over the value
@@ -934,9 +1048,23 @@ impl DictStrategy for BytesDictStrategy {
     /// PyObjectRef.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_bytes_storage_mut(w_dict);
-        for (_, value) in entries.iter_mut() {
+        for value in entries.values_mut() {
             visitor(value as *mut PyObjectRef);
         }
+    }
+
+    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
+    /// the typed `IndexMap<Vec<u8>, PyObjectRef>` backing and wrap
+    /// with the same BytesDictStrategy.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        let storage = &*(dict.dstorage as *const indexmap::IndexMap<Vec<u8>, PyObjectRef>);
+        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        crate::dictmultiobject::w_dict_new_with(
+            &BYTES_DICT_STRATEGY,
+            new_storage as *mut u8,
+            dict.len,
+        )
     }
 }
 
@@ -982,9 +1110,12 @@ pub struct UnicodeDictStrategy;
 impl DictStrategy for UnicodeDictStrategy {
     fn get_empty_storage(&self) -> *mut u8 {
         // `dictmultiobject.py:1302-1304 create_empty_unicode_key_dict`
-        // returns an empty `r_dict(unicode_eq, unicode_hash)`.  Pyre's
-        // Vec backing is the erased equivalent.
-        let v: Box<Vec<(PyObjectRef, PyObjectRef)>> = Box::new(Vec::new());
+        // returns an empty `r_dict(unicode_eq, unicode_hash)`.  Pyre
+        // shares ObjectDictStrategy's `IndexMap<ObjectKey, PyObjectRef>`
+        // backing — str-keyed `dict_keys_equal` matches `unicode_eq`
+        // for the str fast-path callers (`dictmultiobject.py:1311-1318`).
+        let v: Box<indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>> =
+            Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
     }
 
@@ -1091,6 +1222,24 @@ impl DictStrategy for UnicodeDictStrategy {
         }
         (Some(keys), Some(values))
     }
+
+    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
+    /// the IndexMap backing and wrap with the same UnicodeDictStrategy
+    /// (shares Object's `IndexMap<ObjectKey, _>` shape — str fast-path
+    /// helpers route through the Object backing per
+    /// `dictmultiobject.py:1311-1318`).  Proxy-attached W_DictObjects
+    /// route through `w_dict_copy`'s union-walk fallback.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        let storage = &*(dict.dstorage
+            as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
+        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        crate::dictmultiobject::w_dict_new_with(
+            &UNICODE_DICT_STRATEGY,
+            new_storage as *mut u8,
+            dict.len,
+        )
+    }
 }
 
 /// `dictmultiobject.py:1339-... IntDictStrategy`.
@@ -1141,48 +1290,33 @@ impl IntDictStrategy {
         // bytes / unicode never equal int.
         crate::is_bytes(w_key) || crate::is_str(w_key)
     }
-
-    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`:
-    /// ```python
-    /// def switch_to_object_strategy(self, w_dict):
-    ///     d = self.unerase(w_dict.dstorage)
-    ///     strategy = self.space.fromcache(ObjectDictStrategy)
-    ///     d_new = strategy.unerase(strategy.get_empty_storage())
-    ///     for key, value in d.iteritems():
-    ///         d_new[self.wrap(key)] = value
-    ///     w_dict.set_strategy(strategy)
-    ///     w_dict.dstorage = strategy.erase(d_new)
-    /// ```
-    ///
-    /// Wraps each i64 key via `wrap = newint` (`:1342`), producing a
-    /// fresh `Vec<(PyObjectRef, PyObjectRef)>` and dropping the old
-    /// typed `Vec<(i64, PyObjectRef)>` box.
-    ///
-    /// # Safety
-    /// `w_dict` must point at a valid `W_DictObject` on
-    /// [`INT_DICT_STRATEGY`].
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut Vec<(i64, PyObjectRef)>);
-        let mut new_vec: Vec<(PyObjectRef, PyObjectRef)> = Vec::with_capacity(old.len());
-        for &(k, v) in old.iter() {
-            new_vec.push((crate::w_int_new(k), v));
-        }
-        dict.dstorage = Box::into_raw(Box::new(new_vec)) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
-    }
 }
 
 impl DictStrategy for IntDictStrategy {
+    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`:
+    /// wraps each i64 key via `wrap = newint` (`:1342`), produces a
+    /// fresh `IndexMap<ObjectKey, PyObjectRef>` and drops the old typed
+    /// `IndexMap<i64, PyObjectRef>` box.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
+        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
+            indexmap::IndexMap::with_capacity(old.len());
+        for (&k, &v) in old.iter() {
+            let w_key = crate::w_int_new(k);
+            new_map.insert(crate::dictmultiobject::object_key_for(w_key), v);
+        }
+        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    }
+
     /// `dictmultiobject.py:1339-1352 IntDictStrategy.get_empty_storage`
     /// — `erase({})` (typed `Dict[int, W_Root]` in RPython).  Pyre
-    /// uses `Vec<(i64, PyObjectRef)>` with linear scan to match
-    /// `w_dict_object_storage`'s shape pattern (PyPy `r_dict` for
-    /// Object strategy similarly resolves to a hash table at translation
-    /// time; both pyre strategies share the linear-scan adaptation
-    /// until ObjectDictStrategy gains a hash-bucket port).
+    /// stores the typed map as `IndexMap<i64, PyObjectRef>`: a hash
+    /// bucket for O(1) lookup that also preserves insertion order
+    /// (CPython 3.7+ / PyPy3 dict semantics).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<Vec<(i64, PyObjectRef)>> = Box::new(Vec::new());
+        let v: Box<indexmap::IndexMap<i64, PyObjectRef>> = Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
     }
 
@@ -1255,7 +1389,7 @@ impl DictStrategy for IntDictStrategy {
     /// `Vec<i64>` of keys directly from the typed storage.
     fn listview_int(&self, w_dict: PyObjectRef) -> Option<Vec<i64>> {
         let entries = unsafe { crate::dictmultiobject::w_dict_int_storage(w_dict) };
-        Some(entries.iter().map(|&(k, _)| k).collect())
+        Some(entries.keys().copied().collect())
     }
 
     /// PyPy traces `Dict[int, W_Root]` only over the value side at
@@ -1264,8 +1398,22 @@ impl DictStrategy for IntDictStrategy {
     /// that by skipping the i64 key half.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_int_storage_mut(w_dict);
-        for (_, value) in entries.iter_mut() {
+        for value in entries.values_mut() {
             visitor(value as *mut PyObjectRef);
         }
+    }
+
+    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
+    /// the typed `IndexMap<i64, PyObjectRef>` backing and wrap with
+    /// the same IntDictStrategy.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        let storage = &*(dict.dstorage as *const indexmap::IndexMap<i64, PyObjectRef>);
+        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        crate::dictmultiobject::w_dict_new_with(
+            &INT_DICT_STRATEGY,
+            new_storage as *mut u8,
+            dict.len,
+        )
     }
 }

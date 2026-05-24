@@ -88,8 +88,9 @@ pub enum BoxKind {
 /// Variant of the `_forwarded` slot.
 ///
 /// RPython's `_forwarded` is `None | another AbstractResOpOrInputArg |
-/// AbstractInfo`. Const forwarding is one case of "another box", so we
-/// represent it as `Box(BoxRef)` carrying a `BoxKind::Const(...)`.
+/// AbstractInfo | VectorizationInfo`. Const forwarding is one case of
+/// "another box", so we represent it as `Box(BoxRef)` carrying a
+/// `BoxKind::Const(...)`.
 #[derive(Debug)]
 pub enum Forwarded {
     None,
@@ -98,10 +99,14 @@ pub enum Forwarded {
     Box(BoxRef),
 
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
-    /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc. The
-    /// vector optimizer's `VectorizationInfo` also fits inside this
-    /// variant.
+    /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
+
+    /// `resoperation.py:156 VectorizationInfo(AbstractValue)` written by
+    /// `schedule.py:20-28 forwarded_vecinfo`. This is intentionally not an
+    /// `Info(OpInfo)` arm: upstream `VectorizationInfo` is not
+    /// `AbstractInfo` and does not set `is_info_class = True`.
+    VectorInfo(majit_ir::VectorizationInfo),
 }
 
 /// `Rc<Box>` newtype.
@@ -282,6 +287,17 @@ impl BoxRef {
         *self.0.forwarded.borrow_mut() = Forwarded::Info(info);
     }
 
+    /// `resoperation.py:53 set_forwarded(forwarded_to)` — VectorizationInfo
+    /// variant used by `schedule.py:20-28 forwarded_vecinfo`.
+    pub fn set_forwarded_vector_info(&self, info: majit_ir::VectorizationInfo) {
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_vector_info on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        *self.0.forwarded.borrow_mut() = Forwarded::VectorInfo(info);
+    }
+
     /// `_forwarded = None` (used during transition / phase reset).
     pub fn clear_forwarded(&self) {
         // Const has no _forwarded slot to reset; clearing is a no-op for
@@ -309,7 +325,7 @@ impl BoxRef {
                 Advance(BoxRef),
             }
             let step = match &*cur.0.forwarded.borrow() {
-                Forwarded::None | Forwarded::Info(_) => Step::Stop,
+                Forwarded::None | Forwarded::Info(_) | Forwarded::VectorInfo(_) => Step::Stop,
                 Forwarded::Box(b) => {
                     if not_const && b.is_constant() {
                         Step::Stop
@@ -322,6 +338,16 @@ impl BoxRef {
                 Step::Stop => return cur,
                 Step::Advance(next) => cur = next,
             }
+        }
+    }
+
+    /// Read `VectorizationInfo` from the `_forwarded` slot without walking.
+    /// Mirrors `schedule.py:20-28 forwarded_vecinfo`'s direct
+    /// `op.get_forwarded()` check.
+    pub fn vector_info(&self) -> Option<majit_ir::VectorizationInfo> {
+        match &*self.0.forwarded.borrow() {
+            Forwarded::VectorInfo(info) => Some(info.clone()),
+            _ => None,
         }
     }
 

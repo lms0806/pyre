@@ -250,7 +250,14 @@ unsafe fn module_dict_object_custom_trace(
     if !md.object_storage.is_null() {
         let object_storage = unsafe { &mut *md.object_storage };
         for (key, value) in object_storage.iter_mut() {
-            f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            // See `dictmultiobject::w_dict_walk_entries_mut` — ObjectKey.hash
+            // is precomputed and identity-stable across GC moves, so writing
+            // through the raw obj slot does not desync the IndexMap bucket
+            // index.
+            let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+                as *mut pyre_object::dictmultiobject::ObjectKey;
+            let obj_slot = unsafe { &raw mut (*key_ptr).obj };
+            f(obj_slot as *mut majit_ir::GcRef);
             f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         }
     }

@@ -39,7 +39,8 @@ pub use crate::optimizeopt::dependency::schedule_operations;
 pub use crate::optimizeopt::dependency::{DependencyGraph, Node};
 pub use crate::optimizeopt::schedule::{
     AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, Pack, PackSet,
-    VecScheduleState, are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector,
+    VecScheduleState, are_adjacent_memory_refs, isomorphic, isomorphic_with_state,
+    turn_into_vector, unpack_from_vector,
 };
 
 /// vector.py: VectorLoop — wraps a loop body for vectorization analysis.
@@ -380,7 +381,11 @@ impl VectorizingOptimizer {
     /// no vectorizable opcodes, or too many guards.
     /// vector.py:404-425: extend_packset — follow def-use and use-def chains
     /// through can_be_packed to discover new pairs (including accumulation).
-    pub fn extend_packset(pack_set: &mut PackSet, graph: &DependencyGraph) {
+    pub fn extend_packset(
+        pack_set: &mut PackSet,
+        graph: &DependencyGraph,
+        state: &mut VecScheduleState,
+    ) {
         let mut pack_count = pack_set.num_packs();
         loop {
             // vector.py:411-415: follow_def_uses for each 2-pack
@@ -388,7 +393,7 @@ impl VectorizingOptimizer {
             while i < pack_set.packs.len() {
                 if pack_set.packs[i].members.len() == 2 {
                     let pack_snap = pack_set.packs[i].clone();
-                    Self::follow_def_uses(pack_set, &pack_snap, graph);
+                    Self::follow_def_uses(pack_set, &pack_snap, graph, state);
                 }
                 i += 1;
             }
@@ -399,7 +404,7 @@ impl VectorizingOptimizer {
                 while i < pack_set.packs.len() {
                     if pack_set.packs[i].members.len() == 2 {
                         let pack_snap = pack_set.packs[i].clone();
-                        Self::follow_use_defs(pack_set, &pack_snap, graph);
+                        Self::follow_use_defs(pack_set, &pack_snap, graph, state);
                     }
                     i += 1;
                 }
@@ -413,7 +418,12 @@ impl VectorizingOptimizer {
 
     /// vector.py:444-458: follow_def_uses — for a 2-pack, check if users
     /// of leftmost/rightmost can form new pairs via can_be_packed.
-    fn follow_def_uses(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
+    fn follow_def_uses(
+        pack_set: &mut PackSet,
+        pack: &Pack,
+        graph: &DependencyGraph,
+        state: &mut VecScheduleState,
+    ) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
         let left_opref = graph.nodes[left_idx].op.pos.get();
@@ -432,8 +442,8 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_user].op;
                 let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_user < r_user {
-                    match pack_set.can_be_packed(l_user, r_user, Some(pack), true, graph) {
+                if isomorphic_with_state(state, l_op, r_op) && l_user < r_user {
+                    match pack_set.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
                         Ok(Some(pair)) => pack_set.add_pack(pair),
                         Err(_) => return, // NotAVectorizeableLoop — abort extension
                         _ => {}
@@ -445,7 +455,12 @@ impl VectorizingOptimizer {
 
     /// vector.py:427-442: follow_use_defs — for a 2-pack, check if
     /// dependencies of leftmost/rightmost can form new pairs.
-    fn follow_use_defs(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
+    fn follow_use_defs(
+        pack_set: &mut PackSet,
+        pack: &Pack,
+        graph: &DependencyGraph,
+        state: &mut VecScheduleState,
+    ) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
         let left_args = graph.nodes[left_idx].op.getarglist().to_vec();
@@ -465,8 +480,8 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_dep].op;
                 let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_dep < r_dep {
-                    match pack_set.can_be_packed(l_dep, r_dep, Some(pack), false, graph) {
+                if isomorphic_with_state(state, l_op, r_op) && l_dep < r_dep {
+                    match pack_set.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
                         Ok(Some(pair)) => pack_set.add_pack(pair),
                         Err(_) => return,
                         _ => {}
@@ -538,12 +553,23 @@ impl VectorizingOptimizer {
         // Constant resolver — looks up OpRef in the optimizer's constant map.
         let constant_of = |opref: OpRef| -> Option<i64> { ctx.get_constant_int(opref) };
 
+        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
+        let mut sched_state = VecScheduleState::new(start_pos);
+        // resoperation.py:181-186 INT_SIGNEXT branch needs arg1's const
+        // value to populate the destination bytesize; the resolver feeds
+        // it through `setup_vectorization` so the inline vecinfo slot is
+        // stamped at construction, matching PyPy's
+        // `VectorizationInfo(op)` call that reads `arg1.value` off the
+        // `ConstInt` instance directly.
+        sched_state.setup_vectorization(&self.body_ops, &constant_of);
+
         // Phase 1: Schedule operations for ILP before packing.
         let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
         let schedule = schedule_operations(&dep_graph);
         if schedule.len() == self.body_ops.len() {
             let scheduled: Vec<Op> = schedule.iter().map(|&i| self.body_ops[i].clone()).collect();
             self.body_ops = scheduled;
+            sched_state.setup_vectorization(&self.body_ops, &constant_of);
         }
 
         // Phase 2: Rebuild dependency graph on reordered ops and find packs.
@@ -559,7 +585,7 @@ impl VectorizingOptimizer {
             pack_set.add_pack(pack);
         }
         // vector.py:404-425: extend_packset — follow chains via can_be_packed
-        Self::extend_packset(&mut pack_set, &dep_graph);
+        Self::extend_packset(&mut pack_set, &dep_graph, &mut sched_state);
         // vector.py:460-494: combine_packset — merge 2-packs into larger packs
         Self::combine_packset(&mut pack_set);
         let profitable = pack_set.packs;
@@ -576,9 +602,6 @@ impl VectorizingOptimizer {
         //   walk_and_emit() → topo-order walk with delay() gating for packs
         //   mark_emitted() → renamer.rename(op), ensure_args_unpacked(op)
         //   pre_emit() → guard accumulation descriptor stitching
-        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
-        let mut sched_state = VecScheduleState::new(start_pos);
-
         // ── schedule.py:666-670: prepare() ──
         // Populate inputargs and seen from label args.
         for &arg in &self.label_args {
@@ -630,13 +653,13 @@ impl VectorizingOptimizer {
             }
             let datatype = 'i';
             // vector.py:839: pack.getbytesize() — from seed's vecinfo
-            let bytesize: i32 = self
-                .body_ops
-                .iter()
-                .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.get_vecinfo())
-                .map(|vi| vi.getbytesize() as i32)
-                .unwrap_or(8);
+            let bytesize: i32 =
+                if let Some(seed_op) = self.body_ops.iter().find(|op| op.pos.get() == seed) {
+                    sched_state.forwarded_vecinfo(seed_op).getbytesize() as i32
+                } else {
+                    majit_ir::VectorizationInfo::from_type(seed.ty().unwrap_or(majit_ir::Type::Int))
+                        .getbytesize() as i32
+                };
             // vector.py:827,840: vec_reg_size // bytesize
             let vec_reg_size: i32 = 16; // SSE = 16 bytes
             let count = (vec_reg_size / bytesize) as usize;
@@ -858,13 +881,20 @@ fn is_float_opcode(opcode: OpCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRc, OpRef};
+    use majit_ir::{Op, OpCode, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos
                 .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
+    }
+
+    fn schedule_state_for(ops: &[Op]) -> VecScheduleState {
+        let mut state = VecScheduleState::new(ops.len() as u32);
+        let no_consts = |_: OpRef| -> Option<i64> { None };
+        state.setup_vectorization(ops, &no_consts);
+        state
     }
 
     // ── Dependency graph tests ──
@@ -1410,8 +1440,9 @@ mod tests {
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
         let ps = PackSet::new();
+        let mut state = schedule_state_for(&ops);
 
-        let result = ps.can_be_packed(0, 1, None, false, &graph);
+        let result = ps.can_be_packed(&mut state, 0, 1, None, false, &graph);
         assert!(result.is_ok());
         let pack = result.unwrap();
         assert!(pack.is_some());
@@ -1436,8 +1467,11 @@ mod tests {
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
         let ps = PackSet::new();
+        let mut state = schedule_state_for(&ops);
 
-        let result = ps.can_be_packed(0, 1, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut state, 0, 1, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -1480,7 +1514,8 @@ mod tests {
         };
 
         let ps = PackSet::new();
-        let result = ps.can_be_packed(2, 3, Some(&origin), true, &graph);
+        let mut state = schedule_state_for(&ops);
+        let result = ps.can_be_packed(&mut state, 2, 3, Some(&origin), true, &graph);
         assert!(result.is_ok());
         let pack = result.unwrap();
         // Op2 and Op3 are dependent (op3 uses op2's result), so this goes
@@ -1529,11 +1564,16 @@ mod tests {
             position: -1,
             operator: None,
         });
+        let mut state = schedule_state_for(&ops);
         // Trying to pack (0, 2) — node 0 is already leftmost → blocked
-        let result = ps.can_be_packed(0, 2, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut state, 0, 2, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
         // Trying to pack (2, 1) — node 1 is already rightmost → blocked
-        let result = ps.can_be_packed(2, 1, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut state, 2, 1, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
     }
 

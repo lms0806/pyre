@@ -3382,7 +3382,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `setobject.py`).  Pyre's `hash_value` falls through to identity
 /// for un-typed objects, so this wrapper screens the known
 /// unhashables before calling.
-fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "hash() takes exactly one argument");
     let obj = args[0];
     if obj.is_null() {

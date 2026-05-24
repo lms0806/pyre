@@ -5,13 +5,13 @@
 
 use majit_ir::{Op, OpCode, OpRef, Type};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 
 // ── vector.py:670-678: isomorphic ─────────────────────────────────────
 
-/// Get the effective bytesize of an op's result.
-/// Mirrors RPython's forwarded_vecinfo(op).bytesize: returns vecinfo.bytesize
-/// if present, otherwise the default for the op's result type.
+/// vector.py:670-678 helper — returns the bytesize from the op's vecinfo
+/// slot if present, otherwise the default for the op's result type.
 /// INT_WORD = 8, FLOAT_WORD = 8 on 64-bit; void → 0.
 fn get_op_bytesize(op: &Op) -> i32 {
     if let Some(vi) = op.get_vecinfo() {
@@ -31,6 +31,17 @@ pub fn isomorphic(l_op: &Op, r_op: &Op) -> bool {
         return false;
     }
     get_op_bytesize(l_op) == get_op_bytesize(r_op)
+}
+
+/// vector.py:670-678 production path. Uses `forwarded_vecinfo`, which stores
+/// `VectorizationInfo` in the same `_forwarded` slot that RPython uses.
+pub fn isomorphic_with_state(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
+    if l_op.opcode != r_op.opcode {
+        return false;
+    }
+    let l_vecinfo = state.forwarded_vecinfo(l_op);
+    let r_vecinfo = state.forwarded_vecinfo(r_op);
+    l_vecinfo.bytesize == r_vecinfo.bytesize
 }
 
 /// schedule.py:781+: A pack is a set of n isomorphic operations that can
@@ -245,6 +256,7 @@ impl PackSet {
     /// Returns Err(NotAVectorizeableLoop) if vectorization must abort.
     pub fn can_be_packed(
         &self,
+        state: &mut VecScheduleState,
         lnode: usize,
         rnode: usize,
         origin_pack: Option<&Pack>,
@@ -254,7 +266,7 @@ impl PackSet {
         let l_op = &graph.nodes[lnode].op;
         let r_op = &graph.nodes[rnode].op;
 
-        if !isomorphic(l_op, r_op) {
+        if !isomorphic_with_state(state, l_op, r_op) {
             return Ok(None);
         }
 
@@ -309,7 +321,7 @@ impl PackSet {
                 return Ok(None);
             }
             if origin_pack.is_some() {
-                return Ok(self.accumulates_pair(lnode, rnode, origin_pack.unwrap(), graph));
+                return Ok(self.accumulates_pair(state, lnode, rnode, origin_pack.unwrap(), graph));
             }
         }
 
@@ -381,6 +393,7 @@ impl PackSet {
     /// between two isomorphic, dependent nodes.
     fn accumulates_pair(
         &self,
+        state: &mut VecScheduleState,
         lnode: usize,
         rnode: usize,
         origin_pack: &Pack,
@@ -454,8 +467,8 @@ impl PackSet {
         } else {
             8 // INT_WORD on 64-bit
         };
-        let l_bs = get_op_bytesize(left);
-        let r_bs = get_op_bytesize(right);
+        let l_bs = state.forwarded_vecinfo(left).getbytesize() as i32;
+        let r_bs = state.forwarded_vecinfo(right).getbytesize() as i32;
         if !(l_bs == r_bs && l_bs == size) {
             return None;
         }
@@ -777,10 +790,17 @@ pub struct VecScheduleState {
     pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// Type registry: OpRef → is_float for vector ops.
-    /// Registered at creation time (before append_to_oplist),
-    /// so is_float_vector works even before the op is in oplist.
-    vec_type_registry: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, bool>,
+    /// RPython `box._forwarded` storage used by the vectorizer for
+    /// `VectorizationInfo`. This is local to scheduling because upstream
+    /// clears the vectorization `_forwarded` state after the vector pass
+    /// (`vector.py:58-60`, `finaloplist`:88-90).
+    ///
+    /// Keyed by full `OpRef` (variant + payload) so the
+    /// `InputArg*` and `*Op` namespaces stay disjoint — PyPy uses Box
+    /// object identity (`AbstractValue` `is`), so e.g. an inputarg at
+    /// slot 0 and an op at position 0 cannot collide upstream and must
+    /// not collide here either.
+    box_pool: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, BoxRef>,
 }
 
 impl VecScheduleState {
@@ -796,8 +816,242 @@ impl VecScheduleState {
             invariant_oplist: Vec::new(),
             accumulation: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_pos: start_pos,
-            vec_type_registry: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            box_pool: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
+    }
+
+    /// vector.py:54-60 setup/teardown_vectorization. Seed only the local
+    /// scheduling BoxPool; RPython clears this `_forwarded` state after the
+    /// vector pass, so it must not leak into the main optimizer BoxPool.
+    ///
+    /// `constant_of` resolves the optimizer's const-pool so the
+    /// `resoperation.py:181-186 INT_SIGNEXT` branch can read `arg1.value`
+    /// at stamp time — PyPy reads the value off the `ConstInt` instance
+    /// directly because `_args[1]` IS the const; pyre's flat-OpRef
+    /// encoding stores constants as a pool index, so the resolver fills
+    /// the same role at the moment we populate the inline vecinfo slot.
+    pub fn setup_vectorization(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
+        for op in ops {
+            let info = if op.opcode == OpCode::IntSignext {
+                self.int_signext_vecinfo(op, constant_of)
+            } else {
+                self.vectorization_info_for_op(op)
+            };
+            if let Some(b) = self.ensure_box_for_opref(op.pos.get()) {
+                b.set_forwarded_vector_info(info);
+            }
+        }
+    }
+
+    /// `resoperation.py:181-186 VectorizationInfo.__init__` INT_SIGNEXT
+    /// branch.  PyPy reads `op.getarg(1).value` off the `ConstInt` object
+    /// directly; pyre's flat-OpRef encoding stores the const as a pool
+    /// index, so the caller-supplied resolver materialises the value at
+    /// stamp time.  Falls back to the generic branch when arg1 isn't a
+    /// resolvable constant (mirrors PyPy's `assert isinstance(arg1, ConstInt)`
+    /// degrading to the typecast-fallthrough path in non-translated runs).
+    fn int_signext_vecinfo(
+        &self,
+        op: &Op,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+    ) -> majit_ir::VectorizationInfo {
+        if op.num_args() >= 2 {
+            if let Some(bytesize) = constant_of(op.arg(1)) {
+                if (i8::MIN as i64..=i8::MAX as i64).contains(&bytesize) {
+                    let mut info = majit_ir::VectorizationInfo::new();
+                    info.setinfo('i', bytesize as i8, true);
+                    return info;
+                }
+            }
+        }
+        self.vectorization_info_for_op(op)
+    }
+
+    fn ensure_box_for_opref(&mut self, opref: OpRef) -> Option<BoxRef> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        if let Some(existing) = self.box_pool.get(&opref) {
+            return Some(existing.clone());
+        }
+        let tp = opref.ty().unwrap_or(Type::Void);
+        let raw = opref.raw();
+        let b = if matches!(
+            opref,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        ) {
+            BoxRef::new_inputarg(tp, raw)
+        } else {
+            BoxRef::new_resop(tp, raw)
+        };
+        self.box_pool.insert(opref, b.clone());
+        Some(b)
+    }
+
+    fn get_forwarded_vecinfo(&self, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        self.box_pool.get(&opref).and_then(|b| b.vector_info())
+    }
+
+    fn set_forwarded_vecinfo(&mut self, opref: OpRef, info: majit_ir::VectorizationInfo) {
+        if let Some(b) = self.ensure_box_for_opref(opref) {
+            b.set_forwarded_vector_info(info);
+        }
+    }
+
+    /// schedule.py:20-28 `forwarded_vecinfo(op)`.
+    pub fn forwarded_vecinfo(&mut self, op: &Op) -> majit_ir::VectorizationInfo {
+        let opref = op.pos.get();
+        if let Some(info) = self.get_forwarded_vecinfo(opref) {
+            return info;
+        }
+        let info = self.vectorization_info_for_op(op);
+        if !opref.is_constant() {
+            self.set_forwarded_vecinfo(opref, info.clone());
+        }
+        info
+    }
+
+    fn forwarded_vecinfo_for_ref(
+        &mut self,
+        opref: OpRef,
+        ops: &[Op],
+    ) -> majit_ir::VectorizationInfo {
+        if let Some(info) = self.get_forwarded_vecinfo(opref) {
+            return info;
+        }
+        if let Some(op) = ops
+            .iter()
+            .chain(self.oplist.iter())
+            .chain(self.invariant_oplist.iter())
+            .find(|op| op.pos.get() == opref)
+            .cloned()
+        {
+            return self.forwarded_vecinfo(&op);
+        }
+        let tp = opref.ty().unwrap_or(Type::Int);
+        let info = majit_ir::VectorizationInfo::from_type(tp);
+        if !opref.is_constant() {
+            self.set_forwarded_vecinfo(opref, info.clone());
+        }
+        info
+    }
+
+    /// resoperation.py:163-212 `VectorizationInfo(op)` for ResOps.
+    /// Const/InputArg are handled by the cache miss path in
+    /// `forwarded_vecinfo_for_ref` (`VectorizationInfo.from_type`).
+    ///
+    /// Mirrors PyPy `resoperation.py:163-212 VectorizationInfo.__init__`.
+    /// The `INT_SIGNEXT` branch (`:181-186`) is handled in
+    /// `int_signext_vecinfo` at setup time because it needs the
+    /// caller-supplied const-pool resolver; once the inline vecinfo slot
+    /// is stamped, every later lookup hits the cache and never re-enters
+    /// this method for INT_SIGNEXT.  A bare miss-path call on
+    /// INT_SIGNEXT (e.g. a synthesised op that bypassed setup) falls
+    /// through to the typecast branch which returns `None` for it, and
+    /// then to the source-operand pass-through — same degradation as
+    /// PyPy's non-translated `assert` failure path.
+    fn vectorization_info_for_op(&self, op: &Op) -> majit_ir::VectorizationInfo {
+        // resoperation.py:170-180 primitive_array_access branch.
+        if op.opcode.is_primitive_array_access_opcode() {
+            if let Some(descr) = op.getdescr() {
+                if let Some(arr) = majit_ir::descr::descr_arc_as_array_descr(descr) {
+                    if arr.is_array_of_primitives() {
+                        let datatype = match op.result_type() {
+                            Type::Int => 'i',
+                            Type::Float => 'f',
+                            Type::Ref => 'r',
+                            Type::Void => 'v',
+                        };
+                        let bytesize = arr.item_size() as i8;
+                        let signed = arr.is_item_signed();
+                        let mut info = majit_ir::VectorizationInfo::new();
+                        info.setinfo(datatype, bytesize, signed);
+                        return info;
+                    }
+                }
+            }
+        }
+
+        // resoperation.py:187-190 is_typecast branch (INT_SIGNEXT static
+        // gating returns None per `cast_to_bytesize_static`; the dynamic
+        // INT_SIGNEXT bytesize is stamped in `int_signext_vecinfo` at
+        // setup time and read back through the inline vecinfo slot).
+        if op.opcode.is_typecast() {
+            if let Some(bytesize) = op.opcode.cast_to_bytesize_static() {
+                let (_ft, tt) = op.opcode.cast_types();
+                let mut info = majit_ir::VectorizationInfo::new();
+                info.setinfo(tt, bytesize as i8, true);
+                return info;
+            }
+        }
+
+        // resoperation.py:192-209 else branch:
+        //   type = op.type
+        //   signed = type == 'i'
+        //   bytesize = -1
+        //   if op.numargs() > 0:
+        //       i = 0
+        //       arg = op.getarg(i)
+        //       while arg.is_constant() and i+1 < op.numargs():
+        //           i += 1
+        //           arg = op.getarg(i)
+        //       if not arg.is_constant():
+        //           vecinfo = arg.get_forwarded()
+        //           if vecinfo is not None and isinstance(vecinfo, VectorizationInfo):
+        //               if vecinfo.datatype != '\x00' and vecinfo.bytesize != -1:
+        //                   type     = vecinfo.datatype
+        //                   signed   = vecinfo.signed
+        //                   bytesize = vecinfo.bytesize
+        //   if rop.returns_bool_result(op.opnum):
+        //       type = 'i'
+        //   self.setinfo(type, bytesize, signed)
+        let mut tp = op.result_type();
+        let mut datatype = match tp {
+            Type::Int => 'i',
+            Type::Float => 'f',
+            Type::Ref => 'r',
+            Type::Void => 'v',
+        };
+        let mut signed = datatype == 'i';
+        let mut bytesize: i8 = -1;
+
+        let n = op.num_args();
+        if n > 0 {
+            let mut i = 0usize;
+            let mut arg = op.arg(i);
+            while arg.is_constant() && i + 1 < n {
+                i += 1;
+                arg = op.arg(i);
+            }
+            if !arg.is_constant() {
+                if let Some(vinfo) = self.get_forwarded_vecinfo(arg) {
+                    if vinfo.datatype != '\x00' && vinfo.bytesize != -1 {
+                        datatype = vinfo.datatype;
+                        tp = match datatype {
+                            'i' => Type::Int,
+                            'f' => Type::Float,
+                            'r' => Type::Ref,
+                            _ => tp,
+                        };
+                        signed = vinfo.signed;
+                        bytesize = vinfo.bytesize;
+                    }
+                }
+            }
+        }
+
+        if op.opcode.returns_bool() {
+            datatype = 'i';
+            tp = Type::Int;
+        }
+        let _ = tp;
+
+        let mut info = majit_ir::VectorizationInfo::new();
+        info.setinfo(datatype, bytesize, signed);
+        info
     }
 
     /// Allocate a fresh typed OpRef for a newly created vector op. The
@@ -808,11 +1062,6 @@ impl VecScheduleState {
         let pos = OpRef::op_typed(self.next_pos, tp);
         self.next_pos += 1;
         pos
-    }
-
-    /// Register a vector op's datatype at creation time.
-    pub fn register_vec_type(&mut self, opref: OpRef, is_float: bool) {
-        self.vec_type_registry.insert(opref, is_float);
     }
 
     /// resoperation.py:111-116 (VecOperationNew): Create a vector op with
@@ -827,20 +1076,26 @@ impl VecScheduleState {
         signed: bool,
         count: usize,
     ) -> Op {
-        let mut op = Op::new(opcode, args);
+        let op = Op::new(opcode, args);
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
         vinfo.count = count as i16;
-        op.set_vecinfo(vinfo);
-        self.register_vec_type(op.pos.get(), datatype == 'f');
+        // resoperation.py:111-115 VecOperationNew.__init__ stores the
+        // datatype/bytesize/signed/count on the op object itself; copy_and_change
+        // (resoperation.py:511-518) propagates them. Cache the same payload
+        // on `Op.vecinfo` so the vector shape survives schedule-state teardown.
+        op.set_vecinfo(vinfo.clone());
+        self.set_forwarded_vecinfo(op.pos.get(), vinfo);
         op
     }
 
-    /// Check if an OpRef refers to a float-type vector op.
-    /// Uses the type registry (populated at op creation, before append_to_oplist).
+    /// Check if an OpRef refers to a float-type vector op.  The OpRef
+    /// variant itself carries the result-type tag (`opcode.result_type()`
+    /// at `alloc_op_pos`), mirroring PyPy's `opclasses[opnum].type == 'f'`
+    /// gating in `resoperation.py:1597` — no side-table needed.
     pub fn is_float_vector(&self, opref: OpRef) -> bool {
-        self.vec_type_registry.get(&opref).copied().unwrap_or(false)
+        opref.ty() == Some(Type::Float)
     }
 
     /// schedule.py:625-630: setvector_of_box — record that scalar_op
@@ -876,6 +1131,14 @@ impl VecScheduleState {
                 break;
             }
             let arg = op.arg(index);
+            // schedule.py:757-760:
+            //   vecinfo = forwarded_vecinfo(arg)
+            //   if i >= vecinfo.count: break
+            //   self.setvector_of_box(arg, i, box)
+            let vecinfo = self.forwarded_vecinfo_for_ref(arg, ops);
+            if (i as i16) >= vecinfo.count {
+                break;
+            }
             self.setvector_of_box(arg, i, vecbox);
         }
     }
@@ -954,15 +1217,18 @@ pub struct NotAVectorizeableLoop;
 pub struct NotAProfitableLoop;
 
 /// schedule.py:462-474: check_if_pack_supported — validate pack constraints.
-pub fn check_if_pack_supported(pack: &Pack, ops: &[Op]) -> Result<(), NotAProfitableLoop> {
+pub fn check_if_pack_supported(
+    state: &mut VecScheduleState,
+    pack: &Pack,
+    ops: &[Op],
+) -> Result<(), NotAProfitableLoop> {
     let first_op = &ops[pack.members[0]];
     // schedule.py:471-474: INT_MUL with bytesize 8 or 1 is not profitable
     if first_op.opcode == OpCode::IntMul {
-        if let Some(vi) = first_op.get_vecinfo() {
-            let insize = vi.getbytesize();
-            if insize == 8 || insize == 1 {
-                return Err(NotAProfitableLoop);
-            }
+        let vi = state.forwarded_vecinfo(first_op);
+        let insize = vi.getbytesize();
+        if insize == 8 || insize == 1 {
+            return Err(NotAProfitableLoop);
         }
     }
     Ok(())
@@ -987,7 +1253,7 @@ pub fn unpack_from_vector(
         OpCode::VecUnpackI
     };
     // schedule.py:479-483: forwarded_vecinfo(arg).bytesize/signed
-    let (datatype, bytesize, signed) = get_vec_info(state, vec_ref);
+    let (datatype, bytesize, signed) = get_vec_info(state, vec_ref, &[]);
     let unpack_op = state.create_vec_op(
         unpack_opcode,
         &[vec_ref, index_const, count_const],
@@ -1097,7 +1363,7 @@ fn assemble_scattered_values(
 
     // schedule.py:425-428: if scattered across >1 vector, gather
     if vectors.len() > 1 {
-        args[index] = gather(state, &vectors, pack.members.len());
+        args[index] = gather(state, &vectors, pack.members.len(), ops);
         // schedule.py:428: remember_args_in_vector
         state.remember_args_in_vector(pack, index, args[index], ops);
     }
@@ -1106,47 +1372,39 @@ fn assemble_scattered_values(
 /// schedule.py:430-441: gather — combine multiple vector fragments into one.
 /// Uses each fragment's actual lane count (vecinfo.count / newvecinfo.count)
 /// to determine insertion position and guard against overfill.
-fn gather(state: &mut VecScheduleState, vectors: &[(usize, OpRef)], count: usize) -> OpRef {
+fn gather(
+    state: &mut VecScheduleState,
+    vectors: &[(usize, OpRef)],
+    count: usize,
+    ops: &[Op],
+) -> OpRef {
     let (_, mut arg) = vectors[0];
     let mut i = 1;
     while i < vectors.len() {
         let (newarg_pos, newarg) = vectors[i];
         // schedule.py:436-437: get actual lane counts from vecinfo
-        let arg_count = get_vec_count(state, arg);
-        let newarg_count = get_vec_count(state, newarg);
+        let arg_count = get_vec_count(state, arg, ops);
+        let newarg_count = get_vec_count(state, newarg, ops);
         // schedule.py:438: guard: combined count must fit in target
         if arg_count + newarg_count <= count {
             // schedule.py:439: pack newarg into arg at arg's current count
-            arg = pack_into_vector(state, arg, arg_count, newarg, newarg_pos, newarg_count);
+            arg = pack_into_vector(state, arg, arg_count, newarg, newarg_pos, newarg_count, ops);
         }
         i += 1;
     }
     arg
 }
 
-/// Look up an OpRef's VectorizationInfo in state's oplists.
-fn find_vecinfo(state: &VecScheduleState, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
-    for op in state.oplist.iter().chain(state.invariant_oplist.iter()) {
-        if op.pos.get() == opref {
-            if let Some(vi) = op.get_vecinfo() {
-                return Some(vi.clone());
-            }
-        }
-    }
-    None
-}
-
 /// Get the lane count of a vector OpRef. Falls back to 1.
-fn get_vec_count(state: &VecScheduleState, opref: OpRef) -> usize {
-    find_vecinfo(state, opref)
-        .map(|vi| vi.count.max(1) as usize)
-        .unwrap_or(1)
+fn get_vec_count(state: &mut VecScheduleState, opref: OpRef, ops: &[Op]) -> usize {
+    state.forwarded_vecinfo_for_ref(opref, ops).count.max(1) as usize
 }
 
 /// Get (datatype, bytesize, signed) from a vector OpRef's vecinfo.
 /// Falls back to is_float_vector registry + default 8-byte.
-fn get_vec_info(state: &VecScheduleState, opref: OpRef) -> (char, i32, bool) {
-    if let Some(vi) = find_vecinfo(state, opref) {
+fn get_vec_info(state: &mut VecScheduleState, opref: OpRef, ops: &[Op]) -> (char, i32, bool) {
+    let vi = state.forwarded_vecinfo_for_ref(opref, ops);
+    if vi.datatype != '\0' {
         return (vi.datatype, vi.bytesize as i32, vi.signed);
     }
     let is_float = state.is_float_vector(opref);
@@ -1169,6 +1427,7 @@ fn pack_into_vector(
     src: OpRef,
     sidx: usize,
     scount: usize,
+    ops: &[Op],
 ) -> OpRef {
     // schedule.py:493: assert sidx == 0
     debug_assert!(sidx == 0, "pack_into_vector: sidx must be 0, got {}", sidx);
@@ -1181,9 +1440,9 @@ fn pack_into_vector(
     let tidx_const = OpRef::const_int(tidx as u32);
     let scount_const = OpRef::const_int(scount as u32);
     // schedule.py:494-497: forwarded_vecinfo(tgt).bytesize/signed, newcount
-    let tgt_count = get_vec_count(state, tgt);
+    let tgt_count = get_vec_count(state, tgt, ops);
     let newcount = tgt_count + scount;
-    let (datatype, bytesize, signed) = get_vec_info(state, tgt);
+    let (datatype, bytesize, signed) = get_vec_info(state, tgt, ops);
     let vecop = state.create_vec_op(
         pack_opcode,
         &[tgt, src, tidx_const, scount_const],
@@ -1235,12 +1494,12 @@ fn crop_vector(
     // schedule.py:406-408: check if bytesize needs conversion
     // Determine the vector's current element size and the op's expected size
     let arg_bytesize = get_op_bytesize_for_ref(state, arg, ops);
-    let op_bytesize = get_op_bytesize(&ops[pack.members[0]]);
+    let op_bytesize = state.forwarded_vecinfo(&ops[pack.members[0]]).getbytesize() as i32;
     if arg_bytesize > 0 && op_bytesize > 0 && arg_bytesize != op_bytesize {
         // schedule.py:411-417: integer type → VEC_INT_SIGNEXT
         if first_op.opcode.result_type() != majit_ir::Type::Float {
             let newsize_const = OpRef::const_int(op_bytesize as u32);
-            let vec_count = get_vec_count(state, arg);
+            let vec_count = get_vec_count(state, arg, ops);
             // schedule.py:414-415: VecOperationNew with proper vecinfo
             let signext_op = state.create_vec_op(
                 OpCode::VecIntSignext,
@@ -1262,25 +1521,8 @@ fn crop_vector(
 }
 
 /// Helper: get bytesize for an OpRef that may be a vector op created during scheduling.
-fn get_op_bytesize_for_ref(state: &VecScheduleState, opref: OpRef, ops: &[Op]) -> i32 {
-    // Check in the oplist first (newly created vector ops)
-    for op in &state.oplist {
-        if op.pos.get() == opref {
-            return get_op_bytesize(op);
-        }
-    }
-    for op in &state.invariant_oplist {
-        if op.pos.get() == opref {
-            return get_op_bytesize(op);
-        }
-    }
-    // Check original ops
-    for op in ops {
-        if op.pos.get() == opref {
-            return get_op_bytesize(op);
-        }
-    }
-    -1 // unknown
+fn get_op_bytesize_for_ref(state: &mut VecScheduleState, opref: OpRef, ops: &[Op]) -> i32 {
+    state.forwarded_vecinfo_for_ref(opref, ops).getbytesize() as i32
 }
 
 /// schedule.py:524-582: expand — broadcast or gather a scalar into a vector box.
@@ -1308,12 +1550,16 @@ fn expand(
         index < op.num_args() && op.arg(index) == arg
     });
 
-    // schedule.py:551: get vecinfo from left op for bytesize/signed
-    let first_op = &ops[pack.members[0]];
-    let is_float = first_op.opcode.result_type() == majit_ir::Type::Float;
-    let datatype = if is_float { 'f' } else { 'i' };
-    let bytesize: i32 = if is_float { 8 } else { 8 }; // 64-bit
-    let signed = !is_float;
+    // datatype is `arg.type` per PyPy `OpHelpers.create_vec_expand`
+    // (resoperation.py:1556-1562) — opcode dispatch + the resulting
+    // vecinfo.datatype both come from the arg being expanded.
+    let datatype = match arg.ty().unwrap_or(Type::Void) {
+        Type::Int => 'i',
+        Type::Float => 'f',
+        Type::Ref => 'r',
+        Type::Void => 'v',
+    };
+    let is_float = datatype == 'f';
     let numops = pack.members.len();
 
     if all_same {
@@ -1322,12 +1568,22 @@ fn expand(
             args[index] = existing;
             return;
         }
+        // schedule.py:550-552: bytesize/signed come from the left-most
+        // pack op's vecinfo, NOT from `arg` — the pack's element width is
+        // the authoritative shape for the broadcast destination.
+        //   left = pack.leftmost()
+        //   vecinfo = forwarded_vecinfo(left)
+        //   vecop = OpHelpers.create_vec_expand(arg, vecinfo.bytesize,
+        //                                       vecinfo.signed, pack.numops())
+        let left_op = &ops[pack.members[0]];
+        let left_info = state.forwarded_vecinfo(left_op);
+        let bytesize = left_info.bytesize as i32;
+        let signed = left_info.signed;
         let expand_opcode = if is_float {
             OpCode::VecExpandF
         } else {
             OpCode::VecExpandI
         };
-        // schedule.py:552: create_vec_expand(arg, bytesize, signed, numops)
         let vecop = state.create_vec_op(expand_opcode, &[arg], datatype, bytesize, signed, numops);
         let vecop_pos = vecop.pos.get();
         if is_invariant {
@@ -1340,6 +1596,16 @@ fn expand(
         args[index] = vecop_pos;
         return;
     }
+
+    // schedule.py:567: arg_vecinfo = forwarded_vecinfo(arg)
+    //   vecop = OpHelpers.create_vec(arg.type, arg_vecinfo.bytesize,
+    //                                arg_vecinfo.signed, pack.opnum())
+    // Only the heterogeneous (VecPack/gather) branch uses arg's vecinfo —
+    // each pack member contributes its own scalar to the vector, so the
+    // arg's element width is the shape source.
+    let arg_info = state.forwarded_vecinfo_for_ref(arg, ops);
+    let bytesize = arg_info.bytesize as i32;
+    let signed = arg_info.signed;
 
     // schedule.py:560-582: VecPack (gather) — heterogeneous args
     let expandargs: Vec<OpRef> = pack
@@ -1411,7 +1677,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
         return;
     }
     // schedule.py:324: check_if_pack_supported
-    if check_if_pack_supported(pack, ops).is_err() {
+    if check_if_pack_supported(state, pack, ops).is_err() {
         return;
     }
     let count = pack.members.len();
@@ -1430,17 +1696,23 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
 
     // schedule.py:337-338: VecOperation(left.vector, args, left, pack.numops())
     // resoperation.py:100-104: copy datatype/bytesize/signed from baseop's vecinfo
-    let (datatype, bytesize, signed) = if let Some(vi) = first_op.get_vecinfo() {
-        (vi.datatype, vi.bytesize, vi.signed)
-    } else {
-        // Default from result type when vecinfo absent
-        let dt = if first_op.opcode.result_type() == majit_ir::Type::Float {
-            'f'
-        } else {
-            'i'
-        };
-        (dt, -1i8, dt == 'i')
-    };
+    let vi = state.forwarded_vecinfo(first_op);
+    let (mut datatype, mut bytesize, signed) = (vi.datatype, vi.bytesize, vi.signed);
+    // resoperation.py:105-108 VecOperation typecast override.
+    //   if baseop.is_typecast():
+    //       ft, tt = baseop.cast_types()
+    //       datatype = tt
+    //       bytesize = baseop.cast_to_bytesize()
+    // INT_SIGNEXT is excluded by the static-bytesize gate (see
+    // PRE-EXISTING-ADAPTATION in `vectorization_info_for_op`): the dynamic
+    // arg1.value path needs const-pool threading.
+    if first_op.opcode.is_typecast() {
+        if let Some(bs) = first_op.opcode.cast_to_bytesize_static() {
+            let (_ft, tt) = first_op.opcode.cast_types();
+            datatype = tt;
+            bytesize = bs as i8;
+        }
+    }
     let mut vecop =
         state.create_vec_op(vec_opcode, &args, datatype, bytesize as i32, signed, count);
     if let Some(d) = first_op.getdescr() {

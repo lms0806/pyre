@@ -869,7 +869,8 @@ impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage_mut_opt(w_dict)
         {
-            return entries.pop();
+            let (k, v) = entries.pop()?;
+            return Some((k.obj, v));
         }
         let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
         let strategy = &mut *module.mstrategy;
@@ -887,9 +888,7 @@ impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
     /// `:208 wrapvalue`.
     unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            let mut out: Vec<(PyObjectRef, PyObjectRef)> = entries.clone();
-            out.reverse();
-            return out;
+            return entries.iter().rev().map(|(k, &v)| (k.obj, v)).collect();
         }
         let module = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
         let storage = &*module.dstorage;
@@ -912,8 +911,8 @@ impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let new_dict = crate::dictmultiobject::w_dict_new();
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            for &(k, v) in entries.iter() {
-                crate::dictmultiobject::w_dict_store(new_dict, k, v);
+            for (k, &v) in entries.iter() {
+                crate::dictmultiobject::w_dict_store(new_dict, k.obj, v);
             }
             return new_dict;
         }

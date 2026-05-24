@@ -52,6 +52,119 @@
 
 use crate::pyobject::*;
 
+/// `pypy/objspace/std/dictmultiobject.py:1209-1212 ObjectDictStrategy`
+/// — `r_dict(dict_keys_equal, hash_w)` key type.  The hash is cached
+/// at insertion time so the `Hash` trait impl is infallible; equality
+/// dispatches through `dict_keys_equal` so user-defined `__eq__`
+/// resolves through the standard comparison protocol via the
+/// `dict_eq_hook::EQ_W_HOOK` trampoline.
+///
+/// GC-move stability: `ObjectKey.hash` is the value of `space.hash_w(obj)`
+/// at insertion time, which depends only on the object's *content* and
+/// not on its memory address.  Python's data model requires hashable
+/// types to have content-derived, identity-stable hashes
+/// (`__hash__` must agree with `__eq__` and must not change for the
+/// lifetime of the object); built-in immutables (int / str / tuple /
+/// frozenset / bytes / bool) all satisfy this by construction, and
+/// user-defined classes that override `__hash__` are contractually
+/// required to do so.  Pyre's young-gen mark-and-copy collector may
+/// move `key.obj` (the `*mut PyObject` payload) but the cached `hash`
+/// remains valid because it is not a function of the address.  The
+/// `walk_gc_refs` trace in `dictstrategy.rs ObjectDictStrategy` visits
+/// `key.obj` only and leaves `key.hash` untouched.  See
+/// `identitydict.rs IdentityKey` for the contrasting *pointer-hashed*
+/// case where this property does NOT hold.
+#[derive(Clone, Copy)]
+pub struct ObjectKey {
+    pub hash: i64,
+    pub obj: PyObjectRef,
+}
+
+impl std::hash::Hash for ObjectKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_i64(self.hash);
+    }
+}
+
+impl PartialEq for ObjectKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.hash != other.hash {
+            return false;
+        }
+        unsafe { dict_keys_equal(self.obj, other.obj) }
+    }
+}
+
+impl Eq for ObjectKey {}
+
+/// `dictmultiobject.py:1209-1212 r_dict(_, hash_w, ...)` —
+/// `space.hash_w(obj)` precomputed for bucket placement.  When the
+/// `dict_eq_hook::HASH_W_HOOK` trampoline isn't installed (pyre-object
+/// lib tests, snapshot builds before init) we fall back to a structural
+/// hash that mirrors `dict_keys_equal`'s built-in type ladder so the
+/// `Hash` ⇔ `Eq` contract holds for the builtin-keyed dicts that the
+/// crate's unit tests exercise (str, int, bool, bytes, tuple, frozenset).
+/// Unknown types still pointer-hash — sufficient because their
+/// `dict_keys_equal` arm short-circuits on `std::ptr::eq` first.
+#[inline]
+pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
+    let hash = crate::dict_eq_hook::try_hash_w(obj).unwrap_or_else(|| builtin_structural_hash(obj));
+    ObjectKey { hash, obj }
+}
+
+/// Content-based fallback for `object_key_for` when the hash_w hook
+/// isn't installed.  Walks the same type ladder as `dict_keys_equal`
+/// (`:1207-1260`) so that two PyObjectRefs which compare equal via
+/// content hash to the same bucket.  Used only when no `HASH_W_HOOK`
+/// trampoline is registered — under a live pyre-jit init this is
+/// shadowed by `space.hash_w` per `baseobjspace.py:840-845`.
+unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
+    if obj.is_null() {
+        return 0;
+    }
+    if crate::is_bool(obj) {
+        return crate::w_bool_get_value(obj) as i64;
+    }
+    if crate::is_int(obj) {
+        return crate::w_int_get_value(obj);
+    }
+    if crate::is_str(obj) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::w_str_get_value(obj).hash(&mut h);
+        return h.finish() as i64;
+    }
+    if crate::bytesobject::is_bytes(obj) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::bytesobject::w_bytes_data(obj).hash(&mut h);
+        return h.finish() as i64;
+    }
+    if crate::is_tuple(obj) {
+        let n = crate::w_tuple_len(obj);
+        let mut acc: i64 = 0x345678;
+        for i in 0..n {
+            let e = crate::w_tuple_getitem(obj, i as i64).unwrap_or(std::ptr::null_mut());
+            acc = acc
+                .wrapping_mul(1000003)
+                .wrapping_add(builtin_structural_hash(e));
+        }
+        return acc;
+    }
+    if crate::is_frozenset(obj) {
+        // Order-independent (xor) so frozenset({a,b}) and frozenset({b,a})
+        // hash equal, matching `dict_keys_equal`'s set-containment arm.
+        let mut acc: i64 = 0;
+        for &e in crate::w_set_items(obj).iter() {
+            acc ^= builtin_structural_hash(e);
+        }
+        return acc;
+    }
+    obj as usize as i64
+}
+
 /// `pypy/objspace/std/dictmultiobject.py:45-53 W_DictMultiObject(W_Root)`
 /// abstract base — both `W_DictObject` (regular dicts) and
 /// `W_ModuleDictObject` (module/global dicts) inherit from it.
@@ -144,45 +257,51 @@ pub struct W_DictObject {
     pub dstrategy: &'static dyn crate::dictstrategy::DictStrategy,
 }
 
-/// Typed accessor — `dictmultiobject.py:1063 ObjectDictStrategy.unerase
-/// (w_dict.dstorage)`.  Returns an immutable view of the unified
-/// `Vec<(PyObjectRef, PyObjectRef)>` shape used by every strategy until
-/// per-strategy native layouts land in subsequent Slice D sub-slices.
+/// Typed accessor — `dictmultiobject.py:1213-1215 ObjectDictStrategy.getitem`
+/// (`self.unerase(w_dict.dstorage)`) returns the `r_dict(dict_keys_equal,
+/// hash_w)` backing.  Pyre stores this as `IndexMap<ObjectKey,
+/// PyObjectRef>`: a hash bucket for O(1) lookup that also preserves
+/// insertion order (CPython 3.7+ / PyPy3 dict semantics).  Shared with
+/// `UnicodeDictStrategy` per `dictmultiobject.py:1311-1318`'s str
+/// fast-path delegation to the Object helpers.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_DictObject` whose strategy uses the
-/// unified Vec storage (every strategy today; will narrow once typed
-/// storage lands).
+/// `obj` must point to a valid `W_DictObject` on
+/// `ObjectDictStrategy` or `UnicodeDictStrategy`.
 #[inline]
-pub unsafe fn w_dict_object_storage<'a>(obj: PyObjectRef) -> &'a Vec<(PyObjectRef, PyObjectRef)> {
+pub unsafe fn w_dict_object_storage<'a>(
+    obj: PyObjectRef,
+) -> &'a indexmap::IndexMap<ObjectKey, PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
-    &*(dict.dstorage as *const Vec<(PyObjectRef, PyObjectRef)>)
+    &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)
 }
 
-/// Mutable typed accessor — `dictmultiobject.py:1063` write-side.
+/// Mutable typed accessor — write-side of [`w_dict_object_storage`].
 ///
 /// # Safety
 /// Same as [`w_dict_object_storage`].
 #[inline]
 pub unsafe fn w_dict_object_storage_mut<'a>(
     obj: PyObjectRef,
-) -> &'a mut Vec<(PyObjectRef, PyObjectRef)> {
+) -> &'a mut indexmap::IndexMap<ObjectKey, PyObjectRef> {
     let dict = &mut *(obj as *mut W_DictObject);
-    &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>)
+    &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>)
 }
 
 /// Typed accessor for `IntDictStrategy.unerase(w_dict.dstorage)` —
 /// `dictmultiobject.py:1349-1352 IntDictStrategy.erase/unerase` pair
 /// produced by `rerased.new_erasing_pair("integer")`.  Returns the
-/// native `Vec<(i64, PyObjectRef)>` backing.
+/// native `IndexMap<i64, PyObjectRef>` backing — insertion-ordered
+/// hash bucket matching PyPy's `Dict[int, W_Root]` (RPython resolves
+/// to an order-preserving hash table at translation time).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` whose strategy is
 /// [`crate::dictstrategy::INT_DICT_STRATEGY`].
 #[inline]
-pub unsafe fn w_dict_int_storage<'a>(obj: PyObjectRef) -> &'a Vec<(i64, PyObjectRef)> {
+pub unsafe fn w_dict_int_storage<'a>(obj: PyObjectRef) -> &'a indexmap::IndexMap<i64, PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
-    &*(dict.dstorage as *const Vec<(i64, PyObjectRef)>)
+    &*(dict.dstorage as *const indexmap::IndexMap<i64, PyObjectRef>)
 }
 
 /// Mutable counterpart of [`w_dict_int_storage`].
@@ -190,24 +309,29 @@ pub unsafe fn w_dict_int_storage<'a>(obj: PyObjectRef) -> &'a Vec<(i64, PyObject
 /// # Safety
 /// Same as [`w_dict_int_storage`].
 #[inline]
-pub unsafe fn w_dict_int_storage_mut<'a>(obj: PyObjectRef) -> &'a mut Vec<(i64, PyObjectRef)> {
+pub unsafe fn w_dict_int_storage_mut<'a>(
+    obj: PyObjectRef,
+) -> &'a mut indexmap::IndexMap<i64, PyObjectRef> {
     let dict = &mut *(obj as *mut W_DictObject);
-    &mut *(dict.dstorage as *mut Vec<(i64, PyObjectRef)>)
+    &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>)
 }
 
 /// Typed accessor for `BytesDictStrategy.unerase(w_dict.dstorage)` —
 /// `dictmultiobject.py:1230-1232 BytesDictStrategy.erase/unerase` pair
 /// produced by `rerased.new_erasing_pair("bytes")`.  Returns the
-/// native `Vec<(Vec<u8>, PyObjectRef)>` backing (PyPy `Dict[str,
-/// W_Root]` with raw bytes keys).
+/// native `IndexMap<Vec<u8>, PyObjectRef>` backing — insertion-ordered
+/// hash bucket matching PyPy `Dict[str, W_Root]` (RPython resolves to
+/// an order-preserving hash table at translation time).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` whose strategy is
 /// [`crate::dictstrategy::BYTES_DICT_STRATEGY`].
 #[inline]
-pub unsafe fn w_dict_bytes_storage<'a>(obj: PyObjectRef) -> &'a Vec<(Vec<u8>, PyObjectRef)> {
+pub unsafe fn w_dict_bytes_storage<'a>(
+    obj: PyObjectRef,
+) -> &'a indexmap::IndexMap<Vec<u8>, PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
-    &*(dict.dstorage as *const Vec<(Vec<u8>, PyObjectRef)>)
+    &*(dict.dstorage as *const indexmap::IndexMap<Vec<u8>, PyObjectRef>)
 }
 
 /// Mutable counterpart of [`w_dict_bytes_storage`].
@@ -217,9 +341,9 @@ pub unsafe fn w_dict_bytes_storage<'a>(obj: PyObjectRef) -> &'a Vec<(Vec<u8>, Py
 #[inline]
 pub unsafe fn w_dict_bytes_storage_mut<'a>(
     obj: PyObjectRef,
-) -> &'a mut Vec<(Vec<u8>, PyObjectRef)> {
+) -> &'a mut indexmap::IndexMap<Vec<u8>, PyObjectRef> {
     let dict = &mut *(obj as *mut W_DictObject);
-    &mut *(dict.dstorage as *mut Vec<(Vec<u8>, PyObjectRef)>)
+    &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>)
 }
 
 /// Field offset of `len` within `W_DictObject`, for JIT field access.
@@ -335,7 +459,8 @@ pub unsafe fn w_dict_set_strategy(
 /// when EmptyDictStrategy is active the Vec is observationally
 /// empty (the trait readers return empty without touching the slot).
 pub fn w_dict_new() -> PyObjectRef {
-    let entries: *mut Vec<(PyObjectRef, PyObjectRef)> = crate::lltype::malloc_raw(Vec::new());
+    let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
+        crate::lltype::malloc_raw(indexmap::IndexMap::new());
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
@@ -387,7 +512,8 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// this helper produces the EmptyDictStrategy fallback instead — a
 /// PRE-EXISTING-ADAPTATION until mapdict lands.
 pub fn w_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
-    let entries: *mut Vec<(PyObjectRef, PyObjectRef)> = crate::lltype::malloc_raw(Vec::new());
+    let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
+        crate::lltype::malloc_raw(indexmap::IndexMap::new());
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
@@ -403,13 +529,43 @@ pub fn w_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
     )
 }
 
+/// `dictmultiobject.py:81-89 W_DictObject(space, strategy, storage)` —
+/// caller-chosen strategy + caller-owned dstorage.  Used by the
+/// per-strategy `copy()` overrides (`:1152 AbstractTypedStrategy.copy`)
+/// to allocate a fresh W_DictObject that preserves the source's
+/// strategy + a freshly cloned typed storage box.  `len` is carried
+/// explicitly because pyre's W_DictObject keeps a per-allocation
+/// length field that strategies update inline; the new dict starts
+/// without a `dict_storage_proxy` since fresh copies are not
+/// participants in any back-mirror contract.
+pub fn w_dict_new_with(
+    strategy: &'static dyn crate::dictstrategy::DictStrategy,
+    dstorage: *mut u8,
+    len: usize,
+) -> PyObjectRef {
+    alloc_dict_object(
+        W_DictObject {
+            ob_header: PyObject {
+                ob_type: &DICT_TYPE as *const PyType,
+                w_class: get_instantiate(&DICT_TYPE),
+            },
+            dstorage,
+            len,
+            dict_storage_proxy: std::ptr::null_mut(),
+            dstrategy: strategy,
+        },
+        false,
+    )
+}
+
 /// Allocate a dict for a pyre-side address-keyed side table.
 ///
 /// These tables are not part of the translated object graph yet, so the dict
 /// holder itself must keep a stable raw address. The table walker traces the
 /// entries through [`w_dict_walk_entries_mut`] instead.
 pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
-    let entries: *mut Vec<(PyObjectRef, PyObjectRef)> = crate::lltype::malloc_raw(Vec::new());
+    let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
+        crate::lltype::malloc_raw(indexmap::IndexMap::new());
     crate::lltype::malloc_typed(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
@@ -429,7 +585,14 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
 pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(&mut PyObjectRef)) {
     let entries = w_dict_object_storage_mut(obj);
     for (key, value) in entries.iter_mut() {
-        visitor(key);
+        // `ObjectKey.hash` is precomputed at insertion (`object_key_for`)
+        // and stays valid across a GC move — Python's `__hash__` contract
+        // is identity-stable for hashable (immutable) keys, which is the
+        // only class of object permitted in this strategy.  Mutating the
+        // embedded `obj` slot in place therefore does not invalidate
+        // IndexMap's bucket placement.
+        let key_ptr = key as *const ObjectKey as *mut ObjectKey;
+        visitor(&mut (*key_ptr).obj);
         visitor(value);
     }
 }
@@ -501,13 +664,15 @@ pub struct W_ModuleDictObject {
     /// `dstorage` after a `switch_to_object_strategy`
     /// (`celldict.py:173-186`).  Null while the dict is in
     /// ModuleDictStrategy mode; non-null once a non-str key forces the
-    /// strategy swap.  The single Vec holds the unified (PyObjectRef,
-    /// PyObjectRef) entries that PyPy keeps inside the new
-    /// `ObjectDictStrategy` storage after the switch — `dstorage`'s
-    /// entries are drained into this Vec in their original insertion
-    /// order so `items()` / `popitem()` LIFO parity is preserved
-    /// across mixed-key inserts.
-    pub object_storage: *mut Vec<(PyObjectRef, PyObjectRef)>,
+    /// strategy swap.  Holds the unified ObjectKey-keyed entries that
+    /// PyPy keeps inside the new `ObjectDictStrategy` storage after the
+    /// switch — `dstorage`'s entries are drained into this IndexMap in
+    /// their original insertion order so `items()` / `popitem()` LIFO
+    /// parity is preserved across mixed-key inserts.  Backing matches
+    /// `ObjectDictStrategy` (`dictmultiobject.py:1209-1212 r_dict(space.eq_w,
+    /// space.hash_w)`) — same `ObjectKey { hash, obj }` precomputed-hash
+    /// + `dict_keys_equal` equality.
+    pub object_storage: *mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
     /// Optional sibling-storage mirror.  When non-null, every
     /// `w_module_dict_*` write fans out to this `DictStorage` via
     /// `maybe_sync_dict_storage_*` hooks; reads fall back here on a
@@ -634,7 +799,7 @@ pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
         .is_null()
 }
 
-/// Read-only view of the unified object_storage Vec; returns `None`
+/// Read-only view of the unified object_storage IndexMap; returns `None`
 /// when the dict is still in ModuleDictStrategy mode.
 ///
 /// # Safety
@@ -642,7 +807,7 @@ pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_module_dict_object_storage<'a>(
     obj: PyObjectRef,
-) -> Option<&'a Vec<(PyObjectRef, PyObjectRef)>> {
+) -> Option<&'a indexmap::IndexMap<ObjectKey, PyObjectRef>> {
     let raw = &*(obj as *const W_ModuleDictObject);
     if raw.object_storage.is_null() {
         None
@@ -651,8 +816,8 @@ pub unsafe fn w_module_dict_object_storage<'a>(
     }
 }
 
-/// Mutable view of the unified object_storage Vec; requires the dict
-/// to already be in object-strategy mode.
+/// Mutable view of the unified object_storage IndexMap; requires the
+/// dict to already be in object-strategy mode.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject` for which
@@ -660,13 +825,13 @@ pub unsafe fn w_module_dict_object_storage<'a>(
 #[inline]
 pub unsafe fn w_module_dict_object_storage_mut<'a>(
     obj: PyObjectRef,
-) -> &'a mut Vec<(PyObjectRef, PyObjectRef)> {
+) -> &'a mut indexmap::IndexMap<ObjectKey, PyObjectRef> {
     let raw = &mut *(obj as *mut W_ModuleDictObject);
     debug_assert!(!raw.object_storage.is_null());
     &mut *raw.object_storage
 }
 
-/// Mutable view of the unified object_storage Vec when present;
+/// Mutable view of the unified object_storage IndexMap when present;
 /// returns `None` while the dict is still in ModuleDictStrategy mode.
 /// Use this variant when the caller does not control the strategy
 /// state at the call site (e.g. trait-dispatch entry points that
@@ -677,7 +842,7 @@ pub unsafe fn w_module_dict_object_storage_mut<'a>(
 #[inline]
 pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
     obj: PyObjectRef,
-) -> Option<&'a mut Vec<(PyObjectRef, PyObjectRef)>> {
+) -> Option<&'a mut indexmap::IndexMap<ObjectKey, PyObjectRef>> {
     let raw = &mut *(obj as *mut W_ModuleDictObject);
     if raw.object_storage.is_null() {
         None
@@ -748,12 +913,15 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     }
     let strategy = &mut *raw.mstrategy;
     let storage = &mut *raw.dstorage;
-    let mut new_storage: Vec<(PyObjectRef, PyObjectRef)> = strategy
+    let mut new_storage: indexmap::IndexMap<ObjectKey, PyObjectRef> =
+        indexmap::IndexMap::with_capacity(storage.entries.len());
+    for (k, v) in strategy
         .getiterkeys(storage)
         .zip(strategy.getitervalues(storage))
-        .map(|(k, v)| (crate::celldict::_wrapkey(k), v))
-        .collect();
-    new_storage.reserve(1);
+    {
+        let key_obj = crate::celldict::_wrapkey(k);
+        new_storage.insert(object_key_for(key_obj), v);
+    }
     raw.object_storage = crate::lltype::malloc_raw(new_storage);
     storage.clear();
     // `celldict.py:180-184`: every live GlobalCache becomes invalid
@@ -903,16 +1071,7 @@ unsafe fn w_module_dict_setitem_str_internal(
         // (`dictmultiobject.py:1220-1221`).
         let w_key = crate::w_str_new(key);
         let entries = w_module_dict_object_storage_mut(obj);
-        for entry in entries.iter_mut() {
-            if dict_keys_equal(entry.0, w_key) {
-                entry.1 = w_value;
-                let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-                strategy.mutated();
-                maybe_sync_dict_storage_store(proxy, w_key, w_value);
-                return;
-            }
-        }
-        entries.push((w_key, w_value));
+        entries.insert(object_key_for(w_key), w_value);
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
         maybe_sync_dict_storage_store(proxy, w_key, w_value);
@@ -939,10 +1098,8 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
         // overridden `__eq__`/`__hash__` are reachable from the
         // str-fast-path lookup.
         let w_key = crate::w_str_new(key);
-        for &(k, v) in entries.iter() {
-            if dict_keys_equal(k, w_key) {
-                return Some(v);
-            }
+        if let Some(&v) = entries.get(&object_key_for(w_key)) {
+            return Some(v);
         }
         if !proxy.is_null() {
             if let Some(v) = maybe_lookup_dict_storage(proxy, key) {
@@ -1000,8 +1157,7 @@ unsafe fn w_module_dict_delitem_str_internal(
         // / `w_module_dict_getitem_str` (Item 2.2).
         let w_key = crate::w_str_new(key);
         let entries = w_module_dict_object_storage_mut(obj);
-        if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, w_key)) {
-            let removed = entries.remove(idx).1;
+        if let Some(removed) = entries.shift_remove(&object_key_for(w_key)) {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
             maybe_sync_dict_storage_delete(proxy, key);
@@ -1009,6 +1165,8 @@ unsafe fn w_module_dict_delitem_str_internal(
         }
         if !proxy.is_null() && maybe_lookup_dict_storage(proxy, key).is_some() {
             maybe_sync_dict_storage_delete(proxy, key);
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
             return Some(crate::PY_NULL);
         }
         return None;
@@ -1024,6 +1182,8 @@ unsafe fn w_module_dict_delitem_str_internal(
     }
     if !proxy.is_null() && maybe_lookup_dict_storage(proxy, key).is_some() {
         maybe_sync_dict_storage_delete(proxy, key);
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
         return Some(crate::PY_NULL);
     }
     None
@@ -1060,7 +1220,7 @@ pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
     // `object_storage` after `switch_to_object_strategy`;
     // ModuleDictStrategy mode itself is str-only.
     let non_str = if let Some(entries) = w_module_dict_object_storage(obj) {
-        entries.iter().filter(|(k, _)| !crate::is_str(*k)).count()
+        entries.keys().filter(|k| !crate::is_str(k.obj)).count()
     } else {
         0
     };
@@ -1215,13 +1375,8 @@ pub unsafe fn w_dict_lookup_object_strategy(
             return Some(v);
         }
     }
-    let entries = &*(dict.dstorage as *const Vec<(PyObjectRef, PyObjectRef)>);
-    for &(ref k, v) in entries {
-        if dict_keys_equal(*k, key) {
-            return Some(v);
-        }
-    }
-    None
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    entries.get(&object_key_for(key)).copied()
 }
 
 /// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
@@ -1241,9 +1396,19 @@ pub unsafe fn w_module_dict_lookup_inner(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
+    let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     if let Some(entries) = w_module_dict_object_storage(obj) {
-        for &(k, v) in entries.iter() {
-            if dict_keys_equal(k, key) {
+        if let Some(&v) = entries.get(&object_key_for(key)) {
+            return Some(v);
+        }
+        // `celldict.py:173-186 switch_to_object_strategy` replaces the
+        // single `w_dict.dstorage` so the generic lookup and the str
+        // fast path share the same view.  Pyre keeps the proxy on a
+        // sibling slot, so consult it from the generic lookup too —
+        // mirrors the str-side fallback in `w_module_dict_getitem_str`
+        // (`:947-951`).
+        if !proxy.is_null() && crate::is_str(key) {
+            if let Some(v) = maybe_lookup_dict_storage(proxy, crate::w_str_get_value(key)) {
                 return Some(v);
             }
         }
@@ -1257,8 +1422,11 @@ pub unsafe fn w_module_dict_lookup_inner(
     }
     w_module_dict_switch_to_object_strategy(obj);
     let entries = w_module_dict_object_storage(obj)?;
-    for &(k, v) in entries.iter() {
-        if dict_keys_equal(k, key) {
+    if let Some(&v) = entries.get(&object_key_for(key)) {
+        return Some(v);
+    }
+    if !proxy.is_null() && crate::is_str(key) {
+        if let Some(v) = maybe_lookup_dict_storage(proxy, crate::w_str_get_value(key)) {
             return Some(v);
         }
     }
@@ -1291,17 +1459,11 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_store_object_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-    for entry in entries.iter_mut() {
-        if dict_keys_equal(entry.0, key) {
-            entry.1 = value;
-            dict_write_barrier(obj);
-            maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
-            return;
-        }
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let is_insert = entries.insert(object_key_for(key), value).is_none();
+    if is_insert {
+        dict.len += 1;
     }
-    entries.push((key, value));
-    dict.len += 1;
     dict_write_barrier(obj);
     maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
 }
@@ -1326,18 +1488,7 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     }
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     let entries = w_module_dict_object_storage_mut(obj);
-    for entry in entries.iter_mut() {
-        if dict_keys_equal(entry.0, key) {
-            entry.1 = value;
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
-            if crate::is_str(key) {
-                maybe_sync_dict_storage_store(proxy, key, value);
-            }
-            return;
-        }
-    }
-    entries.push((key, value));
+    entries.insert(object_key_for(key), value);
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
     if crate::is_str(key) {
@@ -1564,6 +1715,54 @@ pub unsafe fn w_dict_set_dict_storage_proxy(obj: PyObjectRef, ns: *mut u8) {
     (*(obj as *mut W_DictObject)).dict_storage_proxy = ns;
 }
 
+/// True only for a regular `W_DictObject` on EmptyDictStrategy with no
+/// storage-proxy back-mirror. `W_ModuleDictObject` also surfaces as a
+/// Python `dict`, but it has a different Rust layout and must take the
+/// polymorphic item-loop path.
+///
+/// Mirrors the destination test in
+/// `dictmultiobject.py:1401 update1_dict_dict` while excluding pyre's
+/// proxy-attached adaptation from the storage-transplant fast path.
+pub unsafe fn w_dict_is_regular_empty_no_proxy(obj: PyObjectRef) -> bool {
+    if is_module_dict(obj) {
+        return false;
+    }
+    let dict = &*(obj as *const W_DictObject);
+    std::ptr::eq(
+        dict.dstrategy as *const _ as *const u8,
+        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
+    ) && dict.dict_storage_proxy.is_null()
+}
+
+/// Adopt a freshly copied regular-dict storage into an empty regular
+/// destination for `dict.update(dict)`'s PyPy fast path.
+///
+/// PyPy `update1_dict_dict` performs:
+/// `w_copy = w_data.get_strategy().copy(w_data); w_dict.set_strategy(...);
+/// w_dict.dstorage = w_copy.dstorage`. Pyre keeps a regular empty dict's
+/// placeholder storage allocated, so this helper drops that placeholder,
+/// installs the copy's strategy/storage/len, and fires the explicit GC
+/// write barrier that RPython field stores would get from the GC.
+pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_copy: PyObjectRef) {
+    debug_assert!(!is_module_dict(dst));
+    debug_assert!(!is_module_dict(w_copy));
+
+    let dst_dict = &mut *(dst as *mut W_DictObject);
+    let copy_dict = &*(w_copy as *const W_DictObject);
+    let old_dstorage = dst_dict.dstorage;
+
+    dst_dict.dstrategy = copy_dict.dstrategy;
+    dst_dict.dstorage = copy_dict.dstorage;
+    dst_dict.len = copy_dict.len;
+    dict_write_barrier(dst);
+
+    if !old_dstorage.is_null() {
+        drop(Box::from_raw(
+            old_dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
+        ));
+    }
+}
+
 /// Get a value by int key (convenience wrapper).  Wraps the raw i64
 /// into a `W_IntObject` and dispatches through `w_dict_lookup` so the
 /// strategy-slot path applies uniformly to W_DictObject and
@@ -1610,13 +1809,11 @@ pub unsafe fn w_dict_getitem_str_proxy_first(obj: PyObjectRef, key: &str) -> Opt
             return Some(v);
         }
     }
-    let entries = &*(dict.dstorage as *const Vec<(PyObjectRef, PyObjectRef)>);
-    for &(ref k, v) in entries {
-        if crate::is_str(*k) && crate::w_str_get_value(*k) == key {
-            return Some(v);
-        }
-    }
-    None
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    // Use the str key directly via `object_key_for`; under the
+    // `dict_keys_equal` hash/eq pair, str-keyed lookups hash on the
+    // str hash and compare on `w_str_get_value` equality.
+    entries.get(&object_key_for(crate::w_str_new(key))).copied()
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:111-112 W_DictMultiObject.setitem_str`
@@ -1652,16 +1849,43 @@ pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: Py
         return w_module_dict_setitem_str_no_proxy(obj, key, value);
     }
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-    for entry in entries.iter_mut() {
-        if crate::is_str(entry.0) && crate::w_str_get_value(entry.0) == key {
-            entry.1 = value;
-            dict_write_barrier(obj);
-            return;
-        }
+    // `dictmultiobject.py:759-761 EmptyDictStrategy.setitem_str`
+    // promotes the dict to UnicodeDictStrategy before writing; without
+    // this, the strategy readers (length/items/getitem) return empty
+    // even after entries have been pushed into the dstorage Vec.
+    // UnicodeDictStrategy stores `Vec<(PyObjectRef, PyObjectRef)>`
+    // (same shape as ObjectDictStrategy), so the existing raw Vec
+    // walk below is correct once the strategy slot points at it.
+    let s = dict.dstrategy as *const _ as *const u8;
+    let is_empty = std::ptr::eq(
+        s,
+        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
+    );
+    let is_unicode = std::ptr::eq(
+        s,
+        &crate::dictstrategy::UNICODE_DICT_STRATEGY as *const _ as *const u8,
+    );
+    let is_object = std::ptr::eq(
+        s,
+        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
+    );
+    if is_empty {
+        dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
+    } else if !is_unicode && !is_object {
+        // Int / Bytes / Identity / Kwargs typed storage: PyPy's
+        // `AbstractTypedStrategy.setitem_str` (`dictmultiobject.py:1069`)
+        // promotes to ObjectDictStrategy before the str-key insert.
+        // Polymorphic dispatch through the trait converts the typed
+        // backing to `Vec<(PyObjectRef, PyObjectRef)>` so the walk
+        // below sees the correct layout.
+        dict.dstrategy.switch_to_object_strategy(obj);
     }
-    entries.push((crate::w_str_new(key), value));
-    dict.len += 1;
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let w_key = crate::w_str_new(key);
+    let is_insert = entries.insert(object_key_for(w_key), value).is_none();
+    if is_insert {
+        dict.len += 1;
+    }
     dict_write_barrier(obj);
 }
 
@@ -1676,14 +1900,32 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
         return w_module_dict_delitem_str_no_proxy(obj, key).is_some();
     }
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-    if let Some(idx) = entries
-        .iter()
-        .position(|(k, _)| crate::is_str(*k) && crate::w_str_get_value(*k) == key)
-    {
-        entries.remove(idx);
-        dict.len -= 1;
-
+    // Mirror `w_dict_setitem_str_no_proxy`: if the dict is on a typed
+    // strategy whose backing isn't `Vec<(PyObjectRef, PyObjectRef)>`,
+    // promote to ObjectDictStrategy first so the raw Vec walk below
+    // sees the right layout.  PyPy's typed `delitem` (`dictmultiobject.py:1081-1087`)
+    // promotes on key-type mismatch; we promote on the str-keyed
+    // back-mirror path for the same reason.
+    let s = dict.dstrategy as *const _ as *const u8;
+    let is_empty = std::ptr::eq(
+        s,
+        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
+    );
+    let is_unicode = std::ptr::eq(
+        s,
+        &crate::dictstrategy::UNICODE_DICT_STRATEGY as *const _ as *const u8,
+    );
+    let is_object = std::ptr::eq(
+        s,
+        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
+    );
+    if !is_empty && !is_unicode && !is_object {
+        dict.dstrategy.switch_to_object_strategy(obj);
+    }
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let w_key = crate::w_str_new(key);
+    if entries.shift_remove(&object_key_for(w_key)).is_some() {
+        dict.len = entries.len();
         true
     } else {
         false
@@ -1736,11 +1978,10 @@ pub unsafe fn w_dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_delitem_object_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let mut hit = false;
-    if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
-        entries.remove(idx);
-        dict.len -= 1;
+    if entries.shift_remove(&object_key_for(key)).is_some() {
+        dict.len = entries.len();
         hit = true;
     }
     // String-key delete must also flow into the storage proxy so
@@ -1773,14 +2014,28 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     if w_module_dict_is_object_strategy(obj) {
         let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
         let entries = w_module_dict_object_storage_mut(obj);
-        if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
-            entries.remove(idx);
+        if entries.shift_remove(&object_key_for(key)).is_some() {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
             if crate::is_str(key) {
                 maybe_sync_dict_storage_delete(proxy, crate::w_str_get_value(key));
             }
             return true;
+        }
+        // Entries missed — fall through to the proxy mirror just as
+        // `w_module_dict_delitem_str_internal:1010-1013` does on the
+        // str-fast-path side.  `celldict.py:106-126` invalidates the
+        // cell version for any successful str delete; `mutated()` is
+        // what triggers GlobalCache invalidation in pyre, so fire it
+        // alongside the proxy-only removal.
+        if !proxy.is_null() && crate::is_str(key) {
+            let key_str = crate::w_str_get_value(key);
+            if maybe_lookup_dict_storage(proxy, key_str).is_some() {
+                maybe_sync_dict_storage_delete(proxy, key_str);
+                let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                strategy.mutated();
+                return true;
+            }
         }
         return false;
     }
@@ -1793,8 +2048,7 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     w_module_dict_switch_to_object_strategy(obj);
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     let entries = w_module_dict_object_storage_mut(obj);
-    if let Some(idx) = entries.iter().position(|(k, _)| dict_keys_equal(*k, key)) {
-        entries.remove(idx);
+    if entries.shift_remove(&object_key_for(key)).is_some() {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
         if crate::is_str(key) {
@@ -1842,7 +2096,7 @@ pub unsafe fn w_dict_clear(obj: PyObjectRef) {
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_clear_object_strategy(obj: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     entries.clear();
     dict.len = 0;
 }
@@ -1895,11 +2149,11 @@ pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
     if dict.dict_storage_proxy.is_null() {
         return dict.len;
     }
-    let entries = &*(dict.dstorage as *const Vec<(PyObjectRef, PyObjectRef)>);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
         return dict.len;
     };
-    let non_str = entries.iter().filter(|(k, _)| !crate::is_str(*k)).count();
+    let non_str = entries.keys().filter(|k| !crate::is_str(k.obj)).count();
     storage_items.len() + non_str
 }
 
@@ -1913,6 +2167,27 @@ pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
 /// live values.
 pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     w_dict_get_strategy(obj).items(obj)
+}
+
+/// `dictmultiobject.py:585-587 W_DictMultiObject.descr_copy` —
+/// `w_dict.copy()` delegates to `strategy.copy(w_dict)` so typed
+/// strategies preserve their backing shape (`:1152
+/// AbstractTypedStrategy.copy` → fresh W_DictObject with same strategy
+/// + cloned typed dstorage).
+///
+/// `dict_storage_proxy`-attached dicts (pyre NEW-DEVIATION back-mirror
+/// — Task #134 / Phase C-1) take the union-walk fallback so str-key
+/// entries that live only in the proxy survive the copy.  Once the
+/// proxy retires this branch goes with it.
+pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
+    if is_dict(obj) && !w_dict_get_dict_storage_proxy(obj).is_null() {
+        let new_dict = w_dict_new();
+        for (k, v) in w_dict_items(obj) {
+            w_dict_store(new_dict, k, v);
+        }
+        return new_dict;
+    }
+    w_dict_get_strategy(obj).copy(obj)
 }
 
 /// Internal helper: `IntDictStrategy::setitem` body — direct
@@ -1932,17 +2207,12 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
 /// plain `W_IntObject` (not bool).
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(i64, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
     let k = crate::w_int_get_value(key);
-    for entry in entries.iter_mut() {
-        if entry.0 == k {
-            entry.1 = value;
-            dict_write_barrier(obj);
-            return;
-        }
+    let is_insert = entries.insert(k, value).is_none();
+    if is_insert {
+        dict.len += 1;
     }
-    entries.push((k, value));
-    dict.len += 1;
     dict_write_barrier(obj);
 }
 
@@ -1958,12 +2228,7 @@ pub unsafe fn w_dict_lookup_int_strategy(
 ) -> Option<PyObjectRef> {
     let entries = w_dict_int_storage(obj);
     let k = crate::w_int_get_value(key);
-    for &(stored_k, v) in entries {
-        if stored_k == k {
-            return Some(v);
-        }
-    }
-    None
+    entries.get(&k).copied()
 }
 
 /// Internal helper: `IntDictStrategy::delitem` body —
@@ -1974,15 +2239,17 @@ pub unsafe fn w_dict_lookup_int_strategy(
 /// Same as [`w_dict_store_int_strategy`].
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(i64, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
     let k = crate::w_int_get_value(key);
-    let before = entries.len();
-    entries.retain(|&(stored_k, _)| stored_k != k);
-    if entries.len() != before {
+    // shift_remove preserves insertion order, matching CPython 3.7+ /
+    // PyPy3 dict semantics where deleting an entry leaves the
+    // remaining entries in their original relative order.
+    if entries.shift_remove(&k).is_some() {
         dict.len = entries.len();
-        return true;
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Internal helper: `IntDictStrategy::length` body —
@@ -2004,7 +2271,7 @@ pub unsafe fn w_dict_length_int_strategy(obj: PyObjectRef) -> usize {
 pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     w_dict_int_storage(obj)
         .iter()
-        .map(|&(k, v)| (crate::w_int_new(k), v))
+        .map(|(&k, &v)| (crate::w_int_new(k), v))
         .collect()
 }
 
@@ -2015,7 +2282,7 @@ pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// Same as [`w_dict_length_int_strategy`].
 pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(i64, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
     entries.clear();
     dict.len = 0;
 }
@@ -2030,17 +2297,12 @@ pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
 /// `W_BytesObject`.
 pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(Vec<u8>, PyObjectRef)>);
-    let k = crate::w_bytes_data(key);
-    for entry in entries.iter_mut() {
-        if entry.0.as_slice() == k {
-            entry.1 = value;
-            dict_write_barrier(obj);
-            return;
-        }
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
+    let k = crate::w_bytes_data(key).to_vec();
+    let is_insert = entries.insert(k, value).is_none();
+    if is_insert {
+        dict.len += 1;
     }
-    entries.push((k.to_vec(), value));
-    dict.len += 1;
     dict_write_barrier(obj);
 }
 
@@ -2056,12 +2318,7 @@ pub unsafe fn w_dict_lookup_bytes_strategy(
 ) -> Option<PyObjectRef> {
     let entries = w_dict_bytes_storage(obj);
     let k = crate::w_bytes_data(key);
-    for (stored_k, v) in entries {
-        if stored_k.as_slice() == k {
-            return Some(*v);
-        }
-    }
-    None
+    entries.get(k).copied()
 }
 
 /// Internal helper: `BytesDictStrategy::delitem` body —
@@ -2071,15 +2328,14 @@ pub unsafe fn w_dict_lookup_bytes_strategy(
 /// Same as [`w_dict_store_bytes_strategy`].
 pub unsafe fn w_dict_delitem_bytes_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(Vec<u8>, PyObjectRef)>);
-    let k = crate::w_bytes_data(key).to_vec();
-    let before = entries.len();
-    entries.retain(|(stored_k, _)| stored_k != &k);
-    if entries.len() != before {
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
+    let k = crate::w_bytes_data(key);
+    if entries.shift_remove(k).is_some() {
         dict.len = entries.len();
-        return true;
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Internal helper: `BytesDictStrategy::length` body.
@@ -2109,7 +2365,7 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
 /// Same as [`w_dict_bytes_storage`].
 pub unsafe fn w_dict_clear_bytes_strategy(obj: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
-    let entries = &mut *(dict.dstorage as *mut Vec<(Vec<u8>, PyObjectRef)>);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
     entries.clear();
     dict.len = 0;
 }
@@ -2123,20 +2379,20 @@ pub unsafe fn w_dict_clear_bytes_strategy(obj: PyObjectRef) {
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     let dict = &*(obj as *const W_DictObject);
-    let entries = &*(dict.dstorage as *const Vec<(PyObjectRef, PyObjectRef)>);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
     if dict.dict_storage_proxy.is_null() {
-        return entries.clone();
+        return entries.iter().map(|(k, &v)| (k.obj, v)).collect();
     }
     let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
-        return entries.clone();
+        return entries.iter().map(|(k, &v)| (k.obj, v)).collect();
     };
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = storage_items
         .into_iter()
         .map(|(name, value)| (crate::w_str_new(&name), value))
         .collect();
-    for &(k, v) in entries.iter() {
-        if !crate::is_str(k) {
-            out.push((k, v));
+    for (key, &v) in entries.iter() {
+        if !crate::is_str(key.obj) {
+            out.push((key.obj, v));
         }
     }
     out
@@ -2159,7 +2415,7 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     let proxy = (*(obj as *const W_ModuleDictObject)).dict_storage_proxy;
     let local: Vec<(PyObjectRef, PyObjectRef)> =
         if let Some(entries) = w_module_dict_object_storage(obj) {
-            entries.clone()
+            entries.iter().map(|(k, &v)| (k.obj, v)).collect()
         } else {
             let strategy = &*w_module_dict_get_strategy(obj);
             let storage = &*w_module_dict_get_storage(obj);

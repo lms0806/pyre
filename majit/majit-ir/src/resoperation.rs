@@ -1054,13 +1054,15 @@ pub struct Op {
     /// shared-trace identity model from `Vec<Rc<Op>>`) can update the
     /// slot without requiring `&mut Op`.
     pub rd_resume_position: std::cell::Cell<i32>,
-    /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
-    /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
-    /// `RefCell` so the vectorizer can stamp metadata onto a shared `Op`
-    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython's
-    /// `forwarded_vecinfo(op)` (schedule.py:479-486) writes through the
-    /// same `_vector_info` slot every observer sees.
-    pub vecinfo: std::cell::RefCell<Option<Box<VectorizationInfo>>>,
+    /// resoperation.py:111-115 `VecOperationNew.__init__` stores
+    /// `datatype` / `bytesize` / `signed` / `count` on the op instance
+    /// itself. `resoperation.py:511-518 copy_and_change` propagates them
+    /// across rewrites. The slot lives on every `Op` (not only on
+    /// vector ops) because pyre collapses the upstream
+    /// `VectorOp`/`VectorGuardOp` subclasses into the same struct;
+    /// scalar ops keep this `None`. `RefCell` mirrors the in-place
+    /// `op.bytesize = ...` overwrite in `VecOperation.__init__`.
+    pub vecinfo: std::cell::RefCell<Option<std::boxed::Box<VectorizationInfo>>>,
 }
 
 impl Clone for Op {
@@ -1074,6 +1076,8 @@ impl Clone for Op {
             fail_args: std::cell::RefCell::new(self.fail_args.borrow().clone()),
             fail_arg_types: std::cell::RefCell::new(self.fail_arg_types.borrow().clone()),
             rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
+            // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
+            // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
         }
     }
@@ -1102,6 +1106,14 @@ impl VectorizationInfo {
             signed: true,
             count: -1,
         }
+    }
+
+    /// resoperation.py:163-169 `VectorizationInfo(op)` for Const/InputArg
+    /// and the default result-type branch for regular ops.
+    pub fn from_type(tp: Type) -> Self {
+        let mut info = VectorizationInfo::new();
+        info.setinfo(type_to_vector_datatype(tp), -1, tp == Type::Int);
+        info
     }
 
     /// resoperation.py:214-230: setinfo — normalize bytesize by datatype.
@@ -1142,6 +1154,15 @@ impl VectorizationInfo {
         } else {
             self.count as usize
         }
+    }
+}
+
+fn type_to_vector_datatype(tp: Type) -> char {
+    match tp {
+        Type::Int => 'i',
+        Type::Float => 'f',
+        Type::Ref => 'r',
+        Type::Void => 'v',
     }
 }
 
@@ -1227,11 +1248,10 @@ impl Op {
             fail_args: std::cell::RefCell::new(None),
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
-            // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
-            // copy datatype/bytesize/signed/count from the source.  pyre
-            // collapses VectorOp/VectorGuardOp into Op, so the same copy
-            // happens unconditionally — None for scalar ops, Some(_) for
-            // vector ops which is what RPython's Vector* subclasses do.
+            // resoperation.py:511-518 VectorGuardOp.copy_and_change +
+            // :534-541 VectorOp.copy_and_change propagate
+            // datatype/bytesize/signed/count from self. Scalar ops keep
+            // `self.vecinfo` as `None`, so the clone is a no-op for them.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
@@ -1850,6 +1870,94 @@ impl OpCode {
     pub fn is_raw_store(self) -> bool {
         let n = self.as_u16();
         RAW_STORE_FIRST < n && n < RAW_STORE_LAST
+    }
+
+    /// resoperation.py:1486-1491 `is_primitive_load` / `is_primitive_store`.
+    /// Same opcode range as `is_raw_load` / `is_raw_store` (the upstream
+    /// `_RAW_LOAD_FIRST` / `_RAW_LOAD_LAST` bracket — `is_primitive_*` and
+    /// `is_raw_*` are the same predicate spelled twice).
+    pub fn is_primitive_load(self) -> bool {
+        self.is_raw_load()
+    }
+
+    pub fn is_primitive_store(self) -> bool {
+        self.is_raw_store()
+    }
+
+    /// resoperation.py:407-417 `AbstractResOp.is_primitive_array_access`
+    /// — opcode side of the check. The descr side
+    /// (`descr.is_array_of_primitives()`) must still be tested by the
+    /// caller because `Op.descr` lives outside `OpCode`.
+    pub fn is_primitive_array_access_opcode(self) -> bool {
+        self.is_primitive_load() || self.is_primitive_store()
+    }
+
+    /// resoperation.py:644-696 `CastOp`/`SignExtOp` mixin attachment
+    /// (`resoperation.py:1682-1685`). Returns true exactly for the opcodes
+    /// in `_cast_ops` (`resoperation.py:1177-1188`).
+    pub fn is_typecast(self) -> bool {
+        matches!(
+            self,
+            OpCode::CastFloatToInt
+                | OpCode::CastIntToFloat
+                | OpCode::CastFloatToSinglefloat
+                | OpCode::CastSinglefloatToFloat
+                | OpCode::IntSignext
+                | OpCode::VecCastFloatToInt
+                | OpCode::VecCastIntToFloat
+                | OpCode::VecCastFloatToSinglefloat
+                | OpCode::VecCastSinglefloatToFloat
+                | OpCode::VecIntSignext,
+        )
+    }
+
+    /// resoperation.py:434-435 `CastOp.cast_types`. Returns
+    /// `(cls_casts[0], cls_casts[2])` — the (from_type, to_type) pair from
+    /// `_cast_ops` (`resoperation.py:1177-1188`). Defaults to `('\0','\0')`
+    /// (resoperation.py:264) for non-typecast opcodes.
+    pub fn cast_types(self) -> (char, char) {
+        match self {
+            OpCode::CastFloatToInt | OpCode::VecCastFloatToInt => ('f', 'i'),
+            OpCode::CastIntToFloat | OpCode::VecCastIntToFloat => ('i', 'f'),
+            OpCode::CastFloatToSinglefloat | OpCode::VecCastFloatToSinglefloat => ('f', 'i'),
+            OpCode::CastSinglefloatToFloat | OpCode::VecCastSinglefloatToFloat => ('i', 'f'),
+            OpCode::IntSignext | OpCode::VecIntSignext => ('i', 'i'),
+            _ => ('\0', '\0'),
+        }
+    }
+
+    /// resoperation.py:437-438 `CastOp.cast_to_bytesize` — returns
+    /// `cls_casts[3]`.  The base table at `resoperation.py:1177-1188`
+    /// stores 4 for the float↔int casts; the non-x86 override at
+    /// `resoperation.py:1190-1196` upgrades `CAST_FLOAT_TO_INT` /
+    /// `VEC_CAST_FLOAT_TO_INT` (and the corresponding `cast_from`
+    /// bytesize of `CAST_INT_TO_FLOAT` / `VEC_CAST_INT_TO_FLOAT`) to 8
+    /// on architectures whose `platform.machine()` does not start with
+    /// `x86`.  Mirror that here with a `cfg(target_arch)` switch:
+    /// AArch64 / non-x86 builds return 8 for the float→int direction.
+    /// `None` is returned for `INT_SIGNEXT` / `VEC_INT_SIGNEXT` where
+    /// the `_cast_ops` entry stores 0 and the actual bytesize is the
+    /// dynamic value of `arg1` (`SignExtOp.cast_to_bytesize` at
+    /// `resoperation.py:682-686` reads `arg1.value`).  Callers must
+    /// consult the const-pool to recover the bytesize for these two
+    /// opcodes.
+    pub fn cast_to_bytesize_static(self) -> Option<i32> {
+        // resoperation.py:1190 `if not platform.machine().startswith('x86')`.
+        // pyre is built per target arch; gate at compile time.
+        const FLOAT_TO_INT_BYTESIZE: i32 = if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+        {
+            4
+        } else {
+            8
+        };
+        match self {
+            OpCode::CastFloatToInt | OpCode::VecCastFloatToInt => Some(FLOAT_TO_INT_BYTESIZE),
+            OpCode::CastIntToFloat | OpCode::VecCastIntToFloat => Some(8),
+            OpCode::CastFloatToSinglefloat | OpCode::VecCastFloatToSinglefloat => Some(4),
+            OpCode::CastSinglefloatToFloat | OpCode::VecCastSinglefloatToFloat => Some(8),
+            OpCode::IntSignext | OpCode::VecIntSignext => None,
+            _ => None,
+        }
     }
 
     pub fn is_jit_debug(self) -> bool {
@@ -3186,7 +3294,6 @@ mod tests {
             let mut __op = Op {
                 $($field)*
                 type_: Type::Void,
-                vecinfo: std::cell::RefCell::new(None),
             };
             __op.type_ = __op.opcode.result_type();
             __op
@@ -4257,6 +4364,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4267,6 +4375,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4278,6 +4387,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4299,6 +4409,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -4315,6 +4426,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -4332,6 +4444,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -4348,6 +4461,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -4364,6 +4478,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -4384,6 +4499,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4394,6 +4510,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Finish,
@@ -4405,6 +4522,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4425,6 +4543,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -4456,6 +4575,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4466,6 +4586,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4476,6 +4597,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4487,6 +4609,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4519,6 +4642,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntGt,
@@ -4529,6 +4653,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4539,6 +4664,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Finish,
@@ -4550,6 +4676,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4579,6 +4706,7 @@ mod tests {
 
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
+            vecinfo: std::cell::RefCell::new(None),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -4610,6 +4738,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4620,6 +4749,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntLt,
@@ -4630,6 +4760,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4640,6 +4771,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntSub,
@@ -4650,6 +4782,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4661,6 +4794,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4693,6 +4827,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::GuardFalse,
@@ -4704,6 +4839,7 @@ mod tests {
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
+                vecinfo: std::cell::RefCell::new(None),
             },
         ];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();

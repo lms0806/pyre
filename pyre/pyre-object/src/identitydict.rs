@@ -5,15 +5,62 @@
 //! Selected by `EmptyDictStrategy.switch_to_correct_strategy` per
 //! `dictmultiobject.py:725-730 switch_to_identity_strategy` when the
 //! key's type satisfies `W_TypeObject.compares_by_identity()`
-//! (`typeobject.py:353-371`).  Storage shape matches
-//! `ObjectDictStrategy` — the distinction is in the comparison
-//! function: raw PyObjectRef equality (`==`) instead of
-//! `dict_keys_equal` (`space.eq_w` + `space.hash_w`).
+//! (`typeobject.py:353-371`).  The distinction from
+//! `ObjectDictStrategy` is in the key comparison: raw PyObjectRef
+//! identity (`is`) instead of `dict_keys_equal` (`space.eq_w` +
+//! `space.hash_w`).
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictstrategy::{DictStrategy, OBJECT_DICT_STRATEGY};
 use crate::pyobject::PyObjectRef;
+
+/// `identitydict.py:12-83 IdentityDictStrategy` key type — identity
+/// comparison + identity hash.  Stored in
+/// `IndexMap<IdentityKey, PyObjectRef>` for O(1) lookup matching
+/// PyPy's `mark_dict_non_null(d={})` (`:30-32`) — RPython resolves
+/// `{}` keyed on instance identity to an order-preserving identity
+/// hash table at translation time.
+#[derive(Clone, Copy)]
+pub struct IdentityKey(pub PyObjectRef);
+
+impl std::hash::Hash for IdentityKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.0 as usize).hash(state);
+    }
+}
+
+impl PartialEq for IdentityKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for IdentityKey {}
+
+/// Typed read accessor — `dictmultiobject.py:1063 IdentityDictStrategy.unerase
+/// (w_dict.dstorage)`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`IDENTITY_DICT_STRATEGY`].
+#[inline]
+unsafe fn identity_storage<'a>(
+    obj: PyObjectRef,
+) -> &'a indexmap::IndexMap<IdentityKey, PyObjectRef> {
+    let dict = &*(obj as *const crate::dictmultiobject::W_DictObject);
+    &*(dict.dstorage as *const indexmap::IndexMap<IdentityKey, PyObjectRef>)
+}
+
+#[inline]
+unsafe fn identity_storage_mut<'a>(
+    obj: PyObjectRef,
+) -> &'a mut indexmap::IndexMap<IdentityKey, PyObjectRef> {
+    let dict = &mut *(obj as *mut crate::dictmultiobject::W_DictObject);
+    &mut *(dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>)
+}
 
 /// `identitydict.py:12-83 IdentityDictStrategy`.
 ///
@@ -63,47 +110,40 @@ impl IdentityDictStrategy {
             Some(true)
         )
     }
-
-    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
-    /// instantiation for IdentityDictStrategy — `wrap` is identity
-    /// (`:26-27`), so the migration just relabels the storage as
-    /// ObjectDictStrategy without rewrapping keys.  Pyre still
-    /// reallocates the storage box to match the PyPy
-    /// `set_strategy + dstorage = strategy.erase(d_new)` shape.
-    ///
-    /// # Safety
-    /// `w_dict` must point at a valid `W_DictObject` on
-    /// [`IDENTITY_DICT_STRATEGY`].
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-        // `wrap` is identity so the entries port across unchanged.
-        let new_box = Box::new(old.into_iter().collect::<Vec<_>>());
-        dict.dstorage = Box::into_raw(new_box) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
-    }
 }
 
 impl DictStrategy for IdentityDictStrategy {
+    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+    /// instantiation for IdentityDictStrategy — `wrap` is identity
+    /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
+    /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>);
+        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
+            indexmap::IndexMap::with_capacity(old.len());
+        for (k, &v) in old.iter() {
+            new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
+        }
+        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    }
+
     /// `identitydict.py:67-70 get_empty_storage` — erased `{}` with
-    /// non-null hint.  Pyre stores `Vec<(PyObjectRef, PyObjectRef)>`
-    /// matching ObjectDictStrategy's shape.
+    /// non-null hint.  Pyre stores
+    /// `IndexMap<IdentityKey, PyObjectRef>` — identity-keyed hash
+    /// bucket for O(1) lookup + insertion-order preserving iteration.
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<Vec<(PyObjectRef, PyObjectRef)>> = Box::new(Vec::new());
+        let v: Box<indexmap::IndexMap<IdentityKey, PyObjectRef>> =
+            Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem` —
-    /// linear scan with raw PyObjectRef `==`.
+    /// O(1) identity-keyed lookup.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
-            let entries = crate::dictmultiobject::w_dict_object_storage(w_dict);
-            for &(k, v) in entries {
-                if k == w_key {
-                    return Some(v);
-                }
-            }
-            return None;
+            return identity_storage(w_dict).get(&IdentityKey(w_key)).copied();
         }
         // `identitydict.py:40-41 _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
@@ -111,21 +151,16 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
     }
 
-    /// `dictmultiobject.py:1061-1067 setitem` — linear scan with raw
-    /// PyObjectRef `==`; on mismatch, promote to Object.
+    /// `dictmultiobject.py:1061-1067 setitem` — identity-keyed insert;
+    /// on mismatch, promote to Object.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
             let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-            let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-            for entry in entries.iter_mut() {
-                if entry.0 == w_key {
-                    entry.1 = w_value;
-                    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
-                    return;
-                }
+            let entries = identity_storage_mut(w_dict);
+            let is_insert = entries.insert(IdentityKey(w_key), w_value).is_none();
+            if is_insert {
+                dict.len += 1;
             }
-            entries.push((w_key, w_value));
-            dict.len += 1;
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
             return;
         }
@@ -141,15 +176,13 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
-    /// `dictmultiobject.py:1081-1087 delitem` — raw PyObjectRef `==`
-    /// removal; on mismatch, promote to Object.
+    /// `dictmultiobject.py:1081-1087 delitem` — identity-keyed remove;
+    /// on mismatch, promote to Object.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
             let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-            let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
-            let before = entries.len();
-            entries.retain(|&(k, _)| k != w_key);
-            if entries.len() != before {
+            let entries = identity_storage_mut(w_dict);
+            if entries.shift_remove(&IdentityKey(w_key)).is_some() {
                 dict.len = entries.len();
                 return true;
             }
@@ -160,31 +193,75 @@ impl DictStrategy for IdentityDictStrategy {
     }
 
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).len()
+        identity_storage(w_dict).len()
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict)
-            .iter()
-            .map(|&(k, _)| k)
-            .collect()
+        identity_storage(w_dict).keys().map(|k| k.0).collect()
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict)
-            .iter()
-            .map(|&(_, v)| v)
-            .collect()
+        identity_storage(w_dict).values().copied().collect()
     }
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).clone()
+        identity_storage(w_dict)
+            .iter()
+            .map(|(k, &v)| (k.0, v))
+            .collect()
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let entries = &mut *(dict.dstorage as *mut Vec<(PyObjectRef, PyObjectRef)>);
+        let entries = identity_storage_mut(w_dict);
         entries.clear();
         dict.len = 0;
+    }
+
+    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
+    /// the typed `IndexMap<IdentityKey, _>` backing and wrap with the
+    /// same IdentityDictStrategy.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        let storage = identity_storage(w_dict);
+        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        crate::dictmultiobject::w_dict_new_with(
+            &IDENTITY_DICT_STRATEGY,
+            new_storage as *mut u8,
+            dict.len,
+        )
+    }
+
+    /// `pypy.objspace.std.identitydict.IdentityDictStrategy` stores
+    /// keys as `list[W_Root]` — the GC traces them as roots and follows
+    /// the pointer.  Trace `key.0` through an unsafe pointer cast so a
+    /// minor collection keeps each identity key's referent alive.
+    ///
+    /// SOUNDNESS HAZARD (pyre-only, not in RPython): pyre's young gen
+    /// is moving (`majit-gc/src/lib.rs:184` notes only **old gen** is
+    /// mark-sweep non-moving; `collector.rs:1652 pin_nursery_object`
+    /// confirms minor collection promotes / relocates young objects).
+    /// `IdentityKey`'s `Hash` impl is `(self.0 as usize).hash(state)`
+    /// so a key promoted from young to old gen invalidates its bucket
+    /// placement in the underlying `IndexMap` — subsequent lookups with
+    /// the new pointer probe a different bucket and miss.  PyPy avoids
+    /// this by routing `IdentityDictStrategy` through `space.id(obj)`
+    /// whose result is recorded in the GC header (`compute_identity_hash`)
+    /// and survives moves.  Pyre's equivalent (`pyre_id` / stable-id GC
+    /// header) does not exist yet — see the "stable identity-hash GC
+    /// header" epic in MEMORY for the long-term fix.  Until that lands,
+    /// IdentityDict is sound only when keys are old-gen at insertion or
+    /// have been pinned; the typical pattern (class instances created
+    /// at module init, then used as dict keys) puts keys in old gen
+    /// before the first minor cycle so the bug rarely fires in practice
+    /// but is observable when a fresh user-class instance is inserted
+    /// and a minor collection follows before lookup.
+    unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+        let entries = identity_storage_mut(w_dict);
+        for (k, v) in entries.iter_mut() {
+            let key_ptr = k as *const IdentityKey as *mut IdentityKey;
+            visitor(std::ptr::addr_of_mut!((*key_ptr).0));
+            visitor(v as *mut PyObjectRef);
+        }
     }
 }

@@ -3601,6 +3601,13 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 ))
             }
         } else if is_dict(obj) {
+            // `pypy/objspace/std/dictmultiobject.py:174 descr_setitem` →
+            // `self.setitem(...)` → strategy.setitem(...) → r_dict insert,
+            // which calls `space.hash_w(w_key)` first.  Unhashable keys
+            // raise `TypeError: unhashable type: '<typename>'`.  Pyre's
+            // strategy.setitem doesn't gate on hash_w (Vec linear scan
+            // never needs it), so enforce the raise at the entry point.
+            crate::builtins::builtin_hash(&[index])?;
             w_dict_store(obj, index, value);
             Ok(w_none())
         } else if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -9159,65 +9166,24 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     Err(PyError::type_error("object does not support item deletion"))
 }
 
-/// Delete item from dict by key.  When the dict has a `dict_storage_proxy`
-/// attached (`pick_builtin` lazy-mirror, live `globals()` view, etc.) the
-/// deletion must sync to the storage so subsequent storage-keyed lookups
-/// (LOAD_GLOBAL builtins fallback) see the removal.  PyPy stores both
-/// shapes in the same W_DictMultiObject so the question doesn't arise.
+/// Delete item from dict by key.  `pypy/objspace/std/dictmultiobject.py:177
+/// W_DictMultiObject.descr_delitem` routes `self.delitem(w_key)` through
+/// the strategy slot, so both module and regular dicts get typed-storage
+/// dispatch (IntDictStrategy / BytesDictStrategy / KwargsDictStrategy
+/// etc. each own their layout — the previous raw
+/// `Vec<(PyObjectRef, PyObjectRef)>` cast assumed ObjectDictStrategy).
+/// `ObjectDictStrategy::delitem` + `ModuleDictStrategy::delitem` both
+/// honour the W_DictObject `dict_storage_proxy` back-mirror via
+/// `w_dict_delitem_object_strategy` / `w_module_dict_delitem_inner`.
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
-        // `pypy/objspace/std/celldict.py:106-126 ModuleDictStrategy.delitem`
-        // routes through the strategy on W_ModuleDictObject; the
-        // dispatching `w_dict_delitem` covers both str (strategy)
-        // and non-str (extras Vec fallback for the
-        // `switch_to_object_strategy` path that pyre cannot do in
-        // place).  Surface a KeyError when the entry was absent.
-        if dictmultiobject::is_module_dict(obj) {
-            return if dictmultiobject::w_dict_delitem(obj, key) {
-                Ok(())
-            } else {
-                Err(PyError::key_error("KeyError"))
-            };
-        }
-        let dict = &mut *(obj as *mut dictmultiobject::W_DictObject);
-        let entries = dictmultiobject::w_dict_object_storage_mut(obj);
-        for i in 0..entries.len() {
-            let eq = if std::ptr::eq(entries[i].0, key) {
-                true
-            } else if is_int(entries[i].0) && is_int(key) {
-                w_int_get_value(entries[i].0) == w_int_get_value(key)
-            } else if is_str(entries[i].0) && is_str(key) {
-                w_str_get_value(entries[i].0) == w_str_get_value(key)
-            } else {
-                false
-            };
-            if eq {
-                entries.remove(i);
-                dict.len -= 1;
-                let proxy = w_dict_get_dict_storage_proxy(obj);
-                if !proxy.is_null() && is_str(key) {
-                    let ns = &mut *(proxy as *mut crate::DictStorage);
-                    ns.remove(w_str_get_value(key));
-                }
-                return Ok(());
-            }
-        }
-        // entries Vec missed.  When the dict has a storage proxy
-        // (Module.__dict__ over its backing DictStorage), the binding
-        // may live only in the proxy storage; PyPy's
-        // W_DictMultiObject `dictobject.py:descr_delitem` would
-        // remove either way.  Mirrors `w_dict_delitem_str`'s
-        // storage-fallback shape for str-keyed deletes.
-        if is_str(key) {
-            return if dictmultiobject::w_dict_delitem_str(obj, w_str_get_value(key)) {
-                Ok(())
-            } else {
-                Err(PyError::key_error("KeyError"))
-            };
+        if dictmultiobject::w_dict_delitem(obj, key) {
+            Ok(())
+        } else {
+            Err(PyError::key_error("KeyError"))
         }
     }
-    Err(PyError::key_error("KeyError"))
 }
 
 // py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).
