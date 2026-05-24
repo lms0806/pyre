@@ -553,9 +553,13 @@ fn getfield_gc_i_pureornot(
         // line-by-line port runs `executor.execute(cpu, mi, opnum,
         // fielddescr, box)` and asserts `resvalue ==
         // upd.currfieldbox.getint()`. Pyre projects the struct
-        // pointer through `concrete_of_opref(obj)`.  `cached.value`
-        // carries the upstream Box payload (`getint()` analog).
-        let expected_int = match cached.value {
+        // pointer through `concrete_of_opref(obj)`; the cached Box's
+        // intrinsic value is fetched via `box_value(cached)` —
+        // covering const pool, standard-virtualizable shadow, and
+        // BoxPool `Box::value` field (RPython
+        // `currfieldbox.getint()` dispatch parity).
+        let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
+        let expected_int = match cached_value {
             Value::Int(n) => Some(n),
             _ => None,
         };
@@ -581,7 +585,7 @@ fn getfield_gc_i_pureornot(
         // Counters.HEAPCACHED_OPS) — folded-away op accounting on cache hit.
         ctx.profiler()
             .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
-        return cached.opref;
+        return cached;
     }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureI
@@ -590,9 +594,10 @@ fn getfield_gc_i_pureornot(
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
     // pyjitpl.py:948-949 — pair the recorded opref with the live int
-    // payload so the cache HeapBox mirrors RPython's executor-returned
-    // Box (history.py BoxInt(value=...)).  `box_value` exposes the
-    // same Box.value chain PyPy reads via `obj.getref_base()`.
+    // payload so subsequent `box_value(result)` mirrors RPython's
+    // executor-returned Box (history.py BoxInt(value=...)).
+    // `box_value` exposes the same Box.value chain PyPy reads via
+    // `obj.getref_base()`.
     let live_value = if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
@@ -613,7 +618,7 @@ fn getfield_gc_i_pureornot(
     ctx.heapcache_getfield_now_known(
         obj,
         field_index,
-        majit_ir::HeapBox::new(result, live_value),
+        result,
     );
     result
 }
@@ -668,14 +673,13 @@ pub fn trace_box_int(
     ctx.heap_cache_mut().new_object(obj);
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
-    // `upd.setfield(valuebox)` parity — `box_value` resolves Const
-    // pool / standard-virtualizable / `opref_concrete` stamp; `None`
-    // collapses to `Value::Void` so cache-hit sanity check skips.
-    let value_payload = ctx.box_value(value).unwrap_or(majit_ir::Value::Void);
+    // `upd.setfield(valuebox)` parity — the cache stores the Box
+    // identity (`value` OpRef); cache-hit readers fetch the
+    // intrinsic value via `box_value(cached)` at hit time.
     ctx.heapcache_setfield_cached(
         obj,
         intval_idx,
-        majit_ir::HeapBox::new(value, value_payload),
+        value,
     );
     obj
 }
@@ -782,10 +786,13 @@ fn getfield_gc_f_pureornot(
         // pyjitpl.py:941-945 cache-hit sanity check (float arm).
         // ConstFloat.same_constant compares via longlong.extract_bits
         // (history.py:283-294); pyre's Value Eq for Float uses
-        // to_bits — bit-identical, NaN==NaN, 0.0!=-0.0. `cached.value`
-        // carries the upstream Box payload (`getfloat_storage()`
-        // analog).
-        let expected_float = match cached.value {
+        // to_bits — bit-identical, NaN==NaN, 0.0!=-0.0.  The cached
+        // Box's intrinsic value is fetched via `box_value(cached)` —
+        // covering const pool, standard-virtualizable shadow, and
+        // BoxPool `Box::value` field (RPython
+        // `currfieldbox.getfloat_storage()` dispatch parity).
+        let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
+        let expected_float = match cached_value {
             Value::Float(f) => Some(f),
             _ => None,
         };
@@ -814,7 +821,7 @@ fn getfield_gc_f_pureornot(
         // to the same counter bucket.
         ctx.profiler()
             .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
-        return cached.opref;
+        return cached;
     }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureF
@@ -841,7 +848,7 @@ fn getfield_gc_f_pureornot(
     ctx.heapcache_getfield_now_known(
         obj,
         field_index,
-        majit_ir::HeapBox::new(result, live_value),
+        result,
     );
     result
 }
@@ -879,14 +886,13 @@ pub fn trace_box_float(
     ctx.heap_cache_mut().new_object(obj);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
-    // `upd.setfield(valuebox)` parity — `box_value` resolves the full
-    // Box.value chain (Const pool / standard-virtualizable /
-    // `opref_concrete` stamp).
-    let value_payload = ctx.box_value(value).unwrap_or(majit_ir::Value::Void);
+    // `upd.setfield(valuebox)` parity — the cache stores the Box
+    // identity (`value` OpRef); cache-hit readers fetch the intrinsic
+    // value via `box_value(cached)` at hit time.
     ctx.heapcache_setfield_cached(
         obj,
         floatval_idx,
-        majit_ir::HeapBox::new(value, value_payload),
+        value,
     );
     obj
 }
@@ -1267,7 +1273,7 @@ pub fn generated_binary_float_value(
                 let ff_descr = crate::descr::float_floatval_descr();
                 let ff_idx = ff_descr.index();
                 if let Some(cached) = ctx.heapcache_getfield_cached(obj, ff_idx) {
-                    cached.opref
+                    cached
                 } else {
                     let r = ctx.record_op_with_descr(
                         OpCode::GetfieldGcPureF,
@@ -1290,11 +1296,7 @@ pub fn generated_binary_float_value(
                     if !matches!(live_value, majit_ir::Value::Void) {
                         ctx.set_opref_concrete(r, live_value);
                     }
-                    ctx.heapcache_getfield_now_known(
-                        obj,
-                        ff_idx,
-                        majit_ir::HeapBox::new(r, live_value),
-                    );
+                    ctx.heapcache_getfield_now_known(obj, ff_idx, r);
                     r
                 }
             }
@@ -2208,7 +2210,7 @@ pub fn generated_list_append_by_strategy(
     // (`history.py BoxInt(value+1)`).
     let new_len_value = ctx
         .heapcache_getfield_cached(list, len_descr_idx)
-        .and_then(|b| match b.value {
+        .and_then(|b| match ctx.box_value(b)? {
             majit_ir::Value::Int(n) => Some(n),
             _ => None,
         })
@@ -2223,7 +2225,7 @@ pub fn generated_list_append_by_strategy(
     ctx.heapcache_setfield_cached(
         list,
         len_descr_idx,
-        majit_ir::HeapBox::new(new_len, new_len_value),
+        new_len,
     );
 }
 
@@ -2293,7 +2295,7 @@ pub fn generated_list_pop_by_strategy(
     // sanity-load it stored `Int(n)`, and `IntSub(.., 1)` yields `n-1`.
     let new_len_value = ctx
         .heapcache_getfield_cached(list, len_descr_idx)
-        .and_then(|b| match b.value {
+        .and_then(|b| match ctx.box_value(b)? {
             majit_ir::Value::Int(n) => Some(n),
             _ => None,
         })
@@ -2325,7 +2327,7 @@ pub fn generated_list_pop_by_strategy(
             ctx.heapcache_setfield_cached(
                 list,
                 len_descr_idx,
-                majit_ir::HeapBox::new(new_len, new_len_value),
+                new_len,
             );
             item
         }
@@ -2341,7 +2343,7 @@ pub fn generated_list_pop_by_strategy(
             ctx.heapcache_setfield_cached(
                 list,
                 len_descr_idx,
-                majit_ir::HeapBox::new(new_len, new_len_value),
+                new_len,
             );
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             crate::generated::trace_box_int(
@@ -2365,7 +2367,7 @@ pub fn generated_list_pop_by_strategy(
             ctx.heapcache_setfield_cached(
                 list,
                 len_descr_idx,
-                majit_ir::HeapBox::new(new_len, new_len_value),
+                new_len,
             );
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             crate::trace_box_float(
@@ -3257,7 +3259,7 @@ pub fn generated_iter_next_value(
     ctx.heapcache_setfield_cached(
         iter,
         ri_descr_idx,
-        majit_ir::HeapBox::new(next_current, next_current_value),
+        next_current,
     );
     Some((current, concrete_current))
 }

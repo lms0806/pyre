@@ -1939,7 +1939,7 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
             OpCode::GetarrayitemGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        cached.opref
+        cached
     } else {
         let resbox = ctx
             .trace_ctx
@@ -1984,12 +1984,8 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
         if !matches!(live_value, majit_ir::Value::Void) {
             ctx.trace_ctx.set_opref_concrete(resbox, live_value);
         }
-        ctx.trace_ctx.heapcache_getarrayitem_now_known(
-            array,
-            index,
-            descr_index,
-            majit_ir::HeapBox::new(resbox, live_value),
-        );
+        ctx.trace_ctx
+            .heapcache_getarrayitem_now_known(array, index, descr_index, resbox);
         resbox
     };
 
@@ -2063,23 +2059,12 @@ fn setarrayitem_gc_via_heapcache(
 
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    // Box.value parity: `box_value` resolves Const pool /
-    // standard-virtualizable / `opref_concrete` stamp; `None` for
-    // ops whose runtime result was not computed at trace time
-    // collapses to `Value::Void` so the downstream cache-hit sanity
-    // check skips.  Mirrors PyPy's `upd.setfield(valuebox)`
-    // (heapcache.py:142) where `valuebox.getint()/getref_base()`
-    // payload travels with the Box.
-    let value_payload = ctx
-        .trace_ctx
-        .box_value(value)
-        .unwrap_or(majit_ir::Value::Void);
-    ctx.trace_ctx.heapcache_setarrayitem(
-        array,
-        index,
-        descr_index,
-        majit_ir::HeapBox::new(value, value_payload),
-    );
+    // `upd.setarrayitem(valuebox)` (heapcache.py:142) parity — the
+    // cache stores the Box identity (`value` OpRef); cache-hit
+    // readers fetch the intrinsic value via `box_value(cached)` at
+    // hit time.
+    ctx.trace_ctx
+        .heapcache_setarrayitem(array, index, descr_index, value);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2143,7 +2128,7 @@ fn setfield_gc_via_heapcache(
     let is_redundant = ctx
         .trace_ctx
         .heapcache_getfield_cached(obj, descr_index)
-        .map(|b| b.opref)
+        .map(|b| b)
         == Some(valuebox);
     if is_redundant {
         ctx.trace_ctx.profiler().count_ops(
@@ -2167,11 +2152,8 @@ fn setfield_gc_via_heapcache(
             .trace_ctx
             .box_value(valuebox)
             .unwrap_or(majit_ir::Value::Void);
-        ctx.trace_ctx.heapcache_setfield_cached(
-            obj,
-            descr_index,
-            majit_ir::HeapBox::new(valuebox, valuebox_payload),
-        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(obj, descr_index, valuebox);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -2226,7 +2208,7 @@ fn getfield_gc_via_heapcache(
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        cached.opref
+        cached
     } else {
         // Cache miss — record op + write through.  `box_value`
         // resolves the Box.value chain PyPy reads off
@@ -2265,11 +2247,8 @@ fn getfield_gc_via_heapcache(
         if !matches!(live_value, majit_ir::Value::Void) {
             ctx.trace_ctx.set_opref_concrete(resbox, live_value);
         }
-        ctx.trace_ctx.heapcache_getfield_now_known(
-            obj,
-            descr_index,
-            majit_ir::HeapBox::new(resbox, live_value),
-        );
+        ctx.trace_ctx
+            .heapcache_getfield_now_known(obj, descr_index, resbox);
         resbox
     };
 
@@ -11829,11 +11808,7 @@ mod tests {
         // already cached the field's value. RPython equivalent:
         // `heapcache.getfield_now_known(...)` after a prior fetch.
         let cached_field = tc.const_int(0xCAFE);
-        tc.heapcache_getfield_now_known(
-            obj,
-            1,
-            majit_ir::HeapBox::new(cached_field, majit_ir::Value::Int(0xCAFE)),
-        );
+        tc.heapcache_getfield_now_known(obj, 1, cached_field);
         let ops_before = tc.num_ops();
 
         let mut wc = WalkContext {
@@ -12140,10 +12115,7 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         // Pre-cache valuebox as the current field value.
-        let valuebox_payload = tc
-            .constants_get_value(valuebox)
-            .unwrap_or(majit_ir::Value::Void);
-        tc.heapcache_getfield_now_known(obj, 1, majit_ir::HeapBox::new(valuebox, valuebox_payload));
+        tc.heapcache_getfield_now_known(obj, 1, valuebox);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -12235,7 +12207,7 @@ mod tests {
         // Cache must now know the new field value.  Box identity-only
         // check — value payload is Void in walker-emitted writes.
         assert_eq!(
-            tc.heapcache_getfield_cached(obj, 1).map(|b| b.opref),
+            tc.heapcache_getfield_cached(obj, 1).map(|b| b),
             Some(valuebox),
             "post-setfield, the heapcache must reflect the written value",
         );
@@ -12381,12 +12353,7 @@ mod tests {
         let cached_payload = tc
             .constants_get_value(cached)
             .unwrap_or(majit_ir::Value::Void);
-        tc.heapcache_getarrayitem_now_known(
-            array,
-            index,
-            1,
-            majit_ir::HeapBox::new(cached, cached_payload),
-        );
+        tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
@@ -12557,7 +12524,7 @@ mod tests {
         // Heapcache must reflect the write.  Box identity-only check —
         // value payload is Void in walker-emitted writes.
         assert_eq!(
-            tc.heapcache_getarrayitem(array, index, 1).map(|b| b.opref),
+            tc.heapcache_getarrayitem(array, index, 1).map(|b| b),
             Some(value),
             "post-setarrayitem, heapcache must reflect the written value",
         );

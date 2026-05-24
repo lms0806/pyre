@@ -1829,14 +1829,16 @@ where
                     // (`mark_escaped` does not escape the read,
                     // `clear_caches_not_necessary` returns True), so
                     // the heapcache state is intentionally left
-                    // untouched.  `cached.value` is the upstream
-                    // `tobox.getint()` payload — populated on the
-                    // MISS branch (when the dispatch register carried
-                    // the live concrete) and preserved by the cache
-                    // entry across hits.  `Value::Void` payloads
-                    // (entries seeded without a live concrete) skip
-                    // the check.
-                    let expected = match cached.value {
+                    // untouched.  The cached Box's intrinsic value is
+                    // the upstream `tobox.getint()` payload — fetched
+                    // through `box_value(cached)` which composes the
+                    // const pool, standard-virtualizable shadow, and
+                    // BoxPool `Box::value` field (RPython
+                    // `currfieldbox.getint()` dispatch parity).
+                    // `None` payload (entry seeded without a live
+                    // concrete) skips the check.
+                    let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
+                    let expected = match cached_value {
                         majit_ir::Value::Int(n) => Some(n),
                         _ => None,
                     };
@@ -1877,7 +1879,7 @@ where
                     } else {
                         concrete
                     };
-                    (cached.opref, reg_concrete)
+                    (cached, reg_concrete)
                 } else {
                     let opref = ctx.record_op_with_descr(
                         OpCode::GetarrayitemGcI,
@@ -1888,17 +1890,17 @@ where
                     // Pair the recorded opref with the live `concrete`
                     // payload — mirrors RPython's `resbox` Box carrying
                     // both identity and value from `executor.execute`.
-                    // `Box.value` parity: stamp the result OpRef so
-                    // subsequent `box_value(opref)` / `concrete_of_opref`
-                    // consumers see the runtime concrete (the value lives
-                    // on the Box in RPython; pyre's OpRef carries it
-                    // through `opref_concrete`).
+                    // `Box.value` parity: stamp the result OpRef's
+                    // BoxPool entry so `lookup_opref_concrete(opref)`
+                    // returns the runtime concrete (RPython
+                    // `IntFrontendOp(pos, intval)` construction-time
+                    // field assignment).
                     ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
                     ctx.heapcache_getarrayitem_now_known(
                         array_opref,
                         index_opref,
                         descr_index,
-                        majit_ir::HeapBox::new(opref, majit_ir::Value::Int(concrete)),
+                        opref,
                     );
                     (opref, concrete)
                 };

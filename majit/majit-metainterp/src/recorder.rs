@@ -476,10 +476,13 @@ impl Trace {
         self.ops.iter().find(|op| op.pos.get().raw() == raw)
     }
 
-    /// H-2.1: BoxRef for the value recorded at `position` (= `op_count`
-    /// at the time of recording). H-2.1 has no production reader; this
-    /// accessor exists for transition validation and future H-3 readers.
-    pub fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
+    /// BoxRef for the value recorded at `position` (= `op_count` at
+    /// the time of recording).  Production callers: `TraceCtx`
+    /// `set_opref_concrete` / `lookup_opref_concrete` — the BoxPool
+    /// carries the `Box::value: Cell<Option<Value>>` intrinsic that
+    /// replaces the retired `opref_concrete` side-table (RPython
+    /// `history.py:803-807 *FrontendOp(pos, value)` parity).
+    pub(crate) fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
         self.box_pool.get(position as usize)
     }
 

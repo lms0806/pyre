@@ -147,61 +147,15 @@ impl Value {
     }
 }
 
-/// history.py `Box` analog — trace-time carrier of OpRef identity +
-/// concrete value loaded at recording time.
-///
-/// RPython's `BoxInt(value)` / `BoxRef(value)` / `BoxFloat(value)`
-/// (history.py:220-310) subclass hierarchy collapses into a single
-/// struct here because [`Value`] is already a tagged enum over the
-/// three payload variants.  `box.value.get_type()` recovers what
-/// upstream would express via `isinstance(box, BoxInt)`.
-///
-/// `HeapBox` (not bare `Box`) avoids shadowing Rust's prelude
-/// `std::boxed::Box`; the semantic role matches upstream.
-///
-/// Used by [`HeapCache`] to store cached field / array values — every
-/// entry carries both the IR identity (for cache-hit folding) and the
-/// runtime value (for the pyjitpl.py:929-947 cache-hit sanity check
-/// and any other Box.value consumer).  Mirrors heapcache.py:137
-/// `FieldUpdater.currfieldbox = fieldbox` where `fieldbox` is the Box
-/// returned by `executor.execute(...)` and therefore carries the
-/// just-loaded value alongside its identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeapBox {
-    pub opref: crate::resoperation::OpRef,
-    pub value: Value,
-}
-
-impl HeapBox {
-    pub fn new(opref: crate::resoperation::OpRef, value: Value) -> Self {
-        Self { opref, value }
-    }
-
-    /// history.py:225 `BoxInt.getint` — typed accessor; panics if the
-    /// box does not carry an Int payload, mirroring upstream's
-    /// hierarchy-narrowed `BoxInt.getint` (only present on the Int
-    /// subclass).
-    pub fn getint(&self) -> i64 {
-        self.value.as_int()
-    }
-
-    /// history.py:316 `BoxPtr.getref_base` — typed accessor for the
-    /// raw GC pointer payload.
-    pub fn getref_base(&self) -> GcRef {
-        self.value.as_ref()
-    }
-
-    /// history.py:265 `BoxFloat.getfloatstorage` — i64 bit-pattern of
-    /// the f64 payload.  Used by `pyjitpl.py:944
-    /// ConstFloat(resvalue).same_constant(upd.currfieldbox.constbox())`
-    /// where the sanity-check compares bit-identical encodings.
-    pub fn getfloat_storage(&self) -> i64 {
-        match self.value {
-            Value::Float(f) => f.to_bits() as i64,
-            other => panic!("HeapBox::getfloat_storage on non-Float payload: {other:?}"),
-        }
-    }
-}
+// `HeapBox { opref, value }` retired — the (identity, value) pair is
+// now carried by `BoxRef` itself: identity by the `OpRef` position,
+// value by the recorder's BoxPool `Box::value: Cell<Option<Value>>`
+// field (PyPy `history.py:803-807 IntFrontendOp(pos, intval) /
+// FloatFrontendOp(pos, floatval) / RefFrontendOp(pos, gcref)` parity).
+// Cache writes store the bare `OpRef`; sanity readers resolve the
+// intrinsic value via `TraceCtx::box_value` (composing const pool,
+// standard-virtualizable shadow, BoxPool `Box::value` field).  No
+// external pair carrier needed.
 
 /// A constant value known at trace time.
 ///

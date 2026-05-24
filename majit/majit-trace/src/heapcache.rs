@@ -35,7 +35,7 @@ fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     }
 }
 
-use majit_ir::{EffectInfo, ExtraEffect, GcRef, HeapBox, OpCode, OpRef, Type};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 
 /// Value-equality predicate over constant OpRefs.  Mirrors
 /// `Const.same_constant` (history.py:204): two ConstInt/ConstFloat/
@@ -85,17 +85,21 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
 /// heapcache.py CacheEntry — per-descr cache of fieldbox values.
 ///
-/// `cache_anything` / `cache_seen_allocation` store [`HeapBox`] (opref +
-/// runtime value) rather than bare [`OpRef`].  This mirrors RPython's
-/// `currfieldbox = fieldbox` where `fieldbox` is a Box object carrying
-/// both identity and value (`history.py:220-310`).  Cache-hit sanity
-/// checks (`pyjitpl.py:937 assert resvalue == upd.currfieldbox.getint()`)
-/// read the cached payload directly from the cache entry — no separate
-/// side-table indirection.
+/// `cache_anything` / `cache_seen_allocation` store the cached
+/// fieldbox as a bare [`OpRef`] — the Box identity itself.  RPython
+/// `heapcache.py:60-95 cache_anything[box] = valuebox` stores a Box
+/// object (carrying both identity and value); pyre carries the same
+/// fact through `OpRef` + the recorder's per-position BoxPool
+/// (`box.rs Box::value: Cell<Option<Value>>`).  Cache-hit sanity
+/// checks (`pyjitpl.py:937 assert resvalue == upd.currfieldbox.
+/// getint()`) read the cached OpRef's value via
+/// `TraceCtx::box_value` — composing the const pool, standard-
+/// virtualizable shadow, and BoxPool `Box::value` field in one
+/// call.  No separate side table.
 #[derive(Debug, Default)]
 pub(crate) struct CacheEntry {
-    cache_anything: vecset::VecMap<OpRef, HeapBox>,
-    cache_seen_allocation: vecset::VecMap<OpRef, HeapBox>,
+    cache_anything: vecset::VecMap<OpRef, OpRef>,
+    cache_seen_allocation: vecset::VecMap<OpRef, OpRef>,
     quasiimmut_seen: Option<VecSet<OpRef>>,
     quasiimmut_seen_refs: Option<VecSet<usize>>,
     last_const_box: Option<OpRef>,
@@ -132,7 +136,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:84-88 _getdict
-    pub fn _getdict(&self, seen_alloc: bool) -> &vecset::VecMap<OpRef, HeapBox> {
+    pub fn _getdict(&self, seen_alloc: bool) -> &vecset::VecMap<OpRef, OpRef> {
         if seen_alloc {
             &self.cache_seen_allocation
         } else {
@@ -142,7 +146,7 @@ impl CacheEntry {
 
     /// Pyre adapt: Python doesn't need a separate `_mut` accessor;
     /// Rust's borrow checker does.  Mirrors `_getdict`'s body.
-    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut vecset::VecMap<OpRef, HeapBox> {
+    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut vecset::VecMap<OpRef, OpRef> {
         if seen_alloc {
             &mut self.cache_seen_allocation
         } else {
@@ -154,7 +158,7 @@ impl CacheEntry {
     pub fn do_write_with_aliasing(
         &mut self,
         ref_box: OpRef,
-        fieldbox: HeapBox,
+        fieldbox: OpRef,
         cache: &HeapCache,
         oracle: &dyn SameConstantOracle,
     ) {
@@ -194,23 +198,20 @@ impl CacheEntry {
         ref_box: OpRef,
         cache: &HeapCache,
         oracle: &dyn SameConstantOracle,
-    ) -> Option<HeapBox> {
+    ) -> Option<OpRef> {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict(seen_alloc)
             .get(&ref_box)
             .copied()
-            .map(|b| HeapBox {
-                opref: cache.maybe_replace_with_const(b.opref),
-                value: b.value,
-            })
+            .map(|opref| cache.maybe_replace_with_const(opref))
     }
 
     /// heapcache.py:116-119 read_now_known
     pub fn read_now_known(
         &mut self,
         ref_box: OpRef,
-        fieldbox: HeapBox,
+        fieldbox: OpRef,
         cache: &HeapCache,
         oracle: &dyn SameConstantOracle,
     ) {
@@ -253,7 +254,7 @@ impl CacheEntry {
 /// a raw pointer back to the cache for writeback.
 pub struct FieldUpdater {
     ref_box: OpRef,
-    currfieldbox: Option<HeapBox>,
+    currfieldbox: Option<OpRef>,
     cache: *mut HeapCache,
     descr: Option<u32>,
     _marker: PhantomData<HeapCache>,
@@ -274,7 +275,7 @@ impl FieldUpdater {
         ref_box: OpRef,
         cache: &mut HeapCache,
         descr: u32,
-        fieldbox: Option<HeapBox>,
+        fieldbox: Option<OpRef>,
     ) -> Self {
         Self {
             ref_box,
@@ -286,9 +287,13 @@ impl FieldUpdater {
     }
 
     /// heapcache.py:137 `self.currfieldbox` reader — exposes the
-    /// in-flight Box (opref + value) the updater is wrapping.  Mirrors
-    /// `pyjitpl.py:931 upd.currfieldbox` direct attribute access.
-    pub fn currfieldbox(&self) -> Option<HeapBox> {
+    /// in-flight Box the updater is wrapping.  Mirrors `pyjitpl.py:931
+    /// upd.currfieldbox` direct attribute access.  Pyre carries the
+    /// Box identity as an `OpRef`; downstream sanity readers look up
+    /// the intrinsic value via `TraceCtx::box_value` (composing const
+    /// pool, standard-virtualizable shadow, BoxPool `Box::value`
+    /// field).
+    pub fn currfieldbox(&self) -> Option<OpRef> {
         self.currfieldbox
     }
 
@@ -298,7 +303,7 @@ impl FieldUpdater {
     ///  def getfield_now_known(self, fieldbox):
     ///      self.cache.read_now_known(self.ref_box, fieldbox)
     /// ```
-    pub fn getfield_now_known(&mut self, fieldbox: HeapBox, oracle: &dyn SameConstantOracle) {
+    pub fn getfield_now_known(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
         let ref_box = self.ref_box;
         let (cache, descr_index) = match self.cache_and_descr() {
             Some(pair) => pair,
@@ -315,7 +320,7 @@ impl FieldUpdater {
     ///  def setfield(self, fieldbox):
     ///      self.cache.do_write_with_aliasing(self.ref_box, fieldbox)
     /// ```
-    pub fn setfield(&mut self, fieldbox: HeapBox, oracle: &dyn SameConstantOracle) {
+    pub fn setfield(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
         let ref_box = self.ref_box;
         let (cache, descr_index) = match self.cache_and_descr() {
             Some(pair) => pair,
@@ -810,7 +815,7 @@ impl HeapCache {
         obj: OpRef,
         field_index: u32,
         oracle: &dyn SameConstantOracle,
-    ) -> Option<HeapBox> {
+    ) -> Option<OpRef> {
         let mut entry = self.heap_cache.remove(&field_index)?;
         let result = entry.read(obj, self, oracle);
         self.heap_cache.insert(field_index, entry);
@@ -837,7 +842,7 @@ impl HeapCache {
         &mut self,
         obj: OpRef,
         field_index: u32,
-        value: HeapBox,
+        value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
@@ -861,7 +866,7 @@ impl HeapCache {
         &mut self,
         obj: OpRef,
         field_index: u32,
-        value: HeapBox,
+        value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
@@ -1510,12 +1515,10 @@ impl HeapCache {
                 // heapcache.py:113 `return maybe_replace_with_const(res_box)`
                 // — follow the FO_REPLACED_WITH_CONST forwarding so callers
                 // see the canonical const replacement, not the stale Box.
-                // The HeapBox's `value` payload (the runtime concrete the
-                // source carried) is preserved through the copy.
-                let value = raw_value.map(|b| HeapBox {
-                    opref: self.maybe_replace_with_const(b.opref),
-                    value: b.value,
-                });
+                // The Box identity is the OpRef; its intrinsic `value`
+                // travels with the BoxPool entry, so the copy needs no
+                // explicit payload handling.
+                let value = raw_value.map(|opref| self.maybe_replace_with_const(opref));
                 // heapcache.py:423-429: ...and write it to the dest cell.
                 if let Some(value) = value {
                     let dst_index = dststart + i;
@@ -1658,7 +1661,7 @@ impl HeapCache {
         index_value: i64,
         descr: u32,
         oracle: &dyn SameConstantOracle,
-    ) -> Option<HeapBox> {
+    ) -> Option<OpRef> {
         let entry = self
             .heap_array_cache
             .get_mut(&descr)?
@@ -1667,10 +1670,7 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self.heap_array_cache.get(&descr)?.get(&index_value)?;
         let cached = entry._getdict(seen_alloc).get(&array).copied()?;
-        Some(HeapBox {
-            opref: self.maybe_replace_with_const(cached.opref),
-            value: cached.value,
-        })
+        Some(self.maybe_replace_with_const(cached))
     }
 
     /// heapcache.py:573-585 `setarrayitem`. Non-ConstInt index (`None`
@@ -1683,7 +1683,7 @@ impl HeapCache {
         array: OpRef,
         index_value: Option<i64>,
         descr: u32,
-        value: HeapBox,
+        value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
         let Some(index_value) = index_value else {
@@ -1714,7 +1714,7 @@ impl HeapCache {
         array: OpRef,
         index_value: Option<i64>,
         descr: u32,
-        value: HeapBox,
+        value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
         let Some(index_value) = index_value else {
@@ -2173,15 +2173,10 @@ mod tests {
 
         assert_eq!(cache.getfield_cached(obj, field, IDENTITY_ORACLE), None);
 
-        cache.getfield_now_known(
-            obj,
-            field,
-            majit_ir::HeapBox::new(val, majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj, field, val, IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(val, majit_ir::Value::Int(0)))
+            Some(val)
         );
     }
 
@@ -2191,32 +2186,16 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let field = 1;
 
-        cache.getfield_now_known(
-            obj,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj, field, OpRef::ref_op(10), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(10),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(10))
         );
 
-        cache.getfield_now_known(
-            obj,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj, field, OpRef::ref_op(20), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(20),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(20))
         );
     }
 
@@ -2228,33 +2207,15 @@ mod tests {
         let field = 5;
 
         // Both objects have a known field value
-        cache.getfield_now_known(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            obj_b,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         // Writing to obj_a (which is NOT unescaped) should invalidate
         // obj_b's field cache for the same field (potential aliasing).
-        cache.setfield_cached(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(30), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(30),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(30))
         );
         assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None); // invalidated
     }
@@ -2275,39 +2236,18 @@ mod tests {
         // the seen-allocation bucket and they don't alias each other.
         cache.new_object(obj_a);
         cache.new_object(obj_b);
-        cache.getfield_now_known(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            obj_b,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         // Writing to obj_a leaves obj_b's seen-alloc entry intact.
-        cache.setfield_cached(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(30), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(30),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(30))
         );
         assert_eq!(
             cache.getfield_cached(obj_b, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(20),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(20))
         );
     }
 
@@ -2324,31 +2264,13 @@ mod tests {
 
         cache.new_object(obj_a);
         // obj_b is NOT new_object'd → lives in cache_anything.
-        cache.getfield_now_known(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            obj_b,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
-        cache.setfield_cached(
-            obj_a,
-            field,
-            majit_ir::HeapBox::new(OpRef::ref_op(30), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj_a, field, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(30),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(30))
         );
         assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None);
     }
@@ -2356,18 +2278,8 @@ mod tests {
     #[test]
     fn test_invalidate_caches() {
         let mut cache = HeapCache::new();
-        cache.getfield_now_known(
-            OpRef::ref_op(0),
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            OpRef::ref_op(1),
-            2,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         cache.reset_keep_likely_virtuals();
         assert_eq!(
@@ -2387,27 +2299,14 @@ mod tests {
         let unescaped_obj = OpRef::ref_op(1);
 
         cache.new_object(unescaped_obj);
-        cache.getfield_now_known(
-            escaped_obj,
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            unescaped_obj,
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(escaped_obj, 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         cache.invalidate_caches_for_escaped();
         assert_eq!(cache.getfield_cached(escaped_obj, 1, IDENTITY_ORACLE), None);
         assert_eq!(
             cache.getfield_cached(unescaped_obj, 1, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(20),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(20))
         );
     }
 
@@ -2467,12 +2366,7 @@ mod tests {
         let mut cache = HeapCache::new();
         cache.new_object(OpRef::ref_op(0));
         cache.class_now_known(OpRef::ref_op(0), GcRef(0x1000));
-        cache.getfield_now_known(
-            OpRef::ref_op(0),
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
 
         cache.reset();
         assert!(!cache.is_unescaped(OpRef::ref_op(0)));
@@ -2488,39 +2382,18 @@ mod tests {
         let mut cache = HeapCache::new();
         let obj = OpRef::ref_op(0);
 
-        cache.getfield_now_known(
-            obj,
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(10), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
-        cache.getfield_now_known(
-            obj,
-            2,
-            majit_ir::HeapBox::new(OpRef::ref_op(20), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.getfield_now_known(obj, 1, OpRef::ref_op(10), IDENTITY_ORACLE);
+        cache.getfield_now_known(obj, 2, OpRef::ref_op(20), IDENTITY_ORACLE);
 
         // Writing field 1 should not affect field 2
-        cache.setfield_cached(
-            obj,
-            1,
-            majit_ir::HeapBox::new(OpRef::ref_op(30), majit_ir::Value::Int(0)),
-            IDENTITY_ORACLE,
-        );
+        cache.setfield_cached(obj, 1, OpRef::ref_op(30), IDENTITY_ORACLE);
         assert_eq!(
             cache.getfield_cached(obj, 1, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(30),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(30))
         );
         assert_eq!(
             cache.getfield_cached(obj, 2, IDENTITY_ORACLE),
-            Some(majit_ir::HeapBox::new(
-                OpRef::ref_op(20),
-                majit_ir::Value::Int(0)
-            ))
+            Some(OpRef::ref_op(20))
         );
     }
 

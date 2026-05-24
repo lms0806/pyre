@@ -21,7 +21,7 @@
 //!   `box.set_forwarded(constbox)`. We do not introduce a separate `Const`
 //!   variant: RPython stores everything in a single `_forwarded` slot.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 
 use majit_ir::{Type, Value};
@@ -46,6 +46,19 @@ pub struct Box {
 
     /// Rust enum mirror of RPython's subclass hierarchy.
     pub kind: BoxKind,
+
+    /// `history.py:803-807 IntFrontendOp(pos, intval)` /
+    /// `FloatFrontendOp(pos, floatval)` /
+    /// `RefFrontendOp(pos, gcref)` parity — the intrinsic
+    /// per-position concrete-value carrier that PyPy attaches to every
+    /// operation-result Box at execute-time.  Replaces the previous
+    /// `TraceCtx::opref_concrete: HashMap<u32, Value>` side-table that
+    /// piggybacked the same fact on an OpRef-keyed map.  `None` is the
+    /// RPython "value not yet stamped" analog — pyre keeps it `None`
+    /// for ResOp/InputArg until the recording site has the live
+    /// result in scope.  Const boxes ignore this slot; their value
+    /// lives in `BoxKind::Const { value, .. }` instead.
+    pub value: Cell<Option<Value>>,
 }
 
 /// Enum mirror of the PyPy class hierarchy.
@@ -134,6 +147,7 @@ impl BoxRef {
             kind: BoxKind::ResOp {
                 position: std::cell::Cell::new(position),
             },
+            value: Cell::new(None),
         }))
     }
 
@@ -146,6 +160,7 @@ impl BoxRef {
             forwarded: RefCell::new(Forwarded::None),
             type_,
             kind: BoxKind::InputArg { position },
+            value: Cell::new(None),
         }))
     }
 
@@ -161,6 +176,7 @@ impl BoxRef {
                 value,
                 const_index: None,
             },
+            value: Cell::new(None),
         }))
     }
 
@@ -177,6 +193,7 @@ impl BoxRef {
                 value,
                 const_index: Some(const_index),
             },
+            value: Cell::new(None),
         }))
     }
 
@@ -187,6 +204,38 @@ impl BoxRef {
         match &self.0.kind {
             BoxKind::Const { const_index, .. } => *const_index,
             _ => None,
+        }
+    }
+
+    /// `history.py:240 ConstInt.getint` / `:281 ConstFloat.getfloatstorage`
+    /// / `:323 ConstPtr.getref_base` plus `history.py:803-807 *FrontendOp
+    /// (pos, value)` parity — read the Box's intrinsic concrete value.
+    /// `Const` returns its `BoxKind::Const { value, .. }` payload
+    /// directly; `ResOp` / `InputArg` return the `value: Cell<Option<
+    /// Value>>` slot which the recorder stamps at execute-time
+    /// (equivalent to `IntFrontendOp(pos, intval)` construction).
+    /// Returns `None` when the Box has not yet had its value stamped —
+    /// RPython equivalent: the operation result has not been computed
+    /// yet (impossible in upstream because execute() runs before
+    /// record(), pyre keeps this case for residual-call results and
+    /// guards that don't have a trace-time concrete).
+    pub fn get_value(&self) -> Option<Value> {
+        match &self.0.kind {
+            BoxKind::Const { value, .. } => Some(*value),
+            _ => self.0.value.get(),
+        }
+    }
+
+    /// Intrinsic-value setter for ResOp / InputArg boxes — RPython
+    /// `IntFrontendOp(pos, intval)` construction-time field assignment
+    /// analog.  Const boxes are immutable (their value lives in
+    /// `BoxKind::Const`); calling `set_value` on a Const panics.
+    pub fn set_value(&self, value: Value) {
+        match &self.0.kind {
+            BoxKind::Const { .. } => {
+                panic!("BoxRef::set_value: Const value is immutable (BoxKind::Const)");
+            }
+            _ => self.0.value.set(Some(value)),
         }
     }
 
