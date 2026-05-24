@@ -757,6 +757,37 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
+/// Phase 4 endgame slice 4 / 5 helper.  Returns a stable opname key
+/// per insn variant so the diff probe can compare and tally across
+/// the walker / canonical streams without dragging in operand
+/// equality.
+fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
+    match insn {
+        super::flatten::Insn::Label(_) => "Label".to_string(),
+        super::flatten::Insn::Unreachable => "---".to_string(),
+        super::flatten::Insn::Op { opname, .. } => opname.clone(),
+    }
+}
+
+/// Phase 4 endgame slice 4 helper.  Tally per-opname occurrences of
+/// the given Insn slice, using `"Label"` / `"---"` for the non-`Op`
+/// variants so the resulting `Vec<(String, i64)>` is sortable and
+/// comparable across walker and canonical SSARepr.  `Vec` keyed by
+/// `String` per [[feedback-no-hashmap-ever]] — opname cardinality
+/// stays in the dozens, so linear scan is acceptable.
+fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64)> {
+    let mut tally: Vec<(String, i64)> = Vec::new();
+    for insn in insns {
+        let key = phase4_insn_opname_key(insn);
+        if let Some(entry) = tally.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 += 1;
+        } else {
+            tally.push((key, 1));
+        }
+    }
+    tally
+}
+
 /// The next-block label is recognised as `Insn::Label(L)`, matching
 /// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
 /// catch-landing labels.  The corresponding `goto TLabel(...)` carries
@@ -841,26 +872,26 @@ fn fresh_variable_for_state(
     }
 }
 
-/// CFG-level Variable-pair collector for
-/// `RegAllocator.coalesce_variables` — port of
-/// `rpython/tool/algo/regalloc.py:79-96`.
+/// CFG-level Variable-pair collector for the SSARepr-side
+/// `SSAReprRegAllocator::coalesce_variables` consumer — port of
+/// `rpython/tool/algo/regalloc.py:79-96 RegAllocator.coalesce_variables`.
 ///
 /// Iterates `graph.iterblocks()` → `block.exits` → paired
 /// `(link.args[i], link.target.inputargs[i])` (matching upstream's
 /// `for i, v in enumerate(link.args): self._try_coalesce(v,
 /// link.target.inputargs[i])`).  Projects each Variable through
 /// `walker_slot_for_variable`, yielding `(source_slot, target_slot)`
-/// u16 pairs ready for `RegAllocator::try_coalesce`.
+/// u16 pairs ready for `SSAReprRegAllocator::try_coalesce`.
 ///
 /// Why Variable-keyed, not FrameState-keyed: RPython has no
 /// FrameState indirection — Variables carry their own UnionFind
 /// identity (`regalloc.py:98-101 isinstance(v, Variable)`).  pyre's
-/// regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
+/// SSARepr-side regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
 /// ADAPTATION), so the helper projects Variables back onto walker
 /// SSA slots at the point of collection.  It must not fall back to
 /// graph-regalloc colors: those are post-coalescing color IDs, not
 /// pre-regalloc SSA slots, and feeding them back into
-/// `RegAllocator::try_coalesce` would mix two different domains.
+/// `SSAReprRegAllocator::try_coalesce` would mix two different domains.
 ///
 /// Filter: only Ref-kind pairs are emitted, matching the per-kind
 /// gate inside `allocate_registers` (`regalloc.rs:670-677`).  Every
@@ -2128,7 +2159,7 @@ fn duplicate_shadow_tos(
 /// SSARepr emission has not yet been replaced with a `flatten_graph` pass
 /// (Task #214).  Until it is, each opcode handler must populate both
 /// streams — the SSARepr byte stream that backend/blackhole consume, and
-/// the graph that `FlowGraphRegAllocator` consumes.
+/// the graph that `RegAllocator` consumes.
 ///
 /// Delete this helper once Task #214 lands and the SSARepr stream is
 /// generated from the graph by `flatten_graph`.
@@ -5899,7 +5930,7 @@ impl CodeWriter {
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
-                            let portal_regallocs = [
+                            let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: std::collections::HashMap::new(),
                                     num_colors: 0,
@@ -5913,7 +5944,7 @@ impl CodeWriter {
                                     num_colors: 0,
                                 },
                             ];
-                            GraphFlattener::new(&mut ssarepr, &portal_regallocs)
+                            GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
                             for insn in ssarepr.insns[pre_len..].iter().cloned() {
                                 current_block.push_insn(insn);
@@ -8921,9 +8952,8 @@ impl CodeWriter {
         // colors (HashMap iteration non-determinism between two
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
-        let mut graph_regallocs =
-            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args_graph(&graph, &mut graph_regallocs);
+        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds(&graph);
+        super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
         // BEFORE `walker_post_walk_insert_renamings` reads
         // it.  The same pairing pass also runs downstream (idempotent
@@ -9105,6 +9135,517 @@ impl CodeWriter {
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
+        // Phase 4 endgame slice 1: build canonical SSARepr in parallel
+        // under `PYRE_PHASE4_BUILD_CANONICAL=1`.  Mirrors `codewriter.py:53
+        // ssarepr = flatten_graph(graph, regallocs, cpu)` — the upstream
+        // production path that pyre's walker currently bypasses by
+        // emitting SSARepr inline.  Output is currently unused; this
+        // probe surfaces panics or graph-shape gaps on real workloads
+        // before any per-family flip from walker inline to canonical
+        // splice.  Default-off so production is unchanged.
+        //
+        // Slice 3: under `PYRE_PHASE4_DIFF_CANONICAL=1` (implies build),
+        // also emit a per-graph length diff to stderr so the byte-
+        // equivalent convergence rate can be measured across the 39
+        // production benches.
+        let phase4_build_canonical =
+            std::env::var("PYRE_PHASE4_BUILD_CANONICAL").ok().as_deref() == Some("1");
+        let phase4_diff_canonical =
+            std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1");
+        if phase4_build_canonical || phase4_diff_canonical {
+            let mut canonical_regallocs = graph_regallocs.clone();
+            let canonical_ssarepr = super::flatten::flatten_graph(
+                &graph,
+                &mut canonical_regallocs,
+                false,
+                Some(self.cpu()),
+            );
+            if phase4_diff_canonical {
+                let walker_len = ssarepr.insns.len();
+                let canonical_len = canonical_ssarepr.insns.len();
+                let diff = canonical_len as i64 - walker_len as i64;
+                eprintln!(
+                    "[phase4-diff] graph={} walker_len={walker_len} \
+                     canonical_len={canonical_len} diff={diff}",
+                    ssarepr.name,
+                );
+                // Slice 4: per-opname tally so walker-only and
+                // canonical-only opnames are named.  Walker emits more
+                // insns than canonical (slice 3 finding); slicing the
+                // delta by opname reveals which families need closure
+                // before the production flip — typically `-live-` and
+                // `Label` (per-PC) on the walker side, possibly
+                // `ref_copy` on the canonical side from
+                // `insert_renamings`.
+                let walker_tally = phase4_tally_insn_opnames(&ssarepr.insns);
+                let canonical_tally = phase4_tally_insn_opnames(&canonical_ssarepr.insns);
+                let mut all_keys: Vec<&str> = walker_tally
+                    .iter()
+                    .chain(canonical_tally.iter())
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                all_keys.sort();
+                all_keys.dedup();
+                let mut walker_only: Vec<(String, i64)> = Vec::new();
+                let mut canonical_only: Vec<(String, i64)> = Vec::new();
+                for key in all_keys {
+                    let w = walker_tally
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0);
+                    let c = canonical_tally
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0);
+                    if w > c {
+                        walker_only.push((key.to_string(), w - c));
+                    } else if c > w {
+                        canonical_only.push((key.to_string(), c - w));
+                    }
+                }
+                walker_only.sort_by(|a, b| b.1.cmp(&a.1));
+                canonical_only.sort_by(|a, b| b.1.cmp(&a.1));
+                eprintln!(
+                    "[phase4-diff-opname] graph={} walker-only={:?} canonical-only={:?}",
+                    ssarepr.name, walker_only, canonical_only,
+                );
+                // Slice 5: first-divergence position locator.  Walker
+                // and canonical streams agree on the common prefix
+                // (block label naming, initial inputarg setup); the
+                // first index where their opname tags differ is the
+                // concrete anchor for designing the next per-bench
+                // slice.  Common-prefix length is also useful: a long
+                // prefix means most of the structural divergence is
+                // tail-localised; a short prefix means divergence
+                // starts at block entry.
+                let first_div = ssarepr
+                    .insns
+                    .iter()
+                    .zip(canonical_ssarepr.insns.iter())
+                    .position(|(w, c)| phase4_insn_opname_key(w) != phase4_insn_opname_key(c));
+                match first_div {
+                    Some(pos) => {
+                        let w = phase4_insn_opname_key(&ssarepr.insns[pos]);
+                        let c = phase4_insn_opname_key(&canonical_ssarepr.insns[pos]);
+                        eprintln!(
+                            "[phase4-diff-firstpos] graph={} pos={pos} \
+                             walker={w:?} canonical={c:?}",
+                            ssarepr.name,
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[phase4-diff-firstpos] graph={} pos=PREFIX_MATCH \
+                             (common prefix is full overlap; tail differs by {} insns)",
+                            ssarepr.name,
+                            (canonical_len as i64 - walker_len as i64).abs(),
+                        );
+                    }
+                }
+                // Slice 6: bucket the walker `-live-` excess by
+                // position relative to nearest preceding `Label`.
+                // `leading_after_label` = walker `-live-` insns at
+                // positions immediately following a Label (the
+                // per-block-entry pyre adaptation).  `mid_block` =
+                // walker `-live-` insns NOT preceded by a Label (the
+                // per-PC mid-block tracking).  Compares the sum to
+                // walker's total `-live-` count and to the
+                // canonical `-live-` count so the operator can tell
+                // whether closing the gap is a single per-block-
+                // entry decision or also requires touching mid-block
+                // emission.
+                let mut walker_total_live: usize = 0;
+                let mut walker_leading_live: usize = 0;
+                let mut walker_mid_live: usize = 0;
+                for (i, insn) in ssarepr.insns.iter().enumerate() {
+                    if phase4_insn_opname_key(insn) == "-live-" {
+                        walker_total_live += 1;
+                        let preceded_by_label =
+                            i > 0 && matches!(ssarepr.insns[i - 1], super::flatten::Insn::Label(_));
+                        if preceded_by_label {
+                            walker_leading_live += 1;
+                        } else {
+                            walker_mid_live += 1;
+                        }
+                    }
+                }
+                let canonical_total_live: usize = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| phase4_insn_opname_key(i) == "-live-")
+                    .count();
+                eprintln!(
+                    "[phase4-diff-live] graph={} walker_total_live={walker_total_live} \
+                     walker_leading_live={walker_leading_live} walker_mid_live={walker_mid_live} \
+                     canonical_total_live={canonical_total_live} \
+                     walker_excess={}",
+                    ssarepr.name,
+                    walker_total_live as i64 - canonical_total_live as i64,
+                );
+                // Slice 7: filter out every `-live-` from BOTH streams
+                // and rerun the opname-sequence diff.  If the filtered
+                // streams agree, `-live-` is the only structural
+                // divergence and the remaining work is mechanical.
+                // If they still diverge, the new first-divergence
+                // position is the next concrete anchor.
+                let walker_filtered: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-")
+                    .collect();
+                let canonical_filtered: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-")
+                    .collect();
+                let filtered_first_div = walker_filtered
+                    .iter()
+                    .zip(canonical_filtered.iter())
+                    .position(|(w, c)| w != c);
+                eprintln!(
+                    "[phase4-diff-nolive] graph={} walker_len_nolive={} \
+                     canonical_len_nolive={} diff_nolive={} first_div={}",
+                    ssarepr.name,
+                    walker_filtered.len(),
+                    canonical_filtered.len(),
+                    canonical_filtered.len() as i64 - walker_filtered.len() as i64,
+                    match filtered_first_div {
+                        Some(pos) => format!(
+                            "pos={pos} walker={:?} canonical={:?}",
+                            walker_filtered[pos], canonical_filtered[pos]
+                        ),
+                        None => "PREFIX_MATCH".to_string(),
+                    },
+                );
+                // Slice 8: also filter `ref_copy` (in addition to
+                // `-live-`).  Slice 7 isolated the `-live-` adaptation;
+                // walker's per-opcode stack-shuffle `ref_copy` is the
+                // other major pyre-only emission family.  If non-
+                // exception benches reach PREFIX_MATCH under this
+                // double filter, the per-family flip becomes mechanical:
+                // canonical already produces the rest, and the only
+                // remaining work is deciding how to absorb / express
+                // `-live-` and `ref_copy` (as a runtime side-table, or
+                // via canonical extensions).
+                let walker_filtered2: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-" && k != "ref_copy")
+                    .collect();
+                let canonical_filtered2: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-" && k != "ref_copy")
+                    .collect();
+                let filtered2_first_div = walker_filtered2
+                    .iter()
+                    .zip(canonical_filtered2.iter())
+                    .position(|(w, c)| w != c);
+                eprintln!(
+                    "[phase4-diff-nolive-noref_copy] graph={} \
+                     walker_len2={} canonical_len2={} diff2={} first_div={}",
+                    ssarepr.name,
+                    walker_filtered2.len(),
+                    canonical_filtered2.len(),
+                    canonical_filtered2.len() as i64 - walker_filtered2.len() as i64,
+                    match filtered2_first_div {
+                        Some(pos) => format!(
+                            "pos={pos} walker={:?} canonical={:?}",
+                            walker_filtered2[pos], canonical_filtered2[pos]
+                        ),
+                        None => "PREFIX_MATCH".to_string(),
+                    },
+                );
+                // Slice 10: direct Label count diff.  Slice 9's windowed
+                // dump showed the entire non-exception bench divergence
+                // is canonical's extra `Label` insns.  Counting Labels
+                // directly turns the diff into a single measurement
+                // that quantifies the per-block (canonical) vs per-PC
+                // (walker) emission discrepancy without needing the
+                // filter chain.
+                let walker_label_count = ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| matches!(i, super::flatten::Insn::Label(_)))
+                    .count();
+                let canonical_label_count = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| matches!(i, super::flatten::Insn::Label(_)))
+                    .count();
+                eprintln!(
+                    "[phase4-diff-labels] graph={} walker={walker_label_count} \
+                     canonical={canonical_label_count} diff={}",
+                    ssarepr.name,
+                    canonical_label_count as i64 - walker_label_count as i64,
+                );
+                // Slice 11: collect Label NAMES per stream and emit
+                // the multiset deltas (canonical-only and walker-only).
+                // Tells us whether canonical's extra Labels follow a
+                // naming pattern (block-N synthetic forwarders, link-N
+                // trampolines, etc.) which would point at the
+                // structural fix needed to close the per-PC vs
+                // per-block emission gap.
+                let walker_names: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|i| match i {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let canonical_names: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|i| match i {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut walker_only_names: Vec<String> = Vec::new();
+                let mut canonical_only_names: Vec<String> = Vec::new();
+                let mut wc = walker_names.clone();
+                for c in &canonical_names {
+                    if let Some(pos) = wc.iter().position(|w| w == c) {
+                        wc.remove(pos);
+                    } else {
+                        canonical_only_names.push(c.clone());
+                    }
+                }
+                walker_only_names = wc;
+                eprintln!(
+                    "[phase4-diff-labels-names] graph={} \
+                     walker_only={walker_only_names:?} \
+                     canonical_only={canonical_only_names:?}",
+                    ssarepr.name,
+                );
+                // Slice 12: bucket Label names by prefix and report
+                // counts.  Tests the hypothesis that canonical's extra
+                // Labels (slice 10 diff) are exactly the `link<N>`
+                // per-link trampolines emitted by
+                // `flatten.py:175-205 insert_exits`, which walker
+                // doesn't produce.  Expected: walker emits only
+                // block-prefixed labels; canonical emits both block-
+                // and link-prefixed; canonical_link_count equals the
+                // slice 10 diff.
+                let bucket = |names: &[String]| -> (usize, usize, usize) {
+                    let mut blocks = 0usize;
+                    let mut links = 0usize;
+                    let mut other = 0usize;
+                    for n in names {
+                        if n.starts_with("block") {
+                            blocks += 1;
+                        } else if n.starts_with("link") {
+                            links += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                    (blocks, links, other)
+                };
+                let (w_blocks, w_links, w_other) = bucket(&walker_names);
+                let (c_blocks, c_links, c_other) = bucket(&canonical_names);
+                eprintln!(
+                    "[phase4-diff-labels-prefix] graph={} \
+                     walker(block={w_blocks} link={w_links} other={w_other}) \
+                     canonical(block={c_blocks} link={c_links} other={c_other}) \
+                     diff(block={} link={} other={})",
+                    ssarepr.name,
+                    c_blocks as i64 - w_blocks as i64,
+                    c_links as i64 - w_links as i64,
+                    c_other as i64 - w_other as i64,
+                );
+                // Slice 13: for each canonical `link<N>` Label, dump
+                // the opname of the next ~3 instructions.  Tests
+                // whether canonical's per-link trampolines are bare
+                // (Label + goto, elidable) or carry ref_copy chains
+                // (insert_renamings sites — walker's inline
+                // insert_renamings is the structural equivalent).
+                for (idx, insn) in canonical_ssarepr.insns.iter().enumerate() {
+                    if let super::flatten::Insn::Label(l) = insn {
+                        if l.name.starts_with("link") {
+                            let follow: Vec<String> = canonical_ssarepr
+                                .insns
+                                .iter()
+                                .skip(idx + 1)
+                                .take(3)
+                                .map(phase4_insn_opname_key)
+                                .collect();
+                            eprintln!(
+                                "[phase4-canonical-link-tail] graph={} \
+                                 label={} follow={:?}",
+                                ssarepr.name, l.name, follow,
+                            );
+                        }
+                    }
+                }
+                // Slice 15: canonical's `pc_first_insn_pos` side-table
+                // is now populated by `flatten::serialize_op`.  Report
+                // its size for each graph alongside the count of
+                // distinct walker py_pcs (from
+                // `walker_pc_live_marker_pos`'s outer length minus
+                // None-only entries).  When the two match, canonical's
+                // side-table covers every Python PC walker tracks — a
+                // necessary condition for canonical-driven pc_map at
+                // exit recovery (call_jit.rs:3939).
+                let canonical_pc_count = canonical_ssarepr.pc_first_insn_pos.len();
+                let walker_pc_count = walker_pc_live_marker_pos
+                    .iter()
+                    .filter(|entries| !entries.is_empty())
+                    .count();
+                eprintln!(
+                    "[phase4-pc-coverage] graph={} \
+                     canonical_pc_first_insn_pos_len={canonical_pc_count} \
+                     walker_pc_live_marker_pos_nonempty={walker_pc_count}",
+                    ssarepr.name,
+                );
+                // Slice 16: enumerate walker-only PCs (PCs walker
+                // tracks that canonical does NOT).  walker uses py_pc
+                // as an index, so the position in
+                // `walker_pc_live_marker_pos` IS the py_pc.  canonical's
+                // covered set is the first element of each tuple in
+                // `pc_first_insn_pos`.  Walker-only PCs correspond to
+                // Python opcodes that lower to ZERO SpaceOps (NOP /
+                // CACHE / debug_merge_point / dropped-by-flowgraph
+                // ops).  At runtime, `call_jit.rs:3925-3941`'s
+                // `resolve_jitcode` returns `None` on pc_map miss and
+                // falls through to `recovery_layout` — so canonical's
+                // sparse coverage may be tolerated as-is.
+                let canonical_pcs: Vec<i64> = canonical_ssarepr
+                    .pc_first_insn_pos
+                    .iter()
+                    .map(|(pc, _)| *pc)
+                    .collect();
+                let walker_only_pcs: Vec<usize> = walker_pc_live_marker_pos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entries)| !entries.is_empty())
+                    .map(|(pc, _)| pc)
+                    .filter(|pc| !canonical_pcs.contains(&(*pc as i64)))
+                    .collect();
+                eprintln!(
+                    "[phase4-pc-walker-only] graph={} count={} \
+                     first16={:?}",
+                    ssarepr.name,
+                    walker_only_pcs.len(),
+                    walker_only_pcs.iter().take(16).collect::<Vec<_>>(),
+                );
+                // Slice 17: attempt to assemble canonical SSARepr to
+                // validate it produces a complete byte stream.  Walker
+                // assembles via `finalize_jitcode` (with `pc_map`
+                // translation + descr stamping + many side-effects);
+                // canonical bypasses all that and uses the bare
+                // `Assembler::assemble` path.  Wrap in catch_unwind so
+                // a canonical-assembly panic surfaces but doesn't
+                // abort the production CodeWriter.
+                //
+                // Slice 19: pre-register helper fn pointers on a fresh
+                // canonical `SSAReprEmitter` so descrs[0..N] align
+                // with the fn_idx values baked into canonical's
+                // `residual_call_*` Insn shapes.  Mirrors walker's
+                // `register_helper_fn_pointers(&mut assembler, cpu)`
+                // at codewriter.rs:4002.  fn_idx ordering is
+                // deterministic — the helper's static `bind(...)` call
+                // sequence produces identical descrs[i] entries on the
+                // walker emitter and the canonical emitter, so
+                // canonical's Insn references resolve.
+                let mut canonical_ssarepr_to_assemble = canonical_ssarepr.clone();
+                let canonical_num_regs = super::assembler::NumRegs {
+                    int: canonical_regallocs[super::flatten::Kind::Int.index()].num_colors,
+                    ref_: canonical_regallocs[super::flatten::Kind::Ref.index()].num_colors,
+                    float: canonical_regallocs[super::flatten::Kind::Float.index()].num_colors,
+                };
+                let mut canonical_emitter = SSAReprEmitter::new();
+                canonical_emitter.set_name(format!("{}_canonical_probe", canonical_ssarepr.name));
+                let _ = register_helper_fn_pointers(&mut canonical_emitter, self.cpu());
+                let canonical_builder = canonical_emitter.into_builder();
+                let assembly_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let mut asm = super::assembler::Assembler::new();
+                        let jitcode = asm.assemble(
+                            &mut canonical_ssarepr_to_assemble,
+                            canonical_builder,
+                            Some(canonical_num_regs),
+                        );
+                        (jitcode, canonical_ssarepr_to_assemble)
+                    }));
+                match assembly_result {
+                    Ok((jitcode, post_assemble_ssarepr)) => {
+                        // Slice 20: log canonical's assembled bytecode
+                        // length and the highest pc_first_insn_pos byte
+                        // offset (translated via `insns_pos`) so the
+                        // splice viability question — "could canonical's
+                        // body replace walker's at the same install
+                        // site?" — has a per-graph byte budget.
+                        let body_len = jitcode.core().code.len();
+                        let walker_insns_len = ssarepr.insns.len();
+                        let canonical_insns_len = post_assemble_ssarepr.insns.len();
+                        let max_pc_byte = post_assemble_ssarepr
+                            .insns_pos
+                            .as_ref()
+                            .and_then(|positions| {
+                                post_assemble_ssarepr
+                                    .pc_first_insn_pos
+                                    .iter()
+                                    .map(|(_, ip)| positions.get(*ip).copied().unwrap_or(0))
+                                    .max()
+                            })
+                            .unwrap_or(0);
+                        eprintln!(
+                            "[phase4-canonical-assemble] graph={} OK \
+                             insns_pos_len={} pc_first_insn_pos_len={} \
+                             body_len={body_len} walker_insns={walker_insns_len} \
+                             canonical_insns={canonical_insns_len} \
+                             max_pc_byte={max_pc_byte}",
+                            ssarepr.name,
+                            post_assemble_ssarepr
+                                .insns_pos
+                                .as_ref()
+                                .map(|p| p.len())
+                                .unwrap_or(0),
+                            post_assemble_ssarepr.pc_first_insn_pos.len(),
+                        );
+                    }
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("<unknown panic payload>");
+                        eprintln!(
+                            "[phase4-canonical-assemble] graph={} PANIC msg={msg:?}",
+                            ssarepr.name,
+                        );
+                    }
+                }
+                // Slice 9: windowed dump around the double-filtered
+                // first-divergence — 5 positions before, 10 after.
+                // Helps see whether walker's vable-accessor extras are
+                // a structural pattern (always same opname sequence at
+                // every divergence) or per-bench-specific.
+                if let Some(pos) = filtered2_first_div {
+                    let lo = pos.saturating_sub(5);
+                    let walker_hi = (pos + 11).min(walker_filtered2.len());
+                    let canonical_hi = (pos + 11).min(canonical_filtered2.len());
+                    let walker_window: Vec<&String> =
+                        walker_filtered2[lo..walker_hi].iter().collect();
+                    let canonical_window: Vec<&String> =
+                        canonical_filtered2[lo..canonical_hi].iter().collect();
+                    eprintln!(
+                        "[phase4-diff-window] graph={} lo={lo} pos={pos} \
+                         walker={walker_window:?} canonical={canonical_window:?}",
+                        ssarepr.name,
+                    );
+                }
+            }
+        }
+
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         //
@@ -9134,10 +9675,11 @@ impl CodeWriter {
         // `regalloc.py:79-96 coalesce_variables` CFG-level loop:
         // every Link's `(link.args[i], link.target.inputargs[i])`
         // pair is unioned via try_coalesce, alongside the SSARepr
-        // `*_copy` scanner inside `RegAllocator::coalesce_variables`
-        // (intra-block coalesce, pyre walker NEW-DEVIATION because
-        // upstream defers `*_copy` to `flatten.py:306-334`).  Both
-        // sources feed the same union-find + depgraph.
+        // `*_copy` scanner inside
+        // `SSAReprRegAllocator::coalesce_variables` (intra-block
+        // coalesce, pyre walker NEW-DEVIATION because upstream defers
+        // `*_copy` to `flatten.py:306-334`).  Both sources feed the
+        // same union-find + depgraph.
         let cfg_coalesce_pairs = collect_cfg_coalesce_pairs(&graph, &walker_slot_for_variable);
         let alloc_result = super::regalloc::allocate_registers(
             &ssarepr,
@@ -9146,8 +9688,8 @@ impl CodeWriter {
             &cfg_coalesce_pairs,
         );
         // Phase 3 (b) Slice 1: run graph-side
-        // `perform_graph_register_allocation_all_kinds` +
-        // `enforce_input_args_graph` post-walker on every
+        // `perform_register_allocation_all_kinds` +
+        // `enforce_input_args` post-walker on every
         // production graph, matching upstream `codewriter.py:44-46`'s
         // pre-flatten regalloc step.  The result is not consumed yet —
         // Slice 2 will build the `(Kind, slot) → color` bridge map that
@@ -9215,6 +9757,113 @@ impl CodeWriter {
         for i in 0..nlocals as u16 {
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
             pyre_color_for_semantic_local.push(post);
+        }
+        // Phase 4 endgame slice 22: under PYRE_PHASE4_DIFF_CANONICAL,
+        // compare walker's alloc_result-derived stack_slot_color_map /
+        // pyre_color_for_semantic_local against a graph_regallocs-derived
+        // alternative.  Production splice (replace walker emission with
+        // canonical `flatten_graph`) requires walker's metadata side-
+        // tables to be reproducible from graph_regallocs alone — this
+        // probe quantifies the per-slot regalloc divergence.
+        //
+        // Lookup paths:
+        //   walker:    alloc_result.rename[Kind::Ref][pre_slot] (SSA-side)
+        //   canonical: graph_regallocs[Kind::Ref].coloring[VariableId]
+        //              via inverse `slot_to_variable_id` derived from
+        //              `walker_slot_for_variable`.
+        if phase4_diff_canonical {
+            let total_pre = stack_base as usize + max_stackdepth as usize;
+            let mut slot_to_variable_id: Vec<Option<u32>> = vec![None; total_pre];
+            for (variable_id, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
+                if let Some(slot) = maybe_slot {
+                    let slot_idx = *slot as usize;
+                    if slot_idx < slot_to_variable_id.len() {
+                        slot_to_variable_id[slot_idx] = Some(variable_id as u32);
+                    }
+                }
+            }
+            let ref_coloring = &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
+            let mut probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
+                if let Some(var_id) = slot_to_variable_id.get(pre_slot).copied().flatten() {
+                    let v_id = super::flow::VariableId(var_id);
+                    if let Some(&canonical_color) = ref_coloring.get(&v_id) {
+                        if canonical_color != walker_color {
+                            eprintln!(
+                                "[phase4-color-mismatch] graph={} kind={label} \
+                                 pre_slot={pre_slot} walker={walker_color} \
+                                 canonical={canonical_color} var={}",
+                                ssarepr.name, var_id,
+                            );
+                        }
+                        return (
+                            1u32,
+                            if canonical_color == walker_color {
+                                1
+                            } else {
+                                0
+                            },
+                            0u32,
+                        );
+                    } else {
+                        return (1u32, 0u32, 1u32); // walker-only (no canonical entry)
+                    }
+                }
+                (0u32, 0u32, 0u32) // no variable bound to slot — uncounted
+            };
+            let mut stack_probed = 0u32;
+            let mut stack_match = 0u32;
+            let mut stack_walker_only = 0u32;
+            for d in 0..stack_map_len {
+                let pre_slot = (stack_base + d) as usize;
+                let walker_color = stack_slot_color_map[d as usize];
+                let (p, m, w) = probe_slot("stack", pre_slot, walker_color);
+                stack_probed += p;
+                stack_match += m;
+                stack_walker_only += w;
+            }
+            let mut local_probed = 0u32;
+            let mut local_match = 0u32;
+            let mut local_walker_only = 0u32;
+            for i in 0..nlocals {
+                let walker_color = pyre_color_for_semantic_local[i];
+                let (p, m, w) = probe_slot("local", i, walker_color);
+                local_probed += p;
+                local_match += m;
+                local_walker_only += w;
+            }
+            eprintln!(
+                "[phase4-color-diff] graph={} \
+                 stack_probed={stack_probed} stack_match={stack_match} \
+                 stack_walker_only={stack_walker_only} \
+                 local_probed={local_probed} local_match={local_match} \
+                 local_walker_only={local_walker_only}",
+                ssarepr.name,
+            );
+            // Slice 25: report startblock inputargs' canonical colors
+            // directly.  Tests the slice 24 hypothesis: enforce_input_args
+            // rotates inputargs to colors 0..n, but those inputargs are
+            // DIFFERENT VariableIds than the scratches walker_slot_for_variable
+            // points to.  If canonical[inputarg_for_slot_0] == 0 universally,
+            // the divergence is entirely the slot↔Variable mapping (research
+            // confirms walker_slot_for_variable picks scratch not inputarg).
+            let startblock_inputargs = graph.startblock.borrow().inputargs.clone();
+            let mut input_idx = 0u32;
+            for arg in &startblock_inputargs {
+                let Some(v) = arg.as_variable() else {
+                    input_idx += 1;
+                    continue;
+                };
+                if v.kind != Some(super::flatten::Kind::Ref) {
+                    input_idx += 1;
+                    continue;
+                }
+                let canonical_color = ref_coloring.get(&v.id).copied();
+                eprintln!(
+                    "[phase4-inputarg] graph={} input_idx={input_idx} var={} canonical_color={:?}",
+                    ssarepr.name, v.id.0, canonical_color,
+                );
+                input_idx += 1;
+            }
         }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full

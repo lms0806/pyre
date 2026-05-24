@@ -109,6 +109,16 @@ pub struct SSARepr {
     /// `assembler.py:41` populates this with the byte position of each
     /// instruction after `assemble()`.
     pub insns_pos: Option<Vec<usize>>,
+    /// Pyre-only side-table populated by canonical's
+    /// `serialize_op`: for each non-negative `op.offset` (Python PC)
+    /// encountered, the FIRST `insns` index where an op with that
+    /// PC was emitted.  Walker maintains the analogous mapping via
+    /// `walker_pc_live_marker_pos` (codewriter.rs:4125) — both
+    /// drive `pc_map` construction at exit-recovery time
+    /// (call_jit.rs:3939).  Empty when filled by the walker path.
+    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc per
+    /// [[feedback-no-hashmap-ever]].
+    pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Phase 2.2a (plan staged-sauteeing-koala, Tasks #158/#159/#122
     /// epic): per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
@@ -131,6 +141,7 @@ impl SSARepr {
             name: name.into(),
             insns: Vec::new(),
             insns_pos: None,
+            pc_first_insn_pos: Vec::new(),
             next_var_idx: [0; 3],
         }
     }
@@ -1161,7 +1172,46 @@ impl Insn {
 /// Expand this helper as more ops move from `codewriter.rs` into the
 /// flow-graph + flatten pipeline.
 pub struct GraphFlattener<'a> {
+    // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
+    /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
+    ///
+    /// `enforce_input_args` reads `self.graph.startblock.inputargs`
+    /// (`flatten.py:89`) and `generate_ssa_form` recurses from
+    /// `self.graph.startblock` (`flatten.py:104`).
+    graph: &'a super::flow::FunctionGraph,
+    /// `rpython/jit/codewriter/flatten.py:78 self.regallocs = regallocs`.
+    ///
+    /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
+    /// matching upstream's `self.regallocs[kind].getcolor(v)`.
+    ///
+    /// Stored as `&mut` so `enforce_input_args` (`flatten.py:88-100`)
+    /// can `swapcolors` in place, matching upstream's
+    /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
+    /// reborrow immutably via `&*self.regallocs`.
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
+    ///
+    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
+    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
+    /// can read `self.cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
+    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
+    /// as a borrow; production callers thread `CodeWriter::cpu()`
+    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
+    /// the overflow path leave it `None`, matching upstream's
+    /// `cpu=None` default at `flatten.py:64`.
+    cpu: Option<&'a super::cpu::Cpu>,
+    /// `rpython/jit/codewriter/flatten.py:80
+    /// self._include_all_exc_links = _include_all_exc_links`.
+    include_all_exc_links: bool,
+    /// `rpython/jit/codewriter/flatten.py:86 self.ssarepr = SSARepr(name)`.
+    ///
+    /// Upstream owns the SSARepr; pyre's caller owns it and passes a
+    /// borrow so the `serialize_op` test fixture sites can reuse an
+    /// existing SSARepr (the upstream entry returns a fresh SSARepr).
     ssarepr: &'a mut SSARepr,
+
+    // ─── pyre-only fields (no PyPy counterpart) ───
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
@@ -1181,19 +1231,6 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
-    include_all_exc_links: bool,
-    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
-    ///
-    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
-    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
-    /// can read `self.cpu.rtyper.exceptiondata.
-    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
-    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
-    /// as a borrow; production callers thread `CodeWriter::cpu()`
-    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
-    /// the overflow path leave it `None`, matching upstream's
-    /// `cpu=None` default at `flatten.py:64`.
-    cpu: Option<&'a super::cpu::Cpu>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1206,35 +1243,37 @@ pub struct GraphFlattener<'a> {
     /// Production callers populate it via `cpu.lowering_ctx`
     /// (`codewriter.rs::transform_graph_to_jitcode`).
     lowering_ctx: Option<LoweringContext>,
-    /// `rpython/jit/codewriter/flatten.py:76 self.regallocs = regallocs`.
-    ///
-    /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
-    /// matching upstream's `self.regallocs[kind].getcolor(v)`.
-    regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
 }
 
 impl<'a> GraphFlattener<'a> {
-    /// `rpython/jit/codewriter/flatten.py:73-83 GraphFlattener.__init__`.
+    /// `rpython/jit/codewriter/flatten.py:73-86 GraphFlattener.__init__`.
     ///
-    /// Upstream takes `(graph, regallocs, _include_all_exc_links, cpu)`.
-    /// Pyre keeps `graph` as a per-call argument to `generate_ssa_form`
-    /// because `make_bytecode_block` already threads it, and exposes
-    /// `_include_all_exc_links` / `cpu` / `lowering_ctx` via builder
-    /// methods to keep the common no-options construction concise.
+    /// Upstream takes `(graph, regallocs, _include_all_exc_links=False,
+    /// cpu=None)`.  Pyre matches the first two positional arguments
+    /// `(graph, regallocs)` and trails them with `ssarepr` (the pyre-
+    /// specific borrow — upstream constructs the SSARepr inline at
+    /// `flatten.py:82-86 self.ssarepr = SSARepr(name)`).  The two
+    /// keyword arguments `_include_all_exc_links` / `cpu` (and pyre's
+    /// `lowering_ctx` extension) are exposed via builder methods to
+    /// keep the common no-options construction concise.
     pub fn new(
+        graph: &'a super::flow::FunctionGraph,
+        regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
         ssarepr: &'a mut SSARepr,
-        regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
     ) -> Self {
         Self {
+            // PyPy-mirror fields (`flatten.py:77-86 __init__` order).
+            graph,
+            regallocs,
+            cpu: None,
+            include_all_exc_links: false,
             ssarepr,
+            // pyre-only fields.
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
             next_label_id: 0,
-            include_all_exc_links: false,
-            cpu: None,
             lowering_ctx: None,
-            regallocs,
         }
     }
 
@@ -1276,6 +1315,28 @@ impl<'a> GraphFlattener<'a> {
         // semantics).  See [[project-flatten-graph-canonical-driver-2026-05-17]].
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
+        }
+        // Phase 4 endgame slice 15: record FIRST insn position per
+        // non-negative `op.offset` (Python PC) into
+        // `ssarepr.pc_first_insn_pos`.  Walker tracks the same mapping
+        // via `walker_pc_live_marker_pos` (codewriter.rs:4125); both
+        // drive `pc_map` construction at exit recovery
+        // (call_jit.rs:3939).  Synthetic ops with `offset = -1`
+        // (insert_renamings ref_copy / overflow trampolines /
+        // catch-landing entries) are skipped — they have no Python
+        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>` per
+        // [[feedback-no-hashmap-ever]].
+        if op.offset >= 0 {
+            let py_pc = op.offset;
+            let already_seen = self
+                .ssarepr
+                .pc_first_insn_pos
+                .iter()
+                .any(|(pc, _)| *pc == py_pc);
+            if !already_seen {
+                let pos = self.ssarepr.insns.len();
+                self.ssarepr.pc_first_insn_pos.push((py_pc, pos));
+            }
         }
         let insn = self.flatten_space_operation(op);
         self.emitline(insn);
@@ -2043,14 +2104,18 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
+    /// `rpython/jit/codewriter/flatten.py:88-100
+    /// GraphFlattener.enforce_input_args` — rotate `self.regallocs[kind]`
+    /// inputarg colors into `0..n-1` via `swapcolors`.
+    pub fn enforce_input_args(&mut self) {
+        super::regalloc::enforce_input_args(self.graph, self.regallocs);
+    }
+
     /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
-    /// reset `seen_blocks` and recurse from `graph.startblock`.  Upstream
-    /// stores `graph` as `self.graph`; pyre threads it through because
-    /// `make_bytecode_block` operates on the block argument and does not
-    /// need a graph backreference for any other step.
-    pub fn generate_ssa_form(&mut self, graph: &super::flow::FunctionGraph) {
+    /// reset `seen_blocks` and recurse from `self.graph.startblock`.
+    pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        self.make_bytecode_block(graph.startblock.clone(), false);
+        self.make_bytecode_block(self.graph.startblock.clone(), false);
     }
 
     fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
@@ -2129,7 +2194,7 @@ impl<'a> GraphFlattener<'a> {
             // so the dispatcher signature stays stable; both share the
             // free `regalloc_color` helper with `getcolor_var` so a
             // missing color panics uniformly.
-            let regallocs = self.regallocs;
+            let regallocs: &[super::regalloc::GraphAllocationResult; 3] = &*self.regallocs;
             let mut get_register = |v: Variable| regalloc_color(regallocs, v);
             let mut lower_constant = flatten_constant_operand;
             if let Some(insn) = try_flatten_retired_family_hlop_to_insn(
@@ -2215,7 +2280,7 @@ impl<'a> GraphFlattener<'a> {
     /// Reads `regallocs[kind].coloring[v.id]` directly — matching
     /// upstream's `self.regallocs[kind].getcolor(v)`.
     fn getcolor_var(&self, v: Variable) -> Register {
-        regalloc_color(self.regallocs, v)
+        regalloc_color(&*self.regallocs, v)
     }
 
     /// Lower a graph `Constant` to the typed `Operand` the assembler
@@ -2243,16 +2308,33 @@ fn regalloc_color(
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
     v: Variable,
 ) -> Register {
+    // `flatten.py:382-386 GraphFlattener.getcolor` — pick the
+    // per-kind allocator and call `regallocs[kind].getcolor(v)`.
     let kind = v.kind.unwrap_or(Kind::Ref);
-    let color = *regallocs[kind.index()]
-        .coloring
-        .get(&v.id)
-        .unwrap_or_else(|| {
-            panic!(
-                "GraphFlattener: missing regalloc color for variable {:?} of kind {:?}",
-                v.id, kind,
-            )
-        });
+    let alloc = &regallocs[kind.index()];
+    let color = alloc.coloring.get(&v.id).copied().unwrap_or_else(|| {
+        // Surface kind + per-kind coloring size so the Phase 4 endgame
+        // probe (codewriter.rs PYRE_PHASE4_BUILD_CANONICAL) can name
+        // the specific dual-coloring gap without dumping the entire
+        // graph.  Sample up to 8 known IDs to make "is the Variable
+        // simply skipped or is the kind allocator empty?" obvious at
+        // a glance.
+        let mut known: Vec<u32> = alloc.coloring.keys().map(|id| id.0).collect();
+        known.sort_unstable();
+        let sampled: Vec<u32> = known.iter().take(8).copied().collect();
+        panic!(
+            "regalloc_color: missing color for {v:?} (kind={kind:?}); \
+             kind allocator has {} entries (first {}: {:?}{})",
+            alloc.coloring.len(),
+            sampled.len(),
+            sampled,
+            if known.len() > sampled.len() {
+                ", ..."
+            } else {
+                ""
+            },
+        )
+    });
     Register::new(kind, color)
 }
 
@@ -2527,9 +2609,9 @@ pub fn identity_test_regallocs(
 /// generate_ssa_form`.  Skips `enforce_input_args` because identity
 /// coloring is a fixed-point for id-ordered inputargs.
 pub fn flatten_graph_for_test(graph: &super::flow::FunctionGraph, ssarepr: &mut SSARepr) {
-    let regallocs = identity_test_regallocs(graph);
-    let mut flattener = GraphFlattener::new(ssarepr, &regallocs);
-    flattener.generate_ssa_form(graph);
+    let mut regallocs = identity_test_regallocs(graph);
+    let mut flattener = GraphFlattener::new(graph, &mut regallocs, ssarepr);
+    flattener.generate_ssa_form();
 }
 
 /// Test-fixture entry: identity-coloring regallocs + an explicit
@@ -2542,12 +2624,13 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
     lowering_ctx: LoweringContext,
     cpu: Option<&'a super::cpu::Cpu>,
 ) {
-    let regallocs = identity_test_regallocs(graph);
-    let mut flattener = GraphFlattener::new(ssarepr, &regallocs).with_lowering_ctx(lowering_ctx);
+    let mut regallocs = identity_test_regallocs(graph);
+    let mut flattener =
+        GraphFlattener::new(graph, &mut regallocs, ssarepr).with_lowering_ctx(lowering_ctx);
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
-    flattener.generate_ssa_form(graph);
+    flattener.generate_ssa_form();
 }
 
 /// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
@@ -2583,17 +2666,11 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream's
-    // `enforce_input_args` is a `GraphFlattener` method that mutates
-    // `self.regallocs` via `swapcolors`.  Pyre runs the equivalent
-    // here as a free function so the post-swap regallocs can be
-    // borrowed immutably by `GraphFlattener::new` below.
-    super::regalloc::enforce_input_args_graph(graph, regallocs);
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
-    let mut flattener = GraphFlattener::new(&mut ssarepr, regallocs);
+    let mut flattener = GraphFlattener::new(graph, regallocs, &mut ssarepr);
     if let Some(ctx) = lowering_ctx {
         flattener = flattener.with_lowering_ctx(ctx);
     }
@@ -2603,8 +2680,10 @@ pub fn flatten_graph<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
+    // `flatten.py:68 flattener.enforce_input_args()`.
+    flattener.enforce_input_args();
     // `flatten.py:69 flattener.generate_ssa_form()`.
-    flattener.generate_ssa_form(graph);
+    flattener.generate_ssa_form();
     ssarepr
 }
 
@@ -4379,8 +4458,9 @@ mod tests {
     fn graph_flattener_emits_loop_header_from_graph_op() {
         let op = SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 17);
         let mut ssarepr = SSARepr::new("test");
-        let empty_regallocs = empty_regallocs();
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &empty_regallocs);
+        let mut empty_regallocs = empty_regallocs();
+        let graph = stub_graph();
+        let mut flattener = GraphFlattener::new(&graph, &mut empty_regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 
@@ -4432,7 +4512,7 @@ mod tests {
         let mut ref_coloring = std::collections::HashMap::new();
         ref_coloring.insert(frame.id, 10u16);
         ref_coloring.insert(ec.id, 11u16);
-        let regallocs = [
+        let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
                 coloring: std::collections::HashMap::new(),
                 num_colors: 0,
@@ -4446,7 +4526,8 @@ mod tests {
                 num_colors: 0,
             },
         ];
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
+        let graph = stub_graph();
+        let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 
@@ -4994,7 +5075,7 @@ mod tests {
         let mut ref_coloring = std::collections::HashMap::new();
         ref_coloring.insert(src.id, 0u16);
         ref_coloring.insert(dst.id, 1u16);
-        let regallocs = [
+        let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
                 coloring: std::collections::HashMap::new(),
                 num_colors: 0,
@@ -5008,7 +5089,8 @@ mod tests {
                 num_colors: 0,
             },
         ];
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
+        let graph = stub_graph();
+        let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 
@@ -5401,7 +5483,7 @@ mod tests {
         // `lower_constant` closure.
         use crate::jit::cpu::Cpu;
         use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let lhs = Variable::new(VariableId(0), Kind::Int);
         let rhs = Variable::new(VariableId(1), Kind::Int);
@@ -5441,7 +5523,7 @@ mod tests {
                 _ => None,
             });
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
         // handling_ovf=true emits `raise <ConstRef(pointer)>` per
@@ -5476,7 +5558,7 @@ mod tests {
         // canonical entry's dispatcher-driven emission.
         use crate::jit::cpu::Cpu;
         use crate::jit::flow::{Block, FunctionGraph, Link};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -5502,7 +5584,7 @@ mod tests {
             portal_frame_reg: u16::MAX,
         });
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
         let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
@@ -5545,7 +5627,7 @@ mod tests {
         // `flatten_graph_with_lowering` path (a per-call
         // `lower_constant` closure handles the resolution).
         use crate::jit::flow::{Block, FunctionGraph, Link};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let start = Block::shared(Vec::new());
         let graph = FunctionGraph::new("rtyped_canonical", start.clone(), None);
@@ -5562,7 +5644,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, None);
 
         let has_const_ref_feed = ssarepr.insns.iter().any(|insn| {
@@ -5578,6 +5660,18 @@ mod tests {
              Operand::ConstRef(0xfeed): {:?}",
             ssarepr.insns
         );
+    }
+
+    /// Helper: build a single-block `FunctionGraph` stub for tests
+    /// that exercise `serialize_op` only and never touch
+    /// `graph.startblock.inputargs` or `graph.startblock.exits`.
+    /// `GraphFlattener::new` requires a `&FunctionGraph` per
+    /// `flatten.py:77 self.graph = graph`; this provides the minimum
+    /// shape that satisfies the borrow.
+    fn stub_graph() -> super::super::flow::FunctionGraph {
+        use super::super::flow::{Block, FunctionGraph};
+        let start = Block::shared(Vec::new());
+        FunctionGraph::new("stub", start, None)
     }
 
     /// Helper: build a `[GraphAllocationResult; 3]` with empty
@@ -7764,8 +7858,7 @@ mod tests {
             )
             .into_ref(),
         ]);
-        let mut regallocs =
-            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
         assert_eq!(ssarepr.name, "orthodox4arg");
         assert!(
@@ -7800,8 +7893,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        let mut regallocs =
-            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         // Use the canonical `flatten_graph(graph, regallocs,
         // include_all_exc_links, cpu)` entry — the loop_header op is a
         // passthrough family and needs no LoweringContext arm to fire.

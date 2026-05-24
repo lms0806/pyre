@@ -578,10 +578,21 @@ pub(crate) fn write_stack_slot(
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
-    if reg_idx >= sym.registers_r.len() {
-        sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+    // Path 3 slice 35b (task #225): portal frames carry the authoritative
+    // stack shadow on `virtualizable_boxes` (`pyjitpl.py:1242
+    // _opimpl_setarrayitem_vable`). The companion read paths
+    // (`read_stack_slot` per slice 34; `read_live` per slice 32;
+    // `get_list_of_active_boxes` snapshot fallback per slice 35a) source
+    // their portal-frame view from the vable shadow, so the pyre-only
+    // `registers_r[reg_idx]` semantic-mirror write is dead for portal
+    // frames.  Non-portal frames retain the lazy-fill mirror because
+    // their read path still consults `registers_r[reg_idx]`.
+    if !sym.owns_virtualizable_shadow() {
+        if reg_idx >= sym.registers_r.len() {
+            sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+        }
+        sym.registers_r[reg_idx] = boxed;
     }
-    sym.registers_r[reg_idx] = boxed;
     if stack_idx >= sym.symbolic_stack_types.len() {
         sym.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
     }
@@ -633,6 +644,23 @@ pub(crate) fn write_stack_slot(
 /// `GetarrayitemGcR` with a NONE base operand.
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
+    // Path 3 slice 34 (task #219): for portal frames, read the stack slot
+    // directly from the `virtualizable_boxes` shadow — PyPy-orthodox
+    // (`pyjitpl.py:1230 _opimpl_getarrayitem_vable`).  Empirical verification
+    // (slice 33, `PYRE_PATH3_VERIFY_STACK_READ`) showed zero mismatch between
+    // the vable shadow and the legacy `registers_r[reg_idx]` semantic-mirror
+    // value across 9 benches.  Routing through vable retires one dependency
+    // on the `registers_r` semantic-mirror NEW DEVIATION.
+    //
+    // Non-portal frames keep the `registers_r` lazy-fill path below — they
+    // don't own a vable shadow.  Their semantic-mirror retirement is a
+    // separate epic (Path 3 follow-up).
+    if sym.owns_virtualizable_shadow() {
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        if let Some(v) = ctx.virtualizable_box_at(nvs + semantic_idx) {
+            return v;
+        }
+    }
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -1427,6 +1455,18 @@ impl MIFrame {
             let mut registers_r_semantic: Vec<OpRef> =
                 if let Some(ref pre_r) = self.pre_opcode_registers_r {
                     pre_r[..valid_len.min(pre_r.len())].to_vec()
+                } else if s.owns_virtualizable_shadow() {
+                    // Path 3 slice 35a (task #225): portal frames have the
+                    // authoritative semantic-indexed shadow in
+                    // `virtualizable_boxes` (`pyjitpl.py:1242
+                    // _opimpl_setarrayitem_vable`).  When no opcode-start
+                    // snapshot is available, source the encoder's
+                    // semantic view directly from the vable shadow rather
+                    // than the pyre-only `registers_r` semantic mirror.
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    (0..valid_len)
+                        .map(|idx| ctx.virtualizable_box_at(nvs + idx).unwrap_or(OpRef::NONE))
+                        .collect()
                 } else {
                     s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
                 };
@@ -2052,7 +2092,21 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.registers_r[idx] = value;
+            // Path 3 slice 37b (task #227): when `load_local_value`'s
+            // vable-read predicate (`is_active_vable_owner` AND no
+            // `bridge_local_oprefs`) fires, every reader of the local
+            // OpRef sources from `virtualizable_boxes` and the
+            // `registers_r[idx]` semantic-mirror write is dead — PyPy's
+            // `_opimpl_setarrayitem_vable` (`pyjitpl.py:1242-1247`)
+            // writes only the vable shadow.  Bridges with
+            // `bridge_local_oprefs=Some(...)` still read from
+            // `registers_r[idx]` (`load_local_value`'s non-vable arm at
+            // line 1999), so they retain the mirror write; non-owner
+            // frames also keep it.
+            let vable_read_path = s.is_active_vable_owner && s.bridge_local_oprefs.is_none();
+            if !vable_read_path {
+                s.registers_r[idx] = value;
+            }
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
@@ -4361,15 +4415,34 @@ impl MIFrame {
         None
     }
 
-    fn existing_ref_for_concrete(&self, concrete_obj: PyObjectRef) -> Option<OpRef> {
+    fn existing_ref_for_concrete(
+        &self,
+        ctx: &TraceCtx,
+        concrete_obj: PyObjectRef,
+    ) -> Option<OpRef> {
         if concrete_obj.is_null() {
             return None;
         }
         let s = self.sym();
         let total_slots = s.nlocals + s.concrete_stack.len();
+        let owns_shadow = s.owns_virtualizable_shadow();
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         for abs_idx in 0..total_slots {
             if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
-                let opref = *s.registers_r.get(abs_idx)?;
+                // Path 3 slice 37a (task #227): portal frames carry the
+                // current OpRef on `virtualizable_boxes` (`pyjitpl.py:
+                // 1230 _opimpl_getarrayitem_vable`).  The legacy
+                // `registers_r[abs_idx]` semantic mirror returns the
+                // init-symbolic seed once `store_local_value` retires
+                // the mirror write (slice 37b), so consult vable first
+                // for portal frames.
+                let opref = if owns_shadow {
+                    ctx.virtualizable_box_at(nvs + abs_idx).unwrap_or_else(|| {
+                        s.registers_r.get(abs_idx).copied().unwrap_or(OpRef::NONE)
+                    })
+                } else {
+                    *s.registers_r.get(abs_idx)?
+                };
                 if opref != OpRef::NONE && self.value_type(opref) == Type::Ref {
                     return Some(opref);
                 }
@@ -5129,7 +5202,9 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
-                    if let Some(existing) = this.existing_ref_for_concrete(inner_self) {
+                    if let Some(existing) =
+                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
+                    {
                         return existing;
                     }
                     this.with_ctx(|this, ctx| {

@@ -137,16 +137,22 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             // concretes via a different path).  Tracked as Task #165.
             | Instruction::PopTop
     )
-    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
-    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
-    // codewriter-emitted LoadFastCheck arm body contains a
-    // `goto_if_not/iL` whose value lives in the Int register bank;
-    // walker `dispatch_goto_if_not` falls into the strict-mode
-    // fail-loud path because `concrete_registers_i` doesn't exist.
-    // Blocker is the Int-bank concrete shadow plumbing — see
-    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
-    // for the Int-bank shadow" section.  Allow-list expansion past
-    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
+    // LoadFastCheck was experimentally added to this allow-list under
+    // Task #48 T4 (2026-05-22) because Task #75's Int-bank concrete
+    // shadow makes the outer arm's `int_lt/ii>i` + `goto_if_not/iL`
+    // bounds check folding match `dispatch_switch_id`'s concrete read.
+    // Reverted because the outer arm recurses through `inline_call_r_r
+    // → varnames.get` and `inline_call_ir_r → opcode_load_fast_checked`,
+    // so a deep `getfield_gc_i` against an unboxed-Int-Ref local
+    // surfaces `GotoIfNotValueNotConcrete` the same way PopTop does on
+    // raise_catch_loop + synth/set_membership.  `shadow_validate_pre`
+    // always enters at the top-level Python opcode dispatch and the
+    // recursion happens inside the outer arm itself — no context
+    // guard at this layer can skip just the deep case.  Re-enabling
+    // is gated on Task #165 / #167 finishing the unboxed-Int-Ref
+    // heap-pointer view; until then, the allow-list assertion
+    // (panic on walker↔trait mismatch under MAJIT_SHADOW_WALKER=1)
+    // would be stronger than the implemented parity.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it
@@ -523,6 +529,21 @@ mod tests {
         // need Int-bank concrete shadow — task #75), so the LoadFast
         // blocker doesn't apply here.
         assert!(opname_in_shadow_allow_list(&Instruction::PopTop));
+    }
+
+    #[test]
+    fn load_fast_check_is_not_in_shadow_allow_list() {
+        // LoadFastCheck's outer arm recurses through
+        // `opcode_load_fast_checked` and hits the same depth-N+
+        // unboxed-Int-Ref `getfield_gc_i` blocker PopTop has on
+        // raise_catch_loop + synth/set_membership.  Gated on
+        // Task #165 / #167 — see the comment in
+        // `opname_in_shadow_allow_list`.
+        use pyre_interpreter::bytecode::Arg;
+        let instr = Instruction::LoadFastCheck {
+            var_num: Arg::marker(),
+        };
+        assert!(!opname_in_shadow_allow_list(&instr));
     }
 
     #[test]
