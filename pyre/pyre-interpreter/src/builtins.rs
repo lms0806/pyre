@@ -1604,7 +1604,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
-        fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        pub(crate) fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
             let exc = $ctor(rest)?;
@@ -1643,7 +1643,7 @@ exc_new_wrapper!(exc_unicode_encode_error_new, exc_unicode_encode_error);
 exc_new_wrapper!(exc_unicode_translate_error_new, exc_unicode_translate_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
-fn make_exc_type(
+pub(crate) fn make_exc_type(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
@@ -4519,7 +4519,17 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let reading = mode.contains('r') || !writing;
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
-        match std::fs::read(&path) {
+        #[cfg(not(feature = "host_env"))]
+        {
+            let _ = (binary, &path);
+            return Err(crate::PyError::not_implemented(
+                "open() for reading requires host_env feature",
+            ));
+        }
+        #[cfg(feature = "host_env")]
+        let read_result = rustpython_host_env::fs::read(&path);
+        #[cfg(feature = "host_env")]
+        match read_result {
             Ok(bytes) => {
                 if binary {
                     // Store bytes-as-string for now; we only support ASCII binary.

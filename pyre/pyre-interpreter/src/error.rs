@@ -478,6 +478,16 @@ impl PyError {
         }
     }
 
+    pub fn not_implemented(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::NotImplementedError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::TraceAbort,
@@ -916,11 +926,19 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
         return None;
     }
-    let content = std::fs::read_to_string(filename).ok()?;
-    content
-        .lines()
-        .nth((lineno - 1) as usize)
-        .map(|s| s.to_string())
+    #[cfg(feature = "host_env")]
+    {
+        let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
+        content
+            .lines()
+            .nth((lineno - 1) as usize)
+            .map(|s| s.to_string())
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let _ = (filename, lineno);
+        None
+    }
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {
