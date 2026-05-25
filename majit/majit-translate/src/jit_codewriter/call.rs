@@ -624,6 +624,25 @@ pub struct CallControl {
     /// Targets known to be elidable (pure, no side effects).
     elidable_targets: HashSet<CallPath>,
 
+    /// Pyre extension: targets whose source carries
+    /// `#[majit_macros::elidable_cannot_raise]` — a user assertion that
+    /// the callee never raises.  Honoured by `getcalldescr`'s elidable
+    /// branch before consulting `_canraise`, because pyre's exception
+    /// analyser defaults to `analyze_external_call → True` for any
+    /// callee outside `function_graphs` (Vec::len, pyframe_get_pycode,
+    /// etc.) and cannot recover `EF_ELIDABLE_CANNOT_RAISE` on its own
+    /// the way RPython's analyser does upstream.  Without honouring the
+    /// assertion, every `#[elidable_cannot_raise]` callsite is downgraded
+    /// to `ElidableCanRaise` and pays an unnecessary GUARD_NO_EXCEPTION.
+    cannot_raise_assertion_targets: HashSet<CallPath>,
+
+    /// Pyre extension: targets whose source carries
+    /// `#[majit_macros::elidable_or_memerror]` — a user assertion that
+    /// the callee raises only MemoryError.  Mirrors
+    /// `cannot_raise_assertion_targets` for the `EF_ELIDABLE_OR_MEMORYERROR`
+    /// branch of RPython's `call.py:292-298` 3-way split.
+    memerror_only_assertion_targets: HashSet<CallPath>,
+
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
     /// Targets known to be loop-invariant (call once per loop).
     loopinvariant_targets: HashSet<CallPath>,
@@ -1044,6 +1063,8 @@ impl CallControl {
             quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
             randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
             elidable_targets: HashSet::new(),
+            cannot_raise_assertion_targets: HashSet::new(),
+            memerror_only_assertion_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
@@ -3045,6 +3066,50 @@ impl CallControl {
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
                     }
+                    // Suffix-match fallback for in-impl `self.method()` calls.
+                    //
+                    // When the parser walks `impl PyFrame { fn pop(&mut self) {
+                    // self.stack_base() } }`, the inner `self.stack_base()` is
+                    // recorded as `Method { receiver_root: Some("PyFrame") }`
+                    // — the syntactic spelling, not the canonical
+                    // `pyframe::PyFrame`.  `for_impl_method("PyFrame",
+                    // "stack_base")` produces the 2-segment
+                    // `["PyFrame", "stack_base"]`, but `function_graphs`
+                    // registers the impl method under the 3-segment
+                    // module-qualified key `["pyframe", "PyFrame",
+                    // "stack_base"]`.  The literal lookup above misses, and
+                    // without this fallback every in-impl `self.method()`
+                    // call falls through to residual_call — inflating IR
+                    // emission whenever the BFS would have inlined the
+                    // method body otherwise.
+                    //
+                    // Scan `function_graphs` for keys whose last 2 segments
+                    // match `[receiver, name]`.  Accept the match only if it
+                    // is unique: an ambiguous suffix (e.g. two crates both
+                    // exposing a `PyFrame::pop`) falls through to the trait
+                    // resolution path, which mirrors Rust's name-resolution
+                    // ambiguity error rather than silently picking one.
+                    let needle = (receiver, name.as_str());
+                    let mut matched: Option<&CallPath> = None;
+                    let mut multi = false;
+                    for key in self.function_graphs.keys() {
+                        let segs = &key.segments;
+                        if segs.len() >= 2
+                            && segs[segs.len() - 2] == needle.0
+                            && segs[segs.len() - 1] == needle.1
+                        {
+                            if matched.is_some() {
+                                multi = true;
+                                break;
+                            }
+                            matched = Some(key);
+                        }
+                    }
+                    if !multi {
+                        if let Some(path) = matched {
+                            return Some(path.clone());
+                        }
+                    }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
                 let impl_type =
@@ -3534,6 +3599,72 @@ impl CallControl {
     pub fn is_elidable(&self, target: &CallTarget) -> bool {
         self.target_to_path(target)
             .is_some_and(|p| self.elidable_targets.contains(&p))
+    }
+
+    /// Pyre extension: register a target as carrying the
+    /// `#[elidable_cannot_raise]` user assertion.
+    pub fn mark_cannot_raise_assertion(&mut self, path: CallPath) {
+        assert!(
+            !self.memerror_only_assertion_targets.contains(&path),
+            "conflicting elidable exception assertions for {path:?}: \
+             already marked memerror-only, cannot also mark cannot-raise"
+        );
+        self.cannot_raise_assertion_targets.insert(path);
+    }
+
+    /// Pyre extension: check if `target` carries the
+    /// `#[elidable_cannot_raise]` assertion.
+    ///
+    /// Additionally requires the target's fnaddr to be registered via
+    /// `register_function_fnaddr`.  Without a real fnaddr,
+    /// `fnaddr_for_target` returns a synthetic 64-bit hash via
+    /// [`symbolic_fnaddr_for_path`]; that hash lands in the sub-jitcode
+    /// `constants_i` slot for the funcbox.  When the walker observes
+    /// `EF_ELIDABLE_CANNOT_RAISE` on the descr it routes through
+    /// `try_fold_pure_call_via_executor`
+    /// (pyre-jit-trace/src/jitcode_dispatch.rs:3099) which dereferences
+    /// the constant_i as a C function pointer — SIGSEGV on the hash.
+    /// Pyre's symbolic placeholder is a NEW-DEVIATION vs RPython (where
+    /// every callee has a real `MixLevelHelperAnnotator.constfunc(impl)`
+    /// address); the gate restores the upstream-equivalent invariant
+    /// that `EF_ELIDABLE_CANNOT_RAISE` callees are always executable.
+    pub fn has_cannot_raise_assertion(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target).is_some_and(|p| {
+            self.cannot_raise_assertion_targets.contains(&p)
+                && self
+                    .function_fnaddrs
+                    .get(&p)
+                    .is_some_and(|&fnaddr| fnaddr != 0)
+        })
+    }
+
+    /// Pyre extension: register a target as carrying the
+    /// `#[elidable_or_memerror]` user assertion.
+    pub fn mark_memerror_only_assertion(&mut self, path: CallPath) {
+        assert!(
+            !self.cannot_raise_assertion_targets.contains(&path),
+            "conflicting elidable exception assertions for {path:?}: \
+             already marked cannot-raise, cannot also mark memerror-only"
+        );
+        self.memerror_only_assertion_targets.insert(path);
+    }
+
+    /// Pyre extension: check if `target` carries the
+    /// `#[elidable_or_memerror]` assertion.
+    ///
+    /// Same fnaddr-registration gate as
+    /// [`Self::has_cannot_raise_assertion`]: `EF_ELIDABLE_OR_MEMORYERROR`
+    /// walker arms also route through the executor fold path when the
+    /// caller has no MemoryError stamping, so a symbolic placeholder
+    /// would crash there too.
+    pub fn has_memerror_only_assertion(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target).is_some_and(|p| {
+            self.memerror_only_assertion_targets.contains(&p)
+                && self
+                    .function_fnaddrs
+                    .get(&p)
+                    .is_some_and(|&fnaddr| fnaddr != 0)
+        })
     }
 
     /// RPython: call.py:240 — check if target has `_jit_loop_invariant_`.
@@ -4365,14 +4496,43 @@ impl CallControl {
                 ExtraEffect::LoopInvariant
             } else if elidable {
                 // call.py:292-298 — direct branch only.
-                let canraise = match shape {
-                    CallShape::Direct(target) => self._canraise(target, cache),
+                //
+                // Pyre extension: the user-facing
+                // `#[majit_macros::elidable_cannot_raise]` /
+                // `#[majit_macros::elidable_or_memerror]` macros assert
+                // an `EF_ELIDABLE_*` shape the on-graph `_canraise`
+                // analyser cannot recover on its own — pyre's
+                // `analyze_external_call` defaults to `True` (call.rs:3631)
+                // so any callee that reaches Vec::len / pyframe_get_pycode
+                // / etc. propagates back as CanRaise::Yes.  Honour the
+                // assertion before consulting `_canraise` so the
+                // `EF_ELIDABLE_CANNOT_RAISE` walker arm (no trailing
+                // GUARD_NO_EXCEPTION) actually fires on annotated
+                // callees.
+                let assertion = match shape {
+                    CallShape::Direct(target) => {
+                        if self.has_cannot_raise_assertion(target) {
+                            Some(ExtraEffect::ElidableCannotRaise)
+                        } else if self.has_memerror_only_assertion(target) {
+                            Some(ExtraEffect::ElidableOrMemoryError)
+                        } else {
+                            None
+                        }
+                    }
                     CallShape::Indirect(_) => unreachable!("indirect cannot be elidable"),
                 };
-                match canraise {
-                    CanRaise::No => ExtraEffect::ElidableCannotRaise,
-                    CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
-                    CanRaise::Yes => ExtraEffect::ElidableCanRaise,
+                if let Some(ee) = assertion {
+                    ee
+                } else {
+                    let canraise = match shape {
+                        CallShape::Direct(target) => self._canraise(target, cache),
+                        CallShape::Indirect(_) => unreachable!("indirect cannot be elidable"),
+                    };
+                    match canraise {
+                        CanRaise::No => ExtraEffect::ElidableCannotRaise,
+                        CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
+                        CanRaise::Yes => ExtraEffect::ElidableCanRaise,
+                    }
                 }
             } else {
                 let canraise = match shape {

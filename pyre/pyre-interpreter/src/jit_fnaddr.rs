@@ -468,17 +468,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
 
     // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
-    // at `eval.rs:844 Ok(PyFrame::pop(self))`. The codewriter resolves
-    // the qualified `PyFrame::pop(self)` syntax to a 2-segment CallPath
-    // `["PyFrame", "pop"]` (without the `pyframe::` module prefix that a
-    // bare method call like `self.nlocals()` would have).
+    // at `eval.rs:844 Ok(self.pop())`.  Two CallPath shapes need binding:
+    //
+    // 1. The qualified `PyFrame::pop(self)` spelling resolves to the
+    //    2-segment CallPath `["PyFrame", "pop"]` via `for_impl_method`.
+    // 2. The bare `self.pop()` spelling goes through `target_to_path`'s
+    //    suffix-match fallback (call.rs:3069-3112), which returns the
+    //    3-segment module-qualified key `["pyframe", "PyFrame", "pop"]`
+    //    that `function_graphs` actually stores inherent impl methods
+    //    under (per `parse::extract_inherent_impl_methods`).
+    //
     // `register_macro_helper_trace_fnaddr` strips the leading segment,
-    // so the 3-segment input string `pyre_interpreter::PyFrame::pop`
-    // produces the matching 2-segment canonical form.
+    // so we register both spellings via `push_alias_pair`: the 3-segment
+    // input `pyre_interpreter::PyFrame::pop` produces the 2-segment
+    // canonical, and the 4-segment input `pyre_interpreter::pyframe::PyFrame::pop`
+    // produces the 3-segment module-qualified form.  Without the second
+    // binding, `fnaddr_for_target` for `self.pop()` falls back to the
+    // symbolic hash from [`symbolic_fnaddr_for_path`], which SEGVs at
+    // trace-time call.
     let pyframe_pop: fn(&mut crate::pyframe::PyFrame) -> pyre_object::PyObjectRef =
         crate::pyframe::PyFrame::pop;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::pop",
         "pyre_interpreter::PyFrame::pop",
         pyframe_pop as *const (),
     );
@@ -502,6 +514,76 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::shared_opcode::stack_underflow_error",
         "pyre_interpreter::stack_underflow_error",
         stack_underflow as *const (),
+    );
+
+    // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
+    // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
+    // only honours the assertion when `function_fnaddrs.contains_key(p)`,
+    // so without a registration the descr falls back to
+    // `EF_ELIDABLE_CAN_RAISE`.
+    let pyframe_get_pycode_fn: unsafe fn(&crate::pyframe::PyFrame) -> *const crate::CodeObject =
+        crate::pyframe::pyframe_get_pycode;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::pyframe_get_pycode",
+        pyframe_get_pycode_fn as *const (),
+    );
+
+    let pyframe_ncells_free: fn(&crate::CodeObject) -> usize = crate::pyframe::ncells;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::ncells",
+        pyframe_ncells_free as *const (),
+    );
+
+    let pyframe_npure_cellvars: fn(&crate::CodeObject) -> usize = crate::pyframe::npure_cellvars;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::npure_cellvars",
+        pyframe_npure_cellvars as *const (),
+    );
+
+    let pyframe_ncells_method: fn(&crate::pyframe::PyFrame) -> usize =
+        crate::pyframe::PyFrame::ncells;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::ncells",
+        pyframe_ncells_method as *const (),
+    );
+
+    // B1 LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
+    // carry `#[elidable_cannot_raise]` so `has_cannot_raise_assertion`
+    // requires the fnaddr registration to fire (`call.rs:3626-3631`
+    // gates the assertion on `function_fnaddrs.contains_key(p)`).
+    // Without these the chained `Arg::get` / `VarNum::as_usize` /
+    // `Vec::len` third-party helpers reach the walker as unfolded
+    // `residual_call` ops and the walker's `goto_if_not` bounds-check
+    // aborts with `GotoIfNotValueNotConcrete`.
+    //
+    // `push_alias_pair` (vs plain `push_fnaddr`) is required because the
+    // in-module call site `load_fast_var_num_to_index(var_num, op_arg)`
+    // inside `pyopcode.rs` resolves to a bare-segment `CallPath`
+    // (`["load_fast_var_num_to_index"]`) that the assertion-aware hint
+    // walker DOES populate but the module-qualified-only fnaddr
+    // registration would miss.  Register the bare alias alongside the
+    // canonical `pyopcode::name` form so the assertion gate fires.
+    let load_fast_var_num_to_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNum>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::load_fast_var_num_to_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::load_fast_var_num_to_index",
+        "pyre_interpreter::load_fast_var_num_to_index",
+        load_fast_var_num_to_index as *const (),
+    );
+
+    let code_varnames_len: fn(&crate::CodeObject) -> usize = crate::pyopcode::code_varnames_len;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::code_varnames_len",
+        "pyre_interpreter::code_varnames_len",
+        code_varnames_len as *const (),
     );
 
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
