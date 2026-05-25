@@ -4172,6 +4172,10 @@ fn emit_stroruni_oopspec_call(
 struct BridgeVirtualCache {
     virtuals_ptr_cache: Vec<Option<OpRef>>,
     virtuals_int_cache: Vec<Option<OpRef>>,
+    /// resume.py:882 virtual_ptr_cache concrete parity: raw GcRef
+    /// allocation for each virtual, unified with the symbolic OpRef cache
+    /// above (RPython's VirtualCache stores both in one object).
+    concrete_ptr_cache: Vec<Option<majit_ir::GcRef>>,
 }
 
 impl BridgeVirtualCache {
@@ -4179,6 +4183,7 @@ impl BridgeVirtualCache {
         Self {
             virtuals_ptr_cache: vec![None; size],
             virtuals_int_cache: vec![None; size],
+            concrete_ptr_cache: vec![None; size],
         }
     }
 
@@ -4196,6 +4201,211 @@ impl BridgeVirtualCache {
 
     fn set_int(&mut self, i: usize, v: OpRef) {
         self.virtuals_int_cache[i] = Some(v);
+    }
+
+    fn get_concrete_ptr(&self, i: usize) -> Option<majit_ir::GcRef> {
+        self.concrete_ptr_cache.get(i).copied().flatten()
+    }
+
+    fn set_concrete_ptr(&mut self, i: usize, v: majit_ir::GcRef) {
+        if i < self.concrete_ptr_cache.len() {
+            self.concrete_ptr_cache[i] = Some(v);
+        }
+    }
+}
+
+/// resume.py:1245-1264 decode_box concrete parity for tagged fieldnums.
+/// Converts a tagged i16 (from `rd_virtuals[*].fieldnums`) into raw i64
+/// bits suitable for `write_field_bytes`.
+fn decode_tagged_concrete(
+    tagged: i16,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    cache: &mut BridgeVirtualCache,
+) -> i64 {
+    use majit_ir::resumedata::{
+        NULLREF, TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, UNINITIALIZED_TAG, untag,
+    };
+    if tagged == UNINITIALIZED_TAG {
+        return 0;
+    }
+    let (val, tagbits) = untag(tagged);
+    match tagbits {
+        TAGBOX => {
+            let idx = if val < 0 {
+                (val + num_failargs) as usize
+            } else {
+                val as usize
+            };
+            fail_values.get(idx).copied().unwrap_or(0)
+        }
+        TAGINT => val as i64,
+        TAGCONST => {
+            if tagged == NULLREF {
+                return 0;
+            }
+            let ci = (val - TAG_CONST_OFFSET) as usize;
+            storage
+                .and_then(|s| s.rd_consts().get(ci))
+                .map(|c| c.as_raw_i64())
+                .unwrap_or(0)
+        }
+        TAGVIRTUAL => {
+            let gcref = materialize_concrete_virtual(
+                val as usize,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                cache,
+            );
+            gcref.0 as i64
+        }
+        _ => 0,
+    }
+}
+
+/// resume.py:945-956 getvirtual_ptr concrete parity.
+/// Lazily allocate a concrete object for virtual index `vidx`, caching in
+/// `BridgeVirtualCache.concrete_ptr_cache` so shared/recursive virtuals
+/// allocate exactly once.
+///
+/// resume.py:618-760 polymorphic dispatch by RdVirtualInfo variant:
+///   VirtualInfo  → allocate_with_vtable + set w_class + setfields
+///   VStructInfo  → allocate_struct + setfields (no vtable)
+///   VArray*      → allocate_array + fill elements (not yet implemented)
+///   VStr*/VRaw*  → variant-specific allocation (not yet implemented)
+fn materialize_concrete_virtual(
+    vidx: usize,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    cache: &mut BridgeVirtualCache,
+) -> majit_ir::GcRef {
+    if let Some(cached) = cache.get_concrete_ptr(vidx) {
+        return cached;
+    }
+    let Some(virtuals) = rd_virtuals else {
+        return majit_ir::GcRef::NULL;
+    };
+    let Some(entry) = virtuals.get(vidx) else {
+        return majit_ir::GcRef::NULL;
+    };
+    match entry.as_ref() {
+        // resume.py:618-621 VirtualInfo.allocate
+        majit_ir::RdVirtualInfo::VirtualInfo {
+            descr,
+            fielddescrs,
+            fieldnums,
+            ..
+        } => {
+            let Some(descr) = descr.as_ref() else {
+                return majit_ir::GcRef::NULL;
+            };
+            let Some(size_descr) = descr.as_size_descr() else {
+                return majit_ir::GcRef::NULL;
+            };
+            let vtable = size_descr.vtable();
+            let obj_size = size_descr.size();
+            if vtable == 0 || obj_size < std::mem::size_of::<pyre_object::PyObject>() {
+                return majit_ir::GcRef::NULL;
+            }
+            let Some(layout) = std::alloc::Layout::from_size_align(obj_size, 8).ok() else {
+                return majit_ir::GcRef::NULL;
+            };
+            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+            if raw.is_null() {
+                return majit_ir::GcRef::NULL;
+            }
+            // resume.py:619 allocate_with_vtable(descr)
+            unsafe {
+                let ptr = raw as *mut pyre_object::PyObject;
+                (*ptr).ob_type = vtable as *const pyre_object::pyobject::PyType;
+                // rclass.py:739-743 set w_class from cached instantiate
+                (*ptr).w_class = pyre_object::pyobject::get_instantiate(
+                    &*(vtable as *const pyre_object::pyobject::PyType),
+                );
+            }
+            let gcref = majit_ir::GcRef(raw as usize);
+            // resume.py:620 cache BEFORE filling fields (circular ref safe)
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:597-603 setfields
+            for (fd, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let value = decode_tagged_concrete(
+                    fnum,
+                    rd_virtuals,
+                    fail_values,
+                    num_failargs,
+                    storage,
+                    cache,
+                );
+                unsafe {
+                    write_field_bytes(raw, fd.offset, fd.field_size, value);
+                }
+            }
+            gcref
+        }
+        // resume.py:633-637 VStructInfo.allocate — no vtable
+        majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr,
+            fielddescrs,
+            fieldnums,
+            ..
+        } => {
+            let Some(descr) = typedescr.as_ref() else {
+                return majit_ir::GcRef::NULL;
+            };
+            let Some(size_descr) = descr.as_size_descr() else {
+                return majit_ir::GcRef::NULL;
+            };
+            let obj_size = size_descr.size();
+            if obj_size == 0 {
+                return majit_ir::GcRef::NULL;
+            }
+            let Some(layout) = std::alloc::Layout::from_size_align(obj_size, 8).ok() else {
+                return majit_ir::GcRef::NULL;
+            };
+            // resume.py:635 allocate_struct(typedescr) — raw allocation, no vtable
+            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+            if raw.is_null() {
+                return majit_ir::GcRef::NULL;
+            }
+            let gcref = majit_ir::GcRef(raw as usize);
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:637 setfields
+            for (fd, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let value = decode_tagged_concrete(
+                    fnum,
+                    rd_virtuals,
+                    fail_values,
+                    num_failargs,
+                    storage,
+                    cache,
+                );
+                unsafe {
+                    write_field_bytes(raw, fd.offset, fd.field_size, value);
+                }
+            }
+            gcref
+        }
+        // resume.py:650-670 VArray allocate + fill.
+        // Concrete array allocation requires backend-specific layout
+        // (item stride, header size). Not yet implemented; returns NULL.
+        majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear { .. }
+        | majit_ir::RdVirtualInfo::VArrayStructInfo { .. } => majit_ir::GcRef::NULL,
+        // resume.py:763-830 VStr* / resume.py:692-734 VRaw*.
+        // String/raw-buffer concrete allocation not yet implemented.
+        _ => majit_ir::GcRef::NULL,
     }
 }
 
@@ -5036,42 +5246,46 @@ impl JitState for PyreJitState {
         // is the fixed Box kind the encoder recorded at numbering time
         // (fail_arg_types[idx] for Box variants), matching RPython's
         // immutable Box.type invariant. No heap read.
-        let decode_concrete = |v: &RebuiltValue| -> majit_ir::Value {
-            match v {
-                RebuiltValue::Box(n, tp) => {
-                    // resume.py:1260 decode_box Box branch: liveboxes[num]
-                    // is authoritative. The encoder guarantees num in range.
-                    // Silent unwrap_or(0) would mask encoder/decoder drift
-                    // and write null into Ref slots / zero into Int slots.
-                    let bits = *fail_values.get(*n).unwrap_or_else(|| {
-                        panic!(
-                            "decode_concrete: fail_values[{n}] out of range \
-                             (len={}) — encoder/decoder liveboxes mismatch",
-                            fail_values.len()
-                        )
-                    });
-                    let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
-                    value_for_slot(effective_tp, bits)
-                }
-                RebuiltValue::Const(c) => value_for_slot(c.get_type(), c.as_raw_i64()),
-                // resume.py:1245 TAGVIRTUAL → getvirtual_ptr: RPython returns
-                // a Ref-typed Box pointing at the virtual's materialized
-                // allocation. pyre delays materialization to bridge runtime
-                // (NEW_WITH_VTABLE inside the trace), so the concrete
-                // pointer is not observable at trace time. Seed the shadow
-                // with a Ref-typed null placeholder to preserve Box.type
-                // immutability at the label (virtualstate.py:417) — the
-                // real pointer reaches the live heap when the bridge
-                // executes its NEW_WITH_VTABLE + SETFIELD sequence.
-                RebuiltValue::Virtual(_) => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
-                RebuiltValue::Unassigned => majit_ir::Value::Void,
-            }
-        };
 
-        // resume.py:874-899 VirtualCache parity: per-bridge list caches
-        // indexed by virtual number, so shared / recursive virtuals
-        // materialize exactly once.
+        // resume.py:874-899 VirtualCache parity: single cache indexed by
+        // virtual number, holding both symbolic OpRef (for trace ops) and
+        // concrete GcRef (for shadow values / continue_tracing). RPython's
+        // VirtualCache stores both in one object; pyre unifies them here.
         let mut virtuals_cache = BridgeVirtualCache::new(rd_virtuals.map_or(0, |v| v.len()));
+
+        // resume.py:945 getvirtual_ptr + resume.py:1245 decode_box parity.
+        // Decodes RebuiltValue into concrete raw Value. Virtual entries
+        // delegate to `materialize_concrete_virtual` which allocates via
+        // the unified BridgeVirtualCache.concrete_ptr_cache.
+        let decode_concrete =
+            |v: &RebuiltValue, cache: &mut BridgeVirtualCache| -> majit_ir::Value {
+                match v {
+                    RebuiltValue::Box(n, tp) => {
+                        let bits = *fail_values.get(*n).unwrap_or_else(|| {
+                            panic!(
+                                "decode_concrete: fail_values[{n}] out of range \
+                             (len={}) — encoder/decoder liveboxes mismatch",
+                                fail_values.len()
+                            )
+                        });
+                        let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
+                        value_for_slot(effective_tp, bits)
+                    }
+                    RebuiltValue::Const(c) => value_for_slot(c.get_type(), c.as_raw_i64()),
+                    RebuiltValue::Virtual(vidx) => {
+                        let gcref = materialize_concrete_virtual(
+                            *vidx,
+                            rd_virtuals,
+                            fail_values,
+                            resume_data.num_failargs,
+                            resume_data.storage.as_ref(),
+                            cache,
+                        );
+                        majit_ir::Value::Ref(gcref)
+                    }
+                    RebuiltValue::Unassigned => majit_ir::Value::Void,
+                }
+            };
 
         // resume.py:1245 decode_box parity. Each tagged variant resolves
         // to a live box whose `.type` is the kind the encoder dispatched:
@@ -5145,7 +5359,7 @@ impl JitState for PyreJitState {
         let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
         for v in vvals {
             oprefs.push(resolve(ctx, &mut virtuals_cache, v));
-            concrete_values.push(decode_concrete(v));
+            concrete_values.push(decode_concrete(v, &mut virtuals_cache));
         }
         sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
         let vable_ref_value = concrete_values
@@ -5415,6 +5629,77 @@ impl JitState for PyreJitState {
         sym.valuestackdepth = bridge_valuestackdepth;
         sym.bridge_local_oprefs = Some(bridge_locals);
         sym.bridge_local_types = Some(bridge_local_types);
+
+        // pyjitpl.py:3424 `rebuild_state_after_failure` tail —
+        // `consume_virtualref_boxes` (resume.py:1093):
+        //   for i in range(0, len(virtualref_boxes), 2):
+        //       virtual_box = virtualref_boxes[i]
+        //       vref_box    = virtualref_boxes[i + 1]
+        //   self.virtualref_boxes += [virtual_box, vref_box]
+        // The parent guard already encoded the resumed pair sequence into
+        // `rd_numb`'s vref section (resume.py:738-754 `consume_vref_and_vable`
+        // → `consume_virtualref_info`), and `rebuild_from_numbering`
+        // (majit/majit-ir/src/resumedata.rs:402-416) decoded it into
+        // `resume_data.virtualref_values`. Materialize the OpRef + concrete
+        // pointer for each pair through the same `resolve` / `decode_concrete`
+        // callbacks used for `frames[0].values`, then push the pairs into
+        // `sym.virtualref_boxes` so `opimpl_virtual_ref` /
+        // `opimpl_virtual_ref_finish` handlers (state.rs:3475-3500) observe
+        // the parent's still-open virtualref scope at bridge entry.
+        //
+        // For traces with no active `virtual_ref`, `virtualref_values` is
+        // empty and this loop is a no-op.
+        let vref_values = &resume_data.virtualref_values;
+        // resume.py:1397 `vrefinfo.continue_tracing(vref, virtual_val)` —
+        // restore `JitVirtualRef.forced = virtual` and clear
+        // `virtual_token` for every still-active pair. The runtime
+        // mutation lives on the live JitVirtualRef heap object, so the
+        // call is gated on a non-null concrete `vref_ptr`. Pyre's
+        // `VirtualRefInfo::new()` (majit-metainterp/src/virtualref.rs:257)
+        // is a cheap struct-only constructor — instantiate once outside
+        // the loop instead of per-pair.
+        let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
+        // resume.py:1093 `consume_virtualref_boxes` decodes exactly
+        // `size * 2` entries; a malformed odd-length stream is a bug.
+        assert!(
+            vref_values.len() % 2 == 0,
+            "virtualref_values must contain an even number of entries (got {})",
+            vref_values.len(),
+        );
+        for pair in vref_values.chunks_exact(2) {
+            let virt_opref = resolve(ctx, &mut virtuals_cache, &pair[0]);
+            let vref_opref = resolve(ctx, &mut virtuals_cache, &pair[1]);
+            let virt_ptr = value_to_usize(&decode_concrete(&pair[0], &mut virtuals_cache));
+            let vref_ptr = value_to_usize(&decode_concrete(&pair[1], &mut virtuals_cache));
+            sym.virtualref_boxes.push((virt_opref, virt_ptr));
+            sym.virtualref_boxes.push((vref_opref, vref_ptr));
+            // resume.py:1397 `vrefinfo.continue_tracing(vref, virtual)`
+            // — called unconditionally per RPython. `continue_tracing`
+            // (virtualref.py:122) returns early when vref is null/
+            // not-JitVirtualRef, but asserts `real_object` (line 125)
+            // when vref IS valid. `virt_ptr` is non-null for VirtualInfo
+            // and VStructInfo (materialize_concrete_virtual allocates);
+            // array/string/raw-buffer virtuals may still return NULL
+            // until those allocators are implemented. Guard on virt_ptr
+            // to match the debug_assert in continue_tracing.
+            if virt_ptr != 0 {
+                unsafe {
+                    vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
+                }
+            }
+        }
+
+        // pyjitpl.py:3443 `synchronize_virtualizable()` inside
+        // `rebuild_state_after_failure` (pyjitpl.py:3454) writes
+        // `virtualizable_boxes` to the heap via `write_boxes()`
+        // (virtualizable.py:101-113). This is the ONLY call in
+        // RPython's bridge-resume path — there is no second call.
+        //
+        // In pyre, the equivalent write is `sync_virtualizable_after_
+        // guard_failure` (eval.rs:5709, `ResumeVableMode::
+        // GuardFailureSync`) which runs in the compiled bridge's
+        // guard-failure recovery chain BEFORE `setup_bridge_sym`.
+        // No additional synchronize call is needed here.
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.

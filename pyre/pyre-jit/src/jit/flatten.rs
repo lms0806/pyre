@@ -3202,6 +3202,85 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
     frame_reg: u16,
     dst_reg: u16,
 ) -> Insn {
+    build_load_global_fn_insn_from_operands(
+        load_global_fn_idx,
+        namei,
+        Operand::Register(Register::new(Kind::Ref, ns_reg)),
+        Operand::Register(Register::new(Kind::Ref, code_reg)),
+        Operand::Register(Register::new(Kind::Ref, frame_reg)),
+        dst_reg,
+    )
+}
+
+/// Variant of [`build_load_global_fn_residual_call_ir_r_insn`] that takes the
+/// pycode as a compile-time `Operand::ConstRef` operand instead of a
+/// `Register`.  Mirrors `pyframe.py:509-510` `getcode(): hint(self.pycode,
+/// promote=True)`: in a non-portal callee jitcode the pycode is the callee's
+/// own `W_Code` pointer, already a compile-time constant.  `ns_reg` and
+/// `frame_reg` remain register operands — `frame.w_globals` is loaded per-call
+/// from the frame (its value derives from `pycode.w_globals` at frame
+/// construction, but the trace walker reads it as a register-form operand so
+/// the optimizer can match it in the known-result cache), and `frame_ptr`
+/// feeds the `get_builtin()` fallback in `bh_load_global_fn`.
+pub fn build_load_global_fn_residual_call_ir_r_insn_with_const_pycode(
+    load_global_fn_idx: u16,
+    namei: i64,
+    ns_reg: u16,
+    pycode_const: i64,
+    frame_reg: u16,
+    dst_reg: u16,
+) -> Insn {
+    build_load_global_fn_insn_from_operands(
+        load_global_fn_idx,
+        namei,
+        Operand::Register(Register::new(Kind::Ref, ns_reg)),
+        Operand::ConstRef(pycode_const),
+        Operand::Register(Register::new(Kind::Ref, frame_reg)),
+        dst_reg,
+    )
+}
+
+/// Variant of [`build_load_global_fn_residual_call_ir_r_insn`] that takes
+/// the namespace, pycode, AND frame as compile-time `Operand::ConstRef`
+/// operands.  Used by non-portal callee emit where:
+///   * `pycode` is the callee's own `W_Code` pointer (compile-time known
+///     per `pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`).
+///   * `namespace` is `pycode.w_globals` (`pyframe.py:49 self.w_globals =
+///     w_globals` initializes `frame.w_globals = pycode.w_globals` at
+///     frame construction, so a `W_Code`-level promotion is valid).
+///   * `frame` is `ConstRef(0)` — `bh_load_global_fn`'s `frame_ptr` feeds
+///     `get_builtin()` fallback on globals miss. **Passing null skips
+///     builtin lookup and is NOT sound for names that live in builtins
+///     (e.g. `print`, `len`)**; `pyopcode.py:957` always falls through
+///     to `self.get_builtin()`. This helper is dormant and must NOT be
+///     wired as-is — the trace walker requires Register operands anyway
+///     (see codewriter.rs `compile_jitcode_for_callee` doc block).
+pub fn build_load_global_fn_residual_call_ir_r_insn_with_all_consts(
+    load_global_fn_idx: u16,
+    namei: i64,
+    ns_const: i64,
+    pycode_const: i64,
+    frame_const: i64,
+    dst_reg: u16,
+) -> Insn {
+    build_load_global_fn_insn_from_operands(
+        load_global_fn_idx,
+        namei,
+        Operand::ConstRef(ns_const),
+        Operand::ConstRef(pycode_const),
+        Operand::ConstRef(frame_const),
+        dst_reg,
+    )
+}
+
+fn build_load_global_fn_insn_from_operands(
+    load_global_fn_idx: u16,
+    namei: i64,
+    ns_operand: Operand,
+    code_operand: Operand,
+    frame_operand: Operand,
+    dst_reg: u16,
+) -> Insn {
     let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
@@ -3215,11 +3294,7 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
             Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(namei)])),
             Operand::ListOfKind(ListOfKind::new(
                 Kind::Ref,
-                vec![
-                    Operand::Register(Register::new(Kind::Ref, ns_reg)),
-                    Operand::Register(Register::new(Kind::Ref, code_reg)),
-                    Operand::Register(Register::new(Kind::Ref, frame_reg)),
-                ],
+                vec![ns_operand, code_operand, frame_operand],
             )),
             descr_operand,
         ],
@@ -4128,6 +4203,34 @@ pub fn build_load_const_fn_residual_call_ir_r_insn(
         load_const_fn_idx,
         idx,
         Operand::Register(Register::new(Kind::Ref, pycode_reg)),
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
+/// Variant of [`build_load_const_fn_residual_call_ir_r_insn`] that takes the
+/// pycode pointer as a compile-time `ConstRef` operand instead of reading it
+/// out of a `getfield_vable_r` register.
+///
+/// Mirrors `pyframe.py:509-510` `getcode(): hint(self.pycode, promote=True)`:
+/// `frame.pycode` is hinted promote-to-constant, so every `LOAD_CONST` trace
+/// already sees the pycode as a JIT-time constant.  In a non-portal callee
+/// jitcode the pycode is compile-time known (= the callee's own `W_CodeObject`
+/// pointer), and the portal `getfield_vable_r(frame, code_field)` upstream
+/// would either reference the caller's portal frame (latently wrong) or an
+/// uninitialized slot (the `is_portal=false` graph dual-write currently
+/// elides the input via `emit_vable_getfield_ref!`).  Emitting
+/// `Operand::ConstRef(callee_w_code_ptr)` here matches the promote-to-constant
+/// semantics directly without routing through the portal vable slot.
+pub fn build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
+    load_const_fn_idx: u16,
+    idx: i64,
+    pycode_const: i64,
+    dst_reg: u16,
+) -> Insn {
+    build_residual_call_ir_r_single_ref_plain_insn_from_operands(
+        load_const_fn_idx,
+        idx,
+        Operand::ConstRef(pycode_const),
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -6619,6 +6722,73 @@ mod tests {
     }
 
     #[test]
+    fn build_load_const_fn_with_const_pycode_uses_const_ref_in_listr() {
+        // `_with_const_pycode` variant: same shape as the register form, but
+        // the single `ListR` element is `ConstRef(pycode_const)` instead of a
+        // `Register`.  pyframe.py:509-510 promote-to-constant semantics —
+        // non-portal callee emit sites can pass the callee's own
+        // `W_CodeObject` pointer directly without a portal vable getfield.
+        let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
+        let insn = build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
+            /* load_const_fn_idx */ 9,
+            /* idx */ 17,
+            /* pycode_const */ pycode_const,
+            /* dst_reg */ 5,
+        );
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 5));
+                assert_eq!(args.len(), 4);
+                match &args[0] {
+                    Operand::ConstInt(v) => assert_eq!(*v, 9),
+                    other => panic!("expected ConstInt(9), got {other:?}"),
+                }
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert_eq!(list.content.len(), 1);
+                        match &list.content[0] {
+                            Operand::ConstInt(v) => assert_eq!(*v, 17),
+                            other => panic!("expected ConstInt(17) in ListI, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 1);
+                        match &list.content[0] {
+                            Operand::ConstRef(v) => assert_eq!(*v, pycode_const),
+                            other => panic!("expected ConstRef in ListR, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListOfKind(Ref, 1), got {other:?}"),
+                }
+                match &args[3] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
+                            assert_eq!(
+                                stub.effect_info,
+                                effect_info_for_call_flavor(CallFlavor::Plain),
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_load_const_fn_residual_call_ir_r_insn_matches_flatten_of_residual_call_op() {
         // Byte-equivalence cross-check: the Insn produced by the
         // production helper must match the Insn produced by feeding
@@ -6722,6 +6892,139 @@ mod tests {
                                 index: 4
                             })
                         ));
+                        assert!(matches!(
+                            &list.content[2],
+                            Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 6
+                            })
+                        ));
+                    }
+                    other => panic!("expected ListOfKind(Ref, 3), got {other:?}"),
+                }
+                match &args[3] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.arg_kinds,
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int]
+                            );
+                            assert_eq!(
+                                stub.effect_info,
+                                effect_info_for_call_flavor(CallFlavor::Plain),
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_load_global_fn_with_all_consts_uses_const_ref_for_all_three() {
+        let ns_const: i64 = 0x0a0a_0a0au64 as i64;
+        let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
+        let frame_const: i64 = 0;
+        let insn = build_load_global_fn_residual_call_ir_r_insn_with_all_consts(
+            /* load_global_fn_idx */ 12,
+            /* namei */ 5,
+            /* ns_const */ ns_const,
+            /* pycode_const */ pycode_const,
+            /* frame_const */ frame_const,
+            /* dst_reg */ 7,
+        );
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 7));
+                assert_eq!(args.len(), 4);
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 3);
+                        match &list.content[0] {
+                            Operand::ConstRef(v) => assert_eq!(*v, ns_const),
+                            other => panic!("expected ConstRef for ns, got {other:?}"),
+                        }
+                        match &list.content[1] {
+                            Operand::ConstRef(v) => assert_eq!(*v, pycode_const),
+                            other => panic!("expected ConstRef for pycode, got {other:?}"),
+                        }
+                        match &list.content[2] {
+                            Operand::ConstRef(v) => assert_eq!(*v, frame_const),
+                            other => panic!("expected ConstRef for frame, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListOfKind(Ref, 3), got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_load_global_fn_with_const_pycode_uses_const_ref_for_code_only() {
+        // `_with_const_pycode` variant: same shape as the register form, but
+        // the middle `ListR` element is `ConstRef(pycode_const)` instead of a
+        // `Register`.  ns_reg and frame_reg remain register operands —
+        // pyframe.py:509-510 promote-to-constant applies to `self.pycode`
+        // only; `self.w_globals` and the optional `get_builtin()` fallback
+        // frame are not promoted.
+        let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
+        let insn = build_load_global_fn_residual_call_ir_r_insn_with_const_pycode(
+            /* load_global_fn_idx */ 12,
+            /* namei */ 5,
+            /* ns_reg */ 3,
+            /* pycode_const */ pycode_const,
+            /* frame_reg */ 6,
+            /* dst_reg */ 7,
+        );
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 7));
+                assert_eq!(args.len(), 4);
+                match &args[0] {
+                    Operand::ConstInt(v) => assert_eq!(*v, 12),
+                    other => panic!("expected ConstInt(12), got {other:?}"),
+                }
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert_eq!(list.content.len(), 1);
+                        match &list.content[0] {
+                            Operand::ConstInt(v) => assert_eq!(*v, 5),
+                            other => panic!("expected ConstInt(5) in ListI, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 3);
+                        assert!(matches!(
+                            &list.content[0],
+                            Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 3
+                            })
+                        ));
+                        match &list.content[1] {
+                            Operand::ConstRef(v) => assert_eq!(*v, pycode_const),
+                            other => panic!("expected ConstRef for pycode, got {other:?}"),
+                        }
                         assert!(matches!(
                             &list.content[2],
                             Operand::Register(Register {

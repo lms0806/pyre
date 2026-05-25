@@ -3655,20 +3655,43 @@ impl<S: JitState> JitDriver<S> {
         // clone) and can thread the same handle into
         // `ResumeDataResult`.
         //
-        // PRE-EXISTING-ADAPTATION (`pyjitpl.py:3424
-        // rebuild_state_after_failure`): `ResumeDataResult.virtualref_values`
-        // and `.virtualizable_values` are decoded into the result struct
-        // but NOT yet restored into the new bridge tracer's
-        // `TraceCtx::virtualref_boxes` / `virtualizable_boxes`, and the
-        // matching `vrefinfo.continue_tracing(vref, virtual)`
-        // (`virtualref.py:122-129`, invoked through
-        // `ResumeDataReader::consume_virtualref_info` →
-        // `resume.rs:6476`) is not fired on the bridge-entry path.
-        // The bridge therefore starts with empty vref/vable state.
-        // Bridge tracing of code that crossed an active `virtual_ref`
-        // scope will mis-trace until the restore path is wired
-        // (multi-session: needs box materialization from
-        // `RebuiltValue::Box(idx, kind)` + pointer recovery).
+        // `pyjitpl.py:3424 rebuild_state_after_failure` parity status:
+        //
+        //   * `ResumeDataResult.virtualref_values` (vref pair stream) is
+        //     restored into `sym.virtualref_boxes` and each pair fires
+        //     `vrefinfo.continue_tracing(vref, virtual)`
+        //     (`virtualref.py:122-129`) inside
+        //     `pyre-jit-trace::state::setup_bridge_sym` — matches the
+        //     `consume_virtualref_info` half of `consume_vref_and_vable`
+        //     (resume.py:1389-1397).
+        //   * `ResumeDataResult.virtualizable_values` (vable scalar +
+        //     array stream) is restored into `sym` via
+        //     `seed_virtualizable_boxes`, populating
+        //     `ctx.virtualizable_boxes` / `virtualizable_values` /
+        //     `virtualizable_array_lengths` from resume-decoded values.
+        //
+        // PRE-EXISTING-ADAPTATION (`pyjitpl.py:3437 self.synchronize_
+        // virtualizable()`): the live PyFrame's vable static fields and
+        // array items are written from the resume data by pyre's
+        // separate guard-failure recovery path
+        // (`pyre-jit/src/eval.rs:5677 sync_virtualizable_after_guard_failure`
+        // selected via `ResumeVableMode::GuardFailureSync`), which fires
+        // BEFORE bridge tracing starts. The trailing
+        // `synchronize_virtualizable()` call inside `rebuild_state_after_
+        // failure` is therefore already satisfied by the time
+        // `setup_bridge_sym` runs.  An additional direct call to
+        // `ctx.synchronize_virtualizable()` cannot be wired today because
+        // `trace_ctx.rs:1417` uses `value_to_raw_bits` while
+        // `sync_virtualizable_after_guard_failure` uses field-aware
+        // `value_to_static_vable_bits` / `value_to_vable_array_item_bits`
+        // (pyre/pyre-jit/src/eval.rs:5626-5667) — the Ref-array-slot
+        // auto-boxing of `Value::Int` / `Value::Float` via
+        // `pyre_object::intobject::w_int_new` cannot move into
+        // majit-metainterp without violating the majit ⊥ pyre crate
+        // boundary. Unifying the two writers (likely via a
+        // VTypeFieldConvert trait threaded into TraceCtx) is a separate
+        // epic; see `pyre-jit-trace::state::setup_bridge_sym` tail for
+        // the in-tree diagnosis.
         let resume_data_result = S::rebuild_from_resumedata(
             &mut trace_meta,
             &retrace.fail_types,

@@ -6657,11 +6657,27 @@ impl CodeWriter {
                             // Portal vable sync at this slot relies on the next
                             // opcode's pushvalue (LoadConst's existing A-slice 2
                             // elision documented at LoadGlobal's caveat).
-                            let pycode_graph_var = emit_vable_getfield_ref!(
-                                portal_frame_reg,
-                                dst_slot,
-                                VABLE_CODE_FIELD_IDX
-                            );
+                            //
+                            // pyframe.py:509-510 `getcode(): hint(self.pycode,
+                            // promote=True)`: the JIT treats `frame.pycode` as
+                            // promote-to-constant on every trace.  In a portal
+                            // entry the promotion happens at the merge point
+                            // via the vable getfield; in a non-portal callee
+                            // the pycode is the callee's own `W_Code` pointer,
+                            // already a compile-time constant.  Skip the
+                            // portal vable getfield in the non-portal branch
+                            // and feed `w_code` as `ConstRef` directly — the
+                            // portal `portal_frame_reg` would otherwise alias
+                            // the caller's frame and read the wrong pycode.
+                            let pycode_graph_var = if is_portal {
+                                emit_vable_getfield_ref!(
+                                    portal_frame_reg,
+                                    dst_slot,
+                                    VABLE_CODE_FIELD_IDX
+                                )
+                            } else {
+                                None
+                            };
                             // Task #48 micro-slice 7: LoadConst factor
                             // refactor.  The prior `emit_residual_call(
                             // load_const_fn_idx, ...)` call is replaced by
@@ -6681,15 +6697,27 @@ impl CodeWriter {
                             // matching the production source at
                             // codewriter.rs:2215, so `load_const_fn_flavor`
                             // is no longer threaded into the SSARepr emit.
-                            push_walker_emit(
-                                &current_block,
-                                super::flatten::build_load_const_fn_residual_call_ir_r_insn(
-                                    load_const_fn_idx,
-                                    idx as i64,
-                                    dst_slot,
-                                    dst_slot,
-                                ),
-                            );
+                            if is_portal {
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_load_const_fn_residual_call_ir_r_insn(
+                                        load_const_fn_idx,
+                                        idx as i64,
+                                        dst_slot,
+                                        dst_slot,
+                                    ),
+                                );
+                            } else {
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
+                                        load_const_fn_idx,
+                                        idx as i64,
+                                        w_code as i64,
+                                        dst_slot,
+                                    ),
+                                );
+                            }
                             // Graph-side `residual_call_ir_r` for
                             // `load_const_fn(pycode:Ref, idx:Int) → Ref`.
                             // RPython `flowcontext.py:135-139` keeps the
@@ -6726,10 +6754,13 @@ impl CodeWriter {
                             } else {
                                 // is_portal=false: pycode_var is None per
                                 // `emit_vable_getfield_ref!` gate above.
-                                // Non-portal CodeWriters' graphs would
-                                // reference a non-existent `pycode_var`
-                                // input — fall back to a fresh placeholder
-                                // matching the prior shape.
+                                // Non-portal graphs lack a `pycode_var`
+                                // inputarg — fall back to a fresh placeholder.
+                                // NOTE: this diverges from the walker path
+                                // (which correctly emits ConstRef pycode via
+                                // `_with_const_pycode`); when `flatten_graph`
+                                // canonical path is implemented, the graph
+                                // side must emit a matching ConstRef op.
                                 let placeholder = fresh_ref_value(&mut graph);
                                 if let super::flow::FlowValue::Variable(v) = &placeholder {
                                     pair_walker_slot(
@@ -10958,6 +10989,96 @@ pub fn register_portal_jitdriver(
 /// which inserts the callee into `CallControl.jitcodes` and queues it on
 /// `unfinished_graphs`; the surrounding `make_jitcodes` drain then fills the
 /// same JitCode object.
+///
+/// # Non-portal callee status (PRE-EXISTING-ADAPTATION, partial fix in flight)
+///
+/// Drained graphs whose `code` is NOT registered as a portal go through the
+/// same `transform_graph_to_jitcode` body. `is_portal=false` already gates
+/// the graph-side dual-writes (vable getfield/setfield → `frame_var` would
+/// be an undefined inputarg), and per-helper walker emit sites are being
+/// migrated to feed compile-time-known operands directly per
+/// `pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`.
+///
+/// Per-helper migration status:
+///   * `bh_load_const_fn(w_code_ptr, consti)` — **migrated**.  Walker emit
+///     in the `Instruction::LoadConst` arm splits on `is_portal`: portal
+///     keeps the `getfield_vable_r(portal_frame_reg, code_field)` +
+///     register-operand call shape; non-portal skips the vable getfield
+///     and emits `build_load_const_fn_residual_call_ir_r_insn_with_const_pycode`
+///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
+///   * `bh_load_global_fn(namespace_ptr, w_code_ptr, frame_ptr, namei)` —
+///     **dormant helpers landed**:
+///     `build_load_global_fn_residual_call_ir_r_insn_with_const_pycode`
+///     (pycode-only ConstRef) and
+///     `build_load_global_fn_residual_call_ir_r_insn_with_all_consts`
+///     (all-three ConstRef: namespace from `W_CodeObject.w_globals`,
+///     pycode = callee `w_code`, frame = `ConstRef(0)` — **unsound**:
+///     null frame skips `get_builtin()` fallback required by
+///     `pyopcode.py:957`; see flatten.rs doc on that helper).
+///     `pyframe.py:49 self.w_globals = w_globals` at frame construction
+///     initializes the namespace from `pycode.w_globals`, so its VALUE
+///     is derivable from the promoted pycode.  However the trace walker
+///     reads `frame.w_globals` as a register-form operand (via
+///     `GetfieldVableR`) so the optimizer can match it in the
+///     known-result cache — a ConstRef would break that fold.  A trial
+///     wire of `_with_all_consts` from the `Instruction::LoadGlobal` arm
+///     was attempted and reverted — **root cause found and CLOSED**.
+///     The "latent for non-portal callees" assumption was WRONG:
+///     non-portal jitcode bytecode IS walked by the trace recorder
+///     (`jitcode_dispatch.rs` walker) during callee inlining.  The
+///     walker's `read_ref_var_list` (jitcode_dispatch.rs:1029) reads
+///     `ctx.registers_r[reg]` for each ref operand — register-form
+///     operands produce TRACED variables (results of `GetfieldVableR`
+///     IR ops) that participate in the optimizer's
+///     `RecordKnownResult`/`QuasiimmutField` fold, while ConstRef
+///     operands produce RAW CONSTANT arguments that the optimizer
+///     cannot match against the known-result cache.  The mismatch
+///     causes the optimizer to emit wrong code (mismatched fold →
+///     wrong result patched into the portal's resume snapshot →
+///     fastlocal corruption on guard failure).
+///     **Why LoadConst ConstRef works**: `load_const_fn(pycode, idx)`
+///     has pycode as its sole ref arg; the ConstRef value IS the same
+///     pointer the walker would read from `getfield_vable_r`, so the
+///     QuasiimmutField key matches.  **Why LoadGlobal ConstRef fails**:
+///     `load_global_fn(ns, code, frame, namei)` has ns as a ref arg
+///     whose traced form (GetfieldVableR result) differs from the raw
+///     constant form in the optimizer's value-identity tracking.
+///     **Resolution**: non-portal callee LoadGlobal MUST keep the
+///     register-form emit (getfield_vable_r + Register operands) so
+///     the trace walker produces proper traced variables.  The ConstRef
+///     optimization requires separating the walker path from the
+///     blackhole path — a structural prerequisite not yet in place.
+///   * `bh_call_fn` / `bh_call_fn_N(frame_ptr, callable, args...)` —
+///     `frame_ptr` non-null asserted at runtime entry; used for
+///     `bh_call_self_recursive_portal`, `set_last_exec_ctx`, and
+///     `call_user_function_plain(parent_frame, ...)`.  Pyre's
+///     `bh_call_fn_*` ABI threads `parent_frame` as the first ref argument
+///     — RPython equivalent has no such argument.  Non-portal callees do
+///     not have a self/caller frame on the graph as a startblock
+///     inputarg, so the migration requires either an entry-arg restructure
+///     or a ConstRef-null + adapter-side guard.  Not yet migrated.
+///   * `bh_normalize_raise_varargs_with_frame(frame_ptr, exc, cause)` —
+///     `frame_ptr` non-null asserted; pins
+///     `(*parent_frame_ptr).execution_context` for the normalization
+///     path.  Same migration shape as `bh_call_fn_*`.  Not yet migrated.
+///
+/// Today the un-migrated emit sites are latent for non-portal callees:
+/// production tracing runs `MIFrame::execute_opcode_step` (the trait
+/// dispatch path), not the codewriter-emitted jitcode bytecode.
+/// Shadow-walker validation (`pyre-jit-trace/src/shadow_walker.rs`,
+/// env-gated `MAJIT_SHADOW_WALKER`) and `inline_call_*` sub-jitcode
+/// recursion (`pyre-jit-trace/src/jitcode_dispatch.rs`) are symbolic —
+/// they record IR ops rather than invoke `bh_*_fn` runtime helpers.
+///
+/// Orthodox convergence target: RPython compiles `LOAD_CONST` etc. into
+/// inline JitCode ops via `pypy/module/pypyjit/interp_jit.py` +
+/// `pypy/interpreter/pyopcode.py` opcode_implementations, not via
+/// `residual_call_*` to a Rust-side helper. The pyre helper-fn pattern is
+/// a translation shortcut; collapsing it onto the inline JitCode-op shape
+/// remains the longer-term endgame. The per-helper ConstRef pycode
+/// migration here is the conservative first step that recovers the
+/// `hint(promote=True)` semantics for the part of the helper ABI that
+/// upstream actually treats as a JIT-time constant.
 pub fn compile_jitcode_for_callee(
     code: &pyre_interpreter::CodeObject,
     w_code: *const (),
