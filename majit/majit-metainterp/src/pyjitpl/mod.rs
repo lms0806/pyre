@@ -6231,6 +6231,20 @@ impl<M: Clone> MetaInterp<M> {
         // from optimizer to MetaInterp for post-compile watcher registration.
         self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
+        // compile.py:302-308: vectorization post-pass.
+        // RPython condition: ((warmstate.vec and jitdriver_sd.vec) or
+        // warmstate.vec_all) and cpu.vector_ext and
+        // cpu.vector_ext.is_enabled().
+        //
+        // The vectorizer's success path is incomplete: GuardStrengthenOpt,
+        // cleanup SchedulerState.schedule(), and info.extra_before_label
+        // are not yet ported (vector.py:257-269). Wiring the incomplete
+        // pass into compile produces vectorized loops that differ from
+        // RPython's output — weaker guards, no cleanup scheduling, missing
+        // alignment prefix — which is a parity regression vs main (which
+        // never wired this). Gate the call until the full pipeline lands.
+        let optimized_ops = optimized_ops;
+
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] finish_and_compile: key={}, ops_before={}, ops_after={}",
