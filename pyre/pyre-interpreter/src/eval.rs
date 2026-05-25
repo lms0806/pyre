@@ -346,6 +346,111 @@ pub fn set_current_exception(exc: PyObjectRef) {
     CURRENT_EXCEPTION.with(|current| current.set(exc));
 }
 
+/// `pyopcode.py:1524-1532 DICT_UPDATE` — update `dict` from a mapping
+/// source via the `keys()` + `__getitem__` protocol.  Falls back to
+/// direct `w_dict_items` for exact-dict sources.
+fn dict_update_from_mapping(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_dict(source) {
+            for (k, v) in pyre_object::w_dict_items(source) {
+                pyre_object::w_dict_store(dict, k, v);
+            }
+            return Ok(());
+        }
+    }
+    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
+    let keys_method = match crate::baseobjspace::getattr(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(PyError::type_error(format!(
+                "'{type_name}' object is not a mapping"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        unsafe { pyre_object::w_dict_store(dict, key, val) };
+    }
+    Ok(())
+}
+
+/// Resolve callable display prefix for `**kwargs` error messages.
+/// Returns e.g. `"foo()"` or just `""` when unresolvable.
+fn callable_prefix(w_callable: PyObjectRef) -> String {
+    if w_callable.is_null() {
+        return String::new();
+    }
+    unsafe {
+        if crate::is_function(w_callable) {
+            let name = crate::function_get_name(w_callable);
+            return format!("{name}() ");
+        }
+        if pyre_object::is_type(w_callable) {
+            let name = pyre_object::w_type_get_name(w_callable);
+            return format!("{name}() ");
+        }
+    }
+    String::new()
+}
+
+/// `pyopcode.py:1979-2026 _dict_merge` — merge `source` into `dict`
+/// for `**kwargs` unpacking.  Validates string keys and duplicates.
+fn dict_merge_from_mapping(
+    dict: PyObjectRef,
+    source: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), PyError> {
+    let prefix = callable_prefix(w_callable);
+    let merge_pair = |k: PyObjectRef, v: PyObjectRef| -> Result<(), PyError> {
+        unsafe {
+            if !pyre_object::is_str(k) {
+                return Err(PyError::type_error(format!(
+                    "{prefix}keywords must be strings"
+                )));
+            }
+            if pyre_object::w_dict_lookup(dict, k).is_some() {
+                let key_str = pyre_object::w_str_get_value(k);
+                return Err(PyError::type_error(format!(
+                    "{prefix}got multiple values for keyword argument '{key_str}'"
+                )));
+            }
+            pyre_object::w_dict_store(dict, k, v);
+        }
+        Ok(())
+    };
+
+    unsafe {
+        if pyre_object::is_dict(source) {
+            for (k, v) in pyre_object::w_dict_items(source) {
+                merge_pair(k, v)?;
+            }
+            return Ok(());
+        }
+    }
+    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
+    let keys_method = match crate::baseobjspace::getattr(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(PyError::type_error(format!(
+                "{prefix}argument after ** must be a mapping, not {type_name}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        merge_pair(key, val)?;
+    }
+    Ok(())
+}
+
 pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
     unsafe {
         if crate::baseobjspace::exception_is_valid_obj_as_class_w(value) {
@@ -2243,7 +2348,10 @@ impl OpcodeStepExecutor for PyFrame {
                 return Ok(());
             }
         }
-        Err(PyError::type_error(format!("name '{name}' is not defined")))
+        Err(PyError::new(
+            crate::PyErrorKind::NameError,
+            format!("name '{name}' is not defined"),
+        ))
     }
 
     // ── GetLen ──
@@ -2274,40 +2382,29 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── DictUpdate ──
-    // PyPy: dict.update(source); CPython: DICT_UPDATE
-    // Merges source dict entries into STACK[-i] dict.
+    // pypy/interpreter/pyopcode.py:1524-1532 DICT_UPDATE — `space.ismapping_w`
+    // gate then `dict.update(source)`. Non-mapping operand surfaces
+    // "'<T>' object is not a mapping" (TypeError).
     fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_dict(source) {
-                // `w_dict_items` already dispatches through
-                // `is_module_dict`, so a `**module_dict` unpack walks
-                // the strategy storage for `W_ModuleDictObject` and
-                // the entries Vec for `W_DictObject`.  PyPy
-                // `pypy/objspace/std/dictmultiobject.py:descr_update`
-                // iterates `self.items()` regardless of strategy.
-                for (k, v) in pyre_object::w_dict_items(source) {
-                    pyre_object::w_dict_store(dict, k, v);
-                }
-            }
-        }
-        Ok(())
+        dict_update_from_mapping(dict, source)
     }
 
     // ── DictMerge ──
-    // PyPy: dict merge for **kwargs; CPython: DICT_MERGE
+    // pypy/interpreter/pyopcode.py:1514-1522 DICT_MERGE → _dict_merge
+    // (pyopcode.py:1979-2026).
     fn dict_merge(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_dict(source) {
-                for (k, v) in pyre_object::w_dict_items(source) {
-                    pyre_object::w_dict_store(dict, k, v);
-                }
-            }
-        }
-        Ok(())
+        // pyopcode.py:1514 — callable = peekvalue(oparg + 2)
+        // Stack after pop: [..., callable, NULL, args_tuple, dict]
+        let w_callable = if self.valuestackdepth > i + 2 {
+            PyFrame::peek_at(self, i + 2)
+        } else {
+            pyre_object::PY_NULL
+        };
+        dict_merge_from_mapping(dict, source, w_callable)
     }
 
     // ── MapAdd ──
@@ -2347,18 +2444,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unary_positive ──
     // PyPy: UNARY_POSITIVE → space.pos(w_value)
     fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        unsafe {
-            if pyre_object::is_bool(val) {
-                // +True → 1, +False → 0 (int, not bool)
-                return Ok(pyre_object::w_int_new(
-                    pyre_object::w_bool_get_value(val) as i64
-                ));
-            }
-            if pyre_object::is_int(val) || pyre_object::is_float(val) {
-                return Ok(val);
-            }
-        }
-        Err(PyError::type_error("bad operand type for unary +"))
+        crate::baseobjspace::pos(val)
     }
 
     // ── list_to_tuple ──
@@ -2934,7 +3020,7 @@ impl OpcodeStepExecutor for PyFrame {
             (callable_unwrapped, None)
         };
         let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-        let resolved = crate::call::resolve_kwargs(target_func, call_args, kwarg_names);
+        let resolved = crate::call::resolve_kwargs(target_func, call_args, kwarg_names)?;
         // Drop the temporary prepended buffer once resolved is built.
         prepended = None;
         let _ = prepended;
@@ -3195,6 +3281,10 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── ListExtend ──
+    // pypy/interpreter/pyopcode.py:1480-1491 LIST_EXTEND — calls
+    // `list.extend(iterable)`; on failure surfaces "Value after * must be
+    // an iterable, not <T>" when the operand isn't iterable, else
+    // re-raises the inner error.
     fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let list = self.peek();
@@ -3217,8 +3307,25 @@ impl OpcodeStepExecutor for PyFrame {
                 }
                 return Ok(());
             }
+            // Generic iter-protocol fallback for dict/set/range/generator/etc.
+            let iter = crate::baseobjspace::iter(iterable).map_err(|_| {
+                let type_name = (*(*iterable).ob_type).name;
+                PyError::type_error(format!(
+                    "Value after * must be an iterable, not {}",
+                    type_name
+                ))
+            })?;
+            loop {
+                match crate::baseobjspace::next(iter) {
+                    Ok(item) => {
+                        pyre_object::w_list_append(list, item);
+                    }
+                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(e) => return Err(e),
+                }
+            }
         }
-        Err(PyError::type_error("object is not iterable"))
+        Ok(())
     }
 
     fn unsupported(

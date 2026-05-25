@@ -39,6 +39,12 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     w_list_append(list, item);
                 }
             }
+        } else {
+            // listobject.py:1019 _extend_from_iterable
+            let items = crate::builtins::collect_iterable(other)?;
+            for item in items {
+                w_list_append(list, item);
+            }
         }
     }
     Ok(w_none())
@@ -53,16 +59,28 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 /// PyPy: listobject.py descr_pop — list.pop([index])
+/// listobject.py:759-772 — empty list raises "pop from empty list",
+/// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "pop() requires self");
     let index = if args.len() > 1 {
         unsafe { w_int_get_value(args[1]) }
     } else {
-        -1 // default: pop last
+        -1
     };
-    unsafe {
-        Ok(pyre_object::listobject::w_list_pop(args[0], index)
-            .unwrap_or_else(|| panic!("pop from empty list")))
+    let length = unsafe { pyre_object::w_list_len(args[0]) } as i64;
+    if length == 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "pop from empty list",
+        ));
+    }
+    match unsafe { pyre_object::listobject::w_list_pop(args[0], index) } {
+        Some(v) => Ok(v),
+        None => Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "pop index out of range",
+        )),
     }
 }
 
@@ -185,28 +203,39 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     assert!(args.len() == 2);
     let sep = unsafe { w_str_get_value(args[0]) };
     let iterable = args[1];
-    let mut parts = Vec::new();
-    unsafe {
+    // pypy/objspace/std/unicodeobject.py:856-872 descr_join — each
+    // element must be a str; otherwise TypeError("sequence item N:
+    // expected str instance, <T> found"). Silently dropping non-str
+    // items lost the error and produced an empty join.
+    let collect_strict = |items: Vec<PyObjectRef>| -> Result<Vec<String>, crate::PyError> {
+        let mut parts = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            if unsafe { !is_str(*item) } {
+                return Err(crate::PyError::type_error(format!(
+                    "sequence item {i}: expected str instance, {} found",
+                    unsafe { (*(*(*item)).ob_type).name }
+                )));
+            }
+            parts.push(unsafe { w_str_get_value(*item) }.to_string());
+        }
+        Ok(parts)
+    };
+    let items: Vec<PyObjectRef> = unsafe {
         if is_list(iterable) {
             let n = w_list_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_list_getitem(iterable, i as i64) {
-                    if is_str(item) {
-                        parts.push(w_str_get_value(item).to_string());
-                    }
-                }
-            }
+            (0..n)
+                .filter_map(|i| w_list_getitem(iterable, i as i64))
+                .collect()
         } else if is_tuple(iterable) {
             let n = w_tuple_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
-                    if is_str(item) {
-                        parts.push(w_str_get_value(item).to_string());
-                    }
-                }
-            }
+            (0..n)
+                .filter_map(|i| w_tuple_getitem(iterable, i as i64))
+                .collect()
+        } else {
+            crate::builtins::collect_iterable(iterable)?
         }
-    }
+    };
+    let parts = collect_strict(items)?;
     Ok(w_str_new(&parts.join(sep)))
 }
 
@@ -506,26 +535,96 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_str_new(&strip_chars(s, chars.as_deref(), false, true)))
 }
 
+/// `unicodeobject.py descr_startswith` — accepts either a single str
+/// prefix or a tuple of str prefixes (CPython parity).
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    let prefix = unsafe { w_str_get_value(args[1]) };
-    Ok(w_bool_from(s.starts_with(prefix)))
+    str_prefix_match(s, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    let suffix = unsafe { w_str_get_value(args[1]) };
-    Ok(w_bool_from(s.ends_with(suffix)))
+    str_prefix_match(s, args[1], "endswith", false).map(w_bool_from)
+}
+
+fn str_prefix_match(
+    s: &str,
+    needle: PyObjectRef,
+    method: &str,
+    start: bool,
+) -> Result<bool, crate::PyError> {
+    let test = |p: &str| {
+        if start {
+            s.starts_with(p)
+        } else {
+            s.ends_with(p)
+        }
+    };
+    if unsafe { pyre_object::is_str(needle) } {
+        let p = unsafe { w_str_get_value(needle) };
+        return Ok(test(p));
+    }
+    if unsafe { pyre_object::is_tuple(needle) } {
+        let n = unsafe { pyre_object::w_tuple_len(needle) };
+        for i in 0..n as i64 {
+            let item =
+                unsafe { pyre_object::w_tuple_getitem(needle, i) }.expect("index is in range");
+            if !unsafe { pyre_object::is_str(item) } {
+                return Err(crate::PyError::type_error(format!(
+                    "tuple for {method} must only contain str, not {}",
+                    unsafe { (*(*item).ob_type).name }
+                )));
+            }
+            let p = unsafe { w_str_get_value(item) };
+            if test(p) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Err(crate::PyError::type_error(format!(
+        "{method} first arg must be str or a tuple of str, not {}",
+        unsafe { (*(*needle).ob_type).name }
+    )))
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 3);
     let s = unsafe { w_str_get_value(args[0]) };
+    // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
+    // both `old` and `new` must be str / W_UnicodeObject; otherwise
+    // TypeError("replace() argument N must be str, not ...").
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "replace() argument 1 must be str, not {}",
+            unsafe { (*(*args[1]).ob_type).name }
+        )));
+    }
+    if !unsafe { pyre_object::is_str(args[2]) } {
+        return Err(crate::PyError::type_error(format!(
+            "replace() argument 2 must be str, not {}",
+            unsafe { (*(*args[2]).ob_type).name }
+        )));
+    }
     let old = unsafe { w_str_get_value(args[1]) };
     let new = unsafe { w_str_get_value(args[2]) };
-    Ok(w_str_new(&s.replace(old, new)))
+    // `unicodeobject.py descr_replace` — optional count argument; a
+    // negative count means "no limit" (matches CPython); 0 leaves the
+    // string untouched.
+    let result = match args.get(3) {
+        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => {
+            let count = unsafe { pyre_object::w_int_get_value(w_count) };
+            if count < 0 {
+                s.replace(old, new)
+            } else {
+                s.replacen(old, new, count as usize)
+            }
+        }
+        _ => s.replace(old, new),
+    };
+    Ok(w_str_new(&result))
 }
 
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -630,20 +729,46 @@ fn str_method_format_core(
                 i += 1;
             }
 
+            // pypy/objspace/std/newformat.py:1066-1071 Template.get_arg:
+            // missing positional → IndexError "Replacement index N out of
+            // range for positional args tuple"; missing keyword →
+            // KeyError(name).
             let val = if field.is_empty() {
                 let idx = auto_idx;
                 auto_idx += 1;
-                positional
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(pyre_object::w_none())
+                match positional.get(idx).copied() {
+                    Some(v) => v,
+                    None => {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::IndexError,
+                            format!(
+                                "Replacement index {idx} out of range for positional args tuple"
+                            ),
+                        ));
+                    }
+                }
             } else if let Ok(idx) = field.parse::<usize>() {
-                positional
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(pyre_object::w_none())
+                match positional.get(idx).copied() {
+                    Some(v) => v,
+                    None => {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::IndexError,
+                            format!(
+                                "Replacement index {idx} out of range for positional args tuple"
+                            ),
+                        ));
+                    }
+                }
             } else {
-                lookup_kwarg(&field)?.unwrap_or(pyre_object::w_none())
+                match lookup_kwarg(&field)? {
+                    Some(v) => v,
+                    None => {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::KeyError,
+                            format!("'{field}'"),
+                        ));
+                    }
+                }
             };
             let formatted = if spec.is_empty() {
                 unsafe { crate::py_str(val) }
@@ -985,24 +1110,36 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             if s.is_ascii() {
                 Ok(pyre_object::w_bytes_from_bytes(s.as_bytes()))
             } else {
-                Err(crate::PyError::value_error(
-                    "'ascii' codec can't encode character: ordinal not in range(128)",
+                let (i, ch) = s.chars().enumerate().find(|(_, c)| !c.is_ascii()).unwrap();
+                Err(crate::PyError::new(
+                    crate::PyErrorKind::UnicodeEncodeError,
+                    format!(
+                        "'ascii' codec can't encode character '\\x{:x}' in position {}",
+                        ch as u32, i
+                    ),
                 ))
             }
         }
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
             let mut out = Vec::with_capacity(s.len());
-            for ch in s.chars() {
+            for (i, ch) in s.chars().enumerate() {
                 if (ch as u32) > 0xFF {
-                    return Err(crate::PyError::value_error(
-                        "'latin-1' codec can't encode character: ordinal not in range(256)",
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::UnicodeEncodeError,
+                        format!(
+                            "'latin-1' codec can't encode character '\\u{:04x}' in position {}",
+                            ch as u32, i
+                        ),
                     ));
                 }
                 out.push(ch as u8);
             }
             Ok(pyre_object::w_bytes_from_bytes(&out))
         }
-        _ => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
+        _ => Err(crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown encoding: {encoding}"),
+        )),
     }
 }
 
@@ -1123,13 +1260,27 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// PyPy: unicodeobject.py descr_index
+/// `unicodeobject.py:1006-1010 _descr_index` — missing substring raises
+/// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
     let sub = unsafe { w_str_get_value(args[1]) };
     match s.find(sub) {
         Some(i) => Ok(w_int_new(i as i64)),
-        None => panic!("ValueError: substring not found"),
+        None => Err(crate::PyError::value_error("substring not found")),
+    }
+}
+
+/// `unicodeobject.py descr_rindex` — like rfind, but raises ValueError
+/// when the substring is absent.
+pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sub = unsafe { w_str_get_value(args[1]) };
+    match s.rfind(sub) {
+        Some(i) => Ok(w_int_new(i as i64)),
+        None => Err(crate::PyError::value_error("substring not found")),
     }
 }
 
@@ -1188,24 +1339,43 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 }
 
 /// PyPy: unicodeobject.py descr_center
+/// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to
+/// `' '` when missing; PyPy raises TypeError when the fill string is
+/// not exactly one character long (unicodeobject.py:1191-1194
+/// _convert_fillchar parity).
+fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<char, crate::PyError> {
+    if args.len() <= 2 {
+        return Ok(' ');
+    }
+    if !unsafe { pyre_object::is_str(args[2]) } {
+        return Err(crate::PyError::type_error(format!(
+            "{method}() argument 2 must be a single character"
+        )));
+    }
+    let raw = unsafe { w_str_get_value(args[2]) };
+    let mut iter = raw.chars();
+    let first = iter.next();
+    if first.is_none() || iter.next().is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "{method}() argument 2 must be a single character"
+        )));
+    }
+    Ok(first.unwrap())
+}
+
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) } as usize;
-    let fillchar = if args.len() > 2 {
-        unsafe { w_str_get_value(args[2]) }
-            .chars()
-            .next()
-            .unwrap_or(' ')
-    } else {
-        ' '
-    };
-    if s.len() >= width {
+    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let fillchar = pad_fillchar(args, "center")?;
+    let s_len = s.chars().count();
+    if s_len >= width {
         return Ok(args[0]);
     }
-    let total_pad = width - s.len();
-    let left = total_pad / 2;
-    let right = total_pad - left;
+    // unicodeobject.py:1098 d = (width - len) ; lpad = d//2 + (d & width & 1)
+    let d = width - s_len;
+    let left = d / 2 + (d & width & 1);
+    let right = d - left;
     let result = format!(
         "{}{}{}",
         fillchar.to_string().repeat(left),
@@ -1219,19 +1389,13 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) } as usize;
-    let fillchar = if args.len() > 2 {
-        unsafe { w_str_get_value(args[2]) }
-            .chars()
-            .next()
-            .unwrap_or(' ')
-    } else {
-        ' '
-    };
-    if s.len() >= width {
+    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let fillchar = pad_fillchar(args, "ljust")?;
+    let s_len = s.chars().count();
+    if s_len >= width {
         return Ok(args[0]);
     }
-    let pad = fillchar.to_string().repeat(width - s.len());
+    let pad = fillchar.to_string().repeat(width - s_len);
     Ok(w_str_new(&format!("{s}{pad}")))
 }
 
@@ -1239,19 +1403,13 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) } as usize;
-    let fillchar = if args.len() > 2 {
-        unsafe { w_str_get_value(args[2]) }
-            .chars()
-            .next()
-            .unwrap_or(' ')
-    } else {
-        ' '
-    };
-    if s.len() >= width {
+    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let fillchar = pad_fillchar(args, "rjust")?;
+    let s_len = s.chars().count();
+    if s_len >= width {
         return Ok(args[0]);
     }
-    let pad = fillchar.to_string().repeat(width - s.len());
+    let pad = fillchar.to_string().repeat(width - s_len);
     Ok(w_str_new(&format!("{pad}{s}")))
 }
 
@@ -1856,7 +2014,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if let Some(d) = default {
         Ok(d)
     } else {
-        Err(crate::PyError::key_error("dict.pop(): key not found"))
+        Err(crate::PyError::key_error_with_key(key))
     }
 }
 
@@ -1931,7 +2089,9 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
         }
     }
-    panic!("ValueError: tuple.index(x): x not in tuple")
+    Err(crate::PyError::value_error(
+        "tuple.index(x): x not in tuple",
+    ))
 }
 
 /// PyPy: tupleobject.py descr_count — tuple.count(value)

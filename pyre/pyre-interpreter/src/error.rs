@@ -508,6 +508,31 @@ impl PyError {
         }
     }
 
+    /// `baseobjspace.py:1284 raise_key_error(w_key)` parity — builds
+    /// `KeyError(w_key)` with the key itself (not a stringified copy)
+    /// as args[0], so callers reading `e.args[0]` get back the missing
+    /// key object.  The display message is the key's repr, matching
+    /// what `KeyError.__str__` yields.
+    pub fn key_error_with_key(key: PyObjectRef) -> Self {
+        let message = if key.is_null() {
+            "<null>".to_string()
+        } else {
+            unsafe { crate::display::py_repr(key) }
+        };
+        let exc = pyre_object::excobject::w_exception_new(ExcKind::KeyError, &message);
+        if !key.is_null() {
+            let args_list = pyre_object::w_list_new(vec![key]);
+            unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        }
+        PyError {
+            kind: PyErrorKind::KeyError,
+            message,
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     pub fn os_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::OSError,

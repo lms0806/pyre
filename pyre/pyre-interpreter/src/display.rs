@@ -91,6 +91,37 @@ fn format_float_repr(val: f64) -> String {
     format!("{val}")
 }
 
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject._descr_repr`
+/// parity — pick the outer quote (prefer single, switch to double iff
+/// the string contains a single but no double), then escape backslash,
+/// the matching quote, common whitespace, and control characters.
+/// Non-control codepoints pass through verbatim.
+fn format_str_repr(s: &str) -> String {
+    let has_single = s.contains('\'');
+    let has_double = s.contains('"');
+    let quote = if has_single && !has_double { '"' } else { '\'' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
 /// Format a PyObjectRef for debug display.
 ///
 /// # Safety
@@ -210,8 +241,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 format!("{{{}}}", parts.join(", "))
             }
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            let str_obj = obj as *const pyre_object::strobject::W_StrObject;
-            format!("'{}'", &*(*str_obj).value)
+            format_str_repr(pyre_object::w_str_get_value(obj))
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
             "None".to_string()
         } else if std::ptr::eq(

@@ -735,19 +735,20 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// Extract an i64 from an int or long object. Panics if the long value
-/// exceeds i64 range (range() cannot iterate over such large spans).
-unsafe fn range_arg_to_i64(obj: PyObjectRef) -> i64 {
-    unsafe {
-        if is_int(obj) {
-            return w_int_get_value(obj);
-        }
-        if is_long(obj) {
-            let val = w_long_get_value(obj);
-            return val.to_i64().unwrap_or(i64::MAX);
-        }
-        return 0; // non-integer argument fallback
+/// functional.py:452 — space.int_w / space.bigint_w
+unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    if is_int(obj) {
+        return Ok(w_int_get_value(obj));
     }
+    if is_long(obj) {
+        let val = w_long_get_value(obj);
+        return Ok(val.to_i64().unwrap_or(i64::MAX));
+    }
+    let type_name = (*(*obj).ob_type).name;
+    Err(crate::PyError::type_error(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name
+    )))
 }
 
 /// `range(stop)` or `range(start, stop)` or `range(start, stop, step)`.
@@ -755,29 +756,45 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> i64 {
 /// Returns a range iterator directly (simplified: no separate range object).
 fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     match args.len() {
+        0 => Err(crate::PyError::type_error(
+            "range expected at least 1 argument, got 0",
+        )),
         1 => {
-            let stop = unsafe { range_arg_to_i64(args[0]) };
+            let stop = unsafe { range_arg_to_i64(args[0]) }?;
             Ok(w_range_iter_new(0, stop, 1))
         }
         2 => {
-            let start = unsafe { range_arg_to_i64(args[0]) };
-            let stop = unsafe { range_arg_to_i64(args[1]) };
+            let start = unsafe { range_arg_to_i64(args[0]) }?;
+            let stop = unsafe { range_arg_to_i64(args[1]) }?;
             Ok(w_range_iter_new(start, stop, 1))
         }
         3 => {
-            let start = unsafe { range_arg_to_i64(args[0]) };
-            let stop = unsafe { range_arg_to_i64(args[1]) };
-            let step = unsafe { range_arg_to_i64(args[2]) };
+            let start = unsafe { range_arg_to_i64(args[0]) }?;
+            let stop = unsafe { range_arg_to_i64(args[1]) }?;
+            let step = unsafe { range_arg_to_i64(args[2]) }?;
+            if step == 0 {
+                return Err(crate::PyError::value_error(
+                    "step argument must not be zero",
+                ));
+            }
             Ok(w_range_iter_new(start, stop, step))
         }
-        _ => panic!("range() takes 1 to 3 arguments"),
+        _ => Err(crate::PyError::type_error(format!(
+            "range expected at most 3 arguments, got {}",
+            args.len()
+        ))),
     }
 }
 
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "len() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "len() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     crate::baseobjspace::len(args[0])
 }
 
@@ -810,7 +827,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__abs__") {
-                return Ok(crate::call_function(method, &[obj]));
+                return crate::call::call_function_impl_result(method, &[obj]);
             }
         }
     }
@@ -2154,15 +2171,17 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             if let Ok(v) = s.trim().parse::<f64>() {
                 return Ok(floatobject::w_float_new(v));
             }
+            // `floatobject.py:descr_new` — message uses single-quoted str:
+            // "could not convert string to float: '<s>'".
             return Err(crate::PyError::value_error(format!(
-                "could not convert string to float: {s:?}"
+                "could not convert string to float: '{s}'"
             )));
         }
     }
-    // Fall back to __float__ dunder — PyPy: descroperation.py float.
-    if let Ok(method) = crate::baseobjspace::getattr(obj, "__float__") {
-        let result = crate::call_function(method, &[obj]);
-        if !result.is_null() {
+    // descroperation.py float — type-MRO __float__ then __index__
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__float__") } {
+            let result = crate::call::call_function_impl_result(method, &[obj])?;
             unsafe {
                 if is_float(result) {
                     return Ok(result);
@@ -2172,14 +2191,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 }
             }
         }
-    }
-    // __index__ dunder — integer-like objects.
-    if let Ok(method) = crate::baseobjspace::getattr(obj, "__index__") {
-        let result = crate::call_function(method, &[obj]);
-        if !result.is_null() {
-            unsafe {
-                if is_int(result) {
-                    return Ok(floatobject::w_float_new(w_int_get_value(result) as f64));
+        if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__index__") } {
+            if let Ok(r) = crate::call::call_function_impl_result(method, &[obj]) {
+                unsafe {
+                    if is_int(r) {
+                        return Ok(floatobject::w_float_new(w_int_get_value(r) as f64));
+                    }
                 }
             }
         }
@@ -3801,11 +3818,26 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
     }
 }
 
-/// `ord(c)` — PyPy: operation.py ord
+/// `ord(c)` — PyPy: operation.py ord (dispatches to space.ord);
+/// `unicodeobject.py:155-160` raises TypeError on multi-char strings.
 fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "ord() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "ord() takes exactly one argument",
+        ));
+    }
+    if !unsafe { is_str(args[0]) } {
+        return Err(crate::PyError::type_error(
+            "ord() expected string of length 1, but other type found",
+        ));
+    }
     let s = unsafe { w_str_get_value(args[0]) };
-    assert!(s.len() == 1, "ord() expected a character");
+    let count = s.chars().count();
+    if count != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "ord() expected a character, but string of length {count} found"
+        )));
+    }
     Ok(w_int_new(s.chars().next().unwrap() as i64))
 }
 
@@ -3813,20 +3845,9 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "chr() takes exactly one argument");
     let obj = args[0];
+    // operation.py:28 — space.int_w unwraps to int
     let val = if unsafe { is_int(obj) } {
         unsafe { w_int_get_value(obj) }
-    } else if unsafe { is_str(obj) } {
-        // pyre treats `b'...'` literals as str; iterating yields 1-char str.
-        // Accept single-char str and use its codepoint as the value.
-        let s = unsafe { w_str_get_value(obj) };
-        match s.chars().next() {
-            Some(c) => c as i64,
-            None => {
-                return Err(crate::PyError::type_error(
-                    "chr() arg must be a non-empty string",
-                ));
-            }
-        }
     } else {
         // int subclass instance — check __int_value__ via builtin_int
         match builtin_int(args) {
@@ -3839,15 +3860,13 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     };
     if val < 0 || val > 0x10ffff {
-        return Err(crate::PyError::type_error(&format!(
-            "chr() arg not in range(0x110000): {val}"
-        )));
+        // `pypy/module/__builtin__/operation.py:31-32 chr` — out-of-range
+        // raises ValueError, message "chr() arg out of range".
+        return Err(crate::PyError::value_error("chr() arg out of range"));
     }
     match char::from_u32(val as u32) {
         Some(c) => Ok(w_str_new(&c.to_string())),
-        None => Err(crate::PyError::type_error(&format!(
-            "chr() arg not in range(0x110000): {val}"
-        ))),
+        None => Err(crate::PyError::value_error("chr() arg out of range")),
     }
 }
 
@@ -4074,9 +4093,20 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }
         }
     }
+    // `functional.py:reversed`: when no `__reversed__` exists, the object
+    // must expose a sequence protocol (`__getitem__` + `__len__`).  set /
+    // frozenset / generator carry `__iter__` but no indexing, so PyPy
+    // rejects them with TypeError("argument to reversed() must be a
+    // sequence").
+    unsafe {
+        if pyre_object::is_set_or_frozenset(obj) {
+            return Err(crate::PyError::type_error(format!(
+                "'{}' object is not reversible",
+                (*(*obj).ob_type).name
+            )));
+        }
+    }
     // Fallback: collect any iterable (range, dict views, etc.) and reverse.
-    // PyPy: operation.py reversed falls back to __reversed__ then __getitem__/
-    // __len__. Our iterator protocol covers sequences via collect_iterable.
     let items = collect_iterable(obj)?;
     let mut rev = items;
     rev.reverse();
@@ -4614,26 +4644,62 @@ fn round_half_even(v: f64) -> f64 {
 }
 
 fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "round() takes at least one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "round() missing required argument: 'number' (pos 1)",
+        ));
+    }
     let obj = args[0];
     let ndigits = args.get(1);
     unsafe {
         if is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
-            return Ok(match ndigits {
+            return match ndigits {
+                // `floatobject.py:966-967 _round_float`: nan/inf round to
+                // themselves when an explicit ndigits is supplied.
                 Some(nd) if is_int(*nd) => {
-                    let n = w_int_get_value(*nd);
-                    let factor = 10f64.powi(n as i32);
-                    floatobject::w_float_new(round_half_even(v * factor) / factor)
+                    if !v.is_finite() {
+                        Ok(floatobject::w_float_new(v))
+                    } else {
+                        let n = w_int_get_value(*nd);
+                        let factor = 10f64.powi(n as i32);
+                        Ok(floatobject::w_float_new(
+                            round_half_even(v * factor) / factor,
+                        ))
+                    }
                 }
-                _ => w_int_new(round_half_even(v) as i64),
-            });
+                // `floatobject.py:954-960 _round_float`: single-argument
+                // round routes through newint_from_float, which raises
+                // ValueError on NaN and OverflowError on ±inf.
+                _ => crate::typedef::float_to_pyint(
+                    round_half_even(v),
+                    crate::typedef::FloatToIntMode::Trunc,
+                ),
+            };
         }
         if is_int(obj) {
             return Ok(obj);
         }
     }
-    panic!("round() not supported for this type");
+    // operation.py:97 — lookup __round__ on user objects
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__round__") } {
+            let result = if let Some(nd) = ndigits {
+                crate::call::call_function_impl_result(method, &[obj, *nd])?
+            } else {
+                crate::call::call_function_impl_result(method, &[obj])?
+            };
+            return Ok(result);
+        }
+    }
+    let type_name = match crate::typedef::r#type(obj) {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp).to_string() },
+        None => unsafe { (*(*obj).ob_type).name.to_string() },
+    };
+    Err(crate::PyError::type_error(format!(
+        "type {} doesn't define __round__ method",
+        type_name
+    )))
 }
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.

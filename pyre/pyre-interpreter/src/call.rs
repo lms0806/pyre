@@ -228,58 +228,98 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 }
 
 /// Fill positional defaults, kw-only defaults, and pack varargs for a
-/// user-function call.  Shared by `call_user_function_with_eval` and
-/// `call_user_function_plain_with_ctx` so both entries apply the same
-/// PyPy `function.py:217` _flat_pycall_defaults + `argument.py:273`
-/// kwdefaults + varargs packing.
+/// user-function call.  Shared by `call_user_function_with_eval`,
+/// `call_user_function_plain_with_ctx` and `call_user_function_with_args`
+/// so all positional-only entries apply the same
+/// `function.py:217` _flat_pycall_defaults + `argument.py:170-338`
+/// _match_signature subset (positional-only — no kwargs path).
+///
+/// Raises TypeError on too-many positional args (no `*args` to absorb
+/// overflow) and on missing required positional / keyword-only args after
+/// defaults application, mirroring `argument.py:289-300` ArgErrTooMany and
+/// `argument.py:335-338` ArgErrMissing.
 fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
     args: &[PyObjectRef],
-) -> Vec<PyObjectRef> {
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let defaults = unsafe { crate::function_get_defaults(callable) };
     let nparams = code_ref.arg_count as usize;
+    let nkwonly = code_ref.kwonlyarg_count as usize;
     let nargs = args.len();
-    let filled_args = if nargs < nparams && !defaults.is_null() {
+    let has_varargs = code_ref.flags.contains(crate::CodeFlags::VARARGS);
+
+    // argument.py:235-236 — too_many_args when no *vararg to absorb.
+    if nargs > nparams && !has_varargs {
+        let fname = unsafe { crate::function_get_name(callable) };
+        let ndefaults = if !defaults.is_null() {
+            let defaults = crate::baseobjspace::unwrap_cell(defaults);
+            if unsafe { pyre_object::is_tuple(defaults) } {
+                unsafe { pyre_object::w_tuple_len(defaults) }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let takes_str = if ndefaults > 0 {
+            format!(
+                "from {} to {} positional arguments",
+                nparams - ndefaults,
+                nparams
+            )
+        } else {
+            format!(
+                "{} positional argument{}",
+                nparams,
+                if nparams != 1 { "s" } else { "" }
+            )
+        };
+        let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
+        return Err(crate::PyError::type_error(format!(
+            "{}() takes {} but {} given",
+            fname, takes_str, given_str
+        )));
+    }
+
+    // Lay out filled_args as `[positional[0..nparams], kwonly[0..nkwonly]]`
+    // so the layout matches `pack_varargs`'s expectation that
+    // `args[total_params..]` is positional overflow destined for `*args`.
+    // Without this split, positional overflow would sit in kwonly slots when
+    // `has_varargs && nargs > nparams && nkwonly > 0`
+    // (`def f(a, *args, b=K): f(1, 2, 3)` would put `2` in `b`'s slot).
+    let total_params = nparams + nkwonly;
+    let mut filled_args: Vec<PyObjectRef> = Vec::with_capacity(total_params);
+    let n_pos_copied = nargs.min(nparams);
+    filled_args.extend_from_slice(&args[..n_pos_copied]);
+    for _ in n_pos_copied..total_params {
+        filled_args.push(pyre_object::PY_NULL);
+    }
+
+    // Fill positional defaults for slots [n_pos_copied..nparams).
+    if n_pos_copied < nparams && !defaults.is_null() {
         let defaults = crate::baseobjspace::unwrap_cell(defaults);
-        let mut full = Vec::with_capacity(nparams);
-        full.extend_from_slice(args);
-        // Defaults cover the LAST (nparams - first_default) parameters.
-        // number of defaults = tuple length
         let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
             unsafe { pyre_object::w_tuple_len(defaults) }
         } else {
             0
         };
         let first_default = nparams - ndefaults;
-        for i in nargs..nparams {
+        for i in n_pos_copied..nparams {
             if i >= first_default {
                 let default_idx = i - first_default;
                 if let Some(val) =
                     unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
                 {
-                    full.push(val);
-                } else {
-                    full.push(pyre_object::PY_NULL);
+                    filled_args[i] = val;
                 }
-            } else {
-                full.push(pyre_object::PY_NULL);
             }
         }
-        full
-    } else {
-        args.to_vec()
-    };
+    }
 
-    // Fill keyword-only defaults from kwdefaults dict
-    let nkwonly = code_ref.kwonlyarg_count as usize;
-    let mut filled_args = filled_args;
+    // Fill keyword-only defaults from kwdefaults dict.
     if nkwonly > 0 {
         let kwdefaults = unsafe { crate::function_get_kwdefaults(callable) };
-        // Ensure filled_args covers all positional + kwonly slots
-        while filled_args.len() < nparams + nkwonly {
-            filled_args.push(pyre_object::PY_NULL);
-        }
         if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
             for ki in 0..nkwonly {
                 let slot = nparams + ki;
@@ -294,7 +334,78 @@ fn fill_user_function_args(
         }
     }
 
-    pack_varargs(code_ref, filled_args)
+    // argument.py:302-338 — missing-required after defaults fill.
+    let mut missing_positional: Vec<&str> = Vec::new();
+    for i in 0..nparams {
+        if filled_args[i].is_null() {
+            missing_positional.push(code_ref.varnames[i].as_str());
+        }
+    }
+    if !missing_positional.is_empty() {
+        let fname = unsafe { crate::function_get_name(callable) };
+        return Err(crate::PyError::type_error(format_missing_err(
+            fname,
+            &missing_positional,
+            true,
+        )));
+    }
+
+    let mut missing_kwonly: Vec<&str> = Vec::new();
+    for ki in 0..nkwonly {
+        let slot = nparams + ki;
+        if filled_args[slot].is_null() {
+            missing_kwonly.push(code_ref.varnames[slot].as_str());
+        }
+    }
+    if !missing_kwonly.is_empty() {
+        let fname = unsafe { crate::function_get_name(callable) };
+        return Err(crate::PyError::type_error(format_missing_err(
+            fname,
+            &missing_kwonly,
+            false,
+        )));
+    }
+
+    // Append positional overflow AFTER kwonly slots so `pack_varargs` sees
+    // `args[total_params..]` as the `*args` source.
+    if has_varargs && nargs > nparams {
+        filled_args.extend_from_slice(&args[nparams..]);
+    }
+
+    Ok(pack_varargs(code_ref, filled_args))
+}
+
+/// `argument.py:534-552` ArgErrMissing.getmsg parity.
+fn format_missing_err(fname: &str, missing: &[&str], positional: bool) -> String {
+    let mut arguments_str = String::new();
+    for (i, arg) in missing.iter().enumerate() {
+        if i == 0 {
+            // no separator
+        } else if i == missing.len() - 1 {
+            if missing.len() == 2 {
+                arguments_str.push_str(" and ");
+            } else {
+                arguments_str.push_str(", and ");
+            }
+        } else {
+            arguments_str.push_str(", ");
+        }
+        arguments_str.push('\'');
+        arguments_str.push_str(arg);
+        arguments_str.push('\'');
+    }
+    format!(
+        "{}() missing {} required {} argument{}: {}",
+        fname,
+        missing.len(),
+        if positional {
+            "positional"
+        } else {
+            "keyword-only"
+        },
+        if missing.len() != 1 { "s" } else { "" },
+        arguments_str
+    )
 }
 
 fn call_user_function_with_eval(
@@ -310,7 +421,7 @@ fn call_user_function_with_eval(
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = fill_user_function_args(callable, code_ref, args);
+    let final_args = fill_user_function_args(callable, code_ref, args)?;
 
     // Generator function: create generator object instead of executing.
     // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
@@ -513,7 +624,7 @@ pub fn call_user_function_plain_with_ctx(
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = fill_user_function_args(callable, code_ref, args);
+    let final_args = fill_user_function_args(callable, code_ref, args)?;
 
     if code_ref
         .flags
@@ -606,17 +717,17 @@ pub(crate) fn resolve_kwargs(
     callable: PyObjectRef,
     args: &[PyObjectRef],
     kwarg_names: PyObjectRef,
-) -> Vec<PyObjectRef> {
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
     if kwarg_names.is_null() {
-        return args.to_vec();
+        return Ok(args.to_vec());
     }
     let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
         unsafe { pyre_object::w_tuple_len(kwarg_names) }
     } else {
-        return args.to_vec();
+        return Ok(args.to_vec());
     };
     if nkw == 0 {
-        return args.to_vec();
+        return Ok(args.to_vec());
     }
 
     // Resolve the target function's code object.
@@ -652,17 +763,17 @@ pub(crate) fn resolve_kwargs(
                     if unsafe { crate::is_function(new_fn) } {
                         (new_fn, 1usize)
                     } else {
-                        return args.to_vec();
+                        return Ok(args.to_vec());
                     }
                 } else {
-                    return args.to_vec();
+                    return Ok(args.to_vec());
                 }
             }
         } else {
-            return args.to_vec();
+            return Ok(args.to_vec());
         }
     } else {
-        return args.to_vec();
+        return Ok(args.to_vec());
     };
 
     let code_ptr = unsafe { crate::get_pycode(target_func) };
@@ -671,43 +782,135 @@ pub(crate) fn resolve_kwargs(
     let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
     // Effective params = params visible to the caller (excludes implicit cls for types)
     let nparams = total_params - skip_cls;
+    let n_pos_params = code.arg_count as usize - skip_cls;
     let n_pos = args.len() - nkw; // number of positional args
+    let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
+    let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
+    let posonlyarg_count = code.posonlyarg_count as usize;
+    let fname = unsafe { crate::function_get_name(target_func) };
+
+    // `argument.py:235-236` — too-many positional args with no *vararg.
+    // The kwargs path counts only positional args (`n_pos`); kwargs are
+    // matched separately via _match_keywords.
+    if n_pos > n_pos_params && !has_varargs {
+        let ndefaults = {
+            let defaults = unsafe { crate::function_get_defaults(target_func) };
+            if !defaults.is_null() {
+                let defaults = crate::baseobjspace::unwrap_cell(defaults);
+                if unsafe { pyre_object::is_tuple(defaults) } {
+                    unsafe { pyre_object::w_tuple_len(defaults) }
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        let takes_str = if ndefaults > 0 {
+            format!(
+                "from {} to {} positional arguments",
+                n_pos_params - ndefaults,
+                n_pos_params
+            )
+        } else {
+            format!(
+                "{} positional argument{}",
+                n_pos_params,
+                if n_pos_params != 1 { "s" } else { "" }
+            )
+        };
+        let given_str = format!("{} {}", n_pos, if n_pos != 1 { "were" } else { "was" });
+        return Err(crate::PyError::type_error(format!(
+            "{}() takes {} but {} given",
+            fname, takes_str, given_str
+        )));
+    }
 
     // Start with PY_NULL for all effective params
     let mut result = vec![pyre_object::PY_NULL; nparams];
 
-    // Fill positional args (PyPy: _match_signature step 1)
-    for i in 0..n_pos.min(nparams) {
+    // Fill positional args (PyPy: _match_signature step 1 — argument.py:211-220).
+    // Bound at `n_pos_params` so excess positionals never spill into kwonly
+    // slots; overflow is packed into *args below if `has_varargs`, otherwise
+    // already rejected by the too-many check above.
+    for i in 0..n_pos.min(n_pos_params) {
         result[i] = args[i];
     }
 
     // Match keywords to parameter names (PyPy: _match_keywords)
     // varnames[skip_cls..total_params] are the effective param names
-    let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
-    let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
     let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
+    let mut unmatched_kw_names: Vec<String> = Vec::new();
     for ki in 0..nkw {
         let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
         let Some(kw_name_obj) = kw_name else { continue };
         let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
         let kw_value = args[n_pos + ki];
 
+        // argument.py:630 — keywords must be strings
+        if !unsafe { pyre_object::is_str(kw_name_obj) } {
+            return Err(crate::PyError::type_error(format!(
+                "{}() keywords must be strings",
+                fname
+            )));
+        }
         let mut matched = false;
         for pi in 0..nparams {
             if &*code.varnames[skip_cls + pi] == kw_str {
+                // argument.py:425 — positional-only parameter
+                if skip_cls + pi < posonlyarg_count {
+                    return Err(crate::PyError::type_error(format!(
+                        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                        fname, kw_str
+                    )));
+                }
+                // argument.py:410 — duplicate keyword argument
+                if !result[pi].is_null() {
+                    return Err(crate::PyError::type_error(format!(
+                        "{}() got multiple values for argument '{}'",
+                        fname, kw_str
+                    )));
+                }
                 result[pi] = kw_value;
                 matched = true;
                 break;
             }
         }
-        if !matched && has_varkw {
-            extra_kwargs.push((kw_name_obj, kw_value));
+        if !matched {
+            if has_varkw {
+                extra_kwargs.push((kw_name_obj, kw_value));
+            } else {
+                unmatched_kw_names.push(kw_str.to_string());
+            }
         }
+    }
+
+    // `argument.py:270-271` ArgErrUnknownKwds — unmatched kwargs and no
+    // **kwarg to absorb them.
+    if !unmatched_kw_names.is_empty() {
+        let msg = if unmatched_kw_names.len() == 1 {
+            format!(
+                "{}() got an unexpected keyword argument '{}'",
+                fname, unmatched_kw_names[0]
+            )
+        } else {
+            let joined = unmatched_kw_names
+                .iter()
+                .map(|s| format!("'{}'", s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}() got {} unexpected keyword arguments: {}",
+                fname,
+                unmatched_kw_names.len(),
+                joined
+            )
+        };
+        return Err(crate::PyError::type_error(msg));
     }
 
     // Fill positional defaults (PyPy: _match_signature defs_w)
     // Defaults cover the LAST N of the positional params (arg_count).
-    let n_pos_params = code.arg_count as usize - skip_cls;
     let defaults = unsafe { crate::function_get_defaults(target_func) };
     if !defaults.is_null() {
         let defaults = crate::baseobjspace::unwrap_cell(defaults);
@@ -742,11 +945,42 @@ pub(crate) fn resolve_kwargs(
         }
     }
 
+    // `argument.py:302-338` — missing-required positional / kwonly after
+    // defaults application.  Errors here mirror ArgErrMissing.
+    let mut missing_positional: Vec<&str> = Vec::new();
+    for pi in 0..n_pos_params {
+        if result[pi].is_null() {
+            missing_positional.push(code.varnames[skip_cls + pi].as_str());
+        }
+    }
+    if !missing_positional.is_empty() {
+        return Err(crate::PyError::type_error(format_missing_err(
+            fname,
+            &missing_positional,
+            true,
+        )));
+    }
+    let nkwonly = code.kwonlyarg_count as usize;
+    let mut missing_kwonly: Vec<&str> = Vec::new();
+    for ki in 0..nkwonly {
+        let pi = n_pos_params + ki;
+        if result[pi].is_null() {
+            missing_kwonly.push(code.varnames[skip_cls + pi].as_str());
+        }
+    }
+    if !missing_kwonly.is_empty() {
+        return Err(crate::PyError::type_error(format_missing_err(
+            fname,
+            &missing_kwonly,
+            false,
+        )));
+    }
+
     // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
     // This produces the final scope_w that maps directly to frame locals.
     if has_varargs {
-        let extra_pos: Vec<PyObjectRef> = if n_pos > nparams {
-            args[nparams..n_pos].to_vec()
+        let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
+            args[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
@@ -766,7 +1000,7 @@ pub(crate) fn resolve_kwargs(
         result.push(kw_dict);
     }
 
-    result
+    Ok(result)
 }
 
 /// Call a user function with positional args + keyword args from a dict.
@@ -869,16 +1103,60 @@ pub fn call_with_kwargs(
                     as *const crate::CodeObject)
             };
             let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
+            let n_pos_params = code.arg_count as usize;
             let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
+            let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
+            let fname = unsafe { crate::function_get_name(callable) };
+
+            // `argument.py:235-236` — too-many positional args with no *vararg.
+            if pos_args.len() > n_pos_params && !has_varargs {
+                let ndefaults = {
+                    let defaults = unsafe { crate::function_get_defaults(callable) };
+                    if !defaults.is_null() {
+                        let defaults = crate::baseobjspace::unwrap_cell(defaults);
+                        if unsafe { pyre_object::is_tuple(defaults) } {
+                            unsafe { pyre_object::w_tuple_len(defaults) }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                };
+                let takes_str = if ndefaults > 0 {
+                    format!(
+                        "from {} to {} positional arguments",
+                        n_pos_params - ndefaults,
+                        n_pos_params
+                    )
+                } else {
+                    format!(
+                        "{} positional argument{}",
+                        n_pos_params,
+                        if n_pos_params != 1 { "s" } else { "" }
+                    )
+                };
+                let given_str = format!(
+                    "{} {}",
+                    pos_args.len(),
+                    if pos_args.len() != 1 { "were" } else { "was" }
+                );
+                return Err(crate::PyError::type_error(format!(
+                    "{}() takes {} but {} given",
+                    fname, takes_str, given_str
+                )));
+            }
 
             // Build parameter array
             let mut result = vec![pyre_object::PY_NULL; total_params];
-            // Fill positional args
-            for i in 0..pos_args.len().min(total_params) {
+            // Fill positional args — bound at `n_pos_params` so excess
+            // positionals don't spill into kwonly slots.
+            for i in 0..pos_args.len().min(n_pos_params) {
                 result[i] = pos_args[i];
             }
             // Match keywords to parameter names
             let mut extra_kwargs: Vec<(String, PyObjectRef)> = Vec::new();
+            let mut unmatched_kw_names: Vec<String> = Vec::new();
             for (key, value) in kwargs {
                 let mut matched = false;
                 for pi in 0..total_params {
@@ -889,12 +1167,38 @@ pub fn call_with_kwargs(
                     }
                 }
                 if !matched {
-                    extra_kwargs.push((key.clone(), *value));
+                    if has_varkw {
+                        extra_kwargs.push((key.clone(), *value));
+                    } else {
+                        unmatched_kw_names.push(key.clone());
+                    }
                 }
             }
 
+            // `argument.py:270-271` ArgErrUnknownKwds.
+            if !unmatched_kw_names.is_empty() {
+                let msg = if unmatched_kw_names.len() == 1 {
+                    format!(
+                        "{}() got an unexpected keyword argument '{}'",
+                        fname, unmatched_kw_names[0]
+                    )
+                } else {
+                    let joined = unmatched_kw_names
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{}() got {} unexpected keyword arguments: {}",
+                        fname,
+                        unmatched_kw_names.len(),
+                        joined
+                    )
+                };
+                return Err(crate::PyError::type_error(msg));
+            }
+
             // Fill positional defaults from __defaults__ tuple.
-            let n_pos_params = code.arg_count as usize;
             let defaults = unsafe { crate::function_get_defaults(callable) };
             if !defaults.is_null() {
                 let defaults = crate::baseobjspace::unwrap_cell(defaults);
@@ -934,12 +1238,40 @@ pub fn call_with_kwargs(
                 }
             }
 
+            // `argument.py:302-338` — missing-required after defaults fill.
+            let mut missing_positional: Vec<&str> = Vec::new();
+            for pi in 0..n_pos_params {
+                if result[pi].is_null() {
+                    missing_positional.push(code.varnames[pi].as_str());
+                }
+            }
+            if !missing_positional.is_empty() {
+                return Err(crate::PyError::type_error(format_missing_err(
+                    fname,
+                    &missing_positional,
+                    true,
+                )));
+            }
+            let mut missing_kwonly: Vec<&str> = Vec::new();
+            for ki in 0..nkwonly {
+                let slot = n_pos_params + ki;
+                if result[slot].is_null() {
+                    missing_kwonly.push(code.varnames[slot].as_str());
+                }
+            }
+            if !missing_kwonly.is_empty() {
+                return Err(crate::PyError::type_error(format_missing_err(
+                    fname,
+                    &missing_kwonly,
+                    false,
+                )));
+            }
+
             // Pack *args and **kwargs
-            let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
             let mut final_args = result;
             if has_varargs {
-                let extra_pos: Vec<PyObjectRef> = if pos_args.len() > total_params {
-                    pos_args[total_params..].to_vec()
+                let extra_pos: Vec<PyObjectRef> = if pos_args.len() > n_pos_params {
+                    pos_args[n_pos_params..].to_vec()
                 } else {
                     vec![]
                 };
@@ -1140,6 +1472,13 @@ pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
+    // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
+    // boundary checks the native stack synchronously, so deep recursion
+    // raises RecursionError instead of letting the OS abort on a
+    // guard-page hit. Also drain any JIT-prologue pending overflow.
+    crate::stack_check::drain_jit_pending_exception()?;
+    crate::stack_check::stack_check()?;
+
     unsafe {
         if pyre_object::is_method(callable) {
             let func = pyre_object::w_method_get_func(callable);
@@ -1304,7 +1643,6 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let w_code = unsafe { crate::getcode(func) };
     let globals = unsafe { function_get_globals(func) };
     let closure = unsafe { function_get_closure(func) };
-    let defaults = unsafe { crate::function_get_defaults(func) };
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
@@ -1315,58 +1653,14 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         exec_ctx
     };
 
-    // Fill defaults for missing args
     let code_ref = unsafe { &*func_code };
-    let nparams = code_ref.arg_count as usize;
-    let nargs = args.len();
-    let filled_args = if nargs < nparams && !defaults.is_null() {
-        let defaults = crate::baseobjspace::unwrap_cell(defaults);
-        let mut full = Vec::with_capacity(nparams);
-        full.extend_from_slice(args);
-        let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
-            unsafe { pyre_object::w_tuple_len(defaults) }
-        } else {
-            0
-        };
-        let first_default = nparams - ndefaults;
-        for i in nargs..nparams {
-            if i >= first_default {
-                let di = i - first_default;
-                full.push(
-                    unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }.unwrap_or(PY_NULL),
-                );
-            } else {
-                full.push(PY_NULL);
-            }
+    let final_args = match fill_user_function_args(func, code_ref, args) {
+        Ok(v) => v,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
         }
-        full
-    } else {
-        args.to_vec()
     };
-
-    // Fill keyword-only defaults (same logic as call_user_function_with_eval)
-    let nkwonly = code_ref.kwonlyarg_count as usize;
-    let mut filled_args = filled_args;
-    if nkwonly > 0 {
-        let kwdefaults = unsafe { crate::function_get_kwdefaults(func) };
-        while filled_args.len() < nparams + nkwonly {
-            filled_args.push(PY_NULL);
-        }
-        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
-            for ki in 0..nkwonly {
-                let slot = nparams + ki;
-                if filled_args[slot].is_null() {
-                    let param_name = &code_ref.varnames[slot];
-                    let key = pyre_object::w_str_new(param_name);
-                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
-                        filled_args[slot] = val;
-                    }
-                }
-            }
-        }
-    }
-
-    let final_args = pack_varargs(code_ref, filled_args);
 
     // Generator function: wrap frame in generator object
     if code_ref

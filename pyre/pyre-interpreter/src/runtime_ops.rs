@@ -810,9 +810,14 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // Fast path for known sequence types
     if let Ok(len) = sequence_len(seq) {
         if len != count {
-            return Err(PyError::type_error(format!(
-                "not enough values to unpack (expected {count}, got {len})"
-            )));
+            // `baseobjspace.py:1041-1053 _unpackiterable_known_length_jitlook`
+            // raises ValueError on length mismatch.
+            let msg = if len > count {
+                format!("too many values to unpack (expected {count})")
+            } else {
+                format!("not enough values to unpack (expected {count}, got {len})")
+            };
+            return Err(PyError::value_error(msg));
         }
         return (0..count).map(|idx| sequence_getitem(seq, idx)).collect();
     }
@@ -824,7 +829,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         match crate::baseobjspace::next(iter) {
             Ok(val) => items.push(val),
             Err(e) if e.kind == PyErrorKind::StopIteration => {
-                return Err(PyError::type_error(format!(
+                return Err(PyError::value_error(format!(
                     "not enough values to unpack (expected {count}, got {})",
                     items.len()
                 )));

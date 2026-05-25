@@ -594,7 +594,7 @@ pub fn is_true(obj: PyObjectRef) -> bool {
             return w_int_get_value(obj) != 0;
         }
         if is_long(obj) {
-            return !bigint_eq(w_long_get_value(obj).clone(), BigInt::from(0));
+            return w_long_get_value(obj).clone() != BigInt::from(0);
         }
         if is_float(obj) {
             return w_float_get_value(obj) != 0.0;
@@ -777,18 +777,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_dict(obj) {
             match w_dict_lookup(obj, index) {
                 Some(val) => Ok(val),
-                None => {
-                    let key_repr = if is_str(index) {
-                        format!("'{}'", w_str_get_value(index))
-                    } else if is_int(index) {
-                        format!("{}", w_int_get_value(index))
-                    } else if !index.is_null() {
-                        crate::py_repr(index)
-                    } else {
-                        "<null>".to_string()
-                    };
-                    Err(PyError::new(PyErrorKind::KeyError, key_repr))
-                }
+                None => Err(PyError::key_error_with_key(index)),
             }
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
@@ -1914,6 +1903,75 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    object_getattr_miss(obj, name)
+}
+
+/// `object.__getattribute__` terminal — the default descriptor protocol
+/// without the user `__getattribute__` override check.
+pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
+    let obj = unwrap_cell(obj);
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            let w_descr = lookup_in_type_where(w_type, name);
+            if let Some(descr) = w_descr {
+                if is_data_descr(descr) {
+                    if let Some(result) = get(descr, obj, w_type)? {
+                        return Ok(result);
+                    }
+                }
+            }
+            let w_dict = getdict(obj);
+            if !w_dict.is_null() {
+                if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
+                    return Ok(value);
+                }
+            }
+            let found = ATTR_TABLE.with(|table| {
+                let table = table.borrow();
+                table
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get(name).copied())
+            });
+            if let Some(value) = found {
+                return Ok(value);
+            }
+            if let Some(descr) = w_descr {
+                if let Some(result) = get(descr, obj, w_type)? {
+                    return Ok(result);
+                }
+                if crate::is_function(descr)
+                    && !crate::is_builtin_code(
+                        crate::function_get_code(descr) as pyre_object::PyObjectRef
+                    )
+                {
+                    return Ok(pyre_object::w_method_new(descr, obj, w_type));
+                }
+                return Ok(descr);
+            }
+            if name == "__class__" {
+                return Ok(w_type);
+            }
+            if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
+                let name_obj = w_str_new(name);
+                let result = crate::call_function(getattr_fn, &[obj, name_obj]);
+                if !result.is_null() {
+                    return Ok(result);
+                }
+            }
+            return Err(PyError::new(
+                PyErrorKind::AttributeError,
+                format!(
+                    "'{}' object has no attribute '{name}'",
+                    w_type_get_name(w_type),
+                ),
+            ));
+        }
+    }
+    getattr(obj, name)
+}
+
+fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
     // Type objects: look up in type's own dict → base dicts
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
@@ -3466,14 +3524,40 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 }
 
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    // PyPy `baseobjspace.py:1164-1175 setattr` never auto-unwraps
-    // cells; cell descriptors (`cell_contents`, etc.) reach the cell
-    // typedef directly.  Matches the analogous comment on `getattr`
-    // above.
     let value = unwrap_cell(value);
-    // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation.
-    // Mirrors the `__setattr__` entry that `register_proxy_typedef_dict`
-    // installs on the proxy types: force the receiver, then delegate.
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    // `descroperation.py:143-155 space.setattr` — when the user type
+    // directly defines `__setattr__` (not just inherits Object's), call
+    // the override so user-visible attribute interception works.
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if !w_type.is_null() && is_type(w_type) {
+                let ns_ptr = w_type_get_dict_ptr(w_type) as *const crate::DictStorage;
+                if !ns_ptr.is_null() {
+                    if let Some(&sa) = (*ns_ptr).get("__setattr__") {
+                        if !sa.is_null() {
+                            let w_name = w_str_new(name);
+                            return crate::call::call_function_impl_result(
+                                sa,
+                                &[obj, w_name, value],
+                            )
+                            .map(|_| w_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    object_setattr(obj, name, value)
+}
+
+/// `objectobject.py descr__setattr__` — the terminal implementation
+/// that bypasses user `__setattr__` overrides and writes directly
+/// through the descriptor / instance-dict path.  Called by
+/// `object.__setattr__` and as the default path in `setattr`.
+pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     // Module objects: PyPy `module.py:Module` does not override
     // `descr__setattr__`, so the call falls through to W_Root's
@@ -3813,12 +3897,31 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 ///
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
-    // PyPy `baseobjspace.py:1176-1188 delattr` never auto-unwraps
-    // cells.  Matches the analogous comment on `getattr` / `setattr`
-    // above.
-    // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation
-    // (matches the `__delattr__` entry installed by
-    // `register_proxy_typedef_dict`).
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    // `descroperation.py space.delattr` — dispatch user `__delattr__`
+    // if the class's own dict overrides it.
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if !w_type.is_null() && is_type(w_type) {
+                let ns_ptr = w_type_get_dict_ptr(w_type) as *const crate::DictStorage;
+                if !ns_ptr.is_null() {
+                    if let Some(&da) = (*ns_ptr).get("__delattr__") {
+                        if !da.is_null() {
+                            let w_name = w_str_new(name);
+                            return crate::call::call_function_impl_result(da, &[obj, w_name])
+                                .map(|_| w_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    object_delattr(obj, name)
+}
+
+/// Terminal `object.__delattr__` — bypasses user override.
+pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     // Module objects: PyPy `module.py:Module` does not override
     // `descr__delattr__`, so the call falls through to W_Root's
@@ -4133,10 +4236,18 @@ pub fn call_args_and_c_profile_args(
 }
 
 /// PyPy: baseobjspace.py `call_method`.
+///
+/// Returns `PY_NULL` and stashes the error in `PENDING_CALL_ERROR` when
+/// either the attribute lookup or the call itself raises — same bare-
+/// PyObjectRef contract as `call_function_impl_raw`.
 pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
-    let method =
-        getattr(obj, methname).unwrap_or_else(|e| panic!("call_method({methname}) failed: {e}"));
-    call_function(method, args)
+    match getattr(obj, methname) {
+        Ok(method) => call_function(method, args),
+        Err(e) => {
+            crate::call::set_call_error(e);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// PyPy: baseobjspace.py `call_function`.
@@ -5252,7 +5363,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         (*(*obj).ob_type).name
                     )));
                 }
-                return Ok(crate::call_function(method, &[obj]));
+                return crate::call::call_function_impl_result(method, &[obj]);
             }
             // descroperation.py:333-334 — `__getitem__` fallback only when
             // `space.type(w_obj).flag_map_or_seq != 'M'`.  Mapping types
@@ -5582,7 +5693,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__next__") {
-                return Ok(crate::call_function(method, &[obj]));
+                return crate::call::call_function_impl_result(method, &[obj]);
             }
         }
     }
@@ -6353,8 +6464,18 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
     }
     unsafe {
         use pyre_object::*;
-        if is_int_like(a) && is_int_like(b) {
-            return w_int_get_value(a) == w_int_get_value(b);
+        if (is_int(a) || is_bool(a)) && (is_int(b) || is_bool(b)) {
+            let av = if is_bool(a) {
+                w_bool_get_value(a) as i64
+            } else {
+                w_int_get_value(a)
+            };
+            let bv = if is_bool(b) {
+                w_bool_get_value(b) as i64
+            } else {
+                w_int_get_value(b)
+            };
+            return av == bv;
         }
         if is_str(a) && is_str(b) {
             return w_str_get_value(a) == w_str_get_value(b);
@@ -6447,7 +6568,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         if dictmultiobject::w_dict_delitem(obj, key) {
             Ok(())
         } else {
-            Err(PyError::key_error("KeyError"))
+            Err(PyError::key_error_with_key(key))
         }
     }
 }

@@ -1504,6 +1504,11 @@ fn init_str_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "rindex",
+        make_builtin_function("rindex", crate::type_methods::str_method_rindex),
+    );
+    dict_storage_store(
+        ns,
         "upper",
         make_builtin_function_with_arity("upper", crate::type_methods::str_method_upper, 1),
     );
@@ -5467,23 +5472,98 @@ fn init_float_type(ns: &mut DictStorage) {
             1,
         ),
     );
-    // floatobject.py:713: __int__ = interp2app(W_FloatObject.descr_trunc)
-    for method in ["__trunc__", "__int__"] {
+    // floatobject.py:713/715/449-455 — __int__/__trunc__ go through
+    // descr_trunc (truncate-toward-zero), __floor__ / __ceil__ run
+    // math.floor/ceil first, then newint_from_float.
+    fn float_trunc_method(
+        args: &[*mut pyre_object::PyObject],
+    ) -> Result<*mut pyre_object::PyObject, crate::PyError> {
+        if args.is_empty() {
+            return Err(crate::PyError::type_error("__trunc__() requires self"));
+        }
+        let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+        float_to_pyint(v, FloatToIntMode::Trunc)
+    }
+    fn float_int_method(
+        args: &[*mut pyre_object::PyObject],
+    ) -> Result<*mut pyre_object::PyObject, crate::PyError> {
+        if args.is_empty() {
+            return Err(crate::PyError::type_error("__int__() requires self"));
+        }
+        let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+        float_to_pyint(v, FloatToIntMode::Trunc)
+    }
+    fn float_floor_method(
+        args: &[*mut pyre_object::PyObject],
+    ) -> Result<*mut pyre_object::PyObject, crate::PyError> {
+        if args.is_empty() {
+            return Err(crate::PyError::type_error("__floor__() requires self"));
+        }
+        let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+        float_to_pyint(v, FloatToIntMode::Floor)
+    }
+    fn float_ceil_method(
+        args: &[*mut pyre_object::PyObject],
+    ) -> Result<*mut pyre_object::PyObject, crate::PyError> {
+        if args.is_empty() {
+            return Err(crate::PyError::type_error("__ceil__() requires self"));
+        }
+        let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+        float_to_pyint(v, FloatToIntMode::Ceil)
+    }
+    for (method, func) in [
+        (
+            "__trunc__",
+            float_trunc_method
+                as fn(
+                    &[*mut pyre_object::PyObject],
+                ) -> Result<*mut pyre_object::PyObject, crate::PyError>,
+        ),
+        ("__int__", float_int_method),
+        ("__floor__", float_floor_method),
+        ("__ceil__", float_ceil_method),
+    ] {
         dict_storage_store(
             ns,
             method,
-            make_builtin_function_with_arity(
-                method,
-                |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error("__trunc__() requires self"));
-                    }
-                    let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-                    Ok(pyre_object::w_int_new(v.trunc() as i64))
-                },
-                1,
-            ),
+            make_builtin_function_with_arity(method, func, 1),
         );
+    }
+}
+
+#[derive(Copy, Clone)]
+pub(crate) enum FloatToIntMode {
+    Trunc,
+    Floor,
+    Ceil,
+}
+
+/// `pypy/objspace/std/longobject.py:511-522 newlong_from_float` parity.
+/// NaN → ValueError, ±inf → OverflowError; finite values are reduced
+/// to int and materialised through the BigInt path so values outside
+/// i64 range produce a long rather than saturating.
+pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate::PyError> {
+    if v.is_nan() {
+        return Err(crate::PyError::value_error(
+            "cannot convert float NaN to integer",
+        ));
+    }
+    if v.is_infinite() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::OverflowError,
+            "cannot convert float infinity to integer",
+        ));
+    }
+    let reduced = match mode {
+        FloatToIntMode::Trunc => v.trunc(),
+        FloatToIntMode::Floor => v.floor(),
+        FloatToIntMode::Ceil => v.ceil(),
+    };
+    use num_traits::{FromPrimitive, ToPrimitive};
+    let big = malachite_bigint::BigInt::from_f64(reduced).expect("finite already checked");
+    match big.to_i64() {
+        Some(n) => Ok(pyre_object::w_int_new(n)),
+        None => Ok(pyre_object::w_long_new(big)),
     }
 }
 
@@ -5677,7 +5757,10 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
                 let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-                crate::baseobjspace::setattr(args[0], name, args[2])
+                // `object.__setattr__` is the terminal implementation
+                // that writes directly to the instance dict, bypassing
+                // any user __setattr__ override.
+                crate::baseobjspace::object_setattr(args[0], name, args[2])
             },
             3,
         ),
@@ -5698,7 +5781,7 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
                 let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-                crate::baseobjspace::delattr(args[0], name)
+                crate::baseobjspace::object_delattr(args[0], name)
             },
             2,
         ),
@@ -5719,7 +5802,7 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
                 let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-                crate::baseobjspace::getattr(args[0], name)
+                crate::baseobjspace::object_getattribute(args[0], name)
             },
             2,
         ),
@@ -5738,7 +5821,32 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
     }
     let arg = rest[0];
+    let has_encoding = rest.len() >= 2;
     unsafe {
+        // bytearrayobject.py:217 — str source shares bytesobject.newbytesdata_w
+        if pyre_object::is_str(arg) {
+            if !has_encoding || !pyre_object::is_str(rest[1]) {
+                return Err(crate::PyError::type_error(
+                    "string argument without an encoding",
+                ));
+            }
+            let encoding = pyre_object::w_str_get_value(rest[1]);
+            let errors = if rest.len() >= 3 && pyre_object::is_str(rest[2]) {
+                Some(pyre_object::w_str_get_value(rest[2]))
+            } else {
+                None
+            };
+            let s = pyre_object::w_str_get_value(arg);
+            let encoded = encode_str(s, Some(encoding), errors)?;
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &encoded,
+            ));
+        }
+        if has_encoding {
+            return Err(crate::PyError::type_error(
+                "encoding without a string argument",
+            ));
+        }
         if pyre_object::is_int(arg) {
             let n = pyre_object::w_int_get_value(arg).max(0) as usize;
             return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
@@ -5747,25 +5855,21 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
         }
-        if pyre_object::is_str(arg) {
-            let s = pyre_object::w_str_get_value(arg);
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                s.as_bytes(),
-            ));
-        }
     }
-    // Iterable of ints — collect and convert.
-    if let Ok(items) = crate::builtins::collect_iterable(arg) {
-        let mut buf = Vec::with_capacity(items.len());
-        for item in items {
-            if unsafe { pyre_object::is_int(item) } {
-                let v = unsafe { pyre_object::w_int_get_value(item) };
-                buf.push((v & 0xff) as u8);
-            }
+    // bytesobject.py:856 _from_byte_sequence_w
+    let items = crate::builtins::collect_iterable(arg)?;
+    let mut buf = Vec::with_capacity(items.len());
+    for item in items {
+        if !unsafe { pyre_object::is_int(item) } {
+            return Err(crate::PyError::type_error("an integer is required"));
         }
-        return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf));
+        let v = unsafe { pyre_object::w_int_get_value(item) };
+        if !(0..=255).contains(&v) {
+            return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
+        }
+        buf.push(v as u8);
     }
-    Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
 }
 
 /// PyPy: bytesobject.py W_BytesObject.typedef
@@ -5938,6 +6042,57 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 /// `bytes.__new__(cls, *args)` — PyPy: bytesobject.py descr__new__
+/// `unicodeobject.py W_UnicodeObject.descr_encode` parity for the
+/// common encodings.  ASCII / Latin-1 emit per-character bytes and
+/// reject out-of-range codepoints with UnicodeEncodeError; UTF-8 is
+/// the lossless default Rust string representation.  An unknown
+/// encoding surfaces LookupError("unknown encoding: <name>").
+fn encode_str(
+    s: &str,
+    encoding: Option<&str>,
+    _errors: Option<&str>,
+) -> Result<Vec<u8>, crate::PyError> {
+    let enc = encoding.unwrap_or("utf-8");
+    let lower = enc.to_ascii_lowercase().replace('_', "-");
+    match lower.as_str() {
+        "utf-8" | "utf8" | "u8" => Ok(s.as_bytes().to_vec()),
+        "ascii" | "us-ascii" | "646" => {
+            for (i, ch) in s.chars().enumerate() {
+                if (ch as u32) >= 0x80 {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::UnicodeEncodeError,
+                        format!(
+                            "'ascii' codec can't encode character '\\x{:x}' in position {}",
+                            ch as u32, i
+                        ),
+                    ));
+                }
+            }
+            Ok(s.as_bytes().to_vec())
+        }
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
+            let mut out = Vec::with_capacity(s.len());
+            for (i, ch) in s.chars().enumerate() {
+                if (ch as u32) > 0xff {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::UnicodeEncodeError,
+                        format!(
+                            "'latin-1' codec can't encode character '\\u{:04x}' in position {}",
+                            ch as u32, i
+                        ),
+                    ));
+                }
+                out.push(ch as u8);
+            }
+            Ok(out)
+        }
+        _ => Err(crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown encoding: {enc}"),
+        )),
+    }
+}
+
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored for now)
     // bytes()           → empty
@@ -5949,7 +6104,30 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Ok(pyre_object::bytesobject::w_bytes_empty());
     }
     let arg = args[1];
+    // bytesobject.py:763 — encoding/errors only valid with string source
+    let has_encoding = args.len() >= 3;
     unsafe {
+        if pyre_object::is_str(arg) {
+            if !has_encoding || !pyre_object::is_str(args[2]) {
+                return Err(crate::PyError::type_error(
+                    "string argument without an encoding",
+                ));
+            }
+            let encoding = pyre_object::w_str_get_value(args[2]);
+            let errors = if args.len() >= 4 && pyre_object::is_str(args[3]) {
+                Some(pyre_object::w_str_get_value(args[3]))
+            } else {
+                None
+            };
+            let s = pyre_object::w_str_get_value(arg);
+            let encoded = encode_str(s, Some(encoding), errors)?;
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&encoded));
+        }
+        if has_encoding {
+            return Err(crate::PyError::type_error(
+                "encoding without a string argument",
+            ));
+        }
         if pyre_object::is_int(arg) {
             let n = pyre_object::w_int_get_value(arg).max(0) as usize;
             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&vec![0u8; n]));
@@ -5958,16 +6136,19 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
         }
-        if pyre_object::is_str(arg) {
-            let s = pyre_object::w_str_get_value(arg);
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(s.as_bytes()));
-        }
     }
-    // Iterable of ints
+    // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence
+    // checks 0 <= val < 256 per element; out-of-range raises ValueError
+    // "bytes must be in range(0, 256)".
     let items = crate::builtins::collect_iterable(arg)?;
     let mut buf = Vec::with_capacity(items.len());
     for item in items {
         let val = unsafe { pyre_object::w_int_get_value(item) };
+        if !(0..=255).contains(&val) {
+            return Err(crate::PyError::value_error(
+                "bytes must be in range(0, 256)",
+            ));
+        }
         buf.push(val as u8);
     }
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -5976,6 +6157,14 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytearray_descr_new));
+    // `bytearrayobject.py W_BytearrayObject.descr_decode` shares the
+    // bytes decode machinery — `bytes_method_decode` already pulls the
+    // payload via `bytes_like_data`, which handles both kinds.
+    dict_storage_store(
+        ns,
+        "decode",
+        make_builtin_function("decode", bytes_method_decode),
+    );
     dict_storage_store(
         ns,
         "find",

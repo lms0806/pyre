@@ -84,6 +84,11 @@ fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
 }
 
 #[majit_macros::elidable]
+fn bigint_to_f64(a: BigInt) -> f64 {
+    a.to_f64().unwrap_or(f64::INFINITY)
+}
+
+#[majit_macros::elidable]
 fn bigint_neg(a: BigInt) -> BigInt {
     -a
 }
@@ -111,6 +116,97 @@ fn bigint_gt(a: BigInt, b: BigInt) -> bool {
 #[majit_macros::elidable]
 fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
     a % b
+}
+
+/// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
+/// Produces the correctly-rounded IEEE 754 double for a/b.
+/// Port of CPython `Objects/longobject.c long_true_divide`.
+fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
+    use malachite_bigint::Sign;
+
+    if b.sign() == Sign::NoSign {
+        return Err(PyError::zero_division("division by zero"));
+    }
+    if a.sign() == Sign::NoSign {
+        return Ok(0.0);
+    }
+
+    let negate = (a.sign() == Sign::Minus) != (b.sign() == Sign::Minus);
+    let a_abs = if a.sign() == Sign::Minus { -a } else { a };
+    let b_abs = if b.sign() == Sign::Minus { -b } else { b };
+
+    let a_bits = a_abs.bits() as i64;
+    let b_bits = b_abs.bits() as i64;
+
+    // f64 exponent range: [-1022, 1023]. If a/b would exceed 2^1024, overflow.
+    if a_bits - b_bits > 1024 {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "integer division result too large for a float",
+        ));
+    }
+    // If a/b would underflow to 0 (ratio < 2^-1075 where 1075 = 1022+53):
+    if b_bits - a_bits > 1075 {
+        return Ok(if negate { -0.0 } else { 0.0 });
+    }
+
+    // Shift a so that a_shifted / b has exactly 54 significant bits
+    // (53 mantissa + 1 rounding bit).
+    const MANT_DIG: i64 = 54; // DBL_MANT_DIG + 1
+    let shift = MANT_DIG - a_bits + b_bits;
+    let a_shifted = if shift >= 0 {
+        a_abs << (shift as usize)
+    } else {
+        &a_abs >> ((-shift) as usize)
+    };
+
+    let (q, r) = a_shifted.div_rem(&b_abs);
+    let mut q_bits = q.bits() as i64;
+
+    // Adjust if quotient is one bit too large (55 bits instead of 54)
+    let (q, r, extra_shift) = if q_bits == MANT_DIG + 1 {
+        let q2 = &q >> 1usize;
+        let r2 = &a_shifted - &q2 * &b_abs * BigInt::from(2);
+        (q2, r2, 1i64)
+    } else {
+        (q, r, 0i64)
+    };
+    q_bits = q.bits() as i64;
+
+    // Round-half-to-even: check the last bit of q and the remainder
+    let half = &b_abs >> 1usize;
+    let r_abs = if r.sign() == Sign::Minus { -r } else { r };
+    let round_up = if &r_abs > &half {
+        true
+    } else if &r_abs == &half {
+        // Tie: round to even (check bit 0 of q)
+        &q % BigInt::from(2) != BigInt::from(0)
+    } else {
+        false
+    };
+    let q_final = if round_up { q + BigInt::from(1) } else { q };
+
+    let mantissa = match q_final.to_u64() {
+        Some(v) => v,
+        None => {
+            return Err(PyError::new(
+                PyErrorKind::OverflowError,
+                "integer division result too large for a float",
+            ));
+        }
+    };
+
+    let exponent = a_bits - b_bits - MANT_DIG + 1 + extra_shift;
+    let result = (mantissa as f64) * (2.0_f64).powi(exponent as i32);
+
+    if result.is_infinite() {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "integer division result too large for a float",
+        ));
+    }
+
+    Ok(if negate { -result } else { result })
 }
 
 // ── Arithmetic operations ─────────────────────────────────────────────
@@ -322,7 +418,10 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
-        return Ok(w_float_new((va as f64).powf(vb as f64)));
+        // intobject.py:415-419 _pow_nomod raises ValueError for iw < 0,
+        // descr_pow catches it and routes through float pow — which
+        // carries the ZeroDivisionError guard from floatobject.py:910-913.
+        return Ok(w_float_new(float_pow_raw(va as f64, vb as f64)?));
     }
     // intobject.py:415 / longobject.py:229: x ** 0 == 1 for any x.
     if vb == 0 {
@@ -352,7 +451,7 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         let fa = as_float(a);
         let fb = as_float(b);
-        return Ok(w_float_new(fa.powf(fb)));
+        return Ok(w_float_new(float_pow_raw(fa, fb)?));
     }
     // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1.
     if vb.sign() == malachite_bigint::Sign::NoSign {
@@ -525,13 +624,37 @@ unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_str_new(&result))
 }
 
-/// Repeat a str object `n` times.
+/// Extract a non-negative repeat count from an int or long, raising
+/// OverflowError with `msg` for positive bigints that exceed usize.
+unsafe fn repeat_count(n: PyObjectRef, msg: &str) -> Result<usize, PyError> {
+    if is_long(n) {
+        let big = as_bigint(n);
+        match big.to_usize() {
+            Some(v) => Ok(v),
+            None if bigint_lt(big, BigInt::from(0)) => Ok(0),
+            None => Err(PyError::new(PyErrorKind::OverflowError, msg)),
+        }
+    } else {
+        let nv = w_int_get_value(n);
+        Ok(if nv < 0 { 0 } else { nv as usize })
+    }
+}
 
+/// unicodeobject.py:619-621 descr_mul
 unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let sv = w_str_get_value(s);
-    let nv = w_int_get_value(n);
-    let count = if nv < 0 { 0 } else { nv as usize };
-    Ok(w_str_new(&sv.repeat(count)))
+    let count = repeat_count(n, "new string is too long")?;
+    let total = sv
+        .len()
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "new string is too long"))?;
+    let mut out = String::new();
+    out.try_reserve_exact(total)
+        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    for _ in 0..count {
+        out.push_str(sv);
+    }
+    Ok(w_str_new(&out))
 }
 
 unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -568,11 +691,17 @@ unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_tuple_new(items))
 }
 
+/// listobject.py:638-641 descr_mul
 unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
-    let nv = w_int_get_value(n);
-    let count = if nv < 0 { 0 } else { nv as usize };
+    let count = repeat_count(n, "list is too large")?;
     let len = w_list_len(list);
-    let mut items = Vec::with_capacity(len * count);
+    let cap = len
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    let mut items: Vec<PyObjectRef> = Vec::new();
+    items
+        .try_reserve_exact(cap)
+        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
     for _ in 0..count {
         for i in 0..len {
             if let Some(item) = w_list_getitem(list, i as i64) {
@@ -914,24 +1043,29 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_mul(a, b);
         }
-        if is_str(a) && is_int(b) {
+        if is_str(a) && is_int_or_long(b) {
             return str_repeat(a, b);
         }
-        if is_int(a) && is_str(b) {
+        if is_int_or_long(a) && is_str(b) {
             return str_repeat(b, a);
         }
-        // list * int
-        if is_list(a) && is_int(b) {
+        if is_list(a) && is_int_or_long(b) {
             return list_repeat(a, b);
         }
-        if is_int(a) && is_list(b) {
+        if is_int_or_long(a) && is_list(b) {
             return list_repeat(b, a);
         }
-        // tuple * int
-        if is_tuple(a) && is_int(b) {
-            let n = w_int_get_value(b).max(0) as usize;
+        // tupleobject.py descr_mul
+        if is_tuple(a) && is_int_or_long(b) {
+            let n = repeat_count(b, "tuple is too large")?;
             let len = w_tuple_len(a);
-            let mut items = Vec::with_capacity(n * len);
+            let cap = len
+                .checked_mul(n)
+                .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "tuple is too large"))?;
+            let mut items: Vec<PyObjectRef> = Vec::new();
+            items
+                .try_reserve_exact(cap)
+                .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
             for _ in 0..n {
                 for i in 0..len {
                     if let Some(item) = w_tuple_getitem(a, i as i64) {
@@ -941,14 +1075,19 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return Ok(w_tuple_new(items));
         }
-        if is_int(a) && is_tuple(b) {
+        if is_int_or_long(a) && is_tuple(b) {
             return mul(b, a);
         }
-        // bytes/bytearray * int — bytesobject.py descr_mul / bytearrayobject.py descr_mul
-        if pyre_object::bytesobject::is_bytes_like(a) && is_int(b) {
+        // bytesobject.py descr_mul / bytearrayobject.py descr_mul
+        if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
             let data = pyre_object::bytesobject::bytes_like_data(a);
-            let n = w_int_get_value(b).max(0) as usize;
-            let mut buf = Vec::with_capacity(data.len() * n);
+            let n = repeat_count(b, "repeated bytes are too long")?;
+            let cap = data.len().checked_mul(n).ok_or_else(|| {
+                PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long")
+            })?;
+            let mut buf: Vec<u8> = Vec::new();
+            buf.try_reserve_exact(cap)
+                .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
             for _ in 0..n {
                 buf.extend_from_slice(data);
             }
@@ -958,7 +1097,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
             });
         }
-        if is_int(a) && pyre_object::bytesobject::is_bytes_like(b) {
+        if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
             return mul(b, a);
         }
         if let Some(result) = try_instance_binop(a, b, "__mul__") {
@@ -1025,7 +1164,13 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// True division (`/` operator) — always produces a float result.
-
+///
+/// intobject.py:332-345 `_truediv` raises "division by zero" for int/int;
+/// floatobject.py:519 `_floatdiv` raises "float division by zero" once
+/// any operand is a float.
+/// longobject.py:62-70 `_truediv` catches OverflowError from
+/// `rbigint.truediv` and reissues it as
+/// "integer division result too large for a float".
 pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
@@ -1033,7 +1178,17 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
         if a_num && b_num {
-            return float_truediv(a, b);
+            if is_float(a) || is_float(b) {
+                return float_truediv(a, b);
+            }
+            if !is_long(b) && as_float(b) == 0.0 {
+                return Err(PyError::zero_division("division by zero"));
+            }
+            if is_long(a) || is_long(b) {
+                let r = bigint_truediv(as_bigint(a), as_bigint(b))?;
+                return Ok(w_float_new(r));
+            }
+            return Ok(w_float_new(as_float(a) / as_float(b)));
         }
         if let Some(result) = try_instance_binop(a, b, "__truediv__") {
             return result;
