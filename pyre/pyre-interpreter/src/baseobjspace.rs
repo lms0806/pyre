@@ -1952,13 +1952,8 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             if name == "__class__" {
                 return Ok(w_type);
             }
-            if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
-                let name_obj = w_str_new(name);
-                let result = crate::call_function(getattr_fn, &[obj, name_obj]);
-                if !result.is_null() {
-                    return Ok(result);
-                }
-            }
+            // descroperation.py:88 — object.__getattribute__ raises
+            // AttributeError on miss. __getattr__ is space.getattr's job.
             return Err(PyError::new(
                 PyErrorKind::AttributeError,
                 format!(
@@ -3526,26 +3521,15 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
-    // `descroperation.py:143-155 space.setattr` — when the user type
-    // directly defines `__setattr__` (not just inherits Object's), call
-    // the override so user-visible attribute interception works.
+    // descroperation.py:247 — space.lookup for __setattr__ through MRO,
+    // then get_and_call_function which applies descriptor binding.
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            if !w_type.is_null() && is_type(w_type) {
-                let ns_ptr = w_type_get_dict_ptr(w_type) as *const crate::DictStorage;
-                if !ns_ptr.is_null() {
-                    if let Some(&sa) = (*ns_ptr).get("__setattr__") {
-                        if !sa.is_null() {
-                            let w_name = w_str_new(name);
-                            return crate::call::call_function_impl_result(
-                                sa,
-                                &[obj, w_name, value],
-                            )
-                            .map(|_| w_none());
-                        }
-                    }
-                }
+            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
+                let w_name = w_str_new(name);
+                return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
+                    .map(|_| w_none());
             }
         }
     }
@@ -3898,22 +3882,14 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
-    // `descroperation.py space.delattr` — dispatch user `__delattr__`
-    // if the class's own dict overrides it.
+    // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            if !w_type.is_null() && is_type(w_type) {
-                let ns_ptr = w_type_get_dict_ptr(w_type) as *const crate::DictStorage;
-                if !ns_ptr.is_null() {
-                    if let Some(&da) = (*ns_ptr).get("__delattr__") {
-                        if !da.is_null() {
-                            let w_name = w_str_new(name);
-                            return crate::call::call_function_impl_result(da, &[obj, w_name])
-                                .map(|_| w_none());
-                        }
-                    }
-                }
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                let w_name = w_str_new(name);
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
             }
         }
     }

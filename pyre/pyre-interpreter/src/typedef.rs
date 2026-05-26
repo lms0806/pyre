@@ -5848,8 +5848,11 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             ));
         }
         if pyre_object::is_int(arg) {
-            let n = pyre_object::w_int_get_value(arg).max(0) as usize;
-            return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
+            let n = pyre_object::w_int_get_value(arg);
+            if n < 0 {
+                return Err(crate::PyError::value_error("negative count"));
+            }
+            return Ok(pyre_object::bytearrayobject::w_bytearray_new(n as usize));
         }
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
@@ -6129,8 +6132,14 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         if pyre_object::is_int(arg) {
-            let n = pyre_object::w_int_get_value(arg).max(0) as usize;
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&vec![0u8; n]));
+            // bytesobject.py:797 — negative count raises ValueError
+            let n = pyre_object::w_int_get_value(arg);
+            if n < 0 {
+                return Err(crate::PyError::value_error("negative count"));
+            }
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+                &vec![0u8; n as usize],
+            ));
         }
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);

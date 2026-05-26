@@ -640,6 +640,11 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // the legacy type walker instead of panicking during registry
         // population.
         || (msg.contains("Call with CallTarget::Indirect") && msg.contains("rclass"))
+        // `annrpython.py:432 mergeinputargs` — an inputarg Variable
+        // has no annotation. Happens when cross-block locals
+        // threading misses a name in the predecessor link; the
+        // annotator cannot merge `None` annotations.
+        || msg.contains("inputarg lacks annotation")
         // (Retired 2026-05-06.) `AnnotatorError: immutablevalue(HostObject`
         // was Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
         // None) — the adapter wrapped the ctor name as

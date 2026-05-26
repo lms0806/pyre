@@ -3826,19 +3826,33 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "ord() takes exactly one argument",
         ));
     }
-    if !unsafe { is_str(args[0]) } {
-        return Err(crate::PyError::type_error(
-            "ord() expected string of length 1, but other type found",
-        ));
+    let obj = args[0];
+    unsafe {
+        if is_str(obj) {
+            let s = w_str_get_value(obj);
+            let count = s.chars().count();
+            if count != 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "ord() expected a character, but string of length {count} found"
+                )));
+            }
+            return Ok(w_int_new(s.chars().next().unwrap() as i64));
+        }
+        // bytesobject.py:464 — bytes of length 1
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
+            if data.len() != 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    data.len()
+                )));
+            }
+            return Ok(w_int_new(data[0] as i64));
+        }
     }
-    let s = unsafe { w_str_get_value(args[0]) };
-    let count = s.chars().count();
-    if count != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "ord() expected a character, but string of length {count} found"
-        )));
-    }
-    Ok(w_int_new(s.chars().next().unwrap() as i64))
+    Err(crate::PyError::type_error(
+        "ord() expected string of length 1, but other type found",
+    ))
 }
 
 /// `chr(i)` — PyPy: operation.py chr
@@ -4093,25 +4107,25 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }
         }
     }
-    // `functional.py:reversed`: when no `__reversed__` exists, the object
-    // must expose a sequence protocol (`__getitem__` + `__len__`).  set /
-    // frozenset / generator carry `__iter__` but no indexing, so PyPy
-    // rejects them with TypeError("argument to reversed() must be a
-    // sequence").
-    unsafe {
-        if pyre_object::is_set_or_frozenset(obj) {
-            return Err(crate::PyError::type_error(format!(
-                "'{}' object is not reversible",
-                (*(*obj).ob_type).name
-            )));
+    // functional.py:351 — without __reversed__, require sequence protocol
+    // (__getitem__ + __len__). Non-sequences raise TypeError.
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        let has_getitem =
+            unsafe { crate::baseobjspace::lookup_in_type(tp, "__getitem__") }.is_some();
+        let has_len = unsafe { crate::baseobjspace::lookup_in_type(tp, "__len__") }.is_some();
+        if has_getitem && has_len {
+            let items = collect_iterable(obj)?;
+            let mut rev = items;
+            rev.reverse();
+            let n = rev.len();
+            return Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n));
         }
     }
-    // Fallback: collect any iterable (range, dict views, etc.) and reverse.
-    let items = collect_iterable(obj)?;
-    let mut rev = items;
-    rev.reverse();
-    let n = rev.len();
-    Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n))
+    let type_name = unsafe { (*(*obj).ob_type).name };
+    Err(crate::PyError::type_error(format!(
+        "'{}' object is not reversible",
+        type_name
+    )))
 }
 
 /// `pypy/module/__builtin__/functional.py:328-340 builtin_sorted`

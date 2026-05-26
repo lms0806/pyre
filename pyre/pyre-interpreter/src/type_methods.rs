@@ -537,16 +537,49 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `unicodeobject.py descr_startswith` — accepts either a single str
 /// prefix or a tuple of str prefixes (CPython parity).
+/// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    str_prefix_match(s, args[1], "startswith", true).map(w_bool_from)
+    let slice = str_slice_args(s, args);
+    str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
-    str_prefix_match(s, args[1], "endswith", false).map(w_bool_from)
+    let slice = str_slice_args(s, args);
+    str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
+}
+
+fn str_slice_args<'a>(s: &'a str, args: &[pyre_object::PyObjectRef]) -> &'a str {
+    let char_len = s.chars().count() as i64;
+    let start = if args.len() >= 3 {
+        let v = unsafe { pyre_object::w_int_get_value(args[2]) };
+        if v < 0 {
+            (char_len + v).max(0) as usize
+        } else {
+            (v as usize).min(char_len as usize)
+        }
+    } else {
+        0
+    };
+    let end = if args.len() >= 4 {
+        let v = unsafe { pyre_object::w_int_get_value(args[3]) };
+        if v < 0 {
+            (char_len + v).max(0) as usize
+        } else {
+            (v as usize).min(char_len as usize)
+        }
+    } else {
+        char_len as usize
+    };
+    if start > end {
+        return "";
+    }
+    let byte_start = s.char_indices().nth(start).map_or(s.len(), |(i, _)| i);
+    let byte_end = s.char_indices().nth(end).map_or(s.len(), |(i, _)| i);
+    &s[byte_start..byte_end]
 }
 
 fn str_prefix_match(
@@ -1274,12 +1307,43 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// `unicodeobject.py descr_rindex` — like rfind, but raises ValueError
 /// when the substring is absent.
+/// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
     let sub = unsafe { w_str_get_value(args[1]) };
-    match s.rfind(sub) {
-        Some(i) => Ok(w_int_new(i as i64)),
+    let char_len = s.chars().count() as i64;
+    let start = if args.len() >= 3 {
+        let v = unsafe { pyre_object::w_int_get_value(args[2]) };
+        if v < 0 {
+            (char_len + v).max(0) as usize
+        } else {
+            v as usize
+        }
+    } else {
+        0
+    };
+    let end = if args.len() >= 4 {
+        let v = unsafe { pyre_object::w_int_get_value(args[3]) };
+        if v < 0 {
+            (char_len + v).max(0) as usize
+        } else {
+            (v as usize).min(char_len as usize)
+        }
+    } else {
+        char_len as usize
+    };
+    let byte_start = s.char_indices().nth(start).map_or(s.len(), |(i, _)| i);
+    let byte_end = s.char_indices().nth(end).map_or(s.len(), |(i, _)| i);
+    if byte_start > byte_end {
+        return Err(crate::PyError::value_error("substring not found"));
+    }
+    let slice = &s[byte_start..byte_end];
+    match slice.rfind(sub) {
+        Some(byte_pos) => {
+            let char_pos = s[..byte_start + byte_pos].chars().count();
+            Ok(w_int_new(char_pos as i64))
+        }
         None => Err(crate::PyError::value_error("substring not found")),
     }
 }

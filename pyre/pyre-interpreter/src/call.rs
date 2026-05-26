@@ -844,21 +844,25 @@ pub(crate) fn resolve_kwargs(
     for ki in 0..nkw {
         let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
         let Some(kw_name_obj) = kw_name else { continue };
-        let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
         let kw_value = args[n_pos + ki];
 
-        // argument.py:630 — keywords must be strings
+        // argument.py:630 — keywords must be strings (check before access)
         if !unsafe { pyre_object::is_str(kw_name_obj) } {
             return Err(crate::PyError::type_error(format!(
                 "{}() keywords must be strings",
                 fname
             )));
         }
+        let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
         let mut matched = false;
         for pi in 0..nparams {
             if &*code.varnames[skip_cls + pi] == kw_str {
-                // argument.py:425 — positional-only parameter
+                // argument.py:474 — positional-only parameter: if has_kwarg,
+                // treat as unmatched (absorb into **kwargs); otherwise error.
                 if skip_cls + pi < posonlyarg_count {
+                    if has_varkw {
+                        break; // fall through to !matched → extra_kwargs
+                    }
                     return Err(crate::PyError::type_error(format!(
                         "{}() got some positional-only arguments passed as keyword arguments: '{}'",
                         fname, kw_str

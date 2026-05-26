@@ -89,6 +89,15 @@ fn bigint_to_f64(a: BigInt) -> f64 {
 }
 
 #[majit_macros::elidable]
+fn float_copysign(mag: f64, sign: f64) -> f64 {
+    if sign.is_sign_negative() {
+        -mag.abs()
+    } else {
+        mag.abs()
+    }
+}
+
+#[majit_macros::elidable]
 fn bigint_neg(a: BigInt) -> BigInt {
     -a
 }
@@ -121,6 +130,7 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
 /// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
 /// Produces the correctly-rounded IEEE 754 double for a/b.
 /// Port of CPython `Objects/longobject.c long_true_divide`.
+#[majit_macros::elidable]
 fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
     use malachite_bigint::Sign;
 
@@ -173,13 +183,13 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
     };
     q_bits = q.bits() as i64;
 
-    // Round-half-to-even: check the last bit of q and the remainder
-    let half = &b_abs >> 1usize;
+    // Round-half-to-even using 2*r vs b comparison (correct for odd b
+    // where b>>1 would lose the low bit).
     let r_abs = if r.sign() == Sign::Minus { -r } else { r };
-    let round_up = if &r_abs > &half {
+    let two_r = &r_abs << 1usize;
+    let round_up = if two_r > b_abs {
         true
-    } else if &r_abs == &half {
-        // Tie: round to even (check bit 0 of q)
+    } else if two_r == b_abs {
         &q % BigInt::from(2) != BigInt::from(0)
     } else {
         false
@@ -372,7 +382,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
     } else {
         // floatobject.py:536-538: signed zero — copysign(0.0, y)
-        m = f64::copysign(0.0, y);
+        m = float_copysign(0.0, y);
     }
     Ok(w_float_new(m))
 }
@@ -1496,7 +1506,7 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
         return Ok(if y > 0.0 {
             if y_is_odd { x } else { x.abs() }
         } else if y_is_odd {
-            f64::copysign(0.0, x)
+            float_copysign(0.0, x)
         } else {
             0.0
         });
