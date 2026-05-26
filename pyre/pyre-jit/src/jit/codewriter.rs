@@ -619,17 +619,13 @@ struct SpamBlock {
     framestate: Option<FrameState>,
     /// `flowcontext.py:41` `block.dead`.
     dead: bool,
-    /// Task #227 per-block ssarepr accumulator — pyre-side mirror of
-    /// upstream `block.operations` recorded inside `record_block`
+    /// Per-block ssarepr accumulator — pyre-side mirror of upstream
+    /// `block.operations` recorded inside `record_block`
     /// (`flowcontext.py:407-416`).  Populated alongside the program-
-    /// wide `ssarepr.insns` push so a future post-walk `flatten_graph`
-    /// can iterate `graph.iterblocks()` and consume the per-block
-    /// emit sequence in graph-DFS order, matching
+    /// wide `ssarepr.insns` push so a post-walk `flatten_graph` can
+    /// iterate `graph.iterblocks()` and consume the per-block emit
+    /// sequence in graph-DFS order, matching
     /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu=...)`.
-    /// While the walker still drives production, this shadow only
-    /// records label-equivalent block entries; once Task #227.2 wires
-    /// every `emit_*!` macro through `push_insn` the shadow becomes
-    /// the authoritative source consumed by the post-walk flatten.
     per_block_ssarepr: Vec<super::flatten::Insn>,
     /// Length of `per_block_ssarepr` at the moment the multi-pred
     /// trampoline fallthrough fallback first appended `goto + ---`
@@ -702,21 +698,21 @@ impl SpamBlockRef {
     /// `flowcontext.py:407-416 record_block` runs inside the recorder
     /// loop.  Walker emit macros call this alongside their program-
     /// wide `ssarepr.insns.push(...)` so the per-block shadow stays
-    /// in sync until production flips to consume it (Task #227.3).
+    /// in sync with the production stream.
     fn push_insn(&self, insn: super::flatten::Insn) {
         self.0.borrow_mut().per_block_ssarepr.push(insn);
     }
 
-    /// Snapshot the per-block accumulator — used by Task #227.2
-    /// verification probes and by the post-walk flatten driver to
-    /// drain the per-block emit sequence in graph-DFS order.
+    /// Snapshot the per-block accumulator — used by verification
+    /// probes and by the post-walk flatten driver to drain the
+    /// per-block emit sequence in graph-DFS order.
     fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
         self.0.borrow().per_block_ssarepr.clone()
     }
 
     /// Length of the per-block accumulator without cloning.  Used by
-    /// the T6.1 walker-time PC dispatch tracker to record per-PC
-    /// `-live-` marker positions at emit time.
+    /// the walker-time PC dispatch tracker to record per-PC `-live-`
+    /// marker positions at emit time.
     fn per_block_ssarepr_len(&self) -> usize {
         self.0.borrow().per_block_ssarepr.len()
     }
@@ -736,12 +732,12 @@ impl std::hash::Hash for SpamBlockRef {
     }
 }
 
-/// Task #227.4 walker emit helper — pushes `insn` into
-/// `current_block`'s per-block accumulator.  The program-wide
-/// `ssarepr.insns` is populated post-walk via the drain swap at
+/// Walker emit helper — pushes `insn` into `current_block`'s
+/// per-block accumulator.  The program-wide `ssarepr.insns` is
+/// populated post-walk via the drain swap at
 /// `transform_graph_to_jitcode`'s end (matching `codewriter.py:53
 /// flatten_graph(graph, regallocs, cpu)`).  Every walker emit site
-/// uniformly routes through this helper now — no direct
+/// uniformly routes through this helper — no direct
 /// `ssarepr.insns.push` calls remain in production.
 fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
@@ -757,10 +753,9 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
-/// Phase 4 endgame slice 4 / 5 helper.  Returns a stable opname key
-/// per insn variant so the diff probe can compare and tally across
-/// the walker / canonical streams without dragging in operand
-/// equality.
+/// Diagnostic helper for the walker↔canonical diff probe: returns a
+/// stable opname key per Insn variant so the probe can compare and
+/// tally across the two streams without dragging in operand equality.
 fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
     match insn {
         super::flatten::Insn::Label(_) => "Label".to_string(),
@@ -769,12 +764,12 @@ fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
     }
 }
 
-/// Phase 4 endgame slice 4 helper.  Tally per-opname occurrences of
-/// the given Insn slice, using `"Label"` / `"---"` for the non-`Op`
-/// variants so the resulting `Vec<(String, i64)>` is sortable and
-/// comparable across walker and canonical SSARepr.  `Vec` keyed by
-/// `String` per [[feedback-no-hashmap-ever]] — opname cardinality
-/// stays in the dozens, so linear scan is acceptable.
+/// Diagnostic helper: tally per-opname occurrences of the given Insn
+/// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
+/// resulting `Vec<(String, i64)>` is sortable and comparable across
+/// walker and canonical SSARepr.  `Vec` keyed by `String` (HashMap
+/// banned project-wide); opname cardinality stays in the dozens so a
+/// linear scan is acceptable.
 fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64)> {
     let mut tally: Vec<(String, i64)> = Vec::new();
     for insn in insns {
@@ -786,6 +781,334 @@ fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64
         }
     }
     tally
+}
+
+/// color-budget Step A probe helper: per-Register color-budget violation
+/// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
+/// Role distinguishes argument operand vs result register vs nested
+/// `ListOfKind` element so downstream analysis can correlate the
+/// violation with the canonical emit site responsible.
+type Phase4ColorBudgetViolation = (usize, String, &'static str, &'static str, u16, u16);
+
+fn phase4_check_register_budget(
+    insn_idx: usize,
+    opname: &str,
+    role: &'static str,
+    reg: &super::flatten::Register,
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+    out: &mut Vec<Phase4ColorBudgetViolation>,
+) {
+    let (kind_str, num_colors) = match reg.kind {
+        super::flatten::Kind::Int => ("int", num_int),
+        super::flatten::Kind::Ref => ("ref", num_ref),
+        super::flatten::Kind::Float => ("float", num_float),
+    };
+    if reg.index >= num_colors {
+        out.push((
+            insn_idx,
+            opname.to_string(),
+            role,
+            kind_str,
+            reg.index,
+            num_colors,
+        ));
+    }
+}
+
+fn phase4_check_operand_budget(
+    insn_idx: usize,
+    opname: &str,
+    role: &'static str,
+    op: &super::flatten::Operand,
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+    out: &mut Vec<Phase4ColorBudgetViolation>,
+) {
+    match op {
+        super::flatten::Operand::Register(reg) => {
+            phase4_check_register_budget(
+                insn_idx, opname, role, reg, num_int, num_ref, num_float, out,
+            );
+        }
+        super::flatten::Operand::ListOfKind(list) => {
+            for item in &list.content {
+                phase4_check_operand_budget(
+                    insn_idx, opname, "list", item, num_int, num_ref, num_float, out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// color-budget Step A probe: scan canonical SSARepr `Insn::Op` Register
+/// operands + result registers + nested `ListOfKind` elements for any
+/// `index >= num_colors[kind]`.  Mirrors the assembler-side bounds
+/// check at `majit-metainterp/src/jitcode/assembler.rs:3970-3987
+/// touch_ref_reg_or_pool_slot` that PANICs once `num_regs_frozen=true`.
+/// Surfaces the offending (graph, insn, opname, kind, color, num_colors)
+/// quad so the regalloc-side mutation that violated the budget
+/// (`enforce_input_args swapcolors`, post-chord adjustment, etc.) can be
+/// audited in Step B.
+fn phase4_scan_color_budget_violations(
+    insns: &[super::flatten::Insn],
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+) -> Vec<Phase4ColorBudgetViolation> {
+    let mut violations: Vec<Phase4ColorBudgetViolation> = Vec::new();
+    for (insn_idx, insn) in insns.iter().enumerate() {
+        if let super::flatten::Insn::Op {
+            opname,
+            args,
+            result,
+        } = insn
+        {
+            for arg in args {
+                phase4_check_operand_budget(
+                    insn_idx,
+                    opname,
+                    "arg",
+                    arg,
+                    num_int,
+                    num_ref,
+                    num_float,
+                    &mut violations,
+                );
+            }
+            if let Some(reg) = result {
+                phase4_check_register_budget(
+                    insn_idx,
+                    opname,
+                    "result",
+                    reg,
+                    num_int,
+                    num_ref,
+                    num_float,
+                    &mut violations,
+                );
+            }
+        }
+    }
+    violations
+}
+
+/// Splice-audit helper: filter pyre-only walker emits + canonical
+/// trampoline Labels so the resulting sequence is comparable for byte
+/// equivalence.  Applied symmetrically to both walker and canonical:
+///
+/// - `-live-` per `liveness.py:5-12` — walker emits per Python PC (NEW
+///   DEVIATION); canonical emits 0-or-1 per graph from
+///   `flatten.py:259, 285` bare-live insertion.  Either way, the
+///   liveness pass collapses adjacent markers, so per-PC emit
+///   alignment is not required at compare time.
+/// - `ref_copy` per `flatten.py:319-333 insert_renamings` — walker
+///   emits slot-keyed stack/local mirrors at emit time; canonical
+///   emits them at link rewrite time.  Both express the same renaming
+///   semantics.
+/// - `Label("link*")` per `flatten.py:306-334 insert_renamings` —
+///   canonical synthesises a trampoline Label per multi-pred link
+///   rewrite.  Walker handles the same renaming via
+///   `emit_trampoline_for_multi_pred_link`, which names its
+///   trampoline blocks `epsilon3_link_*`; both prefixes filter out.
+///   Block Labels (`Label("block*")`) and catch-landing Labels
+///   survive.
+fn phase4_filter_compare_eligible(insns: &[super::flatten::Insn]) -> Vec<&super::flatten::Insn> {
+    insns
+        .iter()
+        .filter(|insn| match insn {
+            super::flatten::Insn::Op { opname, .. } => {
+                opname.as_str() != super::flatten::OPNAME_LIVE && opname.as_str() != "ref_copy"
+            }
+            super::flatten::Insn::Label(label) => {
+                // Trampoline labels — canonical synthesises `link*`
+                // names via `flatten.py:306-334 insert_renamings`;
+                // walker uses `epsilon3_link_*` names via
+                // `emit_trampoline_for_multi_pred_link`.  Both express
+                // the same per-link renaming; filter both so the
+                // comparison only sees runtime-visible Labels.
+                !label.name.starts_with("link") && !label.name.starts_with("epsilon3_link")
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// Splice-audit helper: structural equality on `Operand`.
+/// Compares Register kind+index, Const literal values, ListOfKind
+/// content recursively.  `Operand::Descr` and
+/// `Operand::IndirectCallTargets` compare by pointer identity
+/// (`Rc::ptr_eq` / `Arc::ptr_eq`); `assembler.py:197-206` dedups
+/// runtime descrs by Python `id(x)`, so the splice-audit treats two
+/// distinct Rc/Arc allocations as different descrs even when their
+/// semantic payload happens to match.  This is the conservative
+/// choice: splice eligibility errs toward false negatives (denying
+/// splice when descrs are structurally equal but allocated twice)
+/// rather than false positives (marking splice-ready when descrs
+/// actually differ).  `ignore_label_names` is set under the lax
+/// audit mode where walker's pointer-derived `block<addr>` names and
+/// canonical's ordinal `block<N>` names are treated as positionally
+/// equivalent.
+fn phase4_operand_eq(
+    a: &super::flatten::Operand,
+    b: &super::flatten::Operand,
+    ignore_label_names: bool,
+) -> bool {
+    use super::flatten::Operand;
+    match (a, b) {
+        (Operand::Register(x), Operand::Register(y)) => x.kind == y.kind && x.index == y.index,
+        (Operand::ConstInt(x), Operand::ConstInt(y)) => x == y,
+        (Operand::ConstRef(x), Operand::ConstRef(y)) => x == y,
+        (Operand::ConstFloat(x), Operand::ConstFloat(y)) => x == y,
+        (Operand::TLabel(x), Operand::TLabel(y)) => ignore_label_names || x.name == y.name,
+        (Operand::ListOfKind(x), Operand::ListOfKind(y)) => {
+            x.kind == y.kind && phase4_operand_slice_eq(&x.content, &y.content, ignore_label_names)
+        }
+        (Operand::Descr(x), Operand::Descr(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Operand::IndirectCallTargets(x), Operand::IndirectCallTargets(y)) => {
+            // Compare the per-call-site target list by element identity
+            // (`Arc::ptr_eq`).  `assembler.py:197-206` dedups the runtime
+            // set by Python `id(x)`, so distinct JitCode runtime adapters
+            // for the same call site would diverge there even when their
+            // structural payload happens to match.
+            x.lst.len() == y.lst.len()
+                && x.lst
+                    .iter()
+                    .zip(y.lst.iter())
+                    .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+        }
+        _ => false,
+    }
+}
+
+fn phase4_operand_slice_eq(
+    a: &[super::flatten::Operand],
+    b: &[super::flatten::Operand],
+    ignore_label_names: bool,
+) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| phase4_operand_eq(x, y, ignore_label_names))
+}
+
+fn phase4_register_opt_eq(
+    a: &Option<super::flatten::Register>,
+    b: &Option<super::flatten::Register>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.kind == y.kind && x.index == y.index,
+        _ => false,
+    }
+}
+
+/// Splice-audit helper: structural equality on a single `Insn`.
+fn phase4_insn_eq(
+    a: &super::flatten::Insn,
+    b: &super::flatten::Insn,
+    ignore_label_names: bool,
+) -> bool {
+    use super::flatten::Insn;
+    match (a, b) {
+        (Insn::Label(x), Insn::Label(y)) => ignore_label_names || x.name == y.name,
+        (Insn::Unreachable, Insn::Unreachable) => true,
+        (
+            Insn::Op {
+                opname: ao,
+                args: aa,
+                result: ar,
+            },
+            Insn::Op {
+                opname: bo,
+                args: ba,
+                result: br,
+            },
+        ) => {
+            ao == bo
+                && phase4_operand_slice_eq(aa, ba, ignore_label_names)
+                && phase4_register_opt_eq(ar, br)
+        }
+        _ => false,
+    }
+}
+
+/// Splice-audit readiness predicate.  Returns `true` if walker and
+/// canonical Insn sequences are byte-equivalent modulo pyre-only
+/// walker emits (`-live-`, `ref_copy`) and canonical-only trampoline
+/// Labels.  Filtering follows the same conventions as the
+/// `[phase4-diff-nolive-noref_copy]` probe and additionally drops
+/// canonical link Labels so the comparison reflects what production
+/// runtime actually consumes.
+///
+/// `ignore_label_names=false` (strict): block Label names must match
+/// exactly — walker today emits `block<SpamBlock-Rc-addr>` while
+/// canonical emits `block<ordinal>`, so strict mode reports 0 / N
+/// graphs eligible pending the naming bridge.
+///
+/// `ignore_label_names=true` (lax): position-aligned Labels compare
+/// equal regardless of name.  Lax-eligible counts measure how many
+/// graphs would land splice-ready once the naming bridge replaces
+/// walker's address-based names with canonical ordinals.
+///
+/// PyPy parity: byte_equivalent => walker emits the same Insn
+/// sequence that `flatten_graph(graph, regallocs, cpu)` would emit
+/// (`flatten.py:63-70`), modulo documented walker deviations.  A
+/// `true` strict result is the gate that lets a follow-up change
+/// replace walker's `ssarepr.insns` with canonical's at zero behavior
+/// change.
+fn phase4_byte_equivalent(
+    walker_insns: &[super::flatten::Insn],
+    canonical_insns: &[super::flatten::Insn],
+    ignore_label_names: bool,
+) -> bool {
+    let w_filtered = phase4_filter_compare_eligible(walker_insns);
+    let c_filtered = phase4_filter_compare_eligible(canonical_insns);
+    if w_filtered.len() != c_filtered.len() {
+        return false;
+    }
+    w_filtered
+        .iter()
+        .zip(c_filtered.iter())
+        .all(|(w, c)| phase4_insn_eq(w, c, ignore_label_names))
+}
+
+/// Splice-audit diagnostic: return the index + (walker, canonical)
+/// of the first divergent Insn pair in the filter-eligible sequence,
+/// or `None` if the two streams are byte-equivalent.  Filtered_len
+/// mismatch returns `Some((min_len, …))` with the diverging length-
+/// boundary pair (or `None`-sentinel pair on the shorter side).  Used
+/// by the `PYRE_PHASE4_SPLICE_AUDIT` probe to surface the first
+/// concrete Register-index / opname divergence on graphs where
+/// filtered_len matches but eligibility fails.
+fn phase4_first_divergence(
+    walker_insns: &[super::flatten::Insn],
+    canonical_insns: &[super::flatten::Insn],
+    ignore_label_names: bool,
+) -> Option<(
+    usize,
+    Option<super::flatten::Insn>,
+    Option<super::flatten::Insn>,
+)> {
+    let w_filtered = phase4_filter_compare_eligible(walker_insns);
+    let c_filtered = phase4_filter_compare_eligible(canonical_insns);
+    let n = w_filtered.len().min(c_filtered.len());
+    for i in 0..n {
+        if !phase4_insn_eq(w_filtered[i], c_filtered[i], ignore_label_names) {
+            return Some((i, Some(w_filtered[i].clone()), Some(c_filtered[i].clone())));
+        }
+    }
+    if w_filtered.len() != c_filtered.len() {
+        return Some((
+            n,
+            w_filtered.get(n).map(|insn| (*insn).clone()),
+            c_filtered.get(n).map(|insn| (*insn).clone()),
+        ));
+    }
+    None
 }
 
 /// The next-block label is recognised as `Insn::Label(L)`, matching
@@ -872,26 +1195,17 @@ fn fresh_variable_for_state(
     }
 }
 
-/// CFG-level Variable-pair collector for the SSARepr-side
-/// `SSAReprRegAllocator::coalesce_variables` consumer — port of
-/// `rpython/tool/algo/regalloc.py:79-96 RegAllocator.coalesce_variables`.
+/// CFG-level Variable-pair collector — port of
+/// `rpython/tool/algo/regalloc.py:79-96
+/// RegAllocator.coalesce_variables`.
 ///
 /// Iterates `graph.iterblocks()` → `block.exits` → paired
 /// `(link.args[i], link.target.inputargs[i])` (matching upstream's
 /// `for i, v in enumerate(link.args): self._try_coalesce(v,
-/// link.target.inputargs[i])`).  Projects each Variable through
-/// `walker_slot_for_variable`, yielding `(source_slot, target_slot)`
-/// u16 pairs ready for `SSAReprRegAllocator::try_coalesce`.
-///
-/// Why Variable-keyed, not FrameState-keyed: RPython has no
-/// FrameState indirection — Variables carry their own UnionFind
-/// identity (`regalloc.py:98-101 isinstance(v, Variable)`).  pyre's
-/// SSARepr-side regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
-/// ADAPTATION), so the helper projects Variables back onto walker
-/// SSA slots at the point of collection.  It must not fall back to
-/// graph-regalloc colors: those are post-coalescing color IDs, not
-/// pre-regalloc SSA slots, and feeding them back into
-/// `SSAReprRegAllocator::try_coalesce` would mix two different domains.
+/// link.target.inputargs[i])`).  Returns Variable pairs directly,
+/// matching upstream's `_try_coalesce(v1, v2)` Variable-direct
+/// shape.  Slot projection (where required by pyre's u16-keyed
+/// SSARepr regalloc) happens at the consumer.
 ///
 /// Filter: only Ref-kind pairs are emitted, matching the per-kind
 /// gate inside `allocate_registers` (`regalloc.rs:670-677`).  Every
@@ -904,16 +1218,8 @@ fn fresh_variable_for_state(
 /// separately and don't participate in coalesce.
 fn collect_cfg_coalesce_pairs(
     graph: &super::flow::FunctionGraph,
-    walker_slot_for_variable: &[Option<u16>],
-) -> Vec<(u16, u16)> {
-    let walker_slot = |variable: &super::flow::Variable| -> Option<u16> {
-        walker_slot_for_variable
-            .get(variable.id.0 as usize)
-            .copied()
-            .flatten()
-    };
-
-    let mut pairs: Vec<(u16, u16)> = Vec::new();
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
         for link_ref in &block_borrow.exits {
@@ -940,17 +1246,24 @@ fn collect_cfg_coalesce_pairs(
                 {
                     continue;
                 }
-                let kind = dst_variable.kind.unwrap_or(Kind::Ref);
-                if kind != Kind::Ref {
+                // `regalloc.py:99-100 _try_coalesce` predicates on
+                // `consider_var(v) and consider_var(w)`; the Ref-kind
+                // pass requires both endpoints to be Ref.
+                if src_variable.kind != Some(Kind::Ref) || dst_variable.kind != Some(Kind::Ref) {
                     continue;
                 }
-                let Some(src_slot) = walker_slot(&src_variable) else {
+                // `regalloc.py:98 _try_coalesce` rejects `v is w` before
+                // any further work — an inputarg forwarded unchanged
+                // through `link.args[i] == target.inputargs[i]` has
+                // nothing to coalesce with itself.  Pyre's pre-merge
+                // into union-find treats same-VariableId as a no-op,
+                // but emitting the pair still costs a `find` lookup
+                // per side; drop it at the source to match PyPy's
+                // self-pair short-circuit.
+                if src_variable.id == dst_variable.id {
                     continue;
-                };
-                let Some(dst_slot) = walker_slot(&dst_variable) else {
-                    continue;
-                };
-                pairs.push((src_slot, dst_slot));
+                }
+                pairs.push((src_variable.id, dst_variable.id));
             }
         }
     }
@@ -1779,9 +2092,16 @@ fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValu
 fn exception_edge_vars(
     graph: &mut super::flow::FunctionGraph,
 ) -> (super::flow::Variable, super::flow::Variable) {
+    // `last_exception/>i` (Kind::Int) + `last_exc_value/>r` (Kind::Ref)
+    // per `assembler.py:220`.  Matches the walker emit at
+    // `codewriter.rs:4491` / `:4509` and the fixture etype/evalue kinds
+    // at `flatten.rs:5495-5496` / `:7649-7650`.  Untyped Variables
+    // crash the canonical SSARepr build's `regalloc_color` when an
+    // exception edge propagates them into a colored slot
+    // (raise_catch_loop reproducer 2026-05-25).
     (
-        graph.fresh_untyped_variable(),
-        graph.fresh_untyped_variable(),
+        graph.fresh_variable(Kind::Int),
+        graph.fresh_variable(Kind::Ref),
     )
 }
 
@@ -2042,9 +2362,7 @@ fn mergeblock(
             // a different block's FrameState.  The supersede branch
             // and the fresh-path `candidates.insert(0, ...)` already
             // preserve the head-of-list invariant; the match branch
-            // does the same.  Retires when the Task #227 walker
-            // restructure replaces PC sequencing with a pendingblocks-driven
-            // walker.
+            // does the same.
             if index != 0 {
                 candidates.remove(index);
                 candidates.insert(0, block.clone());
@@ -2058,8 +2376,8 @@ fn mergeblock(
             }
         }
         let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
-        // Task #227.3 SpamBlockRef enumeration — record the
-        // supersede-newblock in walker-visit order.
+        // Record the supersede-newblock in walker-visit order so the
+        // post-walk drain enumerates it.
         all_walker_blocks.push(newblock.clone());
         newblock.block().borrow_mut().inputargs = newstate.getvariables();
         append_exit(
@@ -2179,6 +2497,16 @@ fn record_graph_op(
 /// `Variable` with the SSARepr slot the walker assigned in the same
 /// emit.  No-op when `var` is `None` (residual_call with `ResKind::Void`,
 /// non-portal CodeWriter, etc.).
+///
+/// **Overwrite semantics**: when the same `Variable` is paired across
+/// multiple emit sites (e.g. an inputarg `Variable` initially paired
+/// with its parameter slot, then re-paired with a stack slot when a
+/// `LOAD_FAST` push lands the same `Variable` on the stack), the most
+/// recent pairing wins.  `walker_slot_for_variable[v.id]` therefore
+/// reflects "the slot this Variable currently lives in" at the walk
+/// point of the last `pair_walker_slot` call — not "the Variable's
+/// home slot".  Use [`pair_walker_slot_if_absent`] when the caller
+/// wants first-write-wins instead.
 fn pair_walker_slot(
     table: &mut Vec<Option<u16>>,
     var: Option<super::flow::Variable>,
@@ -2216,6 +2544,98 @@ fn pair_walker_slot_if_absent(
             table[idx] = Some(walker_slot);
         }
     }
+}
+
+/// Derive scratch↔inputarg coalesce pairs from
+/// `walker_slot_for_variable`, feeding
+/// [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
+/// so the canonical graph regalloc reproduces walker's slot pinning.
+///
+/// Walker pins every Variable it writes to a Python local-`i` register
+/// to `walker_slot=i` via [`pair_walker_slot`].  Canonical graph
+/// regalloc does not see those pins — its `RegAllocator` only knows
+/// the graph's `link.args↔target.inputargs` pairs (which all locals
+/// share the same inputarg Variable in upstream RPython, but in pyre
+/// each `LOAD_FAST`/`STORE_FAST` walker emit creates a fresh scratch
+/// Variable).  The result is canonical assigns scratch Variables to
+/// arbitrary colors `>= nlocals` while walker has them at color `i`.
+///
+/// This helper returns `(scratch_id, inputarg_id)` pairs for every
+/// non-inputarg Variable walker pinned to slot `i ∈ 0..n_args`,
+/// matched against `graph.startblock.inputargs[i]`.  Feeding the pairs
+/// to [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
+/// pre-coalesces them in the canonical union-find so chordal coloring
+/// gives the unified cluster a single color, which
+/// `enforce_input_args` then rotates onto the `0..n_args-1` slot —
+/// matching walker's slot-pinned color exactly.
+///
+/// The slot upper bound is `n_args` (function parameter count), not
+/// `nlocals`.  Walker's `walker_slot_for_variable[scratch] = Some(i)`
+/// means "scratch represents Python local i", with semantics defined
+/// by `code.varnames[i]`.  Canonical's `startblock.inputargs` only
+/// holds entries for function parameters followed by portal red args
+/// (`graph_entry_inputargs`); `inputargs[n_args..n_args+2]` are
+/// `[portal_frame, portal_ec]`, NOT Python locals `n_args..nlocals`.
+///
+/// Pinning a walker-Python-local-i scratch with `inputargs[i]` for
+/// `i >= n_args` would semantically coalesce different things
+/// (Python local i with portal frame/ec) and force canonical regalloc
+/// to assign the same register to both — visible only via the probe
+/// today, but would corrupt runtime state if canonical's SSARepr ever
+/// became production.  Body-defined Python locals `n_args..nlocals`
+/// have no canonical inputarg counterpart in pyre today; the
+/// architecturally-correct fix (PyPy parity) is to extend
+/// `graph_entry_inputargs` to seed all `nlocals` slots.
+///
+/// PRE-EXISTING-ADAPTATION: the upstream
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` signature
+/// has no extra pre-coalesce parameter because PyPy's flowgraph never
+/// produces scratch local-`i` Variables disjoint from the
+/// `startblock.inputargs[i]` Variable — every read/write of local `i`
+/// flows through the same Variable.  Pyre's walker creates fresh
+/// scratch Variables per emit, so the canonical regalloc needs this
+/// pre-coalesce hint to converge with walker's color assignments.
+/// Retires when the walker is replaced with a graph-only emit
+/// pipeline.
+fn derive_walker_pin_coalesce_pairs(
+    graph: &super::flow::FunctionGraph,
+    walker_slot_for_variable: &[Option<u16>],
+    n_args: usize,
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let inputargs = graph.startblock.borrow().inputargs.clone();
+    let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
+    for (var_id_usize, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
+        let Some(slot) = maybe_slot else { continue };
+        let slot_idx = *slot as usize;
+        if slot_idx >= n_args {
+            // Slot above function-parameter range — either a body-
+            // defined Python local (`n_args..nlocals`, no canonical
+            // inputarg counterpart) or a stack slot (`>= nlocals`,
+            // walker's chordal coloring assigns it freely).  Both
+            // cases need the orthodox PyPy parity fix (extend
+            // `graph_entry_inputargs` to nlocals) before a meaningful
+            // pin can be derived.
+            continue;
+        }
+        let Some(inputarg_value) = inputargs.get(slot_idx) else {
+            continue;
+        };
+        let Some(inputarg_var) = inputarg_value.as_variable() else {
+            continue;
+        };
+        let scratch_id = super::flow::VariableId(var_id_usize as u32);
+        if inputarg_var.id == scratch_id {
+            // The inputarg itself was paired to its own slot — no
+            // coalesce needed (it's already at the right color via
+            // `enforce_input_args`).
+            continue;
+        }
+        if inputarg_var.kind != Some(Kind::Ref) {
+            continue;
+        }
+        pairs.push((scratch_id, inputarg_var.id));
+    }
+    pairs
 }
 
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
@@ -2613,14 +3033,6 @@ fn emit_frontend_bool(
     // `SSARepr` registers still live in two regalloc colorings even
     // though Phase 3c (commit `bc0d6a06c4`) has already collapsed the
     // dual emitter into a single walker-local `SSARepr`.
-    //
-    // Convergence path: Task #229 (TmpVarEnv) replaces the SSA-side
-    // `scratch_truth` slot with a `fresh_var(Kind::Int)` graph Variable so
-    // the same Variable drives both the front-end exitswitch and the
-    // flatten-emitted `goto_if_not`. Once that lands, lower `bool` as a
-    // residual_call to `truth_fn` in the same pass that lowers other
-    // graph ops to assembler Insns and drop the second emit at the
-    // call sites below.
     emit_graph_op_with_result(
         graph,
         block,
@@ -3787,8 +4199,7 @@ impl CodeWriter {
             max_stackdepth,
             stack_base,
         } = layout;
-        // Per-arm fresh int scratch slots — Phase 2 Commit 2.2b
-        // (Tasks #158/#159/#122 plan, plan staged-sauteeing-koala).
+        // Per-arm fresh int scratch slots.
         // Each opcode handler arm that needs a transient int-typed
         // register calls `ssarepr.fresh_var(Kind::Int, scratch_int_base)`
         // (flatten.rs:`SSARepr::fresh_var`) to claim a unique pre-regalloc
@@ -3833,6 +4244,12 @@ impl CodeWriter {
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
+        // `current_depth` is kept synchronised with
+        // `current_state.stack.len()` (pyframe.py `valuestack_w`):
+        // every emit_pushvalue_ref! / popvalue_ref! callsite and every
+        // direct +=/-= maintains `current_state.stack` alongside the
+        // depth bump, so a consumer that needs the FlowValue at
+        // `stack_base + depth - 1` reads `current_state.stack.last()`.
         let mut current_depth: u16 = 0;
 
         // RPython: self.assembler = Assembler() + JitCode(graph.name, ...)
@@ -4001,6 +4418,21 @@ impl CodeWriter {
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
+        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
+        // — RPython looks up portal-ness in the registry that
+        // `setup_jitdriver` populates. pyre matches that: a code is a
+        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
+        // path (`register_portal_jitdriver`) registers before the drain
+        // runs `transform_graph_to_jitcode`, so the lookup must happen
+        // before creating the shadow graph / entry FrameState below.
+        // `merge_point_pc` is only a pyre refinement hint; `None` still
+        // means "registered portal whose exact merge PC is not known yet",
+        // not "non-portal".
+        let portal_jd_index = self
+            .callcontrol()
+            .jitdriver_sd_from_portal_graph(code as *const CodeObject);
+        let is_portal = portal_jd_index.is_some();
+
         // Populate `cpu.lowering_ctx` with the four retired-family fn
         // indices so the canonical `flatten.rs::flatten_graph(graph,
         // regallocs, _include_all_exc_links, cpu)` driver can dispatch
@@ -4032,7 +4464,18 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                portal_frame_reg,
+                // Only portal graphs include `frame_var` in
+                // `graph_entry_inputargs(code, true)`; for non-portal
+                // graphs `frame_var.id` collides with the synthesised
+                // `return_var` slot (`new_shadow_graph_with_portal_inputs`
+                // assigns `return_var = Variable(VariableId(start_inputargs.len()))`,
+                // which equals `entry_arg_slots(code)` when
+                // `portal_inputs=false` — the same id `portal_graph_inputvars`
+                // returns for `frame_var`).  Threading a non-portal
+                // `Some(frame_var)` through `get_register` resolves the
+                // call-frame operand from `return_var`'s color, corrupting
+                // canonical `lower_simple_call_hlop_to_insn` lowering.
+                portal_frame_var: if is_portal { Some(frame_var) } else { None },
             });
         }
 
@@ -4043,21 +4486,6 @@ impl CodeWriter {
         for _ in 0..num_instrs {
             labels.push(assembler.new_label());
         }
-
-        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
-        // — RPython looks up portal-ness in the registry that
-        // `setup_jitdriver` populates. pyre matches that: a code is a
-        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
-        // path (`register_portal_jitdriver`) registers before the drain
-        // runs `transform_graph_to_jitcode`, so the lookup must happen
-        // before creating the shadow graph / entry FrameState below.
-        // `merge_point_pc` is only a pyre refinement hint; `None` still
-        // means "registered portal whose exact merge PC is not known yet",
-        // not "non-portal".
-        let portal_jd_index = self
-            .callcontrol()
-            .jitdriver_sd_from_portal_graph(code as *const CodeObject);
-        let is_portal = portal_jd_index.is_some();
 
         // shadow `FunctionGraph` alongside `ssarepr`.
         //
@@ -4146,19 +4574,18 @@ impl CodeWriter {
                 all_walker_blocks.push(synthetic.clone());
                 synthetic
             });
-        // Task #227.5 per-block contiguous walker — `emit_mark_label_pc!`
-        // sets `block_switch_pending = true` at block transitions
-        // instead of switching `current_block` inline; the inner
-        // for-loop checks the flag after each per-PC emit and breaks,
-        // yielding to the outer `while let Some(pending_block) =
+        // Per-block contiguous walker — `emit_mark_label_pc!` sets
+        // `block_switch_pending = true` at block transitions instead
+        // of switching `current_block` inline; the inner for-loop
+        // checks the flag after each per-PC emit and breaks, yielding
+        // to the outer `while let Some(pending_block) =
         // pendingblocks.pop_front()` which picks up the queued new
         // block in the next iteration.  Mirrors upstream's
         // `flowcontext.py:407-416 record_block` shape where each
         // block is processed contiguously without mid-iteration
         // re-entry.  Correctness relies on the explicit `goto
         // Label("pcN")` + `Unreachable` pair emitted on the yield
-        // path (Phase 4 alignment with `flatten.py:177-258
-        // insert_exits`).
+        // path, aligning with `flatten.py:177-258 insert_exits`.
         let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
@@ -4250,14 +4677,12 @@ impl CodeWriter {
         // stays in sync at every guard/call point — matching RPython's
         // per-push/per-pop semantics.
         //
-        // Task #229 Session 1 slice: record a matching graph op pair
-        // (constant-source `int_copy` producing a fresh Int Variable +
-        // `setfield_vable_i` consuming it) alongside the SSA emission.
-        // The SSA side now mirrors that shape via
-        // `ssarepr.fresh_var(Kind::Int, ...)`,
-        // lifting `graph_num` toward `ssa_num` as Task #227 Phase 4
-        // prepares to flip `flatten_graph(graph, regallocs)` as the
-        // source of truth.
+        // Records a matching graph op pair (constant-source `int_copy`
+        // producing a fresh Int Variable + `setfield_vable_i`
+        // consuming it) alongside the SSA emission.  The SSA side
+        // mirrors that shape via `ssarepr.fresh_var(Kind::Int, ...)`
+        // so the canonical and walker streams agree on the VSD-sync
+        // scratch's liverange.
         macro_rules! emit_vsd {
             ($depth:expr, $py_pc:expr) => {
                 if is_portal {
@@ -4835,12 +5260,11 @@ impl CodeWriter {
                     // joinpoint candidate list (`flowcontext.py:426
                     // candidates = self.joinpoints.setdefault(...)`).
                     //
-                    // Task #227.5 per-block contiguous walker: when
-                    // the gate is on AND the joinpoint target differs
-                    // from `current_block`, queue the target to
-                    // `pendingblocks` (mergeblock-path queuing is
-                    // already done by mergeblock itself; joinpoint
-                    // match doesn't push automatically).
+                    // Per-block contiguous walker: when the joinpoint
+                    // target differs from `current_block`, queue the
+                    // target to `pendingblocks` (mergeblock-path
+                    // queuing is already done by mergeblock itself;
+                    // joinpoint match doesn't push automatically).
                     //
                     // Gate the re-push on `target.exits.is_empty()`
                     // matching upstream `flowcontext.py:407-475
@@ -4901,17 +5325,14 @@ impl CodeWriter {
                         py_pc,
                     );
                 };
-                // Task #227.5 yield-on-switch: when the gate is on and
-                // `new_block` differs from `current_block`, set the
-                // `block_switch_pending` flag and SKIP the inline
-                // switch (the new block has been queued to
-                // `pendingblocks` above; the outer walker loop will
-                // pop it and process its emit sequence
-                // contiguously).  The inner for-loop body checks
-                // `block_switch_pending` after each per-PC emit and
-                // breaks, yielding control.  Default (gate off):
-                // switch inline as before, preserving the PC-
-                // sequential walker's behaviour.
+                // Yield-on-switch: when `new_block` differs from
+                // `current_block`, set the `block_switch_pending`
+                // flag and SKIP the inline switch (the new block has
+                // been queued to `pendingblocks` above; the outer
+                // walker loop will pop it and process its emit
+                // sequence contiguously).  The inner for-loop body
+                // checks `block_switch_pending` after each per-PC
+                // emit and breaks, yielding control.
                 if new_block != current_block {
                     // Yield without pushing Label — the new block's
                     // outer iter at start_pc=py_pc will emit its
@@ -4974,17 +5395,16 @@ impl CodeWriter {
                     current_state = state;
                 }
                 needs_fallthrough = true;
-                // Task #227.5 emission-order tracking: push the catch
-                // landing block to `all_walker_blocks` AT FIRST EMIT
-                // (not at creation) so the drain order reflects
-                // walker emission order — catch landings emit after
-                // the main walker loop per `codewriter.rs::6907+`,
-                // so creation-order tracking would misalign with
-                // ssarepr.insns ordering.  Guard against double-push:
-                // a single catch landing may be entered multiple
-                // times if multiple catch sites share a landing
-                // label (unusual but possible per the catch_sites
-                // dedup at codewriter.rs:catch_sites).
+                // Emission-order tracking: push the catch landing
+                // block to `all_walker_blocks` AT FIRST EMIT (not at
+                // creation) so the drain order reflects walker
+                // emission order — catch landings emit after the
+                // main walker loop, so creation-order tracking would
+                // misalign with ssarepr.insns ordering.  Guard against
+                // double-push: a single catch landing may be entered
+                // multiple times if multiple catch sites share a
+                // landing label (unusual but possible per the
+                // `catch_sites` dedup).
                 if !all_walker_blocks.iter().any(|b| b == &current_block) {
                     all_walker_blocks.push(current_block.clone());
                 }
@@ -5834,9 +6254,9 @@ impl CodeWriter {
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
                 needs_fallthrough = true;
-                // Task #227.5 per-block walker: reset switch flag at the
-                // start of every new block iteration so a previous
-                // block's queued switch doesn't bleed into this one.
+                // Per-block walker: reset switch flag at the start of
+                // every new block iteration so a previous block's
+                // queued switch doesn't bleed into this one.
                 block_switch_pending = false;
                 // Block-entry `Label(block)` per `flatten.py:116
                 // self.emitline(Label(block))`.  Emitted at the moment
@@ -5859,22 +6279,20 @@ impl CodeWriter {
                 // `record_block` assigns `block.operations` from the
                 // recorder.  Pyre iterates PCs linearly because the walker
                 // emits directly into program-wide `ssarepr.insns`.
-                // Convergence: Task #227 Phase 4 + Task #212 (per-block
-                // `record_block` + post-walk `flatten_graph(graph,
-                // regallocs)` per `codewriter.py:44-67`).
                 for py_pc in start_pc..num_instrs {
                     // Exception handler entry: Python resets stack depth to the
                     // handler's specified depth and arrives only from
                     // `catch_exception` edges, not from sequential fallthrough.
                     if handler_depth_at.get(py_pc).map_or(false, |v| v.is_some()) {
-                        // Phase 4 slice 4: when reached sequentially from
-                        // a prior PC (start_pc != py_pc), break.  Handler
-                        // PCs are reached only via exception edges in
-                        // upstream RPython (`flowcontext.py:130-156
-                        // guessexception`); pyre's analogous catch landings
-                        // `emit_goto!(handler_py_pc)` creates the
-                        // handler-entry block, which the outer-loop second
-                        // drain pass walks when start_pc == handler_py_pc.
+                        // When reached sequentially from a prior PC
+                        // (start_pc != py_pc), break.  Handler PCs are
+                        // reached only via exception edges in upstream
+                        // RPython (`flowcontext.py:130-156
+                        // guessexception`); pyre's analogous catch
+                        // landings `emit_goto!(handler_py_pc)` create
+                        // the handler-entry block, which the outer-loop
+                        // second drain pass walks when start_pc ==
+                        // handler_py_pc.
                         if start_pc != py_pc {
                             break;
                         }
@@ -5891,13 +6309,25 @@ impl CodeWriter {
                             handler_depth_at.get(py_pc).copied().flatten()
                         {
                             current_depth = handler_depth;
+                            // Bare handler entry without a recorded
+                            // FrameState: only the depth is known, so
+                            // overwrite the whole symbolic stack with
+                            // null sentinels.  `resize` would preserve
+                            // any prefix carried over from the predecessor
+                            // block, leaking stale symbolic values into
+                            // the handler entry; a consumer reading
+                            // `current_state.stack[i]` here sees the
+                            // sentinel and falls back to the raw
+                            // `stack_base + i` register.
+                            current_state.stack =
+                                vec![null_stack_sentinel(); handler_depth as usize];
                         }
                     }
                     // RPython flatten.py: Label(block) at block entry
                     emit_mark_label_pc!(py_pc);
-                    // Task #227.5 yield-on-switch: if `emit_mark_label_pc!`
-                    // detected a block boundary at this PC and queued the
-                    // new block to `pendingblocks`, break the inner loop
+                    // Yield-on-switch: if `emit_mark_label_pc!` detected
+                    // a block boundary at this PC and queued the new
+                    // block to `pendingblocks`, break the inner loop
                     // and let the outer walker pop the new block in its
                     // own iteration.  The new block's outer iter then
                     // re-enters at PC=py_pc and the same
@@ -5906,12 +6336,10 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")`
-                    // emission retired.  The walker emits one
-                    // block-identity `Label(block)` at block entry
-                    // (`flatten.py:116` parity) and tracks each
-                    // Python PC's `-live-` marker position in
-                    // `walker_pc_live_marker_pos` for `pc_map`
+                    // The walker emits one block-identity `Label(block)`
+                    // at block entry (`flatten.py:116` parity) and
+                    // tracks each Python PC's `-live-` marker position
+                    // in `walker_pc_live_marker_pos` for `pc_map`
                     // population at finalize time.
                     depth_at_pc[py_pc] = current_depth;
 
@@ -5921,9 +6349,11 @@ impl CodeWriter {
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
-                    // live_marker_indices_by_pc uses last-wins to resolve
-                    // to op2 so blackhole guard-failure resume lands past
-                    // the merge point.
+                    // `walker_pc_live_marker_pos[py_pc]` accumulates both
+                    // positions; the post-walk resolver in `resolve_walker_pc`
+                    // picks the FIRST per-PC entry whose block contributes
+                    // non-empty content to the final SSARepr, so blackhole
+                    // guard-failure resume lands consistently.
                     if loop_header_pcs.contains(&py_pc) {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
@@ -7002,19 +7432,29 @@ impl CodeWriter {
                                 .expect("load_global_fn returns Ref result")
                             } else {
                                 // Non-portal helpers: emit_vable_getfield_ref!
-                                // returns None (no graph dual-write of ns / code
-                                // reads because frame_var is not a startblock
-                                // inputarg there), so no graph SpaceOp produces
-                                // the loaded callable.  Allocate a fresh Ref
-                                // Variable anyway so the downstream simple_call
-                                // HLOp's callable arg has a Variable identity to
-                                // resolve through walker_slot; without this the
-                                // simple_call sees a Variable produced by
-                                // fresh_ref_value with no graph op AND no
-                                // walker_slot pairing, causing canonical's
-                                // get_register to fall through to graph regalloc
-                                // and return u16::MAX (Reg(65535)).
-                                graph.fresh_variable(Kind::Ref)
+                                // returned None (frame_var is not a startblock
+                                // inputarg here), so no ns/code Ref Variables
+                                // exist.  Still record a graph SpaceOp with
+                                // `loaded` as op.result and just `namei` as the
+                                // Int arg, so canonical SSARepr build's
+                                // `make_dependencies` (regalloc.py:38-77) sees
+                                // `loaded` as an op.result rather than an
+                                // unbound Variable; without this the downstream
+                                // simple_call HLOp panics in `regalloc_color`
+                                // with "missing color for Variable".
+                                record_residual_call_graph_op(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    load_global_fn_idx,
+                                    CallFlavor::Plain,
+                                    vec![super::flow::Constant::signed(raw_namei).into()],
+                                    vec![],
+                                    vec![],
+                                    vec![Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                )
+                                .expect("load_global_fn returns Ref result")
                             };
                             pair_walker_slot(
                                 &mut walker_slot_for_variable,
@@ -8718,15 +9158,14 @@ impl CodeWriter {
 
             for site in &catch_sites {
                 emit_mark_label_catch_landing!(site.landing_label);
-                // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
-                // reassigns `current_block` to the pre-allocated catch
-                // landing block on every iteration, so subsequent graph
-                // emits in this loop body land in a block reachable from
+                // `emit_mark_label_catch_landing!` reassigns
+                // `current_block` to the pre-allocated catch landing
+                // block on every iteration, so subsequent graph emits
+                // in this loop body land in a block reachable from
                 // `graph.iterblocks()`.  Lock the invariant in debug
-                // builds — Session 17's exception unwind PY_NULL graph
-                // dual-write (codewriter.rs:5481-5491) and any future
-                // catch-landing dual-write rely on this targeting being
-                // intact.
+                // builds: the exception unwind PY_NULL graph dual-
+                // write below and any future catch-landing dual-write
+                // rely on this targeting being intact.
                 debug_assert_eq!(
                     current_block, site.landing,
                     "catch_landing block-targeting invariant violated: \
@@ -8921,7 +9360,7 @@ impl CodeWriter {
                         exc_slot
                     );
                 }
-                // CATCH-LANDING dual-write follow-up (Task #227).
+                // CATCH-LANDING dual-write follow-up.
                 // RPython parity: `pypy/interpreter/pyopcode.py` exception
                 // handler entry pushes the lasti box (`push_lasti` arm) and
                 // the captured exc_value onto the value stack; both writes
@@ -8938,8 +9377,7 @@ impl CodeWriter {
                 // Push lasti graph dual-write — STILL DEFERRED:
                 //   - `box_int(lasti_py_pc)` lowers to a `residual_call_*`
                 //     shape that pyre's graph layer does not yet record
-                //     (the `residual_call_*` family has zero graph
-                //     coverage as of Session 17 — `flatten_arg` panics on
+                //     (`flatten_arg` panics on
                 //     `SpaceOperationArg::Descr`, and per-call-shape
                 //     variant routing for `residual_call_ir_r` / `_r_r` /
                 //     `_r_v` / `_r_i` is absent).  Adding the
@@ -8948,12 +9386,12 @@ impl CodeWriter {
                 //     use: setarrayitem) that breaks RPython's
                 //     "every Variable has exactly one def" invariant.
                 //
-                // Block-targeting (was Session 17 blocker #1) is CLOSED:
-                // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
-                // runs at the head of every iteration and reassigns
-                // `current_block` to the pre-allocated catch landing
-                // block.  The invariant is locked in via
-                // `debug_assert_eq!` at the head of the loop body.
+                // Block-targeting is handled by
+                // `emit_mark_label_catch_landing!`, which runs at the
+                // head of every iteration and reassigns `current_block`
+                // to the pre-allocated catch landing block.  The
+                // invariant is locked in via `debug_assert_eq!` at the
+                // head of the loop body.
                 //
                 // The push_lasti dual-write joins when graph coverage for
                 // `residual_call_*` (via `flatten_arg` Descr handling +
@@ -8962,7 +9400,7 @@ impl CodeWriter {
                 emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
             }
-        } // end outer drain loop (Phase 4 slice 4)
+        } // end outer drain loop
 
         // RPython flatten.py parity: every code path ends with an explicit
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
@@ -9000,19 +9438,13 @@ impl CodeWriter {
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
         //
-        // Compute graph regallocs ONCE pre-drain so walker
-        // insert_renamings and any downstream consumer share identical
-        // colors (HashMap iteration non-determinism between two
-        // separate regalloc calls would otherwise diverge bridge-
-        // fallback Variables' colors).
-        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
-        // BEFORE `walker_post_walk_insert_renamings` reads
-        // it.  The same pairing pass also runs downstream (idempotent
-        // via `pair_walker_slot_if_absent`), but the post-walk
-        // `insert_renamings` color resolution needs the bridge entries
-        // present at the moment the helper runs.
+        // BEFORE graph regalloc + `walker_post_walk_insert_renamings`
+        // read it.  The same pairing pass also runs downstream
+        // (idempotent via `pair_walker_slot_if_absent`);
+        // `derive_walker_pin_coalesce_pairs` needs the full pin map
+        // to project scratch↔inputarg pre-coalesce pairs onto the
+        // canonical graph regalloc below.
         for spam in &all_walker_blocks {
             let Some(state) = spam.framestate() else {
                 continue;
@@ -9029,6 +9461,59 @@ impl CodeWriter {
                 }
             }
         }
+        // Compute graph regallocs ONCE pre-drain so walker
+        // insert_renamings and any downstream consumer share identical
+        // colors (HashMap iteration non-determinism between two
+        // separate regalloc calls would otherwise diverge bridge-
+        // fallback Variables' colors).
+        //
+        // PRE-EXISTING-ADAPTATION: thread walker pin pairs into
+        // canonical Ref regalloc via
+        // `perform_register_allocation_all_kinds_with_pairs`.  Each
+        // pair `(scratch_var, inputarg_var)` requests that the
+        // chordal coloring assign them the same color so
+        // `enforce_input_args`'s rotation lands the scratch on its
+        // semantic local-i slot — matching walker's
+        // `walker_slot_for_variable` pinning regime exactly.
+        //
+        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): CFG
+        // `link.args ↔ target.inputargs` pairs are also threaded
+        // through the pre-merge.  In PyPy
+        // (`regalloc.py:79-96 coalesce_variables` + `:98-112
+        // _try_coalesce`), CFG pairs are coalesced post-
+        // `make_dependencies` with an interference check;
+        // pre-merging here bypasses that check and silently merges
+        // pairs PyPy would reject.  The walker downstream path
+        // `walker_post_walk_insert_renamings` currently depends on
+        // these pairs sharing colors to keep the emitted `ref_copy`
+        // count bounded — honouring PyPy's interference check
+        // surfaces multi-bench timeouts (fib_recursive, fannkuch,
+        // synth/comprehensions).  The interference-aware path needs
+        // `walker_post_walk_insert_renamings` to absorb the extra
+        // copies efficiently before this can flip — separate
+        // restructure.
+        let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
+            &graph,
+            &walker_slot_for_variable,
+            entry_arg_slots(code),
+        );
+        // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
+        // `flatten.py:154 insert_renamings` mutates the graph.
+        // Collect once here so both the canonical (above) and
+        // SSARepr-side (below at `allocate_registers`) consumers
+        // share the same pre-renaming pair set.
+        let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        let canonical_ref_coalesce_pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> =
+            walker_pin_pairs
+                .iter()
+                .copied()
+                .chain(cfg_variable_pairs.iter().copied())
+                .collect();
+        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
+            &graph,
+            &canonical_ref_coalesce_pairs,
+        );
+        super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -9205,7 +9690,16 @@ impl CodeWriter {
             std::env::var("PYRE_PHASE4_BUILD_CANONICAL").ok().as_deref() == Some("1");
         let phase4_diff_canonical =
             std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1");
-        if phase4_build_canonical || phase4_diff_canonical {
+        // Per-graph audit: when walker and canonical Insn sequences
+        // are byte-equivalent (after filtering pyre-only walker
+        // emits and canonical-only trampolines) the graph can be
+        // safely served from `canonical_ssarepr.insns` per
+        // `codewriter.py:53 ssarepr = flatten_graph(graph, regallocs,
+        // cpu)`.  This emits a `[phase4-splice-audit]` report only;
+        // no production behavior change.
+        let phase4_splice_audit =
+            std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
+        if phase4_build_canonical || phase4_diff_canonical || phase4_splice_audit {
             let mut canonical_regallocs = graph_regallocs.clone();
             let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
@@ -9214,6 +9708,62 @@ impl CodeWriter {
                 Some(self.cpu()),
             );
             if phase4_diff_canonical {
+                // color-budget Step A probe: surface Register indices
+                // that exceed `regallocs[kind].num_colors` BEFORE the
+                // downstream `[phase4-canonical-assemble]` PANIC at
+                // `assembler.rs:3970-3987 touch_ref_reg_or_pool_slot`.
+                // The PANIC drops most diagnostic context (only the
+                // `(reg, limit)` pair survives); this scan enumerates
+                // every violation per graph along with the originating
+                // insn index + opname + role (arg/result/list) so the
+                // regalloc-side mutation that violated the budget
+                // (`enforce_input_args swapcolors`, post-chord
+                // adjustment, etc.) can be audited in Step B.
+                let num_int_canonical =
+                    canonical_regallocs[super::flatten::Kind::Int.index()].num_colors;
+                let num_ref_canonical =
+                    canonical_regallocs[super::flatten::Kind::Ref.index()].num_colors;
+                let num_float_canonical =
+                    canonical_regallocs[super::flatten::Kind::Float.index()].num_colors;
+                let color_budget_violations = phase4_scan_color_budget_violations(
+                    &canonical_ssarepr.insns,
+                    num_int_canonical,
+                    num_ref_canonical,
+                    num_float_canonical,
+                );
+                // Always log num_colors triple so the [PANIC] correlation
+                // is visible even when the SSARepr-level scan finds 0
+                // violations (e.g. the offending register index comes
+                // from a non-SSARepr source the scan does not cover).
+                eprintln!(
+                    "[phase4-color-budget-summary] graph={} num_int={num_int_canonical} \
+                     num_ref={num_ref_canonical} num_float={num_float_canonical} \
+                     violations={}",
+                    canonical_ssarepr.name,
+                    color_budget_violations.len(),
+                );
+                if !color_budget_violations.is_empty() {
+                    for (insn_idx, opname, role, kind_str, color, num_colors) in
+                        color_budget_violations.iter().take(8)
+                    {
+                        eprintln!(
+                            "[phase4-color-budget] graph={} insn={insn_idx} \
+                             opname={opname} role={role} kind={kind_str} \
+                             color={color} num_colors={num_colors}",
+                            canonical_ssarepr.name,
+                        );
+                    }
+                    eprintln!(
+                        "[phase4-color-budget] graph={} TOTAL violations={} \
+                         num_int={num_int_canonical} num_ref={num_ref_canonical} \
+                         num_float={num_float_canonical} \
+                         (showed first {} of {})",
+                        canonical_ssarepr.name,
+                        color_budget_violations.len(),
+                        color_budget_violations.len().min(8),
+                        color_budget_violations.len(),
+                    );
+                }
                 let walker_len = ssarepr.insns.len();
                 let canonical_len = canonical_ssarepr.insns.len();
                 let diff = canonical_len as i64 - walker_len as i64;
@@ -9697,6 +10247,46 @@ impl CodeWriter {
                     );
                 }
             }
+            // `phase4_byte_equivalent` filters pyre-only walker emits
+            // (`-live-` / `ref_copy`) and canonical-only trampoline
+            // Labels, then performs structural equality on the
+            // resulting Insn sequence (Register kind+index, Const
+            // literal values, opname).  An `eligible=true` graph
+            // emits the same Insn sequence
+            // `flatten.py:63-70 flatten_graph` would emit, modulo the
+            // documented walker deviations — `ssarepr.insns` could be
+            // replaced with `canonical_ssarepr.insns` on these graphs
+            // without runtime behavior change.
+            if phase4_splice_audit || phase4_diff_canonical {
+                let eligible_strict =
+                    phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, false);
+                let eligible_lax =
+                    phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, true);
+                let walker_filtered_len = phase4_filter_compare_eligible(&ssarepr.insns).len();
+                let canonical_filtered_len =
+                    phase4_filter_compare_eligible(&canonical_ssarepr.insns).len();
+                eprintln!(
+                    "[phase4-splice-audit] graph={} eligible_strict={eligible_strict} \
+                     eligible_lax={eligible_lax} \
+                     walker_filtered_len={walker_filtered_len} \
+                     canonical_filtered_len={canonical_filtered_len} \
+                     walker_raw_len={} canonical_raw_len={}",
+                    ssarepr.name,
+                    ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len(),
+                );
+                if !eligible_lax && walker_filtered_len == canonical_filtered_len {
+                    if let Some((idx, w, c)) =
+                        phase4_first_divergence(&ssarepr.insns, &canonical_ssarepr.insns, true)
+                    {
+                        eprintln!(
+                            "[phase4-splice-audit-diverge] graph={} pos={idx} walker={w:?} \
+                             canonical={c:?}",
+                            ssarepr.name,
+                        );
+                    }
+                }
+            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -9733,7 +10323,30 @@ impl CodeWriter {
         // coalesce, pyre walker NEW-DEVIATION because upstream defers
         // `*_copy` to `flatten.py:306-334`).  Both sources feed the
         // same union-find + depgraph.
-        let cfg_coalesce_pairs = collect_cfg_coalesce_pairs(&graph, &walker_slot_for_variable);
+        //
+        // SSARepr-side regalloc is u16-keyed PRE-EXISTING-ADAPTATION;
+        // project the Variable pairs (collected pre-renaming above as
+        // `cfg_variable_pairs`) through `walker_slot_for_variable`
+        // at the consumer.  Pairs whose endpoints have no walker slot
+        // pinning are silently dropped here — they still participate
+        // in the canonical graph regalloc's normal
+        // `RegAllocator::coalesce_variables` sweep
+        // (`regalloc.py:79-96`), so coloring information is not lost,
+        // only the SSARepr-side u16 projection is.
+        let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
+            .iter()
+            .filter_map(|(src, dst)| {
+                let s = walker_slot_for_variable
+                    .get(src.0 as usize)
+                    .copied()
+                    .flatten()?;
+                let d = walker_slot_for_variable
+                    .get(dst.0 as usize)
+                    .copied()
+                    .flatten()?;
+                Some((s, d))
+            })
+            .collect();
         let alloc_result = super::regalloc::allocate_registers(
             &ssarepr,
             code.varnames.len(),
@@ -9836,7 +10449,7 @@ impl CodeWriter {
                 }
             }
             let ref_coloring = &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
-            let mut probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
+            let probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
                 if let Some(var_id) = slot_to_variable_id.get(pre_slot).copied().flatten() {
                     let v_id = super::flow::VariableId(var_id);
                     if let Some(&canonical_color) = ref_coloring.get(&v_id) {

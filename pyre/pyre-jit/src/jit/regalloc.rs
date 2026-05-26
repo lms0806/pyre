@@ -23,19 +23,20 @@
 //!     `0..n-1`. Pyre's analog is the `enforce_input_args` free
 //!     function below (called by `GraphFlattener::enforce_input_args`
 //!     at `flatten.rs` to mirror `flatten.py:68 flattener.enforce_input_args()`,
-//!     and directly by the walker production path until the Phase 4
-//!     production flip retires walker-side SSARepr emission).
+//!     and directly by the walker production path until the walker
+//!     defers SSARepr emission to
+//!     `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`).
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
 //!     `num_regs[kind] = max(coloring)+1` per kind, packed into the
 //!     `JitCode`. Pyre's analog is `RegAllocator::find_num_colors`
 //!     plus the `AllocationResult.num_regs` field.
 //!
-//! ## Pyre-only deviation (Phase 4 retirement target, task #9)
+//! ## Pyre-only deviation (SSARepr-side companion allocator)
 //!
 //! Pyre's walker emits SSARepr inline rather than building a graph it
 //! later flattens.  Until the walker defers SSARepr emission to the
-//! canonical `flatten_graph(graph, regallocs, cpu)` driver, an
-//! SSARepr-side companion allocator is needed:
+//! canonical `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`
+//! driver, an SSARepr-side companion allocator is needed:
 //!
 //!   * `SSAReprRegAllocator` (declared further down) — same
 //!     `make_dependencies` / `coalesce_variables` /
@@ -134,7 +135,21 @@ impl<'a> RegAllocator<'a> {
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
-                        die_at.insert(v.id, 0);
+                        // ADAPTATION: project each Variable ID through
+                        // `_unionfind.find_rep` so pre-merged pairs
+                        // (from `perform_register_allocation_with_pairs`'s
+                        // `extra_coalesce_pairs`) share a single
+                        // live-set identity.  Walker scratch variables
+                        // pinned to a local-i inputarg slot otherwise
+                        // get distinct entries here and an interference
+                        // edge gets recorded between them — preventing
+                        // the later `try_coalesce` from merging them
+                        // (regalloc.py:106 `has_edge` early return).
+                        // When `_unionfind` has no pre-merges, find_rep
+                        // returns the input ID unchanged so this matches
+                        // upstream `regalloc.py:26-77` exactly.
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.insert(rep, 0);
                     }
                 }
             }
@@ -142,27 +157,31 @@ impl<'a> RegAllocator<'a> {
                 for arg in &op.args {
                     for v in arg.variables() {
                         if v.kind == Some(kind) {
-                            die_at.insert(v.id, i);
+                            let rep = self._unionfind.find_rep(v.id);
+                            die_at.insert(rep, i);
                         }
                     }
                 }
                 if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if v.kind == Some(kind) {
-                        die_at.insert(v.id, i + 1);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.insert(rep, i + 1);
                     }
                 }
             }
             match &block_borrow.exitswitch {
                 Some(ExitSwitch::Value(value)) => {
                     if let Some(v) = value.as_variable() {
-                        die_at.remove(&v.id);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.remove(&rep);
                     }
                 }
                 Some(ExitSwitch::Tuple(values)) => {
                     for value in values {
                         if let ExitSwitchElement::Value(value) = value {
                             if let Some(v) = value.as_variable() {
-                                die_at.remove(&v.id);
+                                let rep = self._unionfind.find_rep(v.id);
+                                die_at.remove(&rep);
                             }
                         }
                     }
@@ -172,7 +191,8 @@ impl<'a> RegAllocator<'a> {
             for link in &block_borrow.exits {
                 for arg in &link.borrow().args {
                     if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                        die_at.remove(&v.id);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.remove(&rep);
                     }
                 }
             }
@@ -181,22 +201,25 @@ impl<'a> RegAllocator<'a> {
             die_list.sort_by_key(|(time, _)| *time);
             die_list.push((usize::MAX, super::flow::VariableId(u32::MAX)));
 
-            let livevars: Vec<Variable> = block_borrow
+            let livevar_reps: Vec<super::flow::VariableId> = block_borrow
                 .inputargs
                 .iter()
                 .filter_map(FlowValue::as_variable)
                 .filter(|v| v.kind == Some(kind))
+                .map(|v| self._unionfind.find_rep(v.id))
                 .collect();
-            for (i, &v) in livevars.iter().enumerate() {
-                self._depgraph.add_node(v.id);
+            for (i, &v) in livevar_reps.iter().enumerate() {
+                self._depgraph.add_node(v);
                 for j in 0..i {
-                    self._depgraph.add_edge(livevars[j].id, v.id);
+                    // `add_edge` is a no-op for self-edges, so distinct
+                    // inputargs that pre-merge into the same rep don't
+                    // trigger a phantom interference.
+                    self._depgraph.add_edge(livevar_reps[j], v);
                 }
             }
             // upstream: `livevars = set(livevars)` — shadow the list
             // with the set rather than renaming to `alive`.
-            let mut livevars: HashSet<super::flow::VariableId> =
-                livevars.into_iter().map(|v| v.id).collect();
+            let mut livevars: HashSet<super::flow::VariableId> = livevar_reps.into_iter().collect();
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -205,15 +228,16 @@ impl<'a> RegAllocator<'a> {
                 }
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
-                        self._depgraph.add_node(result.id);
+                        let rep = self._unionfind.find_rep(result.id);
+                        self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
                         // to `livevars` only *after* the loop, so no
                         // self-edge guard is needed.
                         for &v in &livevars {
-                            self._depgraph.add_edge(v, result.id);
+                            self._depgraph.add_edge(v, rep);
                         }
-                        livevars.insert(result.id);
+                        livevars.insert(rep);
                     }
                 }
             }
@@ -263,8 +287,41 @@ impl<'a> RegAllocator<'a> {
         if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
         }
-        let v0 = self._unionfind.find_rep(v.id);
-        let w0 = self._unionfind.find_rep(w.id);
+        self.try_coalesce_ids(v.id, w.id);
+    }
+
+    /// Variable-id-keyed `try_coalesce` for external-pin pre-coalesce
+    /// (called from `perform_register_allocation_with_pairs` to honour
+    /// the walker's scratch↔inputarg slot pinning).  Skips the kind
+    /// check that [`try_coalesce`] performs; callers must ensure both
+    /// IDs name variables of `self.kind` (the pin path only generates
+    /// Ref-kind pairs, matching walker's `walker_slot_for_variable`
+    /// which only tracks Ref slots).
+    ///
+    /// Calls `_depgraph.add_node` for both endpoints BEFORE the
+    /// union/coalesce: walker scratch variables that don't appear as
+    /// op operands/results in the canonical graph aren't registered
+    /// via `make_dependencies`, so they're absent from `_depgraph.all_nodes`.
+    /// `DependencyGraph::coalesce` only modifies `neighbours` (not
+    /// `all_nodes`), so `find_node_coloring`'s `getnodes` filter would
+    /// skip a coalesced surviving node that was never explicitly
+    /// added — yielding `None` for `getcolor` and dropping the chain's
+    /// inputarg from the final coloring map.
+    fn try_coalesce_ids(&mut self, v_id: super::flow::VariableId, w_id: super::flow::VariableId) {
+        // `regalloc.py:98-99 _try_coalesce` short-circuits `if v is w:
+        // return` before touching the depgraph or union-find — a
+        // `link.arg is target.inputarg` self-edge from
+        // `coalesce_variables` has nothing to do.  The `v0 == w0` check
+        // below catches it after `find_rep`, but the identity guard
+        // avoids two `add_node` calls plus two `find_rep` lookups in
+        // the same case.
+        if v_id == w_id {
+            return;
+        }
+        self._depgraph.add_node(v_id);
+        self._depgraph.add_node(w_id);
+        let v0 = self._unionfind.find_rep(v_id);
+        let w0 = self._unionfind.find_rep(w_id);
         if v0 == w0 {
             return;
         }
@@ -336,14 +393,72 @@ impl<'a> RegAllocator<'a> {
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
 pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> GraphAllocationResult {
+    perform_register_allocation_with_pairs(graph, kind, &[])
+}
+
+/// ADAPTATION variant: runs the same `RegAllocator` pipeline as
+/// [`perform_register_allocation`] but applies `extra_coalesce_pairs`
+/// between the upstream-orthodox `coalesce_variables` and
+/// `find_node_coloring` steps.
+///
+/// Each pair `(scratch_id, inputarg_id)` requests that
+/// `scratch_id`'s post-coloring color equal `inputarg_id`'s color.
+/// The mechanism is `try_coalesce`: the two variables are unioned in
+/// the regalloc union-find (if no interference edge blocks it), so
+/// the subsequent chordal coloring assigns them the same color.
+/// `enforce_input_args` then rotates the unified cluster onto the
+/// inputarg's `0..nlocals-1` slot.
+///
+/// Upstream RPython has no analog because PyPy's flowgraph never
+/// produces "scratch local-i" Variables disjoint from the
+/// `startblock.inputargs[i]` variable — the same Variable flows
+/// through every read/write of local i.  Pyre's walker
+/// (`codewriter.rs::transform_graph_to_jitcode`) emits fresh
+/// scratch Variables for each `LOAD_FAST` / `STORE_FAST` and pins
+/// them to slot=i via `walker_slot_for_variable`; this helper lets
+/// the canonical graph regalloc honor that same pin so the bytes it
+/// emits match the walker's inline emission slot-for-slot.
+pub fn perform_register_allocation_with_pairs(
+    graph: &FlowGraph,
+    kind: Kind,
+    extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> GraphAllocationResult {
     // `rpython/tool/algo/regalloc.py:11-15`:
     //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
     //     regalloc.make_dependencies()
     //     regalloc.coalesce_variables()
     //     regalloc.find_node_coloring()
     let mut allocator = RegAllocator::new(graph, kind);
+    // ADAPTATION: pre-merge external pairs into `_unionfind` BEFORE
+    // `make_dependencies` so the live-set tracking (which projects
+    // every Variable ID through `_unionfind.find_rep`) treats each
+    // pinned scratch↔inputarg pair as a single node.  Without the
+    // pre-merge, walker scratch and the corresponding canonical
+    // inputarg get separate live entries and `make_dependencies`
+    // records an interference edge between them; the post-coalesce
+    // `try_coalesce_ids` then early-returns at the `has_edge` check
+    // (regalloc.py:106) and the pin has no effect on coloring.
+    // `find_rep` auto-creates a singleton partition for IDs not yet
+    // tracked, so unknown scratch IDs are handled safely.
+    for &(v_id, w_id) in extra_coalesce_pairs {
+        let v0 = allocator._unionfind.find_rep(v_id);
+        let w0 = allocator._unionfind.find_rep(w_id);
+        if v0 != w0 {
+            allocator._unionfind.union(v0, w0);
+        }
+    }
     allocator.make_dependencies();
     allocator.coalesce_variables();
+    // External pins — re-apply via `try_coalesce_ids` after
+    // `make_dependencies` so the surviving rep is explicitly added to
+    // `_depgraph.all_nodes` even when neither endpoint appeared as an
+    // op result/arg in the canonical graph.  With the union-find
+    // pre-merge above these calls are no-ops on the union-find side
+    // (`find_rep` already returns a common rep), but `add_node` still
+    // matters for `find_node_coloring`'s `getnodes` filter.
+    for &(v_id, w_id) in extra_coalesce_pairs {
+        allocator.try_coalesce_ids(v_id, w_id);
+    }
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::new();
@@ -408,9 +523,22 @@ pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> Grap
 /// port.  This is the input shape that the canonical
 /// `flatten_graph(graph, regallocs, ...)` driver consumes.
 pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocationResult; 3] {
+    perform_register_allocation_all_kinds_with_pairs(graph, &[])
+}
+
+/// ADAPTATION variant: invokes the per-kind
+/// `perform_register_allocation_with_pairs` for `Kind::Ref` with
+/// `ref_coalesce_pairs`.  Int and Float kinds use the empty-pair
+/// path because walker's `walker_slot_for_variable` only tracks Ref
+/// slots (every `FrameState.mergeable()` position is Ref-kind:
+/// locals, stack, last_exc pair).
+pub fn perform_register_allocation_all_kinds_with_pairs(
+    graph: &FlowGraph,
+    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> [GraphAllocationResult; 3] {
     [
         perform_register_allocation(graph, Kind::Int),
-        perform_register_allocation(graph, Kind::Ref),
+        perform_register_allocation_with_pairs(graph, Kind::Ref, ref_coalesce_pairs),
         perform_register_allocation(graph, Kind::Float),
     ]
 }
@@ -561,8 +689,7 @@ pub(super) fn allocate_registers(
             for i in 0..nlocals as u16 {
                 external.push(i);
             }
-            // Phase 2.1c (plan staged-sauteeing-koala): stack slots are
-            // no longer pinned to colors `nlocals..nlocals+max_stackdepth`.
+            // Stack slots are not pinned to fixed colors;
             // `stack_slot_color_map` (PyJitCodeMetadata) records the
             // post-rename color so decoders / blackhole resume can
             // translate slot → color without assuming identity.
@@ -645,11 +772,12 @@ pub(super) fn allocate_registers(
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
 ///
-/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
-/// the SSARepr-side variant operates on `SSAReprRegAllocator` keyed by
-/// u16 register indices instead of Variable identities.  The
-/// PyPy-orthodox graph-side sibling lives at `enforce_input_args`
-/// (free function) above.
+/// PRE-EXISTING-ADAPTATION: the SSARepr-side variant operates on
+/// `SSAReprRegAllocator` keyed by u16 register indices instead of
+/// Variable identities.  The PyPy-orthodox graph-side sibling lives
+/// at `enforce_input_args` (free function) above and retires this
+/// variant when the walker defers SSARepr emission to
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`.
 fn enforce_ssarepr_input_args(
     allocators: &mut [SSAReprRegAllocator; 3],
     nlocals: usize,
@@ -657,9 +785,9 @@ fn enforce_ssarepr_input_args(
 ) {
     let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
-    // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
-    // rotated into fixed colors. The decoder consults
-    // `stack_slot_color_map` to recover the post-rename color.
+    // Stack slots are not rotated into fixed colors; the decoder
+    // consults `stack_slot_color_map` to recover the post-rename
+    // color.
     if inputs.portal_inputs {
         if inputs.portal_frame_reg != u16::MAX {
             input_indices.push(inputs.portal_frame_reg);
@@ -694,11 +822,12 @@ fn enforce_ssarepr_input_args(
 /// + `rpython/tool/algo/regalloc.py:8-15`.  Builds an
 /// `SSAReprRegAllocator` and runs the three-stage pipeline.
 ///
-/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
-/// pyre's walker emits SSARepr inline, so the consumer is
-/// `SSAReprRegAllocator`, not the orthodox `RegAllocator`.  The
-/// graph-side sibling (`perform_register_allocation`) is the
-/// PyPy-orthodox entry.
+/// PRE-EXISTING-ADAPTATION: pyre's walker emits SSARepr inline, so
+/// the consumer is `SSAReprRegAllocator`, not the orthodox
+/// `RegAllocator`.  The graph-side sibling (`perform_register_allocation`)
+/// is the PyPy-orthodox entry; this variant retires when the walker
+/// defers SSARepr emission to
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`.
 ///
 /// Dual coalesce source, ordered to give CFG link priority over the
 /// pyre-only SSARepr scanner when an interference edge forces a
@@ -754,9 +883,10 @@ fn perform_ssarepr_register_allocation(
 /// `RegAllocator`'s contract line-by-line (`make_dependencies`,
 /// `coalesce_variables`, `find_node_coloring`, `find_num_colors`,
 /// `getcolor`, `swapcolors`) so that — once the walker defers SSARepr
-/// emission to the canonical `flatten_graph` driver (Phase 4 endgame,
-/// task #9) — this whole struct retires and the sibling `RegAllocator`
-/// at the top of this module is the sole allocator, matching upstream
+/// emission to the canonical
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` driver —
+/// this whole struct retires and the sibling `RegAllocator` at the
+/// top of this module is the sole allocator, matching upstream
 /// exactly.
 ///
 /// The `SSARepr` prefix marks this as the deviation pending retirement.
@@ -1193,6 +1323,89 @@ mod tests {
         let result = perform_register_allocation(&graph, Kind::Int);
         assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
         assert_eq!(result.num_colors, 1);
+    }
+
+    #[test]
+    fn perform_register_allocation_with_pairs_shares_color_for_pinned_scratch() {
+        // Two INTERFERING Ref variables: v0 (inputarg) is kept live
+        // past v1's definition by carrying both on the outgoing link,
+        // so the unpinned chordal coloring must assign them different
+        // colors.  `extra_coalesce_pairs` pre-merges them in the
+        // union-find before `make_dependencies` so they collapse into
+        // a single node and share a color — bypassing the interference
+        // edge that `_try_coalesce` (regalloc.py:106) would otherwise
+        // honour.
+        let build_graph = || {
+            let v0 = flow_var(0, Kind::Ref);
+            let v1 = flow_var(1, Kind::Ref);
+            let start = Block::shared(vec![v0.into()]);
+            let mut graph = FunctionGraph::new("pin_share_color", start.clone(), None);
+            push_op(
+                &start,
+                SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
+            );
+            let v2 = flow_var(2, Kind::Ref);
+            let v3 = flow_var(3, Kind::Ref);
+            let next = graph.new_block(vec![v2.into(), v3.into()]);
+            // Both v0 and v1 carried forward so the live-set at the
+            // outgoing link contains both, forcing an interference
+            // edge under the unpinned allocator.
+            start.closeblock(vec![
+                Link::new(vec![v0.into(), v1.into()], Some(next.clone()), None).into_ref(),
+            ]);
+            // returnblock arity is always 1 (a fresh untyped variable
+            // when `return_var = None` was passed to FunctionGraph::new).
+            next.closeblock(vec![
+                Link::new(vec![v2.into()], Some(graph.returnblock.clone()), None).into_ref(),
+            ]);
+            (graph, v0, v1)
+        };
+
+        // Baseline: without pins, the interference forces distinct colors.
+        let (graph_unpinned, v0_u, v1_u) = build_graph();
+        let unpinned = perform_register_allocation_with_pairs(&graph_unpinned, Kind::Ref, &[]);
+        let unpinned_v0 = unpinned.coloring.get(&v0_u.id).copied();
+        let unpinned_v1 = unpinned.coloring.get(&v1_u.id).copied();
+        assert!(unpinned_v0.is_some() && unpinned_v1.is_some());
+        assert_ne!(
+            unpinned_v0, unpinned_v1,
+            "without pins, interfering v0 and v1 must get distinct colors"
+        );
+
+        // Pinned: pre-merge unifies them into one node before
+        // make_dependencies so the interference edge never gets recorded.
+        let (graph_pinned, v0_p, v1_p) = build_graph();
+        let pin_pairs = vec![(v1_p.id, v0_p.id)];
+        let pinned = perform_register_allocation_with_pairs(&graph_pinned, Kind::Ref, &pin_pairs);
+        let pinned_v0 = pinned.coloring.get(&v0_p.id).copied();
+        let pinned_v1 = pinned.coloring.get(&v1_p.id).copied();
+        assert!(pinned_v0.is_some() && pinned_v1.is_some());
+        assert_eq!(
+            pinned_v0, pinned_v1,
+            "pin must unify v0 and v1 even across an interference edge"
+        );
+    }
+
+    #[test]
+    fn perform_register_allocation_with_pairs_handles_unknown_scratch_id() {
+        // Walker may produce scratch Variable IDs that never appear in
+        // the canonical graph (walker-only emit sites).  Pin pairs
+        // containing such IDs must not panic and must not strip the
+        // inputarg's color entry.
+        let v0 = flow_var(0, Kind::Ref);
+        let start = Block::shared(vec![v0.into()]);
+        let graph = FunctionGraph::new("pin_unknown_scratch", start.clone(), None);
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        // v_99 is not in the graph; pin (99, 0) should be benign.
+        let pin_pairs = vec![(VariableId(99), v0.id)];
+        let result = perform_register_allocation_with_pairs(&graph, Kind::Ref, &pin_pairs);
+        assert!(
+            result.coloring.get(&v0.id).is_some(),
+            "inputarg v0 must retain a color even when pinned scratch ID 99 is absent from the graph"
+        );
     }
 
     #[test]
