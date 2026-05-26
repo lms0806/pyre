@@ -11,18 +11,25 @@ use crate::pyobject::*;
 
 /// Python string object.
 ///
-/// Layout: `[ob_type: *const PyType | value: *mut String | len: usize]`
-/// The `value` pointer owns a heap-allocated `String` (via `Box::into_raw`).
+/// Layout: `[ob_type | w_class | value:*mut String | byte_len | len]`
+/// `byte_len` is the UTF-8 byte count (RPython STR `rstr.py:1226
+/// Array(Char)` parity — `llmodel.py:667 bh_strlen` reads this).
+/// `len` is the codepoint count (RPython UNICODE parity —
+/// `bh_unicodelen` reads this).  The `value` pointer owns a
+/// heap-allocated `String` (via `Box::into_raw`).
 #[repr(C)]
 pub struct W_StrObject {
     pub ob_header: PyObject,
     pub value: *mut String,
+    pub byte_len: usize,
     pub len: usize,
 }
 
 /// Field offset of `value` within `W_StrObject`, for JIT field access.
 pub const STR_VALUE_OFFSET: usize = std::mem::offset_of!(W_StrObject, value);
-/// Field offset of `len` within `W_StrObject`, for JIT field access.
+/// Field offset of `byte_len` (UTF-8 byte count) for STR STRLEN parity.
+pub const STR_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_StrObject, byte_len);
+/// Field offset of `len` (codepoint count) for UNICODE UNICODELEN parity.
 pub const STR_LEN_OFFSET: usize = std::mem::offset_of!(W_StrObject, len);
 
 /// GC type id assigned to `W_StrObject` at JitDriver init time.
@@ -42,13 +49,16 @@ impl crate::lltype::GcType for W_StrObject {
 /// The inner `String` is also `Box::into_raw`'d so it can be recovered.
 pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = crate::lltype::malloc_raw(s.to_string());
+    let byte_len = s.len();
+    let char_len = s.chars().count();
     crate::lltype::malloc_typed(W_StrObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
         },
         value,
-        len: s.chars().count(),
+        byte_len,
+        len: char_len,
     }) as PyObjectRef
 }
 
@@ -172,8 +182,9 @@ mod tests {
 
     #[test]
     fn test_str_field_offset() {
-        assert_eq!(STR_VALUE_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
-        assert_eq!(STR_LEN_OFFSET, 24);
+        assert_eq!(STR_VALUE_OFFSET, 16);
+        assert_eq!(STR_BYTE_LEN_OFFSET, 24);
+        assert_eq!(STR_LEN_OFFSET, 32);
     }
 
     #[test]
@@ -182,6 +193,16 @@ mod tests {
         unsafe {
             assert_eq!(w_str_len(obj), 5);
             assert_eq!(w_str_get_value(obj).len(), 5);
+        }
+    }
+
+    #[test]
+    fn test_str_byte_len_vs_char_len() {
+        let obj = w_str_new("café");
+        unsafe {
+            let str_obj = obj as *const W_StrObject;
+            assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
+            assert_eq!((*str_obj).len, 4); // 4 codepoints
         }
     }
 

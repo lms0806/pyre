@@ -1008,16 +1008,18 @@ extern "C" fn jit_reacquire_gil_shim() {
 // comment in `majit-backend-dynasm/src/runner.rs` for full layout
 // rationale — both backends mirror the upstream rstr layout.
 //
-// TODO(parity): These constants assume PyPy's inline `rstr.STR`
-// layout `[hash | len | chars...]`.  Pyre's actual `W_StrObject`
-// (`pyre-object/strobject.rs:14`) is `[ob_type | value:*mut String |
-// len]` with chars behind a pointer indirection.  The constant-fold
-// paths (`PyreCpu::bh_strlen` / `bh_strgetitem`) override correctly,
-// but the non-constant compiled STRGETITEM/STRLEN path still uses
-// `base + basesize + index` addressing against the inline layout.
-// A full fix requires either (a) making the backend read through the
-// `*mut String` indirection, or (b) changing `W_StrObject` to inline
-// its chars like `rstr.STR`.
+// PRE-EXISTING-ADAPTATION: These constants assume PyPy's inline
+// `rstr.STR` layout `[hash | len | chars...]`.  Pyre's `W_StrObject`
+// stores chars behind `*mut String` (a `repr(Rust)` type whose
+// internal layout is not guaranteed).  STRLEN is correct: it reads
+// `byte_len`/`len` via `len_descr().offset()`.  STRGETITEM's
+// compiled path uses `base + basesize + index` addressing against
+// the inline chars, which would produce wrong reads against
+// `W_StrObject`.  In practice the compiled STRGETITEM is not
+// reached — the optimizer constant-folds it (`PyreCpu::bh_strgetitem`)
+// or routes through residual helpers.  Fixing requires either
+// (a) inlining chars in `W_StrObject` like `rstr.STR`, or
+// (b) emitting a 2-load indirection in the backend.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;

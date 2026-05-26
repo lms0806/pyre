@@ -9,8 +9,9 @@
 //! `bh_strgetitem` all reach the same descr.
 //!
 //! Python 3 unifies `str` and `unicode` into one `W_StrObject`
-//! (UTF-8), so `str_descr()` and `unicode_descr()` return the same
-//! `PyreStrDescr`.
+//! (UTF-8), but the RPython-level STR / UNICODE split is preserved:
+//! `str_descr()` returns `PyreStrDescr` (len_descr → byte_len) and
+//! `unicode_descr()` returns `PyreUnicodeDescr` (len_descr → codepoint len).
 //!
 //! `W_StrObject` (pyre-object) stores char data behind a
 //! `*mut String` pointer at `STR_VALUE_OFFSET`; the default
@@ -23,18 +24,44 @@ use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
 use majit_metainterp::r#box::BoxRef;
 use majit_metainterp::cpu::{Cpu, DefaultCpu};
 use pyre_object::strobject::{
-    STR_LEN_OFFSET, STR_VALUE_OFFSET, W_STR_GC_TYPE_ID, W_STR_OBJECT_SIZE,
+    STR_BYTE_LEN_OFFSET, STR_LEN_OFFSET, STR_VALUE_OFFSET, W_STR_GC_TYPE_ID, W_STR_OBJECT_SIZE,
 };
 
-/// `descr.py FieldDescr` for `W_StrObject.len` — the cached length
-/// field at offset `STR_LEN_OFFSET`, 8-byte `usize`.  Consulted by
-/// `bh_arraylen_gc` per `llmodel.py:594-595`.
+/// FieldDescr for `W_StrObject.byte_len` — UTF-8 byte count.
+/// RPython STR is `Array(Char)` byte string (`rstr.py:1226`);
+/// `llmodel.py:667 bh_strlen` reads byte count.
 #[derive(Debug)]
-struct PyreStrLenFieldDescr;
+struct PyreStrByteLenFieldDescr;
 
-impl Descr for PyreStrLenFieldDescr {}
+impl Descr for PyreStrByteLenFieldDescr {}
 
-impl FieldDescr for PyreStrLenFieldDescr {
+impl FieldDescr for PyreStrByteLenFieldDescr {
+    fn offset(&self) -> usize {
+        STR_BYTE_LEN_OFFSET
+    }
+    fn field_size(&self) -> usize {
+        8
+    }
+    fn field_type(&self) -> Type {
+        Type::Int
+    }
+    fn is_field_signed(&self) -> bool {
+        true
+    }
+    fn field_name(&self) -> &'static str {
+        "W_StrObject.byte_len"
+    }
+}
+
+/// FieldDescr for `W_StrObject.len` — codepoint count.
+/// RPython UNICODE uses codepoint-indexed arrays;
+/// `bh_unicodelen` reads codepoint count.
+#[derive(Debug)]
+struct PyreUnicodeLenFieldDescr;
+
+impl Descr for PyreUnicodeLenFieldDescr {}
+
+impl FieldDescr for PyreUnicodeLenFieldDescr {
     fn offset(&self) -> usize {
         STR_LEN_OFFSET
     }
@@ -45,10 +72,6 @@ impl FieldDescr for PyreStrLenFieldDescr {
         Type::Int
     }
     fn is_field_signed(&self) -> bool {
-        // `W_StrObject.len: usize` — `bh_arraylen_gc` reads via
-        // `*(addr as *const i64)` directly, but the upstream
-        // `read_int_at_mem(..., WORD, 1)` at `llmodel.py:587` is
-        // signed.  Keep signed=true to mirror that.
         true
     }
     fn field_name(&self) -> &'static str {
@@ -56,16 +79,20 @@ impl FieldDescr for PyreStrLenFieldDescr {
     }
 }
 
-/// `descr.py ArrayDescr` for `W_StrObject` (Python 3 `str`, UTF-8
-/// bytes).  `base_size` is `W_STR_OBJECT_SIZE` (full struct header
-/// before items would start in the in-line layout that PyPy's STR
-/// uses); `item_size` is 1 byte; `type_id` matches the GC tid the
-/// allocator stamps onto every `W_StrObject`.
+/// ArrayDescr for STR (byte string per `rstr.py:1226 Array(Char)`).
+/// `len_descr` → `byte_len` field.
 #[derive(Debug)]
 struct PyreStrDescr;
 
-const PYRE_STR_LEN_FIELD_DESCR: PyreStrLenFieldDescr = PyreStrLenFieldDescr;
+/// ArrayDescr for UNICODE (codepoint string).
+/// `len_descr` → `len` (codepoint count) field.
+#[derive(Debug)]
+struct PyreUnicodeDescr;
+
+const PYRE_STR_BYTE_LEN_DESCR: PyreStrByteLenFieldDescr = PyreStrByteLenFieldDescr;
+const PYRE_UNICODE_LEN_DESCR: PyreUnicodeLenFieldDescr = PyreUnicodeLenFieldDescr;
 const PYRE_STR_DESCR: PyreStrDescr = PyreStrDescr;
+const PYRE_UNICODE_DESCR: PyreUnicodeDescr = PyreUnicodeDescr;
 
 impl Descr for PyreStrDescr {}
 
@@ -86,7 +113,30 @@ impl ArrayDescr for PyreStrDescr {
         false
     }
     fn len_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(&PYRE_STR_LEN_FIELD_DESCR)
+        Some(&PYRE_STR_BYTE_LEN_DESCR)
+    }
+}
+
+impl Descr for PyreUnicodeDescr {}
+
+impl ArrayDescr for PyreUnicodeDescr {
+    fn base_size(&self) -> usize {
+        W_STR_OBJECT_SIZE
+    }
+    fn item_size(&self) -> usize {
+        4
+    }
+    fn type_id(&self) -> u32 {
+        W_STR_GC_TYPE_ID as u32
+    }
+    fn item_type(&self) -> Type {
+        Type::Int
+    }
+    fn is_item_signed(&self) -> bool {
+        false
+    }
+    fn len_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(&PYRE_UNICODE_LEN_DESCR)
     }
 }
 
@@ -131,16 +181,15 @@ impl Cpu for PyreCpu {
         Some(&PYRE_STR_DESCR)
     }
     fn unicode_descr(&self) -> Option<&dyn ArrayDescr> {
-        Some(&PYRE_STR_DESCR)
+        Some(&PYRE_UNICODE_DESCR)
     }
 
     fn bh_strlen(&self, string: GcRef) -> Option<i64> {
         // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
-        // `llmodel.py:667 bh_strlen` returns the byte count.  The default
-        // impl reads `W_StrObject.len` which is `s.chars().count()`
-        // (codepoint count, `strobject.rs:51`) — wrong for STR semantics.
-        // Follow the `*mut String` indirection and return `s.len()` (byte
-        // count), so "é" (UTF-8 = `[195, 169]`) yields 2, not 1.
+        // `llmodel.py:667 bh_strlen` returns the byte count.
+        // `str_descr().len_descr()` reads `W_StrObject.byte_len` for the
+        // compiled path; this override follows the `*mut String` indirection
+        // directly for the blackhole interpreter path.
         if string.is_null() {
             return None;
         }

@@ -5381,22 +5381,39 @@ impl OptContext {
     ///                                    op.getdescr(), op.type)
     /// ```
     ///
-    /// Returns `None` only for the `supports_guard_gc_type == false`
-    /// gate on memory-reading folds (see `protect_speculative_operation`
-    /// for details).  Every other upstream-divergent path now panics:
-    ///  - `argboxes` build asserts every arg is constant (pure.rs:993-
-    ///    1006 pre-checks the same condition; a mismatch is a caller
-    ///    bug, equivalent to RPython's `AttributeError` from
-    ///    `get_constant_box(...).getint()`).
-    ///  - `Err(NotImplemented)` panics — upstream `executor.py:610`
-    ///    raises `NotImplementedError` when no helper is registered.
-    ///    This includes "never executed by pyjitpl" opnums such as
-    ///    LOAD_FROM_GC_TABLE / LOAD_EFFECTIVE_ADDRESS, which RPython's
-    ///    `_make_execute_list` deliberately leaves without a helper.
-    /// Helper-internal `Ok(None)` for OVF/shift/divide-by-zero/non-
-    /// finite cast still surfaces as `None` here; see `pure.rs:993`.
+    /// Returns `None` only when:
+    ///  - `supports_guard_gc_type == false` and the op is a memory-
+    ///    reading fold (array/string/unicode).  Upstream `optimizer.py:
+    ///    822-825` relies on "we don't unroll in that case"; pyre's
+    ///    `constant_fold` runs outside the unroll pass too, so this
+    ///    gate is placed here at the call site, NOT inside
+    ///    `protect_speculative_operation` (which matches upstream as a
+    ///    plain `()` function).
+    ///  - Helper-internal `Ok(None)` for OVF/shift/divide-by-zero/
+    ///    non-finite cast (see `pure.rs:993`).
+    /// Every other path panics (caller-invariant, NotImplemented).
     pub fn constant_fold(&self, op: &Op) -> Option<Value> {
-        self.protect_speculative_operation(op)?;
+        // optimizer.py:822-825: "if cpu.supports_guard_gc_type is
+        // false, we can't really do this check at all, but then we
+        // don't unroll in that case."  Gate memory-reading ops here
+        // so protect_speculative_operation stays a plain () function.
+        if !majit_gc::supports_guard_gc_type() {
+            use majit_ir::OpCode;
+            if matches!(
+                op.opcode,
+                OpCode::GetarrayitemGcPureI
+                    | OpCode::GetarrayitemGcPureR
+                    | OpCode::GetarrayitemGcPureF
+                    | OpCode::ArraylenGc
+                    | OpCode::Strgetitem
+                    | OpCode::Strlen
+                    | OpCode::Unicodegetitem
+                    | OpCode::Unicodelen
+            ) {
+                return None;
+            }
+        }
+        self.protect_speculative_operation(op);
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
             let b = self.get_box_replacement_box(op.arg(i)).expect(
@@ -5428,35 +5445,22 @@ impl OptContext {
     /// gcref, validate the gcref is non-null and of a valid type;
     /// raise `SpeculativeError` otherwise.
     ///
-    /// Pyre raises the upstream `SpeculativeError` via
-    /// `raise_speculative_error` (panic with
-    /// `crate::optimize::SpeculativeError`) on every line that
-    /// upstream raises:
-    ///  - `cpu.protect_speculative_field/_array/_string/_unicode`
-    ///    returning `Err` → `:832 / :841 / :849 / :857`
-    ///  - shared bounds check `0 <= index < arraylength` failing
-    ///    → `:867`
-    /// `unroll.py:119-123` catches it at the unroll-phase boundary
-    /// (`with_speculative_to_invalid_loop` in `unroll.rs`) and
-    /// rethrows as `InvalidLoop`.
+    /// Returns `()` — matching upstream's Python `def protect_
+    /// speculative_operation(self, op):` which has no return value.
+    /// Either returns normally (validation passed) or raises
+    /// `SpeculativeError` via `raise_speculative_error` (panic with
+    /// `crate::optimize::SpeculativeError`).  `unroll.py:119-123`
+    /// catches it at the unroll-phase boundary.
     ///
-    /// The remaining `Option<()>` return path encodes ONE legitimate
-    /// case: the `supports_guard_gc_type == false` gate on memory-
-    /// reading folds.  Upstream's quote at `optimizer.py:822-825`:
+    /// The `supports_guard_gc_type == false` gate that was previously
+    /// inside this function has been moved to `constant_fold` (the
+    /// only caller), matching upstream's architectural invariant:
     /// *"if cpu.supports_guard_gc_type is false, we can't really do
-    /// this check at all, but then we don't unroll in that case"* —
-    /// upstream gates the entire `protect_speculative_operation`
-    /// entry on the unroll pass.  Pyre's `constant_fold` is also
-    /// called outside unrolling, so the fold itself must decline
-    /// when speculative type validation is impossible (otherwise a
-    /// wrong-type non-null const gcref would be deref'd at fold time
-    /// via `cpu.bh_arraylen_gc / bh_getarrayitem_gc_*`).
+    /// this check at all, but then we don't unroll in that case"*
+    /// (optimizer.py:822-825).
     ///
-    /// Every other path that upstream encodes as `AttributeError` /
-    /// `assert` now panics: missing box registration, missing descr,
-    /// wrong `Value` variant.  This matches the upstream contract —
-    /// the caller (`pure.py:121-128` `for...else`) guarantees every
-    /// arg is a `Const*` before invoking this routine.
+    /// Caller-invariant violations (missing box, descr, wrong Value
+    /// variant) panic — upstream would `AttributeError`.
     ///
     /// Branches mirror the upstream `if / elif / elif / elif / else`
     /// chain line-for-line:
@@ -5472,7 +5476,7 @@ impl OptContext {
     /// returns `None` (pyre has no fold-time str/unicode layout), the
     /// bounds check is skipped — equivalent to RPython where the
     /// optimizer falls back to runtime evaluation in that case.
-    fn protect_speculative_operation(&self, op: &Op) -> Option<()> {
+    fn protect_speculative_operation(&self, op: &Op) {
         use majit_ir::OpCode;
 
         let opnum = op.opcode;
@@ -5501,35 +5505,7 @@ impl OptContext {
             if self.cpu.protect_speculative_field(gcref, fd).is_err() {
                 raise_speculative_error("protect_speculative_field");
             }
-            return Some(());
-        } else if matches!(
-            opnum,
-            OpCode::GetarrayitemGcPureI
-                | OpCode::GetarrayitemGcPureR
-                | OpCode::GetarrayitemGcPureF
-                | OpCode::ArraylenGc
-                | OpCode::Strgetitem
-                | OpCode::Strlen
-                | OpCode::Unicodegetitem
-                | OpCode::Unicodelen
-        ) {
-            // optimizer.py:822-825 comment: "if cpu.supports_guard_gc_type
-            // is false, we can't really do this check at all, but then we
-            // don't unroll in that case."  Upstream gates the entire
-            // protect_speculative_operation entry on the unroll pass; pyre's
-            // constant_fold is called outside of unrolling too, so the
-            // memory-reading array/string/unicode fold must decline here
-            // when speculative type validation is impossible.  Without
-            // this gate a wrong-type non-null const gcref would be deref'd
-            // at fold time via cpu.bh_arraylen_gc / bh_getarrayitem_gc_*,
-            // a regression vs main (which did not fold these ops at all).
-            //
-            // The pure-getfield branch above keeps its main-era behavior
-            // (null-only when supports_guard_gc_type is false) so this
-            // gate is scoped to the newly-enabled memory-reading folds.
-            if !majit_gc::supports_guard_gc_type() {
-                return None;
-            }
+            return;
         }
 
         if matches!(
@@ -5561,7 +5537,7 @@ impl OptContext {
                 raise_speculative_error("protect_speculative_array");
             }
             if opnum == OpCode::ArraylenGc {
-                return Some(());
+                return;
             }
             arraylength = self
                 .cpu
@@ -5583,7 +5559,7 @@ impl OptContext {
                 raise_speculative_error("protect_speculative_string");
             }
             if opnum == OpCode::Strlen {
-                return Some(());
+                return;
             }
             arraylength = self
                 .cpu
@@ -5608,7 +5584,7 @@ impl OptContext {
                 raise_speculative_error("protect_speculative_unicode");
             }
             if opnum == OpCode::Unicodelen {
-                return Some(());
+                return;
             }
             arraylength = self
                 .cpu
@@ -5616,7 +5592,7 @@ impl OptContext {
                 .expect("bh_unicodelen must succeed after protect_speculative_unicode");
         } else {
             // optimizer.py:857-858 else: return — nothing to validate.
-            return Some(());
+            return;
         }
 
         // optimizer.py:860-862 shared bounds check:
@@ -5638,7 +5614,6 @@ impl OptContext {
         if !(0 <= index && index < arraylength) {
             raise_speculative_error("index out of bounds for constant-fold");
         }
-        Some(())
     }
 
     /// Look up the producing `Op` for an OpRef in `new_operations`.

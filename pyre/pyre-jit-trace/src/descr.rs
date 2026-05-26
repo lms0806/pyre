@@ -1672,11 +1672,13 @@ use pyre_object::pyobject::OB_TYPE_OFFSET;
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
+use pyre_object::strobject::STR_LEN_OFFSET;
 use pyre_object::{
     BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
     FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
-    INT_INTVAL_OFFSET, STR_LEN_OFFSET, W_ListObject, W_TupleObject,
+    INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
 };
+// Re-import the rest without duplication
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
 /// Field descriptor for `PyObject.w_class` (Ref, mutable).
@@ -1839,6 +1841,8 @@ pub fn float_floatval_descr() -> DescrRef {
 }
 
 pub fn str_len_descr() -> DescrRef {
+    // Python len(str) returns codepoint count.
+    // unicodeobject.py:165 W_UnicodeObject._len() → _length field.
     make_immutable_field_descr(STR_LEN_OFFSET, 8, Type::Int, false)
 }
 
