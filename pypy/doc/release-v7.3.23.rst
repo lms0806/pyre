@@ -114,14 +114,18 @@ Bugfixes
 ~~~~~~~~
 
 - Fix a ``SystemError`` when ``OSError`` is raised in ``gc.dump_rpy_heap`` (:issue:`5118`)
-- Fix bug in ``inline_short_preamble`` (:issue:`5462`)
+- Fix bug in ``inline_short_preamble`` in the JIT (:issue:`5462`)
 
 Speedups and enhancements
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Speed up ``int << int -> long`` shifts and leave the exponent of ``long **
-  int`` as an int
-- Detect performance-cluster L2 cache size instead of efficiency on Apple Silicon
+  int`` as an int. This happens both on PyPy 2, where those types both still
+  exist and on PyPy 3, where the distinction is a purely internal one, not
+  observable to the programs.
+- Detect performance-cluster L2 cache sizes instead of those of efficiency
+  cores on Apple Silicon. This means that the GC nursery is now larger, because
+  the size is chosen by looking at the L2 CPU cache.
 
 .. reverted
     - Use computed-goto on GCC/Clang instead of a big switch statement
