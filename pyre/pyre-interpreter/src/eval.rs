@@ -412,11 +412,7 @@ fn dict_merge_from_mapping(
             for (k, v) in pyre_object::w_dict_items(source) {
                 if pyre_object::w_dict_lookup(dict, k).is_some() {
                     // pyopcode.py:1987 — %S is str(key)
-                    let key_str = if pyre_object::is_str(k) {
-                        pyre_object::w_str_get_value(k).to_string()
-                    } else {
-                        crate::display::py_repr(k)
-                    };
+                    let key_str = crate::display::py_str(k);
                     return Err(PyError::type_error(format!(
                         "{prefix}got multiple values for keyword argument '{key_str}'"
                     )));
@@ -444,11 +440,7 @@ fn dict_merge_from_mapping(
         let val = crate::baseobjspace::getitem(source, key)?;
         unsafe {
             if pyre_object::w_dict_lookup(dict, key).is_some() {
-                let key_str = if pyre_object::is_str(key) {
-                    pyre_object::w_str_get_value(key).to_string()
-                } else {
-                    crate::display::py_repr(key)
-                };
+                let key_str = crate::display::py_str(key);
                 return Err(PyError::type_error(format!(
                     "{prefix}got multiple values for keyword argument '{key_str}'"
                 )));

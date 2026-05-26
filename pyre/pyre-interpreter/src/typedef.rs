@@ -5982,6 +5982,25 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_str_new(&out))
 }
 
+/// unicodehelper.py:399 _utf8_code_length classification
+fn utf8_error_reason(data: &[u8], valid_end: usize, error_len: Option<usize>) -> &'static str {
+    if error_len.is_none() {
+        return "unexpected end of data";
+    }
+    let b = data[valid_end];
+    match b {
+        // continuation byte at start, overlong 2-byte, or >= 0xF5
+        0x80..=0xBF | 0xC0..=0xC1 | 0xF5..=0xFF => "invalid start byte",
+        // valid start byte but bad continuation
+        _ => "invalid continuation byte",
+    }
+}
+
+/// interp_codecs.py:298/363 — encode-only handlers raise TypeError on decode
+fn decode_error_encode_only_handler() -> crate::PyError {
+    crate::PyError::type_error("don't know how to handle UnicodeDecodeError in error callback")
+}
+
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate::PyError> {
     let mut out = String::new();
     let mut pos = 0;
@@ -5995,13 +6014,15 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
                 let valid_end = pos + e.valid_up_to();
                 out.push_str(unsafe { std::str::from_utf8_unchecked(&data[pos..valid_end]) });
                 let bad_len = e.error_len().unwrap_or(data.len() - valid_end);
+                let bad = &data[valid_end..valid_end + bad_len];
                 match err_mode {
                     "strict" => {
+                        let reason = utf8_error_reason(data, valid_end, e.error_len());
                         if e.error_len().is_none() {
                             return Err(crate::PyError::new(
                                 crate::PyErrorKind::UnicodeDecodeError,
                                 format!(
-                                    "'utf-8' codec can't decode bytes in position {}--{}: unexpected end of data",
+                                    "'utf-8' codec can't decode bytes in position {}--{}: {reason}",
                                     valid_end,
                                     data.len() - 1
                                 ),
@@ -6010,23 +6031,46 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate:
                         return Err(crate::PyError::new(
                             crate::PyErrorKind::UnicodeDecodeError,
                             format!(
-                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte",
+                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: {reason}",
                                 data[valid_end], valid_end
                             ),
                         ));
                     }
                     "ignore" => {}
                     "replace" => out.push('\u{FFFD}'),
-                    "surrogateescape" => {
-                        // PEP 383: map bytes 0x80..0xFF → U+DC80..U+DCFF
-                        for &b in &data[valid_end..valid_end + bad_len] {
-                            out.push(char::from_u32(0xDC00 + b as u32).unwrap_or('\u{FFFD}'));
+                    // interp_codecs.py:515-555 surrogateescape / :431-513 surrogatepass
+                    // produce U+DC80..U+DCFF / U+D800..U+DFFF respectively.
+                    // PyPy stores these via rutf8 allow_surrogates=True (WTF-8).
+                    // pyre's W_StrObject backs onto Rust String (&str = valid UTF-8),
+                    // so surrogate codepoints cannot be represented.  Re-raise the
+                    // original decode error rather than violating the String invariant.
+                    "surrogateescape" | "surrogatepass" => {
+                        let reason = utf8_error_reason(data, valid_end, e.error_len());
+                        if e.error_len().is_none() {
+                            return Err(crate::PyError::new(
+                                crate::PyErrorKind::UnicodeDecodeError,
+                                format!(
+                                    "'utf-8' codec can't decode bytes in position {}--{}: {reason}",
+                                    valid_end,
+                                    data.len() - 1
+                                ),
+                            ));
                         }
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::UnicodeDecodeError,
+                            format!(
+                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: {reason}",
+                                data[valid_end], valid_end
+                            ),
+                        ));
                     }
                     "backslashreplace" => {
-                        for &b in &data[valid_end..valid_end + bad_len] {
+                        for &b in bad {
                             out.push_str(&format!("\\x{:02x}", b));
                         }
+                    }
+                    "xmlcharrefreplace" | "namereplace" => {
+                        return Err(decode_error_encode_only_handler());
                     }
                     _ => {
                         return Err(crate::PyError::new(
@@ -6088,7 +6132,7 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
                             return Err(crate::PyError::new(
                                 crate::PyErrorKind::UnicodeDecodeError,
                                 format!(
-                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}",
+                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}: ordinal not in range(128)",
                                     b
                                 ),
                             ));
@@ -6098,13 +6142,21 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
                             out.push('\u{FFFD}');
                             continue;
                         }
-                        "surrogateescape" => {
-                            out.push(char::from_u32(0xDC00 + b as u32).unwrap_or('\u{FFFD}'));
-                            continue;
+                        "surrogateescape" | "surrogatepass" => {
+                            return Err(crate::PyError::new(
+                                crate::PyErrorKind::UnicodeDecodeError,
+                                format!(
+                                    "'ascii' codec can't decode byte 0x{:02x} in position {i}: ordinal not in range(128)",
+                                    b
+                                ),
+                            ));
                         }
                         "backslashreplace" => {
                             out.push_str(&format!("\\x{:02x}", b));
                             continue;
+                        }
+                        "xmlcharrefreplace" | "namereplace" => {
+                            return Err(decode_error_encode_only_handler());
                         }
                         _ => {
                             return Err(crate::PyError::new(
