@@ -38,7 +38,7 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
-/// PRE-EXISTING-ADAPTATION: pyre does not yet expose `PyFrame` as a
+/// TODO: pyre does not yet expose `PyFrame` as a
 /// Python-visible W_Root with a typedef carrying
 /// `f_back/f_locals/f_globals/f_code/f_lineno` GetSetProperty
 /// descriptors (`pypy/interpreter/pyframe.py:769-786`).  The proper
@@ -327,7 +327,7 @@ pub fn init(ns: &mut DictStorage) {
             // `pyframe.py:773 f_back = GetSetProperty(W_PyFrame
             // .fget_f_back)` returns the previous PyFrame in the
             // execution chain.  Pyre exposes frames as `sys.namespace`
-            // stubs (see PRE-EXISTING-ADAPTATION on
+            // stubs (see TODO on
             // `make_sys_namespace_instance` — the proper port is to
             // surface PyFrame as a typedef-described user-visible
             // type).  Within the stub model, walk the `f_back` chain

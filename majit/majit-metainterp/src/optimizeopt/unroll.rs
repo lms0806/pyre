@@ -615,7 +615,7 @@ impl UnrollOptimizer {
                     .rfind(|op| op.opcode == OpCode::Jump)
                     .map(|op| op.getarglist().to_vec())
                     .unwrap_or_default();
-                // Slice 77b.B: hand opt_p1 the per-iter BoxRef pool that p1_iter
+                // Hand opt_p1 the per-iter BoxRef pool that p1_iter
                 // allocated (slice 77b.A). trace.get_iter() per-call
                 // inputarg_from_tp(...) / cls() — each phase optimizes against a
                 // fresh Box identity set so _forwarded mutations cannot alias
@@ -1005,7 +1005,7 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_emit_ops` untranslated.
-        // Slice 77b.B: hand opt_p2 the per-iter BoxRef pool that the Phase 2
+        // Hand opt_p2 the per-iter BoxRef pool that the Phase 2
         // iter allocated. Disjoint from opt_p1's pool — _forwarded mutations
         // recorded against Phase 1 boxes do not alias Phase 2 boxes for the
         // same OpRef raw index, fixing the Rc<Box> split-brain that broke
@@ -1225,7 +1225,7 @@ impl UnrollOptimizer {
                         }
                     }
                 }
-                // PRE-EXISTING-ADAPTATION (B.6.5): RPython's
+                // TODO (B.6.5): RPython's
                 // `force_op_from_preamble` (unroll.py:26-39) only seeds
                 // `potential_extra_ops`. The orthodox path that fills
                 // `used_boxes` / `short_preamble_jump` / `extra_same_as`
@@ -1896,7 +1896,7 @@ pub struct ExportedState {
     /// `exported_short_boxes + label_args + short_inputargs` at export time
     /// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes` parity).
     pub short_boxes: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)>,
-    /// PRE-EXISTING-ADAPTATION: producer-side const value snapshot for any
+    /// TODO: producer-side const value snapshot for any
     /// const-namespace OpRef referenced by `short_boxes` op args. RPython
     /// gets this for free because `Const` Box objects carry their value as
     /// an attribute and persist across optimization phases. In majit, OpRef
@@ -2969,7 +2969,7 @@ impl OptUnroll {
             })
             .collect();
         state.partial_trace_operations = optimizer.phase1_emit_ops.clone();
-        // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
+        // TODO: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
         // legacy `ExportedShortArg::Const { source, value }` enum), so we
@@ -4048,7 +4048,7 @@ impl OptUnroll {
             // a snapshot. Matches PyPy `_forwarded` reference passing.
             return Some(OpInfo::Ptr(handle));
         }
-        // PRE-EXISTING-ADAPTATION: read from `exported_int_bounds`
+        // TODO: read from `exported_int_bounds`
         // side table.  RPython's `IntBound` flows through
         // `OptInfo.IntBound` on the Box itself
         // (`optimizeopt/info.py:580 IntBoundInfo`), so successive peeling
@@ -4275,7 +4275,7 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
     // every slot as Ref (matches the common loop-body shape; fixtures that
     // need typed inputargs construct ctx directly).
     //
-    // Slice 0.5: type lookup now resolves through `op.pos.ty()` (variant
+    // Type lookup now resolves through `op.pos.ty()` (variant
     // tag, post-Slice-P5/P6) at priority 0 of `opref_type` and
     // `op.type_` at priority 2 — no longer through a `value_types`
     // side table.
@@ -5022,7 +5022,7 @@ impl OptUnroll {
         ctx: &mut OptContext,
     ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
-        // source op's result type (Slice 0.5 follow-up — `OpRef.ty()`
+        // source op's result type ( `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
         let peeled_positions: Vec<OpRef> = self
             .buffer
@@ -5072,7 +5072,7 @@ impl OptUnroll {
         label_op.pos.set(label_pos);
         ctx.emit(label_op);
 
-        // Reserve body positions, tagged per source op (Slice 0.5 follow-up).
+        // Reserve body positions, tagged per source op ( ).
         let body_positions: Vec<OpRef> = self
             .buffer
             .iter()

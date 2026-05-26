@@ -822,7 +822,7 @@ impl ShortBoxes {
     /// ```
     ///
     /// Unconditionally returns `self.short_inputargs`. The pyre fallback
-    /// to `label_args.to_vec()` on empty was a NEW-DEVIATION — empty
+    /// to `label_args.to_vec()` on empty was a TODO — empty
     /// short_inputargs is the legitimate empty-loop case in upstream.
     pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<OpRef> {
         self.short_inputargs.clone()
@@ -1375,7 +1375,7 @@ impl ProducedShortOp {
         // `used_imported_short_aliases()` derives the alias list directly
         // from `imported_short_preamble_builder.extra_same_as()` at the same
         // phase boundary, so an eager `imported_short_aliases.push` here
-        // would be a NEW-DEVIATION dual write.
+        // would be a TODO dual write.
         //
         // Path B parity (B.6.7): Heap/Array/LoopInvariant produce_* return
         // `source` so successor short-op dependency args resolve through

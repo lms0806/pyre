@@ -71,7 +71,7 @@ impl JitCode {
 /// pyre: per-thread equivalent (no-GIL runtime). Populated from the
 /// authoritative `CodeWriter.make_jitcodes()` result before tracing.
 ///
-/// PRE-EXISTING-ADAPTATION: the RPython-orthodox
+/// TODO: the RPython-orthodox
 /// `MetaInterpStaticData` lives in
 /// `majit_metainterp::pyjitpl::MetaInterpStaticData`.  pyre embeds it
 /// as the `canonical` field below and delegates every RPython method
@@ -1096,7 +1096,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
 /// `max_stackdepth`), and returns an empty Vec if the index is unknown.
 ///
 /// Used by tests + tooling that need to translate "stack depth `d`" into
-/// the post-rename register color the dispatcher would touch — Phase 2.1c
+/// the post-rename register color the dispatcher would touch — the pinning removal
 /// removed the `nlocals + d` identity, so direct slot arithmetic no
 /// longer works.
 pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
@@ -1990,7 +1990,7 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
 ///
 /// Distinct from `trace_arraylen_gc` above — that helper reads
 /// pyre-specific length FIELDS off the host wrapper struct via
-/// getfield (PRE-EXISTING-ADAPTATION) and is reserved for callers
+/// getfield (TODO: bring to parity) and is reserved for callers
 /// that still go through that path (`str_len`, `dict_len`,
 /// `list_length`, typed list `int_items.len`).
 pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
@@ -2380,7 +2380,7 @@ pub(crate) unsafe fn objspace_compare_floats(
 /// the `locals_cells_stack_w` array field. Materialises the array
 /// pointer that step 2 (`lst[i]` → `GETARRAYITEM_GC_R`) indexes.
 ///
-/// PRE-EXISTING-ADAPTATION: the upstream-orthodox emission is
+/// TODO: the upstream-orthodox emission is
 /// `OpCode::GetfieldGcR` because `pyframe_locals_cells_stack_descr`
 /// is field 0 of `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
 /// on a `PYFRAME_GC_TYPE_ID`-typed PyFrame, so the read goes through
@@ -2496,7 +2496,7 @@ pub(crate) fn trace_raw_array_getitem_value(
 /// matching `rpython/rtyper/lltypesystem/rlist.py:84` `GcArray(OBJECTPTR)`.
 ///
 /// Replaces the prior two-step `IntAdd(items_block, OFFSET) +
-/// raw-array op` NEW-DEVIATION with the upstream single-op shape.
+/// raw-array op` deviation with the upstream single-op shape.
 pub(crate) fn trace_items_block_getitem_value(
     ctx: &mut TraceCtx,
     block: OpRef,
@@ -2897,7 +2897,7 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 /// re-mints `ConstClass(constants[i])` unconditionally — the fill loop
 /// here matches that.
 ///
-/// PRE-EXISTING ADAPTATIONS (pre-main divergences kept for now):
+/// TODOs (pre-main divergences kept for now):
 ///
 /// 1. Grow-in-place via `resize(num_regs_and_consts, NONE)` instead of
 ///    full replacement `[missing] * num_regs_and_consts` (the
@@ -2997,7 +2997,7 @@ impl PyreSym {
             // resizes `registers_i` / `registers_f` once the owning JitCode is
             // bound. `registers_r` continues to be driven by the existing
             // semantic-slot logic until the SSA-authoritative live_r epic
-            // (Task #185) rewires the encoder to per-bank reads.
+            // rewires the encoder to per-bank reads.
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -3028,8 +3028,7 @@ impl PyreSym {
     /// overwrite semantics line-by-line.
     ///
     /// `registers_r` carries the unified locals + stack-tail abstract
-    /// register file (Stage 3.4 Phase C). Slice 3b-1 of the
-    /// SSA-authoritative live_r epic (Task #185) extends the resize to
+    /// register file. The SSA-authoritative live_r work extends the resize to
     /// `registers_r` so its size matches the post-regalloc-color shape
     /// `num_regs_and_consts_r` already in use for `registers_i` /
     /// `registers_f`.
@@ -5058,7 +5057,7 @@ impl JitState for PyreJitState {
             // helpers (vable_collect_jump_args, NUM_EXTRA_REDS) already
             // thread the ec slot. The runtime flag here remains 0 because
             // pypy/module/pypyjit/interp_jit.py:67 PyPyJitDriver reds=
-            // ['frame', 'ec']. With Task #21 Slice 2 + Slice 3 landed
+            // ['frame', 'ec']. With vable heap-writeback landed
             // (vable heap-writeback active behind the reduced-LABEL
             // gate), the descriptor activation chain is unblocked.
             // Cluster 2 flip — pairs with `driver_descriptor() = Some(...)`
@@ -5208,12 +5207,12 @@ impl JitState for PyreJitState {
         //       force-virtualizable bookkeeping) invoked from
         //       `close_loop_args_at`. Plan:
         //       memory/task21_fix_implementation_plan.md.
-        //   (e) Task #24 dynasm recursive CA frame contract — *blocking*
+        //   (e) dynasm recursive CA frame contract — *blocking*
         //       for dynasm SIGSEGV at fib(24).
         //
-        // Status (2026-04-28): (a)+(b)+(c1)+(c2) and Task #21 Slice 3
-        // (gen_writeback_vable_to_heap) have landed; descriptor is
-        // active. (e) Task #24 (dynasm recursive CA frame contract)
+        // Status (2026-04-28): (a)+(b)+(c1)+(c2) and
+        // gen_writeback_vable_to_heap have landed; descriptor is
+        // active. (e) dynasm recursive CA frame contract
         // remains as a separate open item driving fib_recursive on
         // dynasm.
         Some(Self::pypyjit_driver_descriptor())
@@ -5566,7 +5565,7 @@ impl JitState for PyreJitState {
         // `sym.concrete_vable_ptr` had not yet been bound at
         // setup_bridge_sym time), causing pushes past `nlocals`/the
         // local prefix to panic at `set_virtualizable_entry_at: index N
-        // out of range for N slots`. Phase 0.5 probe-C captured the
+        // out of range for N slots`. A probe captured the
         // mismatch directly: root portal sized `vable_boxes_len=25`
         // (= 6 + 18 + 1) but a fannkuch bridge fell back to
         // `bridge_array_len=14` → `vable_boxes_len=21`, then pushed
@@ -6060,7 +6059,7 @@ impl JitState for PyreJitState {
             let length_f = all_liveness[off + 2] as u32;
             let mut cursor = off + 3;
             use majit_translate::liveness::LivenessIterator;
-            // Phase 2 commit 2.1 step B: route Ref-bank live-register
+            // Route Ref-bank live-register
             // colors through `metadata.stack_slot_color_map` (forward
             // map: stack slot d → post-rename color). Currently with
             // input-arg pinning the map is `[nlocals, nlocals+1, ...]`
@@ -9254,7 +9253,7 @@ mod tests {
 // so the tracer can compute the same offsets without depending on
 // `pyre-interpreter`. Driver registration still happens in `pyre-jit/src/eval.rs`.
 
-/// PRE-EXISTING-ADAPTATION: deferred `MetaInterp.perform_call`
+/// TODO: deferred `MetaInterp.perform_call`
 /// (`rpython/jit/metainterp/pyjitpl.py`) for pyre.  RPython constructs
 /// and pushes the callee `MIFrame` directly inside `perform_call`; pyre
 /// returns this struct from the trace step so the framestack mutation
@@ -9327,7 +9326,7 @@ pub fn execute_inline_residual_call(
 /// already implements the full upstream predicate including the
 /// `w_class != get_instantiate(&INT_TYPE)` int-subclass rejection
 /// (`listobject.rs:235`); a previous in-place `py_type_check` shortcut
-/// at this site was a NEW-DEVIATION that mishandled int subclasses
+/// at this site was a deviation that mishandled int subclasses
 /// because pyre stores them with `ob_type == &INT_TYPE` and only
 /// distinguishes them via `w_class` (`typedef.rs:686 w_int_new_unique`).
 pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -> bool {

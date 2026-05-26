@@ -341,7 +341,7 @@ impl<'a> TraceIterator<'a> {
                         )
                     });
                     let r = OpRef::input_arg_typed(_fresh, tp);
-                    // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
+                    // companion BoxRef per inputarg, fresh per iter.
                     box_pool.push(BoxRef::new_inputarg(tp, _fresh));
                     _fresh += 1;
                     r
@@ -363,7 +363,7 @@ impl<'a> TraceIterator<'a> {
                 .iter()
                 .map(|&tp| {
                     let r = OpRef::input_arg_typed(_fresh, tp);
-                    // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
+                    // companion BoxRef per inputarg, fresh per iter.
                     box_pool.push(BoxRef::new_inputarg(tp, _fresh));
                     _fresh += 1;
                     r
@@ -495,7 +495,7 @@ impl<'a> TraceIterator<'a> {
             // mixin (resoperation.py:564-638); pyre uses
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
-            // Slice 77b.A: companion BoxRef for the fresh op result.
+            // companion BoxRef for the fresh op result.
             self.box_pool
                 .push(BoxRef::new_resop(src.opcode.result_type(), self._fresh));
             self._fresh += 1;
@@ -516,7 +516,7 @@ impl<'a> TraceIterator<'a> {
             // never reference it. `AbstractResOp.type = 'v'`
             // (resoperation.py:260) → VoidOp variant.
             let f = OpRef::void_op(self._fresh);
-            // Slice 77b.A: companion Void-typed BoxRef placeholder so
+            // companion Void-typed BoxRef placeholder so
             // `box_pool[idx]` indexing stays dense.
             self.box_pool
                 .push(BoxRef::new_resop(Type::Void, self._fresh));

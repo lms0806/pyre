@@ -35,7 +35,7 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
 
 /// pyre walker bridge — resolves the post-merge SSARepr index of each
 /// Python PC's `-live-` marker.  Internal-only helper that supports
-/// pyre's per-PC `-live-` emission (NEW DEVIATION vs upstream RPython,
+/// pyre's per-PC `-live-` emission (TODO: deviates from upstream RPython,
 /// which emits `-live-` only at JIT-relevant block boundaries).
 ///
 /// `walker_tracked_pc_live_indices[py_pc]` is the pre-merge SSARepr

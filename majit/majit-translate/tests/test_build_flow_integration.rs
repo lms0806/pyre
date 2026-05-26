@@ -2,7 +2,7 @@
 //!
 //! RPython basis: `rpython/flowspace/test/test_objspace.py` end-to-end
 //! style, but focused on a narrow smoke path that exercises every
-//! flowspace module landed by Phases 1–3:
+//! landed flowspace module:
 //!
 //!   source →  rustpython-compiler  →  CodeObject
 //!    └→  HostCode::from_code
@@ -10,7 +10,7 @@
 //!    └→  objspace::build_flow
 //!    └→  checkgraph(graph)
 //!
-//! This is the phase-exit test for Phase 3 F3.9. It does not assert
+//! This is the exit test for the build_flow pipeline. It does not assert
 //! fine-grained SpaceOperation ordering — that lives inside the
 //! per-handler unit tests on flowcontext.rs. What this test does
 //! pin is: build_flow never panics on a realistic `def f(x): return x

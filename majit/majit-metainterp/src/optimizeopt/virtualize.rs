@@ -74,7 +74,7 @@ pub(crate) const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
-/// PRE-EXISTING-ADAPTATION: Virtualizable field tracking in the optimizer.
+/// TODO: Virtualizable field tracking in the optimizer.
 ///
 /// RPython does NOT track virtualizable field values in the optimizer.
 /// Field tracking happens during tracing (`pyjitpl.py:virtualizable_boxes`),
@@ -293,7 +293,7 @@ impl VirtualizableTracker {
 
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
-    /// PRE-EXISTING-ADAPTATION: pyre-specific virtualizable field tracker.
+    /// TODO: pyre-specific virtualizable field tracker.
     /// See `VirtualizableTracker` doc comment for convergence path.
     vable: Option<VirtualizableTracker>,
     /// optimizer.py:27 REMOVED + virtualize.py:67-75,180,247:
@@ -2174,7 +2174,7 @@ fn build_vref_field_descr(index: u32) -> Arc<VRefFieldDescr> {
         // and `optimize_jit_force_virtual`'s constant-null read agree
         // on the value tag.
         //
-        // PRE-EXISTING-ADAPTATION (GC trace divergence).  The optimizer
+        // TODO (GC trace divergence).  The optimizer
         // descriptor is `Type::Ref` for parity with the rtyper's
         // setfield_gc_r emit, but the actual GC tracer at
         // `pyre/pyre-jit/src/eval.rs:241-247` registers JIT_VIRTUAL_REF
@@ -4428,7 +4428,7 @@ mod tests {
     // `effectinfo.check_forces_virtual_or_virtualizable()` and the
     // EF_* extraeffect class to decide when to force unconditionally —
     // pyre's port is incomplete here. Fix spans heap.rs force_from_effectinfo
-    // + virtualize.rs force_virtual ordering; multi-session.
+    // + virtualize.rs force_virtual ordering.
     #[ignore = "OptHeap force_from_effectinfo: fresh-object escape via non-random-effects call skips lazy_set flush"]
     #[test]
     fn test_callr_preserves_float_field_store_on_escaping_fresh_object() {

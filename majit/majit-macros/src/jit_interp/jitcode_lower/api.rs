@@ -54,7 +54,7 @@ pub(crate) struct CallerLocalLayout {
     pub kind: BindingKind,
 }
 
-/// Slice 1.2 of dispatch arm caller-local plumbing.
+/// Dispatch arm caller-local plumbing.
 ///
 /// Dispatch-arm lowering entry that pre-binds a list of caller-locals as
 /// portal-input bindings on the sub-Lowerer before lowering the body.
@@ -373,7 +373,7 @@ fn try_generate_jitcode_body_inner(
 /// `greens = [stackok]` with `let stackok = program.get_req_size(pc) <= ...`)
 /// flow through `resolve_greens` / `emit_promote_greens` without panic.
 ///
-/// PRE-EXISTING-ADAPTATION: RPython has no equivalent two-pass walker.
+/// TODO: RPython has no equivalent two-pass walker.
 /// Its annotator-driven flowgraph SpaceOperation-lowers every stmt before
 /// `jtransform.handle_jit_marker__jit_merge_point` fires, so `Variable`
 /// records exist for body-locals at merge-point rewrite time. Pyre's

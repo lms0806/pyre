@@ -56,7 +56,7 @@ pub enum EnsuredPtrInfo {
     },
     /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when
-    /// `OptContext::box_pool` is populated (Epic H Phase C).
+    /// `OptContext::box_pool` is populated.
     ForwardedBox(crate::r#box::BoxRef),
 }
 

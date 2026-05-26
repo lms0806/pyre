@@ -3,7 +3,7 @@
 //!
 //! Files in this tree must use RPython-orthodox structure (file
 //! names, function names, control flow). The legacy `translate_legacy/`
-//! subtree it once paired with was deleted at Slice 10; the residual
+//! subtree it once paired with was deleted; the residual
 //! adapter walker that still drives the dual-gate Skip arm now lives
 //! in [`rtyper::legacy_annotator`] / [`rtyper::legacy_resolve`]
 //! inside this same tree.  Both `majit-annotator` and `majit-rtyper`

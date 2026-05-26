@@ -45,7 +45,7 @@
 //! graph.set_raise_values(block, etype, evalue)
 //! ```
 //!
-//! ### PRE-EXISTING-ADAPTATION — `Constant` SSA carrier shape
+//! ### TODO: `Constant` SSA carrier shape
 //!
 //! Upstream RPython encodes the exception class operand as a
 //! `Constant(class_obj)` SSA value living directly inside
@@ -65,7 +65,7 @@
 //! across 14 files spanning `front/`, `inline.rs`,
 //! `jit_codewriter/{call,jtransform,liveness,regalloc,assembler,
 //! format,flatten,support}.rs`, `translator/rtyper/rpbc.rs`, plus
-//! tests).  That is a multi-session port and is **deferred**.
+//! tests).  That port is **deferred**.
 //!
 //! Until the `Vec<LinkArg>` migration lands, this helper carries the
 //! constant exception class as the *second segment* of the
@@ -87,10 +87,10 @@
 //!    assembler `lookup_coloring_var` because the downstream pipeline
 //!    requires every `args` `Variable` to have a regalloc coloring,
 //!    which non-Variable Constants don't have.  Plumbing constants
-//!    through liveness / regalloc / assembler is multi-session.
+//!    through liveness / regalloc / assembler is deferred.
 //! 3. **`OpKind::Const { value, result_ty }`** — a typed parallel of
 //!    `OpKind::ConstInt(i64)`.  Reviewer would still reject because
-//!    `ConstInt` is itself an existing PRE-EXISTING-ADAPTATION
+//!    `ConstInt` is itself a deviation
 //!    (RPython has no `const_int` op either), so adding more of the
 //!    same does not improve parity.  Also `ConstValue` lacks
 //!    `Serialize`/`Deserialize` derives, so wiring it into `OpKind`
@@ -136,10 +136,9 @@ use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 /// `exc_class_name` is the Python-layer exception class name
 /// (`"AssertionError"`, `"PanicError"`, …) carried as the second
 /// segment of the `simple_call` target's `FunctionPath`.  See the
-/// module-level "PRE-EXISTING-ADAPTATION" block for why the class
+/// module-level TODO block for why the class
 /// is not yet at `simple_call.args[0]` — the orthodox fix is the
-/// `Vec<Variable>` → `Vec<LinkArg>` migration tracked separately
-/// (multi-session).
+/// `Vec<Variable>` → `Vec<LinkArg>` migration tracked separately.
 ///
 /// `message_args` is the pre-evaluated list of message `Variable`s
 /// (side effects already on the graph from the caller's walk).
@@ -161,9 +160,9 @@ pub fn lower_exc_from_raise(
     // path segment so the single op still models
     // `simple_call(const(exc_class), *args)`; downstream readers can
     // reconstruct `(op, const_class, args…)` from `(path[0], path[1],
-    // op.args)`.  This is a documented PRE-EXISTING-ADAPTATION — see
-    // the module-level docstring for why it stands until the
-    // `Vec<Variable>` → `Vec<LinkArg>` migration lands.
+    // op.args)`.  This is a documented deviation — see the module-level
+    // docstring for why it stands until the `Vec<Variable>` →
+    // `Vec<LinkArg>` migration lands.
     let simple_call_target = CallTarget::function_path(["simple_call", exc_class_name]);
     let evalue_var = graph
         .push_op_var(

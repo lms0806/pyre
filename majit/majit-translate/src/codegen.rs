@@ -716,7 +716,7 @@ pub fn trace_int_binop_ovf(
     // `generated_binary_int_value` instead.  The bare
     // `record_guard_typed` keeps the guard shape correct in unit tests
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
-    // path is Task #72 (codegen.rs → register-machine jitcode).
+    // path is convergence to register-machine jitcode.
     ctx.record_guard_typed(OpCode::GuardNoOverflow, &[], Vec::new());
     trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
 }

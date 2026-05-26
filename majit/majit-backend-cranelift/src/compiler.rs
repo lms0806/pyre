@@ -34,7 +34,7 @@ use majit_ir::{
 };
 
 mod slice_x2_probe {
-    //! Slice X2 instrumentation: count how often the host-loop
+    //! Instrumentation: count how often the host-loop
     //! `execute_with_inputs` falls back to the dispatch-loop branch for
     //! cross-loop JUMP exits.  In-code `closing_jump` work will keep
     //! shrinking this counter until the branch can be deleted.
@@ -91,8 +91,8 @@ use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
 //
-// Per-result-type `DoneWithThisFrame*` singletons.  Slice 7-Tβ14f:
-// these are now `DescrRef`s holding the metainterp's class-distinct
+// Per-result-type `DoneWithThisFrame*` singletons.
+// These are now `DescrRef`s holding the metainterp's class-distinct
 // `Arc<DoneWithThisFrameDescr*>` / `Arc<ExitFrameWithExceptionDescrRef>`
 // instances directly, with no `CraneliftFailDescr` wrapper.  Used as
 // fallback identity when the metainterp has not attached its own per-
@@ -113,7 +113,7 @@ static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<DescrRef> =
     std::sync::LazyLock::new(|| Arc::new(majit_backend::DoneWithThisFrameDescrRef::new()));
 
 /// compile.py:658-662 ExitFrameWithExceptionDescrRef singleton.
-/// Slice 7-Tβ14f: a `DescrRef` holding the metainterp's
+/// A `DescrRef` holding the metainterp's
 /// `ExitFrameWithExceptionDescrRef` directly — no cranelift wrapper.
 static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<DescrRef> =
     std::sync::LazyLock::new(|| Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new()));
@@ -122,7 +122,7 @@ static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<DescrRef> =
     std::sync::LazyLock::new(|| Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new()));
 
 /// compile.py:665-674 parity: return the singleton FailDescr for a
-/// given Finish result type.  Slice 7-Tβ14f: returns the metainterp
+/// given Finish result type.  Returns the metainterp
 /// `DescrRef` directly (no cranelift wrapper).
 /// `compile.py:665-674` `make_and_attach_done_descrs` singletons
 /// (`_DoneWithThisFrameDescr*`, `ExitFrameWithExceptionDescrRef`,
@@ -131,8 +131,7 @@ static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<DescrRef> =
 /// and propagate trampoline.  Singletons are matched ptr-eq against
 /// the `CpuDescrAttachments` slot list at the guard-fail boundary
 /// (`match_metainterp_finish_descr`) — no process-global Weak
-/// registry needed (Slice 80-G.7 retirement of
-/// `FAIL_DESCR_REGISTRY_GLOBAL`).
+/// registry needed.
 fn done_with_this_frame_descr(result_types: &[Type]) -> &'static DescrRef {
     match result_types {
         [Type::Float] => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
@@ -142,14 +141,14 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static DescrRef {
     }
 }
 
-/// Helper for the `fail_descrs: Box<[DescrRef]>` storage migration
-/// (Slice 7-Tβ14d).  Every entry in a `fail_descrs` collection
+/// Helper for the `fail_descrs: Box<[DescrRef]>` storage.
+/// Every entry in a `fail_descrs` collection
 /// implements `FailDescr` by construction (codegen pushes singleton
 /// `Arc<CraneliftFailDescr>` instances upcast to `DescrRef`); this
 /// helper makes the `as_fail_descr()` downcast explicit at every
 /// FailDescr-method callsite so the `Box<[DescrRef]>` field can drive
 /// trait-method dispatch through the metainterp's `ResumeGuardDescr`
-/// (post Slice 7-Tβ14f) without backend-wrapper indirection.
+/// without backend-wrapper indirection.
 #[inline]
 fn as_fd(d: &DescrRef) -> &dyn FailDescr {
     d.as_fail_descr()
@@ -164,7 +163,7 @@ fn as_fd(d: &DescrRef) -> &dyn FailDescr {
 /// the jitcounter/bridge-retrace machinery and have no counter slot
 /// — the trait default panics on them, so this gate keeps the
 /// guard-failure dispatcher honest for non-Resume descrs reaching
-/// it via the Slice X-D / #124 identity-preservation path.
+/// it via the identity-preservation path.
 fn maybe_increment_fail_count(fd: &dyn FailDescr) -> u32 {
     if fd.is_resume_guard() || fd.is_resume_guard_copied() {
         fd.increment_fail_count()
@@ -183,7 +182,7 @@ fn attached_descr_ptrs_with_fallbacks(
             fallback as usize
         }
     }
-    // Slice 7-Tβ14f: singletons are now `DescrRef = Arc<dyn Descr>`.
+    // Singletons are now `DescrRef = Arc<dyn Descr>`.
     // `Arc::as_ptr` returns a *fat* pointer (data + vtable); take the
     // data half via `*const () as i64` so jf_descr identity matches the
     // address the metainterp's `Arc::as_ptr(arc) as *const ()` produces
@@ -262,8 +261,8 @@ fn match_metainterp_finish_descr(
         ),
     ] {
         if let Some(arc) = check(slot, ptr) {
-            // Slice 7-Tβ14f: cl_singleton is now `&DescrRef` (the
-            // metainterp's `Arc<DoneWithThisFrameDescr*>` or
+            // cl_singleton is `&DescrRef` (the metainterp's
+            // `Arc<DoneWithThisFrameDescr*>` or
             // `Arc<ExitFrameWithExceptionDescrRef>` directly — no
             // CraneliftFailDescr wrapper).
             return Some((arc, cl_singleton.clone()));
@@ -578,8 +577,8 @@ unsafe impl Send for LoopTargetEntry {}
 unsafe impl Sync for LoopTargetEntry {}
 
 thread_local! {
-    /// Per-thread `TargetToken._ll_loop_code` registry. Same PRE-EXISTING-
-    /// ADAPTATION rationale as `CALL_ASSEMBLER_TARGETS` — pyre's u64-keyed
+    /// Per-thread `TargetToken._ll_loop_code` registry. Same TODO
+    /// rationale as `CALL_ASSEMBLER_TARGETS` — pyre's u64-keyed
     /// trampoline dispatch needs a runtime lookup that RPython avoids by
     /// reading `target_token._ll_loop_code` off the descr directly.
     /// Thread-local matches pyre's single-threaded JIT execution and
@@ -617,7 +616,7 @@ fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     let trace_id = fd.trace_id();
     let mut layout = fail_descr_layout(&descr_ref, fail_index, trace_id);
 
-    // Slice X3-D: if a `wrap_call_assembler_deadframe_with_caller_prefix`
+    // If a `wrap_call_assembler_deadframe_with_caller_prefix`
     // call has stashed a caller-prefix layout on this deadframe, prepend
     // it to the descr's own recovery layout (the same composition the
     // overlay descr machinery used to bake at wrap time).  Replays the
@@ -698,7 +697,7 @@ fn caller_prefix_recovery_layout(
 }
 
 fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> DeadFrame {
-    // Slice X3-D: stash the caller-prefix layout in a side-channel on
+    // Stash the caller-prefix layout in a side-channel on
     // `JitFrameDeadFrame` instead of synthesising an overlay descr and
     // stamping it onto `jf_descr`.  `deadframe_layout` reads the side-
     // channel and prepends it to the callee descr's own recovery layout
@@ -706,7 +705,7 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> Dea
     // Arc identity, so `cpu.get_latest_descr(deadframe)` returns the
     // callee descr (`llmodel.py:411-419` get_latest_descr parity), and
     // the raw `jf_descr` slot still carries a `FailDescrCell` thin
-    // pointer resolvable via `recover_fail_descr_cell` (Slice 80-G.7),
+    // pointer resolvable via `recover_fail_descr_cell`,
     // with no overlay descr needed.
     let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() else {
         // Fallback: return as-is (should not happen after FrameData removal).
@@ -753,12 +752,9 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> Dea
 ///
 /// This struct mirrors the six values
 /// `wrap_call_assembler_deadframe_with_caller_prefix` already takes one
-/// at a time.  Slice X3-B will route the deopt-callback reader through
-/// it; Slice X3-C will stop synthesising the overlay descr in favour of
-/// the same data; Slice X3-D will delete the descr synthesis machinery.
-/// The struct itself disappears together with `execute_with_inputs`
-/// once Slice X4 collapses the dispatch loop to a single-call
-/// `execute_token` (PyPy `llmodel.execute_token`).
+/// at a time.  The struct itself disappears together with
+/// `execute_with_inputs` once the dispatch loop collapses to a
+/// single-call `execute_token` (PyPy `llmodel.execute_token`).
 #[derive(Clone)]
 struct CallAssemblerCallerContext {
     trace_id: u64,
@@ -812,9 +808,9 @@ thread_local! {
     /// caller of any CALL_ASSEMBLER deadframe interception currently
     /// being processed.
     ///
-    /// Slice X3-B wires the producer (CallAssemblerCallerContextGuard at
-    /// every wrap site) and the consumer (dual-verify in
-    /// `wrap_call_assembler_deadframe_with_caller_prefix`).  Thread-local
+    /// The producer (CallAssemblerCallerContextGuard at every wrap site)
+    /// and the consumer (`wrap_call_assembler_deadframe_with_caller_prefix`)
+    /// are connected via this thread-local.  Thread-local
     /// matches pyre's single-threaded JIT execution, mirroring the
     /// surrounding `LOOP_TARGET_REGISTRY` shape.
     static CALL_ASSEMBLER_CALLER_STACK: RefCell<Vec<CallAssemblerCallerContext>> =
@@ -829,7 +825,7 @@ fn pop_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
     CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow_mut().pop())
 }
 
-#[allow(dead_code)] // consumed by Slice X3-C deopt callback
+#[allow(dead_code)] // consumed by deopt callback
 fn current_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
     CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow().last().cloned())
 }
@@ -848,8 +844,7 @@ where
 /// RAII guard that pushes a `CallAssemblerCallerContext` on construction
 /// and pops on drop.  Used at every `wrap_call_assembler_deadframe_with_
 /// caller_prefix` call site so the wrap consumer can read the caller's
-/// data off the stack — Slice X3-B dual-write phase keeps the explicit
-/// parameter path active alongside; Slice X3-C drops the parameters.
+/// data off the stack.
 struct CallAssemblerCallerContextGuard;
 
 impl CallAssemblerCallerContextGuard {
@@ -1008,7 +1003,7 @@ extern "C" fn jit_reacquire_gil_shim() {
 // comment in `majit-backend-dynasm/src/runner.rs` for full layout
 // rationale — both backends mirror the upstream rstr layout.
 //
-// PRE-EXISTING-ADAPTATION: These constants assume PyPy's inline
+// TODO: These constants assume PyPy's inline
 // `rstr.STR` layout `[hash | len | chars...]`.  Pyre's `W_StrObject`
 // stores chars behind `*mut String` (a `repr(Rust)` type whose
 // internal layout is not guaranteed).  STRLEN is correct: it reads
@@ -1387,7 +1382,7 @@ fn collect_full_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_full());
 }
 
-/// Host-side root-register trampoline (Task #141 option a). Bridges
+/// Host-side root-register trampoline. Bridges
 /// `majit_gc::gc_add_root` to the active cranelift-owned GC's
 /// `RootSet`.
 ///
@@ -1525,15 +1520,15 @@ thread_local! {
     /// (rewrite.py:665-695) reads metadata via
     /// `loop_token.compiled_loop_token` with no indirection. pyre's
     /// backends emit u64-keyed trampolines, so a `token_number ->
-    /// RegisteredLoopTarget` map is a PRE-EXISTING-ADAPTATION required
+    /// RegisteredLoopTarget` map is a TODO required
     /// for the u64 dispatch. Storing the map thread-locally (matching
     /// `CALL_ASSEMBLER_DEADFRAMES` below) keeps cranelift's per-thread
     /// CA state separated and avoids a process-global registry
-    /// (`plan:staged-sauteeing-koala.md` Phase 2 goal).
+    /// (keeps cranelift's per-thread CA state separated).
     static CALL_ASSEMBLER_TARGETS: RefCell<VecAssoc<u64, RegisteredLoopTarget>> =
         RefCell::new(VecAssoc::new());
     /// Per-thread caller->callee result-kind expectations. Same
-    /// PRE-EXISTING-ADAPTATION rationale as `CALL_ASSEMBLER_TARGETS`.
+    /// TODO rationale as `CALL_ASSEMBLER_TARGETS`.
     static CALL_ASSEMBLER_EXPECTATIONS: RefCell<VecAssoc<u64, VecAssoc<CallAssemblerCallerId, u64>>> =
         RefCell::new(VecAssoc::new());
     /// Thread-local deadframe storage for call_assembler results.
@@ -1581,7 +1576,7 @@ pub fn register_call_assembler_blackhole(
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> = OnceLock::new();
 
-/// On-demand resume callback (Slice QQ): pyre-jit registers this to
+/// On-demand resume callback: pyre-jit registers this to
 /// drive `ResumeDataDirectReader` from the failed descr's `rd_numb` /
 /// `rd_consts` / `rd_virtuals` / `rd_pendingfields` so cranelift's
 /// `rebuild_state_after_failure` no longer needs a pre-baked
@@ -1606,7 +1601,7 @@ static RESUMEDATA_DEOPT_FN: OnceLock<fn(usize, &mut Vec<i64>, &[Type], usize) ->
     OnceLock::new();
 
 /// Register the on-demand resume callback for cranelift deopt
-/// materialisation (Slice QQ-1).  pyre-jit calls this during JIT
+/// materialisation.  pyre-jit calls this during JIT
 /// boot alongside `register_call_assembler_blackhole` so the
 /// callback is reachable when cranelift consumers migrate off the
 /// `ExitRecoveryLayout` cache.
@@ -1614,7 +1609,7 @@ pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> 
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
-/// On-demand layout reconstruction callback (Path 1 Slice 1).  Returns
+/// On-demand layout reconstruction callback.  Returns
 /// an `ExitRecoveryLayout` for the descr at `descr_addr`, optionally
 /// prefixed by `caller_prefix`.  Implementation looks up the
 /// metainterp's `StoredExitLayout` cache (keyed by trace_id /
@@ -1643,8 +1638,8 @@ pub fn register_recovery_layout(
     let _ = RECOVERY_LAYOUT_FN.set(f);
 }
 
-/// Dispatch helper consulted by `fail_descr_recovery_layout` (Slice
-/// X3-E).  Returns `None` if the callback hasn't been registered yet
+/// Dispatch helper consulted by `fail_descr_recovery_layout`.
+/// Returns `None` if the callback hasn't been registered yet
 /// (cranelift in pure-backend tests without pyre-jit boot); production
 /// callers fall through to the metainterp's
 /// `trace_layout_ref.recovery_layout` fallback at
@@ -1659,8 +1654,8 @@ pub(crate) fn recovery_layout_via_callback(
 
 /// Dispatch entry used by the four runtime-deopt callers
 /// (compiler.rs:3185, 3555, 3590, 3717) — drives the on-demand
-/// `ResumeDataDirectReader` callback (Slice QQ-2's
-/// `cranelift_resumedata_deopt`) which materialises virtuals + replays
+/// `ResumeDataDirectReader` callback
+/// (`cranelift_resumedata_deopt`) which materialises virtuals + replays
 /// pending fields straight from `rd_numb` / `rd_consts` / `rd_virtuals`
 /// / `rd_pendingfields`, matching `pyjitpl.py:3424
 /// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)` +
@@ -1686,8 +1681,8 @@ fn rebuild_state_after_failure_dispatch(
         "RESUMEDATA_DEOPT_FN not registered — pyre-jit's init_callbacks (eval.rs) must call \
          register_resumedata_deopt before any guard can fail.",
     );
-    // Slice 80-G.7: `cranelift_resumedata_deopt` recovers the descr
-    // via `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`,
+    // `cranelift_resumedata_deopt` recovers the descr via
+    // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`,
     // which requires a `FailDescrCell` thin pointer.  Wrap in a fresh
     // cell and bake its address; the cell stays alive through the
     // callback, and the recovery bumps the refcount.
@@ -2550,7 +2545,7 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
     // receiver derives green_key (memmgr-evicted JCT recovery via
     // `frame.pycode`), trace_id, and fail_index from the descr Arc.
     //
-    // Slice 80-G.7: the blackhole hook recovers its descr via
+    // The blackhole hook recovers its descr via
     // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`,
     // which requires `descr_addr` to be a `FailDescrCell` thin pointer.
     // The deadframe carries only `DescrRef`, so wrap it in a fresh cell
@@ -2635,7 +2630,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
     // parity.  `jf_force_descr` carries the per-emission
     // `FailDescrCell` thin pointer baked at codegen
-    // (`collect_guards` Slice 80-G.7).  Recovery is a pure
+    // (`collect_guards`).  Recovery is a pure
     // `Arc::from_raw` against the cell, with the strong refcount
     // held by the owning `CompiledLoop::fail_descr_cells` for the
     // life of the executing JIT code.
@@ -2686,7 +2681,7 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 /// metainterp `AbstractFailDescr` Arc the optimizer stamped onto
 /// `op.descr` (or the cpu-attached singleton for FINISH exits).
 /// `JitFrameDeadFrame.fail_descr` IS that Arc — no wrapper indirection
-/// after Slice 7-Tβ14f.
+/// (no wrapper indirection).
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
@@ -2820,7 +2815,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 return bridge_frame;
             }
             // Non-loop-reentry: materialize virtuals then dispatch.
-            // Slice QQ-3: route through rebuild_state_after_failure_dispatch
+            // Route through rebuild_state_after_failure_dispatch
             // so the on-demand `ResumeDataDirectReader` callback (when
             // registered by pyre-jit) drives materialisation directly
             // from `rd_numb` / `rd_consts` / `rd_virtuals` /
@@ -3208,7 +3203,7 @@ fn call_assembler_fast_path_heap(
     maybe_increment_fail_count(fail_descr_fd);
 
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
-        // Slice QQ-3: dispatch routes on-demand ResumeDataDirectReader
+        // Dispatch routes on-demand ResumeDataDirectReader
         // callback first; falls back to recovery_layout walker.
         let mut bridge_outputs = outputs;
         let fail_arg_types = fail_descr_fd.fail_arg_types();
@@ -3243,7 +3238,7 @@ fn call_assembler_fast_path_heap(
     }
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        // Slice 80-G.7: BH expects a `FailDescrCell` thin pointer (see
+        // BH expects a `FailDescrCell` thin pointer (see
         // `Backend::fail_descr_arc_from_addr`).  Wrap in a fresh cell
         // and bake its address; the local cell stays alive across the
         // BH call, and the recovery inside BH bumps the strong refcount
@@ -3253,7 +3248,7 @@ fn call_assembler_fast_path_heap(
         let raw_num = fail_descr_fd.fail_arg_types().len();
         let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
-        // Slice QQ-3: same on-demand dispatch as the bridge path above.
+        // Same on-demand dispatch as the bridge path above.
         let fail_arg_types_for_dispatch = fail_descr_fd.fail_arg_types();
         rebuild_state_after_failure_dispatch(
             fail_descr,
@@ -3387,7 +3382,7 @@ fn call_assembler_shim_inner(
         let raw_num = fail_types.len();
         let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
-        // Slice QQ-3 + QQ-4: dispatch through on-demand callback.  No
+        // Dispatch through on-demand callback.  No
         // recovery_layout walker fallback — if the descr can't be
         // looked up in fail_descrs (shouldn't happen for in-bounds
         // fail_index per the producer's invariant) we leave bh_outputs
@@ -3403,7 +3398,7 @@ fn call_assembler_shim_inner(
             );
         }
         let num_outputs = bh_outputs.len();
-        // Slice 80-G.7: BH recovers its descr via
+        // BH recovers its descr via
         // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`
         // which requires a `FailDescrCell` thin pointer.  Use the
         // position-aligned cell from `target.fail_descr_cells`; fall back
@@ -4258,7 +4253,7 @@ fn resolve_call_assembler_target(
         call_descr.arg_types().len()
     };
     if target.inputarg_types.len() != expected_arity {
-        // PRE-EXISTING-ADAPTATION: pyre's `direct_assembler_call`
+        // TODO: pyre's `direct_assembler_call`
         // emits CALL_ASSEMBLER with `arg_types = [frame]` (or
         // `[frame, ec]` once `extra_reds` flips) while the callee's
         // compiled trace still exposes the full vable-expanded
@@ -4267,7 +4262,7 @@ fn resolve_call_assembler_target(
         // `patch_new_loop_to_load_virtualizable_fields`
         // (compile.py:425-461), which only fires when
         // `state.rs:4058 driver_descriptor()` returns `Some(...)`.
-        // Pyre holds it disabled pending Task #21 vable
+        // Pyre holds it disabled pending vable
         // heap-writeback (see state.rs comment for the full
         // prerequisite chain). Until then, when the target exposes
         // scalar header slots (`num_scalar_inputargs >` caller's red
@@ -5633,13 +5628,13 @@ fn emit_attached_bridge_dispatch(
     // it's too small.  Mirror that here: load the bridge code cell and
     // dispatch on non-null alone.  The frame_depth cache is no longer
     // read here — the bridge prologue (compiler.rs:7585) bakes the
-    // expected size as an iconst at compile time.  Slice X1-realloc/B.
+    // expected size as an iconst at compile time.
     //
-    // Slice JJ: bridge code_ptr cell lives on the descr as
+    // Bridge code_ptr cell lives on the descr as
     // `Box<AtomicUsize>`.  Box gives it a heap-pinned address that
     // survives the descr being moved into `Arc::new(...)`, so the
     // address is stable for the descr's lifetime and safe to bake
-    // into machine code as an immediate.  Slice 7-Tβ14e: the caller
+    // into machine code as an immediate.  The caller
     // pre-computes the address pair via `fail_descr_bridge_cache_addrs`
     // and passes it directly, since `jf_descr` now embeds the meta
     // Arc rather than the backend wrapper that owns the cells.
@@ -6053,10 +6048,8 @@ impl CompiledLoop {
 
 /// `assembler.py:write_failure_recovery_description` parity —
 /// derive the GC-map classification on demand from `fail_arg_types`
-/// and the per-emission `force_token_slots`.  Slice 7-Tβ14a: lifted
-/// off `CraneliftFailDescr` to take `&dyn FailDescr` so callers can
-/// invoke it on the bare metainterp `DescrRef` after the wrapper is
-/// retired.
+/// and the per-emission `force_token_slots`.  Takes `&dyn FailDescr`
+/// so callers can invoke it on the bare metainterp `DescrRef`.
 pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
     let slots = fd.force_token_slots();
     let mut gc_map = GcMap::new();
@@ -6069,7 +6062,7 @@ pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
 }
 
 /// Resolve the `ExitRecoveryLayout` for a fail descr via the on-demand
-/// callback (Slice X3-E).  The cranelift backend no longer caches a
+/// callback.  The cranelift backend no longer caches a
 /// recovery layout — pyre-jit's
 /// `cranelift_recovery_layout_for_descr` reconstructs it from the
 /// metainterp's `StoredExitLayout.resume_layout` cache, matching
@@ -6079,8 +6072,8 @@ pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
 /// callback is registered (test scaffolds without pyre-jit) or when
 /// the descr is synthetic (no `rd_loop_token_clt`).
 fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
-    // Slice 80-G.7: the callback (`cranelift_recovery_layout_for_descr`)
-    // resolves the descr via `Backend::fail_descr_arc_from_addr` →
+    // The callback (`cranelift_recovery_layout_for_descr`) resolves the
+    // descr via `Backend::fail_descr_arc_from_addr` →
     // `recover_fail_descr_cell`, which requires a `FailDescrCell` thin
     // pointer.  Wrap in a fresh cell and bake its address; the local
     // cell stays alive through the callback and the recovery bumps the
@@ -6093,7 +6086,7 @@ fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
 }
 
 /// Read the per-trace `CompiledTraceInfo` from the meta-side
-/// per-emission slot (Slice 7-Tβ10).  Routes through the
+/// per-emission slot.  Routes through the
 /// `FailDescr::trace_info_any` trait method so copied descrs return
 /// their own published info instead of `None`.
 fn fail_descr_trace_info(fd: &dyn FailDescr) -> Option<CompiledTraceInfo> {
@@ -6106,7 +6099,7 @@ fn fail_descr_trace_info(fd: &dyn FailDescr) -> Option<CompiledTraceInfo> {
 /// `fail_index` / `trace_id` from the descr — those identities come
 /// from the per-trace storage position and the surrounding
 /// `CompiledLoop::trace_id`, since FINISH singletons share Arc
-/// identity across emissions (Slice 7-Tβ3 parity with dynasm
+/// identity across emissions (parity with dynasm
 /// `layout_for_fail_descr` at guard.rs:146).
 fn fail_descr_layout(
     descr: &DescrRef,
@@ -6145,10 +6138,8 @@ fn fail_descr_layout(
 }
 
 /// Read the per-emission bridge `Arc<BridgeData>` from the meta-side
-/// dispatch cell (Slice 7-Tβ12).  Returns `None` when no bridge has
-/// been attached.  Slice 7-Tβ14c lift off `CraneliftFailDescr::bridge_ref`
-/// so the helper runs on `&dyn FailDescr`; the inherent forwarder goes
-/// away once the wrapper retires.
+/// dispatch cell.  Returns `None` when no bridge has been attached.
+/// Runs on `&dyn FailDescr` directly.
 ///
 /// Safety / lifecycle: `bridge_dispatch_load` returns the raw pointer
 /// that `attach_bridge` (`fail_descr_attach_bridge` below) published
@@ -6169,10 +6160,9 @@ pub(crate) fn fail_descr_bridge_ref(fd: &dyn FailDescr) -> Option<Arc<BridgeData
 
 /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
 /// parity — atomic-store the bridge `Arc` raw pointer into the
-/// meta-side dispatch cell (Slice 7-Tβ12), and publish
-/// `(code_ptr, frame_depth)` into the cache cells (Slice 7-Tβ11)
-/// that `emit_attached_bridge_dispatch` baked addresses for. Slice
-/// 7-Tβ14c lift-off so the helper takes `&dyn FailDescr`.
+/// meta-side dispatch cell, and publish `(code_ptr, frame_depth)`
+/// into the cache cells that `emit_attached_bridge_dispatch` baked
+/// addresses for.
 ///
 /// Panics when the descr does not expose the per-emission bridge slot
 /// (`bridge_cache_addrs()` is `None`). Every bridgeable guard carries
@@ -6191,8 +6181,7 @@ pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
     // cache.  Reversing the order would leave a window where the host-
     // loop bridge fallback at compiler.rs:7287 fires with a freshly
     // published Arc but a still-null cache, which the in-code dispatch
-    // (`emit_attached_bridge_dispatch`) cannot reach.  Slice X1-delete
-    // preparation.
+    // (`emit_attached_bridge_dispatch`) cannot reach.
     fd.store_bridge_caches(code_ptr, frame_depth);
     let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut ();
     let old_ptr = fd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
@@ -6203,17 +6192,16 @@ pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
 
 /// Whether a bridge has been attached to this descr.  Helper around
 /// `FailDescr::bridge_code_ptr` so callers do not have to know the 0
-/// sentinel.  Slice 7-Tβ14c lift-off.
+/// sentinel.
 pub(crate) fn fail_descr_has_bridge(fd: &dyn FailDescr) -> bool {
     fd.bridge_code_ptr() != 0
 }
 
-/// Read the per-emission bridge cell addresses (Slice 7-Tβ11),
-/// suitable for baking into JIT machine code as immediates.  Panics
-/// when the descr does not carry the slot — every guard that reaches
+/// Read the per-emission bridge cell addresses, suitable for baking
+/// into JIT machine code as immediates.  Panics when the descr does
+/// not carry the slot — every guard that reaches
 /// `emit_attached_bridge_dispatch` does (real `op.descr` or the
-/// test-scaffold synthesis at compiler.rs:12884).  Slice 7-Tβ14c
-/// lift-off.
+/// test-scaffold synthesis at compiler.rs:12884).
 pub(crate) fn fail_descr_bridge_cache_addrs(fd: &dyn FailDescr) -> (usize, usize) {
     fd.bridge_cache_addrs().expect(
         "bridge_cache_addrs requires a FailDescr carrying the per-emission \
@@ -6223,12 +6211,11 @@ pub(crate) fn fail_descr_bridge_cache_addrs(fd: &dyn FailDescr) -> (usize, usize
 }
 
 /// Write the per-trace `CompiledTraceInfo` to the meta-side per-
-/// emission slot (Slice 7-Tβ10).  Wrap the value in `Arc<dyn Any>` so
-/// the `FailDescr::set_trace_info_any` trait method can carry it
-/// without depending on `majit-backend`'s concrete type.  Silently
-/// no-ops for descrs whose `set_trace_info_any` is the trait default
-/// (synthetic singletons that never carry per-trace metadata).  Slice
-/// 7-Tβ14c lift-off.
+/// emission slot.  Wrap the value in `Arc<dyn Any>` so the
+/// `FailDescr::set_trace_info_any` trait method can carry it without
+/// depending on `majit-backend`'s concrete type.  Silently no-ops for
+/// descrs whose `set_trace_info_any` is the trait default (synthetic
+/// singletons that never carry per-trace metadata).
 pub(crate) fn fail_descr_set_trace_info(fd: &dyn FailDescr, trace_info: CompiledTraceInfo) {
     if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
         return;
@@ -6238,9 +6225,9 @@ pub(crate) fn fail_descr_set_trace_info(fd: &dyn FailDescr, trace_info: Compiled
 }
 
 /// Read the external-JUMP target from the meta-side
-/// `ResumeGuardDescr::external_jump_target` slot (Slice 7-Tβ8).
-/// Returns `None` for descrs without a `ResumeGuardDescr` meta AND for
-/// regular guard descrs (the common case).  Slice 7-Tβ14c lift-off.
+/// `ResumeGuardDescr::external_jump_target` slot.  Returns `None` for
+/// descrs without a `ResumeGuardDescr` meta AND for regular guard
+/// descrs (the common case).
 pub(crate) fn fail_descr_external_jump_target(descr: &DescrRef) -> Option<DescrRef> {
     descr
         .as_any()
@@ -6249,7 +6236,7 @@ pub(crate) fn fail_descr_external_jump_target(descr: &DescrRef) -> Option<DescrR
 }
 
 /// Write the external-JUMP target into the meta-side per-emission
-/// slot on the Resume-family descr (Slice 7-Tβ8).  Dispatches via
+/// slot on the Resume-family descr.  Dispatches via
 /// the `FailDescr::set_external_jump_target` trait method which
 /// the Resume-family overrides; non-Resume descrs trip the trait
 /// panic default.  Cross-loop JUMP descrs synthesise a fresh
@@ -6259,7 +6246,7 @@ pub(crate) fn fail_descr_set_external_jump_target(descr: &DescrRef, target: Desc
 }
 
 /// Build the per-trace `FailDescrLayout` view for a slice of
-/// `fail_descrs`.  Slice 7-Tβ3: FINISH descrs are now the static
+/// `fail_descrs`.  FINISH descrs are now the static
 /// singletons (`DONE_WITH_THIS_FRAME_DESCR_*`,
 /// `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) shared across every
 /// trace, so the singleton's `self.fail_index = u32::MAX` and
@@ -6386,7 +6373,7 @@ fn find_fail_descr_in_fail_descrs(
 /// Three address kinds reach this lookup:
 ///
 /// * Non-FINISH guards bake the per-emission `FailDescrCell` thin
-///   pointer (`collect_guards` Slice 80-G.7).  `recover_fail_descr_cell`
+///   pointer (`collect_guards`).  `recover_fail_descr_cell`
 ///   recovers the cell via `Arc::from_raw` (strong refcount lives on
 ///   the owning `CompiledLoop::fail_descr_cells`).
 /// * FINISH emissions bake the metainterp `AbstractFailDescr` Arc's
@@ -6708,16 +6695,14 @@ fn run_compiled_code_inner(
         // address (compiler.rs:13778 baking).  Return that *exact* Arc
         // so the consumer sees the same identity `compile.py:618-672`
         // attached on the cpu — not the process-global fallback static.
-        // Both are `Arc<DoneWithThisFrameDescrInt>` after Slice 7-Tβ14f
-        // (no wrapper) so the trait-method dispatch is identical; only
+        // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
+        // trait-method dispatch is identical; only
         // the Arc identity differs, and PyPy parity demands they match.
         (u32::MAX, Some(metainterp_finish))
     } else {
-        // Slice 7-Tβ14e: `jf_descr_raw` is the metainterp
-        // `AbstractFailDescr` Arc's data pointer.  Resolve via the
-        // `fail_descrs` collection (which still holds backend wrappers
-        // until 7-Tβ14f — `find_fail_descr_by_ptr` tries both backend
-        // and meta back-pointer addresses).  Derive `fail_index` from
+        // `jf_descr_raw` is the metainterp `AbstractFailDescr` Arc's
+        // data pointer.  Resolve via the `fail_descrs` collection.
+        // Derive `fail_index` from
         // the resolved Arc via the FailDescr trait — never dereference
         // the raw pointer as a concrete type, since the meta side can
         // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
@@ -6731,8 +6716,8 @@ fn run_compiled_code_inner(
         // global singleton — it won't appear in per-trace fail_descrs.
         let arc = arc.or_else(|| {
             let ptr = jf_descr_raw as usize;
-            // Slice 7-Tβ14f: singletons are `DescrRef = Arc<dyn Descr>`
-            // (fat pointer).  Match on the data-pointer half via
+            // Singletons are `DescrRef = Arc<dyn Descr>` (fat pointer).
+            // Match on the data-pointer half via
             // `as *const () as usize`.
             for global in [
                 &*DONE_WITH_THIS_FRAME_DESCR_INT,
@@ -6787,12 +6772,12 @@ struct GuardInfo {
     /// allocate_gcmap (gcmap.py:7-18) parity.
     gcmap: u64,
     /// assembler.py:2126 get_gcref_from_faildescr parity: written to
-    /// jf_descr on guard exit.  Slice 7-Tβ14e: this is the metainterp
+    /// jf_descr on guard exit.  This is the metainterp
     /// `AbstractFailDescr` Arc's data pointer (matching `history.py:125`
     /// identity) for non-FINISH guards, or the FINISH singleton's
     /// `Arc` address for FINISH guards.
     fail_descr_ptr: i64,
-    /// Slice 7-Tβ14e: per-emission bridge cache cell addresses
+    /// Per-emission bridge cache cell addresses
     /// (`(code_ptr, frame_depth)`) baked into machine code as
     /// immediates by `emit_attached_bridge_dispatch`.  Pre-computed at
     /// codegen time via `fail_descr_bridge_cache_addrs` so the dispatch
@@ -7043,7 +7028,7 @@ impl CraneliftBackend {
 
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython's `llop.raw_load(STYPE, gcref, ofs)`
+    /// TODO: RPython's `llop.raw_load(STYPE, gcref, ofs)`
     /// segfaults on a null `gcref`; the JIT relies on emitted guards
     /// (`guard_nonnull`, `guard_class`, etc.) to filter null inputs
     /// before reaching the helper. Cranelift currently calls this helper
@@ -7074,7 +7059,7 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
-    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// TODO: see `read_int_at_mem` above for the
     /// null-guard rationale (cranelift call-site auditing required).
     fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
         if addr == 0 {
@@ -7092,7 +7077,7 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
-    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// TODO: see `read_int_at_mem` above for the
     /// null-guard rationale.
     fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
         if addr == 0 {
@@ -7103,7 +7088,7 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
-    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// TODO: see `read_int_at_mem` above for the
     /// null-guard rationale.
     fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
         if addr == 0 {
@@ -7231,7 +7216,7 @@ impl CraneliftBackend {
         // `CompiledLoopToken` lifetime (`model.py:294`,
         // `llmodel.py:252-268 free_loop_and_bridges`).
         //
-        // Slice 80-G.7: `recover_fail_descr_cell` lifts the descr Arc
+        // `recover_fail_descr_cell` lifts the descr Arc
         // from the JIT-baked `FailDescrCell` thin pointer directly
         // (`history.py:109-114 AbstractDescr.show` = pure cast); the
         // process-global Weak registry that used to bridge addr→Arc
@@ -7607,7 +7592,7 @@ impl CraneliftBackend {
             // llgraph/runner.py:1192-1194 fail_guard → ExecutionFinished
             // (LLDeadFrame).
             //
-            // Slice X1-delete: the host-loop bridge dispatch branch that
+            // The host-loop bridge dispatch branch that
             // previously sat between `increment_fail_count` and this
             // deadframe return has been removed.  After
             // `fail_descr_attach_bridge` was reordered (compiler.rs:5891)
@@ -10524,7 +10509,7 @@ impl CraneliftBackend {
                     // dynasm backend mirrors that with
                     // `func_index = 3 + is_call_release_gil` at
                     // `backend-dynasm/x86/assembler.rs:4804`.
-                    // PRE-EXISTING-ADAPTATION: pyre does not yet
+                    // TODO: pyre does not yet
                     // forward `saveerr` to the GIL pre/post-hooks, so
                     // `op.arg(0)` is still consumed as a const_int
                     // operand at trace replay rather than threaded
@@ -13049,12 +13034,11 @@ impl CraneliftBackend {
         // increments the `fail_index` counter in lockstep with
         // `fail_descrs.push`, so the contract is structural rather than
         // descr-internal.  The earlier per-descr assertion was a pyre
-        // NEW DEVIATION removed in Session 7-Tβ4 (parallels dynasm
-        // Tα4 cf05a9e99c): singleton FINISH descrs (the
+        // TODO removed: singleton FINISH descrs (the
         // `DONE_WITH_THIS_FRAME_DESCR_*` cl statics whose
         // `fail_index_per_trace()` is stamped once at module init) would
         // mismatch their Vec position on every non-zero codegen, and
-        // post-Slice 7-Tβ1 the runtime lookup is position-based via
+        // The runtime lookup is position-based via
         // `find_fail_descr_in_fail_descrs` rather than descr-internal.
         let fail_descrs: Box<[DescrRef]> = fail_descrs.into_boxed_slice();
         let fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]> =
@@ -13725,15 +13709,15 @@ fn collect_guards(
             // forward through `meta_descr` so no local copy is needed.
             // `compile.py:658` ExitFrameWithExceptionDescrRef identity is
             // now read through `meta_descr` forwarding in
-            // `FailDescr::is_exit_frame_with_exception` (Session 5i-cl); no
+            // `FailDescr::is_exit_frame_with_exception`; no
             // backend-local mirror needed for descrs that carry a
             // metainterp Arc.
             fd.vector_info()
         } else {
             Vec::new()
         };
-        // Slice 7-Tβ14f: descr is now `DescrRef` directly — the
-        // metainterp `Arc<DoneWithThisFrameDescr*>` /
+        // Descr is now `DescrRef` directly — the metainterp
+        // `Arc<DoneWithThisFrameDescr*>` /
         // `Arc<ExitFrameWithExceptionDescrRef>` for FINISH, or the
         // metainterp `Arc<ResumeGuardDescr>` (op.descr or synthesized)
         // for guards.  No CraneliftFailDescr wrapper between codegen
@@ -13741,14 +13725,13 @@ fn collect_guards(
         // identity (`history.py:121`: one ResumeGuardDescr per guard,
         // shared between metainterp and backend).
         let descr: DescrRef = if is_finish {
-            // Slice 7-Tβ3: singleton-direct FINISH push (parallel of
-            // dynasm Slice 7-Tα3 commit 3f282e5b19).  PyPy's
+            // Singleton-direct FINISH push.  PyPy's
             // `compile.py:626-656 _DoneWithThisFrameDescr*` are
             // module-level singletons; every FINISH exit of a given
             // result type resolves to the SAME `Arc::ptr_eq` identity
-            // matching `make_and_attach_done_descrs` parity.  Slice
-            // 7-Tβ14f: the singletons are now the metainterp Arc
-            // directly, no CraneliftFailDescr wrapper layered on top.
+            // matching `make_and_attach_done_descrs` parity.  The
+            // singletons are now the metainterp Arc directly, no
+            // CraneliftFailDescr wrapper layered on top.
             //
             // `is_exit_frame_with_exception` vs DoneWithThisFrame
             // routing mirrors lines 12992-13001 below.
@@ -13782,8 +13765,8 @@ fn collect_guards(
                 // op.descr for external JUMP is the TargetToken (already
                 // captured in external_jump_target above) — not a
                 // FailDescr.  Synthesize a `ResumeGuardDescr` so the
-                // meta-side slots for `force_token_slots` (Slice 7-Tβ7)
-                // and `external_jump_target` (Slice 7-Tβ8) are reachable.
+                // meta-side slots for `force_token_slots` and
+                // `external_jump_target` are reachable.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
             } else if let Some(d) = op.getdescr() {
                 // Preserve `op.descr` identity for every guard that carries
@@ -13806,7 +13789,7 @@ fn collect_guards(
                 // normally stamps op.descr to a ResumeGuardDescr via
                 // store_final_boxes_in_guard) synthesize a
                 // ResumeGuardDescr so the recovery_layout slot has
-                // somewhere to land — orthodox Slice QQ-4: only the
+                // somewhere to land — only the
                 // meta-side slot stores recovery_layout, no backend
                 // cell fallback.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
@@ -13826,8 +13809,8 @@ fn collect_guards(
                 }
             }
             // Per-emission setters publish into ResumeGuardDescr slots
-            // reached directly off `descr` (Slice 7-Tβ6 source_op_index,
-            // Slice 7-Tβ7 force_token_slots).  Gate on Resume-family
+            // reached directly off `descr` (source_op_index,
+            // force_token_slots).  Gate on Resume-family
             // ownership — non-Resume descrs (PropagateExceptionDescr
             // attached via compile_tmp_callback, etc.) carry neither
             // slot and the trait-default panic would fire otherwise.
@@ -13835,7 +13818,6 @@ fn collect_guards(
                 as_fd(&descr).set_source_op_index(op_idx);
                 as_fd(&descr).set_force_token_slots(force_token_slots);
             }
-            // Slice X3-E: dropped the codegen-time recovery_layout stamp.
             // Backend no longer caches an `ExitRecoveryLayout` per descr;
             // `fail_descr_recovery_layout` reads on demand via
             // `recovery_layout_via_callback` (metainterp's
@@ -13876,13 +13858,13 @@ fn collect_guards(
             }
         }
         // assembler.py:2126 get_gcref_from_faildescr parity: store the
-        // FailDescr Arc data pointer in jf_descr.  Slice 7-Tβ14f:
+        // FailDescr Arc data pointer in jf_descr.
         // FINISH and non-FINISH alike bake a thin pointer identity;
         // FINISH still routes through `attached_descrs` so multiple
         // traces share the same pointer for
         // `_call_assembler_check_descr` (assembler.py:2274) identity.
         // Non-FINISH guards bake the per-emission `FailDescrCell` thin
-        // ptr (Slice 80-G.7 cranelift): `Arc<dyn Descr>` is fat and
+        // ptr: `Arc<dyn Descr>` is fat and
         // can't round-trip through a `usize` JIT bake, while
         // `Arc<FailDescrCell>` is concrete-typed and `Arc::from_raw`
         // recovers identity without a process-global Weak registry.
@@ -13906,7 +13888,7 @@ fn collect_guards(
             // `CompiledLoop::fail_descr_cells` (this push site below).
             Arc::as_ptr(&cell) as *const () as i64
         };
-        // Slice 7-Tβ14e: pre-compute the per-emission bridge cache cell
+        // Pre-compute the per-emission bridge cache cell
         // addresses while we still have a typed `&dyn FailDescr` handle.
         // `fail_descr_ptr` carries the meta Arc data pointer; the
         // dispatch emitter cannot recover the cell owner from that
@@ -14114,7 +14096,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // `ResumeGuardDescr` so non-Resume descrs (Done* / ExitExc /
         // PropagateException) skip the stamp, matching upstream.
         //
-        // Post Slice 7-Tβ14f: `fail_descrs` storage holds the metainterp
+        // `fail_descrs` storage holds the metainterp
         // `AbstractFailDescr` Arcs directly — there is no backend wrapper
         // between codegen and metainterp.  The stamp here lands on the
         // same `op.descr` Arc that `pyjitpl/mod.rs::record_loop_or_bridge`
@@ -14256,7 +14238,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // `rd_loop_token_clt`.  The metainterp caller now passes that
         // owning JCT as `original_token`, so the matching backend descr
         // is always reachable inside `original_compiled.fail_descrs` —
-        // the prior `previous_tokens` scan was a NEW-DEVIATION compensating
+        // the prior `previous_tokens` scan was a TODO compensating
         // for the absence of `descr_owning_jct` and has been retired.
         let source_trace_id = fail_descr.trace_id();
         let source_descr = find_fail_descr_in_fail_descrs(
@@ -14274,7 +14256,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_descr.fail_index_per_trace()
             )));
         }
-        // Slice QQ-7: caller_recovery_layout is now passed in by the
+        // caller_recovery_layout is now passed in by the
         // metainterp (StoredExitLayout.recovery_layout for the source
         // guard).  The previous `source_descr.recovery_layout_ref()`
         // read forced the metainterp to push the layout into the
@@ -14628,7 +14610,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // surface (resume-trace builder via `[`crate::pyre`]`) needs the
         // exit-slot bytes BEFORE virtual reconstruction.
         //
-        // External JUMP fallback (Slice X2 upstream blocker): cranelift's
+        // External JUMP fallback: cranelift's
         // in-code `closing_jump` dispatch (`emit_attached_loop_dispatch`)
         // stays gated off pending the aarch64 Tail-conv defect fix
         // (`project_cranelift_wrapper_body_tail_leak.md`).  Until then a
@@ -14740,7 +14722,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // target trace identified by the TargetToken stored on the
             // fail descriptor and continue dispatch, mirroring
             // `execute_with_inputs`.  Required until in-code `closing_jump`
-            // (Slice X2) lands — see
+            // lands — see
             // `project_cranelift_wrapper_body_tail_leak.md` for the
             // upstream cranelift aarch64 Tail-conv blocker.
             if fail_descr_fd.is_external_jump() {
@@ -15098,7 +15080,7 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
-        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // TODO: `BhDescr.get_type_id()` returns the
         // u64 `path_hash` cache key, but `gc.alloc_nursery_typed`
         // expects a u32 GC tid (allocated by `gc_cache.next_struct_tid`).
         // Truncating loses gc identity; the structural fix is to route
@@ -15123,7 +15105,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let ptr = match with_cranelift_gc(|gc| {
-            // PRE-EXISTING-ADAPTATION: same cache-key/gc-tid conflation
+            // TODO: same cache-key/gc-tid conflation
             // as `bh_new`; truncate `as u32` until gc_cache routing.
             gc.alloc_nursery_typed(sizedescr.get_type_id() as u32, size)
                 .0 as i64
@@ -15158,7 +15140,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // TODO: `BhDescr.get_type_id()` returns the
         // u64 `path_hash` cache key, but `active_runtime_alloc_*`
         // expects the u32 GC tid.  Truncate `as u32` until gc_cache
         // routing resolves the proper allocated tid here.
@@ -15558,7 +15540,7 @@ impl majit_backend::Backend for CraneliftBackend {
 }
 
 // `bh_call_i_dispatch` arity table moved to
-// `majit_backend::call_stub::bh_call_i_dispatch` (Slice 0d) so dynasm shares
+// `majit_backend::call_stub::bh_call_i_dispatch` so dynasm shares
 // the same dispatch.
 
 // Tests
@@ -16041,7 +16023,7 @@ mod tests {
         // IntAdd / Jump args that reference the inputarg slot are
         // `InputArgInt` boxes, not `IntOp` results. The op-position
         // raw-keyed `constants` VecAssoc (positions 100/101 below) is a
-        // PRE-EXISTING-ADAPTATION mirroring `make_constant`'s op-position
+        // TODO mirroring `make_constant`'s op-position
         // inline-constant path; that part of the fixture is left alone.
         let ia0 = OpRef::input_arg_int(0);
         let ops = vec![
@@ -16476,13 +16458,13 @@ mod tests {
             .expect("compiled layouts should exist");
         let layout = &layouts[0];
         assert_eq!(layout.source_op_index, Some(1));
-        // Slice X3-E: backend no longer caches per-fail-descr recovery
+        // Backend no longer caches per-fail-descr recovery
         // layouts.  Terminal exit layouts (sibling test below) still
         // carry the recovery_layout because they live on
         // `CompiledLoop.terminal_exit_layouts`, not on the descr.
         assert!(
             layout.recovery_layout.is_none(),
-            "Slice X3-E: per-fail-descr recovery_layout is metainterp-owned"
+            "per-fail-descr recovery_layout is metainterp-owned"
         );
         assert_eq!(layout.fail_arg_types, vec![Type::Ref, Type::Int]);
     }
@@ -16806,7 +16788,7 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        // Slice X3-E: backend no longer caches recovery_layout; the source
+        // Backend no longer caches recovery_layout; the source
         // layout flows through `compile_bridge`'s explicit
         // `caller_recovery_layout` parameter (QQ-7 contract).
 
@@ -16848,13 +16830,13 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("bridge guard layout should exist");
-        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned;
+        // Per-fail-descr recovery_layout is metainterp-owned;
         // the bridge's terminal exit (sibling assertion below) still
         // composes the caller frames because that path lives on
         // `CompiledLoop.terminal_exit_layouts`.
         assert!(
             guard_layout.recovery_layout.is_none(),
-            "Slice X3-E: bridge guard fail_descr recovery_layout is metainterp-owned"
+            "bridge guard fail_descr recovery_layout is metainterp-owned"
         );
 
         let bridge_terminal_layouts = backend
@@ -16942,7 +16924,7 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        // Slice X3-E: backend no longer caches recovery_layout; layout flows
+        // Backend no longer caches recovery_layout; layout flows
         // through `compile_bridge`'s explicit `caller_recovery_layout`
         // parameter below.
 
@@ -17029,7 +17011,7 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        // Slice X3-E: backend no longer caches recovery_layout; the bridge
+        // Backend no longer caches recovery_layout; the bridge
         // source layout flows through the nested `compile_bridge`'s
         // explicit `caller_recovery_layout` parameter below.
 
@@ -17065,10 +17047,10 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("nested bridge guard layout should exist");
-        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        // Per-fail-descr recovery_layout is metainterp-owned.
         assert!(
             nested_guard_layout.recovery_layout.is_none(),
-            "Slice X3-E: nested bridge guard fail_descr recovery_layout is metainterp-owned"
+            "nested bridge guard fail_descr recovery_layout is metainterp-owned"
         );
 
         let nested_terminal_layouts = backend
@@ -17650,7 +17632,7 @@ mod tests {
             .expect("raw exit should expose backend layout");
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.source_op_index, Some(2));
-        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        // Per-fail-descr recovery_layout is metainterp-owned.
         assert!(layout.recovery_layout.is_none());
         assert!(!jit_exc_is_pending());
     }
@@ -20182,7 +20164,7 @@ mod tests {
             .expect("raw exit should expose backend layout");
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.source_op_index, Some(3));
-        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        // Per-fail-descr recovery_layout is metainterp-owned.
         assert!(layout.recovery_layout.is_none());
         assert_eq!(
             *may_force_void_values()
@@ -20880,7 +20862,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Slice X2 dispatch site gated off: enabling `emit_attached_loop_dispatch` triggers cranelift 0.130/0.131 aarch64 Tail-conv leak + jf_frame-slot corruption (project_cranelift_wrapper_body_tail_leak.md). Test passes the moment the gate at compiler.rs `emit_guard_exit` flips on."]
+    #[ignore = "dispatch site gated off: enabling `emit_attached_loop_dispatch` triggers cranelift 0.130/0.131 aarch64 Tail-conv leak + jf_frame-slot corruption (project_cranelift_wrapper_body_tail_leak.md). Test passes the moment the gate at compiler.rs `emit_guard_exit` flips on."]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1500_260);
@@ -21131,7 +21113,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry; multi-session structural change."]
+    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry."]
     fn test_execute_bridge_external_jump_to_second_label_skips_preamble() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_265);
@@ -21216,7 +21198,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry; multi-session structural change."]
+    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry."]
     fn test_execute_bridge_external_jump_to_middle_label_uses_label_selector() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_268);
@@ -22523,7 +22505,7 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // Slice X3-E: backend no longer caches a per-descr recovery
+        // Backend no longer caches a per-descr recovery
         // layout — `FailDescrLayout.recovery_layout` is None for every
         // fail descr (matching dynasm parity).  The metainterp's
         // `StoredExitLayout.recovery_layout` is the canonical store;
@@ -22533,7 +22515,7 @@ mod tests {
         for (idx, layout) in layouts.iter().enumerate() {
             assert!(
                 layout.recovery_layout.is_none(),
-                "Slice X3-E: fail_descr[{idx}] recovery_layout must be None at the backend boundary"
+                "fail_descr[{idx}] recovery_layout must be None at the backend boundary"
             );
             if !layout.is_finish {
                 guard_layouts_seen += 1;
@@ -22588,7 +22570,7 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // Slice X3-E: per-fail-descr recovery_layout (and the derived
+        // Per-fail-descr recovery_layout (and the derived
         // frame_stack) is metainterp-owned; backend boundary reports
         // None.  `fail_arg_types` still flows through `FailDescr` so the
         // typed slot list remains observable.

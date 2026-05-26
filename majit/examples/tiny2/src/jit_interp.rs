@@ -1,6 +1,6 @@
 /// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// PRE-EXISTING-ADAPTATION: `rpython/jit/tl/tiny2_hotpath.py:90` models the
+/// TODO: `rpython/jit/tl/tiny2_hotpath.py:90` models the
 /// operand stack as a linked-list `Stack(value, next)`; each push allocates
 /// one cons cell that RPython's JIT peels as a chain of virtuals. pyre's
 /// `state_fields = { stackpos, stack: [int; virt] }` does not express

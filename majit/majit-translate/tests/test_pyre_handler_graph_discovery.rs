@@ -1,8 +1,8 @@
-//! Phase A.1 harness: feed every `opcode_*` freestanding handler in
+//! Harness: feed every `opcode_*` freestanding handler in
 //! `pyre-interpreter/src/pyopcode.rs` through the existing Rust-source-to-
 //! FunctionGraph path (`front::ast::build_function_graph_pub`).
 //!
-//! Positioning: this harness sits in the PRE-EXISTING-ADAPTATION layer —
+//! Positioning: this harness sits in the adaptation layer —
 //! RPython does not parse interpreter *source* to build graphs, its rtyper
 //! produces `translator.graphs` before codewriter ever runs. Here pyre
 //! bridges Rust source to the same `FunctionGraph` object that RPython
@@ -10,14 +10,14 @@
 //!
 //! Output: for every handler the test prints `(name, blocks, ops, status)`
 //! so the matrix is readable. A panic anywhere fails the test — that is
-//! the discovery signal telling us which Rust patterns Phase B/C still
-//! need to cover.
+//! the discovery signal telling us which Rust patterns still need to
+//! be covered.
 //!
 //! Intentionally lax assertions: we only insist that a core set of super-
 //! instruction helpers (`opcode_load_fast_load_fast`,
 //! `opcode_load_fast_pair_checked`, `opcode_store_fast_load_fast`,
 //! `opcode_store_fast_store_fast`) lower to at least one block. Any
-//! stricter shape check belongs to later phases.
+//! stricter shape check belongs to dedicated tests.
 
 use std::path::PathBuf;
 
@@ -112,15 +112,15 @@ fn discover_pyre_opcode_handler_graphs() {
         matrix.push(stats);
     }
 
-    // Emit the matrix so the phase reviewer can scan it from `cargo test --nocapture`.
-    eprintln!("[phase-a.1] pyre-interpreter opcode handler lowering matrix:");
+    // Emit the matrix so the reviewer can scan it from `cargo test --nocapture`.
+    eprintln!("[handler-discovery] pyre-interpreter opcode handler lowering matrix:");
     eprintln!(
-        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
+        "[handler-discovery]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
         "name", "blocks", "ops", "canraise", "exc_links", "exc_arity"
     );
     for entry in &matrix {
         eprintln!(
-            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
+            "[handler-discovery]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
             entry.name,
             entry.blocks,
             entry.ops,
@@ -139,7 +139,7 @@ fn discover_pyre_opcode_handler_graphs() {
         );
     }
 
-    // The core super-instruction helpers are the reason this epic exists.
+    // The core super-instruction helpers are the reason this test exists.
     // If any of these cannot lower, super-inst parity cannot be closed.
     let required_super_inst_helpers = [
         "opcode_load_fast_load_fast",
@@ -154,7 +154,7 @@ fn discover_pyre_opcode_handler_graphs() {
             .unwrap_or_else(|| {
                 panic!(
                     "super-instruction helper `{}` missing from pyopcode.rs — the \
-                     epic's premise (each super-inst expressed as an atomic-op chain) \
+                     premise (each super-inst expressed as an atomic-op chain) \
                      no longer holds",
                     required
                 )

@@ -41,7 +41,7 @@ pub enum ListStrategy {
 /// (upstream `len(l.items)` per rlist.py:251).
 ///
 /// `strategy`, `int_items`, `float_items` are pyre-only
-/// PRE-EXISTING-ADAPTATIONs for PyPy's list strategy split
+/// TODOs for PyPy's list strategy split
 /// (`pypy/objspace/std/listobject.py`). Only the Object strategy
 /// reads/writes `length` + `items`; Integer/Float strategies operate
 /// on their own typed arrays and keep `length = 0`, `items = null`.
@@ -402,7 +402,7 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     // Allocate body via GC old-gen (mark-sweep, non-moving). The
     // `items` field carries `gc_ptr_offsets = [offset_of(items)]`
     // (`eval.rs:274`) and still points at a `std::alloc`'d
-    // `ItemsBlock` until Task #98; the mark walker's
+    // `ItemsBlock`; the mark walker's
     // `is_managed_heap_object` guard (collector.rs:991/1008) keeps
     // that stepping-stone correctness-safe.
     let raw = match crate::gc_hook::try_gc_alloc_stable(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE)

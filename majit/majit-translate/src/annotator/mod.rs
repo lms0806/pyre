@@ -1,7 +1,6 @@
 //! `annotator` — Rust port of `rpython/annotator/`.
 //!
-//! Phase 4-5 of the five-year roadmap (see
-//! `.claude/plans/majestic-forging-meteor.md`). Builds the
+//! Builds the
 //! type-lattice (`SomeValue` hierarchy) + forward-propagation driver
 //! (`RPythonAnnotator`) that feeds the rtyper.
 //!
@@ -14,20 +13,20 @@
 //! | majit                         | rpython/annotator/              |
 //! |-------------------------------|---------------------------------|
 //! | `model`                       | `model.py`                      |
-//! | `annrpython`      (Phase 5)   | `annrpython.py`                 |
-//! | `argument`        (Phase 5)   | `argument.py`                   |
-//! | `binaryop`        (Phase 5)   | `binaryop.py`                   |
-//! | `unaryop`         (Phase 5)   | `unaryop.py`                    |
-//! | `bookkeeper`      (Phase 5)   | `bookkeeper.py`                 |
-//! | `builtin`         (Phase 5)   | `builtin.py`                    |
-//! | `description`     (Phase 5)   | `description.py`                |
-//! | `classdesc`       (Phase 5)   | `classdesc.py`                  |
-//! | `dictdef`         (Phase 5)   | `dictdef.py`                    |
-//! | `listdef`         (Phase 5)   | `listdef.py`                    |
-//! | `exception`       (Phase 5)   | `exception.py`                  |
-//! | `policy`          (Phase 5)   | `policy.py`                     |
-//! | `signature`       (Phase 5)   | `signature.py`                  |
-//! | `specialize`      (Phase 5)   | `specialize.py`                 |
+//! | `annrpython`                   | `annrpython.py`                 |
+//! | `argument`                     | `argument.py`                   |
+//! | `binaryop`                     | `binaryop.py`                   |
+//! | `unaryop`                      | `unaryop.py`                    |
+//! | `bookkeeper`                   | `bookkeeper.py`                 |
+//! | `builtin`                      | `builtin.py`                    |
+//! | `description`                  | `description.py`                |
+//! | `classdesc`                    | `classdesc.py`                  |
+//! | `dictdef`                      | `dictdef.py`                    |
+//! | `listdef`                      | `listdef.py`                    |
+//! | `exception`                    | `exception.py`                  |
+//! | `policy`                       | `policy.py`                     |
+//! | `signature`                    | `signature.py`                  |
+//! | `specialize`                   | `specialize.py`                 |
 
 pub mod annrpython;
 pub mod argument;

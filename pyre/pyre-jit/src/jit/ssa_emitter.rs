@@ -7,8 +7,8 @@
 //! virtualizable setup, jitcode name, abort flag) that
 //! `Assembler::assemble` needs as its starting builder. The per-op
 //! methods that used to mirror `JitCodeBuilder` and push `Insn::Op`
-//! values are gone — Phase 3c collapsed the dual emitter into the
-//! single walker-local `SSARepr` (commit bc0d6a06c4).
+//! values are gone — the dual emitter was collapsed into the
+//! single walker-local `SSARepr`.
 //!
 //! Reference: `rpython/jit/codewriter/codewriter.py:33-73`.
 //!
@@ -186,7 +186,7 @@ impl SSAReprEmitter {
     }
 
     /// Consume the emitter and yield its underlying [`JitCodeBuilder`].
-    /// Used by the Phase 4 canonical-assemble probe so it can drive
+    /// Used by the canonical-assemble probe so it can drive
     /// [`Assembler::assemble`] directly while retaining ownership of the
     /// canonical [`SSARepr`] (whose `insns_pos` side-table the probe
     /// inspects post-assemble).  Production callers continue to use

@@ -155,7 +155,7 @@ impl BoxPool {
         self.inner.push(Some(value));
     }
 
-    /// Slice 8.C: bind ResOp boxes to their matching `OpRc` so subsequent
+    /// bind ResOp boxes to their matching `OpRc` so subsequent
     /// `BoxRef::set_forwarded_*` calls dual-write through to `Op.forwarded`.
     /// `num_inputargs` is the count of InputArg boxes at the head of the
     /// pool — ResOp boxes occupy `box_pool[num_inputargs..]` and correspond
@@ -173,7 +173,7 @@ impl BoxPool {
         }
     }
 
-    /// Slice 8.D InputArg counterpart of `bind_ops`. Binds the head
+    /// InputArg counterpart of `bind_ops`. Binds the head
     /// `inputargs.len()` slots of the pool to their matching `InputArgRc`
     /// so `BoxRef::set_forwarded_*` routes through `inputarg.forwarded`
     /// (`resoperation.py:700 AbstractInputArg._forwarded`). Index `i`

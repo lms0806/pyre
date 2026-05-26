@@ -478,7 +478,7 @@ pub struct TranslationDriver {
 
     /// Strong holder for the annotator across the task chain.
     ///
-    /// PRE-EXISTING-ADAPTATION (Rust-language): upstream stores
+    /// TODO (Rust-language): upstream stores
     /// `translator.annotator = self` (annrpython.py:30-35) as a
     /// strong Python attribute; CPython's cyclic GC unwinds the
     /// `translator → annotator → translator` cycle on session exit.
@@ -1188,7 +1188,7 @@ impl TranslationDriver {
     ///     return d['res']
     /// ```
     ///
-    /// Two PRE-EXISTING-ADAPTATION leaves with no direct Rust analogue:
+    /// Two TODO leaves with no direct Rust analogue:
     /// `cProfile.Profile` (Python-host CPython profiler with C
     /// extension hooks) and `lsprofcalltree.KCacheGrind` (callgrind-
     /// format dumper). Substituting either with a Rust profiler is a
@@ -1203,7 +1203,7 @@ impl TranslationDriver {
         goal: &str,
         _func: &Rc<dyn Fn() -> Result<TaskOutput, TaskError>>,
     ) -> Result<TaskOutput, TaskError> {
-        // PRE-EXISTING-ADAPTATION: cProfile / KCacheGrind have no
+        // TODO: cProfile / KCacheGrind have no
         // Rust counterparts. Upstream `:259 prof.runctx("res = func()",
         // ...)` ALWAYS writes `<goal>.out` after running `func`; the
         // file is the leaf's only externally visible product. Returning
@@ -1490,7 +1490,7 @@ impl TranslationDriver {
 
     /// Upstream `task_pyjitpl_lltype(self)` at `:347-363`.
     ///
-    /// Cross-crate boundary note (PRE-EXISTING-ADAPTATION):
+    /// Cross-crate boundary note (TODO):
     /// upstream `:359-360` calls
     /// `rpython.jit.metainterp.warmspot.apply_jit`, which would map to
     /// `majit_metainterp::warmspot::apply_jit`. `majit-translate` does
@@ -1594,7 +1594,7 @@ impl TranslationDriver {
     ///             raise Exception(str(e) + '\n' + i)
     /// ```
     ///
-    /// **PRE-EXISTING-ADAPTATION** — `rpython.rtyper.tool.rffi_platform`
+    /// **TODO** — `rpython.rtyper.tool.rffi_platform`
     /// (`pypy/rpython/rtyper/tool/rffi_platform.py`) and
     /// `rpython.translator.platform` (`pypy/rpython/translator/platform/__init__.py`)
     /// are not ported. The configure_boehm probe links a tiny C
@@ -1614,7 +1614,7 @@ impl TranslationDriver {
         };
         if gc == "boehm" {
             // Upstream `:397-403`: probe the platform for libgc-dev.
-            // PRE-EXISTING-ADAPTATION — see the doc-comment above for
+            // TODO — see the doc-comment above for
             // the convergence path.
         }
         Ok(())

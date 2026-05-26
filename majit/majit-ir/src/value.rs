@@ -258,7 +258,7 @@ pub struct InputArg {
     /// Index in the inputargs list.
     pub index: u32,
     /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot.
-    /// Empty (`Forwarded::None`) until Slice 8.C dual-writes wire
+    /// Empty (`Forwarded::None`) until dual-writes wire
     /// `BoxRef::set_forwarded_*` to this field.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 }
@@ -563,7 +563,7 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// fix — reshape `GreenKey::values` from `Vec<i64>` to a typed enum
 /// carrying `Box<str>` for str/unicode greens, with the macro
 /// emitting a temporary that the JitCell cache promotes on insertion
-/// — is a multi-session refactor and is intentionally deferred.
+/// — is a refactor and is intentionally deferred.
 /// Functional behavior matches RPython (content-keyed compare/hash);
 /// only the lifetime / allocation profile differs.
 pub fn make_str_slot(s: &str) -> i64 {

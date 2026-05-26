@@ -23,7 +23,7 @@
 //!
 //! Two parity adaptations apply here:
 //!
-//! 1. **Rust-source entry** (PRE-EXISTING-ADAPTATION, unavoidable). The
+//! 1. **Rust-source entry** (unavoidable). The
 //!    upstream line 25 call `buildflowgraph(entry_point)` compiles Python
 //!    bytecode. pyre-interpreter's source is Rust, so the same call has
 //!    no bytecode to run on. Replaced by `build_host_function_from_rust`
@@ -737,8 +737,8 @@ impl Translation {
         kwds: &[(String, String)],
     ) -> Result<(Self, HostObject), TranslationConstructError> {
         // Synthesize a single-item `syn::File` so the walker
-        // (Slice O7-O8) populates the module-globals registry with
-        // the entry-point fn before its body is lowered. Mirrors
+        // populates the module-globals registry with the entry-point
+        // fn before its body is lowered. Mirrors
         // upstream Python `def` running at module-import time
         // before `buildflowgraph(entry_point)` is invoked
         // (`flowcontext.py:847 w_globals.value[varname]`). Callers
@@ -746,7 +746,7 @@ impl Translation {
         // the same source file walked alongside the entry point
         // should use
         // [`Self::from_rust_file_entry_point_with_source_and_options`]
-        // (Slice O9) directly.
+        // directly.
         let synthetic_file = single_item_file(item);
         let entry_point_name = item.sig.ident.to_string();
         Self::from_rust_file_entry_point_with_source_and_options(
@@ -761,7 +761,7 @@ impl Translation {
     }
 
     /// File-aware entry: walk every top-level item in `file` through
-    /// `register_rust_module` (Slice O7-O8) before lowering the
+    /// `register_rust_module` before lowering the
     /// `entry_point_name` `Item::Fn`. Mirrors upstream
     /// `interactive.py:25 buildflowgraph(entry_point)` running AFTER
     /// the module's `def` / `class` statements have already populated
@@ -843,8 +843,8 @@ impl Translation {
 
         // `build_host_function_from_rust_file` runs the walker
         // pre-pass over `file.items` (registering enums/structs/fns
-        // into the process-global module-globals registry — Slice
-        // O7-O8) and then lowers the named entry-point. Mirrors
+        // into the process-global module-globals registry) and then
+        // lowers the named entry-point. Mirrors
         // upstream `buildflowgraph(entry_point)` arriving with
         // `entry_point.func_globals` already populated by the
         // module's `def` / `class` execution at import time.
@@ -951,7 +951,7 @@ impl Translation {
 /// has a unified input shape. Used by
 /// [`Translation::from_rust_item_fn_with_source_and_options`] to
 /// route every existing item-fn-only caller through the same walker
-/// path Slice O9 introduces for multi-item file callers.
+/// path used for multi-item file callers.
 fn single_item_file(item: &ItemFn) -> SynFile {
     SynFile {
         shebang: None,
@@ -1729,7 +1729,7 @@ mod tests {
         );
     }
 
-    // ---- Slice O9 — file-aware entry point with walker pre-pass ---
+    // ---- file-aware entry point with walker pre-pass ---
 
     #[test]
     fn from_rust_file_entry_point_walks_sibling_enum_before_lowering_entry() {

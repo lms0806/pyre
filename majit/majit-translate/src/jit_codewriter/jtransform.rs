@@ -1179,7 +1179,7 @@ impl<'a> Transformer<'a> {
                 } else {
                     "floordiv"
                 };
-                // PRE-EXISTING-ADAPTATION (no direct RPython precedent):
+                // TODO: no direct RPython precedent:
                 // pyre-side recovery when an explicit
                 // `lltype.cast_ptr_to_int` (`rbuiltin.py:543-548
                 // genop('cast_ptr_to_int', vlist, resulttype=Signed)`)
@@ -1701,7 +1701,7 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// PRE-EXISTING-ADAPTATION recovery helper — no direct RPython
+    /// TODO: recovery helper — no direct RPython
     /// precedent.  Inserts an explicit `cast_ptr_to_int` op for a
     /// Ref-typed operand reaching an arithmetic site that requires
     /// Int operands.  Upstream RPython does NOT auto-cast arbitrary
@@ -2025,7 +2025,7 @@ impl<'a> Transformer<'a> {
             };
             let base = base.clone();
             if rank.is_quasi_immutable() {
-                // PRE-EXISTING-ADAPTATION: RPython
+                // TODO: RPython
                 // `quasiimmut.get_mutate_field_name(fieldname)` —
                 // `rpython/jit/metainterp/quasiimmut.py:11-15` — strips the
                 // lltype `inst_` prefix before prepending `mutate_`.  Rust
@@ -2951,7 +2951,7 @@ impl<'a> Transformer<'a> {
     // `rpython/jit/codewriter/jtransform.py:1665-1683`. pyre dispatches
     // conditional_call via the proc-macro path (see above), so this
     // function is never reached at runtime; the Rust #[allow(dead_code)]
-    // is a deliberate PRE-EXISTING-ADAPTATION marker. Keeping the body
+    // is deliberate. Keeping the body
     // here lets future porters cross-reference our conditional_call
     // lowering against the upstream flow line-by-line.
 
@@ -4281,7 +4281,7 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
 /// (`Transformer::with_callcontrol` is set by every production
 /// entry — `codewriter.rs:382`).
 ///
-/// PRE-EXISTING-ADAPTATION: the override table itself is pyre-only
+/// TODO: the override table itself is pyre-only
 /// (no upstream basis). The producer (`codewriter.rs::
 /// stamp_classdef_hints_on_graph`) stores the receiver's `ClassDef.name`
 /// (RPython `classdef.py:36 self.name`, fully qualified `module.Class`)

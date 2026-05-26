@@ -15,7 +15,7 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type,
 };
 
-// PRE-EXISTING-ADAPTATION: tag bits in the high nibble of the descr
+// TODO: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs
 // in `setup_descrs`'s flat `all_descrs` list (descr.py:25-47) and
 // recovers the type via `isinstance` on the descr object. Pyre cannot
@@ -334,7 +334,7 @@ impl Descr for PyreArrayDescr {
         // the same index; distinct tuples allocate fresh ids and never
         // collide within the 2^28 budget.
         //
-        // PRE-EXISTING-ADAPTATION: this index lives in a different
+        // TODO: this index lives in a different
         // namespace from the codewriter `CallControl::array_index`
         // (`majit-translate/src/jit_codewriter/call.rs:762`), which
         // mints `effectinfo.py:307-311` indices for the EffectInfo
@@ -736,8 +736,8 @@ pub use pyre_object::dictproxyobject::W_DICT_PROXY_GC_TYPE_ID;
 pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
 // `PYFRAME_GC_TYPE_ID` lives in `pyre-interpreter::pyframe` alongside
 // the `PyFrame` struct it describes. Re-exported for the JIT
-// registration site (`pyre-jit/src/eval.rs`). Phase 2.3 옵션 B
-// foundation — registered ahead of any future
+// registration site (`pyre-jit/src/eval.rs`).
+// Registered ahead of any future
 // `NewWithVtable(PyFrame)` in trace IR.
 pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 
@@ -1068,7 +1068,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 // Upstream PyPy handles this with a quasi-immutable flag
                 // + invalidate_compiled_code hook on strategy change;
                 // pyre has no such hook yet, so `strategy` stays
-                // plain-mutable. NEW-DEVIATION — strategy split itself
+                // plain-mutable. TODO — strategy split itself
                 // is a pyre-only adaptation vs rlist.py.
                 "W_ListObject.strategy",
                 std::mem::offset_of!(W_ListObject, strategy),
@@ -1079,7 +1079,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             // Integer-strategy typed storage (pyre-only
-            // PRE-EXISTING-ADAPTATION vs listobject.py's
+            // TODO vs listobject.py's
             // IntegerListStrategy at the interp level — upstream keeps
             // the unwrap inline and doesn't add a separate backing
             // array).
@@ -1414,7 +1414,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // Phase 2.3 옵션 B prerequisite: inline PyFrame 생성 시 새 frame 의
+            // Inline PyFrame 생성 시 새 frame 의
             // execution_context 슬롯에 caller 의 ec 를 SetfieldGc 로 쓰기 위해
             // 필요. RPython parity 는 interp_jit.py:67 reds=[frame, ec] 의 ec
             // 슬롯과 동등 — pyre 는 ec 를 PyFrame 헤더에 inline 저장.
@@ -1968,9 +1968,9 @@ pub fn pyframe_lastblock_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
-/// Phase 2.3 옵션 B prerequisite: PyFrame.execution_context FieldDescr.
+/// PyFrame.execution_context FieldDescr.
 /// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
-/// 호출 사이트는 다음 세션의 `helpers.rs::emit_new_pyframe_inline*`.
+/// 호출 사이트는 `helpers.rs::emit_new_pyframe_inline*`.
 pub fn pyframe_execution_context_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
 }
@@ -2396,7 +2396,7 @@ fn simple_descr_group_from_bh_size(
         // name, ...)`) resolve to the same Arc this mint produces —
         // restoring PyPy `cpu.fielddescrof` per-`(STRUCT, name)`
         // identity.  The u32 truncation for the SimpleSizeDescr's gc
-        // tid is a PRE-EXISTING-ADAPTATION (the tid is allocated by
+        // tid is a TODO (the tid is allocated by
         // gc_cache.init_size_descr in the canonical path; this factory
         // bypasses that, so the tid stays a path_hash-derived u32 with
         // birthday-paradox collision risk around 2^16 distinct STRUCTs).
@@ -2642,7 +2642,7 @@ pub fn make_struct_array_descr_full_keyed(
         // PyPy `gc.py:544-549 init_array_descr` stamps `descr.tid`
         // from `layoutbuilder.get_type_id(A)` — a dense sequential
         // GC type id.  Pyre does not yet port the layoutbuilder
-        // analog (multi-session epic), so the cache-hit branch only
+        // analog, so the cache-hit branch only
         // updates the per-trace `descr_index` and leaves
         // `SimpleArrayDescr.type_id` at its mint default (0, set in
         // `get_array_descr` at descr.rs:515).  The
@@ -3020,7 +3020,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 // keyed factory so `gc_cache._cache_array[LLType::Array(
                 // cache_key)]` is populated and subsequent lookups
                 // resolve to the same Arc.  The u32 truncation for the
-                // SimpleArrayDescr gc tid is a PRE-EXISTING-ADAPTATION
+                // SimpleArrayDescr gc tid is a TODO
                 // (gc tid should come from `init_array_descr`
                 // sequential allocation).
                 make_struct_array_descr_full_keyed(
@@ -3044,7 +3044,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 make_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
-                    // PRE-EXISTING-ADAPTATION: same u32 gc tid truncation.
+                    // TODO: same u32 gc tid truncation.
                     *type_id as u32,
                     *len_offset,
                     *item_type,
@@ -3108,7 +3108,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // dispatch) carries an empty list and falls through to the
             // bare ctor, which is the existing test-helper shape.
             if all_fielddescrs.is_empty() {
-                // PRE-EXISTING-ADAPTATION: `make_size_descr_with_type_and_vtable`
+                // TODO: `make_size_descr_with_type_and_vtable`
                 // takes the u32 gc tid; `*type_id` is the u64 cache key.
                 // Truncate `as u32` until gc_cache routing.
                 make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable)

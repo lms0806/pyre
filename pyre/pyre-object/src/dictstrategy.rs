@@ -8,9 +8,8 @@
 //! be hung off a single trait dispatch — replacing pyre's flat
 //! `W_DictObject.entries: *mut Vec<(PyObjectRef,PyObjectRef)>` layout.
 //!
-//! No `W_DictObject` callers yet — Phase 5 cutover is staged and the
-//! `dstrategy + dstorage` migration of `W_DictObject` lands in a
-//! subsequent slice.
+//! No `W_DictObject` callers yet — the
+//! `dstrategy + dstorage` migration of `W_DictObject` is pending.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -231,7 +230,7 @@ pub trait DictStrategy {
 
     /// Strategy-side GC trace dispatch for `W_DictObject.dstorage`.
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython's translator generates a
+    /// TODO: RPython's translator generates a
     /// per-`rerased`-pair GC trace function from the
     /// `new_erasing_pair("name")` call (`rpython/rlib/rerased.py:24-72`
     /// `new_erasing_pair`), so each PyPy strategy's storage layout
@@ -807,8 +806,8 @@ impl DictStrategy for ObjectDictStrategy {
     /// `dictmultiobject.py:1216-1218 ObjectDictStrategy.getitem_str` —
     /// upstream just delegates to `getitem` after wrapping the key.
     /// Pyre's W_DictObject additionally carries a `dict_storage_proxy`
-    /// for back-mirror dicts (PRE-EXISTING-ADAPTATION, retires with
-    /// Phase C-1); the storage-first lookup is preserved here so
+    /// for back-mirror dicts (TODO: bring to parity); the storage-first
+    /// lookup is preserved here so
     /// strategy-dispatch behavior matches the previous direct
     /// `w_dict_getitem_str` path.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {

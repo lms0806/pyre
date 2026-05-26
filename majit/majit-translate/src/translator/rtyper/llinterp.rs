@@ -251,7 +251,7 @@ impl LLInterpreter {
         // `self.tracer = None`. The local `Tracer` port is not landed,
         // so the slot stays `None` regardless. The `tracing` arg is
         // accepted for signature parity but not yet observable —
-        // documented PRE-EXISTING-ADAPTATION until `Tracer` lands.
+        // documented TODO until `Tracer` lands.
         let _ = tracing;
         Self {
             bindings: RefCell::new(Vec::new()),

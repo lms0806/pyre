@@ -1,6 +1,6 @@
 /// JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// PRE-EXISTING-ADAPTATION: `rpython/jit/tl/tiny3_hotpath.py:96` models the
+/// TODO: `rpython/jit/tl/tiny3_hotpath.py:96` models the
 /// operand stack as a linked-list `Stack(value, next)`, identical shape to
 /// tiny2_hotpath.py. pyre's `state_fields = { stackpos, stack: [int; virt] }`
 /// does not express linked-list stacks — see the same adaptation note on

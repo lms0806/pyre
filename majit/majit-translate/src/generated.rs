@@ -1,7 +1,7 @@
 //! Phase F: static registry of `Arc<JitCode>`s produced from
 //! pyre-interpreter handler graphs.
 //!
-//! ## Positioning (PRE-EXISTING-ADAPTATION)
+//! ## Positioning (TODO)
 //!
 //! Per parity rule #1 (`CLAUDE.md` majit ↔ RPython Parity Rules): this
 //! module has **no RPython counterpart**. Upstream's
@@ -56,7 +56,7 @@
 //! is what the unit tests need to assert (graph discovery, alloc-order
 //! invariants, by-path keying).
 //!
-//! The historical Task #100 description ("route generated::all_jitcodes
+//! The historical description ("route generated::all_jitcodes
 //! through fnaddr_bindings instead of symbolic fallback") was written
 //! before the build-time bincode path landed in `pyre-jit-trace/build.rs`;
 //! production-side fnaddr resolution is therefore already done by that
@@ -110,7 +110,7 @@ use std::cell::OnceCell;
 
 pub use crate::codewriter::AllJitCodes;
 
-/// PRE-EXISTING-ADAPTATION: Rust source → FunctionGraph bridge. RPython's
+/// TODO: Rust source → FunctionGraph bridge. RPython's
 /// rtyper has already produced `translator.graphs` before codewriter runs;
 /// pyre lacks that pre-processing and must embed the source here.
 ///
@@ -219,7 +219,7 @@ fn build() -> AllJitCodes {
     // `call.py:87 self.jitcodes` (dict) + `call.py:88 self.all_jitcodes`
     // (list).
     //
-    // KNOWN DEVIATION (tracked by Task #100): this path uses the
+    // KNOWN DEVIATION: this path uses the
     // symbolic `JitCode.fnaddr` fallback at
     // `crate::call::symbolic_fnaddr_for_path`, NOT upstream's real
     // `getfunctionptr(graph)` surface (`rpython/jit/codewriter/

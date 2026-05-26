@@ -49,7 +49,7 @@
 //! Matching upstream `test_model.py:13-43` + `test_ssa.py:55-88`
 //! construction idioms for straight-line functions.
 //!
-//! ## PRE-EXISTING-ADAPTATIONs (do not accumulate new ones)
+//! ## TODOs (do not accumulate new ones)
 //!
 //! Three structural divergences exist from upstream
 //! `rpython/flowspace/*.py`. Each is load-bearing for the "no Python
@@ -93,7 +93,7 @@
 //!    chosen arm flows; no 2-exit fork materializes. Wired in
 //!    `lower_if`, `lower_if_without_else`, and `lower_while`.
 //!    One pure-op callsite stays on raw `emit_op` as a real
-//!    PRE-EXISTING-ADAPTATION:
+//!    TODO:
 //!    - `build_flow.rs:651` cascade `getattr` in
 //!      `Builder::resolve_path_constant`: keeps an explicit
 //!      `host.class_get` / `is_host_class_minted` path because
@@ -104,7 +104,7 @@
 //!      lands when minting retires.
 //!
 //!    A second raw `emit_op` callsite at `build_flow.rs:2658`
-//!    (`same_as` in `lower_match`) is NOT a PRE-EXISTING-ADAPTATION
+//!    (`same_as` in `lower_match`) is NOT a TODO
 //!    — `same_as` is a synthetic pseudo-op in upstream too,
 //!    referenced only at `rpython/flowspace/model.py:634`
 //!    (`raising_op.opname not in ("keepalive", "cast_pointer",

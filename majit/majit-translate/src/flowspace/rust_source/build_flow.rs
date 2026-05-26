@@ -169,7 +169,7 @@ pub fn build_flow_from_rust_in_module_with_globals(
     // return value preserves boundary semantics for its arms; nested
     // `lower_block`/`lower_if`/`lower_match` reached from value
     // position (`let z = …;`, function args) flips `at_boundary` to
-    // `false` per the Slice O4 PRE-EXISTING-ADAPTATION.
+    // `false` per the TODO boundary-only adaptation.
     match lower_block(&mut builder, &func.block, true)? {
         BlockExit::FallThrough(tail) => {
             // Body reached its closing `}` with a tail value —
@@ -641,7 +641,7 @@ impl Builder {
     ///    without annotator-level context.
     /// 2. **Multi-segment paths** (`A::B::C`) — leftmost segment goes
     ///    through single-segment resolution but with mint fallback
-    ///    (PRE-EXISTING-ADAPTATION, see "Mint-on-demand stand-in"
+    ///    (TODO, see "Mint-on-demand stand-in"
     ///    below): if not in locals / not the `None` singleton / not
     ///    in PYRE_STDLIB, find-or-mint a `HostObject::Class` via the
     ///    process-global `host_env::mint_host_class(name)` so every
@@ -656,15 +656,14 @@ impl Builder {
     ///    ConstValue::byte_str(seg))` SpaceOperation per
     ///    `operation.py:618 getattr` arity=2; the final `Variable`
     ///    is the resolved expression value. N segments emit N-1
-    ///    getattr ops (PRE-EXISTING-ADAPTATION, see "Raw-getattr
+    ///    getattr ops (TODO, see "Raw-getattr
     ///    cascade stand-in" below).
     ///
     /// Paths with `qself` (`<T as Foo>::Bar`), generic arguments
     /// (`Foo::<T>::Bar`), or a leading `::` (global path) reject as
-    /// `Unsupported`. Each is its own port — see Slice O7+ in the
-    /// orthodox HOST_ENV plan.
+    /// `Unsupported`. Each is its own port.
     ///
-    /// ### PRE-EXISTING-ADAPTATION — Mint-on-demand stand-in for
+    /// ### TODO — Mint-on-demand stand-in for
     /// names not yet registered through the walker
     ///
     /// Upstream `flowcontext.py:845 find_global` raises
@@ -708,7 +707,7 @@ impl Builder {
     ///
     /// Compound `Item::Const` was closed by Issue 2.4 (extended
     /// `eval_const_expr`); immutable `Item::Static` by Slice O15
-    /// (`static mut` documented as PRE-EXISTING-ADAPTATION skip).
+    /// (`static mut` documented as TODO skip).
     /// - **Third-party crate types** (`rustpython_compiler_core::Instruction`)
     ///   that pyre-interpreter references — the walker has no
     ///   visibility into upstream crate sources.
@@ -795,7 +794,7 @@ impl Builder {
     /// load-bearing fallback for minted-class leftmosts (which have
     /// empty class dicts by construction).
     ///
-    /// ### PRE-EXISTING-ADAPTATION (Issue 2.1): constfold-miss is too lenient
+    /// ### TODO: constfold-miss is too lenient
     ///
     /// Upstream `operation.py:624 GetAttr.constfold` does:
     ///
@@ -821,7 +820,7 @@ impl Builder {
     /// empty dicts, so any `getattr(MintedFoo, "Variant")` cascade
     /// would otherwise fail at every call site.
     ///
-    /// **Convergence path** (multi-session, blocked on retiring the
+    /// **Convergence path** (blocked on retiring the
     /// mint stand-in):
     ///
     /// 1. Land enough walker coverage (Issue 2.3) and per-module
@@ -912,7 +911,7 @@ impl Builder {
                             ),
                         });
                     }
-                    // PRE-EXISTING-ADAPTATION (mint-on-demand):
+                    // TODO (mint-on-demand):
                     // mint-class dicts are intentionally empty
                     // pending walker coverage of the source-file
                     // declaration (`Item::Fn`, `Item::Use`,
@@ -954,7 +953,7 @@ impl Builder {
     /// path (mint on miss) vs a standalone single-segment path
     /// (reject on miss).
     ///
-    /// `mint_unknown=true` is the PRE-EXISTING-ADAPTATION described
+    /// `mint_unknown=true` is the TODO described
     /// at length on `resolve_path_constant` — see "Mint-on-demand
     /// stand-in for the missing module-globals walker". Reject is
     /// the upstream-orthodox shape (`flowcontext.py:845-854 find_global`
@@ -1056,9 +1055,9 @@ impl Builder {
 /// `lower_if` / `lower_match` / `lower_arm_body` caller is itself in
 /// boundary position (e.g. `fn f() { match x { 0 => Ok(1), _ =>
 /// Err(e) } }` where each arm body's tail IS the function tail).
-/// The Slice O4 PRE-EXISTING-ADAPTATION (`Ok(x)` / `Some(x)` →
-/// unwrap, `None` → `ConstValue::None`, `Err(e)` → raise edge per
-/// Slice O5) only fires under `at_boundary=true`.
+/// The TODO boundary-only adaptation (`Ok(x)` / `Some(x)` →
+/// unwrap, `None` → `ConstValue::None`, `Err(e)` → raise edge)
+/// only fires under `at_boundary=true`.
 ///
 /// `at_boundary=false` means the block result is consumed by the
 /// caller (`let z = { … };`, function arg, binop operand, etc.).
@@ -1343,7 +1342,7 @@ fn match_unshadowed_simple_ident<'a>(
     None
 }
 
-/// PRE-EXISTING-ADAPTATION for the Ok/Some/None collapse only (Codex
+/// TODO for the Ok/Some/None collapse only (Codex
 /// 2026-05-03 parity audit accepted as "documented as structural
 /// adaptation, not parity"). Function/arm boundary positions in
 /// pyre-interpreter Rust source frequently end in `Ok(x)` / `Some(x)`
@@ -1429,7 +1428,7 @@ fn lower_value_boundary(b: &mut Builder, expr: &Expr) -> Result<BlockExit, Adapt
 ///
 /// `BlockExit::Terminated` returned — Rust analogue of `StopFlowing`.
 ///
-/// PRE-EXISTING-ADAPTATION (`flowspace/flowcontext.rs:1355` family
+/// TODO (`flowspace/flowcontext.rs:1355` family
 /// level, NOT introduced by this slice): `ll_assert_not_none` is
 /// recorded as a direct opname (single arg, pure pseudo-op), not as
 /// the upstream shape. Upstream `flowcontext.py:633` is
@@ -2842,7 +2841,7 @@ fn lower_arm_body(
         // Control-flow constructs propagate `at_boundary` so a
         // boundary-position `match`/`if`/`block` whose arms feed the
         // function's return value continues to collapse Ok/Some/Err
-        // tails per the Slice O4 PRE-EXISTING-ADAPTATION.
+        // tails per the TODO boundary-only adaptation.
         Expr::Block(block_expr) => lower_block(b, &block_expr.block, at_boundary),
         Expr::If(if_expr) => lower_if(b, if_expr, at_boundary, true),
         Expr::Match(match_expr) => lower_match(b, match_expr, at_boundary),
@@ -4006,7 +4005,7 @@ fn lower_loop(b: &mut Builder, loop_expr: &ExprLoop) -> Result<(), AdapterError>
 //   on the exceptblock with those AssertionError constants — that is
 //   the shape the adapter emits.
 //
-// PRE-EXISTING-ADAPTATION (value-stack vs locals-map). Upstream
+// TODO (value-stack vs locals-map). Upstream
 // `flowcontext.py:782 GET_ITER` leaves the iterator on the Python
 // value stack, and `:787 FOR_ITER` pops it via IterBlock.handle
 // after StopIteration. The adapter lacks a stack model — its frame
@@ -4657,7 +4656,7 @@ fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError>
     // for the equivalent Python source. Wrapper-transparency for
     // `return Ok(x)` / `arm => Ok(x)` lives at the boundary sites
     // (`lower_arm_body` / `lower_return`) only — see those
-    // helpers for the documented PRE-EXISTING-ADAPTATION shape.
+    // helpers for the documented TODO shape.
     match &*call.func {
         Expr::Path(_) => {}
         _ => {
@@ -5702,7 +5701,7 @@ mod tests {
         }
     }
 
-    // ---- guessbool early-resolution (PRE-EXISTING-ADAPTATION #3) ---
+    // ---- guessbool early-resolution (TODO #3) ---
     //
     // upstream `flowcontext.py:341 guessbool`:
     //
@@ -6376,10 +6375,9 @@ mod tests {
         }
     }
 
-    /// Slice 2d accept: rest-only struct-variant pattern
-    /// `Foo::Bar { .. }` lowers to a single getattr+isinstance cascade
-    /// step — structurally identical to the unit-variant case (slice
-    /// 2c). The field-binding extraction is deliberately deferred so
+    /// Rest-only struct-variant pattern `Foo::Bar { .. }` lowers to a
+    /// single getattr+isinstance cascade step — structurally identical
+    /// to the unit-variant case. The field-binding extraction is deliberately deferred so
     /// this slice carries zero new SpaceOperations beyond the cascade
     /// pair.
     #[test]
@@ -6410,7 +6408,7 @@ mod tests {
         assert_eq!(start.operations[1].args[1], getattr_result);
     }
 
-    /// Slice 2d accept: rest-only tuple-variant pattern
+    /// Rest-only tuple-variant pattern
     /// `Foo::Bar(..)` lowers to a single getattr+isinstance cascade
     /// step.
     #[test]
@@ -6512,7 +6510,7 @@ mod tests {
         );
     }
 
-    /// Slice 2d accept: heterogeneous variant arms in the same match
+    /// Heterogeneous variant arms in the same match
     /// — `Foo::A` (unit), `Foo::B { .. }` (rest-only struct), and
     /// `Foo::C(..)` (rest-only tuple) all share the cascade lowering
     /// since they all classify via `variant_match_path_str`.
@@ -6548,7 +6546,7 @@ mod tests {
         );
     }
 
-    /// Slice 2e accept: struct-variant arm with a single named-Ident
+    /// Struct-variant arm with a single named-Ident
     /// field binding emits exactly one `getattr` op at the arm body
     /// block's entry, plus the cascade's single `isinstance` step.
     /// The bound local is reachable from the arm body — the test
@@ -6586,7 +6584,7 @@ mod tests {
         );
     }
 
-    /// Slice 2e accept: multiple named-Ident bindings from one arm
+    /// Multiple named-Ident bindings from one arm
     /// produce one `getattr` per binding, in declaration order, at
     /// the arm body block's entry.
     #[test]
@@ -6629,7 +6627,7 @@ mod tests {
         assert_eq!(names, vec![b"lhs" as &[u8], b"rhs" as &[u8]]);
     }
 
-    /// Slice 2e accept: explicit-rename binding `{ field: ident }`
+    /// Explicit-rename binding `{ field: ident }`
     /// produces the `getattr` against the FIELD name and binds the
     /// LOCAL identifier in the arm body. The arm body reads the
     /// renamed identifier, so a missing rename would surface as an
@@ -6676,7 +6674,7 @@ mod tests {
         );
     }
 
-    /// Slice 2e accept: `{ field: _ }` is a field-skip pattern — the
+    /// `{ field: _ }` is a field-skip pattern — the
     /// field is matched but its value is discarded, so no `getattr`
     /// is emitted for the *field*. The arm body doesn't reference the
     /// field's name. The cascade itself still emits its
@@ -6719,8 +6717,8 @@ mod tests {
         );
     }
 
-    /// Slice 2f boundary: tuple-variant arms with element bindings
-    /// continue to reject with the slice-2f diagnostic.
+    /// Tuple-variant arms with element bindings continue to reject
+    /// with a diagnostic.
     #[test]
     fn rejects_match_tuple_variant_with_element_bindings() {
         match lower(
@@ -6743,7 +6741,7 @@ mod tests {
         }
     }
 
-    /// Slice 2e boundary: or-pattern siblings whose field bindings
+    /// Or-pattern siblings whose field bindings
     /// disagree must reject — Rust enforces this at the language
     /// level, but the adapter re-validates so a malformed or-pattern
     /// surfaces a precise error rather than a confusing arm-body
@@ -6773,7 +6771,7 @@ mod tests {
         }
     }
 
-    /// Slice 2e boundary: non-Ident / non-Wild field sub-patterns
+    /// Non-Ident / non-Wild field sub-patterns
     /// (literal, nested struct, etc.) reject with a complex-
     /// destructuring diagnostic.
     #[test]
@@ -7945,10 +7943,9 @@ mod tests {
         }
     }
 
-    // ---- M2.5e orthodox HOST_ENV (Slice O4): boundary-only
-    //      Result/Option transparency adaptation
+    // ---- boundary-only Result/Option transparency adaptation
     //
-    // PRE-EXISTING-ADAPTATION (Codex 2026-05-03 parity audit accepted
+    // TODO (Codex 2026-05-03 parity audit accepted
     // as "documented as structural adaptation, not parity"). Function
     // /arm tail and `return expr` positions in pyre-interpreter Rust
     // source frequently end in `Ok(x)` / `Some(x)` / `None`; upstream
@@ -8569,7 +8566,7 @@ mod tests {
         // `Constant(Str("a"))` — same encoding the match-arm side
         // emits in `classify_pattern`. An end-to-end test with a
         // constant-scrutinee match would also need `guessbool` /
-        // `HLOperation.eval` constant-folding (PRE-EXISTING-ADAPTATION
+        // `HLOperation.eval` constant-folding (TODO
         // #3 in `mod.rs`) to close cleanly, so that composition is
         // deferred to the constfold port; here we only pin the
         // literal-to-Constant step.
@@ -8902,7 +8899,7 @@ mod tests {
     /// `FlowingError` whenever both args are foldable and Python's
     /// `getattr` would raise `AttributeError`. The Rust counterpart
     /// surfaces `AdapterError::Unsupported`. The mint-on-demand path
-    /// (PRE-EXISTING-ADAPTATION) keeps the raw-emit fall-through —
+    /// (TODO) keeps the raw-emit fall-through —
     /// see [`cascade_falls_through_to_raw_emit_for_minted_class_missing_member`].
     #[test]
     fn cascade_fails_loud_for_walker_registered_class_missing_member() {
@@ -8940,7 +8937,7 @@ mod tests {
         }
     }
 
-    /// Mint-on-demand classes (PRE-EXISTING-ADAPTATION) carry empty
+    /// Mint-on-demand classes (TODO) carry empty
     /// class dicts pending walker coverage of the source-file
     /// declaration. The cascade treats them as opaque — analogous to
     /// upstream's `w_obj.foldable() == False` path which records the
@@ -8955,7 +8952,7 @@ mod tests {
         // is not in any registry slice, so the multi-segment leftmost
         // resolution lands on `mint_host_class`. Body lowering then
         // hits the cascade's class-dict miss and falls through to the
-        // raw `getattr` op per the PRE-EXISTING-ADAPTATION.
+        // raw `getattr` op per the TODO.
         let item = parse(
             "fn f(x: i64) -> i64 {
                 match x {
@@ -8976,12 +8973,11 @@ mod tests {
     }
 
     // ____________________________________________________________
-    // Slice O4 boundary-vs-value-position discipline (Issue 1.1
-    // regression suite).
+    // Boundary-vs-value-position discipline (regression suite).
     //
-    // The Slice O4 PRE-EXISTING-ADAPTATION (`Ok(x)` / `Some(x)` →
-    // unwrap, `None` → `Constant(None)`, `Err(e)` → raise edge per
-    // O5) collapses the Result/Option wrapper at the
+    // The TODO boundary-only adaptation (`Ok(x)` / `Some(x)` →
+    // unwrap, `None` → `Constant(None)`, `Err(e)` → raise edge)
+    // collapses the Result/Option wrapper at the
     // function-return boundary. The threading invariant verified
     // here: collapse fires ONLY when the wrapper sits at a real
     // return edge — function tail, `return` statement, or the tail

@@ -21,7 +21,7 @@
 //! `pyjitpl::compiled_loops`. Achieving "alive_loops is the SOLE
 //! strong owner" requires the slicing chain in
 //! `.claude/plans/memmgr-line-by-line-parity.md` (Slices 3.5–3.6),
-//! whose tail is blocked on Task #195 (Arc lift of CompiledEntry.token).
+//! whose tail is blocked on (Arc lift of CompiledEntry.token).
 //! Today `alive_loops` is a *third* strong owner; eviction tracking
 //! works for the warmstate side, but actual token frees only happen
 //! once Slices 3.5–3.6 prune the other strong owners.
@@ -186,7 +186,7 @@ impl MemoryManager {
     ///         self.next_check = self.current_generation + self.check_frequency
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: returns `Vec<Arc<JitCellToken>>` of the
+    /// TODO: returns `Vec<Arc<JitCellToken>>` of the
     /// evicted token objects.  Upstream returns `None` because
     /// `LoopToken.__del__` (`memmgr.py:13`) dispatches
     /// `cpu.free_loop_and_bridges` automatically when the only strong
@@ -204,7 +204,7 @@ impl MemoryManager {
     /// green_key (the recompile case where `compiled_loops[gk].token`
     /// has already been replaced).  This adaptation is removed once
     /// Slice X-G converts `compiled_loops` to `Weak`
-    /// (memmgr-line-by-line-parity.md Slice 3.6).
+    /// (memmgr-line-by-line-parity.md ).
     pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
         self.current_generation += 1;
         if self.current_generation == self.next_check {

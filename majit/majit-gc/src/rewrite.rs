@@ -989,7 +989,7 @@ impl GcRewriterImpl {
     /// `rewrite_for_gc_with_constants` is what threads the right
     /// instance through this signature.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre still lacks the Boehm branch
+    /// TODO: pyre still lacks the Boehm branch
     /// (`gen_boehm_malloc_array`).  Framework-GC path #4
     /// (`gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`)
     /// is ported below and emits CALL_R + CHECK_MEMORY_ERROR like
@@ -1384,7 +1384,7 @@ impl GcRewriterImpl {
 
     /// rewrite.py:836-840 `gen_malloc_str`.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's `malloc_str` helper closure
+    /// Upstream's `malloc_str` helper closure
     /// captures `str_type_id = self.str_descr.tid` (gc.py:451) at
     /// generate-time.  Rust `extern "C" fn` can't lexically capture, so
     /// the type id is threaded as an explicit CALL arg sourced from
@@ -1408,7 +1408,7 @@ impl GcRewriterImpl {
 
     /// rewrite.py:842-846 `gen_malloc_unicode`.
     ///
-    /// PRE-EXISTING-ADAPTATION: see `gen_malloc_str`.  Type id sourced
+    /// See `gen_malloc_str`.  Type id sourced
     /// from `gc_ll_descr.unicode_descr.type_id()` (gc.py:455
     /// `unicode_type_id = self.unicode_descr.tid`).
     fn gen_malloc_unicode(

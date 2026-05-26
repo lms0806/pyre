@@ -650,7 +650,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
     // (slice 33, `PYRE_PATH3_VERIFY_STACK_READ`) showed zero mismatch between
     // the vable shadow and the legacy `registers_r[reg_idx]` semantic-mirror
     // value across 9 benches.  Routing through vable retires one dependency
-    // on the `registers_r` semantic-mirror NEW DEVIATION.
+    // on the `registers_r` semantic-mirror deviation.
     //
     // Non-portal frames keep the `registers_r` lazy-fill path below — they
     // don't own a vable shadow.  Their semantic-mirror retirement is a
@@ -926,7 +926,7 @@ impl MIFrame {
     }
 
     /// Read `PyFrame.valuestackdepth` directly from the concrete frame at
-    /// `concrete_frame_addr`.  Issue #73 Phase 4.5 slice 1: the orthodox
+    /// `concrete_frame_addr`.  The orthodox
     /// PyPy-parity replacement for `self.sym().valuestackdepth`.
     ///
     /// RPython has no symbolic mirror of the Python stack — `MIFrame` only
@@ -1023,7 +1023,7 @@ impl MIFrame {
         // the actual live extent at the current opcode, not the stale
         // symbolic counter.
         let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
-        // Issue #73 Phase 4.5: prefix_len fallback reads
+        // prefix_len fallback reads
         // `PyFrame.valuestackdepth` rather than the symbolic mirror.
         // `capture_pre_opcode_state` runs at the orgpc anchor where
         // PyFrame holds the pre-opcode state (the interpreter step has
@@ -1086,7 +1086,7 @@ impl MIFrame {
     /// `sym.valuestackdepth` only when `concrete_frame_addr == 0`
     /// (unit tests constructing sym-only `MIFrame`s).
     ///
-    /// Issue #73 Phase 4.5: replaces the `pre_opcode_depth_or(self.sym().valuestackdepth)`
+    /// Replaces the `pre_opcode_depth_or(self.sym().valuestackdepth)`
     /// pattern.  The `pre_opcode_*` machinery exists precisely because
     /// pyre's `MIFrame::pop_value` / `push_typed_value` mutate
     /// `sym.valuestackdepth` mid-opcode and the guard/snapshot writers
@@ -1188,7 +1188,7 @@ impl MIFrame {
             // bridge install seeds `metadata.stack_base` (G.3h) +
             // `depth_at_py_pc[pc]` (G.4.2) so the live ref slots at
             // this PC span `0..stack_base + depth` — locals + cells +
-            // operand-stack tail.  Slice 3 covers the full range; the
+            // operand-stack tail.  The full range is covered; the
             // lazy-load preamble (lines 555+) routes each through
             // `load_local_value` whose vable-shadow read (line 1218)
             // works for any flat slot in `vb[NUM_VABLE_SCALARS..
@@ -1783,7 +1783,7 @@ impl MIFrame {
         // happens to occupy. `ctx.get_opref_type` resolves the type
         // from the OpRef's producing op (constant kind, recorded
         // result_type, or `Forwarded::Info(PtrInfo)` for virtualized
-        // Phase 1 heads — see the PtrInfo fallback at
+        // See the PtrInfo fallback at
         // optimizeopt/mod.rs:3995). Position-based scans of
         // `registers_r` / `virtualizable_boxes` were a pyre-only
         // adaptation that papered over earlier `get_opref_type` gaps;
@@ -1823,7 +1823,7 @@ impl MIFrame {
             (s.owns_virtualizable_shadow(), s.valuestackdepth)
         };
         if owns_shadow {
-            // Phase 0.5 probe-D — `MAJIT_PROBE_BRIDGE` gated. See git
+            // `MAJIT_PROBE_BRIDGE` gated. See git
             // archaeology for context; logged for parity with the
             // pre-helper push path.
             if std::env::var_os("MAJIT_PROBE_BRIDGE").is_some() {
@@ -1892,14 +1892,14 @@ impl MIFrame {
         // subsequent snapshots do not pick up a stale pushed OpRef above
         // the current stack depth.
         //
-        // Task #136 partial: gating on `is_active_vable_owner`
+        // Gating on `is_active_vable_owner`
         // intentionally does NOT cover bridges here. Unlike the other
         // four mirror sites (push_typed_value / swap_values /
         // store_local_value / finishframe_exception, all flipped to
         // `owns_virtualizable_shadow()`), clearing the bridge shadow
         // to NULL on every pop triggers a severe perf regression on
         // fib_recursive (~50x slowdown: 0.88s → 47s; answer remains
-        // correct).  Root cause (Task #138 probe): the pop-clear writes
+        // correct).  Root cause: the pop-clear writes
         // `const_ref(PY_NULL)` into the vable shadow.  When a bridge
         // subsequently inherits that shadow state and its IR
         // references the cleared slot (e.g. a later `SetfieldGc` whose
@@ -1914,11 +1914,11 @@ impl MIFrame {
         // Upstream `pyframe.py:411 popvalue_maybe_none` clears without
         // this consequence because RPython's virtualizable layout does
         // NOT include the Python stack — the shadow has no stack-pop
-        // story.  pyre's stack-in-vable PRE-EXISTING-ADAPTATION puts
+        // story.  pyre's stack-in-vable TODO puts
         // the popped slots in a structure the bridge optimizer reads
         // as heap bases, so the None-clear pattern does not translate.
         // Resolving this requires either removing the stack from the
-        // vable shadow (multi-session) or teaching the bridge
+        // vable shadow or teaching the bridge
         // optimizer to recognise cleared-stack-slot sentinels
         // separately from real null heap bases.
         if is_active {
@@ -1927,8 +1927,8 @@ impl MIFrame {
             let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
             ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
         }
-        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 2,
-        // Task #114). `pyframe.popvalue_maybe_none` decrements vsd as part
+        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity.
+        // `pyframe.popvalue_maybe_none` decrements vsd as part
         // of the same sequence that clears the array slot; upstream emits a
         // `setfield_vable_i(virtualizable, vsd_descr, depth-1)` after the
         // setarrayitem_vable_r clear.  The bridge NULL-base issue
@@ -1993,7 +1993,7 @@ impl MIFrame {
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        // Issue #73 Phase 4.5 slice 1: read the stack depth from the
+        // Read the stack depth from the
         // concrete `PyFrame` at `concrete_frame_addr` rather than the
         // symbolic mirror `sym.valuestackdepth`.  This is the first reader
         // migration toward eliminating the `PyreSym.valuestackdepth`
@@ -2330,7 +2330,7 @@ impl MIFrame {
         self.publish_last_instr_to_vable(pc);
     }
 
-    /// pyopcode.py:170-172 `dispatch_bytecode` parity (Slice 3a, Task #115):
+    /// pyopcode.py:170-172 `dispatch_bytecode` parity:
     ///
     /// ```python
     /// while True:
@@ -2347,13 +2347,13 @@ impl MIFrame {
     /// orgpc anchor — every `set_orgpc(pc)` call is the analogue of one
     /// `self.last_instr = next_instr` setattr.
     ///
-    /// Semantic mismatch (PRE-EXISTING-ADAPTATION until Slice 3b lands):
+    /// Semantic mismatch (TODO):
     /// pyre's `PyFrame.last_instr` carries "PC of the last completed
     /// opcode" (= `orgpc - 1`), whereas RPython's carries "PC of the
-    /// opcode now starting" (= `orgpc`).  Slice 3a publishes
+    /// opcode now starting" (= `orgpc`).  Currently publishes
     /// `orgpc - 1` to keep every existing reader (`flush_to_frame_for_guard`
     /// re-seed, `get_last_lineno`, `fget_f_lasti`, blackhole resume,
-    /// guard fail_args) seeing the same value they always did.  Slice 3b
+    /// guard fail_args) seeing the same value they always did.  The parity fix
     /// flips the semantic to RPython's "current opcode PC" and removes
     /// the `-1` adjustment from this publish + the four other vable-side
     /// sites (`flush_to_frame`, `flush_to_frame_for_guard`,
@@ -2404,7 +2404,7 @@ impl MIFrame {
         // and crashing the next pop. Recompute from the per-PC user-side
         // depth metadata derived in `install_portal_for` (G.4.2).
         //
-        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // When the portal-bridge metadata is absent,
         // read from the concrete `PyFrame.valuestackdepth` rather than the
         // stale `sym.valuestackdepth`.  `resume_pc == self.orgpc` (the
         // start PC of the current opcode) so PyFrame holds the correct
@@ -2433,7 +2433,7 @@ impl MIFrame {
             s.vable_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
-        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 3.0b):
+        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity:
         // mirror the heap-read seed into the canonical
         // `metainterp.virtualizable_boxes` shadow so subsequent readers
         // (snapshot, gen_writeback_vable_to_heap, JUMP-arg dedup) see
@@ -2837,7 +2837,7 @@ impl MIFrame {
     pub(crate) fn live_args_shape_at(&self, ctx: &TraceCtx) -> usize {
         let extra_reds = crate::virtualizable_gen::NUM_EXTRA_REDS;
         let nlocals = self.sym().nlocals;
-        // Issue #73 Phase 4.5 slice 2: pure-read of stack depth comes from
+        // Pure-read of stack depth comes from
         // the concrete `PyFrame` (no symbolic mirror).  RPython's
         // pyjitpl.py:2957-2965 `live_arg_boxes` shape derives directly
         // from PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
@@ -2855,7 +2855,7 @@ impl MIFrame {
         7 + extra_reds + target_array_capacity
     }
 
-    /// PRE-EXISTING-ADAPTATION: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
+    /// TODO: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
     /// construction (`greenboxes + redboxes + virtualizable_boxes`,
     /// `pop()` the trailing token) with the `vable_last_instr` pin
     /// (`pyjitpl.py:2973`). RPython performs both inline within
@@ -2873,7 +2873,7 @@ impl MIFrame {
         // read_boxes) are carried into the JUMP unchanged, including
         // stack slots. Do NOT truncate to nlocals here.
         //
-        // Issue #73 Phase 4.5 slice 2 parity: read the user-side
+        // Read the user-side
         // `valuestackdepth` from the concrete `PyFrame` to match
         // `live_args_shape_at`'s reader.  Both helpers share the same
         // shape derivation; reading from different sources lets the two
@@ -2924,7 +2924,7 @@ impl MIFrame {
         // point. flush_to_frame already stored `orgpc - 1`; override with
         // the merge target.
         //
-        // Task #21 Slice 3 propagation gap #1: propagate the override
+        // Propagation gap #1: propagate the override
         // into the virtualizable_boxes shadow so the writeback below
         // emits the merge-target PC, not the orgpc placed by
         // flush_to_frame. virtualizable_boxes[0] = vable_last_instr per
@@ -2946,7 +2946,7 @@ impl MIFrame {
                 );
             }
         }
-        // Task #21 fix path 3 — vable heap-writeback before JUMP.
+        // Vable heap-writeback before JUMP.
         //
         // When `descriptor=Some` + `patch_new_loop_to_load_virtualizable_
         // fields` (compile.py:425-461) reduces the target LABEL to
@@ -2969,7 +2969,7 @@ impl MIFrame {
         // entries: `[frame, 6 scalars, locals..., stack...]`) from
         // reduced (1-2 entries: `[frame]` or `[frame, ec]`).
         //
-        // Slice 3 closure (3.0a/b/c/d/e/e'): every direct `s.vable_*`
+        // Every direct `s.vable_*`
         // write that touches the active sym now mirrors into
         // `virtualizable_boxes` via `mirror_vable_static_to_boxes`,
         // and inline frame push/pop save+restore the boxes shadow so
@@ -3063,7 +3063,7 @@ impl MIFrame {
         // snapshot below so JUMP args never carry OpRef::NONE in the ec
         // slot on adapter / bridge-from-guard paths.
         let recovered_ec = self.ensure_execution_context(ctx);
-        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // When the portal-bridge metadata is absent,
         // the stack depth fallback reads from `PyFrame.valuestackdepth`
         // (via `concrete_valuestackdepth()`) rather than the symbolic
         // mirror.  `close_loop_args_at` runs at the orgpc anchor where
@@ -3331,7 +3331,7 @@ impl MIFrame {
         // loop" path since the frame won't be reused.
         {
             // `num_scalars` (NUM_SCALAR_INPUTARGS) already counts extra_reds
-            // (frame + extra_reds + vable static fields) post-Phase 2.1.
+            // (frame + extra_reds + vable static fields).
             let total_scalar_prefix = num_scalars;
             let s = self.sym_mut();
             for &(idx, new_opref) in &dedup_changed {
@@ -3543,7 +3543,7 @@ impl MIFrame {
                 &callee_active_boxes,
                 &callee_snapshot_types_full,
             );
-            // Task #91 slice 4a: snapshot is the source of truth — the
+            // Snapshot is the source of truth — the
             // optimizer's `store_final_boxes_in_guard`
             // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
             // the snapshot via `op.store_final_boxes(liveboxes)`
@@ -3602,7 +3602,7 @@ impl MIFrame {
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
         let fail_arg_types = snapshot_full_types.clone();
 
-        // Task #91 slice 4a: snapshot is the source of truth — the
+        // Snapshot is the source of truth — the
         // optimizer's `store_final_boxes_in_guard`
         // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from the
         // snapshot built below via `op.store_final_boxes(liveboxes)`
@@ -3626,7 +3626,7 @@ impl MIFrame {
         // pyjitpl.py:2581: self.staticdata.profiler.count_ops(opnum, Counters.GUARDS).
         // Atomic fetch_add through the shared `Arc<MetaInterpStaticData>`
         // — `&self` access is enough because `JitProfiler::count_ops`
-        // bumps an `AtomicUsize` (Task #17 infrastructure).
+        // bumps an `AtomicUsize`.
         ctx.profiler()
             .count_ops(opcode, majit_metainterp::counters::GUARDS);
     }
@@ -4154,7 +4154,7 @@ impl MIFrame {
                     Some(array_item_type),
                 ));
             } else {
-                // PRE-EXISTING-ADAPTATION: legacy `register == PyFrame
+                // TODO: legacy `register == PyFrame
                 // slot` conflation (plan Stage 3.4) lets STORE_FAST
                 // write an unboxed int into `locals_cells_stack_w[i]`
                 // when the trace IR optimizer promoted that local's
@@ -4362,7 +4362,7 @@ impl MIFrame {
         // `resumepc` for the duration of the capture and restores it on
         // exit; RPython has no pre-opcode snapshot because its jitcode is
         // register-machine and liveness is per-PC. Pyre's pre_opcode_*
-        // fields are a NEW-DEVIATION that will be removed once per-PC
+        // fields are a deviation that will be removed once per-PC
         // liveness is ported (codewriter/liveness.py). Until then, clear
         // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
         // and list_of_boxes_virtualizable all read the current (post-pop)
@@ -4388,7 +4388,7 @@ impl MIFrame {
             &callee_active_boxes,
             &callee_snapshot_types_full,
         );
-        // Task #91 slice 4a: snapshot is the source of truth — the
+        // Snapshot is the source of truth — the
         // optimizer's `store_final_boxes_in_guard`
         // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
         // the snapshot via `op.store_final_boxes(liveboxes)`
@@ -5279,7 +5279,7 @@ impl MIFrame {
             return self.trace_call_callable(callable, args);
         }
 
-        // PRE-EXISTING-ADAPTATION. In RPython the `lst.append(i)` /
+        // TODO. In RPython the `lst.append(i)` /
         // `lst.pop()` lowering goes through rtyper helpers in
         // `rpython/rtyper/rlist.py`: `ll_append` (rlist.py:588) is
         // documented "no oopspec — inlined by the JIT", and the pop
@@ -5796,7 +5796,7 @@ impl MIFrame {
                         // `get_assembler_token` (warmstate.py:714) handles
                         // the pending case by synthesising a
                         // `compile_tmp_callback` token; that path is not
-                        // yet ported (Task #195).  Until it is, mirror
+                        // yet ported.  Until it is, mirror
                         // main and gate strictly on compiled presence.
                         let Some(token_number) = driver.get_loop_token_number(callee_key) else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
@@ -6154,7 +6154,7 @@ impl MIFrame {
         // last_instr = return_point_pc - 1 so the caller's next_instr()
         // returns the fallthrough PC when the blackhole restores the frame.
         //
-        // Task #21 Slice 3 propagation gap #2: mirror the parent's
+        // Propagation gap #2: mirror the parent's
         // sym.vable_last_instr + sym.vable_valuestackdepth into the
         // virtualizable_boxes shadow when this sym owns it. Without
         // propagation, the heap still carries the caller's pre-call PC
@@ -6438,7 +6438,7 @@ impl MIFrame {
         Ok(FrontendOp::void(opref))
     }
 
-    /// PRE-EXISTING-ADAPTATION: pyre's tracer holds raw `PyObjectRef`
+    /// TODO: pyre's tracer holds raw `PyObjectRef`
     /// (the runtime W_Root pointer) instead of typed `FrontendOp`
     /// banks. RPython's `pyjitpl.py:opimpl_goto_if_*` reads
     /// `box.getint()` / `RefFrontendOp._resref` directly, dispatching
@@ -6526,7 +6526,7 @@ impl MIFrame {
     /// dispatch pair: `pyre_interpreter::execute_opcode_step` runs the
     /// trait-driven Python-opcode interpreter while
     /// `jitcode_dispatch::dispatch_via_miframe` walks the codewriter-
-    /// emitted jitcode arm.  Phase 5 retires the trait path opcode-by-
+    /// emitted jitcode arm.  The trait path retires opcode-by-
     /// opcode; this helper is the per-opcode walker entry that root-frame
     /// production dispatch (`trace_code_step`) calls for allow-listed
     /// instructions.  Inline dispatch (`trace_code_step_inline`) remains
@@ -6597,7 +6597,7 @@ impl MIFrame {
                 })
         };
 
-        // Issue #73 Phase 5.B: per-opcode arm entry allocates fresh
+        // Per-opcode arm entry allocates fresh
         // per-jitcode register banks and seeds r0 = sym.frame.  This
         // matches RPython MIFrame.setup (`pyjitpl.py:74-91`) and breaks
         // the prior alias of sym.registers_r (semantic frame mirror)
@@ -6623,7 +6623,7 @@ impl MIFrame {
         use crate::jitcode_dispatch::DispatchOutcome;
         match walk_result {
             Ok((DispatchOutcome::SubReturn { .. }, _)) => {
-                // Issue #73 Phase 4.5: the walker arm records IR for the
+                // The walker arm records IR for the
                 // opcode but does NOT run the trait dispatch's
                 // `MIFrame::pop_value` / `push_typed_value` paths that
                 // mutate `sym.valuestackdepth`.  Apply the opcode's net
@@ -6770,7 +6770,7 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                // Inline-frame gate (Issue #73 Phase 4 PopTop activation):
+                // Inline-frame gate (PopTop activation):
                 // `walker_capture_snapshot_for_last_guard` only captures a
                 // single Python frame (the outer pyjitcode coordinates,
                 // jitcode_dispatch.rs:3568) because pyre's blackhole cannot
@@ -6936,7 +6936,7 @@ impl MIFrame {
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let snapshot =
                     this.build_framestack_snapshot(ctx, resume_pc, &active_boxes, &fail_arg_types);
-                // Task #91 slice 4a: snapshot is the source of truth —
+                // Snapshot is the source of truth —
                 // the optimizer's `store_final_boxes_in_guard`
                 // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args`
                 // from the snapshot via
@@ -7475,7 +7475,7 @@ unsafe fn trace_check_exc_match_against(
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
 }
 
-/// Production-walker allow-list for issue #73 Phase 5 cutover.
+/// Production-walker allow-list for the walker cutover.
 ///
 /// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
 /// every opcode through the single jitcode-bytecode path; there is no
@@ -7485,7 +7485,7 @@ unsafe fn trace_check_exc_match_against(
 /// `MIFrame::dispatch_via_walker_for_opcode` and the root-frame trait
 /// path is dead code at runtime.  `trace_code_step_inline` intentionally
 /// stays on the trait path until walker snapshots can encode the full
-/// parent-frame chain.  Phase 6 removes the trait impl once every opcode
+/// parent-frame chain.  The trait impl will be removed once every opcode
 /// is in this set and the inline-frame snapshot gap is closed.
 ///
 /// Current status: the allow-list is deliberately empty.  The Nop
@@ -7499,8 +7499,8 @@ unsafe fn trace_check_exc_match_against(
 /// real no-op shape (`ref_return/r ...`) without residual-call wrapper
 /// ops.
 ///
-/// Subsequent Phase 5 batches grow this set until it covers every Python
-/// opcode, at which point Phase 6 deletes the trait infra.
+/// Subsequent batches grow this set until it covers every Python
+/// opcode, at which point the trait infra is deleted.
 ///
 /// PopTop is intentionally NOT in this set: 2026-05-21 diagnostic
 /// (synth/set_membership SIGBUS, exit 138) traced the failure to the

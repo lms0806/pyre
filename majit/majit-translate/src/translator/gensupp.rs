@@ -188,7 +188,7 @@ impl NameManager {
     /// returned [`LocalScope`] keeps an `Rc::clone` so its methods
     /// can `borrow_mut()` the same allocation without a per-call
     /// parameter. See [`LocalScope.glob`] for the
-    /// PRE-EXISTING-ADAPTATION block on why upstream's bare
+    /// TODO block on why upstream's bare
     /// `self.glob = glob` lowers to an `Rc<RefCell<>>` here.
     ///
     /// Grows `scopelist` so the new scope's per-basename dedup map
@@ -234,7 +234,7 @@ impl NameManager {
 /// then mutates it through `self.glob.uniquename(...)` /
 /// `self.glob.scopelist[...]` inside `uniquename` / `localname`.
 ///
-/// PRE-EXISTING-ADAPTATION: Rust forbids storing `&mut NameManager`
+/// TODO: Rust forbids storing `&mut NameManager`
 /// inside the same struct that holds other state without locking
 /// the whole `NameManager` for the lifetime of the `LocalScope`,
 /// which would break upstream's pattern of keeping a parent
@@ -265,7 +265,7 @@ pub struct LocalScope {
     /// RPython `_LocalScope.glob` (`gensupp.py:77`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /
     /// `localname` calls borrow the parent NameManager without a
-    /// per-call parameter — see the PRE-EXISTING-ADAPTATION block
+    /// per-call parameter — see the TODO block
     /// on the struct.
     pub glob: Rc<RefCell<NameManager>>,
 }

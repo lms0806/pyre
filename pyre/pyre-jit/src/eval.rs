@@ -51,7 +51,7 @@ fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
 
-/// Task #141 trampoline for stable-address host-side allocations.
+/// Trampoline for stable-address host-side allocations.
 /// Routes pyre-object's stable-allocation hook to the backend's
 /// `alloc_oldgen_typed`. MiniMark's old-gen is mark-sweep
 /// (non-moving), so the returned pointer is safe to hold on the Rust
@@ -81,7 +81,7 @@ fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
 
-/// Task #141 option (a) trampoline: register a caller-owned slot as
+/// Trampoline: register a caller-owned slot as
 /// a GC root with the active backend. Bridges `*mut *mut u8` (the
 /// pyre-object-facing shape that does not depend on majit-gc) to
 /// `*mut GcRef` expected by `majit_gc::gc_add_root`. `GcRef` is
@@ -497,8 +497,7 @@ thread_local! {
         // earlier one-typeid-per-root-layout approximation under-walked
         // lists/tuples/range-iters as soon as their descr groups carried
         // `type_id = 0`. `gc_ptr_offsets` stays empty for all four — this
-        // slice is pure bookkeeping (see gc_retype_epic_plan_2026_04_24.md
-        // Session 1); Sessions 2-5 will add the real pointer fields.
+        // slice is pure bookkeeping; real pointer fields will be added later.
         let w_bool_tid = gc.register_type(TypeInfo::object_subclass(
             std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
             w_int_tid,
@@ -521,7 +520,7 @@ thread_local! {
         // `pyre_object::object_array`), so
         // `is_nursery_object_start` (collector.rs:377) rejects it
         // and the walker no-ops. Activates end-to-end only after
-        // Phase L2's allocator cutover (blocked on Task #141 GC-root
+        // the allocator cutover (blocked on GC-root
         // infrastructure). Do NOT promote `W_LIST_GC_TYPE_ID` to
         // "fully-parity" status in docs/MEMORY while this stepping-
         // stone state holds.
@@ -569,7 +568,7 @@ thread_local! {
         // registration shapes the GC's type table but no walker
         // ever visits a PY_OBJECT_ARRAY_GC_TYPE_ID-tagged object.
         // Activates once Phase L2 swaps the allocator (blocked on
-        // Task #141). See comments on
+        // GC-root infrastructure). See comments on
         // `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
         // `pyre_object::object_array::ItemsBlock` for the
         // companion stepping-stone notices.
@@ -1249,7 +1248,7 @@ thread_local! {
         // `locals_cells_stack_w`; that path covers `std::alloc`-backed
         // PyFrames today and is the entry point that hands control to
         // the standard tracer for nursery-backed frames once
-        // Slice 2 Step 2 teaches it about forwarding.
+        // it is taught about forwarding.
         let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
             std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
             vec![
@@ -1704,7 +1703,7 @@ thread_local! {
         pyre_object::dict_eq_hook::register_compares_by_identity_hook(
             pyre_object_compares_by_identity_trampoline,
         );
-        // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
+        // Host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots
         // come from manual `pyre_object::gc_roots::pin_root` calls
         // bracketed by `push_roots()`; the active `MiniMarkGC`
@@ -3004,7 +3003,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 {
                     return loop_result;
                 }
-                // Issue #73 Phase 5 partial flip (per-opcode).  When the
+                // Partial flip (per-opcode).  When the
                 // tracer's `trace_code_step` routed the opcode through
                 // `dispatch_via_walker_for_opcode`, the walker arm's
                 // emitted IR ran through `vable_setfield` /
@@ -3015,7 +3014,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // PyFrame state a second time (double-decrement of
                 // `valuestackdepth`, etc.).  RPython doesn't see this
                 // because MetaInterp.interpret IS the execution loop —
-                // there is no separate `eval_loop_jit`.  Until Phase 5
+                // there is no separate `eval_loop_jit`.  Until
                 // retires `execute_opcode_step` from this loop entirely,
                 // the per-opcode skip below brings the gating in line
                 // with RPython for the allow-listed instructions only.
@@ -3203,7 +3202,7 @@ fn jit_merge_point_hook(
     // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
     // surface stays warm for the cutover; the result is intentionally
     // discarded so the legacy hash-only flow below still owns the
-    // decision (see also Pre-S3.1 Task #17 — incremental hash unification
+    // decision (incremental hash unification
     // is blocked by a fannkuch perf regression, so the soak gate is the
     // S3.1 prereq instead).
     static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3236,7 +3235,7 @@ fn jit_merge_point_hook(
             key.values[2] = frame.pycode as i64;
             // Shadow lookup — read-only, no install. Discarded result.
             // Pre-S3.1 the typed `get_uhash` and the legacy
-            // `make_green_key` hash differ (see Task #17), so this lookup
+            // `make_green_key` hash differ, so this lookup
             // intentionally misses. The soak's value is exercising the
             // typed-API call site so a regression in
             // `lookup_chain_with_key` surfaces under
@@ -6852,7 +6851,7 @@ mod tests {
     }
 
     /// Translate Python-stack depths into the post-regalloc Ref-bank
-    /// colors the dispatcher would actually touch. Phase 2.1c removed the
+    /// colors the dispatcher would actually touch. The pinning removal changed the
     /// `register_color = nlocals + depth` identity (chordal coloring may
     /// coalesce disjointly-live slots), so callers must consult
     /// `metadata.stack_slot_color_map` before checking liveness.
@@ -6920,7 +6919,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        // Phase 2.1c removed `register_color = nlocals + depth` identity:
+        // The `register_color = nlocals + depth` identity was removed:
         // stack-slot colors come from `stack_slot_color_map_at`. Locals
         // remain at colors `0..nlocals` (input-arg pinning kept that
         // half).
@@ -6938,7 +6937,7 @@ mod tests {
     /// Stack-depth-based variant of `compiled_trace_fixture`. Locates the
     /// first Python PC where the bytecode-level forward stack analysis
     /// reports `target_depth`, independent of which Ref-bank colors land
-    /// in the encoded `-live-` set. Stable across Task #158 force-add
+    /// in the encoded `-live-` set. Stable across force-add
     /// removal: the codewriter `live_r` is now SSA-driven only, so
     /// stack-slot colors no longer always appear there even when those
     /// slots are runtime-live (the consume_one_section heap-read
@@ -7011,7 +7010,7 @@ mod tests {
         }
     }
 
-    // Phase 4 endgame slice: emit_store_local_with_mirror no longer
+    // emit_store_local_with_mirror no longer
     // emits the inline `ref_copy(reg, stored_reg)` on portal frames
     // (matches upstream `jtransform.py:1898 do_fixed_list_setitem`
     // vable branch which emits only `setarrayitem_vable_r`).  This
@@ -7023,7 +7022,7 @@ mod tests {
     // virtualizable array path.  Rewriting this test against the
     // vable-array recovery shape is tracked separately.
     #[test]
-    #[ignore = "Phase 4 endgame: walker no longer mirrors locals into Ref-bank registers on portal frames; rewrite against vable-array recovery path"]
+    #[ignore = "walker no longer mirrors locals into Ref-bank registers on portal frames; rewrite against vable-array recovery path"]
     fn test_restore_guard_failure_uses_runtime_value_kinds_with_compiled_trace_jitcode() {
         use majit_ir::{GcRef, Type, Value};
         use majit_metainterp::JitState;
@@ -7383,7 +7382,7 @@ mod tests {
         // couples the test to walker's pre-canonical local-slot identity;
         // canonical `flatten_graph`'s regalloc-coalesced coloring may emit
         // a different color for the inputarg.  Mirrors the
-        // [[project-flatten-graph-canonical-driver-2026-05-17]] Phase 4
+        // The
         // splice-gate convergence pattern landed for
         // test_restore_guard_failure_uses_runtime_value_kinds_... .
         let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
@@ -7670,7 +7669,7 @@ mod tests {
                 state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
             }
 
-            // Task #91 slice 4a: production guard recording goes through
+            // Production guard recording goes through
             // `record_guard_typed` + `capture_resumedata` —
             // `op.fail_args` stays None until the optimizer's
             // `store_final_boxes_in_guard` writes it back from the
@@ -7713,8 +7712,8 @@ mod tests {
                 .map(|f| f.boxes.as_slice())
                 .unwrap_or(&[]);
             assert_eq!(active_boxes.len(), live_regs.len());
-            // Task #134 restored kind-segregated liveness emission
-            // (Int regs first, then Ref); Phase 2.1c further removed
+            // Kind-segregated liveness emission was restored
+            // (Int regs first, then Ref); additionally, the
             // the `register_color = nlocals + depth` identity, so the
             // active_boxes order no longer reflects Python stack
             // depth. Verify both stack OpRefs are present without
@@ -7818,7 +7817,7 @@ mod tests {
         );
         <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
 
-        // Task #91 slice 4a: snapshot is the resume-data oracle, not
+        // Snapshot is the resume-data oracle, not
         // `op.fail_args` (None until the optimizer's
         // `store_final_boxes_in_guard` writes it back).
         let guard = ctx
@@ -7847,7 +7846,7 @@ mod tests {
         assert_eq!(active_boxes.len(), live_regs.len());
         // See note on the sibling test
         // `test_branch_guard_preserves_pre_pop_stack_shape_*`: kind
-        // segregation (Task #134) + Phase 2.1c color reassignment mean
+        // segregation + color reassignment mean
         // active_boxes order is dictated by liveness format, not by
         // stack depth.
         assert!(
@@ -7879,7 +7878,7 @@ mod tests {
         let _ = driver_pair();
         init_callbacks();
         // Symbolic state below has nlocals=1 + 2 stack slots, so the
-        // target PC needs depth=2 (post-Task #158 force-add removal,
+        // target PC needs depth=2 (post force-add removal,
         // stack-slot colors no longer always appear in `live_r`, so a
         // depth-based locator is needed instead of `&[1, 2]` regs).
         let (mut frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
@@ -7890,7 +7889,7 @@ mod tests {
                 frame.locals_w_mut()[0] = w_int_new(7);
             },
         );
-        // Issue #73 Phase 4.5: `live_args_shape_at` and
+        // `live_args_shape_at` and
         // `close_loop_args_at` both derive their JUMP-args shape from
         // `concrete_valuestackdepth()`.  The symbolic state below
         // advertises `valuestackdepth=3` (one local + two stack slots);

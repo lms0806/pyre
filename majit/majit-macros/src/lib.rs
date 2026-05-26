@@ -979,7 +979,7 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// call.rs:3250 effectinfo_from_writeanalyze`) is not yet plumbed to
 /// the runtime trace recorder. This attribute provides explicit user
 /// opt-in for the cannot-raise effect-info until the codewriter→
-/// recorder wire-up lands (Task #64 analyzer-rollout).
+/// recorder wire-up lands.
 #[proc_macro_attribute]
 pub fn dont_look_inside_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise")
@@ -1815,7 +1815,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             #block
         }
 
-        // Phase 4 Epic B.3-B.4: inline helper jitcodes register
+        // Inline helper jitcodes register
         // per-marker liveness triples through the caller-supplied
         // `Assembler`.  The production caller threads the driver-shared
         // `Assembler` (see `JitDriver::shared_asm`) so all jitcodes —

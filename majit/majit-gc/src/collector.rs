@@ -205,7 +205,7 @@ pub struct MiniMarkGC {
     /// survivors and by direct old-gen weakref allocation. Drained by
     /// `invalidate_old_weakrefs` during the sweep phase of a major
     /// collection (incminimark.py:3107-3133); the major-side
-    /// consumer lands in Slice 3.
+    /// consumer lands in the major-collection sweep phase.
     old_objects_with_weakrefs: Vec<usize>,
     /// Configuration.
     config: GcConfig,
@@ -784,7 +784,7 @@ impl MiniMarkGC {
 
             // Target is in old-gen (or a foreign address pyre's GC
             // does not own). Either way, the minor cycle leaves the
-            // weakptr untouched and the major cycle (Slice 3) gets
+            // weakptr untouched and the major cycle gets
             // the chance to invalidate it later.
             if self.oldgen.contains(pointing_to) {
                 self.old_objects_with_weakrefs.push(new_obj);
@@ -1126,12 +1126,12 @@ impl MiniMarkGC {
         // (line 814): a `Ptr(GcStruct)` field can transiently point at
         // memory outside the GC-managed heap during the L1/L2 stepping-
         // stone state (e.g. `W_TupleObject.wrappeditems` →
-        // `std::alloc`'d ItemsBlock until Task #98 lands). In that
+        // `std::alloc`'d ItemsBlock). In that
         // window calling `header_of` on the field would dereference
         // memory before the std::alloc'd block. Upstream RPython
         // `_collect_obj` (incminimark.py:2739-2752) does not need this
         // guard because RPython's type system guarantees every
-        // `Ptr(GcStruct)` is GC-managed. PRE-EXISTING-ADAPTATION:
+        // `Ptr(GcStruct)` is GC-managed. TODO:
         // matches `mark_object`'s own custom_trace-path guard and
         // converges away once every gc_ptr_offsets target is a real
         // GC allocation.
@@ -1213,7 +1213,7 @@ impl MiniMarkGC {
             if pointing_to == 0 {
                 continue;
             }
-            // Slice 2 only adds oldgen-resident targets here; the
+            // Minor collection only adds oldgen-resident targets here; the
             // foreign-address path is filtered upstream. If the
             // target's header reports VISITED, the weakref survives.
             let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;

@@ -235,7 +235,7 @@ pub struct W_ExceptionObject {
     /// `descr_init` path (matches PyPy's class-default `w_object = None`
     /// — `descr_str` checks `if self.object is None: return ""`).
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy uses three distinct
+    /// TODO: PyPy uses three distinct
     /// `W_UnicodeTranslateError` / `W_UnicodeDecodeError` /
     /// `W_UnicodeEncodeError` classes each with their own field set.
     /// Pyre flattens them onto `W_ExceptionObject` to keep a single
@@ -519,7 +519,7 @@ pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
 
 /// `interp_exceptions.py:196-201 descr_gettraceback` parity (minus
 /// the `PyTraceback.frame.mark_as_escaped()` callback, which pyre
-/// does not have yet — see PRE-EXISTING-ADAPTATION on
+/// does not have yet — see TODO on
 /// `baseobjspace::getattr`'s `__traceback__` arm).
 ///
 /// # Safety

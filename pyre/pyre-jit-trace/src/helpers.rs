@@ -55,7 +55,7 @@ pub fn emit_trace_call_int_typed(
     // virtualizable / quasi-immut analyzers; the gap is the trace-side
     // plumbing — pyre-jit-trace helpers live outside the codewriter
     // pipeline so the analyzer's per-callee EI never reaches this
-    // emit site. Until per-helper EI registration lands (Task #64),
+    // emit site. Until per-helper EI registration lands,
     // fall back to the conservative `default_effect_info()`
     // (≡ `effectinfo.MOST_GENERAL` for unanalyzed callees: CanRaise +
     // all-writes-set bitmasks).
@@ -902,7 +902,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
 // invokes the helper through `TraceCtx::call_typed_with_effect_pure`
 // with an explicit `ElidableCannotRaise` `EffectInfo`.  Production
 // `emit_trace_call_int_typed` callsites still pass
-// `default_effect_info()` until per-helper EI registration (Task #64)
+// `default_effect_info()` until per-helper EI registration
 // lands; this canary closes the macro-side gap so the EI side can
 // proceed in a separate slice.
 #[majit_macros::elidable_cannot_raise]

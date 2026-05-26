@@ -689,7 +689,7 @@ mod test {
     fn matches_uses_tag_for_flow_signal() {
         // Ensure the FlowSignal import path used by tests resolves —
         // the tag check is exercised by union_stack in union(), not
-        // by matches(), but pin the import so Phase 3 developers know
+        // by matches(), but pin the import so developers know
         // the enum lives at super::flowcontext::FlowSignal.
         let tag = FlowSignal::Return {
             w_value: Hlvalue::Constant(Constant::new(ConstValue::Int(1))),

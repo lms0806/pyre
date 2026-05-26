@@ -21,9 +21,9 @@
 //! address that the collector **does not** follow when discovering
 //! live objects. Instead, the collector walks `T_IS_WEAKREF`-tagged
 //! objects during its own cycle and invalidates `weakptr` (sets it to
-//! null) for any target it didn't otherwise reach. Slice 2 / Slice 3
-//! wire that side; this module is the data layout the cycles operate
-//! on.
+//! null) for any target it didn't otherwise reach. The minor and major
+//! collection cycles wire that side; this module is the data layout
+//! the cycles operate on.
 
 use majit_ir::GcRef;
 

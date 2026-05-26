@@ -1,5 +1,4 @@
-//! Trace-side jitcode walker (Phase D-1 entry, eval-loop automation
-//! plan `tingly-splashing-balloon.md`).
+//! Trace-side jitcode walker.
 //!
 //! RPython parity: this is the trace-side counterpart of
 //! `BlackholeInterpBuilder.dispatch_loop` (`blackhole.py:65-100`). The
@@ -29,29 +28,27 @@
 //! | `inline_call_irf_r/dIRF>r`, `inline_call_irf_f/dIRF>f` | PARITY | full-arglist variants — descr + I-list + R-list + F-list + dst. RPython same `setup_call` distribution; walker uses `dispatch_inline_call_dirf_kind(dst_bank)` extending the dIR helper with `read_float_var_list` + float-bank arg setup. Float arity overflow surfaces `InlineCallFloatArityMismatch`. |
 //! | `int_copy/i>i`      | PARITY        | `registers_i[dst] = registers_i[src]` SSA rename, no IR op emitted (`pyjitpl.py:471-477 _opimpl_any_copy + >i` decorator) |
 //! | `ref_copy/r>r`      | PARITY        | Ref-bank sibling — `registers_r[dst] = registers_r[src]` SSA rename, no IR op. Const-source variants (codewriter `emit_ref_copy!` with `ConstRef`) resolve through the constants window of `registers_r` (pre-populated by `setposition` in [`num_regs_r, num_regs_and_consts_r)`). |
-//! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_lshift/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (14 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). Mixed shapes such as `int_lshift/ri>i` stay unwired: those are Task #85 kind-flow bugs and must stay unsupported. |
+//! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_lshift/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (14 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). Mixed shapes such as `int_lshift/ri>i` stay unwired: those are kind-flow kind-flow bugs and must stay unsupported. |
 //! | `float_<binop>/ff>f` + `float_neg/f>f` | PARITY | float_add/float_sub/float_truediv binops + float_neg unary (4 ops total — float_mul, float comparisons, float_abs all absent from codewriter today, would land mechanically when emitted). Read on `registers_f` bank, record `OpCode::Float<Binop>`, write dst (`pyjitpl.py:284-292`). |
 //! | `int_neg/i>i`, `int_invert/i>i` | PARITY | unary i→i ops via `unop_int_record`. RPython `pyjitpl.py:356-368` exec-generated unary opimpls. `int_same_as/i>i` has a dormant walker arm for forward-prep, but the generated table should not contain it because RPython `jtransform.py:246 rewrite_op_same_as` removes `same_as` before assembly. |
 //! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
 //! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
-//! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow Task #85) stays unsupported. |
-//! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
+//! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow kind-flow) stays unsupported. |
+//! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
-//! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (Task #85). |
-//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (deferred slices for `direct_assembler_call` + `capture_resumedata`) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver, Task #45). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
+//! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
+//! | `residual_call_r_r/iRd>r` | TODO (deferred slices for `direct_assembler_call` + `capture_resumedata`) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
-//! | `raise/r`           | PRE-EXISTING-ADAPTATION (trait-leg-only `GUARD_CLASS`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; walker is symbolic shadow validator (`shadow_walker.rs`) with only an OpRef for the exception, no concrete-pointer access. Trait dispatch (`trace_opcode.rs:5980-6000 seed_raised_exception`) reads `concrete_exc.ob_header.ob_type` and emits the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. Walker IR is rolled back via `cut_trace`, so missing the emission on the walker leg has no production effect — by-design split. |
+//! | `raise/r`           | TODO (trait-leg-only `GUARD_CLASS`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; walker is symbolic shadow validator (`shadow_walker.rs`) with only an OpRef for the exception, no concrete-pointer access. Trait dispatch (`trace_opcode.rs:5980-6000 seed_raised_exception`) reads `concrete_exc.ob_header.ob_type` and emits the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. Walker IR is rolled back via `cut_trace`, so missing the emission on the walker leg has no production effect — by-design split. |
 //! | `reraise/`          | PARITY        | reads `ctx.last_exc_value` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py:1702 assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py:1700-1704 popframe + finishframe_exception`). |
 //! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py:1716-1719 opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
 //!
-//! Slice 1 = pure decode walker (no TraceCtx); slice 2b adds
-//! `WalkContext { registers_r, trace_ctx }` + `ref_return/r` recording.
-//! Slice 2c = `goto/L`. Slice 2d = `catch_exception/L`. Slice 2e =
-//! `reraise/`. Slice 2f = `int_copy/i>i`. Slice 2g =
-//! `residual_call_r_r/iRd>r`. Slice 2h = `inline_call_r_r/dR>r`
-//! recursion. Slice 2i (this) = caller-frame `catch_exception` scan,
-//! `last_exc_value` field, `reraise` finishframe routing, typed
+//! Covers: decode walker, `WalkContext { registers_r, trace_ctx }` +
+//! `ref_return/r` recording, `goto/L`, `catch_exception/L`,
+//! `reraise/`, `int_copy/i>i`, `residual_call_r_r/iRd>r`,
+//! `inline_call_r_r/dR>r` recursion, caller-frame `catch_exception`
+//! scan, `last_exc_value` field, `reraise` finishframe routing, typed
 //! arity / shape / no-active-exception errors, production
 //! `PyreJitCodeDescr` adapter.
 //!
@@ -126,7 +123,7 @@
 //!       carries a single-frame snapshot keyed by
 //!       `ctx.outer_jitcode_index` so the optimizer's
 //!       `store_final_boxes_in_guard` finds populated resume data.
-//!       Active-box narrowing via per-PC liveness is a Phase 4
+//!       Active-box narrowing via per-PC liveness is a future
 //!       follow-up; today's helper conservatively snapshots every
 //!       non-`OpRef::NONE` register across all three banks.
 //!    (Item f from the earlier audit — `_build_allboxes` ABI re-ordering
@@ -143,18 +140,18 @@
 //!    `cut_trace`, so the missing emission on the walker leg has no
 //!    production effect. A half-port that supplied a resolver-may-be-
 //!    None type-erased callback was tried earlier and reverted —
-//!    silently skipping when no resolver is wired is a NEW-DEVIATION;
+//!    silently skipping when no resolver is wired is a TODO;
 //!    the by-design split is the orthodox answer.
 //! 3. End-to-end real arm tests (`walk_return_value_arm_*`,
 //!    `walk_pop_top_arm_*`) stay `#[ignore]` until handlers exist for
 //!    every opname the codewriter-emitted callee bodies use (e.g.
 //!    `getfield_vable_i/rd>i`). Each new opname is a tracked slice.
 //! 4. (External) `build_default_bh_builder_with_unwired_report` is a
-//!    transitional helper for Task #85 (6 unwired opnames:
+//!    transitional helper for kind-flow (6 unwired opnames:
 //!    `int_ge/ir>i`, `int_mul/ir>i`, `int_ne/fr>i`, `int_xor/ri>i`,
 //!    `setarrayitem_gc_f/rrfd`, `setarrayitem_gc_i/rrid` — kind-flow
 //!    bug in assembler emitting mixed-kind operand types). RPython
-//!    upstream has no non-strict builder. Removed when Task #85
+//!    upstream has no non-strict builder. Removed when kind-flow
 //!    closes; not blocking dispatcher work.
 //! 5. Concrete-truth-dependent branch opnames (`goto_if_not/iL`,
 //!    `goto_if_exception_mismatch/iL`) and the non-constant side of
@@ -167,7 +164,7 @@
 //!    (`shadow_walker.rs`); `WalkContext` carries `OpRef`s, not
 //!    concrete `box.getint()` values, so the walker has no dispatch arm
 //!    for these opnames — emitting one direction unconditionally would
-//!    be a NEW-DEVIATION. Trait dispatch handles concrete branches via
+//!    be a TODO. Trait dispatch handles concrete branches via
 //!    `record_branch_guard(concrete_truth: bool)` (`trace_opcode.rs`);
 //!    walker IR is rolled back so missing arms here have no production
 //!    effect. Same split for `goto_if_exception_mismatch/iL`
@@ -326,10 +323,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// GUARD_CLASS is sound.
     ///
     /// **Companion bank** `concrete_registers_i` below now exists as a
-    /// skeleton field (Task #75.A) so handlers can plumb concrete int
+    /// skeleton field (Concrete shadow skeleton) so handlers can plumb concrete int
     /// shadow without changing the WalkContext signature again.  Seed
     /// wiring (real concrete int values at trace entry + per-handler
-    /// writes for `int_*` arithmetic) is deferred to Task #75.B and
+    /// writes for `int_*` arithmetic) is deferred to Concrete shadow seeding and
     /// later slices.  Until then every callsite passes `&mut []`.
     ///
     /// `goto_if_not/iL` and `switch/id` (which consume concrete Int)
@@ -338,14 +335,14 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     ///
     /// Reference: [[project-tracer-m4-cutover-decision]] memory.
     pub concrete_registers_r: &'frame mut [ConcreteValue],
-    /// **Skeleton — Task #75.A.**  Concrete shadow mirror for
+    /// **Skeleton — Concrete shadow skeleton.**  Concrete shadow mirror for
     /// `registers_i`.  Color-indexed (not semantic-slot indexed like
     /// `concrete_registers_r`) because pyre's Int bank has no
     /// "semantic-slot" abstraction — Int registers are post-regalloc
     /// colors directly.  Length equals `registers_i.len()` when
     /// populated, or `0` when callsites pass `&mut []`.
     ///
-    /// Future invariant (Task #75.B+): every walker handler that writes
+    /// Future invariant (Concrete shadow seeding+): every walker handler that writes
     /// `registers_i[dst]` MUST also write `concrete_registers_i[dst]`
     /// in lock-step, mirroring the Ref-bank contract above.  A future
     /// `write_int_reg` helper will enforce this once seeding lands.
@@ -353,7 +350,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// Consumers (`dispatch_goto_if_not/iL`, `switch/id`) currently
     /// fall back to the strict-mode fail-loud path; they will switch
     /// to reading `concrete_registers_i[src]` for the test-direction
-    /// fold once Task #75.B populates seeds.
+    /// fold once Concrete shadow seeding populates seeds.
     ///
     /// Reference: [[project-tracer-m4-cutover-decision]] memory,
     /// "Architectural blocker for the Int-bank shadow" section.
@@ -709,7 +706,7 @@ pub enum DispatchError {
     /// `OopSpecIndex::JitForceVirtual` is set only by
     /// `jtransform.rs:1903 jit.force_virtual` lowering, which our
     /// benchmarks don't trigger; this guard is fail-loud against future
-    /// silent NEW-DEVIATIONs.
+    /// silent TODOs.
     JitForceVirtualRequiresConcreteResolver { pc: usize },
 }
 
@@ -882,7 +879,7 @@ fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
 /// (`pyre-jit/src/call_jit.rs:1058`); walker is the symbolic shadow
 /// validator (`shadow_walker.rs`) and its IR is rolled back via
 /// `cut_trace`, so the rvmprof side effect lives on the trait-driven
-/// leg today and the caller drops it here — PRE-EXISTING-ADAPTATION,
+/// leg today and the caller drops it here — TODO,
 /// scoped to the rvmprof profiler instrumentation only (no trace IR
 /// effect).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -998,7 +995,7 @@ fn concrete_int_for_switch(
 // generate_guard` walks `metainterp.framestack` and consults per-opcode
 // liveness (`pyjitpl.py:177 get_list_of_active_boxes`) to encode the
 // live `i`/`r`/`f` registers in i→r→f order plus virtualizable / vref
-// boxes.  Walker's helper today omits per-PC liveness narrowing (Phase 4
+// boxes.  Walker's helper today omits per-PC liveness narrowing (future
 // follow-up: thread the `op_live` byte table through `SubJitCodeBody`)
 // and conservatively snapshots every non-`OpRef::NONE` register —
 // over-capture is correctness-preserving because the optimizer's
@@ -1122,7 +1119,7 @@ fn write_ref_reg(
     Ok(())
 }
 
-/// Int-bank twin of [`read_ref_reg_concrete`] (Task #75.C).
+/// Int-bank twin of [`read_ref_reg_concrete`] (Int-bank concrete shadow).
 /// Reads the Int-bank slot at the operand index from
 /// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
 /// out-of-range reads — the only legal time the slice is shorter than
@@ -1142,7 +1139,7 @@ fn read_int_reg_concrete(
         .unwrap_or(ConcreteValue::Null)
 }
 
-/// Int-bank twin of [`write_ref_reg`] (Task #75.C).  Writes an Int
+/// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
 /// `registers_i[dst]` MUST also write `concrete_registers_i[dst]` so
@@ -1175,7 +1172,7 @@ fn write_int_reg(
     *slot = value;
     // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
     // an empty `concrete_registers_i` slice; production callers
-    // (Task #75.B) size it to `registers_i.len()` at dispatch entry.
+    // (Concrete shadow seeding) size it to `registers_i.len()` at dispatch entry.
     //
     // Codex P1 (PR #89) symmetry with `write_ref_reg`: collapse
     // non-Int ConcreteValue to Null before storing into the Int
@@ -1192,7 +1189,7 @@ fn write_int_reg(
 }
 
 /// Derive a `ConcreteValue` for shadow write-back from a freshly
-/// recorded `OpRef` via `concrete_of_opref` (Task #75.E).
+/// recorded `OpRef` via `concrete_of_opref` (concrete_of_opref derivation).
 ///
 /// RPython parity: `pyjitpl.py:execute_with_descr` /
 /// `rpython/jit/metainterp/executor.py` stamps `box.value` on every
@@ -1352,7 +1349,7 @@ fn binop_int_record(
 /// * on miss, emit `INT_EQ(valuebox, ConstInt(key))` plus `GUARD_FALSE`
 ///   for every `switchdict.const_keys_in_order`, then fall through
 ///
-/// PRE-EXISTING-ADAPTATION: guards below record with empty resume data
+/// TODO: guards below record with empty resume data
 /// (`record_guard(..., 0)`).  RPython `pyjitpl.py:600 opimpl_switch`
 /// pairs every `GUARD_VALUE` / `GUARD_FALSE` with `generate_guard(...,
 /// resumepc=orgpc) → capture_resumedata(orgpc)` walking the framestack
@@ -1492,7 +1489,7 @@ pub fn dispatch_via_miframe(
     // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: the
     // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
     // allocates fresh `Vec<OpRef>`s sized to `top_num_regs_* +
-    // top_constants_*.len()` — replacing the prior NEW-DEVIATION that
+    // top_constants_*.len()` — replacing the prior TODO that
     // reused `sym.registers_r` (a Python locals/stack mirror) as the
     // MIFrame register file.  The codewriter-compiled arm jitcode
     // expects `R[0]_r = handler = MIFrame self ptr`, which the
@@ -1550,7 +1547,7 @@ pub fn dispatch_via_miframe(
 
     // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: allocate
     // fresh per-bank register vectors sized to `top_num_regs_* +
-    // top_constants_*.len()`.  This replaces the prior NEW-DEVIATION
+    // top_constants_*.len()`.  This replaces the prior TODO
     // that reused `sym.registers_r` (a Python locals/stack mirror,
     // whose `[0]` slot is Python local 0) as the MIFrame register
     // file.  The codewriter-compiled arm jitcode emits getfield
@@ -1701,7 +1698,7 @@ pub fn dispatch_via_miframe(
         //     walker has only OpRefs — concrete writeback is the
         //     production tracer's responsibility (the trait-driven
         //     `MIFrame::execute_opcode_step` path). This is a known
-        //     PRE-EXISTING-ADAPTATION (the walker is symbolic-only,
+        //     TODO (the walker is symbolic-only,
         //     concrete state is fed by another path).
         if let Some(exc) = final_last_exc {
             sym.last_exc_box = exc;
@@ -1712,7 +1709,7 @@ pub fn dispatch_via_miframe(
     result
 }
 
-/// Issue #73 Phase 5.B orthodox entry: walk a per-opcode arm jitcode with
+/// Orthodox entry: walk a per-opcode arm jitcode with
 /// **fresh per-jitcode register banks** sized to the entry jitcode's
 /// declared `num_regs_<i|r|f>() + len(constants_<i|r|f>)`, with `r0`
 /// pre-seeded to the live PyFrame OpRef (`sym.frame`).
@@ -1991,7 +1988,7 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
     };
 
     let dst = code[op.pc + 5] as usize;
-    // Task #75.E: derive shadow concrete from the recorded result's
+    // concrete_of_opref derivation: derive shadow concrete from the recorded result's
     // `concrete_of_opref` entry instead of inventing Null.  Constant
     // arraybox + constant index hits land in `constants.get_value`;
     // virtualizable hits surface via `standard_virtualizable_box`;
@@ -2169,7 +2166,7 @@ fn setfield_gc_via_heapcache(
 /// non-pure read into `GetfieldGcPure*` based on `descr.is_always_pure()`,
 /// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py:
 /// 1284-1289) parity. Walker emitting Pure variants directly would be
-/// a NEW-DEVIATION since RPython's opimpl_* never emits the Pure
+/// a TODO since RPython's opimpl_* never emits the Pure
 /// opcodes; they're an optimizer-rewrite artifact.
 ///
 /// `dst_bank` selects the result bank: `'i'` writes `registers_i[dst]`,
@@ -2243,9 +2240,9 @@ fn getfield_gc_via_heapcache(
     };
 
     let dst = code[op.pc + 4] as usize;
-    // Task #75.E: derive shadow concrete via `concrete_of_opref` so a
+    // concrete_of_opref derivation: derive shadow concrete via `concrete_of_opref` so a
     // constant-folded predecessor (e.g. `binop_int_record` having
-    // stamped this OpRef in Task #75.D) propagates through.  RPython
+    // stamped this OpRef in OpRef concrete stamping) propagates through.  RPython
     // `Box.value` parity: `pyjitpl.py:executor.py` per-opcode LLOp
     // stamps `box.value` post-exec; pyre's `concrete_of_opref` reads
     // that channel.  Null fallback preserves the prior unknown-result
@@ -2355,7 +2352,7 @@ fn getfield_vable_via_metainterp(
     }
 
     let dst = code[op.pc + 4] as usize;
-    // Task #75.E: derive shadow concrete via `concrete_of_opref`.  The
+    // concrete_of_opref derivation: derive shadow concrete via `concrete_of_opref`.  The
     // `vable_getfield_*` helpers in `TraceCtx` already populate the
     // concrete shadow for virtualizable-resident fields via the
     // `standard_virtualizable_box()`/`virtualizable_boxes` channel,
@@ -2573,7 +2570,7 @@ fn ptr_nonzero_record(
 ///     `registers_r` slot still pointing at `value` to `expected_ref`,
 ///     matching `dispatch_switch_id:1198-1202`.
 ///
-/// PRE-EXISTING-ADAPTATION: guards record with empty resume data
+/// TODO: guards record with empty resume data
 /// (`record_guard(..., 0)`) — same caveat as `dispatch_switch_id`
 /// (no MIFrame liveness / framestack in the standalone walker).
 fn ref_guard_value_record(
@@ -2969,7 +2966,7 @@ fn select_residual_call_opcode(
 /// is a missed cache hit on non-const funcptrs that upstream would
 /// have caught.  Convergence with upstream's full coverage requires
 /// threading concrete-int shadow alongside OpRef for non-const ints
-/// (Task #137 territory) — multi-session work.
+/// — significant work remaining.
 ///
 /// `descr_key` is the descriptor's stable identity key (`Descr::index()`),
 /// matching upstream's identity comparison on `descr` more closely than
@@ -3009,7 +3006,7 @@ fn loopinvariant_lookup(
 /// OpRef is read for register writeback), so the `0` placeholder is
 /// observationally equivalent.  Convergence with upstream requires
 /// either threading the concrete result up from the executing trace
-/// (Task #68 — concrete shadow tracking) or dropping the field from
+/// (concrete shadow tracking) or dropping the field from
 /// the cache shape entirely (separate cleanup).
 #[inline]
 fn loopinvariant_now_known(
@@ -3327,7 +3324,7 @@ fn do_not_in_trace_call_result(
 ///     starts emitting `OopSpecIndex::JitForceVirtual`.
 ///
 /// Convergence path back to 1:1 PyPy parity: an OpRef → concrete-pointer
-/// resolver (Task #45 epic).  When that lands the guard becomes a real
+/// resolver.  When that lands the guard becomes a real
 /// `_do_jit_force_virtual()` body that returns `Some(vref_opref)` /
 /// `Some(standard_opref)` / `None` and threads through the dispatcher
 /// like the release-gil short-circuit does today.
@@ -3363,7 +3360,7 @@ fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<()
 ///         self.history.record2(rop.SETFIELD_GC, ..., descr=...)     # IR
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION: in pyre, the IR-recording role and the
+/// TODO: in pyre, the IR-recording role and the
 /// runtime heap-mutation role are split.  The trait-driven path
 /// (`state.rs MIFrame::vable_and_vrefs_before_residual_call`,
 /// `trace_opcode.rs:2193-2229`) ALREADY performs the heap mutations
@@ -3429,7 +3426,7 @@ fn write_residual_call_result_to_dst(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
-    // Task #75.F: route the shadow write through `concrete_of_opref`
+    // concrete_of_opref shadow write: route the shadow write through `concrete_of_opref`
     // so a CallPure* descr whose argboxes are all constant (do_residual_call
     // path that lands a constant result via the executor.execute_varargs
     // stamp) propagates concrete to the dst slot.  Falls back to Null when
@@ -3539,7 +3536,7 @@ fn collect_outer_active_boxes(
     // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
     // register that the trait dispatcher never filled, the candidate fill
     // is one of these sym shadow OpRefs.  Including them in the diagnostic
-    // lets Task #30 fallback work jump straight to the right source.
+    // lets fallback work jump straight to the right source.
     let vable_vsd = sym.vable_valuestackdepth;
     let vable_last_instr = sym.vable_last_instr;
     let dump_ctx = |bank: &'static str, reg_idx: u32| -> String {
@@ -3823,7 +3820,7 @@ fn direct_call_release_gil(
 /// shape is `_irf_f/iIRFd>f`, dispatched by
 /// [`dispatch_residual_call_iIRFd_kind`].)
 ///
-/// PRE-EXISTING-ADAPTATION: walker selects the IR opcode by EffectInfo
+/// TODO: walker selects the IR opcode by EffectInfo
 /// branch (`CallMayForce*` for forces, `CallLoopinvariant*` for
 /// loop-invariant, `CallPure*` for elidable, otherwise `Call*`) via
 /// [`select_residual_call_opcode`]. Two sub-cases route through
@@ -3858,7 +3855,7 @@ fn direct_call_release_gil(
 /// [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
 /// split rationale.  The `OS_NOT_IN_TRACE` check fires up front via
 /// [`do_not_in_trace_call_result`] — fail-loud guard against future
-/// silent NEW-DEVIATIONs once the `majit-translate` analyzer trio
+/// silent TODOs once the `majit-translate` analyzer trio
 /// populates `oopspecindex`.
 ///
 /// Still missing relative to upstream `do_residual_call`, all blocked
@@ -3909,7 +3906,7 @@ fn direct_call_release_gil(
 ///     all three banks; RPython narrows the box list via
 ///     `jitcode.get_live_vars_info(pc, op_live)` so dead registers are
 ///     pruned before the snapshot.  The walker has no `op_live` byte
-///     reader plumbed through `SubJitCodeBody` yet — Phase 4 follow-up
+///     reader plumbed through `SubJitCodeBody` yet — follow-up
 ///     once the codewriter exposes the per-PC liveness table on the
 ///     callee body slice.  Over-capture is correctness-preserving:
 ///     `store_final_boxes_in_guard` filters dead boxes from the
@@ -5152,7 +5149,7 @@ fn handle(
         // the canonical operand shape is therefore `ii>i`
         // (`blackhole.py:516-519 bhimpl_int_lshift(a, b): return
         // intmask(a << b)`). Mixed shapes such as `int_lshift/ri>i`
-        // stay unwired: those are Task #85 kind-flow bugs, and adding
+        // stay unwired: those are kind-flow kind-flow bugs, and adding
         // a handler for them would mask a Ref register flowing into
         // an Int op.
         "int_lshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLshift),
@@ -5275,7 +5272,7 @@ fn handle(
         // dispatches the same way through `heapcache.get_field_updater`.
         // Walker handles the canonical `rd>X` shapes (Ref source);
         // pyre-specific `id>X` variants where the source is an int
-        // register holding an unwrapped pointer are kind-flow Task #85
+        // register holding an unwrapped pointer are kind-flow kind-flow
         // territory and stay unsupported here.
         "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
         "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
@@ -5319,7 +5316,7 @@ fn handle(
         "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
         "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
-        // shapes are pyre kind-flow Task #85 territory and stay
+        // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.
         "setfield_gc_i/rid" => setfield_gc_via_heapcache(code, op, ctx, 'i'),
         "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
@@ -5328,7 +5325,7 @@ fn handle(
         // `ri{i,r,f}d` shapes).  The pyre-only Ref-index shape
         // `getarrayitem_gc_r/rrd>r` lives in `pyre_extension_insns()`
         // and is NOT canonical; non-canonical setarrayitem shapes
-        // (`rrid`/`rrrd`/`rrfd`, Ref index) stay unsupported (Task #85
+        // (`rrid`/`rrrd`/`rrfd`, Ref index) stay unsupported (kind-flow
         // kind-flow territory).
         "getarrayitem_gc_i/rid>i" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcI, 'i')
@@ -5381,7 +5378,7 @@ fn handle(
             // records *no* IR op for a copy — pure SSA-level rename.
             // Operand layout `i>i`: 1B src + 1B dst.
             //
-            // Task #75.C: propagate the source slot's Int-bank concrete
+            // Int-bank concrete shadow: propagate the source slot's Int-bank concrete
             // shadow alongside the symbolic OpRef, mirroring the
             // `ref_copy/r>r` Step 2.2 chain.  Without this, a
             // `goto_if_not/iL` reading the dst slot wouldn't see the
@@ -6295,7 +6292,7 @@ mod tests {
 
     #[test]
     fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
-        // Slice 2h core acceptance: caller's `inline_call_r_r/dR>r`
+        // Core acceptance: caller's `inline_call_r_r/dR>r`
         // recurses into a synthetic callee jitcode whose body is
         // simply `ref_return r0`. The callee's ref_return surfaces as
         // `SubReturn { result: Some(callee.registers_r[0]) }`; the
@@ -6402,7 +6399,7 @@ mod tests {
 
     #[test]
     fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
-        // Slice 3.7 acceptance: caller's `inline_call_r_i/dR>i`
+        // Acceptance: caller's `inline_call_r_i/dR>i`
         // recurses into a synthetic callee whose body is `int_return
         // r0` on the int bank. The callee's int_return surfaces as
         // `SubReturn { result: Some(callee.registers_i[0]) }`; the
@@ -6552,7 +6549,7 @@ mod tests {
 
     #[test]
     fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
-        // Slice 3.8 acceptance: caller's `inline_call_ir_r/dIR>r` carries
+        // Acceptance: caller's `inline_call_ir_r/dIR>r` carries
         // both an I-list and an R-list. The callee's int + ref register
         // banks must both be populated (RPython
         // `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r,
@@ -6646,7 +6643,7 @@ mod tests {
 
     #[test]
     fn inline_call_irf_r_populates_all_three_kind_banks() {
-        // Slice 3.9 acceptance: caller's `inline_call_irf_r/dIRF>r`
+        // Acceptance: caller's `inline_call_irf_r/dIRF>r`
         // carries an I-list, R-list, AND F-list. Smoke test: callee
         // body is `ref_return r0` — the caller's R-list arg propagates
         // through. The I-list and F-list args are dead from the
@@ -6746,7 +6743,7 @@ mod tests {
 
     #[test]
     fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
-        // Slice 3.8: per-bank arity check — providing more I-args than
+        // Per-bank arity check — providing more I-args than
         // the callee declared `num_regs_i` slots surfaces
         // `InlineCallIntArityMismatch`. The Ref-bank check is covered
         // by the existing `inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch`
@@ -6931,7 +6928,7 @@ mod tests {
 
     #[test]
     fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
-        // Slice 2h: descr at the inline_call's d-slot must implement
+        // Descr at the inline_call's d-slot must implement
         // `JitCodeDescr`. A `FailDescr` placeholder doesn't, so the
         // walker surfaces `ExpectedJitCodeDescr`.
         let inline_byte = *insns_opname_to_byte()
@@ -6975,7 +6972,7 @@ mod tests {
 
     #[test]
     fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
-        // Slice 2h: descr resolves to JitCodeDescr but lookup returns
+        // Descr resolves to JitCodeDescr but lookup returns
         // None — surface `SubJitCodeNotFound`.
         let inline_byte = *insns_opname_to_byte()
             .get("inline_call_r_r/dR>r")
@@ -7057,7 +7054,7 @@ mod tests {
 
     #[test]
     fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
-        // Slice 2c-fix: `ref_return/r` records `rop.FINISH(reg)` to the
+        // `ref_return/r` records `rop.FINISH(reg)` to the
         // TraceCtx with `done_with_this_frame_descr_ref` attached, and
         // the `reg` byte selects the correct OpRef from `registers_r`.
         // RPython `pyjitpl.py:opimpl_ref_return → finishframe →
@@ -7162,7 +7159,7 @@ mod tests {
 
     #[test]
     fn step_through_int_return_records_finish_with_int_descr() {
-        // Slice 3.6: `int_return/i` mirrors `ref_return/r` on the int
+        // `int_return/i` mirrors `ref_return/r` on the int
         // bank. Top-level records `FINISH(int_value)` with
         // `done_with_this_frame_descr_int` (RPython `pyjitpl.py:3206-3208
         // compile_done_with_this_frame: token = sd.done_with_this_frame_descr_int`).
@@ -7217,7 +7214,7 @@ mod tests {
 
     #[test]
     fn step_through_int_return_subwalk_surfaces_subreturn_some() {
-        // Slice 3.6: nested `int_return/i` propagates SubReturn{Some(value)}
+        // nested `int_return/i` propagates SubReturn{Some(value)}
         // — same shape as `ref_return/r` sub-walk. RPython
         // `pyjitpl.py:1688-1698 finishframe → popframe` returns control to
         // caller's metainterp loop with the box in hand.
@@ -7270,7 +7267,7 @@ mod tests {
 
     #[test]
     fn step_through_void_return_records_empty_finish_with_void_descr() {
-        // Slice 3.6: top-level `void_return/` records `FINISH([])` with
+        // top-level `void_return/` records `FINISH([])` with
         // `done_with_this_frame_descr_void`. RPython
         // `pyjitpl.py:3202-3205 compile_done_with_this_frame`:
         //   if result_type == VOID:
@@ -7327,7 +7324,7 @@ mod tests {
 
     #[test]
     fn step_through_void_return_subwalk_surfaces_subreturn_none() {
-        // Slice 3.6: nested `void_return/` propagates SubReturn{None} —
+        // nested `void_return/` propagates SubReturn{None} —
         // RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`.
         // The caller's `inline_call_*_v` variant (when one exists) does
         // not write a dst register; today the walker has no `_v`
@@ -7374,7 +7371,7 @@ mod tests {
 
     #[test]
     fn raise_with_out_of_range_register_surfaces_typed_error() {
-        // Slice 2c-fix: `raise/r` reads its operand for OOR validation
+        // `raise/r` reads its operand for OOR validation
         // even though recording is deferred. Catches the same classes
         // of assembler bugs `ref_return/r` does.
         let raise_byte = *insns_opname_to_byte()
@@ -7418,7 +7415,7 @@ mod tests {
 
     #[test]
     fn step_through_goto_jumps_to_label_target() {
-        // Slice 2c: `goto/L` reads its 2-byte LE label and the walker
+        // `goto/L` reads its 2-byte LE label and the walker
         // returns Continue at the label target, not the linear next pc.
         // RPython `blackhole.py:950-952 bhimpl_goto(target): return target`.
         let goto_byte = *insns_opname_to_byte()
@@ -7600,7 +7597,7 @@ mod tests {
 
     #[test]
     fn step_through_catch_exception_advances_past_label_operand() {
-        // Slice 2d: `catch_exception/L` records nothing on the normal
+        // `catch_exception/L` records nothing on the normal
         // walk (RPython `pyjitpl.py:497-504 opimpl_catch_exception` is
         // an `assert not last_exc_value` only) and the walker advances
         // linearly past the 2-byte target.
@@ -7801,7 +7798,7 @@ mod tests {
 
     #[test]
     fn step_through_reraise_at_top_level_records_outermost_finish() {
-        // Slice 2i: `reraise/` mirrors `raise/r` for the top-level
+        // `reraise/` mirrors `raise/r` for the top-level
         // frame — it records `FINISH(last_exc_value,
         // exit_frame_with_exception_descr_ref)`. RPython parity:
         // `pyjitpl.py:1700-1704 opimpl_reraise → popframe →
@@ -7866,7 +7863,7 @@ mod tests {
 
     #[test]
     fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
-        // Slice 2i: RPython `pyjitpl.py:1702 opimpl_reraise`:
+        // RPython `pyjitpl.py:1702 opimpl_reraise`:
         //   assert self.metainterp.last_exc_value
         // — reaching `reraise` without an active exception is a
         // codewriter invariant violation. Walker surfaces it as a
@@ -7905,7 +7902,7 @@ mod tests {
 
     #[test]
     fn raise_at_top_level_populates_last_exc_value_before_finish() {
-        // Slice 2i: `raise/r` at top-level records FINISH and *also*
+        // `raise/r` at top-level records FINISH and *also*
         // sets `ctx.last_exc_value` (RPython `pyjitpl.py:1695`). The
         // post-condition matters because a future opcode in a
         // wrap-around (e.g. an unconditional `reraise/` after the
@@ -8026,7 +8023,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_portal_jitcode_summary() {
-        // Phase 9 architecture diagnostic: confirm whether the
+        // Architecture diagnostic: confirm whether the
         // portal jitcode (eval_loop_jit's compiled form) exists and
         // what its body shape is.  If portal contains per-opcode
         // arms inlined directly, then walking portal at JitCode PC
@@ -8127,7 +8124,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_pop_value_jitcode_356() {
-        // Phase 4 diagnostic: dump PyFrame::pop_value's body so we
+        // Diagnostic: dump PyFrame::pop_value's body so we
         // can see whether `nlocals()` is now `residual_call_r_i` or
         // still `inline_call_r_i` after impl-method-hints fix.
         use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
@@ -8310,10 +8307,10 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_load_fast_check_arm_bytes() {
-        // T4 allow-list extension diagnostic (Task #48): LoadFastCheck's arm
+        // T4 allow-list extension diagnostic: LoadFastCheck's arm
         // body was the first opcode beyond PopTop blocked on the Int-bank
         // concrete shadow (`GotoIfNotValueNotConcrete { pc: 28, value:
-        // IntOp(35) }` on fib_loop, 2026-05-17). With Task #75.A-G landed
+        // IntOp(35) }` on fib_loop, 2026-05-17). With Concrete shadow skeleton-G landed
         // the concrete_registers_i pool exists, so this dumper is the
         // first step before re-attempting the allow-list extension.
         use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
@@ -8600,7 +8597,7 @@ mod tests {
 
     #[test]
     fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
-        // Slice 2i acceptance: callee's `raise/r` surfaces SubRaise to
+        // Acceptance: callee's `raise/r` surfaces SubRaise to
         // the caller; caller's inline_call SubRaise arm probes
         // `op.next_pc` for `live/` + `catch_exception/L`, finds it,
         // sets `last_exc_value = exc`, and resumes at the catch target.
@@ -8819,7 +8816,7 @@ mod tests {
 
     #[test]
     fn step_through_int_copy_advances_past_operand_bytes() {
-        // Slice 2f: `int_copy/i>i` reads the src `i` operand for OOR
+        // `int_copy/i>i` reads the src `i` operand for OOR
         // validation, advances past 2 operand bytes, records nothing.
         // Dst writeback (`registers_i[dst] = registers_i[src]`) is
         // deferred — RPython `pyjitpl.py:471-477 _opimpl_any_copy(box)
@@ -8966,7 +8963,7 @@ mod tests {
 
     #[test]
     fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
-        // Slice 2f: src OOR validation parity with `raise/r`. Bank tag
+        // src OOR validation parity with `raise/r`. Bank tag
         // is `"i"` to disambiguate from the Ref-bank OOR error.
         let int_copy_byte = *insns_opname_to_byte()
             .get("int_copy/i>i")
@@ -9023,9 +9020,9 @@ mod tests {
     // `BC_MOVE_I = 21` in wellknown). Production walker dispatch over
     // runtime-emitted jitcode bytes therefore needs a table-
     // unification step before any `dispatch_via_miframe` invocation
-    // can read production bytes. Tracked separately as an Epic E
+    // can read production bytes. Tracked separately as a
     // prerequisite.
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (Epic E prerequisite)"]
+    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn step_through_ref_copy_advances_past_operand_bytes() {
         // Slice E1a: `ref_copy/r>r` Ref-bank sibling of `int_copy/i>i`.
@@ -9073,7 +9070,7 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (Epic E prerequisite)"]
+    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_writes_src_value_into_dst_register() {
         // Verify the dst writeback half of `ref_copy/r>r`.
@@ -9123,7 +9120,7 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (Epic E prerequisite)"]
+    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         let ref_copy_byte = *insns_opname_to_byte()
@@ -9166,7 +9163,7 @@ mod tests {
         );
     }
 
-    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (Epic E prerequisite)"]
+    #[ignore = "blocked on pipeline.insns ↔ wellknown_bh_insns table unification (pipeline prerequisite)"]
     #[test]
     fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         let ref_copy_byte = *insns_opname_to_byte()
@@ -10019,7 +10016,7 @@ mod tests {
 
     #[test]
     fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
-        // Slice 2g: `residual_call_r_r/iRd>r` records `OpCode::CallR`
+        // `residual_call_r_r/iRd>r` records `OpCode::CallR`
         // with `[funcptr, ...args]` and `descr=descr_refs[d]`. RPython
         // `pyjitpl.py:1334-1347 _opimpl_residual_call1` →
         // `do_residual_or_indirect_call → execute_and_record_varargs(
@@ -10142,7 +10139,7 @@ mod tests {
         // instead of panicking on the `-1` sentinel.
         assert!(
             guard_op.rd_resume_position.get() >= 0,
-            "GuardNoException must carry an attached snapshot (rd_resume_position >= 0) after Phase 4 capture_resumedata port",
+            "GuardNoException must carry an attached snapshot (rd_resume_position >= 0) after capture_resumedata port",
         );
     }
 
@@ -10721,7 +10718,7 @@ mod tests {
 
     #[test]
     fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
-        // Slice 2g: descr-index OOR validation. Same shape as
+        // descr-index OOR validation. Same shape as
         // RegisterOutOfRange, dedicated DispatchError variant for clarity.
         let residual_byte = *insns_opname_to_byte()
             .get("residual_call_r_r/iRd>r")
@@ -10767,7 +10764,7 @@ mod tests {
 
     #[test]
     fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
-        // Slice 4.1: kind sibling of `_r_r`. Same `iRd>X` operand
+        // kind sibling of `_r_r`. Same `iRd>X` operand
         // layout, dst kind flipped to int. RPython `pyjitpl.py:1346
         // opimpl_residual_call_r_i = _opimpl_residual_call1` shares
         // the body; `do_residual_call`'s `descr.get_normalized_result_type()`
@@ -10878,7 +10875,7 @@ mod tests {
 
     #[test]
     fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
-        // Slice 4.1: EF_ELIDABLE_CANNOT_RAISE on the int-kind sibling
+        // EF_ELIDABLE_CANNOT_RAISE on the int-kind sibling
         // must rewrite to CALL_PURE_I (not CALL_PURE_R) and skip
         // GUARD_NO_EXCEPTION. Confirms the `pure_op` selection in
         // `dispatch_residual_call_iRd_kind` follows `dst_bank`.
@@ -10931,7 +10928,7 @@ mod tests {
 
     #[test]
     fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
-        // Slice 4.2: shape sibling `_ir_r/iIRd>r`. Operand layout adds
+        // shape sibling `_ir_r/iIRd>r`. Operand layout adds
         // an i-bank list between funcptr and the R-list. RPython
         // `_build_allboxes` permutes argboxes by `descr.get_arg_types()`
         // ABI; for an [Int, Int, Ref, Ref] callee the permutation
@@ -11188,7 +11185,7 @@ mod tests {
 
     #[test]
     fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
-        // Slice 2g: varlist member OOR validation. Bank tag = "r" since
+        // varlist member OOR validation. Bank tag = "r" since
         // R-list reads from registers_r.
         let residual_byte = *insns_opname_to_byte()
             .get("residual_call_r_r/iRd>r")
@@ -11439,7 +11436,7 @@ mod tests {
 
     #[test]
     fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
-        // Slice 2i: codewriter shape contract says `R-list.len() <=
+        // codewriter shape contract says `R-list.len() <=
         // callee.num_regs_r` for `inline_call_r_r/dR>r`. Walker rejects
         // overflow with a typed error instead of silently dropping
         // (the dropped args would carry symbolic OpRefs the callee

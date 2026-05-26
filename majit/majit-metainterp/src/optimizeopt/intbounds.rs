@@ -3209,7 +3209,7 @@ impl Optimization for OptIntBounds {
         // ctx.getintbound and generate guard ops.
     }
 
-    /// PRE-EXISTING-ADAPTATION: pyre threads loop-iteration IntBound
+    /// TODO: pyre threads loop-iteration IntBound
     /// hand-offs through an explicit `HashMap<OpRef, IntBound>` side
     /// table; RPython's `intbounds.py` lets bounds survive iteration
     /// boundaries naturally because `box._forwarded`/`OptInfo.IntBound`

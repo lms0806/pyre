@@ -22,8 +22,7 @@ use majit_ir::{DescrRef, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-// Slice 80-G.7 (cranelift mirror of dynasm Slice 80-G.6) — the
-// process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was
+// The process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was
 // retired.  `history.py:109-114 AbstractDescr.show(cpu, descr_gcref)
 // = cast_gcref_to_instance(...)` parity is now a pure
 // `Arc::from_raw` against the `FailDescrCell` wrapper baked at
@@ -119,22 +118,21 @@ impl std::fmt::Debug for BridgeData {
     }
 }
 
-// `CraneliftFailDescr` removed (Slice 7-Tβ14f).  PyPy's cranelift-
-// equivalent `assembler.py` carries no per-emission descr wrapper —
-// every guard op's `op.descr` is the same `AbstractFailDescr` Arc that
-// the metainterp stamps via `compile.py:870 store_final_boxes_in_guard`,
+// `CraneliftFailDescr` removed.  PyPy's cranelift-equivalent
+// `assembler.py` carries no per-emission descr wrapper — every guard
+// op's `op.descr` is the same `AbstractFailDescr` Arc that the
+// metainterp stamps via `compile.py:870 store_final_boxes_in_guard`,
 // and every FINISH emission writes the cpu-attached class-distinct
 // singleton (`finish_descrs.rs DoneWithThisFrameDescr*` /
 // `ExitFrameWithExceptionDescrRef`) directly into the deadframe's
-// `jf_descr` slot.  After Phases A/B/C of the Unified-Descr Port Epic
-// the cranelift backend wrapper carried only forwarding shims, and the
-// singleton-direct push (Slices 7-Tβ3 / 7-Tβ14a..e) eliminated the
-// last constructor of the wrapper.  All readers reach the descr
-// through `DescrRef` and dispatch trait methods on `&dyn FailDescr` /
-// `&dyn Descr`.
+// `jf_descr` slot.  After the Unified-Descr port the cranelift backend
+// wrapper carried only forwarding shims, and the singleton-direct push
+// eliminated the last constructor of the wrapper.  All readers reach
+// the descr through `DescrRef` and dispatch trait methods on
+// `&dyn FailDescr` / `&dyn Descr`.
 
 /// Backend-registered cleanup for the type-erased
-/// `ResumeGuardDescr::bridge_dispatch_cell` (Slice 7-Tβ12).  Invoked
+/// `ResumeGuardDescr::bridge_dispatch_cell`.  Invoked
 /// by `ResumeGuardDescr::drop` on any payload still in the cell at
 /// descr teardown; reconstructs the owning `Arc<BridgeData>` so its
 /// `Drop` runs.
@@ -170,7 +168,7 @@ pub struct JitFrameDeadFrame {
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
-    /// Slice X3-D side-channel: caller-prefix layout assembled from the
+    /// Side-channel: caller-prefix layout assembled from the
     /// `CALL_ASSEMBLER_CALLER_STACK` top at deadframe interception
     /// (`wrap_call_assembler_deadframe_with_caller_prefix`).  When `Some`,
     /// `compiler.rs::deadframe_layout` prefixes the descr's own recovery

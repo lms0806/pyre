@@ -2,7 +2,7 @@
 //!
 //! Upstream covers ~22 tests but many require `TranslationContext` /
 //! `buildannotator` / `rpython.annotator.binaryop` side-effect
-//! registration — all of which land in Phase 5.  This file ports the
+//! registration — all of which are deferred.  This file ports the
 //! subset that exercises only the model.py primitives already carried
 //! locally:
 //!
@@ -89,7 +89,7 @@ fn const_float(x: f64) -> SomeValue {
 fn test_equality() {
     // upstream binds listdef1/listdef2 once at module scope and reuses
     // them in every `SomeList(...)` construction, so the identity-based
-    // same_as holds. Mirror that here — the Phase 5 P5.1 port makes
+    // same_as holds. Mirror that here — the ported
     // `ListDef.same_as` identity-based, so fresh ListDefs compare
     // unequal even when their element types agree.
     let listdef1 = listdef_tuple_nonneg();

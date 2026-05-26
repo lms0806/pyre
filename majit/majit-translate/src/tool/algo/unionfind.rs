@@ -8,7 +8,7 @@
 //! weighted union in [`union`], and the `info.absorb(other_info)`
 //! side-effect on merge.
 //!
-//! ## PRE-EXISTING-ADAPTATION: return shape
+//! ## TODO: return shape
 //!
 //! Upstream `find` / `union` return the 3-tuple
 //! `(new_root, representative, info)`. In Rust we cannot return a
@@ -22,7 +22,7 @@
 //! [`UnionFindInfo::absorb`] trait, so behaviour is identical — only
 //! the call-site shape differs.
 //!
-//! ## PRE-EXISTING-ADAPTATION: factory is mandatory
+//! ## TODO: factory is mandatory
 //!
 //! Upstream accepts `info_factory=None`, in which case every root's
 //! info is the Python object `None` and `absorb` is skipped. The Rust

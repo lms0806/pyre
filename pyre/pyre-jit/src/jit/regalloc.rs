@@ -772,7 +772,7 @@ pub(super) fn allocate_registers(
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
 ///
-/// PRE-EXISTING-ADAPTATION: the SSARepr-side variant operates on
+/// TODO: the SSARepr-side variant operates on
 /// `SSAReprRegAllocator` keyed by u16 register indices instead of
 /// Variable identities.  The PyPy-orthodox graph-side sibling lives
 /// at `enforce_input_args` (free function) above and retires this
@@ -822,7 +822,7 @@ fn enforce_ssarepr_input_args(
 /// + `rpython/tool/algo/regalloc.py:8-15`.  Builds an
 /// `SSAReprRegAllocator` and runs the three-stage pipeline.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's walker emits SSARepr inline, so
+/// TODO: pyre's walker emits SSARepr inline, so
 /// the consumer is `SSAReprRegAllocator`, not the orthodox
 /// `RegAllocator`.  The graph-side sibling (`perform_register_allocation`)
 /// is the PyPy-orthodox entry; this variant retires when the walker
@@ -873,7 +873,7 @@ fn perform_ssarepr_register_allocation(
     alloc
 }
 
-/// Pyre-only SSARepr-side allocator (NEW DEVIATION).
+/// Pyre-only SSARepr-side allocator (TODO: bring to parity).
 ///
 /// PyPy has exactly one allocator at `rpython/tool/algo/regalloc.py:18`
 /// (`RegAllocator`), driven by a `FunctionGraph`.  Pyre's walker emits

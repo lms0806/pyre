@@ -2,8 +2,7 @@
 //!
 //! RPython upstream: `rpython/annotator/model.py` (855 LOC).
 //!
-//! Commit split (Phase 4 of the five-year roadmap at
-//! `.claude/plans/majestic-forging-meteor.md`):
+//! Commit split:
 //!
 //! * **A4.1 (this commit)** — Crate skeleton: `SomeValue` enum with
 //!   the primitive-type variants declared, `SomeObjectTrait` shell
@@ -1591,7 +1590,7 @@ pub struct SomeBuiltin {
     pub base: SomeObjectBase,
     /// Opaque name identifying the special-cased analyser
     /// (e.g. `"getattr"`, `"isinstance"`, `"len"`). Populated from
-    /// specialcase.rs when Phase 5 wires the bookkeeper in.
+    /// specialcase.rs when the bookkeeper is wired in.
     pub analyser_name: String,
     /// RPython `self.s_self` — bound-method receiver annotation.
     pub s_self: Option<Box<SomeValue>>,
@@ -2633,10 +2632,10 @@ impl std::error::Error for AnnotatorError {}
 ///
 /// Upstream dispatches to `pair(s1, s2).union()` which walks a
 /// `DoubleDispatchRegistry` populated by `rpython/annotator/binaryop.py`
-/// (859 LOC of per-pair handlers landing in Phase 5). A4.6 ships a
+/// (859 LOC of per-pair handlers). The current port ships a
 /// primitive-family subset sufficient to exercise
 /// `test_model.py::{test_equality, test_contains, test_list_union,
-/// test_list_contains, test_signedness}`; Phase 5's binaryop port
+/// test_list_contains, test_signedness}`; the binaryop port
 /// extends this match with the container / PBC / instance pairs.
 pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
     // upstream: `if s1 == s2: return s1`. Identity short-circuit
@@ -3017,14 +3016,14 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::None_(_), obj) | (obj, SomeValue::None_(_)) => obj.noneify(),
 
         // Default fallback — upstream's `pair(...).union()` would
-        // consult binaryop.py; Phase 5 fills those arms (container
+        // consult binaryop.py which fills those arms (container
         // key/value splicing, SomeByteArray ↔ string mixes, SomePtr,
         // SomeAddress family, ...). Until then we raise UnionError
         // so the annotator surfaces the gap loudly.
         _ => Err(UnionError {
             lhs: s1.clone(),
             rhs: s2.clone(),
-            msg: "no upstream pair(s1, s2).union() handler in Phase 4 A4.6 subset".into(),
+            msg: "no upstream pair(s1, s2).union() handler in current subset".into(),
         }),
     }
 }

@@ -1,4 +1,4 @@
-//! Task #98 Slice 5 — end-to-end `jit_marker` pipeline integration.
+//! End-to-end `jit_marker` pipeline integration.
 //!
 //! Upstream `jtransform.py:1658-1723 rewrite_op_jit_marker` dispatches to
 //! `handle_jit_marker__jit_merge_point` / `handle_jit_marker__loop_header` /
@@ -139,11 +139,11 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
                     // branch at `jtransform.py::make_three_lists`. The
                     // parity contract locked down here is the cardinality
                     // (one green, one red, receiver stripped), not the
-                    // bucketing. Task #107 (`rpbc.py` PBCRepr
-                    // specialization) tightens the concrete-type surface;
-                    // once it lands the expected split becomes i=1/r=0.
+                    // bucketing. `rpbc.py` PBCRepr specialization will
+                    // tighten the concrete-type surface; once it lands
+                    // the expected split becomes i=1/r=0.
                     eprintln!(
-                        "[task-98 slice 5] greens: i={} r={} f={}; reds: i={} r={} f={}",
+                        "[jit-marker] greens: i={} r={} f={}; reds: i={} r={} f={}",
                         greens_i.len(),
                         greens_r.len(),
                         greens_f.len(),
@@ -336,7 +336,7 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
     );
 
     eprintln!(
-        "[task-98 slice 5] portal ssarepr.insns={} merge_points={} loop_headers={}",
+        "[jit-marker] portal ssarepr.insns={} merge_points={} loop_headers={}",
         ssarepr.insns.len(),
         merge_points,
         loop_headers

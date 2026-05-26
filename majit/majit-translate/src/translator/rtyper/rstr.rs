@@ -77,7 +77,7 @@ use crate::translator::rtyper::rtyper::{
 // and dispatch to `LLHelpers.ll_*` graphs.
 //
 // Pyre lands the **struct skeleton + module-global singletons** today
-// (`Slice 3` of the Item 3 epic — `item3_abstractstringrepr_epic_plan.md`).
+// (struct skeleton + module-global singletons).
 // Method bodies arrive in slices 4-12 alongside the `LLHelpers.ll_*`
 // helper graphs in `lltypesystem/rstr.rs`. Until then the trait
 // methods inherit `Repr`'s default `rtype_*` impls, which surface
@@ -4596,7 +4596,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:253-269 plus Slice 9 isxxx batch —
+    /// rstr.py:253-269 isxxx batch —
     /// `AbstractStringRepr.rtype_method_isxxx` lowers to
     /// `direct_call(ll_isxxx, v_str)`. The helper graph itself
     /// sub-helper-direct-calls the per-char predicate.

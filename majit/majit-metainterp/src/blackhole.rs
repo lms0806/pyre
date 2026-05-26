@@ -593,7 +593,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
 
     // Defensive trivial-loop short-circuit (mirrors
     // pyjitpl/mod.rs:9188-9199): `_run_forever` parity here is a
-    // NEW-DEVIATION (PyPy interprets jitcode bytecodes, not IR ops). When
+    // TODO (PyPy interprets jitcode bytecodes, not IR ops). When
     // ops[start_index..] contains a Jump but no real work, the Jump-loops-
     // to-Label parity (line 644-653 below) re-enters the body indefinitely
     // without making progress. Return GuardFailed early using the preceding
@@ -1199,7 +1199,7 @@ impl BlackholeInterpreter {
     /// `BlackholeInterpBuilder::acquire_interp` to avoid re-entering the
     /// thread-local builder pool already lent to the caller.
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython `blackhole.py:1279-1320`
+    /// TODO: RPython `blackhole.py:1279-1320`
     /// `bhimpl_inline_call_*` does not allocate a callee interpreter at
     /// all — it calls `cpu.bh_call_*(jitcode.fnaddr, ..., jitcode.calldescr)`
     /// directly because RPython's inline_call jitcode carries a native
@@ -2441,7 +2441,7 @@ impl BlackholeInterpBuilder {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION narrowed for parity:
+    /// TODO narrowed for parity:
     /// some Rust call sites construct a fresh builder away from the
     /// codewriter, but they already hold the cached opcode ids that
     /// RPython `setup_insns(insns)` would have stored on the builder.
@@ -2491,7 +2491,7 @@ impl BlackholeInterpBuilder {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
         //
-        // PRE-EXISTING-ADAPTATION: RPython sizes `_insns` by `len(insns)`
+        // TODO: RPython sizes `_insns` by `len(insns)`
         // because every opname is dynamically numbered `0..len-1`
         // (`Assembler.insns.setdefault(key, len(self.insns))`), so the
         // length and the maximum byte coincide.  Pyre's canonical-routing
@@ -2682,7 +2682,7 @@ impl BlackholeInterpBuilder {
     /// `dispatch_loop` with a per-opcode probe hook (Phase D-2 shadow
     /// execution scaffolding).
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython's `BlackholeInterpBuilder.dispatch_loop`
+    /// TODO: RPython's `BlackholeInterpBuilder.dispatch_loop`
     /// has no probe parameter because upstream runs a single dispatch
     /// path (jitcode). Pyre is mid-migration: trait-based
     /// `MIFrame::execute_opcode_step` (trace_opcode.rs) and this
@@ -4117,7 +4117,7 @@ mod tests {
             b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some(1));
             let jitcode = b.finish();
 
-            // Slice 3.1d: route through `handler_inline_call_pyre_nested`
+            // route through `handler_inline_call_pyre_nested`
             // (the production builder shape) so this test exercises the
             // same path as the production blackhole resume.
             let mut builder = super::build_inline_call_only_bh_builder();
@@ -4133,7 +4133,7 @@ mod tests {
             assert_eq!(bh.registers_i[1], 42);
         }
 
-        /// Slice 3.1e Tier 2.1: ref-typed return propagation through
+        /// Tier 2.1: ref-typed return propagation through
         /// `handler_inline_call_pyre_nested`.  Sub-jitcode is the ref
         /// identity (passes its ref arg through and `ref_return`s it);
         /// caller passes a non-trivial constant ref and verifies the
@@ -4158,7 +4158,7 @@ mod tests {
             assert_eq!(bh.registers_r[1], 0xDEAD_BEEF);
         }
 
-        /// Slice 3.1e Tier 2.1: float-typed return propagation.
+        /// Tier 2.1: float-typed return propagation.
         /// Sub-jitcode is the float identity; caller passes a constant
         /// float bit-pattern and verifies the caller-side float dst.
         #[test]
@@ -4182,7 +4182,7 @@ mod tests {
             assert_eq!(bh.registers_f[1], bits);
         }
 
-        /// Slice 3.1e Tier 2.1: void-return path skips the
+        /// Tier 2.1: void-return path skips the
         /// `trailing_return_info()` block in the handler (returns None
         /// for `BC_VOID_RETURN`-terminated jitcodes per
         /// `JitCodeRuntimeExt::trailing_return_info`).  No caller dst
@@ -4215,7 +4215,7 @@ mod tests {
             );
         }
 
-        /// Slice 3.1f Tier 2.2: exception raised inside the callee is
+        /// Tier 2.2: exception raised inside the callee is
         /// caught by the caller's `catch_exception/L` immediately
         /// following the inline_call.  The handler should sync
         /// `bh.position` to operand-end before invoking
@@ -4263,7 +4263,7 @@ mod tests {
             assert_eq!(bh.return_type, BhReturnType::Int);
         }
 
-        /// Slice 3.1f Tier 2.2: exception raised inside the callee
+        /// Tier 2.2: exception raised inside the callee
         /// without a caller-side `catch_exception/L` propagates as
         /// `LeaveFrame` with `bh.got_exception` and
         /// `bh.exception_last_value` set.  The handler's
@@ -4303,7 +4303,7 @@ mod tests {
             );
         }
 
-        /// Slice 3.1g Tier 2.3: callee `abort_permanent/` propagates
+        /// Tier 2.3: callee `abort_permanent/` propagates
         /// `aborted = true` to the caller via the handler's
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm.
         /// `bhimpl_abort_permanent` (blackhole.rs:1714) sets aborted
@@ -4340,8 +4340,8 @@ mod tests {
             );
         }
 
-        /// Slice 3.1g Tier 2.3: callee `abort/` propagates aborted=true.
-        /// Slice 3.2.1: callee shares the parent's dispatch_table, so
+        /// Tier 2.3: callee `abort/` propagates aborted=true.
+        /// callee shares the parent's dispatch_table, so
         /// byte `BC_ABORT` fires the wired handler
         /// (`handler_abort_marker_pyre`), which sets `aborted = true` +
         /// LeaveFrame.  The
@@ -4372,9 +4372,9 @@ mod tests {
             );
         }
 
-        /// Slice 3.2.2: 2-level nested inline_call.  `outer_sub` itself
+        /// 2-level nested inline_call.  `outer_sub` itself
         /// emits `BC_INLINE_CALL` to invoke `inner_sub`.  Acceptance
-        /// criterion for Slice 3.2.1's callee runtime context clone:
+        /// criterion for 's callee runtime context clone:
         /// the inner-most callee inherits the parent's dispatch_table
         /// via `clone_context_from`, so byte 17 routes to
         /// `handler_inline_call_pyre_nested` recursively.  The
@@ -4451,7 +4451,7 @@ mod tests {
             assert_eq!(callee.jitdrivers_sd.len(), parent.jitdrivers_sd.len());
         }
 
-        /// Slice 3.2.0: `handler_abort_marker_pyre` defines the pyre
+        /// `handler_abort_marker_pyre` defines the pyre
         /// `BC_ABORT` marker semantics.  Reaching `OpKind::Abort` at
         /// runtime sets `aborted = true` and exits the frame —
         /// continuing dispatch past it would misread the next bytes
@@ -6678,7 +6678,7 @@ fn handler_residual_call_r_v(
     Ok(p)
 }
 
-// Task #45 A1-A8: every BC_* emitted by pyre now follows the canonical
+// A1-A8: every BC_* emitted by pyre now follows the canonical
 // RPython argcode contract (1-byte register operands per
 // `blackhole.py:107`).  All `*_pyre_u16` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
@@ -6686,7 +6686,7 @@ fn handler_residual_call_r_v(
 /// Per-thread Backend instance for blackhole's `bh_getfield_gc_*` /
 /// `bh_setfield_gc_*` / `bh_getarrayitem_gc_*` / `bh_arraylen_gc` reads.
 ///
-/// PRE-EXISTING-ADAPTATION: RPython `blackhole.py:55-56,286` reads
+/// TODO: RPython `blackhole.py:55-56,286` reads
 /// `self.cpu = builder.cpu`, where `builder.cpu` is the metainterp-shared
 /// AbstractCPU subclass (`LLOpHelpers` in tests, real native cpu in
 /// production).  The cpu's `bh_getfield_gc_*` etc. methods are stateless
@@ -6731,7 +6731,7 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 
 /// Build a strict `BlackholeInterpBuilder` for pyre's blackhole resume path.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's `JitCodeBuilder` emits other
+/// TODO: pyre's `JitCodeBuilder` emits other
 /// runtime opcodes in fixed BC_* bytes and several pyre-only payload
 /// shapes.  This builder's `setup_insns` registers every opcode key
 /// the production producers (`pyjitpl/dispatch.rs`, `majit-macros`
@@ -6745,7 +6745,7 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 /// `dispatch_step`'s unwired-opcode panic.
 ///
 /// Initially registered:
-///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` (Slice 3.1)
+///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` ()
 ///   - Sub-slice B byte-identical canonical: `live/`, `loop_header/i`,
 ///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
 ///   - A1-A8 canonical-encoded: every `JitCodeBuilder`-emitted BC_*
@@ -7182,7 +7182,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // `setarrayitem_vable_*` / `arraylen_vable`) bypasses the cpu chain
     // and calls `vable_*_array_item` / `bhimpl_arraylen_vable` directly
     // to handle pyre's `EmbeddedArray` storage — see
-    // PRE-EXISTING-ADAPTATION header at `handler_getarrayitem_vable_i`.
+    // TODO header at `handler_getarrayitem_vable_i`.
     // Together this makes the vable family strict-dispatch ready.
     insns.insert(
         "getfield_vable_i/rd>i".to_string(),
@@ -7629,7 +7629,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/rdd",
         handler_record_quasiimmut_field,
     );
-    // PRE-EXISTING-ADAPTATION op for Rust fat-pointer dispatch — see
+    // TODO op for Rust fat-pointer dispatch — see
     // `majit/majit-translate/src/model.rs OpKind::VtableMethodPtr`.
     // No runtime consumer ships yet; the handler panics on dispatch so a
     // future regression that triggers this path in pyre fails loudly
@@ -7758,7 +7758,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("inline_call_r_r/dR>r", handler_inline_call_r_r);
     builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
-    // PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.  See
+    // TODO: pyre nested-bytecode `inline_call`.  See
     // the comment on `handler_inline_call_pyre_nested` for rationale.
     // The canonical `inline_call_{r,ir,irf}_*` keys above are now pinned
     // in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
@@ -8027,7 +8027,7 @@ fn handler_guard_class(
 /// indirect call survives unfrozen into a metainterp resume.  pyre's hot
 /// path does not currently emit this pattern; intentionally panic so any
 /// future regression is loud rather than silent.  The codewriter still
-/// emits the op + descriptor (PRE-EXISTING-ADAPTATION of
+/// emits the op + descriptor (TODO of
 /// `rpython/rtyper/rclass.py:371-377 getclsfield()`) so the IR survives
 /// serialization for the next integration step.
 fn handler_vtable_method_ptr_unimplemented(
@@ -8446,7 +8446,7 @@ fn handler_setfield_vable_f(
 //          array = cpu.bh_getfield_gc_r(vable, fielddescr)
 //          return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
 //
-// PRE-EXISTING-ADAPTATION: pyre's W_ListObject `EmbeddedArray` storage
+// TODO: pyre's W_ListObject `EmbeddedArray` storage
 // (`virtualizable.rs:104-113`) reaches the array data via two pointer
 // dereferences from the vable (vable→container→data + `ptr_offset`),
 // while `cpu.bh_getfield_gc_r + cpu.bh_setarrayitem_gc_*`
@@ -9128,7 +9128,7 @@ fn handler_newlist_hint(
     Ok(p + 1)
 }
 // blackhole.py:1384-1387 bhimpl_getarrayitem_vable_f
-// PRE-EXISTING-ADAPTATION mirrored from `handler_getarrayitem_vable_i`
+// TODO mirrored from `handler_getarrayitem_vable_i`
 // header — pyre's W_ListObject EmbeddedArray storage requires direct
 // `vable_read_array_item`.  `registers_f` stores the f64 bit-pattern
 // in i64, so the universal i64 read path round-trips losslessly.
@@ -9349,7 +9349,7 @@ fn handler_inline_call_r_v(
     Ok(p)
 }
 
-/// PRE-EXISTING-ADAPTATION: pyre `call_assembler_*` adapters.
+/// TODO: pyre `call_assembler_*` adapters.
 ///
 /// `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
 /// (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat payload
@@ -9502,7 +9502,7 @@ fn handler_call_assembler_void_pyre(
     Ok(p)
 }
 
-/// PRE-EXISTING-ADAPTATION: pyre `cond_call` / `record_known_result`
+/// TODO: pyre `cond_call` / `record_known_result`
 /// adapters.
 ///
 /// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
@@ -9666,7 +9666,7 @@ fn handler_record_known_result_ref_pyre(
     handler_record_known_result_int_pyre(bh, code, p)
 }
 
-/// PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.
+/// TODO: pyre nested-bytecode `inline_call`.
 ///
 /// Pyre does not compile inlined helpers into separate native functions —
 /// trace IR merges them into a single compiled trace.  When a guard

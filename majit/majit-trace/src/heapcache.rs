@@ -395,7 +395,7 @@ pub struct HeapCache {
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
     /// Subsequent calls overwrite the single entry.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's `result` is a Box that
+    /// TODO: upstream's `result` is a Box that
     /// carries both the symbolic identity and the concrete value
     /// together; pyre splits these into the symbolic `OpRef` plus a
     /// concrete `i64` so `do_residual_call` can return the same

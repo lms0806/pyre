@@ -2375,7 +2375,7 @@ impl<'a> Assembler386<'a> {
         // increments the `fail_index` counter in lockstep with
         // `fail_descrs.push`, so the contract is structural rather than
         // descr-internal.  The earlier per-descr assertion was a pyre
-        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // Deviation removed: singleton FINISH
         // descrs (`compile.py:623-662`) answer the trait-default `0`
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
@@ -2501,7 +2501,7 @@ impl<'a> Assembler386<'a> {
         // increments the `fail_index` counter in lockstep with
         // `fail_descrs.push`, so the contract is structural rather than
         // descr-internal.  The earlier per-descr assertion was a pyre
-        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // Deviation removed: singleton FINISH
         // descrs (`compile.py:623-662`) answer the trait-default `0`
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
@@ -3479,7 +3479,7 @@ impl<'a> Assembler386<'a> {
             // many iterations + later loop). Adding any eprintln in the
             // dispatch hides the bug, so it is likely a stale
             // base-array pointer surviving a minor GC during the inline
-            // jitframe-alloc fast path. Tracked separately as Task #21.
+            // jitframe-alloc fast path.
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                 let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs {
                     [b, o, sc, of, sz, sg] => (b, o, sc, of, sz, sg),

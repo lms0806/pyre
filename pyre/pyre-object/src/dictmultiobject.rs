@@ -5,7 +5,7 @@
 //! Hosts the `W_DictMultiObject` Rust trait + concrete subclasses
 //! `W_DictObject` (regular dict, `:313-325`) and `W_ModuleDictObject`
 //! (module / globals dict backed by `ModuleDictStrategy` per
-//! `pypy/objspace/std/celldict.py:28`).  The Phase 5 cutover lifted
+//! `pypy/objspace/std/celldict.py:28`).  The cutover lifted
 //! pyre's `DictStorage`-based module-dict path out of
 //! `pyre-interpreter/executioncontext.rs` and into a sibling
 //! `celldict.rs` so the upstream strategy-per-W_Root model holds.
@@ -29,7 +29,7 @@
 //! - `w_dict_delitem` → `:101-102`
 //! - `w_dict_len` → `:107-109 length`
 //!
-//! ## Phase C field-deletion status (PRE-EXISTING-ADAPTATION queue)
+//! ## Field-deletion status (TODO queue)
 //!
 //! - `W_DictObject.len` field: JIT inline-length cache via
 //!   `DICT_LEN_OFFSET`.  PyPy delegates to `strategy.length(self)`
@@ -39,9 +39,9 @@
 //!   `DICT_LEN_OFFSET` consumers in `pyre-jit-trace`.
 //!
 //! - `W_DictObject.dict_storage_proxy` + `W_ModuleDictObject.dict_storage_proxy`:
-//!   NEW-DEVIATION back-mirror pointers to a legacy `DictStorage`.
+//!   TODO: back-mirror pointers to a legacy `DictStorage`.
 //!   Retirement gated on the `PyFrame.w_globals` migration from
-//!   `*mut DictStorage` to `PyObjectRef` (Phase C-1).  Once frames
+//!   `*mut DictStorage` to `PyObjectRef`.  Once frames
 //!   use W_DictObject directly, no back-mirror is needed.
 //!
 //! - `pyre-interpreter::DictStorage` struct: legacy str-keyed
@@ -220,14 +220,14 @@ pub trait W_DictMultiObject {
 ///   `r_dict(space.eq_w, space.hash_w)` storage (`:1209-1212`).  Keys
 ///   compared by `dict_keys_equal` which routes through the registered
 ///   `dict_eq_hook::EQ_W_HOOK` trampoline → `baseobjspace::eq_w`.
-/// - `len`: NEW-DEVIATION JIT inline-length cache so `bool(dict)` and
+/// - `len`: TODO: JIT inline-length cache so `bool(dict)` and
 ///   `len(dict)` lower to a single field-load via `DICT_LEN_OFFSET`.
 ///   PyPy delegates length to `strategy.length(self)`; pyre's cache
 ///   keeps the strategy method correct (it reads this slot) but the
 ///   field itself is not in upstream and would be retired alongside
 ///   `dict_storage_proxy` once the JIT field-load can target a
 ///   strategy-side counter.
-/// - `dict_storage_proxy`: NEW-DEVIATION back-mirror pointer to a
+/// - `dict_storage_proxy`: TODO: back-mirror pointer to a
 ///   legacy `DictStorage` allocation.  Non-null only when a frame's
 ///   `w_globals` (or a module's `w_dict`) was constructed from raw
 ///   `DictStorage` and lifted via `dict_storage_to_dict`; mutations
@@ -510,7 +510,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// PyPy's `space.newdict(instance=True)` branch (`:70-72`) routes to
 /// `mapdict.make_instance_dict`, which is not yet ported in pyre;
 /// this helper produces the EmptyDictStrategy fallback instead — a
-/// PRE-EXISTING-ADAPTATION until mapdict lands.
+/// TODO until mapdict lands.
 pub fn w_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
     let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
         crate::lltype::malloc_raw(indexmap::IndexMap::new());
@@ -679,7 +679,7 @@ pub struct W_ModuleDictObject {
     /// local miss.  Used by `dict_storage_to_dict` so the frame-side
     /// `*mut DictStorage`-typed `PyFrame.w_globals` continues to
     /// observe `STORE_GLOBAL` and `module.__dict__[k] = v` writes
-    /// uniformly.  PRE-EXISTING-ADAPTATION until Phase 5e migrates
+    /// uniformly.  TODO until
     /// `PyFrame.w_globals` to `PyObjectRef`; mirrors the
     /// `dict_storage_proxy` pattern on W_DictObject (line 35).
     pub dict_storage_proxy: *mut u8,
@@ -721,11 +721,11 @@ impl W_DictMultiObject for W_ModuleDictObject {
     /// correctly without panicking; non-Object target strategies stay
     /// unreachable per the upstream surface.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre carries `object_storage` as a
+    /// TODO: pyre carries `object_storage` as a
     /// side field instead of swapping `dstorage` wholesale (PyPy's
     /// `w_dict.dstorage = strategy.erase(d_new)`).  The trait method
     /// hides that adapter from callers; the side-field layout retires
-    /// alongside Task #147 typed-strategy storage migration.
+    /// alongside typed-strategy storage migration.
     fn set_strategy(&mut self, strategy: &'static dyn crate::dictstrategy::DictStrategy) {
         let target = strategy as *const dyn crate::dictstrategy::DictStrategy as *const () as usize;
         let object_singleton = &crate::dictstrategy::OBJECT_DICT_STRATEGY
@@ -878,7 +878,7 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
 /// call, all reads / writes route through `object_storage` regardless
 /// of key type — matching PyPy's `ObjectDictStrategy` semantics.
 ///
-/// **PRE-EXISTING-ADAPTATION** vs `celldict.py:185-186`:
+/// **TODO** vs `celldict.py:185-186`:
 /// PyPy actually swaps the strategy (`w_dict.set_strategy(strategy)`)
 /// and replaces `w_dict.dstorage` with the new `strategy.erase(d_new)`
 /// payload.  Pyre carries TWO storages (`dstorage` + `object_storage`)
@@ -892,8 +892,8 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
 /// `DictStrategy` trait + concrete `ObjectDictStrategy` /
 /// `UnicodeDictStrategy` ports (see `dictmultiobject.py:236-1369`)
 /// so `set_strategy` can replace both the dispatch object and the
-/// erased storage type uniformly.  That hierarchy is a multi-session
-/// epic (750+ LOC across 4 strategies, 200+ call sites in
+/// erased storage type uniformly.  That hierarchy is a large effort
+/// (750+ LOC across 4 strategies, 200+ call sites in
 /// `dictmultiobject.py` consuming `w_dict.get_strategy()` and
 /// `space.fromcache(<Strategy>)`).
 ///
@@ -1688,7 +1688,7 @@ unsafe fn maybe_items_dict_storage(ns_ptr: *mut u8) -> Option<Vec<(String, PyObj
 /// live globals sync).
 ///
 /// Both W_DictObject and W_ModuleDictObject carry a `dict_storage_proxy`
-/// field (PRE-EXISTING-ADAPTATION until Phase 5e migrates
+/// field (TODO until
 /// `PyFrame.w_globals` to `PyObjectRef`); this returns whichever side
 /// is attached so callers like `exec(..., module.__dict__)` can re-use
 /// the existing backing storage instead of materialising a fresh
@@ -2065,8 +2065,8 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
 /// `dict_storage_proxy` flush bookkeeping (`maybe_sync_dict_storage_delete`)
 /// so that `module.__dict__.clear()` / `globals().clear()` also empty
 /// the legacy str-keyed `DictStorage` shadow.  The proxy flush is a
-/// PRE-EXISTING-ADAPTATION; once `PyFrame.w_globals` migrates to
-/// `PyObjectRef` (Phase C-1), the shadow goes away and only the
+/// TODO; once `PyFrame.w_globals` migrates to
+/// `PyObjectRef`, the shadow goes away and only the
 /// strategy.clear() body remains here.
 pub unsafe fn w_dict_clear(obj: PyObjectRef) {
     let proxy = w_dict_get_dict_storage_proxy(obj);
@@ -2175,8 +2175,8 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
 /// AbstractTypedStrategy.copy` → fresh W_DictObject with same strategy
 /// + cloned typed dstorage).
 ///
-/// `dict_storage_proxy`-attached dicts (pyre NEW-DEVIATION back-mirror
-/// — Task #134 / Phase C-1) take the union-walk fallback so str-key
+/// `dict_storage_proxy`-attached dicts (pyre back-mirror
+/// TODO) take the union-walk fallback so str-key
 /// entries that live only in the proxy survive the copy.  Once the
 /// proxy retires this branch goes with it.
 pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {

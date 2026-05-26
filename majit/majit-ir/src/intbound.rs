@@ -172,7 +172,7 @@ impl IntBound {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION: RPython's keyword-default constructor
+    /// TODO: RPython's keyword-default constructor
     /// `IntBound(lower=lower, upper=upper)` (intutils.py:81-115) leaves
     /// `tvalue` / `tmask` at the `TNUM_ONLY_VALUE_DEFAULT` (= 0) and
     /// `TNUM_ONLY_MASK_DEFAULT` (= TNUM_UNKNOWN = r_uint(-1)) defaults

@@ -11,7 +11,7 @@ use majit_ir::FailDescr;
 // cast_gcref_to_instance(...)` parity.  The strong refcount is held by
 // `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`).
 
-// RECOVERY_LAYOUT_TABLE removed (Slice NN): `recovery_layout` is not in
+// RECOVERY_LAYOUT_TABLE removed: `recovery_layout` is not in
 // PyPy `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream resume
 // code (`resume.py:450-488`) decodes recovery on demand from
 // `rd_numb / rd_consts / rd_virtuals / rd_pendingfields`.  Pyre's
@@ -22,7 +22,7 @@ use majit_ir::FailDescr;
 // `pyjitpl/mod.rs:6322` falls back to `trace_layout_ref.recovery_layout`
 // which reads from the metainterp cache.
 
-// FAIL_ARG_LOCS_TABLE removed (Slice MM): duplicates `rd_locs`
+// FAIL_ARG_LOCS_TABLE removed: duplicates `rd_locs`
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
 // `runner.rs::execute_token`) now decode `descr.rd_locs()` directly
 // via `decode_rd_loc_slot` below, matching PyPy's
@@ -54,16 +54,16 @@ pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> 
 /// regardless of backend.
 pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle};
 
-// `DynasmFailDescr` removed (Slice 7-Tα7).  PyPy's dynasm-equivalent
+// `DynasmFailDescr` removed.  PyPy's dynasm-equivalent
 // `assembler.py` carries no per-emission descr wrapper — every guard
 // op's `op.descr` is the same `ResumeGuardDescr` Arc that the metainterp
 // stamps, and every FINISH emission writes the cpu-attached singleton
 // (`compile.py:665-674 make_and_attach_done_descrs`) directly into
-// `jf_descr`.  After Phases A/B/C of the Unified-Descr port the backend
-// no longer owned any field worth wrapping, and the singleton-direct
-// push (Slices 7-Tα3..7-Tα6) eliminated the last constructor of the
-// wrapper.  All readers reach the descr through `DescrRef` and dispatch
-// trait methods on `&dyn FailDescr`.
+// `jf_descr`.  After the Unified-Descr port the backend no longer
+// owned any field worth wrapping, and the singleton-direct push
+// eliminated the last constructor of the wrapper.  All readers reach
+// the descr through `DescrRef` and dispatch trait methods on
+// `&dyn FailDescr`.
 
 /// `compile.py:849` build a FailDescrLayout snapshot for any FailDescr
 /// descr identity (post Phase C-1 cascade — `find_descr_by_ptr` returns
@@ -103,7 +103,7 @@ pub fn layout_for_fail_descr(
             .collect(),
         force_token_slots: fd.force_token_slots(),
         frame_stack: None,
-        // Slice NN: backend no longer caches recovery_layout.  The
+        // Backend no longer caches recovery_layout.  The
         // metainterp `pyjitpl/mod.rs:6322` falls back to
         // `trace_layout_ref.recovery_layout` (read from
         // `StoredExitLayout.recovery_layout`).

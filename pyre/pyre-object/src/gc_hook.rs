@@ -8,8 +8,8 @@
 //! the backend-owned GC allocator via `majit_gc` TLS hooks.
 //!
 //! Callers use [`try_gc_alloc`] which returns `None` when no hook is
-//! installed — they fall back to the `Box::into_raw` Phase 1 path in
-//! that case. Session-by-session migration drops the `Box::into_raw`
+//! installed — they fall back to the `Box::into_raw` path in
+//! that case. Incremental migration drops the `Box::into_raw`
 //! fallback at each call site as the hook's reliability is verified
 //! under the full bench suite.
 //!
@@ -58,7 +58,7 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
 /// Used by host-side allocators (`w_int_new`, `w_float_new`, …)
 /// whose callers hold the returned pointer on the Rust stack across
 /// subsequent allocations without registering it as a GC root
-/// (Task #141). The backend routes this to an old-gen allocator
+/// The backend routes this to an old-gen allocator
 /// whose returned pointer is stable across minor and major
 /// collections (MiniMark mark-sweep does not move old-gen objects).
 pub fn register_gc_alloc_stable_hook(hook: GcAllocHookFn) {
@@ -109,8 +109,8 @@ pub fn try_gc_collect() {
     });
 }
 
-/// Signature of the host-side root-register callbacks (Task #141
-/// option a). `slot` is a pointer to a slot holding a `PyObjectRef`
+/// Signature of the host-side root-register callbacks.
+/// `slot` is a pointer to a slot holding a `PyObjectRef`
 /// (equivalently `*mut u8`); the GC treats it as a live root until
 /// [`try_gc_remove_root`] is called with the same pointer.
 ///
@@ -121,7 +121,7 @@ pub fn try_gc_collect() {
 /// RPython accomplishes this automatically via its GC transform
 /// pass (shadowstack save/restore around safepoints). pyre has no
 /// such pass, so root registration is explicit at the call site.
-/// This is a documented PRE-EXISTING-ADAPTATION.
+/// TODO: this is a known deviation from RPython.
 pub type GcAddRootHookFn = unsafe fn(slot: *mut *mut u8);
 pub type GcRemoveRootHookFn = fn(slot: *mut *mut u8);
 

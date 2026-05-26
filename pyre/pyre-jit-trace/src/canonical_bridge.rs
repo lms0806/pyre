@@ -11,7 +11,7 @@
 //! portal bypasses the per-jitcode `exec.descrs` pool entirely; descr
 //! resolution goes through the global `ALL_DESCRS`).
 //!
-//! ## PRE-EXISTING-ADAPTATION
+//! ## TODO
 //!
 //! RPython has no per-CodeObject portal wrapper. Upstream
 //! `pypy/module/pypyjit/interp_jit.py portal_runner` *is* the single

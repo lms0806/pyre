@@ -37,9 +37,9 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let classified = classify_arms(&match_expr.arms);
     let env_type = &config.env_type;
 
-    // Slice 1: dispatch JitCode singleton produced by lower_dispatch_body.
-    // Slice 2 wires `__trace_*` to invoke it; Slice 3 extends install pipeline
-    // to register it as the driver-shared singleton. Slice 3.2 splices the
+    // Dispatch JitCode singleton produced by lower_dispatch_body.
+    // `__trace_*` invokes it; the install pipeline registers it as the
+    // driver-shared singleton. The prebuild step splices the
     // dispatch JitCode's per-marker liveness prebuild into
     // `__prebuild_jitcode_liveness_*` alongside the per-arm prebuilds, so the
     // driver-shared `Assembler` already holds every triple the dispatch
@@ -88,7 +88,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // merge wrapper layer because the resolver borrows
     // `MetaInterp::compiled_loops` / `warm_state` via the
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
-    // (Legacy Slice 91.3 identity closure `|pc| pc` retained at the
+    // (Legacy identity closure `|pc| pc` retained at the
     // call site there.)
     let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
         quote! {
@@ -193,13 +193,12 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     };
 
     quote! {
-        /// Slice 1: dispatch JitCode singleton builder.
+        /// Dispatch JitCode singleton builder.
         ///
         /// Builds the entire dispatch loop body (jit_merge_point + pre-dispatch
         /// ops + opcode fetch + dispatch chain + per-arm INLINE_CALL + loop
-        /// close) as a single JitCode. Slice 2 wires this into `__trace_*`;
-        /// Slice 3 registers it via `JitDriver::register_dispatch_jitcode` at
-        /// install time.
+        /// close) as a single JitCode. `__trace_*` invokes this; the install
+        /// pipeline registers it via `JitDriver::register_dispatch_jitcode`.
         ///
         /// Returns `Option<JitCode>`: `Some(jc)` when `lower_dispatch_body`
         /// succeeded at proc-macro time, `None` when the body shape was

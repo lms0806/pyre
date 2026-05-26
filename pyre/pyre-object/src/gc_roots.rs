@@ -1,4 +1,4 @@
-//! `push_roots` / `pop_roots` parity scaffold — Phase 2c of Task #145.
+//! `push_roots` / `pop_roots` parity scaffold.
 //!
 //! Mirrors RPython's `framework.py:803-853 gct_fv_gc_malloc`, which
 //! brackets every GC malloc call with `push_roots(hop)` and
@@ -76,7 +76,7 @@ thread_local! {
               to `_` would pop immediately and defeat the bracket"]
 pub struct RootScope {
     /// Length of [`SHADOW_STACK`] at the moment [`push_roots`] was
-    /// called. Phase 2c will replace this with a backend
+    /// called. Will be replaced with a backend
     /// `RootSet::Handle` once the active GC consumes the stack.
     save_point: usize,
 }
@@ -122,7 +122,7 @@ pub fn push_roots() -> RootScope {
 ///
 /// Callers should always pair this with a guard from [`push_roots`]
 /// so the matching [`Drop`] truncates the entry. Pinning without a
-/// guard is a leak from the GC's perspective once Phase 2c lands.
+/// guard is a leak from the GC's perspective once the backend GC consumes the stack.
 #[inline]
 pub fn pin_root(root: PyObjectRef) {
     SHADOW_STACK.with(|s| s.borrow_mut().push(root));
@@ -184,8 +184,8 @@ mod tests {
         let _roots = push_roots();
     }
 
-    /// In Phase 2b `RootScope` carries a single `usize` save-point.
-    /// Phase 2c will swap this for a backend `RootSet::Handle` (still
+    /// Currently `RootScope` carries a single `usize` save-point.
+    /// This will be swapped for a backend `RootSet::Handle` (still
     /// pointer-sized on 64-bit hosts); this test traps unintended
     /// growth beyond that.
     #[test]

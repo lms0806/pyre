@@ -235,7 +235,7 @@ pub(crate) struct StoredExitLayout {
     /// does not resolve to an op with a descr — readers treat that as
     /// an empty type vector.
     pub(crate) descr: Option<DescrRef>,
-    /// PRE-EXISTING-ADAPTATION (pyre): types of the values flowing through
+    /// Pyre-specific: types of the values flowing through
     /// a JUMP terminal exit, populated only when `descr` cannot supply
     /// them.  RPython's JUMP descr is `TargetToken` (`history.py:470`)
     /// which carries no `fail_arg_types` because PyPy reads JUMP arg
@@ -1433,7 +1433,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
     }
 
-    /// Path 1 Slice 1: on-demand `ExitRecoveryLayout` reconstruction for
+    /// On-demand `ExitRecoveryLayout` reconstruction for
     /// the cranelift overlay path.  Returns the `ExitRecoveryLayout` that
     /// would be cached on `ResumeGuardDescr.recovery_layout` for a given
     /// production guard, computed from the metainterp-side
@@ -1574,7 +1574,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `None` if none of the canonical sources carry the data.
     /// The earlier OpRef-walker fallback (inputargs / constant_types /
-    /// `op.pos` producer scan) was a pyre-only NEW-DEVIATION: RPython
+    /// `op.pos` producer scan) was pyre-only: RPython
     /// would have `Box.type` in hand at the same point and never need a
     /// trace-level walk.  Removed per `/parity` review.
     fn infer_exit_types_from_trace(trace: &CompiledTrace, fail_index: u32) -> Option<Vec<Type>> {
@@ -1982,7 +1982,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the upstream lifecycle in which `make_jitcodes` populates the
     /// codewriter's assembler before this call.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre stores `staticdata: Arc<…>` on
+    /// TODO: pyre stores `staticdata: Arc<…>` on
     /// `MetaInterp` (see field doc) so callers downstream can clone the
     /// Arc into per-session structures.  RPython holds an unwrapped
     /// reference instead.  Routing through `Arc::get_mut` recovers the
@@ -1994,7 +1994,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `unwrap` panics with a clear message and the convergence failure
     /// is visible at the call site.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `CodeWriter` does not own
+    /// TODO: pyre's `CodeWriter` does not own
     /// `callcontrol` (see `MetaInterpStaticData::finish_setup` doc);
     /// the call site threads both as siblings to keep the upstream
     /// `codewriter.callcontrol.<field>` reads literal in the inner
@@ -2083,7 +2083,7 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.install_canonical_liveness(asm);
     }
 
-    /// Phase 4 Epic B.3-B.4: copy a freshly-snapshotted `all_liveness`
+    /// Copy a freshly-snapshotted `all_liveness`
     /// byte stream into `staticdata.liveness_info` without re-running
     /// the full `install_canonical_liveness` insn-id seeding.
     ///
@@ -2492,10 +2492,10 @@ impl<M: Clone> MetaInterp<M> {
         // re-minting under descriptor=None breaks pyre's downstream
         // virtualizable_boxes consumers (dynasm nested_loop crashes
         // exit 101 if the gate is removed without also flipping
-        // descriptor=Some + Task #21 heap-writeback). PRE-EXISTING-
-        // ADAPTATION: the gate is the convergence-debt marker; the
-        // fully-RPython-orthodox shape lands together with descriptor
-        // activation (state.rs:4058 driver_descriptor + Task #21 plan).
+        // descriptor=Some + heap-writeback). The gate is the
+        // convergence-debt marker; the fully-RPython-orthodox shape
+        // lands together with descriptor activation
+        // (state.rs:4058 driver_descriptor).
         // Cluster 2 (b): allow heap-read fallback when live_values is the
         // reds-only `[frame, ec]` shape that descriptor=Some emits. The
         // expanded-tail path still uses live_values directly; the short
@@ -2861,10 +2861,10 @@ impl<M: Clone> MetaInterp<M> {
                 // extra_reds..., vable_scalars..., array_items...]. The
                 // canonical source of `vable_input_offset` is the active
                 // jitdriver's `num_red_args - 1` (excluding frame).
-                // Today's slot-0 jitdriver carries empty reds (`wiggly-
-                // barto S3.1 Slice 1`) so `num_reds == 0` and the offset
-                // is `0` — matching the legacy `[frame, vable_scalars...]`
-                // layout. Once Task #24 populates the real reds spec
+                // Today's slot-0 jitdriver carries empty reds so
+                // `num_reds == 0` and the offset is `0` — matching the
+                // legacy `[frame, vable_scalars...]` layout. Once the
+                // real reds spec is populated
                 // (`['frame', 'ec']`) and the macro flip lands the
                 // `extra_reds = { ec: Ref }` block, this expression
                 // returns `1` automatically.
@@ -4513,10 +4513,10 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
         recorder.close_loop(jump_args);
-        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
-        // them so downstream consumers (`trace.snapshots`) still observe
-        // the captured resumedata. `recorder.get_trace()` on its own
-        // returns a snapshot-less TreeLoop post-Task #70.
+        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
+        // downstream consumers (`trace.snapshots`) still observe the
+        // captured resumedata. `recorder.get_trace()` on its own returns
+        // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
 
@@ -6124,10 +6124,10 @@ impl<M: Clone> MetaInterp<M> {
                 })
         };
         recorder.finish(finish_args, finish_descr);
-        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
-        // them so downstream consumers (`trace.snapshots`) still observe
-        // the captured resumedata. `recorder.get_trace()` on its own
-        // returns a snapshot-less TreeLoop post-Task #70.
+        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
+        // downstream consumers (`trace.snapshots`) still observe the
+        // captured resumedata. `recorder.get_trace()` on its own returns
+        // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let SimpleCompileViews {
@@ -6545,10 +6545,10 @@ impl<M: Clone> MetaInterp<M> {
 
         let call_pure_results = ctx.take_call_pure_results();
         let recorder = ctx.recorder;
-        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
-        // them so downstream consumers (`trace.snapshots`) still observe
-        // the captured resumedata. `recorder.get_trace()` on its own
-        // returns a snapshot-less TreeLoop post-Task #70.
+        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
+        // downstream consumers (`trace.snapshots`) still observe the
+        // captured resumedata. `recorder.get_trace()` on its own returns
+        // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let SimpleCompileViews {
@@ -7332,7 +7332,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// **Convergence path**: retire this helper after the 8 fixtures
     /// in `tests/jit_driver_runtime_parity.rs` migrate to
-    /// compile-path resume data injection (multi-session test
+    /// compile-path resume data injection (test
     /// refactor). Reaching strict line-by-line parity removes the
     /// out-of-band injection surface entirely, matching PyPy's "resume
     /// data is built at compile time, never injected" contract.
@@ -7473,7 +7473,7 @@ impl<M: Clone> MetaInterp<M> {
     /// memory manager's generation counter.  Old loops not accessed
     /// for max_age generations are removed from `alive_loops`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre also drops the matching
+    /// TODO: pyre also drops the matching
     /// `compiled_loops` entry.  RPython's `try_to_free_some_loops` is
     /// one line — `next_generation()` alone — because long-lived
     /// references outside `alive_loops` are weakrefs, so pruning
@@ -7731,7 +7731,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // PRE-EXISTING-ADAPTATION: pyre-only fallback to cover targets
+        // TODO: pyre-only fallback to cover targets
         // whose `JitCellToken` lives only on `BaseJitCell.loop_token`
         // (tmp-callback installs via `attach_tmp_callback_to_interp` —
         // `warmstate.py:716-723`). Without this, `compile.py:187`
@@ -7757,8 +7757,8 @@ impl<M: Clone> MetaInterp<M> {
     ///    owning JitCellToken, record keepalive, clear the descr.
     ///
     /// Each branch below cites its upstream line and, where pyre cannot
-    /// yet match RPython 1:1, names a PRE-EXISTING-ADAPTATION with the
-    /// blocker that gates convergence.
+    /// yet match RPython 1:1, names the blocker that gates
+    /// convergence.
     fn record_loop_or_bridge(
         &self,
         original: &Arc<JitCellToken>,
@@ -7842,8 +7842,8 @@ impl<M: Clone> MetaInterp<M> {
             }
 
             // `compile.py:185-186` `if isinstance(descr, ResumeDescr):
-            // descr.rd_loop_token = clt`.  After the Session 6 / Session 7
-            // unification `cpu.get_latest_descr()` returns the same
+            // descr.rd_loop_token = clt`.  `cpu.get_latest_descr()` returns
+            // the same
             // `ResumeGuardDescr` Arc the metainterp stamps here, so the
             // backend-post-compile re-stamp (runner.rs::compile_loop /
             // compiler.rs::compile_loop) writes through to the same object.
@@ -7973,7 +7973,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // `compile.py:204-207` quasi-immutable_deps register_loop_token.
         //
-        // PRE-EXISTING-ADAPTATION (crate-boundary): the registration walker
+        // TODO: crate-boundary: the registration walker
         // is ported in `pyre/pyre-jit/src/eval.rs::register_quasi_immutable_deps`
         // and called at the post-compile sites that follow `compile_loop`
         // / `compile_bridge` in `eval.rs:2513` / `eval.rs:3059`.  It cannot
@@ -8190,7 +8190,7 @@ impl<M: Clone> MetaInterp<M> {
     /// reads `cell.loop_token.as_ref()` per F.1 audit
     /// (`tfinal_f0_f1_landed_2026_05_07`). The Arc identity returned
     /// here is the same `Arc<JitCellToken>` that `compiled_loops[gk].token`
-    /// holds (Slice 5.1 lifted `CompiledEntry.token` so both slots share
+    /// holds (both slots share
     /// one Arc); convergence to a sole owner happens at F.6 when the
     /// `compiled_loops` HashMap retires.
     ///
@@ -8273,7 +8273,7 @@ impl<M: Clone> MetaInterp<M> {
                 return true;
             }
         }
-        // PRE-EXISTING-ADAPTATION: previous_tokens is a pyre NEW-DEVIATION
+        // TODO: previous_tokens is a pyre-specific approach
         // field on `CompiledEntry` that compensates for cross-recompile
         // bridge attachments. Upstream `JitCellToken.target_tokens`
         // (`history.py:501-540`) keeps every retraced loop's code alive
@@ -10049,7 +10049,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // PyPy parity: `_run_forever` interprets Python bytecode after guard
         // failure, NOT the JIT trace's IR. pyre's `blackhole_execute_with_state_ca`
-        // IR-replay is a NEW-DEVIATION. When post-guard ops are only Label/Jump
+        // IR-replay is TODO (pyre-specific). When post-guard ops are only Label/Jump
         // structural markers, the replay's `_run_forever` parity Jump-loop
         // (blackhole.rs:283-291) loops back to label_index+1, potentially
         // re-executing preamble+body indefinitely without making progress.
@@ -11015,7 +11015,7 @@ impl<M: Clone> MetaInterp<M> {
     ///     return op
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: lives on `MetaInterp<M>` rather than
+    /// TODO: lives on `MetaInterp<M>` rather than
     /// `MIFrame` because of the borrow-checker constraint that already
     /// moved `do_residual_or_indirect_call` here.  `make_result_of_lastop`
     /// is invoked on the framestack's current frame via `dst` —
@@ -11235,7 +11235,7 @@ impl<M: Clone> MetaInterp<M> {
     ///     self.execute_ll_raised(llexception, constant)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre callers already hold a `i64`
+    /// TODO: pyre callers already hold a `i64`
     /// exception pointer (the equivalent of RPython's `llexception`
     /// after `get_llexception` lowering), so this entry just forwards
     /// to `execute_ll_raised`.  The `JitException` re-raise branch
@@ -11290,7 +11290,7 @@ impl<M: Clone> MetaInterp<M> {
     ///     self.staticdata.stats.aborted()
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's existing `abort_trace` performs
+    /// TODO: pyre's existing `abort_trace` performs
     /// the live cleanup (recorder.abort, warm_state.abort_tracing,
     /// pending_token reset, on_trace_abort hook).  This named entry
     /// adds the upstream-shaped accounting:
@@ -11877,7 +11877,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `result` is `None` for void returns; otherwise it is the
     /// `(kind, target_index, opref, concrete)` tuple
-    /// `MIFrame::make_result_of_lastop` consumes.  PRE-EXISTING-ADAPTATION:
+    /// `MIFrame::make_result_of_lastop` consumes.
     /// pyre's call BC encodes `target_index` explicitly per call site
     /// instead of reading `bytecode[pc-1]` after dispatch, so the
     /// caller threads it through here.
@@ -11885,7 +11885,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `compile_done_with_this_frame` is invoked here line-by-line
     /// per pyjitpl.py:2487-2491; its body is the structural port at
     /// `MetaInterp::compile_done_with_this_frame` (pyjitpl.py:3198).
-    /// PRE-EXISTING-ADAPTATION: in pyre the `recorder.finish()` +
+    /// TODO: in pyre the `recorder.finish()` +
     /// `compile.compile_trace` work also happens at the
     /// `TraceAction::Finish` dispatch point (jitdriver.rs:956 →
     /// `MetaInterp::finish_and_compile`) because production function-
@@ -12022,7 +12022,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `popping_jdindex` snapshot for why the index has to be threaded
     /// through here in pyre.
     ///
-    /// PRE-EXISTING-ADAPTATION: `self.history.record(rop.FINISH, ...)`
+    /// `self.history.record(rop.FINISH, ...)`
     /// + `compile.compile_trace` are also driven from the
     /// `TraceAction::Finish` dispatch (jitdriver.rs:956 →
     /// `MetaInterp::finish_and_compile`) — pyre's recorder owns the
@@ -12088,7 +12088,7 @@ impl<M: Clone> MetaInterp<M> {
     /// ```
     ///
     /// Exception-flavored sibling of `compile_done_with_this_frame`.
-    /// PRE-EXISTING-ADAPTATION shared with that method: the FINISH op
+    /// TODO: shared with that method: the FINISH op
     /// emit + `compile.compile_trace` happen at the trace-dispatch
     /// `TraceAction::Finish` site (jitdriver.rs:1031), so this method
     /// runs only the upstream skeleton — `store_token_in_vable` +
@@ -12270,7 +12270,7 @@ impl<M: Clone> MetaInterp<M> {
     ///     return self.do_residual_call(funcbox, argboxes, calldescr, pc)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython places this method on `MIFrame`
+    /// TODO: RPython places this method on `MIFrame`
     /// because `self.metainterp` is a back-pointer attribute; pyre's
     /// `MIFrame` does not carry a `&mut MetaInterp` back-reference (the
     /// borrow checker would alias `MetaInterp::framestack` against
@@ -12364,7 +12364,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the stack, leaving the new callee in place — that's what makes
     /// it a tail call.
     ///
-    /// PRE-EXISTING-ADAPTATION: lives on `MetaInterp<M>` rather than
+    /// TODO: lives on `MetaInterp<M>` rather than
     /// `MIFrame` — same borrow-checker constraint as
     /// `do_residual_or_indirect_call`.  The "self frame" (RPython's
     /// `self`) is `framestack.current_mut()` — i.e. the top frame.
@@ -12560,7 +12560,7 @@ impl<M: Clone> MetaInterp<M> {
     ///                                       valueconst, calldescr)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `cpu.calldescrof_dynamic`,
+    /// TODO: pyre has no `cpu.calldescrof_dynamic`,
     /// no `CIF_DESCRIPTION_P` layout reader, and no
     /// `ffisupport.get_arg_descr` — the upstream specialization
     /// reaches into `rpython.rlib.jit_libffi` which has no Rust
@@ -13374,7 +13374,7 @@ impl<M: Clone> MetaInterp<M> {
     ///                                  assembler_call_jd=targetjitdriver_sd)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: `portal_code.calldescr` is the portal
+    /// `portal_code.calldescr` is the portal
     /// jitcode's calldescr (a `BhCallDescr` in pyre).  Pyre does not
     /// yet expose a `&dyn CallDescr` view onto BhCallDescr, so the
     /// caller passes the typed `(DescrRef, &dyn CallDescr)` pair
@@ -13944,7 +13944,7 @@ pub mod counters {
     /// routes this id to `cpu.tracker.total_compiled_loops`.  pyre has
     /// no global per-CPU tracker yet — [`crate::jitprof::JitProfiler::get_counter`]
     /// returns `None` for this id (see
-    /// `majit-backend/src/lib.rs:939-943` PRE-EXISTING-ADAPTATION note).
+    /// `majit-backend/src/lib.rs:939-943` note).
     pub const TOTAL_COMPILED_LOOPS: i32 = 22;
     /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  See the
     /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
@@ -14034,7 +14034,7 @@ impl std::error::Error for ChangeFrame {}
 /// `bytecode_for_address` lookup that `MIFrame.do_residual_or_indirect_call`
 /// uses to promote a const-funcptr residual call into an inlined one.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` still owns several
+/// TODO: pyre's `MetaInterp<M>` still owns several
 /// `descr.py:348-360 get_array_descr` lltype-shape cache key for
 /// `dispatch_array_descr_cache`.  RPython keys
 /// `gccache._cache_array[ARRAY_OR_STRUCT]` on the lltype itself, which
@@ -14089,7 +14089,7 @@ pub struct MetaInterpStaticData {
     pub opcode_names: Vec<String>,
     /// pyjitpl.py:2229, 2235 `opcode_implementations[opcode_id] = opimpl`.
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython looks up an opimpl bound method
+    /// TODO: RPython looks up an opimpl bound method
     /// per opcode id and dispatches `MIFrame.run_one_step` through it.
     /// Pyre dispatches by `BC_*` constant inside
     /// `JitCodeMachine::dispatch_one`, so the implementation table is
@@ -14183,7 +14183,7 @@ pub struct MetaInterpStaticData {
     /// `addr2name` and `indirectcall_dict` caches.  Populated on first
     /// call to `bytecode_for_address` / `get_name_from_address`.
     ///
-    /// PRE-EXISTING-ADAPTATION: wrapped in `Mutex` because
+    /// TODO: wrapped in `Mutex` because
     /// `MetaInterp.staticdata` is `Arc<MetaInterpStaticData>` and this
     /// field mutates lazily (memoization) through the shared Arc.
     /// RPython's Python dicts are shared mutable references by
@@ -14200,7 +14200,7 @@ pub struct MetaInterpStaticData {
     /// the length directly via `self.metainterp_sd.all_descrs.lock().unwrap().len()`
     /// from `_encode_descr` and the TraceIterator.
     ///
-    /// PRE-EXISTING-ADAPTATION: wrapped in `Mutex` because
+    /// TODO: wrapped in `Mutex` because
     /// `MetaInterp.staticdata` is `Arc<MetaInterpStaticData>` and the
     /// `TraceRecordBuffer` inside `TraceCtx` holds a clone of this Arc
     /// (opencoder.py:471 `self.metainterp_sd = metainterp_sd` —
@@ -14496,7 +14496,7 @@ impl MetaInterpStaticData {
     ///     self.globaldata = MetaInterpGlobalData(self)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `CodeWriter`
+    /// TODO: pyre's `CodeWriter`
     /// (`majit-translate/src/jit_codewriter/codewriter.rs:64-77`) does
     /// **not** own `callcontrol` — RPython's does
     /// (`codewriter.py:CodeWriter.__init__` keeps both).  The Rust
@@ -14520,18 +14520,18 @@ impl MetaInterpStaticData {
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
-        // PRE-EXISTING-ADAPTATION: pyre's `BlackholeInterpBuilder`
+        // TODO: pyre's `BlackholeInterpBuilder`
         // (`blackhole.rs:3088 setup_insns`) is wired piecewise from
         // per-jitdriver bring-up rather than a single constructor call
         // — bringing the constructor-form back here cascades into a
         // refactor of `BlackholeInterpBuilder`'s allocator and
-        // exceeds Task #89 session scope.
+        // exceeds the current scope.
 
         let asm = &codewriter.assembler;
         // pyjitpl.py:2260 `self.setup_insns(asm.insns)`
         self.setup_insns(asm.insns());
         // pyjitpl.py:2261 `self.setup_descrs(asm.descrs)`
-        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // TODO: payload mismatch.  Translate-side
         // `Assembler.descrs` is a `Vec<DescrRef>` (object refs); pyre's
         // `setup_descrs(Vec<u64>)` keys by opcode id.  The conversion
         // is `descrs[i] = asm.descrs[i].as_int_id()`, but pyre's
@@ -14539,7 +14539,7 @@ impl MetaInterpStaticData {
         // stable u64 id — that bridging is a separate audit slice.
 
         // pyjitpl.py:2262 `self.setup_indirectcalltargets(asm.indirectcalltargets)`
-        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // TODO: payload mismatch.  Translate-side
         // `Assembler.indirectcalltargets` is a JitCode set; pyre
         // stores `Vec<Arc<JitCode>>` already keyed in alloc-order on
         // `MetaInterpStaticData`.  Bridging requires
@@ -14547,7 +14547,7 @@ impl MetaInterpStaticData {
         // commit the same shape.
 
         // pyjitpl.py:2263 `self.setup_list_of_addr2name(asm.list_of_addr2name)`
-        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // TODO: payload mismatch.  Translate-side
         // carries `Vec<(String, String)>` (modname, funcname); pyre's
         // `setup_list_of_addr2name((usize, String))` wants
         // `(address, full_name)` — bridging requires
@@ -14557,7 +14557,7 @@ impl MetaInterpStaticData {
         self.liveness_info = asm.all_liveness().to_vec();
 
         // pyjitpl.py:2266 `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`
-        // PRE-EXISTING-ADAPTATION: pyre populates `jitdrivers_sd`
+        // TODO: pyre populates `jitdrivers_sd`
         // incrementally via `register_jitdriver_sd`
         // (`mod.rs:11576-11589`).  Wholesale assignment here would
         // clobber the incremental work; the convergence path is to
@@ -14587,7 +14587,7 @@ impl MetaInterpStaticData {
         self.callinfocollection = callcontrol.callinfocollection.clone();
 
         // pyjitpl.py:2269 `self.has_libffi_call = codewriter.callcontrol.has_libffi_call`
-        // PRE-EXISTING-ADAPTATION: pyre's `CallControl` has no
+        // TODO: pyre's `CallControl` has no
         // `has_libffi_call` field; libffi handling is currently not
         // implemented.
 
@@ -14595,13 +14595,13 @@ impl MetaInterpStaticData {
         //     exc_descr = compile.PropagateExceptionDescr()
         //     for jd in self.jitdrivers_sd: jd.portal_finishtoken = ...
         //     self.cpu.propagate_exception_descr = exc_descr
-        // PRE-EXISTING-ADAPTATION: pyre runs the equivalent reattach
+        // TODO: pyre runs the equivalent reattach
         // through `finish_setup_descrs_for_jitdrivers` from
         // `register_jitdriver_sd` (`mod.rs:11588`).  Repeating the
         // loop here would double-attach.
 
         // pyjitpl.py:2285 `self.globaldata = MetaInterpGlobalData(self)`
-        // PRE-EXISTING-ADAPTATION: pyre constructs `globaldata` in
+        // TODO: pyre constructs `globaldata` in
         // `MetaInterpStaticData::new()` because `MetaInterpGlobalData`
         // is required by other init sites that run before
         // `finish_setup`.  Replacing here would require an ownership
@@ -14632,11 +14632,10 @@ impl MetaInterpStaticData {
     /// same write target and the same `pyjitpl.py:2264`
     /// `self.liveness_info` semantics; downstream sessions will
     /// migrate state-field callers to the full `finish_setup` once
-    /// `CodeWriter::with_assembler_only` (Task #89 orth-9 plan
-    /// step 4) lands.
+    /// `CodeWriter::with_assembler_only` lands.
     ///
-    /// Codex review (2026-04-26): this hook is a NEW-DEVIATION vs
-    /// RPython.  RPython has no `install_canonical_liveness`
+    /// TODO: this hook has no RPython counterpart.
+    /// RPython has no `install_canonical_liveness`
     /// equivalent — `warmspot.py:281-289` calls a single
     /// `metainterp_sd.finish_setup(codewriter)` after
     /// `make_jitcodes()`, and `pyjitpl.py:2255-2285 finish_setup`
@@ -14650,7 +14649,7 @@ impl MetaInterpStaticData {
     /// liveness eagerly per JitState rather than going through the
     /// shared codewriter pipeline.  Convergence path: when CodeWriter
     /// owns its Assembler (`with_assembler_only`) and CallControl
-    /// merges in (Task #89 orth-9 step 4 + Task #72 sub-thread),
+    /// merges in,
     /// this method dissolves into the canonical
     /// `finish_setup(codewriter)` and the macro-side examples drop
     /// their `state.build_meta(...).install_canonical_liveness(...)`
@@ -14706,7 +14705,7 @@ impl MetaInterpStaticData {
             .unwrap_or(0);
         let mut names = vec![String::from("?"); table_len];
         // pyjitpl.py:2230-2235: opcode_implementations[value] = opimpl.
-        // PRE-EXISTING-ADAPTATION: pyre dispatches by BC_* match, so
+        // Pyre dispatches by BC_* match, so
         // the slot is left as None — the table only carries the size
         // for parity with `opcode_names`.
         let implementations = vec![None; table_len];
@@ -14783,7 +14782,7 @@ impl MetaInterpStaticData {
         // narrow set since pyre's array descrs don't always carry a
         // separate length descr) snapshot to empty Vec, leaving the
         // sequential index domain compact but ordered correctly.
-        // GcCache SSOT epic Slice 2.x: call_descrs now write through to
+        // call_descrs now write through to
         // `gc_cache._cache_call_order` via `descr_registry::register_call`
         // at `make_call_descr_with_effect` mint time, so `snapshot_calls()`
         // returns the same population that `cached_call_descrs()` would.
@@ -15006,7 +15005,7 @@ impl MetaInterpStaticData {
     ///         self.globaldata.initialized = True
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre owns the jitlog `Logger` on
+    /// Pyre owns the jitlog `Logger` on
     /// `WarmEnterState`, not on `MetaInterpStaticData` as PyPy does
     /// on `self.jitlog`.  The PyPy `setup_once` step `self.jitlog
     /// .setup_once()` therefore cannot run from here — it would need
@@ -18607,7 +18606,7 @@ mod tests {
                     .map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
             })
             .expect("fail descr");
-        // After Slice 80-G.7 the `fail_descrs` vec stores
+        // The `fail_descrs` vec stores
         // `Arc<FailDescrCell>` thin wrappers (the cell is the JIT-baked
         // identity in `jf_descr`).  The inner descr is reached via
         // `FailDescrCell::Deref<Target = dyn Descr>`, so `.as_fail_descr()`
@@ -18943,7 +18942,7 @@ mod tests {
     }
 
     // `guard_fail_descr_proxy_trusts_empty_backend_fail_arg_types`
-    // removed in Unified-Descr Port Epic, Session 6: the proxy now
+    // removed: the proxy now
     // forwards `fail_arg_types()` to the metainterp `ResumeGuardDescr`
     // Arc, so patching the backend descr's `fail_arg_types` no longer
     // changes the proxy's view (the test's premise was a split-descr

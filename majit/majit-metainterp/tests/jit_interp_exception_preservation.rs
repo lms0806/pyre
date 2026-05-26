@@ -1,5 +1,4 @@
-//! Slice 4.2 regression pin: `ExceptionState` clone/clear preserves
-//! pending state.
+//! Regression pin: `ExceptionState` clone/clear preserves pending state.
 //!
 //! Multi-frame guard-fail resume threads `&ExceptionState` through
 //! `restore_guard_failure_with_session_cache` (`jit_state.rs:885-991`)

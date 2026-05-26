@@ -87,7 +87,7 @@ pub struct Cpu {
     /// **Note**: upstream's `cpu` does not carry
     /// these because upstream's rtyper rewrites the graph to post-
     /// rtype shape before `flatten_graph` runs, so the dispatcher has
-    /// no upstream analog.  Phase 5 retires these fields once pyre's
+    /// no upstream analog.  These fields retire once pyre's
     /// walker stops emitting pre-rtype HLOps in favour of post-rtype
     /// residual_call SpaceOperations on the graph.
     pub lowering_ctx: std::sync::RwLock<Option<super::flatten::LoweringContext>>,

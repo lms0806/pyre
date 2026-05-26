@@ -1423,7 +1423,7 @@ impl RegisterManager {
         let items: Vec<(OpRef, RegLoc)> = self.reg_bindings_items();
         for (v, reg) in items {
             let max_age = longevity.get(v).unwrap().last_usage;
-            // PRE-EXISTING-ADAPTATION: the `unwrap_or(Type::Int)` mirrors
+            // TODO: the `unwrap_or(Type::Int)` mirrors
             // the cranelift caller seeding gap documented at
             // `majit-ir/src/op_type_index.rs:144-164`. RPython box.type
             // is intrinsic on the Box object (history.py:220) and never
@@ -1987,7 +1987,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:305 possibly_free_vars_for_op(op) — RPython reads
     /// `arg.type` per box; pyre routes through `self.opref_type`. The
-    /// `unwrap_or(Type::Int)` is a PRE-EXISTING-ADAPTATION; see `tp()`
+    /// `unwrap_or(Type::Int)` is a TODO; see `tp()`
     /// docstring + `majit-ir/src/op_type_index.rs:144-164` for the
     /// shared cranelift caller seeding gap rationale.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
@@ -2318,7 +2318,7 @@ impl<'a> RegAlloc<'a> {
     /// RPython reads `box.type` directly (history.py:220 ConstInt /
     /// :261 ConstFloat / :307 ConstPtr pin `type` at construction);
     /// pyre delegates to `OpTypeIndex`. The `unwrap_or(Type::Int)`
-    /// fallback is a PRE-EXISTING-ADAPTATION mirroring
+    /// fallback is a TODO mirroring
     /// `majit-ir/src/op_type_index.rs:144-164` — the same cranelift
     /// caller seeding gap blocks fail-loud here. Convergence path
     /// closes both layers together.

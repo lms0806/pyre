@@ -25,10 +25,10 @@ pub use jit_codewriter::{
 
 mod codegen;
 pub mod front;
-// Phase F: pyre-interpreter handler JitCode registry
-// (PRE-EXISTING-ADAPTATION per parity rule #1 — Rust source → FunctionGraph
-// bridge with no RPython counterpart; upstream assumes rtyper-produced
-// `translator.graphs` is already in memory at codewriter entry).
+// TODO(pyre): pyre-interpreter handler JitCode registry
+// (Rust source → FunctionGraph bridge with no RPython counterpart;
+// upstream assumes rtyper-produced `translator.graphs` is already in
+// memory at codewriter entry).
 pub mod generated;
 pub mod handler_spec;
 pub mod hints;

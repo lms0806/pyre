@@ -24,7 +24,7 @@ static FRAME_VALUE_COUNT_FN: AtomicUsize = AtomicUsize::new(0);
 /// Signature: `(jitcode_index, py_pc) -> count`.  The implementation
 /// translates `py_pc` through `pc_map` to look up `get_live_vars_info`;
 /// pyre's portal-bridge fallback (`PyJitCodeMetadata.depth_at_py_pc`) is
-/// py_pc-keyed pending its own NEW-DEVIATION retirement.
+/// py_pc-keyed pending its own TODO retirement.
 pub fn set_frame_value_count_fn(f: fn(i32, i32) -> usize) {
     FRAME_VALUE_COUNT_FN.store(f as usize, Ordering::Relaxed);
 }

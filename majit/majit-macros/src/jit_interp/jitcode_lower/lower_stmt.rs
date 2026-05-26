@@ -40,7 +40,7 @@ impl<'c> Lowerer<'c> {
                 // surrounding fn has no `__jdindex`) the recognition
                 // falls through to `None` and the body lowering aborts
                 // — pyre's per-arm trace JitCode is a
-                // PRE-EXISTING-ADAPTATION not present in RPython, so
+                // TODO: not present in RPython, so
                 // omitting `loop_header` there is consistent with
                 // upstream's single-JitCode model.
                 if !self.in_dispatch_arm_body {

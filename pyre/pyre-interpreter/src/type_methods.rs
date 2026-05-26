@@ -1908,7 +1908,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 // when the destination is on EmptyDictStrategy,
                 // transplant the source's strategy + dstorage instead
                 // of iterating items.  Skipped for module dicts and
-                // proxy-attached dicts (NEW-DEVIATION) because their
+                // proxy-attached dicts (TODO: bring to parity) because their
                 // Rust layouts / storage mirrors are not self-contained.
                 // Falls through to the item-loop otherwise (matches
                 // `:1407 else: rev_update1_dict_dict`).

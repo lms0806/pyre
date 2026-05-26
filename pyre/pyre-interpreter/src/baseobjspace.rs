@@ -1246,7 +1246,7 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
         } else if is_range_iter(obj) {
-            // PRE-EXISTING-ADAPTATION: pyre conflates `range` and
+            // TODO: pyre conflates `range` and
             // `range_iterator` into a single `W_RangeIterator` (see
             // `builtin_range` in `builtins.rs`). PyPy keeps them
             // separate: `pypy/module/__builtin__/functional.py:444
@@ -1508,7 +1508,7 @@ pub fn dict_storage_to_dict_kind(
         DictWrapKind::Instance => {
             // `dictmultiobject.py:81-89` default branch — EmptyDictStrategy
             // regular W_DictObject (PyPy `instance=True`'s mapdict path
-            // is a PRE-EXISTING-ADAPTATION: pyre stops at the regular
+            // is a TODO: pyre stops at the regular
             // W_DictObject shape until mapdict is ported).
             pyre_object::dictmultiobject::w_dict_new_with_storage_proxy(ns_ptr as *mut u8)
         }
@@ -2411,7 +2411,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                 // explodes module-level type initialisation for
                 // `types`, `functools`, `enum`, ...
                 //
-                // PRE-EXISTING-ADAPTATION — until pyre grows real
+                // TODO — until pyre grows real
                 // traceback objects (`pypy/interpreter/pytraceback.py
                 // PyTraceback`), surface a stub `W_InstanceObject`
                 // carrying `tb_frame`/`tb_lineno`/`tb_next` so the

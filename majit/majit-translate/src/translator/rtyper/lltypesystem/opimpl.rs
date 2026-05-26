@@ -1212,7 +1212,7 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 
 // ---- registry -----------------------------------------------------
 
-// PRE-EXISTING-ADAPTATION: opimpl missing-ops audit.
+// TODO: opimpl missing-ops audit.
 //
 // Upstream `opimpl.py` defines per-LLOp fold callables; the local
 // registry below is the subset whose carriers all live in

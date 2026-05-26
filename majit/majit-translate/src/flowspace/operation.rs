@@ -2,8 +2,7 @@
 //!
 //! RPython upstream: `rpython/flowspace/operation.py` (764 LOC).
 //!
-//! Commit split (Phase 3 F3.3 of the five-year roadmap at
-//! `.claude/plans/majestic-forging-meteor.md`):
+//! Commit split:
 //!
 //! * **Commit 1 (this file's initial landing)** — data model skeleton.
 //!   Every RPython `HLOperation` subclass surfaces as an `OpKind`
@@ -1197,7 +1196,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         //           raise FlowingError("%s always raises %s" % …)
         //       return const(result)
         //
-        // Phase 3 F3.3 gaps documented per CLAUDE.md parity rule #1:
+        // Gaps documented per CLAUDE.md parity rule #1:
         //
         //  1. 3-arg `getattr(x, name, default)` support — upstream
         //     raises `FlowingError` at flow time, surfacing a hard
@@ -2347,7 +2346,7 @@ impl HLOperation {
         // closes off the Option<SomeValue> propagation epic at
         // tag/MRO time.  Converging needs a NoneType lattice tag and
         // a `Vec<Option<SomeValue>>` carrier through every spec arm
-        // — multi-session (touches every binding registered in
+        // — this touches every binding registered in
         // `_REGISTRY_SINGLE` / `_REGISTRY_DOUBLE`).
         let mut args_s: Vec<SomeValue> = Vec::with_capacity(self.args.len());
         for a in &self.args {

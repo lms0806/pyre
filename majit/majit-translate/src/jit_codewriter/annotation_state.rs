@@ -32,7 +32,7 @@ use crate::model::ValueType;
 /// | `Float`            | `Float(SomeFloat)`     | `model.py:164-183` -> `SomeValue::Float` arm. |
 /// | `Ref`              | `Instance(SomeInstance{classdef:None,..})` | `model.py:438` `SomeInstance.__init__(classdef, can_be_None=False, flags={})`.  `classdef=None` denotes the abstract `object`-only instance — the legitimate RPython placeholder when the bookkeeper has not narrowed the ClassDef.  Routes through `rclass.py:445-447 SomeInstance.rtyper_makerepr` -> `getinstancerepr(rtyper, None, Gc)` -> `InstanceRepr::new_rootinstance` -> `Ptr(GcStruct(OBJECT))` -> `lowleveltype_to_concrete` GC-arm -> `ConcreteType::GcRef`, matching legacy `resolve_types(Ref) -> GcRef`.  Convergence path: a producer (frontend / annotator with bookkeeper) attaches a richer `SomeInstance(classdef=Some(..))` directly onto `Variable.annotation` once the ClassDef is known (RPython `annrpython.py:289-294 setbinding`). |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
-/// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **PRE-EXISTING-ADAPTATION (no upstream)**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
+/// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
 /// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs:418`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
 ///
 /// Returns `None` only for `ValueType::Unknown`; every other variant
@@ -61,8 +61,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // instance for cases where the bookkeeper has not yet
             // narrowed the ClassDef.
             //
-            // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic
-            // Phase 3, blocked on M2.5g): for typed `&Foo` Rust
+            // TODO (blocked on M2.5g): for typed `&Foo` Rust
             // references the upstream-orthodox lift is
             // `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), not
             // `SomeInstance(classdef=None)`.  Pyre's
@@ -87,7 +86,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             )))
         }
         ValueType::State => {
-            // PRE-EXISTING-ADAPTATION (no upstream).  Pyre's `State`
+            // TODO: no upstream equivalent.  Pyre's `State`
             // carries the JIT state pointer; RPython has no analogue.
             // `SomeInstance(classdef=None)` is a temporary fallback
             // that lets the rtyper resolve to `GcRef` without a real

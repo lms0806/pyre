@@ -13,7 +13,7 @@
 //! the live `Rc<RefCell<super::classdesc::ClassDef>>` (the
 //! `classdesc.py` port lives in [`super::classdesc`]).
 //!
-//! ## PRE-EXISTING-ADAPTATION: DescKey
+//! ## TODO: DescKey
 //!
 //! Upstream keys `CallFamily.descs`, `FrozenAttrFamily.descs`, and
 //! `ClassAttrFamily.descs` on the `Desc` instance itself — Python
@@ -511,7 +511,7 @@ pub(crate) fn simplify_desc_set_default(
 ) {
 }
 
-/// PRE-EXISTING-ADAPTATION: single-inheritance Desc hierarchy in Rust.
+/// TODO: single-inheritance Desc hierarchy in Rust.
 ///
 /// Upstream `rpython/annotator/description.py` + `classdesc.py` define
 /// `FunctionDesc / MethodDesc / ClassDesc / FrozenDesc /
@@ -2956,8 +2956,8 @@ mod tests {
 
     #[test]
     fn class_attr_family_update_unions_s_value() {
-        // Use compatible integer types to stay within the Phase 4
-        // A4.6 pair-union subset.
+        // Use compatible integer types to stay within the pair-union
+        // subset.
         let mut a = ClassAttrFamily::new(desc_key(1));
         let mut b = ClassAttrFamily::new(desc_key(2));
         a.set_s_value("x", SomeValue::Integer(SomeInteger::new(true, false)));

@@ -770,7 +770,7 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
 /// Thread-local callback that performs a stable-address old-gen
 /// allocation for the currently active backend. Used by host-side
 /// allocators whose callers hold the returned pointer on the Rust
-/// stack without registering it as a GC root (Task #141). MiniMark's
+/// stack without registering it as a GC root. MiniMark's
 /// old-gen is mark-sweep (non-moving), so a subsequent minor
 /// collection cannot invalidate the pointer. The callback returns
 /// `GcRef(0)` on allocation failure.
@@ -871,15 +871,15 @@ pub fn gc_current_object_address(addr: usize) -> usize {
 }
 
 /// Thread-local callbacks for registering/removing a Rust-stack slot
-/// as a GC root with the currently active backend (Task #141 option
-/// a). Used by host-side allocators whose callers need to keep a
+/// as a GC root with the currently active backend. Used by host-side
+/// allocators whose callers need to keep a
 /// just-allocated nursery pointer alive across a subsequent
 /// potentially-collecting allocation.
 ///
 /// RPython accomplishes the same thing automatically via its GC
 /// transform pass (shadowstack save/restore around safepoints). pyre
 /// lacks that pass, so root registration is explicit at the call
-/// site. This is a documented PRE-EXISTING-ADAPTATION.
+/// site. This is a documented TODO.
 pub type AddRootFn = unsafe fn(slot: *mut GcRef);
 pub type RemoveRootFn = fn(slot: *mut GcRef);
 

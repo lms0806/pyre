@@ -1803,7 +1803,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     index_of_virtualizable: usize,
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
-    // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
+    // TODO (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
     // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
     // forwarding pointers, which `emit_op`'s default `get_box_replacement`
@@ -1816,7 +1816,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     // accomplishes via Box mutation. No semantic divergence.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
+    // TODO (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
     // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
     // forwarding pointers, which `emit_op`'s default `get_box_replacement`
@@ -2018,7 +2018,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 (item_opcode, item_descr, item_base)
             }
             crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                // PRE-EXISTING-ADAPTATION (heap layout divergence):
+                // TODO (heap layout divergence):
                 // RPython's `vinfo.array_field_descrs` points at a real
                 // GC array field; `compile.py:445 ResOperation(GETFIELD_GC_R)`
                 // returns the array Box and `:451 ResOperation(GETARRAYITEM_GC_*)`
@@ -2379,7 +2379,7 @@ pub fn compile_tmp_callback(
     }
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
-    // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`
+    // marker.  TODO: `rpython/rlib/jit.py`'s `jl`
     // module is not ported; skip.
     //
     // `compile.py:1112` `nb_red_args = jitdriver_sd.num_red_args`.
@@ -3944,7 +3944,7 @@ impl Drop for ResumeGuardCopiedDescr {
         }
         // Reclaim any published bridge dispatch payload via the
         // backend-registered cleanup function (mirrors
-        // `ResumeGuardDescr::drop` Slice 7-Tβ12 logic).
+        // `ResumeGuardDescr::drop` -Tβ12 logic).
         let bridge_ptr = self
             .bridge_dispatch_cell
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
@@ -3975,7 +3975,7 @@ impl ResumeGuardCopiedDescr {
         unsafe { *self.prev.get() = prev }
     }
 
-    /// Mirror `ResumeGuardDescr::set_external_jump_target` (Slice 7-Tβ8):
+    /// Mirror `ResumeGuardDescr::set_external_jump_target` (-Tβ8):
     /// publish the cross-loop JUMP target `DescrRef` into the
     /// write-once slot.  Each copied descr carries its own slot so
     /// distinct loop-version peels sharing a donor (compile.py:840
@@ -4275,7 +4275,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
 
-    /// Mirror `ResumeGuardDescr::is_external_jump` (Slice 7-Tβ8 +
+    /// Mirror `ResumeGuardDescr::is_external_jump` (-Tβ8 +
     /// resume_guard_descr.rs:498): membership in the per-emission
     /// `external_jump_target` slot IS the cross-loop-JUMP predicate.
     fn is_external_jump(&self) -> bool {
@@ -5115,7 +5115,7 @@ impl TraceCtx {
         header_pc: usize,
     ) {
         // Use the TraceCtx-level position so `snapshot_data_len` reflects
-        // the current Vec<Snapshot> side table length (Task #70 moved
+        // the current Vec<Snapshot> side table length (moved
         // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
         // would report `snapshot_data_len: 0`, causing `cut_trace` to
         // truncate valid snapshots when this merge point is restored).
@@ -5145,7 +5145,7 @@ impl TraceCtx {
     /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
     /// loop header (key, header_pc) was already visited.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre disambiguates loop headers by
+    /// TODO: pyre disambiguates loop headers by
     /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py:2994`)
     /// matches by Python box identity over a structural greenkey tuple;
     /// pyre's `make_green_key` collapses `(W_CodeObject*, pc)` into a

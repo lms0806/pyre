@@ -165,7 +165,7 @@ pub(super) fn get_liveness_info(set: &BTreeSet<Register>, kind: BindingKind) -> 
 /// Convenience: return the `(live_i, live_r, live_f)` triple sourced
 /// from `set`. Used by `maybe_dump_liveness` and by the BC_LIVE
 /// per-marker patcher (`live_placeholder_with_triple` consumers added
-/// in Phase 4 Epic B.3-B.4).
+/// at emit time).
 #[allow(dead_code)]
 pub(super) fn liveness_triple(set: &BTreeSet<Register>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (
@@ -325,7 +325,7 @@ pub(super) fn remove_repeated_live(
             }
             continue;
         }
-        // PRE-EXISTING-ADAPTATION: `liveness.py:82-116 remove_repeated_live`
+        // TODO: `liveness.py:82-116 remove_repeated_live`
         // unions the `reads` of every marker in the run because every
         // upstream marker actually fires (RPython has no conditional
         // emission).  pyre's `live_marker_if` markers exist or not at
@@ -389,7 +389,7 @@ pub(super) fn remove_repeated_live(
     *statements = new_stmts;
 }
 
-/// Phase 4 / Epic B.3-B.4 emit-time bridge: replace each `LiveMarker`
+/// Emit-time bridge: replace each `LiveMarker`
 /// statement's `live_placeholder()` call with the triple-aware
 /// `live_placeholder_with_triple(&[live_i...], &[live_r...], &[live_f...])`
 /// shape, sourcing the per-marker triples from

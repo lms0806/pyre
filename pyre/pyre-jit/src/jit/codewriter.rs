@@ -2475,11 +2475,11 @@ fn duplicate_shadow_tos(
 /// and skipped the flow-graph stage.  Step 6A reintroduces the graph
 /// (so CFG-level `regalloc.py:79-96 coalesce_variables` can run), but the
 /// SSARepr emission has not yet been replaced with a `flatten_graph` pass
-/// (Task #214).  Until it is, each opcode handler must populate both
+/// .  Until it is, each opcode handler must populate both
 /// streams — the SSARepr byte stream that backend/blackhole consume, and
 /// the graph that `RegAllocator` consumes.
 ///
-/// Delete this helper once Task #214 lands and the SSARepr stream is
+/// Delete this helper once the SSARepr stream is
 /// generated from the graph by `flatten_graph`.
 fn record_graph_op(
     block: &super::flow::BlockRef,
@@ -2493,7 +2493,7 @@ fn record_graph_op(
     op
 }
 
-/// Phase 4 production-flip bridge: pair a graph dual-write's result
+/// Production-flip bridge: pair a graph dual-write's result
 /// `Variable` with the SSARepr slot the walker assigned in the same
 /// emit.  No-op when `var` is `None` (residual_call with `ResKind::Void`,
 /// non-portal CodeWriter, etc.).
@@ -2587,7 +2587,7 @@ fn pair_walker_slot_if_absent(
 /// architecturally-correct fix (PyPy parity) is to extend
 /// `graph_entry_inputargs` to seed all `nlocals` slots.
 ///
-/// PRE-EXISTING-ADAPTATION: the upstream
+/// TODO: the upstream
 /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` signature
 /// has no extra pre-coalesce parameter because PyPy's flowgraph never
 /// produces scratch local-`i` Variables disjoint from the
@@ -2733,7 +2733,7 @@ fn vable_getfield_ref_graph_args(
 ///   - argv `[Const(fn_idx), ListI?, ListR?, ListF?, Descr(stub)]`,
 ///     each `ListX` present iff that letter appears in `kinds`;
 ///   - the trailing descr is an interned `Arc<CallDescrStub>` from
-///     [`super::flatten::intern_call_descr_stub`] (Task #41 plumbing).
+///     [`super::flatten::intern_call_descr_stub`] .
 ///
 /// Returns the fresh result `Variable` if `reskind != Void`; callers
 /// at sites where the symbolic value is already provided by an
@@ -2811,7 +2811,7 @@ fn record_residual_call_graph_op(
 /// `jit_merge_point` and `loop_header` are produced with no `result`
 /// and immediately fed into `GraphFlattener.serialize_op`.
 ///
-/// Phase 1 walker-rewrite entrypoint (Task #224): the void counterpart
+/// Walker-rewrite entrypoint: the void counterpart
 /// of `emit_graph_op_with_result`.  Callers that need the recorded
 /// `SpaceOperation` (e.g. to immediately flatten it into the SSARepr via
 /// `GraphFlattener::serialize_op`) use the returned value; callers
@@ -2835,7 +2835,7 @@ fn emit_graph_op_void(
 /// self.recorder.append(spaceop)
 /// ```
 ///
-/// Phase 1 walker-rewrite entrypoint (Task #224): a single place that
+/// Walker-rewrite entrypoint: a single place that
 /// packages the fresh-Variable → `record_graph_op` → return-Variable
 /// pattern so the walker's per-opcode handlers can record
 /// value-producing graph operations without inlining `graph.fresh_variable`
@@ -3031,7 +3031,7 @@ fn emit_frontend_bool(
     // ResKind::Int, Some(scratch_truth))` (consumed by `goto_if_not`).
     // The duplication exists because `FunctionGraph` Variables and
     // `SSARepr` registers still live in two regalloc colorings even
-    // though Phase 3c (commit `bc0d6a06c4`) has already collapsed the
+    // though the dual emitter has already been collapsed into the
     // dual emitter into a single walker-local `SSARepr`.
     emit_graph_op_with_result(
         graph,
@@ -3468,7 +3468,7 @@ struct FnPtrIndices {
 ///   (`pypy/interpreter/pyopcode.py:516` vs
 ///   `pyre-interpreter/src/pyframe.rs:1748-1768`).  Hand-pure
 ///   classification without those prerequisites would be a
-///   NEW-DEVIATION.
+///   TODO.
 fn register_helper_fn_pointers(
     assembler: &mut SSAReprEmitter,
     cpu: &super::cpu::Cpu,
@@ -3526,7 +3526,7 @@ fn register_helper_fn_pointers(
     // at `rpython/rlib/jit.py:180`; the local PyPy intobject
     // declaration omits it).  Without an analyzer or a matching
     // upstream decorator, hand-classifying `box_int_fn` as
-    // `Pure*` would be a NEW-DEVIATION; stay on `Plain` until the
+    // `Pure*` would be a TODO; stay on `Plain` until the
     // decorator path or a per-callee analyzer landing produces
     // an upstream-cited pure flavor.
     let box_int_fn = bind(assembler, cpu.box_int_fn as *const (), CallFlavor::Plain);
@@ -3677,13 +3677,13 @@ fn filter_liveness_in_place(
     // recorded per-PC `-live-` position through the
     // `remove_repeated_live` remap.  The walker's
     // `walker_pc_live_marker_pos` side-table is the authoritative
-    // source since T6.1 Slice 6 retired the per-PC `Insn::Label`
+    // source since label retirement retired the per-PC `Insn::Label`
     // emission.
     let walker_tracked = walker_tracked_pc_live_indices
         .filter(|walker_tracked| walker_tracked.len() == code.instructions.len())
         .expect(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
-             entry per Python PC since T6.1 Slice 6 retired per-PC label emission",
+             entry per Python PC since label retirement retired per-PC label emission",
         );
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
@@ -3801,7 +3801,7 @@ fn filter_liveness_in_place(
             // `OpRef::NONE` in `registers_r` because no trace-time
             // writer populates them.  Removing this retain requires
             // either (a) populating scratch colors during tracing
-            // (Task #158 graph regalloc) or (b) the encoder tolerating
+            // (graph regalloc) or (b) the encoder tolerating
             // NONE for non-frame live registers.
             //
             // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
@@ -4214,12 +4214,12 @@ impl CodeWriter {
         // placeholder slots in the conflated Ref index space. Their final
         // post-regalloc colors are looked up from `alloc_result.rename` after
         // `apply_rename` runs (see below). Slot `+10` was the dedicated
-        // `null_ref_reg` PY_NULL holder before Tier 4 Epic A retired it; the
+        // `null_ref_reg` PY_NULL holder before null_ref_reg retirement retired it; the
         // portal red regs keep their numerical positions so layout-sensitive
         // tests stay stable.
         let (portal_frame_reg, portal_ec_reg) =
             portal_red_pre_regalloc_slots(nlocals, max_stackdepth);
-        // Per-arm fresh ref scratch slots — Phase 2 Commit 2.2 first slice
+        // Per-arm fresh ref scratch slots
         // (Tasks #158/#159/#122 plan).  Each opcode handler arm that needs
         // a transient ref-typed register allocates one or more fresh slots
         // from this counter instead of sharing the historical
@@ -4550,7 +4550,7 @@ impl CodeWriter {
         // self.joinpoints.setdefault(...)`).  Populated at walker
         // emit time so the runtime can resolve `pc_map` from
         // walker-tracked positions, without per-PC `Insn::Label`
-        // anchors in the final SSARepr (T6.1 Slice 6).
+        // anchors in the final SSARepr (label retirement).
         let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
             vec![Vec::new(); num_instrs];
         // Catch landings live on `ExceptionCatchSite::landing` (decode-
@@ -4693,7 +4693,7 @@ impl CodeWriter {
                     // jtransform.py:925 so graph regalloc observes the
                     // liverange of the VSD-sync scratch.
                     //
-                    // Phase 4 endgame Slice F — record graph offset as the
+                    // Endgame Slice F — record graph offset as the
                     // walker's current py_pc.  Walker emits emit_vsd!
                     // INLINE during each PC's handler; canonical
                     // make_bytecode_block (flatten.rs:2258-2303) sorts ops
@@ -4847,7 +4847,7 @@ impl CodeWriter {
         // `Insn::Op { opname: "ref_return", args: [Register(Ref, src)] }`
         // to the SSARepr so the future `Assembler::assemble` path
         // (`assembler.rs::dispatch_op:374`) can reproduce the same byte at
-        // the Phase 3c switchover. The direct builder call stays until the
+        // the switchover. The direct builder call stays until the
         // switchover runs so the emitted JitCode remains bit-identical.
         // RPython parity: `rpython/jit/codewriter/jtransform.py` emits
         // `op_ref_return(v)` via `rewrite_op_jit_return` for the portal
@@ -4880,19 +4880,19 @@ impl CodeWriter {
         // `assembler.py:220` turns the op into `goto/L`. Pyre labels are
         // integer indices into `labels[]`, one per Python PC; the
         // `TLabel` carries the synthetic name `pc{target_py_pc}` so the
-        // Phase 3c dispatch (`assembler.rs::dispatch_op:345`) can resolve
+        // dispatch (`assembler.rs::dispatch_op:345`) can resolve
         // it against `builder_label`.
         macro_rules! emit_goto {
             ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                // T6.1 Slice 5: mergeblock first to learn the target
+                // mergeblock support: mergeblock first to learn the target
                 // SpamBlock, then emit `goto` against its block-identity
                 // `TLabel("block{addr}")`.  Mirrors upstream
                 // `flatten.py:161 self.emitline('goto',
                 // TLabel(link.target))` where `link.target` is a Block
                 // identity, not a PC.  The per-PC `Label("pcN")` at the
                 // target's first PC remains a valid branch target until
-                // Slice 6 retires the per-PC labels.
+                // per-PC labels are retired.
                 let target_block = mergeblock(
                     code,
                     &mut graph,
@@ -4931,7 +4931,7 @@ impl CodeWriter {
         // translation of unsupported bytecode handlers and permanent
         // guard-fail edges, which upstream sidesteps via
         // `rpython/jit/metainterp/policy.py`-driven whitelisting. Because
-        // the opname *already* surfaces at the runtime layer, Phase 3c's
+        // the opname *already* surfaces at the runtime layer, the
         // single-SSARepr requirement forces it through the walker-local
         // `ssarepr` too; the alternative — a hybrid "some ops go through
         // SSARepr, some don't" dispatch — defeats the purpose of the
@@ -5349,7 +5349,7 @@ impl CodeWriter {
                     // fallthrough to whichever block lands next in
                     // walker-pop order.
                     if needs_fallthrough {
-                        // T6.1 Slice 5: emit goto against the new
+                        // mergeblock support: emit goto against the new
                         // block's identity TLabel, matching upstream
                         // `flatten.py:161` `TLabel(link.target)` where
                         // `link.target` is a Block, not a PC.
@@ -5484,7 +5484,7 @@ impl CodeWriter {
                 // args lives at the START of each PC's emission, not
                 // here.
                 push_walker_emit(&current_block, Insn::live(Vec::new()));
-                // T6.1 Slice 5: mergeblock first to learn target block
+                // mergeblock support: mergeblock first to learn target block
                 // identity, then emit the guard with block-identity
                 // `TLabel`.  `flatten.py:240-267` linkfalse mergeblock.
                 let target_block = mergeblock(
@@ -5518,7 +5518,7 @@ impl CodeWriter {
                 let py_pc = $py_pc;
                 // `flatten.py:259` bare `-live-` precedes the guard.
                 push_walker_emit(&current_block, Insn::live(Vec::new()));
-                // T6.1 Slice 5: mergeblock first to learn target block,
+                // mergeblock support: mergeblock first to learn target block,
                 // then emit guard with block-identity `TLabel`.
                 // `flatten.py:247` `goto_if_not_int_is_zero` shape is
                 // identical to `goto_if_not` save for the opname.
@@ -5975,7 +5975,7 @@ impl CodeWriter {
             }};
         }
 
-        // Tier 4 Epic A — null_ref_reg → ConstRef(PY_NULL) migration.
+        // null_ref_reg retirement — null_ref_reg → ConstRef(PY_NULL) migration.
         // pyframe.py:389 `pushvalue(w_object)` lowers, when w_object is a
         // compile-time `ConstPtr.NULL`, to `setarrayitem_vable_r(
         // locals_cells_stack_w, depth, ConstPtr(NULL))` via
@@ -6197,7 +6197,7 @@ impl CodeWriter {
         // (`codewriter.rs:5094-5101 else branch`) reads
         // Reg(Ref, reg) directly.  Keep the mirror for those.
         //
-        // Phase 4 endgame slice: dropping the portal mirror is the
+        // Endgame: dropping the portal mirror is the
         // first step in retiring walker's raw-register local model.
         // Subsequent slices will retire the equivalent push-side
         // `emit_ref_copy!` in `emit_pushvalue_ref!` and the various
@@ -6226,7 +6226,7 @@ impl CodeWriter {
         // flowcontext.py:402-405 `while self.pendingblocks: block =
         // self.pendingblocks.popleft(); if not block.dead: self.record_block(block)`.
         //
-        // Phase 4 slice 4: outer loop wraps main drain + catch landings
+        // Outer loop: outer loop wraps main drain + catch landings
         // emit so handler-entry blocks queued by
         // `emit_goto!(handler_py_pc)` in catch landings get drained by
         // a second main-drain pass.  Without this, handler-entry blocks
@@ -6569,7 +6569,7 @@ impl CodeWriter {
 
                         Instruction::LoadSmallInt { i } => {
                             let val = i.get(op_arg) as u32 as i64;
-                            // A-slice 1 (Task #224): call writes result directly
+                            // A-slice 1: call writes result directly
                             // to the target stack slot. Safe because the only
                             // call input is a literal constant (no Ref conflict)
                             // and no post-call op reads from that stack slot
@@ -6578,7 +6578,7 @@ impl CodeWriter {
                             // `Variable | Constant` directly, so the constant
                             // reaches `expect_list_regs_or_pool`
                             // (assembler.rs:1736-1784) without a scratch register.
-                            // Task #48 micro-slice 10: box_int_fn factor
+                            // box_int_fn factor
                             // refactor.  The prior `emit_residual_call(
                             // box_int_fn_idx, ...)` is replaced by a single
                             // direct push of
@@ -6613,7 +6613,7 @@ impl CodeWriter {
                             // stack so the def-use chain matches the
                             // upstream "call result is the downstream value"
                             // shape.
-                            // Phase 4 walker-orthodoxy: graph residual_call
+                            // Walker-orthodoxy: graph residual_call
                             // dual-write fires unconditionally.  `box_int_fn`
                             // takes only a literal Int as input, so no
                             // frame_var or other portal-only Variable is
@@ -6678,7 +6678,7 @@ impl CodeWriter {
                             } else {
                                 None
                             };
-                            // Task #48 micro-slice 7: LoadConst factor
+                            // LoadConst factor
                             // refactor.  The prior `emit_residual_call(
                             // load_const_fn_idx, ...)` call is replaced by
                             // a single direct push of
@@ -7268,7 +7268,7 @@ impl CodeWriter {
                                 Some(bool_value),
                                 scratch_truth,
                             );
-                            // Task #48 micro-slice 5: BOOL family
+                            // BOOL family
                             // retirement (sibling of the PopJumpIfFalse
                             // closure above) — same `(Ref) → Int` shape
                             // helper, same probe coverage.
@@ -7428,7 +7428,7 @@ impl CodeWriter {
                                     loaded_dst_reg,
                                 ),
                             );
-                            // Task #46 micro-slice 6: graph-side residual_call
+                            // graph-side residual_call
                             // dual-write for load_global_fn(ns:Ref, code:Ref,
                             // frame:Ref, namei:Int) → Ref.  ns and code
                             // Variables come from the preceding
@@ -7616,7 +7616,7 @@ impl CodeWriter {
                                     7 => call_fn_7_idx,
                                     _ => call_fn_8_idx,
                                 };
-                                // Task #48 micro-slice 9: CALL family
+                                // CALL family
                                 // factor refactor.  The prior
                                 // `emit_residual_call(call_fn_N_idx, ...)`
                                 // call is replaced by a single direct push
@@ -7731,7 +7731,7 @@ impl CodeWriter {
                                 binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                                     .expect("subtract must have a jit binary-op tag");
                             let scratch_zero = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // Task #48 micro-slice 10: box_int_fn factor
+                            // box_int_fn factor
                             // refactor (UnaryNegative site).  See
                             // LoadSmallInt site for the shared rationale.
                             push_walker_emit(
@@ -7742,7 +7742,7 @@ impl CodeWriter {
                                     scratch_zero,
                                 ),
                             );
-                            // Task #48 micro-slice 11: UnaryNegative
+                            // UnaryNegative
                             // binary_op_fn factor refactor.  The prior
                             // `emit_residual_call(binary_op_fn_idx, ...)`
                             // is replaced by a single direct push of the
@@ -7762,7 +7762,7 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            // Phase 3 walker-orthodoxy: graph dual-writes for
+                            // Walker-orthodoxy: graph dual-writes for
                             // the UnaryNegative `box_int_fn(0)` + `binary_op_fn(
                             // zero, operand, subtract_tag)` pair fire
                             // unconditionally (no `is_portal` gating).  Both
@@ -7896,7 +7896,7 @@ impl CodeWriter {
                                 Some(result_value),
                                 stack_base + current_depth,
                             );
-                            // Task #48 micro-slice 13: BuildList factor
+                            // BuildList factor
                             // refactor.  The prior `emit_residual_call(
                             // build_list_fn_idx, ...)` is replaced by a
                             // single direct push of
@@ -8021,7 +8021,7 @@ impl CodeWriter {
                                         cause_fv,
                                     )
                                 } else {
-                                    // Tier 4 Epic A: PY_NULL flows directly through
+                                    // null_ref_reg retirement: PY_NULL flows directly through
                                     // the residual_call's ListOfKind(Ref) as a
                                     // raw constant — make_three_lists
                                     // (jtransform.py:437-445) admits Constant in
@@ -8063,7 +8063,7 @@ impl CodeWriter {
                                 // `emit_raise!` reads the same register as its
                                 // source. Pattern matches Sessions 1-3 retirements
                                 // (Call/UnaryNegative/CheckExcMatch input-side).
-                                // Task #48 micro-slice 14: RaiseVarargs
+                                // RaiseVarargs
                                 // normalize_raise_varargs_fn factor
                                 // refactor.  The prior `emit_residual_call(
                                 // normalize_raise_varargs_fn_idx, ...)` is
@@ -8154,7 +8154,7 @@ impl CodeWriter {
                             // get_current_exception / set_current_exception are TLS read/write —
                             // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
                             // getcalldescr's analyzer outcome for non-raising helpers).
-                            // Task #48 micro-slice 15: PushExcInfo
+                            // PushExcInfo
                             // get/set_current_exception factor refactor.
                             // Both helpers are PlainCannotRaise (TLS
                             // read/write only).  `get_current_exception`
@@ -8175,12 +8175,12 @@ impl CodeWriter {
                                 scratch_exc,
                             ),
                         );
-                            // Task #46 micro-slice 7: graph dual-writes for
+                            // graph dual-writes for
                             // both PushExcInfo emits.  get_current_exception
                             // takes no args (shape residual_call_r_r with empty
                             // ListR); set_current_exception is `(exc:Ref)→Void`
                             // (shape residual_call_r_v).
-                            // Phase 4 walker-orthodoxy: TLS-only helpers,
+                            // Walker-orthodoxy: TLS-only helpers,
                             // no frame_var threading.  Match helper
                             // bind-site flavors at codewriter.rs:2207-2217
                             // — both current-exception helpers are TLS
@@ -8247,7 +8247,7 @@ impl CodeWriter {
                                 .cloned()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
                             let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // Task #48 micro-slice 12: CheckExcMatch
+                            // CheckExcMatch
                             // compare_fn factor refactor.  `compare_fn` is
                             // the same helper used by COMPARE_OP — the
                             // call shape `(exc:Ref, match_type:Ref, op_val:
@@ -8272,7 +8272,7 @@ impl CodeWriter {
                                     scratch_match,
                                 ),
                             );
-                            // Phase 4 walker-orthodoxy: compare_fn(exc,
+                            // Walker-orthodoxy: compare_fn(exc,
                             // match_type, ISINSTANCE_OP:Int) → Ref shape
                             // residual_call_ir_r.  No frame_var threading.
                             let cmp_result = record_residual_call_graph_op(
@@ -8313,7 +8313,7 @@ impl CodeWriter {
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // set_current_exception is a TLS write — EF_CANNOT_RAISE.
-                            // Task #48 micro-slice 15: PopExcept
+                            // PopExcept
                             // set_current_exception factor refactor.
                             // PlainCannotRaise TLS write `(prev:Ref) → Void`.
                             // Graph dual-write below unchanged.
@@ -8324,7 +8324,7 @@ impl CodeWriter {
                                 prev_reg,
                             ),
                         );
-                            // Phase 4 walker-orthodoxy: set_current_exception
+                            // Walker-orthodoxy: set_current_exception
                             // `(prev:Ref)→Void` shape residual_call_r_v.
                             // TLS write, no GC heap touched,
                             // `PlainCannotRaiseNoHeap` (`effectinfo.py:281-283`
@@ -9175,7 +9175,7 @@ impl CodeWriter {
                 }
             } // end inner while-let pendingblocks
 
-            // Phase 4 slice 4 outer loop logic.  After main drain
+            // Outer loop outer loop logic.  After main drain
             // exhausts pendingblocks, catch landings emit (below) runs
             // ONCE (gated on `catch_landings_processed`).  `emit_goto!`
             // in catch landings queues handler-entry blocks onto
@@ -9292,7 +9292,7 @@ impl CodeWriter {
                 if site.push_lasti {
                     // A-slice 6: box_int writes the lasti result directly to
                     // the exception slot, retiring obj_tmp0 → exc_slot copy.
-                    // Task #48 micro-slice 10: box_int_fn factor refactor
+                    // box_int_fn factor refactor
                     // (exception lasti site).  See LoadSmallInt site for
                     // the shared rationale.
                     push_walker_emit(
@@ -9498,7 +9498,7 @@ impl CodeWriter {
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
         //
-        // PRE-EXISTING-ADAPTATION: thread walker pin pairs into
+        // TODO: thread walker pin pairs into
         // canonical Ref regalloc via
         // `perform_register_allocation_all_kinds_with_pairs`.  Each
         // pair `(scratch_var, inputarg_var)` requests that the
@@ -9507,7 +9507,7 @@ impl CodeWriter {
         // semantic local-i slot — matching walker's
         // `walker_slot_for_variable` pinning regime exactly.
         //
-        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): CFG
+        // TODO (parity regression vs PyPy): CFG
         // `link.args ↔ target.inputargs` pairs are also threaded
         // through the pre-merge.  In PyPy
         // (`regalloc.py:79-96 coalesce_variables` + `:98-112
@@ -9552,7 +9552,7 @@ impl CodeWriter {
         // sole source for `pc_map`.
         let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
         {
-            // Phase 4 endgame — walker post-walk insert_renamings.
+            // Endgame — walker post-walk insert_renamings.
             // Run BEFORE the per-block drain so the splice positions
             // land in the per_block_ssarepr accumulators.  Mirrors
             // `flatten.py:154 self.insert_renamings(link)` for the
@@ -9704,7 +9704,7 @@ impl CodeWriter {
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
-        // Phase 4 endgame slice 1: build canonical SSARepr in parallel
+        // Endgame 1: build canonical SSARepr in parallel
         // under `PYRE_PHASE4_BUILD_CANONICAL=1`.  Mirrors `codewriter.py:53
         // ssarepr = flatten_graph(graph, regallocs, cpu)` — the upstream
         // production path that pyre's walker currently bypasses by
@@ -9713,7 +9713,7 @@ impl CodeWriter {
         // before any per-family flip from walker inline to canonical
         // splice.  Default-off so production is unchanged.
         //
-        // Slice 3: under `PYRE_PHASE4_DIFF_CANONICAL=1` (implies build),
+        // Under `PYRE_PHASE4_DIFF_CANONICAL=1` (implies build),
         // also emit a per-graph length diff to stderr so the byte-
         // equivalent convergence rate can be measured across the 39
         // production benches.
@@ -9803,7 +9803,7 @@ impl CodeWriter {
                      canonical_len={canonical_len} diff={diff}",
                     ssarepr.name,
                 );
-                // Slice 4: per-opname tally so walker-only and
+                // Per-opname tally so walker-only and
                 // canonical-only opnames are named.  Walker emits more
                 // insns than canonical (slice 3 finding); slicing the
                 // delta by opname reveals which families need closure
@@ -9845,7 +9845,7 @@ impl CodeWriter {
                     "[phase4-diff-opname] graph={} walker-only={:?} canonical-only={:?}",
                     ssarepr.name, walker_only, canonical_only,
                 );
-                // Slice 5: first-divergence position locator.  Walker
+                // first-divergence position locator.  Walker
                 // and canonical streams agree on the common prefix
                 // (block label naming, initial inputarg setup); the
                 // first index where their opname tags differ is the
@@ -9878,7 +9878,7 @@ impl CodeWriter {
                         );
                     }
                 }
-                // Slice 6: bucket the walker `-live-` excess by
+                // bucket the walker `-live-` excess by
                 // position relative to nearest preceding `Label`.
                 // `leading_after_label` = walker `-live-` insns at
                 // positions immediately following a Label (the
@@ -9918,7 +9918,7 @@ impl CodeWriter {
                     ssarepr.name,
                     walker_total_live as i64 - canonical_total_live as i64,
                 );
-                // Slice 7: filter out every `-live-` from BOTH streams
+                // filter out every `-live-` from BOTH streams
                 // and rerun the opname-sequence diff.  If the filtered
                 // streams agree, `-live-` is the only structural
                 // divergence and the remaining work is mechanical.
@@ -9955,8 +9955,8 @@ impl CodeWriter {
                         None => "PREFIX_MATCH".to_string(),
                     },
                 );
-                // Slice 8: also filter `ref_copy` (in addition to
-                // `-live-`).  Slice 7 isolated the `-live-` adaptation;
+                // also filter `ref_copy` (in addition to
+                // `-live-`).  The prior step isolated the `-live-` adaptation;
                 // walker's per-opcode stack-shuffle `ref_copy` is the
                 // other major pyre-only emission family.  If non-
                 // exception benches reach PREFIX_MATCH under this
@@ -9996,7 +9996,7 @@ impl CodeWriter {
                         None => "PREFIX_MATCH".to_string(),
                     },
                 );
-                // Slice 10: direct Label count diff.  Slice 9's windowed
+                // direct Label count diff.  The windowed dump's windowed
                 // dump showed the entire non-exception bench divergence
                 // is canonical's extra `Label` insns.  Counting Labels
                 // directly turns the diff into a single measurement
@@ -10019,7 +10019,7 @@ impl CodeWriter {
                     ssarepr.name,
                     canonical_label_count as i64 - walker_label_count as i64,
                 );
-                // Slice 11: collect Label NAMES per stream and emit
+                // collect Label NAMES per stream and emit
                 // the multiset deltas (canonical-only and walker-only).
                 // Tells us whether canonical's extra Labels follow a
                 // naming pattern (block-N synthetic forwarders, link-N
@@ -10059,7 +10059,7 @@ impl CodeWriter {
                      canonical_only={canonical_only_names:?}",
                     ssarepr.name,
                 );
-                // Slice 12: bucket Label names by prefix and report
+                // bucket Label names by prefix and report
                 // counts.  Tests the hypothesis that canonical's extra
                 // Labels (slice 10 diff) are exactly the `link<N>`
                 // per-link trampolines emitted by
@@ -10095,7 +10095,7 @@ impl CodeWriter {
                     c_links as i64 - w_links as i64,
                     c_other as i64 - w_other as i64,
                 );
-                // Slice 13: for each canonical `link<N>` Label, dump
+                // for each canonical `link<N>` Label, dump
                 // the opname of the next ~3 instructions.  Tests
                 // whether canonical's per-link trampolines are bare
                 // (Label + goto, elidable) or carry ref_copy chains
@@ -10119,7 +10119,7 @@ impl CodeWriter {
                         }
                     }
                 }
-                // Slice 15: canonical's `pc_first_insn_pos` side-table
+                // canonical's `pc_first_insn_pos` side-table
                 // is now populated by `flatten::serialize_op`.  Report
                 // its size for each graph alongside the count of
                 // distinct walker py_pcs (from
@@ -10139,7 +10139,7 @@ impl CodeWriter {
                      walker_pc_live_marker_pos_nonempty={walker_pc_count}",
                     ssarepr.name,
                 );
-                // Slice 16: enumerate walker-only PCs (PCs walker
+                // enumerate walker-only PCs (PCs walker
                 // tracks that canonical does NOT).  walker uses py_pc
                 // as an index, so the position in
                 // `walker_pc_live_marker_pos` IS the py_pc.  canonical's
@@ -10170,7 +10170,7 @@ impl CodeWriter {
                     walker_only_pcs.len(),
                     walker_only_pcs.iter().take(16).collect::<Vec<_>>(),
                 );
-                // Slice 17: attempt to assemble canonical SSARepr to
+                // attempt to assemble canonical SSARepr to
                 // validate it produces a complete byte stream.  Walker
                 // assembles via `finalize_jitcode` (with `pc_map`
                 // translation + descr stamping + many side-effects);
@@ -10179,7 +10179,7 @@ impl CodeWriter {
                 // a canonical-assembly panic surfaces but doesn't
                 // abort the production CodeWriter.
                 //
-                // Slice 19: pre-register helper fn pointers on a fresh
+                // pre-register helper fn pointers on a fresh
                 // canonical `SSAReprEmitter` so descrs[0..N] align
                 // with the fn_idx values baked into canonical's
                 // `residual_call_*` Insn shapes.  Mirrors walker's
@@ -10211,7 +10211,7 @@ impl CodeWriter {
                     }));
                 match assembly_result {
                     Ok((jitcode, post_assemble_ssarepr)) => {
-                        // Slice 20: log canonical's assembled bytecode
+                        // log canonical's assembled bytecode
                         // length and the highest pc_first_insn_pos byte
                         // offset (translated via `insns_pos`) so the
                         // splice viability question — "could canonical's
@@ -10258,7 +10258,7 @@ impl CodeWriter {
                         );
                     }
                 }
-                // Slice 9: windowed dump around the double-filtered
+                // windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
                 // a structural pattern (always same opname sequence at
@@ -10351,11 +10351,11 @@ impl CodeWriter {
         // pair is unioned via try_coalesce, alongside the SSARepr
         // `*_copy` scanner inside
         // `SSAReprRegAllocator::coalesce_variables` (intra-block
-        // coalesce, pyre walker NEW-DEVIATION because upstream defers
+        // coalesce, pyre walker TODO because upstream defers
         // `*_copy` to `flatten.py:306-334`).  Both sources feed the
         // same union-find + depgraph.
         //
-        // SSARepr-side regalloc is u16-keyed PRE-EXISTING-ADAPTATION;
+        // SSARepr-side regalloc is u16-keyed TODO;
         // project the Variable pairs (collected pre-renaming above as
         // `cfg_variable_pairs`) through `walker_slot_for_variable`
         // at the consumer.  Pairs whose endpoints have no walker slot
@@ -10384,19 +10384,19 @@ impl CodeWriter {
             inputs,
             &cfg_coalesce_pairs,
         );
-        // Phase 3 (b) Slice 1: run graph-side
+        // Run graph-side
         // `perform_register_allocation_all_kinds` +
         // `enforce_input_args` post-walker on every
         // production graph, matching upstream `codewriter.py:44-46`'s
         // pre-flatten regalloc step.  The result is not consumed yet —
-        // Slice 2 will build the `(Kind, slot) → color` bridge map that
+        // The `(Kind, slot) → color` bridge map that
         // the 5 SSA-side `alloc_result` consumers below currently rely
-        // on; Slice 3 will swap the source of truth.  Running the
+        // on; the source of truth will be swapped later.  Running the
         // graph-side allocator unconditionally first surfaces any
         // graph topology that the allocator can't process before any
         // downstream code reads from it.
         //
-        // Phase 4 endgame: `graph_regallocs` is now computed earlier
+        // Endgame: `graph_regallocs` is now computed earlier
         // (pre-drain) so walker insert_renamings shares the same
         // colors as canonical's pass below.  The duplicate compute is
         // retired; we reuse the shared instance.
@@ -10414,7 +10414,7 @@ impl CodeWriter {
         let portal_ec_reg =
             super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_ec_reg);
 
-        // Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
+        // Graph-side register allocation (plan
         // `~/.claude/plans/staged-sauteeing-koala.md`): record each
         // Python-semantic stack slot's post-regalloc color. With the
         // input-arg pinning removed (regalloc.rs `enforce_input_args`
@@ -10448,14 +10448,14 @@ impl CodeWriter {
         // -100 parity) pins each local-i inputarg color to identity
         // (`color = i`), so this map is `[0, 1, ..., nlocals-1]` for
         // every populated jitcode.  When `enforce_input_args` pinning
-        // is relaxed (Task #158), the encoder will read this map to
+        // is relaxed, the encoder will read this map to
         // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
             pyre_color_for_semantic_local.push(post);
         }
-        // Phase 4 endgame slice 22: under PYRE_PHASE4_DIFF_CANONICAL,
+        // Endgame 22: under PYRE_PHASE4_DIFF_CANONICAL,
         // compare walker's alloc_result-derived stack_slot_color_map /
         // pyre_color_for_semantic_local against a graph_regallocs-derived
         // alternative.  Production splice (replace walker emission with
@@ -10536,7 +10536,7 @@ impl CodeWriter {
                  local_walker_only={local_walker_only}",
                 ssarepr.name,
             );
-            // Slice 25: report startblock inputargs' canonical colors
+            // Report startblock inputargs' canonical colors
             // directly.  Tests the slice 24 hypothesis: enforce_input_args
             // rotates inputargs to colors 0..n, but those inputargs are
             // DIFFERENT VariableIds than the scratches walker_slot_for_variable
@@ -10990,7 +10990,7 @@ pub fn register_portal_jitdriver(
 /// `unfinished_graphs`; the surrounding `make_jitcodes` drain then fills the
 /// same JitCode object.
 ///
-/// # Non-portal callee status (PRE-EXISTING-ADAPTATION, partial fix in flight)
+/// # Non-portal callee status (TODO, partial fix in flight)
 ///
 /// Drained graphs whose `code` is NOT registered as a portal go through the
 /// same `transform_graph_to_jitcode` body. `is_portal=false` already gates

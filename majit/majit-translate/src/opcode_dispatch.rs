@@ -1,6 +1,6 @@
 //! Opcode dispatch arm metadata.
 //!
-//! PRE-EXISTING-ADAPTATION. PyPy's interpreter has one Python method per
+//! TODO: PyPy's interpreter has one Python method per
 //! opcode (`def LOAD_FAST(self, varindex, next_instr)`); each method is
 //! registered with `CallControl.get_jitcode(graph)` and assigned a slot
 //! in `all_jitcodes[]`. Pyre's interpreter dispatches opcodes inside one

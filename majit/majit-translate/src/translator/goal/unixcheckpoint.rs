@@ -241,7 +241,7 @@ fn restartable_point_fork_with<R: BufRead, W: Write, P: CheckpointRuntime>(
                     });
                 }
                 "pdb" => {
-                    // PRE-EXISTING-ADAPTATION: upstream `unixcheckpoint.py:27`
+                    // TODO: upstream `unixcheckpoint.py:27`
                     // calls `pdb.set_trace()` to drop into Python's interactive
                     // debugger.  Rust has no in-process equivalent of `pdb`, so
                     // the prompt accepts the keyword and writes the same

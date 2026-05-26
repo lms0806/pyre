@@ -98,7 +98,7 @@ pub fn raise_type_error(w_function: PyObjectRef, msg: String) -> crate::PyError 
 /// parallel string-typed list), so the typed dispatch reduces to byte
 /// equality of the underlying utf8.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's `W_UnicodeObject` does not yet
+/// TODO: pyre's `W_UnicodeObject` does not yet
 /// expose an `eq_w` method, so the byte-equality is open-coded via
 /// `pyre_object::w_str_get_value` and gated on `is_str`.  The identity
 /// fast path `is_w` is preserved as the cheap shortcut PyPy gets from
@@ -389,7 +389,7 @@ pub fn combine_starargs_wrapped(
 ///     ...merge into self.keyword_names_w / self.keywords_w...
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's `view_as_kwargs` always returns
+/// TODO: pyre's `view_as_kwargs` always returns
 /// `(None, [])` (kwargsdict variant unported), so the fast-path arm
 /// (lines 110-120) is unreachable until the dict-strategy port lands.
 /// The slow `keys()` iteration arm runs unconditionally for now.
@@ -456,7 +456,7 @@ pub fn combine_starstarargs_wrapped(
             // OperationError and re-raises async (baseobjspace.py:878).
             // Pyre's `findattr` matches the same shape (Option<W>),
             // modulo async-propagation (still a known gap covered by
-            // the `findattr` PRE-EXISTING-ADAPTATION).
+            // the `findattr` TODO).
             let w_obj_type = crate::typedef::r#type(w_starstararg).unwrap_or(pyre_object::PY_NULL);
             let lhs = if w_obj_type.is_null() {
                 None
@@ -561,7 +561,7 @@ pub fn combine_starstarargs_wrapped(
 /// `combine_starargs_wrapped` / `combine_starstarargs_wrapped`
 /// in-place, matching the upstream constructor flow.
 ///
-/// PRE-EXISTING-ADAPTATION (justified): PyPy stores RPython list
+/// TODO(justified): PyPy stores RPython list
 /// references — the same mutable list object can be aliased between
 /// the caller's `args` and `Arguments.arguments_w`.  Pyre owns
 /// `Vec<PyObjectRef>` and clones at construction.  Rust's borrow
@@ -1041,7 +1041,7 @@ impl Arguments {
         if signature.has_kwarg() {
             // PyPy: `space.newdict(kwargs=True)` produces a kwargs-strategy
             // dict; pyre's W_DictObject lacks the strategy variant so a
-            // plain dict is used (PRE-EXISTING-ADAPTATION).
+            // plain dict is used (TODO: add kwargs strategy).
             w_kwds = pyre_object::dictmultiobject::w_dict_new();
             let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
             scope_w[kwarg_loc] = w_kwds;

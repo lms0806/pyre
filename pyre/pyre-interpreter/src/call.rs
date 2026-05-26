@@ -192,7 +192,7 @@ pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
 /// `space.getexecutioncontext()` callers see the live EC even when
 /// no eval frame is currently on the stack.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre is single-threaded today so the TLS
+/// TODO: pyre is single-threaded today so the TLS
 /// slot is effectively a global.  PyPy's per-thread `threadlocals`
 /// dispatch lands when pyre adds its own thread state container.
 pub fn getexecutioncontext() -> *const crate::PyExecutionContext {

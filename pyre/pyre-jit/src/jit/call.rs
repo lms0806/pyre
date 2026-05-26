@@ -143,8 +143,7 @@ pub struct JitDriverStaticData {
     /// path is reworked so the runtime `JitCode` itself can be
     /// late-stamped without an outer skeleton (the per-jitcode pyre-only
     /// metadata moves to a side table keyed by `RuntimeJitCode` Arc
-    /// identity).  See `pyjitcode_wrapper_dissolution_slice_a_audit_*`
-    /// memos for the multi-session plan.
+    /// identity).
     pub mainjitcode: Option<std::sync::Arc<PyJitCode>>,
 }
 

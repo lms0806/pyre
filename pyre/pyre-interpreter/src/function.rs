@@ -207,7 +207,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// The remaining fields are non-GC: `can_change_code` is a `bool`,
 /// `name` is a manually-managed `*const String`, `w_func_globals` is a
 /// `*mut DictStorage` (manually-managed pointer to non-GC storage —
-/// see Task #145 follow-up for DictStorage GC migration).
+/// see DictStorage GC migration TODO).
 ///
 /// `ob.w_class` is intentionally absent, mirroring how W_IntObject /
 /// W_FloatObject leave the typeptr-shaped header field out of their
@@ -339,7 +339,7 @@ fn function_new_impl(
     // construction onward; `function_get_globals_obj`'s lazy
     // fallback becomes a zero-hit safety net for synthetic test
     // stubs that pass a null storage pointer.  This is the first
-    // step of Phase 5 commit 3 — collapsing the dual storage to
+    // step toward collapsing the dual storage to
     // a single `PyObjectRef` field requires that every Function
     // already has its `__globals__` resolved at construction time.
     // Prefer the explicit `PyObjectRef` hint when the caller already
@@ -1394,7 +1394,7 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// After fdel___module__ writes w_none(), subsequent reads return
 /// None without re-computing from globals.
 ///
-/// Phase 5 cutover: reach for `w_func_globals_obj` (the canonical
+/// TODO: reach for `w_func_globals_obj` (the canonical
 /// PyObjectRef the user actually sees via `__globals__`) and route
 /// through `w_dict_getitem_str`, which dispatches `is_module_dict`
 /// to `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).

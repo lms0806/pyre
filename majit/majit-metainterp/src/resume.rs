@@ -3400,7 +3400,7 @@ impl ResumeDataLoopMemo {
         if !virtual_fields.is_empty() {
             // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
             let length = num_env_virtuals + self.num_cached_virtuals();
-            // PRE-EXISTING-ADAPTATION: resume.py:492 uses `[None] * length` —
+            // TODO: resume.py:492 uses `[None] * length` —
             // holes are represented as Python `None` in the list. Pyre's
             // descr-side `rd_virtuals: Arc<[Rc<RdVirtualInfo>]>` (compile.py:855
             // `_attrs_`) wraps the whole array in Option but the INNER

@@ -554,7 +554,7 @@ pub(super) fn lower_pre_dispatch_stmts(
         if !seen_merge_point {
             continue;
         }
-        // Slice 1.4: try to lower opcode-fetch patterns before the
+        // Try to lower opcode-fetch patterns before the
         // state-field filter so they are emitted as IR ops rather than
         // verbatim Rust (which would fail to compile inside
         // `__dispatch_jitcode_*` where `program`/`pc` are not in scope).
@@ -603,7 +603,7 @@ pub(super) fn lower_pre_dispatch_stmts(
         // through `jtransform.py:456-470 rewrite_op` + `call.py:282-324
         // getcalldescr`'s analyzer trio at translation time. Pyre's
         // `resolve_call_policy` + `lower_config_call_stmt` is the
-        // per-callsite equivalent before Task #64 plumbs the analyzer
+        // per-callsite equivalent before the analyzer
         // trio output to runtime helper-call sites. This recognizer is
         // a third path alongside opcode-fetch and state-modifying stmts
         // — it MUST NOT extend `stmt_modifies_jit_state`, which means
@@ -632,7 +632,7 @@ pub(super) fn lower_pre_dispatch_stmts(
 /// `DEFAULT_EFFECT_INFO` (EF_CAN_RAISE + saturated read/write descrs)
 /// per Pre-A.2.5 codex review (`call.py:282-324 getcalldescr` for the
 /// upstream analyzer-trio classification; pyre's per-callsite hatch
-/// before Task #64 plumbs the analyzer outputs).
+/// before the analyzer outputs are plumbed).
 ///
 /// Returns `true` if the stmt was consumed (lowered via
 /// `lower_config_call_stmt`), `false` if the caller should continue
@@ -1704,7 +1704,7 @@ mod dispatch_arm_inline_call_tokens_tests {
     }
 }
 
-/// Slice 1.5: Emit the dispatch chain for the opcode dispatch loop.
+/// Emit the dispatch chain for the opcode dispatch loop.
 ///
 /// For each non-wildcard arm, emits a fused `goto_if_not_int_eq/iiL`
 /// (BC_GOTO_IF_NOT_INT_EQ) that branches past the arm if the opcode does NOT
@@ -1822,7 +1822,7 @@ pub(super) fn lower_dispatch_chain(
         // This executes when the arm MATCHED (guards fell through); the
         // sub-JitCode encodes the opcode handler body.
         //
-        // Slice 1.3 of dispatch-arm caller-local plumbing: walk the arm
+        // Dispatch-arm caller-local plumbing: walk the arm
         // body to collect parent-scope idents (via `collect_arm_caller_locals`),
         // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
         // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
@@ -2145,7 +2145,7 @@ pub(super) fn resolve_greens(
 /// pyre's portal inputs are `program` (Ref/r0), `pc` (Int/i0), and optionally
 /// `vable_var` (Ref/r1).  The reds = portal-inputs minus declared greens.
 ///
-/// PRE-EXISTING-ADAPTATION: `interp_jit.py:67 reds = ['frame', 'ec']` uses
+/// TODO: `interp_jit.py:67 reds = ['frame', 'ec']` uses
 /// PyPy's frame+ec pair; pyre uses `[program, pc]` (minus greens) as its
 /// minimal reds set.  Consumers that want the PyPy parity declaration can set
 /// `greens = [pc, program]`, leaving reds = [], which is the intended A.6
@@ -2479,22 +2479,22 @@ fn assert_kind_sorted(label: &str, vars: &[(u8, String, TokenStream)]) {
     }
 }
 
-/// Slice 1: Dispatch JitCode body lowerer.
+/// Dispatch JitCode body lowerer.
 ///
 /// Lowers a `#[jit_interp]` function's `while { jit_merge_point!(); ...
 /// match opcode { ... } }` dispatch loop into a single dispatch JitCode
 /// body. Mirrors RPython `pypy/module/pypyjit/interp_jit.py:82-94`
 /// portal + `pypy/interpreter/pyopcode.py:168-181` dispatch_bytecode.
 ///
-/// Output IR shape (filled in across Slice 1 tasks 1.1-1.7):
-/// 1. `BC_LIVE` (canonical entry) — Task 1.1 (this task)
-/// 2. `BC_JIT_MERGE_POINT(_C)` (interp_jit.py:88-90 jit_merge_point hook) — Task 1.2
-/// 3. `BC_LOOP_HEADER` — Task 1.2
-/// 4. pre-dispatch ops, source-order (interp_jit.py:91-93) — Task 1.3
-/// 5. opcode/oparg fetch + pc advance (pyopcode.py:171-181) — Task 1.4
+/// Output IR shape:
+/// 1. `BC_LIVE` (canonical entry)
+/// 2. `BC_JIT_MERGE_POINT(_C)` (interp_jit.py:88-90 jit_merge_point hook)
+/// 3. `BC_LOOP_HEADER`
+/// 4. pre-dispatch ops, source-order (interp_jit.py:91-93)
+/// 5. opcode/oparg fetch + pc advance (pyopcode.py:171-181)
 /// 6. dispatch chain via existing `BC_GOTO_IF_NOT_*` ops
-///    (jtransform.py:196-225 conditional fusion) — Task 1.5
-/// 7. per-arm `BC_INLINE_CALL sub_jitcode_idx` (jtransform.py:473-482) — Task 1.6
+///    (jtransform.py:196-225 conditional fusion)
+/// 7. per-arm `BC_INLINE_CALL sub_jitcode_idx` (jtransform.py:473-482)
 /// 8. loop close `BC_GOTO 0` — Task 1.7
 /// 9. default arm: typed return / dispatch-exit ABI — Task 1.7
 pub(crate) fn lower_dispatch_body(
@@ -2634,7 +2634,7 @@ pub(crate) fn lower_dispatch_body(
     // backwards relative to RPython (which has loop_header at back-edges)
     // and is now retired.
 
-    // Slice 1.4: allocate input registers for the dispatch JitCode.
+    // Allocate input registers for the dispatch JitCode.
     //
     // The dispatch JitCode reads from two reds at its entry point:
     //   r0 — `program` (bytecode slice, Ref bank)
@@ -2645,7 +2645,7 @@ pub(crate) fn lower_dispatch_body(
     // Mirrors interp_jit.py:67-70 reds=['frame', 'ec'] for PyPy's portal;
     // pyre's per-#[jit_interp] dispatch uses (program, pc) as the minimal
     // reds.  The actual value seeding (binding i0/r0 to the outer Rust
-    // `program`/`pc` at trace time) is Slice 2's `__trace_*` rewrite.
+    // `program`/`pc` at trace time) is the `__trace_*` rewrite.
     //
     // TODO: derive env_param_name / pc_var_name from LowererConfig or
     // macro config instead of hard-coding "program"/"pc".

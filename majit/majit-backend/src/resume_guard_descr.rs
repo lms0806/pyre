@@ -3,11 +3,10 @@
 //! backend's codegen identity.  Moved to `majit-backend` so backends
 //! can instantiate it directly without depending on `majit-metainterp`.
 //!
-//! This is the unified-descr endpoint of the Phase C-1 cascade: with
-//! `ResumeGuardDescr` reachable from backend codegen, the dynasm
-//! per-emission wrapper `DynasmFailDescr` was retired (Slice 7-Tα7);
-//! the cranelift counterpart still carries codegen-bound payload
-//! pending Phase 7-Tβ.
+//! This is the unified-descr endpoint: with `ResumeGuardDescr`
+//! reachable from backend codegen, the dynasm per-emission wrapper
+//! `DynasmFailDescr` was retired; the cranelift counterpart was
+//! also retired once codegen-bound payload was lifted here.
 //!
 //! # Concurrency invariant (audited 2026-05-19)
 //!
@@ -159,8 +158,7 @@ pub struct ResumeGuardDescr {
     /// at compile time has an implicit index in `loop.operations`).
     /// Used at the backend→metainterp interop boundary
     /// (`FailDescrLayout::source_op_index`).  Migrated here from
-    /// `CraneliftFailDescr::source_op_index_cell` (Slice 7-Tβ6) so the
-    /// meta Arc is the single source of truth.  `None` for synthetic
+    /// the meta Arc is the single source of truth.  `None` for synthetic
     /// FINISH / external-JUMP descrs that have no associated trace op.
     pub source_op_index: UnsafeCell<Option<usize>>,
     /// Force-token slot positions for runtime GC-root filtering.
@@ -168,19 +166,18 @@ pub struct ResumeGuardDescr {
     /// GC-map immediates (`assembler.py` handles force-token slot
     /// produce/consume inline); cranelift IR has no equivalent inline
     /// encoding so the vector lives on the descr.  Migrated here from
-    /// `CraneliftFailDescr::force_token_slots_cell` (Slice 7-Tβ7) so
     /// the meta Arc is the single source of truth.  Sorted and deduped
     /// at write time so `is_force_token_slot` can use `binary_search`.
     pub force_token_slots: UnsafeCell<Vec<usize>>,
     /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
     /// drives `must_compile` via `jitcounter.tick(status_hash)` in
-    /// RPython.  Pyre keeps a raw per-descr counter (Slice 7-Tβ9):
+    /// RPython.  Pyre keeps a raw per-descr counter:
     /// the cranelift dispatch hot path calls `increment_fail_count()`
     /// once per guard failure to drive the same threshold logic.
     /// Migrated here from `CraneliftFailDescr::fail_count` so the
     /// meta Arc is the single source of truth.
     pub fail_count: AtomicU32,
-    /// Per-descr `CompiledTraceInfo` cell (Slice 7-Tβ10).  PyPy
+    /// Per-descr `CompiledTraceInfo` cell.  PyPy
     /// recovers the same state on demand from `cpu.asmmemmgr_blocks` +
     /// `compiled_loop_token`; cranelift parks the per-trace metadata
     /// (input types / header_pc / source_guard tuple) here so the
@@ -192,8 +189,8 @@ pub struct ResumeGuardDescr {
     /// Null on construction.  Written via
     /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
     pub trace_info: AtomicPtr<CompiledTraceInfo>,
-    /// Per-descr external-JUMP target cell (Slice 7-Tβ8 / cranelift-
-    /// only NEW DEVIATION).  PyPy's `assembler.py:2456-2462 closing_jump`
+    /// Per-descr external-JUMP target cell (cranelift-only TODO).
+    /// PyPy's `assembler.py:2456-2462 closing_jump`
     /// emits a raw inter-function JMP to `target_token._ll_loop_code`
     /// at codegen time, so no per-descr slot exists upstream.  Cranelift
     /// IR cannot emit raw inter-function JMPs, so cross-loop JUMP descrs
@@ -205,10 +202,10 @@ pub struct ResumeGuardDescr {
     ///
     /// Write-once: set at codegen finalisation.  Migrated here from
     /// `CraneliftFailDescr::external_jump_target_cell` so the meta Arc
-    /// is the single source of truth (Slice 7-Tβ8).
+    /// is the single source of truth.
     pub external_jump_target: OnceLock<DescrRef>,
-    /// Bridge code-pointer cache (Slice 7-Tβ11 / cranelift-only NEW
-    /// DEVIATION).  PyPy's `assembler.py:987 patch_jump_for_descr`
+    /// Bridge code-pointer cache (cranelift-only TODO: PyPy patches
+    /// guard JMP targets in place).  PyPy's `assembler.py:987 patch_jump_for_descr`
     /// rewrites the guard JMP target in place when a bridge is
     /// attached; cranelift cannot patch finalised code, so the
     /// JIT-baked dispatch loads the bridge code-pointer from this
@@ -221,13 +218,13 @@ pub struct ResumeGuardDescr {
     /// `emit_attached_bridge_dispatch` (compiler.rs:5347) embeds this
     /// address as an immediate.  `0` = no bridge attached.
     pub bridge_code_ptr_cache: Box<AtomicUsize>,
-    /// Bridge frame-depth cache (Slice 7-Tβ11).  Same shape as
+    /// Bridge frame-depth cache.  Same shape as
     /// `bridge_code_ptr_cache`; baked into the dispatch path so the
     /// runtime can verify the JIT frame can fit the bridge inputs
     /// before re-entering.
     pub bridge_frame_depth_cache: Box<AtomicUsize>,
-    /// Bridge dispatch cell (Slice 7-Tβ12 / cranelift-only NEW
-    /// DEVIATION).  PyPy's `assembler.py:987 patch_jump_for_descr`
+    /// Bridge dispatch cell (cranelift-only TODO: PyPy patches guard
+    /// JMP targets in place).  PyPy's `assembler.py:987 patch_jump_for_descr`
     /// rewrites the guard JMP target in place; cranelift cannot patch
     /// finalised code, so the runtime guard-failure dispatch loads
     /// the published `Arc<BridgeData>` raw pointer from this cell
@@ -516,11 +513,8 @@ impl FailDescr for ResumeGuardDescr {
     /// `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
     /// are routed through a synthesised `ResumeGuardDescr` whose
     /// `external_jump_target` slot carries the cross-loop TargetToken
-    /// `DescrRef` (Slice 7-Tβ8).  Membership in the slot IS the
-    /// external-JUMP predicate.  Slice 7-Tβ14f override: prior to
-    /// CraneliftFailDescr deletion the predicate lived on the backend
-    /// wrapper; with the wrapper gone the FailDescr trait impl must
-    /// answer directly.
+    /// `DescrRef`.  Membership in the slot IS the external-JUMP
+    /// predicate.
     fn is_external_jump(&self) -> bool {
         self.external_jump_target.get().is_some()
     }
@@ -528,13 +522,13 @@ impl FailDescr for ResumeGuardDescr {
     /// `history.py:470` `TargetToken._ll_loop_code` parity: when this
     /// descr is the synthesised cross-loop JUMP exit, surface the target
     /// `DescrRef` the dispatcher re-enters via.  `None` for regular
-    /// guard descrs.  Slice 7-Tβ14f override (see `is_external_jump`).
+    /// guard descrs.
     fn target_descr(&self) -> Option<DescrRef> {
         self.external_jump_target.get().cloned()
     }
 
     /// Trait override of `set_external_jump_target` forwarding to the
-    /// inherent method (Slice 7-Tβ8); reuses the same write-once
+    /// inherent method; reuses the same write-once
     /// semantics so trait dispatch on `&dyn FailDescr` lands here for
     /// the cross-loop JUMP target publish in `collect_guards`.
     fn set_external_jump_target(&self, target: DescrRef) {
@@ -577,7 +571,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
 }
 
 impl ResumeGuardDescr {
-    /// Read the codegen-time `source_op_index` (Slice 7-Tβ6).  `None`
+    /// Read the codegen-time `source_op_index`.  `None`
     /// when codegen has not yet stamped one (synthetic descrs minted
     /// outside `_compile_one_block`).
     pub fn source_op_index(&self) -> Option<usize> {
@@ -585,13 +579,13 @@ impl ResumeGuardDescr {
         unsafe { *self.source_op_index.get() }
     }
 
-    /// Write the codegen-time `source_op_index` (Slice 7-Tβ6).
+    /// Write the codegen-time `source_op_index`.
     pub fn set_source_op_index(&self, source_op_index: usize) {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
 
-    /// Read the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Read the codegen-time `force_token_slots`.
     /// Returns `&[]` when codegen has not stamped any slots (the
     /// common case for guards that do not produce force tokens).
     pub fn force_token_slots(&self) -> &[usize] {
@@ -599,7 +593,7 @@ impl ResumeGuardDescr {
         unsafe { &*self.force_token_slots.get() }
     }
 
-    /// Write the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Write the codegen-time `force_token_slots`.
     /// Sorts + dedups so the stored vector satisfies the
     /// `binary_search` invariant used by
     /// `CraneliftFailDescr::is_force_token_slot`.
@@ -610,7 +604,7 @@ impl ResumeGuardDescr {
         unsafe { *self.force_token_slots.get() = slots };
     }
 
-    /// Increment the per-descr `fail_count` (Slice 7-Tβ9).  Returns
+    /// Increment the per-descr `fail_count`.  Returns
     /// the post-increment value.  Mirrors PyPy's `jitcounter.tick`
     /// semantics: one increment per observed guard failure, drives
     /// `must_compile` threshold in `compile.py:701-717`.
@@ -618,13 +612,13 @@ impl ResumeGuardDescr {
         self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Read the per-descr `fail_count` (Slice 7-Tβ9).
+    /// Read the per-descr `fail_count`.
     pub fn get_fail_count(&self) -> u32 {
         self.fail_count.load(Ordering::Relaxed)
     }
 
     /// Publish the per-trace `CompiledTraceInfo` into the descr-local
-    /// atomic cell (Slice 7-Tβ10).  Any previously published Arc is
+    /// atomic cell.  Any previously published Arc is
     /// reclaimed by the swap.
     pub fn set_trace_info(&self, info: CompiledTraceInfo) {
         let new_ptr = Arc::into_raw(Arc::new(info)) as *mut CompiledTraceInfo;
@@ -636,7 +630,7 @@ impl ResumeGuardDescr {
         }
     }
 
-    /// Read the per-trace `CompiledTraceInfo` (Slice 7-Tβ10).
+    /// Read the per-trace `CompiledTraceInfo`.
     /// Returns an owned clone of the published value, or `None` when
     /// no trace info has been published.  Lock-free.
     ///
@@ -664,7 +658,7 @@ impl ResumeGuardDescr {
         }
     }
 
-    /// Publish the external-JUMP target (Slice 7-Tβ8).  Write-once;
+    /// Publish the external-JUMP target.  Write-once;
     /// panics if invoked twice on the same descr (mirrors PyPy's
     /// `assembler.py:2456-2462 closing_jump` codegen-time finality —
     /// the target is determined at trace emission and never revised).
@@ -674,7 +668,7 @@ impl ResumeGuardDescr {
             .expect("external_jump_target already published");
     }
 
-    /// Read the external-JUMP target (Slice 7-Tβ8).  `None` for
+    /// Read the external-JUMP target.  `None` for
     /// regular guard descrs (the common case); `Some` only for the
     /// cranelift-synthesised cross-loop JUMP descrs.
     pub fn external_jump_target(&self) -> Option<DescrRef> {
@@ -682,13 +676,13 @@ impl ResumeGuardDescr {
     }
 
     /// Predicate (`is_external_jump` parity) — membership in the
-    /// external-JUMP target cell (Slice 7-Tβ8).
+    /// external-JUMP target cell.
     pub fn is_external_jump(&self) -> bool {
         self.external_jump_target.get().is_some()
     }
 
     /// Heap-pinned addresses of the two bridge-cache atomic cells
-    /// (Slice 7-Tβ11) suitable for baking into JIT machine code as
+    /// suitable for baking into JIT machine code as
     /// immediates.  Returns `(code_ptr_addr, frame_depth_addr)`.
     pub fn bridge_cache_addrs(&self) -> (usize, usize) {
         (
@@ -698,7 +692,7 @@ impl ResumeGuardDescr {
     }
 
     /// Atomically store the bridge code-pointer + frame-depth caches
-    /// (Slice 7-Tβ11).  Called from cranelift `attach_bridge` after
+    /// Called from cranelift `attach_bridge` after
     /// the bridge has been compiled.
     pub fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
         self.bridge_frame_depth_cache
@@ -707,13 +701,13 @@ impl ResumeGuardDescr {
             .store(code_ptr, Ordering::Release);
     }
 
-    /// Read the cached bridge code-pointer (Slice 7-Tβ11).  `0` when
+    /// Read the cached bridge code-pointer.  `0` when
     /// no bridge is attached.
     pub fn bridge_code_ptr(&self) -> usize {
         self.bridge_code_ptr_cache.load(Ordering::Acquire)
     }
 
-    /// Read the type-erased bridge dispatch cell (Slice 7-Tβ12).
+    /// Read the type-erased bridge dispatch cell.
     /// Returns the published raw pointer for the backend to
     /// reconstruct its concrete `Arc<BridgeData>` via
     /// `Arc::increment_strong_count + Arc::from_raw`.  Null when no
@@ -723,7 +717,7 @@ impl ResumeGuardDescr {
     }
 
     /// Atomic-swap a new bridge dispatch payload into the cell and
-    /// register the backend-supplied cleanup function (Slice 7-Tβ12).
+    /// register the backend-supplied cleanup function.
     /// Returns the previous payload so the backend can reclaim its
     /// owned `Arc`.  The cleanup function is registered once
     /// (idempotent) and invoked by `Drop` on any payload still in the
@@ -752,7 +746,7 @@ impl ResumeGuardDescr {
 
 impl Drop for ResumeGuardDescr {
     fn drop(&mut self) {
-        // Slice 7-Tβ10: reclaim any published `Arc<CompiledTraceInfo>`
+        // Reclaim any published `Arc<CompiledTraceInfo>`
         // by swapping the cell to null and reconstructing the Arc so
         // its Drop runs.
         let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
@@ -761,7 +755,7 @@ impl Drop for ResumeGuardDescr {
             // `set_trace_info`.
             unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
         }
-        // Slice 7-Tβ12: reclaim any published bridge dispatch payload
+        // Reclaim any published bridge dispatch payload
         // via the backend-registered cleanup function.  Swap-to-null
         // first so a concurrent reader either sees the still-live
         // pointer (and bumps the strong count) or null (and skips).

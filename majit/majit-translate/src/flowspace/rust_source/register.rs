@@ -344,7 +344,7 @@ pub fn build_host_function_from_rust_file(
 /// `__code__` is set but whose flowspace `FunctionGraph` has not been
 /// built yet.
 ///
-/// **Status**: as of Issue 1.2 (PRE-EXISTING-ADAPTATION), this helper
+/// **Status**: as of Issue 1.2 (TODO), this helper
 /// is no longer the walker's body-deferral path —
 /// [`register_rust_module`] does not register `Item::Fn` because
 /// the rebuild path between `FunctionDesc.buildgraph`
@@ -518,13 +518,13 @@ pub fn register_rust_module(file: &File) -> Result<ModuleId, AdapterError> {
 /// method's `(target_class_path, method_name, body)` triple between
 /// pass 1 (collection) and pass 2 (lower-and-`class_set`).
 ///
-/// Slice O24: `class_path` widened from `String` (single segment) to
+/// `class_path` widened from `String` (single segment) to
 /// `Vec<String>` (1+ segments) so multi-segment self-types (`impl
 /// Trait for foo::Bar` where `foo` is a registered inline-mod
 /// namespace) cascade through [`try_resolve_use_path`] in pass 2.
-/// Length-1 paths preserve Slice O18 / O22 behavior; length-2+ paths
+/// Length-1 paths preserve prior behavior; length-2+ paths
 /// add the inline-mod cascade pending external-crate / `crate::` /
-/// `super::` resolution (multi-session).
+/// `super::` resolution.
 struct DeferredImpl {
     class_path: Vec<String>,
     method_name: String,
@@ -986,7 +986,7 @@ fn register_items_into_namespace<'a>(
             // borrow concept) so `Foo<'a>` resolves to the same
             // classdef as `Foo`.
             //
-            // **PRE-EXISTING-ADAPTATION (trait-name namespace
+            // **TODO (trait-name namespace
             // collapse).** Rust's trait method dispatch can
             // disambiguate same-named methods from different traits
             // (`<Foo as TraitA>::name` vs `<Foo as TraitB>::name`)
@@ -1002,7 +1002,7 @@ fn register_items_into_namespace<'a>(
             // `seen_method_collisions` in both walkers (round-4
             // 2026-05-11). Convergence option (a) — a trait-aware
             // dispatch table keyed on `(trait_id, method_name)` — is
-            // still deferred (multi-session, no upstream basis) and
+            // still deferred (no upstream basis) and
             // would let two trait impls with the same method name
             // coexist instead of erroring out. Today's closed-world
             // `pyre-interpreter` codebase avoids such collisions so
@@ -1023,8 +1023,8 @@ fn register_items_into_namespace<'a>(
             // add_source_attribute`'s `classdict[name] =
             // Constant(value)` flat assignment.
             Item::Impl(item_impl) if is_external_rooted_impl_self_type(&item_impl.self_ty) => {
-                // PRE-EXISTING-ADAPTATION (external scope): see the
-                // outer walker's identical short-circuit.
+                // TODO (external scope): see the outer walker's
+                // identical short-circuit.
                 let _ = item_impl;
                 continue;
             }
@@ -1072,7 +1072,7 @@ fn register_items_into_namespace<'a>(
             // Skip leading-`::` paths and paths rooted at well-known
             // external prefixes (`crate::`, `super::`, `self::`,
             // `std::`, `core::`, `alloc::`) — multi-file resolution
-            // is its own future slice (PRE-EXISTING-ADAPTATION,
+            // is its own future port (TODO,
             // outer-walker convergence path applies).
             Item::Use(item_use) => {
                 if item_use.leading_colon.is_some() {
@@ -1091,7 +1091,7 @@ fn register_items_into_namespace<'a>(
                 }
             }
             _ => {
-                // PRE-EXISTING-ADAPTATION: same set of silently-skipped
+                // TODO: same set of silently-skipped
                 // item kinds as the outer walker — `static mut`,
                 // `Item::Trait` / `TraitAlias`, `Item::Type`,
                 // `Item::Macro`, `Item::ForeignMod`, `Item::ExternCrate`,
@@ -1614,8 +1614,8 @@ pub fn register_rust_module_at_with_source(
             // assignment-bound names identically.
             //
             // **Mutable static (`static mut FOO: T = <expr>;`) is
-            // NOT registered** (Slice O15, codex parity audit
-            // 2026-05-06). PRE-EXISTING-ADAPTATION: Rust's `mut`
+            // NOT registered** (codex parity audit
+            // 2026-05-06). TODO: Rust's `mut`
             // marks the global as runtime-mutated; the registry
             // entry would be a stale snapshot of the *initial*
             // value the moment any code writes to it, and folding
@@ -1730,7 +1730,7 @@ pub fn register_rust_module_at_with_source(
             // below because type-arg reification is required before a
             // method can attach to one concrete class dict.
             Item::Impl(item_impl) if is_external_rooted_impl_self_type(&item_impl.self_ty) => {
-                // PRE-EXISTING-ADAPTATION (external scope):
+                // TODO (external scope):
                 // `impl Trait for crate::foo::Bar`,
                 // `impl Trait for ::leading::Anchor`,
                 // `impl Trait for std::collections::HashMap`, etc.
@@ -1834,7 +1834,7 @@ pub fn register_rust_module_at_with_source(
                 }
             }
             _ => {
-                // PRE-EXISTING-ADAPTATION: silently-skipped item
+                // TODO: silently-skipped item
                 // kinds. Each carries a documented convergence path
                 // and explicit reasoning for why fail-loud would
                 // overreach beyond the strict-parity contract.
@@ -1883,7 +1883,7 @@ pub fn register_rust_module_at_with_source(
                 //   `Item::Union` / `Item::Verbatim`** — FFI, cross-
                 //   crate registry, overlay storage, and syn parse
                 //   verbatim respectively. Each needs its own slice
-                //   (multi-session); promoting to fail-loud would
+                //   promoting to fail-loud would
                 //   block any source containing them from walking.
             }
         }
@@ -3631,7 +3631,7 @@ fn build_host_metadata_parts(
     // exposes `start()` outside of a proc-macro runtime.
     let co_firstlineno = item_fn.sig.fn_token.span().start().line as u32;
 
-    // PRE-EXISTING-ADAPTATION: upstream `model.py:54 FunctionGraph.filename`
+    // TODO: upstream `model.py:54 FunctionGraph.filename`
     // surfaces `func.__code__.co_filename` (a real filesystem path).
     // `syn::Span::source_file()` is nightly-only in `proc_macro2`, so
     // stable Rust cannot recover the path the ItemFn parsed from.
@@ -4067,10 +4067,10 @@ mod tests {
         // `module.__dict__[name]` with a callable function object
         // (`flowcontext.py:847 w_globals.value[varname]`).
         //
-        // The eager-build approach uses Slice M2.5f's
-        // `prebuilt_flow_graph` mechanism so downstream resolution
-        // gets a real graph, not the empty bytecode that motivated
-        // the prior Issue 1.2 PRE-EXISTING-ADAPTATION skip. Bodies
+        // The eager-build approach uses the `prebuilt_flow_graph`
+        // mechanism so downstream resolution gets a real graph, not
+        // the empty bytecode that motivated the prior TODO skip.
+        // Bodies
         // the lowerer rejects (covered by
         // `register_rust_module_skip_extends_to_unsupported_bodies`)
         // remain unregistered, falling through to the resolver's
@@ -7692,7 +7692,7 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         assert!(
             super::super::host_env::lookup_host_lltype(&host).is_none(),
             "unsupported field shape must NOT populate the lltype \
-             registry until the matching Phase 5 slice lands",
+             registry until the matching catalog port lands",
         );
     }
 

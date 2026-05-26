@@ -142,7 +142,7 @@ pub(crate) enum ItemOwner {
 /// in `Rc<RefCell<ListItem>>` for sharing — sister `ListDef`s clone
 /// the Rc so their identity comparisons hold.
 ///
-/// ## PRE-EXISTING-ADAPTATION: DictKey/DictValue field flattening
+/// ## TODO: DictKey/DictValue field flattening
 ///
 /// Upstream has `class DictKey(ListItem)` (dictdef.py:7-66) and
 /// `class DictValue(ListItem)` (dictdef.py:69-72). The subclass

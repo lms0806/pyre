@@ -120,7 +120,7 @@ pub struct Trace {
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
-    /// Epic H H-2.1: parallel BoxRef allocation.
+    /// parallel BoxRef allocation.
     ///
     /// Mirrors RPython `AbstractValue` object identity per recorded
     /// position. `box_pool[i]` holds the `BoxRef` allocated when

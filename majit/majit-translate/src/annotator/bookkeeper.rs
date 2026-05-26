@@ -284,7 +284,7 @@ pub struct Bookkeeper {
     /// observable.
     pub needs_generic_instantiate:
         RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
-    /// PRE-EXISTING-ADAPTATION (no upstream).  Pyre struct parameters
+    /// TODO: no upstream equivalent.  Pyre struct parameters
     /// (`Ref` / `State` `ValueType`s) lack a Python `HostObject` /
     /// `ClassDesc` identity — they're Rust struct types known only by a
     /// qualified type-root string (e.g. `crate::pyframe::PyFrame`).
@@ -293,7 +293,7 @@ pub struct Bookkeeper {
     /// caches a synthetic ClassDef per type-root name here — wrapping a
     /// fresh `HostObject::new_class` + `ClassDesc::new_shell` pair.
     pub pyre_stub_classdefs: RefCell<HashMap<String, Rc<RefCell<ClassDef>>>>,
-    /// PRE-EXISTING-ADAPTATION (no upstream).  Pyre-only struct-field
+    /// TODO: no upstream equivalent.  Pyre-only struct-field
     /// metadata snapshot (`struct_name -> [(field_name, type_string)]`)
     /// used by [`Self::get_pyre_classdef_by_name`] to populate the
     /// synthetic `ClassDef.attrs`.  `None` for unit-test fixtures that
@@ -476,7 +476,7 @@ impl Bookkeeper {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION (no upstream).  Wire the pyre-only
+    /// TODO: no upstream equivalent.  Wire the pyre-only
     /// `StructFieldRegistry` so [`Self::get_pyre_classdef_by_name`]
     /// can populate the synthetic stub `ClassDef.attrs` from
     /// struct-field metadata.  Idempotent: a second call overwrites
@@ -1373,7 +1373,7 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
-    /// PRE-EXISTING-ADAPTATION (no upstream).  Return a cached synthetic
+    /// TODO: no upstream equivalent.  Return a cached synthetic
     /// ClassDef stub for a pyre type-root name (qualified Rust path
     /// string such as `crate::pyframe::PyFrame`).  Used by the rtyper
     /// adapter's `seed_variable` to project pyre `Ref` / `State`
@@ -1443,8 +1443,8 @@ impl Bookkeeper {
         // attrs-empty until they too are requested as a root — at
         // that point the cache hit at the top of this function
         // short-circuits, so inner-stub attrs remain empty for the
-        // bookkeeper's lifetime.  Tasks #58 / #63 track the gap vs
-        // `add_source_for_attribute` (classdesc.py:189-216).
+        // bookkeeper's lifetime.  The gap vs
+        // `add_source_for_attribute` (classdesc.py:189-216) remains.
         let fields_to_project: Option<Vec<(String, String)>> = {
             let guard = self.pyre_struct_fields.borrow();
             guard.as_ref().and_then(|r| r.fields.get(name).cloned())
@@ -1478,7 +1478,7 @@ impl Bookkeeper {
             .expect("phase-1 fabrication invariant: root name is always cached after the loop")
     }
 
-    /// PRE-EXISTING-ADAPTATION (no upstream).  Project a Rust type
+    /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
     /// `s_getattr` would observe for a class attribute seeded with a
@@ -2589,7 +2589,7 @@ fn split_generic_args(input: &str) -> Vec<&str> {
 /// these) directly and returns
 /// [`HostCallError::RequiresFlowEvaluator`] for a `UserFunction`
 /// body. The latter surfaces as an explicit
-/// "Phase 6 host-graph evaluator not yet landed" `AnnotatorError`
+/// "host-graph evaluator not yet landed" `AnnotatorError`
 /// rather than a generic call failure — this keeps the boundary
 /// between host-executable and flowspace-required callables
 /// discoverable at the callsite.
@@ -2601,7 +2601,7 @@ fn call_freeze_method(obj: &HostObject) -> Result<bool, AnnotatorError> {
     let result = method.call_host(&[]).map_err(|err| {
         AnnotatorError::new(match err {
             crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q) => format!(
-                "_freeze_() on {q:?} requires the Phase 6 host-graph evaluator \
+                "_freeze_() on {q:?} requires the host-graph evaluator \
                  (user function body cannot be executed host-side yet)"
             ),
             other => format!("_freeze_() call failed: {other}"),
@@ -2619,7 +2619,7 @@ fn call_freeze_method(obj: &HostObject) -> Result<bool, AnnotatorError> {
 ///
 /// Fires the cleanup method for side-effects and ignores the return
 /// value. Absence of `_cleanup_` is silently accepted. A `UserFunction`
-/// body surfaces the same `Phase 6 host-graph evaluator` marker as
+/// body surfaces the same `host-graph evaluator` marker as
 /// `call_freeze_method` so the two boundary limitations are visible
 /// at a single grep point.
 fn call_cleanup_method(obj: &HostObject) -> Result<(), AnnotatorError> {
@@ -2629,7 +2629,7 @@ fn call_cleanup_method(obj: &HostObject) -> Result<(), AnnotatorError> {
     method.call_host(&[]).map(|_| ()).map_err(|err| {
         AnnotatorError::new(match err {
             crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q) => format!(
-                "_cleanup_() on {q:?} requires the Phase 6 host-graph evaluator \
+                "_cleanup_() on {q:?} requires the host-graph evaluator \
                  (user function body cannot be executed host-side yet)"
             ),
             other => format!("_cleanup_() call failed: {other}"),

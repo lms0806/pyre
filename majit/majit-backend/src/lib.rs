@@ -1198,8 +1198,7 @@ pub struct JitCellToken {
     ///
     /// Wrapped in `Mutex` so `record_jump_to` can push through
     /// `&JitCellToken` once the token has been shared via
-    /// `Arc<JitCellToken>` (Slice 5.1 lifted `CompiledEntry::token` to
-    /// `Arc<JitCellToken>` so the same object is reachable from
+    /// `Arc<JitCellToken>` (the same object is reachable from
     /// `record_loop_or_bridge`'s descr walk).  The Mutex is the
     /// Rust-side equivalent of RPython's implicit dict-mutation interior
     /// mutability under the single-threaded JIT scheduler invariant.
@@ -1712,7 +1711,7 @@ pub trait Backend: Send {
     /// `lib.rs:969`) and passes it as `original_token`, so the source descr
     /// is always reachable from `original_token.compiled.fail_descrs`.
     ///
-    /// **PRE-EXISTING-ADAPTATION:** the second `previous_tokens` slice is
+    /// **TODO:** the second `previous_tokens` slice is
     /// pyre-only.  Cranelift recompiles bridges as fresh modules instead of
     /// patching live machine code, so after a retrace the RUNNING machine
     /// code still references descrs in retired predecessor tokens — the
@@ -2028,7 +2027,7 @@ pub trait Backend: Send {
 
     /// Resolve a raw fail-descr address to its owning `Arc<dyn FailDescr>`.
     ///
-    /// PRE-EXISTING-ADAPTATION (no upstream counterpart): RPython dispatches
+    /// TODO (no upstream counterpart): RPython dispatches
     /// the CA bridge entry as a method on the descr — `compile.py:706-732
     /// _trace_and_compile_from_bridge(self, deadframe, ...)`, where `self`
     /// IS the descr — so the metainterp receives the descr object directly

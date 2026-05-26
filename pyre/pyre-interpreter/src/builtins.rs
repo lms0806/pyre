@@ -2883,7 +2883,7 @@ fn exec_or_eval(
             // so dropping the `Box<DictStorage>` here would dangle the
             // captures and surface as a use-after-free on the next
             // `g["reader"]()` invocation.  Leak the Box until the full
-            // `LegacyGlobalsBox` retirement lands (Phase 5d remaining
+            // `LegacyGlobalsBox` retirement lands (remaining
             // slice — frame.w_globals becomes a PyObjectRef so the
             // captured globals identity IS the backing dict and no
             // temp is needed).  Memory cost is one DictStorage per
@@ -4048,7 +4048,7 @@ fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // `functional.py:255-264 descr___new__` — `space.index(w_start)`
     // then `space.int_w(w_start)`; on OverflowError, drop into bigint
     // slot.  Pyre uses i64 directly and would overflow on bigint
-    // start; surfaced as a PRE-EXISTING-ADAPTATION below (W_Enumerate
+    // start; TODO: W_Enumerate
     // can still promote during iteration once start fits in i64).
     let start = match start_obj {
         Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,

@@ -655,7 +655,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //     `ValueError("math domain error")` on negative input, and
     //     Rust's `f64::sqrt()` returns NaN; making the fnaddr
     //     reachable would be a silent semantic regression.
-    // See the PRE-EXISTING-ADAPTATION block at
+    // See the TODO block at
     // `call.rs::find_all_graphs_bfs` for the convergence path.
     push_fnaddr(
         &mut entries,

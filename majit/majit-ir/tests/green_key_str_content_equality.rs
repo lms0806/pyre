@@ -1,4 +1,4 @@
-//! Slice 92.4 — content equality + content hash for `GreenType::Str` greens
+//! Content equality + content hash for `GreenType::Str` greens
 //! routes through pyre's `default_str_eq` / `default_str_hash` slot ABI
 //! decoder (`warmstate.py:108-128 lltype.Ptr STR/UNICODE` parity).
 //!
@@ -51,7 +51,7 @@ fn str_greens_compare_by_content() {
     let p2 = (&s2) as *const _ as usize as i64;
     assert_ne!(
         p1, p2,
-        "Slice 92.4 fixture expects distinct &str storage \
+        "Fixture expects distinct &str storage \
          pointers — pointer-Ref equality would fail",
     );
     assert!(
@@ -163,7 +163,7 @@ fn distinct_content_str_greens_are_unequal() {
 /// merge-point hit collapses to a single cache entry.  A
 /// process-global string intern was rejected as non-orthodox
 /// (RPython does not maintain one); the structural fix
-/// (per-JitCell owned-string field) is a multi-session refactor.
+/// (per-JitCell owned-string field) is a larger refactor.
 #[test]
 fn make_str_slot_decodes_via_default_str_eq() {
     use majit_ir::make_str_slot;

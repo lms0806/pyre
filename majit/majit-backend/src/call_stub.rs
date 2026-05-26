@@ -332,7 +332,7 @@ macro_rules! dispatch_arity_body {
                 f($int_args[0], $float_args[0], $float_args[1], $float_args[2])
             }
             (ni, nf) => {
-                // PRE-EXISTING-ADAPTATION: upstream
+                // TODO: upstream
                 // `rpython/jit/backend/llsupport/descr.py:590-602
                 // create_call_stub` generates a per-calldescr stub at
                 // translation time so any (ni, nf) combination has a

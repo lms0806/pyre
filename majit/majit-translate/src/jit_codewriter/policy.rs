@@ -290,7 +290,7 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
 
 /// policy.py:86-109 `contains_unsupported_variable_type(graph, ...)`.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's value-id table does not yet carry the
+/// TODO: pyre's value-id table does not yet carry the
 /// per-value lltype information that RPython walks here.  Since pyre
 /// always supports floats and the codewriter never produces longlong /
 /// singlefloat values, the upstream check would never reject a graph in

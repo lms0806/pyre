@@ -157,7 +157,7 @@ impl CBuilder {
     /// `rpython/translator/c/` (the directory holding `src/`, `g_*.h`,
     /// and the rest of the C-backend headers).
     ///
-    /// PRE-EXISTING-ADAPTATION: the Rust port has not yet vendored the
+    /// TODO: the Rust port has not yet vendored the
     /// upstream C-backend header tree (`rpython/translator/c/src/*.h`,
     /// `g_*.h`, `genc.py:81 pypy_include_dir`). Upstream `get_eci`
     /// **always** returns a non-empty `include_dirs` list whose first
@@ -359,7 +359,7 @@ impl CBuilder {
     /// (`collect_compilation_info`'s gc-policy ECI). When the slot
     /// holds a typed [`ExternalCompilationInfo`] the merge runs
     /// in-place; otherwise the call is a no-op until the slot is
-    /// populated by a typed source (PRE-EXISTING-ADAPTATION because
+    /// populated by a typed source (TODO: because
     /// `gcpolicy.compilation_info()` still returns an opaque
     /// `Option<Rc<dyn Any>>`).
     pub fn merge_eci(&self, ecis: Option<Rc<dyn Any>>) {

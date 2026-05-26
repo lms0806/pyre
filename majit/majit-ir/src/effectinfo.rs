@@ -2,7 +2,7 @@
 //!
 //! Translated from `rpython/jit/codewriter/effectinfo.py`.
 //!
-//! PRE-EXISTING-ADAPTATION: the upstream module path is
+//! TODO: the upstream module path is
 //! `rpython/jit/codewriter/effectinfo.py`, but in pyre this lives in
 //! `majit-ir` because `LLType::for_call` (descr.rs:46) holds
 //! `extraeffect`/`oopspecindex` indices and `EffectInfo` is constructed
@@ -199,14 +199,14 @@ fn descr_set_hash<H: std::hash::Hasher>(s: &Option<Vec<DescrRef>>, state: &mut H
 /// types, plus the `OBJECT.typeptr` special case. Pyre lacks `lltype`
 /// metadata at this layer, so the predicate is intentionally permissive
 /// (the codewriter has already filtered out non-GC fields earlier).
-/// PRE-EXISTING-ADAPTATION.
+/// TODO.
 pub fn consider_struct(_type_name: &str, _fieldname: &str) -> bool {
     true
 }
 
 /// effectinfo.py:392-397: consider_array(ARRAY)
 ///
-/// Same caveat as `consider_struct`. PRE-EXISTING-ADAPTATION.
+/// Same caveat as `consider_struct`. TODO.
 pub fn consider_array(_array_name: &str) -> bool {
     true
 }
@@ -382,7 +382,7 @@ impl Default for EffectInfo {
 
 /// effectinfo.py:17-24: `EF_*` extraeffect constants.
 ///
-/// The Rust enum is a PRE-EXISTING-ADAPTATION over RPython's bare
+/// TODO: the Rust enum is an adaptation over RPython's bare
 /// integer constants for type safety. The `repr(u8)` discriminants are
 /// the upstream values verbatim so ordering comparisons (`>`, `>=`)
 /// behave identically to RPython.
@@ -737,7 +737,7 @@ impl EffectInfo {
 
 // ════════════════════════════════════════════════════════════════════════
 // effectinfo.py:401-418: Three analyzer classes derived from
-// `BoolGraphAnalyzer`. PRE-EXISTING-ADAPTATION: pyre's `CallControl`
+// `BoolGraphAnalyzer`. TODO: pyre's `CallControl`
 // already inspects Rust source operations directly, so the analyzers
 // are kept as marker types whose `analyze_simple_operation` mirrors
 // upstream's discriminator (op-name match) for documentation parity.

@@ -77,7 +77,7 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
-/// Host-side old-gen allocation trampoline (Task #141). Stable
+/// Host-side old-gen allocation trampoline. Stable
 /// across minor/major collections — see dynasm counterpart.
 fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     WASM_ACTIVE_GC.with(|cell| {
@@ -89,7 +89,7 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
-/// Host-side root-register trampoline (Task #141 option a).
+/// Host-side root-register trampoline.
 ///
 /// # Safety
 /// Caller must keep `slot` valid until [`wasm_gc_remove_root`] is

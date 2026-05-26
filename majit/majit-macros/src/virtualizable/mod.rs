@@ -484,7 +484,7 @@ fn generate_layout_helpers(
         pub const SYM_ARRAY_BASE: u32 = #array_base_val;
         /// Number of scalar inputargs (frame + declared fields).
         ///
-        /// PRE-EXISTING-ADAPTATION: codegen-time constant equivalent to
+        /// TODO: codegen-time constant equivalent to
         /// `len(VABLEINFO.static_field_descrs) + 1` (frame ptr + N
         /// `_virtualizable_` scalars from `interp_jit.py:25-31`). RPython
         /// derives the count dynamically by iterating

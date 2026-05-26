@@ -301,7 +301,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `MIFrame::get_list_of_active_boxes` walk against the canonical
     // liveness entry decodes back the same OpRefs / values that
     // `__JitSym` and the macro-emitted `live/<offset>` placeholder
-    // refer to.  Virt-array populate is deferred (Session 3b) — see
+    // refer to.  Virt-array populate is deferred — see
     // the trait-method docstring.
     let populate_scalar_parts: Vec<TokenStream> = scalars
         .iter()
@@ -333,7 +333,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // Virt-array populate (Session 3b-1): two consecutive slots per
+    // Virt-array populate: two consecutive slots per
     // varray — `<varr>_ptr` (data pointer OpRef) at offset N, then
     // `<varr>_len` at N+1.  Value mirrors come from
     // `<varr>_ptr_value` / `<varr>_len_value` cached at
@@ -596,7 +596,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // current `<state>.<varr>` ptr/len so `populate_frame_int_regs`
     // can fill the corresponding `MIFrame.int_values` slots without
     // re-reading the live state at guard time
-    // (Task #89 framestack-lift Session 3b-1).  PRE-EXISTING-ADAPTATION:
+    // TODO:
     // accurate iff the user's varray Vec does not reallocate during
     // tracing — true for the 6 macro examples
     // (`vec![0i64; program.len()]` is fixed-capacity).  Dynamic
@@ -718,7 +718,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // then reflect the actual payload partition.
                 #declare_schema_fn_name(driver);
                 driver.ensure_descriptor_registered();
-                // Phase 4 Epic B.3-B.4: register canonical entry +
+                // Register canonical entry +
                 // canonical opcode ids into the driver-shared
                 // `Assembler` (cf. `JitDriver::shared_asm`) so per-pc
                 // factory calls dedup against the same
@@ -954,11 +954,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 frame: &mut majit_metainterp::MIFrame,
             ) {
                 // Slot layout matches `live_slots_for_state_field_jit`
-                // (Task #89 orth-6): scalars at `0..num_scalars`,
+                // Scalars at `0..num_scalars`,
                 // then flattened arrays, then virt-array (ptr, len)
                 // pairs.  Virt-array value mirrors are cached at
                 // `JitState::initialize_sym` time
-                // (Task #89 framestack-lift Session 3b-1) from the
+                // from the
                 // user state's `<varr>.as_ptr()` / `<varr>.len()`,
                 // accurate iff the Vec does not reallocate during
                 // tracing.
@@ -1041,7 +1041,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 true #(#validate_array_checks)*
             }
 
-            // Task #89 framestack-lift Session 4: state-field JIT
+            // State-field JIT
             // override of `JitState::populate_frame_for_guard` so
             // jitdriver-level guard sites (e.g. `force_finish_trace`'s
             // GuardAlwaysFails fallback) get the same snapshot wire-up

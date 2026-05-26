@@ -39,7 +39,7 @@ pub struct MetaInterpFrame {
     pub arg_state: pyre_interpreter::bytecode::OpArgState,
     /// The CALL bytecode's pc on THIS frame at the moment it pushed an
     /// inline callee.  `top.pc` is advanced to the post-CALL fallthrough
-    /// before the callee is pushed (PRE-EXISTING-ADAPTATION vs PyPy where
+    /// before the callee is pushed (TODO: differs from PyPy where
     /// `self.last_instr` stays at the CALL during the call); when the
     /// callee raises and `finishframe_exception` walks up to this frame,
     /// the exception-table lookup must probe the CALL site, not the
@@ -411,7 +411,7 @@ impl PyreMetaInterp {
 
     // ── Frame management ─────────────────────────────────────────
 
-    /// PRE-EXISTING-ADAPTATION: equivalent to RPython
+    /// TODO: equivalent to RPython
     /// `MetaInterp.perform_call` (`rpython/jit/metainterp/pyjitpl.py`)
     /// which constructs and pushes the callee `MIFrame` directly.  Pyre
     /// splits trace-step output (returns `PendingInlineFrame`) from the
@@ -666,7 +666,7 @@ impl PyreMetaInterp {
             };
             let sym = unsafe { &*top.sym };
             // `top.pc` was advanced past the CALL bytecode before any
-            // inline callee was pushed (PRE-EXISTING-ADAPTATION).  When a
+            // inline callee was pushed (TODO: differs from RPython).  When a
             // callee raises and we walk up to this caller, the
             // exception-table lookup must probe the CALL site (the saved
             // `call_site_pc`) — mirroring PyPy

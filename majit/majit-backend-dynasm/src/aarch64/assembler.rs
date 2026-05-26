@@ -1452,7 +1452,7 @@ impl<'a> AssemblerARM64<'a> {
         // increments the `fail_index` counter in lockstep with
         // `fail_descrs.push`, so the contract is structural rather than
         // descr-internal.  The earlier per-descr assertion was a pyre
-        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // Deviation removed: singleton FINISH
         // descrs (`compile.py:623-662`) answer the trait-default `0`
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
@@ -1578,7 +1578,7 @@ impl<'a> AssemblerARM64<'a> {
         // increments the `fail_index` counter in lockstep with
         // `fail_descrs.push`, so the contract is structural rather than
         // descr-internal.  The earlier per-descr assertion was a pyre
-        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // Deviation removed: singleton FINISH
         // descrs (`compile.py:623-662`) answer the trait-default `0`
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {

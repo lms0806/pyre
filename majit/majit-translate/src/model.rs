@@ -165,7 +165,7 @@ pub enum UnsupportedExprKind {
     /// `FunctionGraph`s round-trip through the bookkeeper).  Pyre's
     /// `syn::Expr::Closure` arm produces an `Unknown` marker for the
     /// closure value rather than walking the body — inlining it would
-    /// be a NEW-DEVIATION (treats the closure as a synchronous block).
+    /// be a deviation (treats the closure as a synchronous block).
     /// Classified separately from `OtherExpr` so the producer site is
     /// distinguishable from the catch-all in dual-gate diagnostics.
     Closure,
@@ -311,7 +311,7 @@ impl CallTarget {
     /// Read the classdef hint if present. Callers must treat `None` as
     /// "annotator did not supply a decision"; falling back to
     /// `receiver_root` string is the pre-monomorphization
-    /// PRE-EXISTING-ADAPTATION still living in
+    /// TODO: still living in
     /// [`crate::call::CallControl::resolve_method`].
     pub fn classdef_hint(&self) -> Option<crate::annotator::description::ClassDefKey> {
         match self {
@@ -585,7 +585,7 @@ pub enum OpKind {
     /// vtable for the named method slot.  Result is integer-typed so it
     /// can be fed to `int_guard_value` (RPython `jtransform.py:546`).
     ///
-    /// PRE-EXISTING-ADAPTATION of `rclass.py:371-377 getclsfield()`. RPython
+    /// TODO: pyre adaptation of `rclass.py:371-377 getclsfield()`. RPython
     /// emits a `cast_pointer + getfield(vtable_struct, method_name)` chain
     /// because `ClassRepr` models the vtable as an explicit `Struct`. Rust
     /// `dyn Trait` vtable layout is compiler-internal (unstable ABI), so
@@ -853,7 +853,7 @@ pub enum OpKind {
     /// but the descriptors drive guard/invalidation accounting in the
     /// optimizer (`quasiimmut.py`).
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython derives `mutate_field` via
+    /// TODO: RPython derives `mutate_field` via
     /// `quasiimmut.get_mutate_field_name(name)` which expects the lltype
     /// `inst_` prefix (`quasiimmut.py:11-15`).  Rust structs have no such
     /// prefix, so we use the literal `mutate_<fieldname>` convention.
@@ -1178,10 +1178,10 @@ pub struct Block {
 /// `(locals_w, stack, last_exception, blocklist, next_offset)`.  Pyre's
 /// AST frontend currently runs over Rust source rather than Python
 /// bytecode, so the `stack` / `last_exception` / `blocklist` /
-/// `next_offset` projections are vestigially empty until Path-Z Slice
-/// 4+ rewrites `front::ast` as a flowcontext-style walker.
+/// `next_offset` projections are vestigially empty until the
+/// flowcontext-style walker rewrites `front::ast`.
 ///
-/// All five fields are present in the struct now (Path-Z Slice 1) so
+/// All five fields are present in the struct now so
 /// shape parity is locked in at the model layer; downstream merging
 /// passes already thread them via `union`.  The flowcontext walker
 /// (`flowspace::flowcontext::FlowContext`) and `flowspace::framestate::
@@ -1217,8 +1217,8 @@ pub struct FrameState {
     /// a hand-built fixture.
     pub locals_w: Vec<Option<crate::flowspace::model::Hlvalue>>,
     /// `framestate.py:21 self.stack` — value-stack content at the
-    /// snapshot point.  Empty for AST-frontend snapshots until Path-Z
-    /// Slice 4+ introduces flowcontext-style stack push/pop on Expr
+    /// snapshot point.  Empty for AST-frontend snapshots until the
+    /// flowcontext-style walker introduces stack push/pop on Expr
     /// nodes; the `union` invariant requires both predecessors agree
     /// on stack content (upstream `framestate.py:79 _union(self.stack,
     /// other.stack)` zips positionally — equal-length always for any
@@ -1226,17 +1226,17 @@ pub struct FrameState {
     pub stack: Vec<crate::flowspace::framestate::StackElem>,
     /// `framestate.py:22 self.last_exception` — pending FSException at
     /// the snapshot point.  None for AST-frontend snapshots until
-    /// Path-Z Slice 4+ introduces flowcontext-style exception handling.
+    /// the flowcontext-style walker introduces exception handling.
     pub last_exception: Option<crate::flowspace::model::FSException>,
     /// `framestate.py:23 self.blocklist` — block-stack snapshot
     /// (`SETUP_*` / `POP_BLOCK` depth at the snapshot point).  Empty
-    /// for AST-frontend snapshots until Path-Z Slice 4+ introduces
-    /// frame-block management.  `framestate.py:58 matches` asserts
+    /// for AST-frontend snapshots until the flowcontext-style walker
+    /// introduces frame-block management.  `framestate.py:58 matches` asserts
     /// blocklist equality across merge candidates as a precondition.
     pub blocklist: Vec<crate::flowspace::flowcontext::FrameBlock>,
     /// `framestate.py:24 self.next_offset` — bytecode offset resumed
     /// at after the snapshot.  `0` for AST-frontend snapshots until
-    /// Path-Z Slice 4+ uses an AST-node index (the equivalent of a
+    /// the flowcontext-style walker uses an AST-node index (the equivalent of a
     /// virtual-bytecode tape position).  `framestate.py:59 matches`
     /// asserts next_offset equality across merge candidates as a
     /// precondition.
@@ -1279,10 +1279,8 @@ impl FrameState {
     /// backing Variable occupies.  Returns `Some(idx)` when the entry
     /// is bound and resolves to a registered Variable; `None` for
     /// None-killed slots or out-of-range indices.  Bridge accessor
-    /// ahead of the carrier flip — after `entries` holds Variables
-    /// directly the body becomes
-    /// `self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))`,
-    /// keeping callers identity-stable through the flip.
+    /// after `entries` holds Variables directly the body becomes
+    /// `self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))`.
     pub fn entry_slot(&self, slot: usize, graph: &FunctionGraph) -> Option<usize> {
         self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))
     }
@@ -1343,8 +1341,7 @@ impl FrameState {
     /// annotator (`annrpython.py`).  Pyre follows the same convention:
     /// callers query types via `FunctionGraph::concretetype_of(&var)`
     /// at the point of use; the prior per-slot `value_type` field on
-    /// `FrameStateEntry` was a NEW-DEVIATION that has been retired in
-    /// Path-Z Slice 2.3.
+    /// `FrameStateEntry` was a deviation that has been retired.
     ///
     /// Returns `Some(merged_state)` when the union succeeds; `None`
     /// when any per-projection union raises `UnionError`
@@ -1923,7 +1920,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 /// `blocks` is the BFS-reachable closure of every entry block (mirrors
 /// `flowspace/model.py:66 iterblocks()`).
 ///
-/// PRE-EXISTING-ADAPTATION: `start_blocks` is `{graph.startblock} ∪
+/// TODO: `start_blocks` is `{graph.startblock} ∪
 /// {blocks with no incoming link}` rather than the strict single-graph
 /// `{graphs[0].startblock}` of `simplify.py:428`.  The `generated::*`
 /// pipeline emits closures / specialisations as secondary entries
@@ -1994,7 +1991,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///      no standalone Input shape, but the line-by-line port
 ///      sweeps them under the same canremove rule.
 ///
-///      PRE-EXISTING-ADAPTATION (translator-gated arms not ported).
+///      TODO: translator-gated arms not ported.
 ///      Upstream's Step 5 has two further `elif` arms after the
 ///      canremove drop:
 ///        - `simplify.py:489-499 elif op.opname == 'simple_call'`
@@ -2650,7 +2647,7 @@ pub struct FunctionGraph {
     /// RPython has no counterpart — `framestate.py:92-99 getoutputargs`
     /// pushes the polymorphic `Hlvalue` cell directly into `Link.args`,
     /// no bridge needed because the link domain IS `Hlvalue`.  This map
-    /// is the documented PRE-EXISTING-ADAPTATION for pyre's slot-indexed
+    /// is the documented TODO for pyre's slot-indexed
     /// `value_variables` / `value_names` side tables: it lets
     /// Variable-keyed lookups resolve in `O(1)` without scanning
     /// `value_variables` linearly.
@@ -3176,7 +3173,7 @@ impl FunctionGraph {
     /// it here — that would advance the allocator cursor in a way
     /// downstream codegen does not expect and surface as a slot
     /// mismatch in cranelift / dynasm output.  Such Variables are
-    /// PRE-EXISTING-ADAPTATIONs of the AST frontend's `last_exception`
+    /// TODOs of the AST frontend's `last_exception`
     /// flow and are left to their unregistered state; the future Z4
     /// walker is responsible for registering them at their actual
     /// definition site.
@@ -3692,7 +3689,7 @@ impl FunctionGraph {
     /// Non-mutating mirror of [`Self::ensure_variable_at_block`] — answers
     /// "would the recursive backfill succeed without touching any block
     /// in `forbidden`?" without modifying any block's `inputargs` or
-    /// exit-link args.  Used by Slice 4.2's `lower_if_expr` migration
+    /// exit-link args.  Used by `lower_if_expr`'s migration
     /// to skip `create_block_from_framestate` +
     /// `set_goto_from_framestate` when the chain walk would either:
     ///
@@ -4204,7 +4201,7 @@ mod tests {
 
     /// Convenience helper: install an `OpKind::Input` op AND register its
     /// backing Variable as a phi inputarg on the same block.  Mirrors what
-    /// the Slice 2 eager-phi installer at union sites does.
+    /// the eager-phi installer at union sites does.
     fn install_phi(
         graph: &mut FunctionGraph,
         block: BlockId,
@@ -4735,7 +4732,7 @@ mod tests {
         assert!(graph.slot_of(v_v_phi).is_some());
     }
 
-    /// Task #117 Substep 1: `FrameState::union` derives the parallel
+    /// `FrameState::union` derives the parallel
     /// `locals_w` (`Hlvalue` carrier matching `framestate.py:19
     /// self.locals_w`) from the unioned `entries` (Variable carrier).
     /// Each defined slot's Variable carries through directly via

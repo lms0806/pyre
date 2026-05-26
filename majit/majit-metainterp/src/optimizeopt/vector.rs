@@ -9,13 +9,13 @@
 /// - In RPython, `VectorizingOptimizer` extends `Optimizer` (the main
 ///   optimization dispatcher). In Rust, `VectorizingOptimizer` implements
 ///   the `Optimization` trait (a sub-pass in the `Optimizer` pipeline).
-///   This is a PRE-EXISTING-ADAPTATION: the Rust optimization pipeline
+///   This is a TODO: the Rust optimization pipeline
 ///   uses a trait-object chain rather than inheritance. The standalone
 ///   `optimize_vector()` function provides the RPython-shaped entry point.
 ///
 /// - `CostModel`, `GenericCostModel`, `PackSet`, `isomorphic` live in
 ///   `schedule.rs` in Rust but in `vector.py` in RPython. This is a
-///   PRE-EXISTING-ADAPTATION driven by the Rust module split done before
+///   TODO driven by the Rust module split done before
 ///   parity enforcement. They are re-exported here.
 use majit_ir::vec_set::VecSet;
 
@@ -259,7 +259,7 @@ impl VectorLoop {
 /// Creates a VectorizingOptimizer, runs vectorization on the loop, and
 /// returns the rewritten op list. The loop is modified in place.
 ///
-/// PRE-EXISTING-ADAPTATION: In RPython this receives `metainterp_sd`,
+/// TODO: In RPython this receives `metainterp_sd`,
 /// `jitdriver_sd`, `warmstate`, `loop_info`, `loop_ops`, `jitcell_token`.
 /// In Rust we receive a `VectorLoop` directly and pass cost/size params.
 /// The `metainterp_sd`-dependent parts (profiler counting, logger) are
@@ -360,7 +360,7 @@ pub fn user_loop_bail_fast_path(loop_: &VectorLoop) -> bool {
 ///
 /// In RPython, this extends `Optimizer` and is the top-level optimizer for
 /// the vector pass. In Rust, it implements `Optimization` and is used as
-/// a sub-pass in the `Optimizer` pipeline (PRE-EXISTING-ADAPTATION).
+/// a sub-pass in the `Optimizer` pipeline (TODO).
 ///
 /// The RPython-shaped methods (`run_optimization`, `unroll_loop_iterations`,
 /// etc.) are provided alongside the `Optimization` trait impl.
@@ -382,7 +382,7 @@ pub struct VectorizingOptimizer {
     /// false for platforms where alignment unrolling is not beneficial.
     should_align_unroll: bool,
 
-    // ── Rust Optimization trait fields (PRE-EXISTING-ADAPTATION) ──
+    // ── Rust Optimization trait fields (TODO) ──
     // These support the sub-pass integration path where VectorizingOptimizer
     // is used inside an Optimizer pipeline via the Optimization trait.
     /// Buffered loop body ops (populated by propagate_forward).
@@ -917,7 +917,7 @@ impl VectorizingOptimizer {
         }
 
         // vector.py:496: self.packset.split_overloaded_packs(self.cpu.vector_ext)
-        // PRE-EXISTING-ADAPTATION: split_overloaded_packs not yet ported.
+        // TODO: split_overloaded_packs not yet ported.
         // RPython splits packs that exceed the vector register size and
         // removes packs that are too small (< FULL load). This requires
         // pack_load() and Pack.FULL which depend on vectorization info
@@ -943,7 +943,7 @@ impl VectorizingOptimizer {
     /// This ensures guards fail "early" and relax dependencies, which is
     /// a prerequisite for vectorization.
     ///
-    /// PRE-EXISTING-ADAPTATION: The full RPython implementation requires:
+    /// TODO: The full RPython implementation requires:
     /// - DependencyGraph.imaginary_node() — synthetic graph nodes
     /// - Node.iterate_paths() — path enumeration with blacklist
     /// - Path.is_always_pure() — purity analysis along paths
@@ -967,7 +967,7 @@ impl VectorizingOptimizer {
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
     ///
-    /// PRE-EXISTING-ADAPTATION: CompileLoopVersionDescr is not yet ported
+    /// TODO: CompileLoopVersionDescr is not yet ported
     /// to Rust. When it is, this should create the descr and attach it.
     fn mark_guard(&self, _guard_idx: usize, _loop_: &VectorLoop) {
         // vector.py:588-594: create CompileLoopVersionDescr, copy attrs
@@ -1424,7 +1424,7 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ve
     }
 }
 
-// ── Optimization trait impl (PRE-EXISTING-ADAPTATION) ──────────────────
+// ── Optimization trait impl (TODO) ──────────────────
 // In RPython, VectorizingOptimizer extends Optimizer and is called via
 // optimize_vector(). In Rust, it participates in the Optimizer pipeline
 // as an Optimization sub-pass. This impl bridges the two worlds.

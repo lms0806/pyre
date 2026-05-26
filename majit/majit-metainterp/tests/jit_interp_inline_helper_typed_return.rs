@@ -67,7 +67,7 @@ fn wrapped_int_identity(value: i64) -> i64 {
 // analyzer (`majit-translate/src/jit_codewriter/call.rs:3250
 // effectinfo_from_writeanalyze`) computes the equivalent in the
 // codewriter pipeline but is not yet plumbed to runtime trace
-// recording (Task #64), so users opt in via
+// recording, so users opt in via
 // `#[dont_look_inside_cannot_raise]` until the wire-up lands.
 
 #[dont_look_inside_cannot_raise]
@@ -89,7 +89,7 @@ fn wrapped_int_identity_cr(value: i64) -> i64 {
 
 #[test]
 fn jit_inline_ref_identity_generates_valid_jitcode() {
-    // Phase 4 Epic B.3-B.4: inline helper jitcodes register their
+    // Inline helper jitcodes register their
     // per-marker liveness triples into an `Assembler` passed in by the
     // caller (the production path uses the driver-shared one).  Tests
     // that only inspect structural properties pass a freshly-allocated
@@ -382,7 +382,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     jc_builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
     let jitcode = jc_builder.finish();
 
-    // Slice 3.1d: route through `handler_inline_call_pyre_nested`
+    // Route through `handler_inline_call_pyre_nested`
     // (the production builder shape) instead of the legacy
     // `dispatch_one::BC_INLINE_CALL` fallback.
     let mut bh_builder = build_inline_call_only_bh_builder();

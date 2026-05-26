@@ -30,9 +30,9 @@
 //!    2026-04-25 review explicitly endorsed as an alternative to a
 //!    full structural GC transform.
 //!
-//! Phase 1 body: `Box::into_raw(Box::new(value))` — the pre-existing
-//! leak baseline. Future Phase 2 routes through a GC-managed
-//! allocator with proper root push/pop (Task #145).
+//! Current body: `Box::into_raw(Box::new(value))` — the pre-existing
+//! leak baseline. Future work routes through a GC-managed
+//! allocator with proper root push/pop.
 
 /// Per-type GC metadata, mirroring the compile-time constants that
 /// RPython's `gct_fv_gc_malloc` (`framework.py:807-811`) closes over:
@@ -83,8 +83,8 @@ pub fn malloc<T>(value: T) -> *mut T {
 
 /// Typed variant of [`malloc`]: requires `T: GcType` so the future
 /// managed allocator can read `T::TYPE_ID` and `T::SIZE` without a
-/// runtime registry lookup. Phase 1 body identical to [`malloc`];
-/// Phase 2 will route through the GC-managed allocator with proper
+/// runtime registry lookup. Current body identical to [`malloc`];
+/// will later route through the GC-managed allocator with proper
 /// `push_roots` / `pop_roots` brackets (`framework.py:853-856`).
 ///
 /// New call sites should prefer [`malloc_typed`] over [`malloc`]
@@ -104,7 +104,7 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
 /// caller manages lifetime via `Box::from_raw` later.
 ///
 /// Distinct from [`malloc`] only in intent today (both call
-/// `Box::into_raw`); Phase 2 GC integration will keep this on the
+/// `Box::into_raw`); future GC integration will keep this on the
 /// raw allocator while [`malloc`] moves to the managed allocator.
 #[inline]
 pub fn malloc_raw<T>(value: T) -> *mut T {
@@ -116,8 +116,8 @@ mod tests {
     use super::*;
 
     // GC-flavored mallocs (`malloc` / `malloc_typed`) are leaked in
-    // these tests — the Phase 2 managed allocator forbids
-    // `Box::from_raw` on its output, so the tests stay Phase-2-ready
+    // these tests — the managed allocator forbids
+    // `Box::from_raw` on its output, so the tests stay forward-compatible
     // by never freeing GC-flavor allocations. Only `malloc_raw`
     // (RPython `flavor='raw'`) is paired with explicit
     // `Box::from_raw` cleanup.

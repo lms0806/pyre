@@ -16,9 +16,9 @@
 //! see `pyobject.rs:25-38`) while the user-visible `w_class` field
 //! always resolves to `get_instantiate(&TUPLE_TYPE)`.
 //!
-//! Phase 2 of T1-full lands the data structures only. Construction
+//! Data structures are landed. Construction
 //! dispatch (`makespecialisedtuple2`) and JIT specialisation are
-//! Phase 3.
+//! not yet implemented.
 
 #![allow(non_camel_case_types)]
 
@@ -101,7 +101,7 @@ pub static SPECIALISED_TUPLE_OO_TYPE: PyType = new_pytype("tuple");
 /// (`gc_ptr_offsets = []`, `eval.rs:336`), so mark-sweep traversal
 /// has nothing to follow and routing through the GC stays
 /// correctness-safe. Unrelated to W_TupleObject canonical allocations
-/// (those depend on Task #98 ItemsBlock migration before they can
+/// (those depend on ItemsBlock migration before they can
 /// move).
 pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     let header = PyObject {
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     // GC-flavored allocations are leaked in these tests; calling
     // `Box::from_raw` on `malloc_typed` output becomes unsound once
-    // Phase 2 routes typed mallocs through the managed allocator.
+    // typed mallocs route through the managed allocator.
 
     fn test_ii_layout_and_access() {
         let t = w_specialised_tuple_ii_new(7, 11);

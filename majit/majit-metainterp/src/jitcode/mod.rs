@@ -7,18 +7,18 @@ pub use majit_translate::jitcode::{
 };
 
 // `BC_*` constants and `MAX_HOST_CALL_ARITY` live in
-// `majit_translate::insns` (Task #86, slice #86c). The module is
+// `majit_translate::insns` (, slice #86c). The module is
 // re-exported here as the canonical access path; in-crate and external
 // consumers reach `BC_*` / `MAX_HOST_CALL_ARITY` via
 // `jitcode::insns::BC_*`.
 pub use majit_translate::insns;
 
 /// Alias for `BC_JUMP`; used in dispatch JitCode loop-close tests
-/// (Slice 1.7) and `jitcode_lower::lower_dispatch_body` jump emission.
+/// (7) and `jitcode_lower::lower_dispatch_body` jump emission.
 pub const BC_GOTO: u8 = insns::BC_JUMP;
 
 // `insn_byte` and `wellknown_bh_insns` were moved to
-// `majit_translate::insns` in slice #86d (Task #86). Re-exports keep
+// `majit_translate::insns` in slice #86d. Re-exports keep
 // internal callers (`jitcode::assembler::JitCodeBuilder`) and external
 // callers (`pyre/pyre-jit/src/jit/assembler.rs`) resolving unchanged
 // — the import-path sweep is slice #86e.
@@ -547,7 +547,7 @@ impl JitCodeRuntimeExt for JitCode {
         if code.last().copied() == Some(insns::BC_VOID_RETURN) || code.len() < 2 {
             return None;
         }
-        // A2 epic (Task #155): typed-return opcodes carry a 1-byte
+        // Typed-return opcodes carry a 1-byte
         // register source operand (`int_return/i`, `ref_return/r`,
         // `float_return/f` per RPython argcode contract).
         let opcode_pos = code.len() - 2;
@@ -699,8 +699,8 @@ mod tests {
             insns.get("hint_force_virtualizable/r"),
             Some(&super::insns::BC_HINT_FORCE_VIRTUALIZABLE)
         );
-        // Slice 0 of `pyre-call-family-canonical-migration.md` — canonical
-        // residual_call_*_v opcodes reserved for Slice 1 emit migration.
+        // of `pyre-call-family-canonical-migration.md` — canonical
+        // residual_call_*_v opcodes reserved for emit migration.
         assert_eq!(
             insns.get("residual_call_r_v/iRd"),
             Some(&super::insns::BC_RESIDUAL_CALL_R_V),

@@ -31,7 +31,7 @@ use crate::parse::CallPath;
 /// fields on `CallControl` itself — `self.jitcodes = {}` (graph-keyed dict)
 /// and `self.all_jitcodes = []` (alloc-order list). Pyre preserves both
 /// fields on `CallControl` and additionally returns them as a single value
-/// from `make_jitcodes`. The wrapper is a PRE-EXISTING-ADAPTATION: upstream
+/// from `make_jitcodes`. TODO: upstream
 /// callers (`warmspot.py:281-282`) read `self.all_jitcodes` off the
 /// CallControl directly; pyre pairs the two views so that downstream
 /// consumers (e.g. `crate::generated::all_jitcodes`) receive one value and
@@ -73,7 +73,7 @@ pub struct CodeWriter {
     pub assembler: Assembler,
     /// RPython: `self.debug = True` (codewriter.py:18).
     pub debug: bool,
-    /// Slice 6 — lazy program-wide `PyreCallRegistry` for the
+    /// Lazy program-wide `PyreCallRegistry` for the
     /// PYRE_RTYPER dual-gate (cf. `transform_graph_to_jitcode`).
     /// Built on first use from `callcontrol.function_graphs()` and
     /// reused across every dual-gated graph in the same CodeWriter
@@ -193,7 +193,7 @@ impl CodeWriter {
     ///
     /// Transforms a FunctionGraph into a JitCode through the 4-step pipeline.
     /// Upstream signature `(self, graph, jitcode, verbose, index)`. Pyre adds
-    /// `path` / `callcontrol` / `config` as PRE-EXISTING-ADAPTATION:
+    /// `path` / `callcontrol` / `config` as pyre-specific additions:
     ///   - `path`: graph identity surrogate (upstream uses `graph` object
     ///     identity; pyre uses `CallPath`).
     ///   - `callcontrol`: upstream has `self.callcontrol`; pyre passes
@@ -234,8 +234,8 @@ impl CodeWriter {
     /// consumes [`crate::model::FunctionGraph`] (a slot-indexed legacy
     /// IR) instead of [`crate::flowspace::model::FunctionGraph`] (the
     /// upstream `Variable`-based shape).  Operand identity in
-    /// `SpaceOperation` payloads is already `Variable` (Slice 2.9
-    /// onward); `FlatOp` operands are `Register` (regalloc color +
+    /// `SpaceOperation` payloads is already `Variable`;
+    /// `FlatOp` operands are `Register` (regalloc color +
     /// kind).  What still ties the codewriter to the legacy IR is the
     /// dense slot index that `FunctionGraph` uses to key
     /// `value_variables` and the side tables in `value_map` /
@@ -243,7 +243,7 @@ impl CodeWriter {
     /// throughout would let pyre drop the `value_to_var` bridge and
     /// consume the rtyper's Variable graph directly — multi-week
     /// scope tracked separately.
-    /// Slice 12.2 / 12.4 — shared dual-gate type-resolve entry.
+    /// Shared dual-gate type-resolve entry.
     ///
     /// Runs [`dual_gate_check_with_registry`] against the
     /// program-wide `PyreCallRegistry`; on Match the real path's
@@ -352,8 +352,8 @@ impl CodeWriter {
         // Step 0: annotate + rtype (majit-specific)
         // RPython: types are already on Variable.concretetype from the rtyper.
         //
-        // Slice 12.2 narrowed the legacy walker to the Skip arm; Slice
-        // 12.4 lifted the dual-gate logic into the shared
+        // The legacy walker was narrowed to the Skip arm; the dual-gate
+        // logic was lifted into the shared
         // [`Self::dual_gate_type_state`] helper so the parser-level
         // debug snapshot in `build_canonical_opcode_dispatch`
         // (lib.rs:898) can route through the same path.

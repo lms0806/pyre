@@ -2,14 +2,7 @@
 //!
 //! RPython basis: `rpython/flowspace/bytecode.py`.
 //!
-//! Phase 2 F2.1 landed the bare re-export. F2.2 added the `HostCode`
-//! wrapper and its `cpython_code_signature` companion. F2.3 (this
-//! commit) adds `BytecodeCorruption` and the `HostCode::read` decoder.
-//! Upstream has a single `HostCode.read`; the roadmap's companion name
-//! `next_bytecode_instruction` has no upstream symbol — the `read`
-//! method IS the instruction walker.
-//!
-//! ## PRE-EXISTING-ADAPTATION: bytecode enum source
+//! ## TODO: bytecode enum source
 //!
 //! Upstream `bytecode.py:6` does `from opcode import EXTENDED_ARG,
 //! HAVE_ARGUMENT` — the opcode definitions come from **host Python's

@@ -628,7 +628,7 @@ pub trait Repr: Debug + std::any::Any {
     /// callers that need the Arc must invoke the impl-specific helper
     /// directly.
     ///
-    /// **Convergence path** (PRE-EXISTING-ADAPTATION fix queue):
+    /// **Convergence path** (TODO):
     /// the dual-method shape collapses once `rbuiltin.rtype_hlinvoke`
     /// (rpbc.py-side: rbuiltin.py:312) lands and reveals the production
     /// call site shape. Two unification options at that point:

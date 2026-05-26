@@ -84,11 +84,11 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 ///
 /// Carries `gc_ptr_offsets = [offset_of(wrappeditems)]`
 /// (`eval.rs:289`). `wrappeditems` still points at a `std::alloc`'d
-/// `ItemsBlock` until Task #98 lands; the mark walker's
+/// `ItemsBlock`; the mark walker's
 /// `is_managed_heap_object` guard (collector.rs:991/1008) keeps that
 /// stepping-stone correctness-safe.
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
-    // First Phase 2 caller of the `gct_fv_gc_malloc` bracket pattern
+    // First caller of the `gct_fv_gc_malloc` bracket pattern
     // (`framework.py:853-856`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])

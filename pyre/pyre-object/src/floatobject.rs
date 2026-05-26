@@ -31,7 +31,7 @@ impl crate::lltype::GcType for W_FloatObject {
 
 /// Allocate a new W_FloatObject on the heap.
 ///
-/// Routes through [`crate::lltype::malloc_typed`] (Task #145), the
+/// Routes through [`crate::lltype::malloc_typed`], the
 /// typed unified allocation lowering that mirrors RPython's
 /// `lltype.malloc(W_FloatObject)`
 /// (`rpython/rtyper/lltypesystem/lltype.py:2192`). PyPy's
@@ -45,7 +45,7 @@ impl crate::lltype::GcType for W_FloatObject {
 /// matching `gct_fv_gc_malloc`'s `c_type_id` / `c_size` constants
 /// (`framework.py:807-811`).
 ///
-/// Phase 1: `lltype::malloc_typed` is `Box::into_raw`. Future GC
+/// `lltype::malloc_typed` is currently `Box::into_raw`. Future GC
 /// integration replaces only that body; this constructor stays
 /// unchanged.
 pub fn w_float_new(value: f64) -> PyObjectRef {
@@ -83,7 +83,7 @@ mod tests {
     use super::*;
 
     // GC-flavored allocations (`malloc_typed`) are leaked in these
-    // tests; `Box::from_raw` is unsound once Phase 2 routes
+    // tests; `Box::from_raw` is unsound once
     // `malloc_typed` through the managed allocator.
 
     #[test]

@@ -1756,7 +1756,7 @@ where
         }
 
         // All other opcodes fall through to unsupported handler.
-        // Phase 1 opcodes (closures, exceptions, imports) will be added
+        // Remaining opcodes (closures, exceptions, imports) will be added
         // ── Closures / cells ──
         Instruction::LoadDeref { i } => {
             let idx = i.get(op_arg).as_usize();
@@ -2060,7 +2060,7 @@ where
 
         // ── Pattern matching (Python 3.10+) ──
         Instruction::MatchMapping | Instruction::MatchSequence => {
-            // Phase 1 stub: push False
+            // Stub: push False
             executor.match_stub()?;
             Ok(StepResult::Continue)
         }

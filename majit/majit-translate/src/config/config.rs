@@ -28,7 +28,7 @@
 //! - `to_optparse()`, `make_dict()` — build an optparse parser from a
 //!   config + dump config as dict.
 //!
-//! **Rust adaptations** (documented PRE-EXISTING-ADAPTATIONs):
+//! **Rust adaptations** (documented TODOs):
 //!
 //! 1. **Dynamic attribute access**. Upstream `config.translation.verbose`
 //!    routes through Python's `__getattr__` / `__setattr__` protocol

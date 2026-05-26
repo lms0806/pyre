@@ -65,7 +65,7 @@ pub struct ObjectHeader {
 /// `make_vref_field_descr` (`Type::Ref` per
 /// `optimizeopt/virtualize.rs`) agree on the slot type.
 ///
-/// PRE-EXISTING-ADAPTATION (GC trace).  Upstream traces both fields as
+/// TODO (GC trace).  Upstream traces both fields as
 /// real GC pointers; pyre traces only `forced`.  `eval.rs:241-247`
 /// registers JIT_VIRTUAL_REF with `gc_ptr_offsets = [16]` (forced
 /// only).  The reason is that every value `virtual_token` ever holds
@@ -167,7 +167,7 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
 /// initialised lazily on first call; subsequent calls return the
 /// same address (program-lifetime immortal).
 ///
-/// PRE-EXISTING-ADAPTATION (GC registration).  Upstream's `_dummy`
+/// TODO (GC registration).  Upstream's `_dummy`
 /// is a real GcStruct that the collector knows about; pyre's leaked
 /// `Box<ObjectHeader>` is host-allocated memory the GC has no
 /// record of.  The adaptation is internally consistent because
@@ -293,7 +293,7 @@ impl VirtualRefInfo {
     /// (`virtualref.py:172-173`) verify these writebacks; pyre
     /// mirrors them as `debug_assert!`s after `force_now` returns.
     ///
-    /// PRE-EXISTING-ADAPTATION (dependency injection).  Upstream
+    /// TODO (dependency injection).  Upstream
     /// passes `cpu` directly because `ResumeGuardForcedDescr` lives
     /// alongside the runner; pyre's `VirtualRefInfo` cannot import
     /// `dyn Runner` without a crate-cycle (the runner trait lives

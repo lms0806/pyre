@@ -137,7 +137,7 @@ fn real_main() {
     // import that crate (no metainterp build-dep, and the offsets are
     // a runtime fact), so the codewriter-side factory returns `None`
     // here; the codewriter slot stays empty until the runtime metainterp
-    // setter overrides it.  PRE-EXISTING-ADAPTATION documented at
+    // setter overrides it.  TODO: documented at
     // `CallControl::make_virtualizable_infos`.
     let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();

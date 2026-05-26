@@ -700,7 +700,7 @@ pub struct JitDriver<S: JitState> {
     epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
     /// Handle for the background invalidation thread.
     _invalidation_thread: Option<std::thread::JoinHandle<()>>,
-    /// Phase 4 Epic B.3-B.4 driver-shared `Assembler`: holds the
+    /// Driver-shared `Assembler`: holds the
     /// `all_liveness` payload (`assembler.py:30`) populated incrementally
     /// by `__JitMeta::install_canonical_liveness` (canonical entry) and
     /// each per-pc JitCode build (per-marker triples via
@@ -793,7 +793,7 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    /// Phase 4 Epic B.3-B.4: borrow the driver-shared `Assembler` mutex
+    /// Borrow the driver-shared `Assembler` mutex
     /// so macro-emitted install/prebuild paths can append dispatch and
     /// embedded sub-JitCode liveness entries into a single `all_liveness`
     /// table before `staticdata.liveness_info` is snapshotted.
@@ -807,7 +807,7 @@ impl<S: JitState> JitDriver<S> {
         self.shared_asm.clone()
     }
 
-    /// Phase 4 Epic B.3-B.4: copy `shared_asm`'s `all_liveness` byte
+    /// Copy `shared_asm`'s `all_liveness` byte
     /// stream into `staticdata.liveness_info`, mirroring
     /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
     ///
@@ -824,7 +824,7 @@ impl<S: JitState> JitDriver<S> {
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
     /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
     /// slice — full `finish_setup` requires `CodeWriter` /
-    /// `CallControl` construction (Task #89 orth-9 plan step 4) which
+    /// `CallControl` construction (orth-9 plan step 4) which
     /// is not yet wired.
     ///
     /// Caller responsibility: build a fresh
@@ -1229,7 +1229,7 @@ impl<S: JitState> JitDriver<S> {
     /// driver should switch to compiled code after the merge-point closure
     /// returns.
     ///
-    /// PRE-EXISTING-ADAPTATION: substitutes for `ContinueRunningNormally`
+    /// TODO: substitutes for `ContinueRunningNormally`
     /// stack unwind (`pyjitpl.py:3095` `raise_if_successful`). RPython
     /// raises across the interpreter to break out of trace recording; the
     /// Rust dispatch loop cannot raise across the FFI boundary into
@@ -1328,7 +1328,7 @@ impl<S: JitState> JitDriver<S> {
                 // (state-field-JIT macro consumers), pair the guard with
                 // the bridge snapshot.
                 //
-                // PRE-EXISTING-ADAPTATION: when the default no-op
+                // TODO: when the default no-op
                 // returns `None`, this low-level driver has no MIFrame
                 // to walk — it only knows the active jump boxes from
                 // `S::collect_jump_args`.  We feed those into
@@ -1337,7 +1337,7 @@ impl<S: JitState> JitDriver<S> {
                 // `framestack` walk (`pyjitpl.py:2586
                 // capture_resumedata`).  Bounded scope: this branch is
                 // only reached on the segmented-loop force path of the
-                // low-level driver and dissolves once Task #89 lifts
+                // low-level driver and dissolves once lifts
                 // `S::Sym` into `MIFrame::populate_for_guard` so every
                 // path captures uniformly via the framestack walk.
                 let op_live = self.meta.staticdata.op_live as u8;
@@ -1405,7 +1405,7 @@ impl<S: JitState> JitDriver<S> {
                         let snapshot_id = ctx.capture_resumedata(snapshot);
                         ctx.set_last_guard_resume_position(snapshot_id);
                     } else {
-                        // PRE-EXISTING-ADAPTATION: see header comment.
+                        // TODO: see header comment.
                         // No framestack-lift override available, so
                         // capture the active low-level boxes via the
                         // segmented-driver placeholder helper instead
@@ -1776,7 +1776,7 @@ impl<S: JitState> JitDriver<S> {
                 // `SwitchToBlackhole(ABORT_TOO_LONG)`
                 // path (`pyjitpl.py:2807`).
                 //
-                // PRE-EXISTING-ADAPTATION: virtualizable-escape aborts
+                // TODO: virtualizable-escape aborts
                 // in RPython actually flow through
                 // `pyjitpl.py:2907-2916 _compile_and_run_once` →
                 // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing(stb)`,
@@ -1796,7 +1796,7 @@ impl<S: JitState> JitDriver<S> {
                 // semantics requires `BlackholeInterpBuilder` +
                 // `last_exc_value` plumbed here and a JitException
                 // return surface on the back-edge runner —
-                // multi-session followup.
+                // followup.
                 let pending_reason = self
                     .meta
                     .tracing
@@ -2219,7 +2219,7 @@ impl<S: JitState> JitDriver<S> {
                 // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
                 // wired to handler_inline_call_pyre_nested when the
                 // multi-frame state-field-JIT chain reconstructs sub-frames
-                // via parent.descrs[idx].as_jitcode() above.  Slice 3.3
+                // via parent.descrs[idx].as_jitcode() above.  3
                 // retired the dispatch_one BC_INLINE_CALL legacy arm so an
                 // empty builder would now panic on byte 17.  Re-apply
                 // staticdata control opcodes after the constructor's
@@ -3280,7 +3280,7 @@ impl<S: JitState> JitDriver<S> {
         }
         // `memmgr.py:85-89 release_all_loops` — the upstream entry
         // point for `jit_hooks.releaseall` (`rlib/jit_hooks.py:131`)
-        // calls `memory_manager.alive_loops.clear()`.  Slice 3.3
+        // calls `memory_manager.alive_loops.clear()`.  3
         // (`memmgr.rs alive_loops` Arc owner) made `alive_loops`
         // a strong owner of every running loop, so releasing here
         // is the only path that drops those Arcs.
@@ -3670,7 +3670,7 @@ impl<S: JitState> JitDriver<S> {
         //     `ctx.virtualizable_boxes` / `virtualizable_values` /
         //     `virtualizable_array_lengths` from resume-decoded values.
         //
-        // PRE-EXISTING-ADAPTATION (`pyjitpl.py:3437 self.synchronize_
+        // TODO (`pyjitpl.py:3437 self.synchronize_
         // virtualizable()`): the live PyFrame's vable static fields and
         // array items are written from the resume data by pyre's
         // separate guard-failure recovery path
@@ -4110,7 +4110,7 @@ impl<S: JitState> JitDriver<S> {
                 // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
                 // wired to handler_inline_call_pyre_nested when the
                 // multi-frame state-field-JIT chain reconstructs sub-frames
-                // via parent.descrs[idx].as_jitcode() above.  Slice 3.3
+                // via parent.descrs[idx].as_jitcode() above.  3
                 // retired the dispatch_one BC_INLINE_CALL legacy arm so an
                 // empty builder would now panic on byte 17.  Re-apply
                 // staticdata control opcodes after the constructor's
@@ -5111,7 +5111,7 @@ mod tests {
         assert_eq!(spec, vec![GreenType::Int, GreenType::Ref]);
     }
 
-    /// Slice 91.1 — per-kind partition of greens/reds aligning with
+    /// 1 — per-kind partition of greens/reds aligning with
     /// `bhimpl_jit_merge_point`'s `[I, R, F, I, R, F]` payload shape.
     #[test]
     fn green_red_kind_counts_partition_vars_by_ir_type() {

@@ -134,7 +134,7 @@ pub struct JitCodeBuilder {
     /// `num_regs[kind]` — so freeze restores parity with the upstream
     /// invariant.
     num_regs_frozen: bool,
-    /// Phase 4 / Epic B.3-B.4 deferred-patch table populated by
+    /// Deferred-patch table populated by
     /// `live_placeholder_with_triple`. Each entry pairs a `live/<offset>`
     /// patch site (returned by `live_placeholder`) with the per-marker
     /// `(live_i, live_r, live_f)` triple computed by the macro lowerer's
@@ -154,7 +154,7 @@ pub struct JitCodeBuilder {
     /// this deferred path, then finalize against the driver-shared
     /// `Assembler` during install/prebuild.
     pending_live_triples: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)>,
-    /// Phase 4 / Epic B.3-B.4: positions of leading-dummy `BC_LIVE` slots
+    /// Positions of leading-dummy `BC_LIVE` slots
     /// (`live_placeholder` without an explicit triple) whose 2-byte offset
     /// must be back-patched to the assembler's canonical "all-live" entry
     /// during `finalize_liveness`.
@@ -1454,7 +1454,7 @@ impl JitCodeBuilder {
         self.code[patch_offset + 1] = bytes[1];
     }
 
-    /// Phase 4 / Epic B.3-B.4 deferred-patch entry point: emit a `live/`
+    /// Deferred-patch entry point: emit a `live/`
     /// opcode followed by a 2-byte placeholder offset (mirroring
     /// [`live_placeholder`]) and record the per-marker
     /// `(live_i, live_r, live_f)` triple in `pending_live_triples` so
@@ -1482,7 +1482,7 @@ impl JitCodeBuilder {
         patch_offset
     }
 
-    /// Phase 4 / Epic B.3-B.4 finalisation step: register every pending
+    /// Finalisation step: register every pending
     /// per-marker liveness triple into `asm` (deduplicating against the
     /// shared `all_liveness_positions`) and rewrite each corresponding
     /// `live/<offset>` BC_LIVE slot via [`patch_live_offset`].
@@ -1982,7 +1982,7 @@ impl JitCodeBuilder {
         }
     }
 
-    /// Slice 1 adapter — bridges `fn_ptr_idx`-using emit sites to the
+    /// adapter — bridges `fn_ptr_idx`-using emit sites to the
     /// canonical `residual_call_*_v` byte layout. Looks up the
     /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materializes
     /// `concrete_ptr` in the int constants pool, derives a `BhCallDescr`
@@ -1991,7 +1991,7 @@ impl JitCodeBuilder {
     /// trace-time pointer selection.
     ///
     /// The 7 production emit sites referenced in
-    /// `pyre-call-family-canonical-migration.md` Slice 1 (Slice 1b)
+    /// ()
     /// route through this adapter so callers do not have to thread
     /// `concrete_ptr` and `BhCallDescr` separately.
     pub fn residual_call_void_canonical_via_target(
@@ -2034,7 +2034,7 @@ impl JitCodeBuilder {
         );
     }
 
-    /// Slice 0e of `pyre-call-family-canonical-migration.md`: emit canonical
+    /// of: emit canonical
     /// `residual_call_{r,ir,irf}_v` opname/argcodes byte layout.
     ///
     /// Policy-specific void calls use this same bytecode family; their
@@ -2066,7 +2066,7 @@ impl JitCodeBuilder {
     ///
     /// `funcptr` is the raw concrete C-ABI pointer that
     /// `cpu.bh_call_v` (cranelift `compiler.rs:13934`, dynasm
-    /// `runner.rs` Slice 0d override) will eventually transmute into a
+    /// `runner.rs` override) will eventually transmute into a
     /// typed `extern "C" fn(...)`. The pointer is stashed in the int
     /// constants pool — RPython `assembler.py:127-138 emit_const`
     /// projects const-pool slot N into the post-regs window of
@@ -2318,8 +2318,8 @@ impl JitCodeBuilder {
     /// `handler_residual_call_*_{i,r,f}` at `blackhole.rs:6611-6660` via
     /// `code[p]`).
     ///
-    /// Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md`:
-    /// foundation. Slice 4 Slice 1a (`residual_call_*_canonical_*`
+    /// of:
+    /// foundation. (`residual_call_*_canonical_*`
     /// wrappers below) is the first non-dormant caller.
     fn emit_canonical_call_typed(
         &mut self,
@@ -2407,7 +2407,7 @@ impl JitCodeBuilder {
         self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
-    /// Slice 4 of `pyre-call-family-canonical-migration.md`: int-result
+    /// of: int-result
     /// sibling of [`Self::residual_call_void_canonical_via_target`].
     /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py:1225-1247`)
     /// dispatches via `cpu.bh_call_i` and writes the result into
@@ -2451,7 +2451,7 @@ impl JitCodeBuilder {
         );
     }
 
-    /// Slice 4: ref-result sibling.  `bhimpl_residual_call_{r,ir,irf}_r`
+    /// ref-result sibling.  `bhimpl_residual_call_{r,ir,irf}_r`
     /// (`blackhole.py:1228-1250`) dispatches via `cpu.bh_call_r`.
     #[allow(dead_code)]
     pub fn residual_call_ref_canonical_via_target(
@@ -2560,7 +2560,7 @@ impl JitCodeBuilder {
         calldescr_idx
     }
 
-    /// Slice 4: float-result sibling.  Always uses `IRF_F` per
+    /// float-result sibling.  Always uses `IRF_F` per
     /// `resoperation.py:1238-1248` ("no such thing" `R_F` / `IR_F`)
     /// and goes through [`Self::emit_canonical_call_typed_irf_f`] so
     /// the F list count byte is always present.
@@ -2615,7 +2615,7 @@ impl JitCodeBuilder {
         self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
-    // ── Slice 4 Slice 1b: typed policy variants (dormant) ──
+    // ── typed policy variants (dormant) ──
     //
     // Mirrors the void-family policy wrappers at lines 1772-1878.  Each
     // call_<policy>_<result>_canonical_via_target seeds the appropriate
@@ -2837,7 +2837,7 @@ impl JitCodeBuilder {
         );
     }
 
-    /// Slice 4: low-level int-result direct entry — sibling of
+    /// low-level int-result direct entry — sibling of
     /// [`Self::residual_call_void_canonical_typed_args`].  Skips the
     /// `JitCallTarget` resolution and registers a self-bridging
     /// `(funcptr, funcptr)` pair (mirrors void at line 1645).
@@ -3613,10 +3613,10 @@ impl JitCodeBuilder {
     /// `call_*` emit paths that need a `d` argcode descriptor (RPython
     /// `assembler.py:197-207` `_encode_descr(calldescr)`).
     ///
-    /// Slice 0 of `pyre-call-family-canonical-migration.md`: helper only.
-    /// Slice 1 emits via this from the migrated emit sites.
+    /// of: helper only.
+    /// emits via this from the migrated emit sites.
     ///
-    /// PRE-EXISTING-ADAPTATION: dedup is intentionally NOT done for the
+    /// TODO: dedup is intentionally NOT done for the
     /// `Call` variant. RPython's `descr.py:660-668 _key_for_caching`
     /// dedups calldescrs on `(arg_classes, RESULT_ERASED, ffi_flags,
     /// extrainfo)` because the funcptr lives in `op.args[0]` separately
@@ -4288,7 +4288,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_array_type_id == rhs_array_type_id
                 && lhs_interior_fields == rhs_interior_fields
         }
-        // PRE-EXISTING-ADAPTATION: `Call` variant intentionally falls
+        // TODO: `Call` variant intentionally falls
         // through `_ => false`. See `add_call_descr`'s docstring — pyre's
         // per-callsite `JitCodeExecState.call_descr_to_call_target`
         // sidetable is keyed by descr slot, so dedup'ing two distinct
@@ -4427,7 +4427,7 @@ mod tests {
 
     #[test]
     fn add_call_descr_pushes_canonical_call_entry() {
-        // Slice 0 of `pyre-call-family-canonical-migration.md` — verify
+        // of — verify
         // that `add_call_descr` puts a `BhDescr::Call { calldescr }` at the
         // returned pool index so canonical `residual_call_*_v` handlers
         // (`blackhole.rs:6886-6892`) can reach it via `read_descr` →
@@ -4450,7 +4450,7 @@ mod tests {
 
     #[test]
     fn residual_call_void_canonical_emits_irf_for_mixed_kinds() {
-        // Slice 0e — `residual_call_void_canonical_typed_args` writes the
+        // — `residual_call_void_canonical_typed_args` writes the
         // canonical byte layout that `blackhole.rs:6534 handler_residual_call_irf_v`
         // reads: 1B funcptr_reg + (countI:1 + regI×N) + (countR:1 + regR×M)
         // + (countF:1 + regF×K) + descr:2.
@@ -4557,7 +4557,7 @@ mod tests {
 
     #[test]
     fn residual_call_int_canonical_emits_irf_with_dst_for_mixed_kinds() {
-        // Slice 4 Slice 1a — `residual_call_int_canonical_typed_args`
+        // — `residual_call_int_canonical_typed_args`
         // writes the same byte layout as the void IRF case, plus a
         // trailing `dst:u8` byte (`>i` suffix in `wellknown_bh_insns`).
         let mut builder = JitCodeBuilder::new();

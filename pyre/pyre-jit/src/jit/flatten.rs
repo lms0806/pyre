@@ -126,7 +126,7 @@ pub struct SSARepr {
     /// `fresh_var(kind, base)` returns and bumps the counter, ensuring
     /// scratches occupy indices distinct from Python locals/stack and
     /// from any hardcoded scratch slots still living in
-    /// `RegisterLayout`. Once Phase 2.2 fully migrates the dispatcher,
+    /// `RegisterLayout`. Once the dispatcher is fully migrated,
     /// the counter becomes the sole source of scratch indices and
     /// `RegisterLayout`'s scratch fields can be retired.
     next_var_idx: [u16; 3],
@@ -425,12 +425,12 @@ pub enum DescrOperand {
 /// bh_call_*` + `calldescr.call_stub_*`). pyre needs both pieces at
 /// dispatch time.
 ///
-/// Slice 1 of the EffectInfo wire-up epic: `effect_info` carries the
+/// `effect_info` carries the
 /// upstream-shape `EffectInfo` derived from the producer's
 /// [`CallFlavor`] at emit time via [`effect_info_for_call_flavor`].
-/// Slice 3 flipped `dispatch_residual_call` to derive its branch from
-/// [`dispatch_kind_for_effect_info`] applied to `effect_info`. Slice 3b
-/// dropped the redundant `flavor` field: codewriter sites still take a
+/// `dispatch_residual_call` derives its branch from
+/// [`dispatch_kind_for_effect_info`] applied to `effect_info`.
+/// The redundant `flavor` field was dropped: codewriter sites still take a
 /// `CallFlavor` parameter as construction-site shorthand, but the stub
 /// stores only the canonical `EffectInfo` form. `arg_kinds` stays for
 /// the per-arg `JitCallArg` reassembly until upstream `descr.arg_types()`
@@ -459,7 +459,7 @@ pub struct CallDescrStub {
 
 /// Make [`CallDescrStub`] addressable through `majit_ir::DescrRef` so the
 /// graph layer can carry it as a `flow::SpaceOperationArg::Descr` arg
-/// when graph-side `residual_call_*` recorders land (Task #42).  Other
+/// when graph-side `residual_call_*` recorders land.  Other
 /// `Descr` trait methods take their default values — the stub is not
 /// indexed in the `JitCode.descrs` table, has no fail/size/array
 /// downcast, and only needs to be downcast-recognisable from
@@ -525,7 +525,7 @@ pub fn intern_call_descr_stub(
 /// `EffectInfo.extraeffect` value upstream's optimizer would have read
 /// off the calldescr to pick the same `call_*_*` rewrite.
 ///
-/// Slice 1 of the EffectInfo wire-up epic. `effect_info_for_call_flavor`
+/// `effect_info_for_call_flavor`
 /// is the foundation for future slices that flip dispatch consumers
 /// (assembler / blackhole / trace recorder) from reading `flavor`
 /// directly to reading `effect_info.extraeffect`.
@@ -594,7 +594,7 @@ pub fn intern_call_descr_stub(
 ///     specialization unreachable (also unported on the consumer
 ///     side; matches by missing).
 ///
-/// Convergence (Task #64): build a callee-identity-keyed registry of
+/// Convergence: build a callee-identity-keyed registry of
 /// codewriter `getcalldescr` results so this producer can resolve a
 /// residual call's `EffectInfo` from `CallControl` instead of returning
 /// a `CallFlavor`-bucketed stub.  Until that plumbing lands, this
@@ -767,7 +767,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // `ElidableCanRaise` (4) → true (guard recorded). Producers
         // pick the right variant based on callee analysis; a producer
         // that does not yet have the analyzer wired falls back to
-        // `PureCanRaise` (`Task #64` callee-identity-keyed registry).
+        // `PureCanRaise` (callee-identity-keyed registry TODO).
         CallFlavor::PureCannotRaise => majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
         CallFlavor::PureOrMemerror => majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
         CallFlavor::PureCanRaise => majit_metainterp::ELIDABLE_EFFECT_INFO,
@@ -876,7 +876,7 @@ pub enum CallFlavor {
     /// picks this on the non-elidable `else` branch when
     /// `_canraise(op) == False` — `pyjitpl.py:2111 do_residual_call`
     /// then drops the trailing `GUARD_NO_EXCEPTION`. pyre's analyzer
-    /// port (Task #64) is the upstream replacement; producers select
+    /// port is the upstream replacement; producers select
     /// this flavor today only when the callee is statically known not
     /// to raise.
     ///
@@ -1313,7 +1313,7 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
-        // Phase 4 endgame slice 15: record FIRST insn position per
+        // Record FIRST insn position per
         // non-negative `op.offset` (Python PC) into
         // `ssarepr.pc_first_insn_pos`.  Walker tracks the same mapping
         // via `walker_pc_live_marker_pos` (codewriter.rs:4125); both
@@ -2310,7 +2310,7 @@ fn regalloc_color(
     let kind = v.kind.unwrap_or(Kind::Ref);
     let alloc = &regallocs[kind.index()];
     let color = alloc.coloring.get(&v.id).copied().unwrap_or_else(|| {
-        // Surface kind + per-kind coloring size so the Phase 4 endgame
+        // Surface kind + per-kind coloring size so the
         // probe (codewriter.rs PYRE_PHASE4_BUILD_CANONICAL) can name
         // the specific dual-coloring gap without dumping the entire
         // graph.  Sample up to 8 known IDs to make "is the Variable
@@ -2780,7 +2780,7 @@ where
 ///    by `record_graph_op` for vable get/setfield + get/setarrayitem
 ///    ops (`jtransform.py:846-927`, `:1880-1906`).
 /// 2. `as_any` downcast to pyre's local [`CallDescrStub`], for graph-
-///    side `residual_call_*` recorders (Task #42) that thread the
+///    side `residual_call_*` recorders that thread the
 ///    interned stub via [`intern_call_descr_stub`].  The downcast
 ///    clones the stub value into the SSA-side `DescrOperand` so the
 ///    consumer (`assembler::dispatch_residual_call`) sees the same
@@ -2827,7 +2827,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 }
 
 // ---------------------------------------------------------------------------
-// Task #48 — flatten-time pre-rtype HLOp lowering.
+// Flatten-time pre-rtype HLOp lowering.
 // ---------------------------------------------------------------------------
 
 /// Per-CodeWriter context that the pre-rtype HLOp lowering arms read
@@ -2837,9 +2837,9 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 /// `GraphFlattener`; pyre's pass is per-CodeWriter, but the threading
 /// shape is identical.
 ///
-/// Slice 1 of the epic introduced `binary_op_fn_idx` (BINARY_OP
-/// family); slice 4 adds `compare_op_fn_idx` (COMPARE_OP family).
-/// Subsequent slices add `truth_fn_idx`, `setitem_fn_idx`, etc.,
+/// `binary_op_fn_idx` covers the BINARY_OP
+/// family; `compare_op_fn_idx` covers the COMPARE_OP family.
+/// `truth_fn_idx`, `setitem_fn_idx`, etc. cover
 /// one per HLOp family that the lowering pass brings online.
 #[derive(Debug, Clone, Copy)]
 pub struct LoweringContext {
@@ -3150,8 +3150,8 @@ where
 }
 
 /// Construct the COMPARE_OP-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice 4
-/// retirement) bypasses the SpaceOperation→Insn round-trip and
+/// raw register indices.  Production codewriter callsite
+/// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(compare_fn_idx, ...)` + matching graph
 /// dual-write at codewriter.rs:5393-5428.
@@ -3762,8 +3762,8 @@ where
 }
 
 /// Construct the BOOL-family `residual_call_r_i` Insn from a raw
-/// register index.  Production codewriter callsite (Slice 5
-/// retirement) bypasses the SpaceOperation→Insn round-trip and
+/// register index.  Production codewriter callsite
+/// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(truth_fn_idx, ...)` + graph dual-write at
 /// codewriter.rs:5453-5480 (PopJumpIfFalse) and :5518-5544
@@ -3828,7 +3828,7 @@ fn build_residual_call_r_i_insn_from_operands(
 /// Single HLOp opname `setitem`.  Returns `None` for non-`setitem`
 /// opnames or non-void-result HLOps.
 ///
-/// Task #48 micro-slice 6 (SETITEM retirement): same per-family
+/// SETITEM retirement: same per-family
 /// pattern as micro-slices 3-5.  Differences vs the prior shapes:
 ///   * void Insn (no result Register).
 ///   * 3-element ListR (vs 2 for BINARY_OP/COMPARE_OP, 1 for BOOL).
@@ -4088,8 +4088,8 @@ where
 }
 
 /// Construct the SETITEM-family `residual_call_r_v` Insn from raw
-/// register indices.  Production codewriter callsite (Slice 6
-/// retirement) bypasses the SpaceOperation→Insn round-trip and
+/// register indices.  Production codewriter callsite
+/// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(store_subscr_fn_idx, ...)` + matching graph
 /// dual-write at codewriter.rs:5244-5282.
@@ -5801,7 +5801,7 @@ mod tests {
     /// Helper: build a `get_register` closure that maps each
     /// `Variable` to a `Register` whose index equals the
     /// `VariableId`, kind taken from the variable.  Used by the
-    /// Task #48 lowering tests.
+    /// lowering tests.
     fn identity_register_mapper() -> impl FnMut(Variable) -> Register {
         |variable: Variable| {
             Register::new(
@@ -5824,7 +5824,7 @@ mod tests {
 
     #[test]
     fn binary_op_tag_for_opname_covers_runtime_ops_table() {
-        // Task #48 micro-slice 1: tag mapping must agree with
+        // Tag mapping must agree with
         // `pyre_interpreter::runtime_ops::binary_op_tag` for every
         // BinaryOperator the codewriter encodes.  Keep the two tables
         // in lockstep — a divergence would record the wrong op_val on
@@ -5883,7 +5883,7 @@ mod tests {
 
     #[test]
     fn lower_binary_op_hlop_to_insn_emits_residual_call_ir_r() {
-        // Task #48 micro-slice 1: lowering an `add(lhs, rhs) → result`
+        // Lowering an `add(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the BINARY_OP
         // callsite (codewriter.rs:5335-5352): `residual_call_ir_r`
@@ -6068,7 +6068,7 @@ mod tests {
 
     #[test]
     fn compare_op_tag_for_opname_covers_runtime_ops_table() {
-        // Task #48 micro-slice 4: tag mapping must agree with
+        // Tag mapping must agree with
         // `pyre_interpreter::runtime_ops::compare_op_tag` for every
         // ComparisonOperator the codewriter encodes.  Six opnames
         // (no `inplace_*` siblings — comparisons are pure).
@@ -6098,7 +6098,7 @@ mod tests {
 
     #[test]
     fn lower_compare_op_hlop_to_insn_emits_residual_call_ir_r() {
-        // Task #48 micro-slice 4: lowering an `lt(lhs, rhs) → result`
+        // Lowering an `lt(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the
         // CompareOp callsite (codewriter.rs:5393-5410):
@@ -6217,7 +6217,7 @@ mod tests {
 
     #[test]
     fn lower_bool_hlop_to_insn_emits_residual_call_r_i() {
-        // Task #48 micro-slice 5: lowering a `bool(operand) →
+        // Lowering a `bool(operand) →
         // result` HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the
         // PopJumpIfFalse / PopJumpIfTrue callsites
@@ -6335,7 +6335,7 @@ mod tests {
 
     #[test]
     fn lower_setitem_hlop_to_insn_emits_residual_call_r_v() {
-        // Task #48 micro-slice 6: lowering a `setitem(obj, key,
+        // Lowering a `setitem(obj, key,
         // value)` HLOp (no result — `emit_frontend_setitem` records
         // the SpaceOperation with `result = None` per
         // codewriter.rs:1518-1524) must produce the same Insn shape
@@ -6650,7 +6650,7 @@ mod tests {
 
     #[test]
     fn build_load_const_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
-        // Task #48 micro-slice 7: LoadConst factor refactor.  The
+        // LoadConst factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
         // codewriter.rs:4933-4946 before the refactor: `[ConstInt(
@@ -6835,7 +6835,7 @@ mod tests {
 
     #[test]
     fn build_load_global_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
-        // Task #48 micro-slice 8: LoadGlobal factor refactor.  The
+        // LoadGlobal factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
         // codewriter.rs:5598-5615 before the refactor: `[ConstInt(
@@ -7161,7 +7161,7 @@ mod tests {
 
     #[test]
     fn build_call_fn_residual_call_r_r_insn_emits_residual_call_r_r_for_nargs_2() {
-        // Task #48 micro-slice 9: CALL family factor refactor.  The
+        // CALL family factor refactor.  The
         // helper must produce the same `residual_call_r_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
         // codewriter.rs:5747-5754 before the refactor.  For nargs=2:
@@ -7357,7 +7357,7 @@ mod tests {
 
     #[test]
     fn build_box_int_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
-        // Task #48 micro-slice 10: box_int_fn factor refactor.  The
+        // box_int_fn factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn
         // shape that `emit_residual_call_shape` produced inline at
         // all 3 box_int_fn callsites (LoadSmallInt / UnaryNegative /
@@ -7486,7 +7486,7 @@ mod tests {
 
     #[test]
     fn build_build_list_fn_residual_call_ir_r_insn_emits_residual_call_ir_r_for_argc_2() {
-        // Task #48 micro-slice 13: BuildList factor refactor.  argc=2:
+        // BuildList factor refactor.  argc=2:
         // two item slots are real Refs, and the third trailing ABI slot
         // is an Int dummy.  Expected shape:
         // `[ConstInt(fn_idx), ListI([ConstInt(2), ConstInt(0)]),
@@ -7824,7 +7824,7 @@ mod tests {
 
     #[test]
     fn build_get_current_exception_fn_residual_call_r_r_insn_emits_zero_arg_call() {
-        // Task #48 micro-slice 15: 0-arg `() → Ref` PlainCannotRaiseNoHeap.
+        // 0-arg `() → Ref` PlainCannotRaiseNoHeap.
         // Insn shape: `[ConstInt(fn_idx), ListR([]), Descr]
         // → Reg(Ref, dst)`.  arg_kinds is empty; flavor is PlainCannotRaiseNoHeap.
         let insn = build_get_current_exception_fn_residual_call_r_r_insn(

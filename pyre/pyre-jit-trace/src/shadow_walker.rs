@@ -50,7 +50,7 @@ fn shadow_walker_enabled_once() -> bool {
 }
 
 /// Returns `true` iff the process started with `MAJIT_SHADOW_WALKER=1`.
-/// Production hook sites (Slice 2) gate their shadow walker call on
+/// Production hook sites gate their shadow walker call on
 /// this. Default off — production unaffected.
 pub fn shadow_walker_enabled() -> bool {
     shadow_walker_enabled_once()
@@ -493,7 +493,7 @@ mod tests {
         // `opcode_load_fast_checked` and hits the same depth-N+
         // unboxed-Int-Ref `getfield_gc_i` blocker PopTop has on
         // raise_catch_loop + synth/set_membership.  Gated on
-        // Task #165 / #167 — see the comment in
+        // See the comment in
         // `opname_in_shadow_allow_list`.
         use pyre_interpreter::bytecode::Arg;
         let instr = Instruction::LoadFastCheck {

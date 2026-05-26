@@ -587,7 +587,7 @@ impl TranslationContext {
     ///
     /// The `rtyper is None` guard at `:87-88` is mirrored exactly. The
     /// lazy creation at `:91-92` (`ExceptionTransformer(self)`) is
-    /// PRE-EXISTING-ADAPTATION pending the
+    /// TODO: pending the
     /// `rpython/translator/exceptiontransform.py` port — for now the
     /// method returns `Ok(None)` so callers see the
     /// "rtyper-present-but-no-transformer-yet" shape and route the

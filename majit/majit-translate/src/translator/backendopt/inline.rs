@@ -1,10 +1,10 @@
 //! Port of `rpython/translator/backendopt/inline.py`.
 //!
-//! Slice 1 lands the read-only foundation: the call-graph
-//! collectors / matchers / RaiseAnalyzer-driven predicates that
-//! upstream uses to drive `BaseInliner` (the heavy graph-rewriting
-//! machinery is unported — see [`super::all`] for the gating
-//! `inline` / `mallocs` `TaskError`).
+//! Read-only foundation: call-graph collectors / matchers /
+//! RaiseAnalyzer-driven predicates that upstream uses to drive
+//! `BaseInliner` (the heavy graph-rewriting machinery is unported
+//! — see [`super::all`] for the gating `inline` / `mallocs`
+//! `TaskError`).
 //!
 //! Ported in this file:
 //!
@@ -17,54 +17,39 @@
 //! * `does_raise_directly(graph, raise_analyzer)` (`:109-122`).
 //! * `any_call_to_raising_graphs(from_graph, translator,
 //!   raise_analyzer)` (`:124-142`).
-//!
-//! Slice 2 lands the auto-inlining cost helpers and the
-//! call-graph collector consumed by `auto_inlining`:
-//!
 //! * `OP_WEIGHTS` (`:470-476`) → `op_weight()` helper.
 //! * `block_weight(block)` (`:478-488`).
 //! * `static_instruction_count(graph)` (`:532-536`).
-//! * `always_inline(graph)` (`:604-606`) — PRE-EXISTING-ADAPTATION,
-//!   pyre's `GraphFunc` lacks the `_always_inline_` slot.
+//! * `always_inline(graph)` (`:604-606`) — TODO: pyre's `GraphFunc`
+//!   lacks the `_always_inline_` slot.
 //! * `inlinable_static_callers` (`:546-567`).
-//!
-//! Slice 3 lands the median-execution-cost solver and the actual
-//! `inlining_heuristic` consumer:
-//!
 //! * `measure_median_execution_cost(graph)` (`:491-530`) — uses
 //!   [`crate::tool::algo::sparsemat::SparseMatrix`] and
 //!   [`super::support::find_loop_blocks`].
 //! * `inlining_heuristic(graph)` (`:538-544`).
-//!
-//! Slice 4 ports the actual inliner machinery in three sub-slices:
-//!
-//! * Slice 4a: `BaseInliner` foundation — fields, ctor, simple
-//!   helpers (`get_graph_from_op` / `get_new_name` / `passon_vars` /
+//! * `BaseInliner` foundation — fields, ctor, simple helpers
+//!   (`get_graph_from_op` / `get_new_name` / `passon_vars` /
 //!   `copy_operation` / `copy_link` / `copy_block` /
 //!   `search_for_calls` / `find_args_in_exceptional_case`).
-//! * Slice 4b: orchestrator and rewire mutators — `inline_all` /
-//!   `inline_once` / `do_inline` / `rewire_returnblock` /
-//!   `rewire_exceptblock` / `rewire_exceptblock_no_guard` /
-//!   `cleanup`. Exception-guarded calls return `CannotInline`
-//!   pending Slice 4d.
-//! * Slice 4c: public entry points — `BaseInliner::new_inliner`
-//!   (`:439-459`), free-function [`inline_function`] (`:75-80`),
-//!   free-function [`simple_inline_function`] (`:82-86`, wraps
-//!   [`inline_function`] with the upstream defaults; threads `()`
-//!   in place of `lltype_to_classdef_mapping()` since that mapping
-//!   is consumed only by Slice 4d's
-//!   `rewire_exceptblock_with_guard`).
+//! * Orchestrator and rewire mutators — `inline_all` / `inline_once`
+//!   / `do_inline` / `rewire_returnblock` / `rewire_exceptblock` /
+//!   `rewire_exceptblock_no_guard` / `cleanup`.
+//! * Public entry points — `BaseInliner::new_inliner` (`:439-459`),
+//!   free-function [`inline_function`] (`:75-80`), free-function
+//!   [`simple_inline_function`] (`:82-86`, wraps [`inline_function`]
+//!   with the upstream defaults; threads `()` in place of
+//!   `lltype_to_classdef_mapping()` since that mapping is consumed
+//!   only by `rewire_exceptblock_with_guard`).
+//! * `instrument_inline_candidates` (`:569-602`) / `auto_inlining` /
+//!   `auto_inline_graphs` (`:608-731`).
 //!
-//! Deferred to subsequent slices (anchored in upstream order):
+//! Deferred (anchored in upstream order):
 //!
-//! * Slice 4d: `_find_exception_type` (`:89-107`),
+//! * `_find_exception_type` (`:89-107`),
 //!   `rewire_exceptblock_with_guard` (`:326-353`),
 //!   `generic_exception_matching` (`:355-390`) — blocked on
 //!   `lltype.normalizeptr` + `RPythonTyper.lltype_to_classdef_mapping()`
 //!   ports.
-//! * Slice 5: `instrument_inline_candidates` (`:569-602`) /
-//!   `auto_inlining` / `auto_inline_graphs` (`:608-731`) — depend on
-//!   the heap-based driver loop.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -457,9 +442,9 @@ pub fn any_call_to_raising_graphs(
 
 // ============================================================
 // Auto-inlining heuristics — pure read-only graph cost model.
-// Slice 2 of `inline.py` covers `OP_WEIGHTS` / `block_weight` /
-// `static_instruction_count` / `inlinable_static_callers` /
-// `always_inline`. The `_dont_inline_` / `_always_inline_` flag
+// `OP_WEIGHTS` / `block_weight` / `static_instruction_count` /
+// `inlinable_static_callers` / `always_inline`. The
+// `_dont_inline_` / `_always_inline_` flag
 // reads default to upstream's `getattr(..., default)` fallback —
 // pyre's `GraphFunc` does not yet surface either flag.
 // ============================================================
@@ -635,7 +620,7 @@ pub enum InlinableCallerEntry {
 /// `_dont_inline_` is a Python attribute on the Python callable.
 /// Pyre's `_callable` slot is `Option<String>`; the upstream
 /// `getattr` with default `False` reduces to "always False" today.
-/// PRE-EXISTING-ADAPTATION documented at [`callable_dont_inline`].
+/// TODO: documented at [`callable_dont_inline`].
 pub fn inlinable_static_callers(
     graphs: &[GraphRef],
     store_calls: bool,
@@ -716,10 +701,9 @@ fn callable_dont_inline(callee: &GraphRef) -> bool {
 }
 
 // ============================================================
-// Slice 3: median-execution-cost solver + inlining_heuristic.
+// Median-execution-cost solver + inlining_heuristic.
 // Depends on `tool::algo::sparsemat::SparseMatrix` and
-// `super::support::find_loop_blocks` — both ported as foundation
-// in this slice's commits.
+// `super::support::find_loop_blocks`.
 // ============================================================
 
 /// `measure_median_execution_cost(graph)` at `inline.py:491-530`.
@@ -911,13 +895,10 @@ pub fn inlining_heuristic(graph: &GraphRef) -> (f64, bool) {
 }
 
 // ============================================================
-// Slice 4a: BaseInliner foundation — fields, constructor, and
-// the read-only / pure helpers (get_new_name, passon_vars,
-// copy_operation, copy_link, copy_block, search_for_calls,
-// find_args_in_exceptional_case). The `do_inline` orchestrator
-// and `rewire_*` mutators land in Slice 4b; the public
-// `Inliner` / `OneShotInliner` / `inline_function` entry points
-// land in Slice 4c.
+// BaseInliner foundation — fields, constructor, and the read-only
+// / pure helpers (get_new_name, passon_vars, copy_operation,
+// copy_link, copy_block, search_for_calls,
+// find_args_in_exceptional_case).
 // ============================================================
 
 /// Sub-inliner kind selector — controls
@@ -971,9 +952,9 @@ pub enum PassonCacheKey {
 /// varmap and copied-block cache, and the queue of (block,
 /// op_index, callee) tuples to inline.
 ///
-/// Slice 4a populates the struct surface and the read-only
-/// helpers. Slice 4b adds `inline_once` / `do_inline` and the
-/// rewire mutators; Slice 4c adds the public entry points.
+/// The struct surface and the read-only helpers are defined here;
+/// `inline_once` / `do_inline` and the rewire mutators follow;
+/// the public entry points are at the bottom.
 pub struct BaseInliner<'t> {
     // ----- upstream `__init__` parameters -----
     /// Upstream `self.translator`.
@@ -993,7 +974,7 @@ pub struct BaseInliner<'t> {
     /// `RPythonTyper.lltype_to_classdef_mapping()` is unported;
     /// the slot is held as `()` so the public surface lines up
     /// for the day the dependency lands. Consumed only by
-    /// `rewire_exceptblock_with_guard` (Slice 4d).
+    /// `rewire_exceptblock_with_guard` (unported).
     pub lltype_to_classdef: (),
     /// Upstream `self.call_count_pred` — predicate consulted
     /// inside `inline_all` for the
@@ -1468,7 +1449,7 @@ impl<'t> BaseInliner<'t> {
         linkargs
     }
 
-    // ----- Slice 4b: orchestrator + rewire mutators + drivers -----
+    // ----- orchestrator + rewire mutators + drivers -----
 
     /// `inline_all(self)` at `inline.py:163-187`.
     ///
@@ -1576,7 +1557,7 @@ impl<'t> BaseInliner<'t> {
     ///   does_raise_directly` arm.
     /// * upstream `:205-207 not inline_guarded_calls AND
     ///   any_call_to_raising_graphs` arm.
-    /// * Slice 4d-not-yet-ported guarded-inline path.
+    /// * not-yet-ported guarded-inline path.
     pub fn inline_once(
         &mut self,
         block: &crate::flowspace::model::BlockRef,
@@ -1655,7 +1636,7 @@ impl<'t> BaseInliner<'t> {
             // message identifies which upstream branch would have
             // fired and a reviewer can verify the
             // would-have-passed-through cases are the only ones the
-            // Slice 4d gap blocks.
+            // unported guarded-inline blocks.
             if self.inline_guarded_calls {
                 if !self.inline_guarded_calls_no_matter_what
                     && does_raise_directly(&graph_to_inline, &mut self.raise_analyzer)
@@ -1666,8 +1647,8 @@ impl<'t> BaseInliner<'t> {
                 }
                 return Err(CannotInline::new(
                     "inline.py:201-204 inline_guarded_calls pass-through requires \
-                     rewire_exceptblock_with_guard (Slice 4d gap: \
-                     lltype.normalizeptr + lltype_to_classdef_mapping unported).",
+                     rewire_exceptblock_with_guard (unported: \
+                     lltype.normalizeptr + lltype_to_classdef_mapping).",
                 ));
             } else if any_call_to_raising_graphs(
                 &graph_to_inline,
@@ -1679,8 +1660,8 @@ impl<'t> BaseInliner<'t> {
                 return Err(CannotInline::new(
                     "inline.py:205-207 non-raising callee under \
                      inline_guarded_calls=False would pass through to \
-                     rewire_exceptblock_with_guard (Slice 4d gap: \
-                     lltype.normalizeptr + lltype_to_classdef_mapping unported).",
+                     rewire_exceptblock_with_guard (unported: \
+                     lltype.normalizeptr + lltype_to_classdef_mapping).",
                 ));
             }
         }
@@ -1832,11 +1813,11 @@ impl<'t> BaseInliner<'t> {
             self.rewire_exceptblock(&afterblock);
         }
         // Upstream `:425-428 if self.exception_guarded:` —
-        // unreachable in Slice 4b because `inline_once` already
-        // bails on exception_guarded. Kept as a sanity assert.
+        // unreachable because `inline_once` already bails on
+        // exception_guarded. Kept as a sanity assert.
         assert!(
             !self.exception_guarded,
-            "inline.py:425 Slice 4b should never reach do_inline with \
+            "inline.py:425 should never reach do_inline with \
              exception_guarded=true",
         );
         // Upstream `:429-430 self.search_for_calls(afterblock);
@@ -1916,12 +1897,12 @@ impl<'t> BaseInliner<'t> {
             // self.rewire_exceptblock_no_guard(...)`.
             self.rewire_exceptblock_no_guard(afterblock, &copiedexceptblock);
         } else {
-            // Slice 4d gap; gated by `inline_once` returning
+            // Unported guarded path; gated by `inline_once` returning
             // CannotInline, so this branch is unreachable today.
             unreachable!(
                 "inline.py:303-308 exception-guarded path requires \
                  rewire_exceptblock_with_guard + generic_exception_matching \
-                 (Slice 4d). inline_once gates this case with CannotInline."
+                 (unported). inline_once gates this case with CannotInline."
             );
         }
     }
@@ -2175,13 +2156,13 @@ pub fn inline_function<'t>(
 ///     return inliner.inline_all()
 /// ```
 ///
-/// `lltype_to_classdef_mapping()` is consumed only by Slice 4d's
+/// `lltype_to_classdef_mapping()` is consumed only by the unported
 /// `rewire_exceptblock_with_guard` / `generic_exception_matching`,
 /// which `inline_once` already gates with `CannotInline`. Pyre's
 /// thread-through is `()`; the wrapper is otherwise a faithful
 /// port — non-exception-guarded callsites inline as upstream does,
 /// and the guarded ones surface the same `CannotInline` shape until
-/// Slice 4d lands.
+/// the guarded path lands.
 pub fn simple_inline_function<'t>(
     translator: &'t TranslationContext,
     inline_func: InlineFuncTarget,
@@ -2200,7 +2181,7 @@ pub fn simple_inline_function<'t>(
 }
 
 // ============================================================
-// Slice 5: automatic inlining driver.
+// Automatic inlining driver.
 //
 // `instrument_inline_candidates` (`:569-602`),
 // `auto_inlining` (`:608-713`),
@@ -2256,7 +2237,7 @@ pub fn simple_inline_function<'t>(
 ///
 /// Calls whose callee has the `_dont_inline_` flag set on its
 /// `_callable` are skipped — see [`callable_dont_inline`] for the
-/// pyre PRE-EXISTING-ADAPTATION on that flag.
+/// pyre TODO on that flag.
 ///
 /// Returns the number of inserted ops. Upstream's trailing
 /// `log.inlining` is replaced with a return value so tests can
@@ -2498,7 +2479,7 @@ pub fn auto_inlining(
     let mut try_again: HashMap<usize, String> = HashMap::new();
     // Upstream `:627 lltype_to_classdef =
     // translator.rtyper.lltype_to_classdef_mapping()`. Threaded as
-    // `()` per `inline_function` signature; PRE-EXISTING-ADAPTATION
+    // `()` per `inline_function` signature; TODO:
     // documented at `BaseInliner.lltype_to_classdef`.
     let lltype_to_classdef: () = ();
     // Upstream `:629 count = 0`.
@@ -2600,7 +2581,7 @@ pub fn auto_inlining(
             //         try_again[graph] = str(e)
             //         res = CannotInline
             // Pyre creates a fresh RaiseAnalyzer per call; see the
-            // function-level PRE-EXISTING-ADAPTATION note.
+            // function-level TODO note.
             let raise = RaiseAnalyzer::new(translator);
             let result = inline_function(
                 translator,
@@ -2735,7 +2716,7 @@ pub fn auto_inlining(
 /// `exceptiontransformed` attribute carrier yet
 /// (`exceptiontransform.py` is unported), so the filter is a no-op
 /// — every graph in `translator.graphs` qualifies.
-/// PRE-EXISTING-ADAPTATION: when `exceptiontransform` lands and
+/// TODO: when `exceptiontransform` lands and
 /// stamps the attribute, this arm needs the corresponding skip.
 pub fn auto_inline_graphs(
     translator: &TranslationContext,
@@ -2997,7 +2978,7 @@ mod tests {
         assert!(!contains_call(&g, CalleeMatcher::Any, &translator));
     }
 
-    // ----- Slice 2: auto-inlining heuristics -----
+    // ----- auto-inlining heuristics -----
 
     #[test]
     fn op_weight_table_matches_upstream_six_overrides() {
@@ -3101,9 +3082,8 @@ mod tests {
     #[test]
     fn always_inline_returns_false_until_flag_lands() {
         let g = int_add_graph("f");
-        // PRE-EXISTING-ADAPTATION: pyre's GraphFunc has no
-        // `_always_inline_` slot, so the helper is structurally
-        // always-False today.
+        // TODO: pyre's GraphFunc has no `_always_inline_` slot, so
+        // the helper is structurally always-False today.
         assert!(!always_inline(&g));
     }
 
@@ -3117,7 +3097,7 @@ mod tests {
         assert_eq!(result_with_ops.len(), 0);
     }
 
-    // ----- Slice 3: median-execution cost + inlining_heuristic -----
+    // ----- median-execution cost + inlining_heuristic -----
 
     #[test]
     fn measure_median_execution_cost_int_add_graph_returns_block_weight() {
@@ -3167,7 +3147,7 @@ mod tests {
         assert_eq!(weight, 200.0);
     }
 
-    // ----- Slice 4a: BaseInliner construction + simple helpers -----
+    // ----- BaseInliner construction + simple helpers -----
 
     fn fixture_inliner<'t>(
         translator: &'t TranslationContext,
@@ -3316,7 +3296,7 @@ mod tests {
         assert!(Rc::ptr_eq(&target, &copied));
     }
 
-    // ----- Slice 4b: orchestrator + drivers -----
+    // ----- orchestrator + drivers -----
 
     #[test]
     fn inline_all_empty_queue_returns_zero() {
@@ -3330,13 +3310,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_once_rejects_exception_guarded_call_with_slice_4d_gap() {
+    fn inline_once_rejects_exception_guarded_call_with_unported_gap() {
         // Build a host graph whose only block has a single
         // direct_call op AND `block.canraise()` is true (i.e. the
         // call is a try-except site). Pyre's `Block::canraise()`
-        // requires `block.exitswitch == c_last_exception`. For Slice
-        // 4b we synthesise that shape and verify inline_once
-        // returns CannotInline.
+        // requires `block.exitswitch == c_last_exception`. Synthesise
+        // that shape and verify inline_once returns CannotInline.
         use crate::flowspace::model::{Atom, LAST_EXCEPTION};
         let translator = fixture_translator();
         let host = int_add_graph("host");
@@ -3390,8 +3369,8 @@ mod tests {
         // raising op because `block.canraise() && block.operations[-1] is op`.
         let result = inliner.inline_once(&block, 0);
         assert!(
-            matches!(&result, Err(e) if e.0.contains("Slice 4d gap")),
-            "expected Slice-4d-gap CannotInline, got {result:?}",
+            matches!(&result, Err(e) if e.0.contains("unported")),
+            "expected unported-guarded-path CannotInline, got {result:?}",
         );
     }
 
@@ -3487,7 +3466,7 @@ mod tests {
         assert!(!any_direct_call, "direct_call should have been inlined out");
     }
 
-    // ----- Slice 4c: public entry points -----
+    // ----- public entry points -----
 
     /// Helper: build the trivial host graph `g(): r = f(...); return r`
     /// where the call's funcobj points at `callee`. Returns the host
@@ -3650,7 +3629,7 @@ mod tests {
         Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(ptr))))
     }
 
-    // ----- Slice 5a: instrument_inline_candidates -----
+    // ----- instrument_inline_candidates -----
 
     #[test]
     fn instrument_inline_candidates_empty_graphs_returns_zero() {
@@ -3739,7 +3718,7 @@ mod tests {
         assert_eq!(labels, [0, 1]);
     }
 
-    // ----- Slice 5b: auto_inlining -----
+    // ----- auto_inlining -----
 
     /// Test heuristic that always reports a low fixed weight so the
     /// `weight >= threshold` early-exit doesn't fire. Returns
@@ -3857,7 +3836,7 @@ mod tests {
         );
     }
 
-    // ----- Slice 5c: auto_inline_graphs -----
+    // ----- auto_inline_graphs -----
 
     #[test]
     fn auto_inline_graphs_empty_returns_zero() {

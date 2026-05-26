@@ -61,7 +61,7 @@ pub struct Box {
     /// `BoxKind::Const { value, .. }` instead.
     pub value: Cell<Option<Value>>,
 
-    /// Slice 8.C dual-write backref to the `Op` this Box stands in for.
+    /// Dual-write backref to the `Op` this Box stands in for.
     /// `Weak` to avoid an Rc cycle (Op.forwarded may carry a `BoxRef`
     /// holding an `Rc<Box>` whose `op_handle` could otherwise loop back
     /// through the trace). Empty for `BoxKind::InputArg` / `Const`
@@ -69,11 +69,11 @@ pub struct Box {
     /// for `BoxKind::ResOp` it is filled by `BoxRef::bind_op` at the
     /// recorder→TreeLoop handoff. When `Some`, `set_forwarded_box` /
     /// `set_forwarded_info` / `clear_forwarded` also write through to
-    /// `op.forwarded`, establishing the Slice 8.D invariant
+    /// `op.forwarded`, establishing the invariant
     /// `Box.forwarded == op.forwarded`.
     pub op_handle: RefCell<Option<Weak<Op>>>,
 
-    /// Slice 8.D parity: backref to the `InputArg` this Box stands in
+    /// Parity: backref to the `InputArg` this Box stands in
     /// for, mirroring `op_handle` for the `BoxKind::InputArg` variant.
     /// Empty for `BoxKind::ResOp` / `Const`; filled by
     /// `BoxRef::bind_inputarg` at the recorder→TreeLoop handoff so the
@@ -307,7 +307,7 @@ impl BoxRef {
         }))
     }
 
-    /// Slice 8.C: bind this Box to its corresponding `Op` so subsequent
+    /// Bind this Box to its corresponding `Op` so subsequent
     /// `set_forwarded_*` / `clear_forwarded` calls dual-write through to
     /// `op.forwarded`. Stores a `Weak<Op>` to avoid an Rc cycle. Called by
     /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
@@ -334,7 +334,7 @@ impl BoxRef {
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
-    /// Slice 8.D prep: upgrade the bound `Weak<Op>` into a strong `OpRc`.
+    /// Upgrade the bound `Weak<Op>` into a strong `OpRc`.
     /// Returns `None` for unbound boxes (InputArg / Const / lazy-allocated)
     /// or if the bound `Op` was dropped. Callers migrating away from
     /// `box.get_forwarded()` use this to reach `op.forwarded.borrow()` for
@@ -343,7 +343,7 @@ impl BoxRef {
         self.0.op_handle.borrow().as_ref().and_then(|w| w.upgrade())
     }
 
-    /// Slice 8.D InputArg counterpart of `bind_op`. Stores a
+    /// InputArg counterpart of `bind_op`. Stores a
     /// `Weak<InputArg>` so subsequent `set_forwarded_*` / `clear_forwarded`
     /// route through `inputarg.forwarded` (`resoperation.py:700
     /// AbstractInputArg._forwarded`). Panics if called on a non-InputArg
@@ -363,7 +363,7 @@ impl BoxRef {
         *self.0.inputarg_handle.borrow_mut() = Some(Rc::downgrade(ia));
     }
 
-    /// Slice 8.D prep: upgrade the bound `Weak<InputArg>` into a strong
+    /// Upgrade the bound `Weak<InputArg>` into a strong
     /// `InputArgRc`. Returns `None` for unbound or non-InputArg boxes and
     /// for dropped `InputArg`s. Symmetric to `bound_op`.
     pub fn bound_inputarg(&self) -> Option<crate::value::InputArgRc> {
@@ -438,8 +438,8 @@ impl BoxRef {
     }
 
     /// `resoperation.py:50 get_forwarded`. Returns a clone of the
-    /// current slot. For Slice 8.C-bound ResOp boxes the read is routed
-    /// through `op.forwarded`; Slice 8.D extends this to InputArg via
+    /// current slot. For bound ResOp boxes the read is routed
+    /// through `op.forwarded`; extends this to InputArg via
     /// `inputarg.forwarded`. Unbound boxes (Const / lazy-allocated) fall
     /// back to `Box.forwarded`. The clone is cheap — every `Forwarded`
     /// payload is an `Rc`/`Copy` handle.
@@ -1204,7 +1204,7 @@ mod tests {
         assert!(a.int_bound_mut().is_none());
     }
 
-    /// Slice 8.C: after `bind_op`, `set_forwarded_*` dual-writes through
+    /// After `bind_op`, `set_forwarded_*` dual-writes through
     /// to `op.forwarded`, so a reader on `op.forwarded` sees the same
     /// state as `box.get_forwarded()`.
     #[test]
@@ -1241,7 +1241,7 @@ mod tests {
 
     /// `bind_op` stores `Weak<Op>`; once the `Rc<Op>` is dropped, the
     /// dual-write becomes a no-op (Weak::upgrade returns None) without
-    /// panicking. Slice 8.C safety net.
+    /// panicking. Safety net.
     #[test]
     fn dropped_op_makes_dual_write_a_noop() {
         use crate::resoperation::{Op, OpCode};
@@ -1329,7 +1329,7 @@ mod tests {
 
     /// After `bind_inputarg`, `set_forwarded_*` writes through to
     /// `inputarg.forwarded` and `get_forwarded` reads from it — same
-    /// dual-write invariant Slice 8.C established for ResOp.
+    /// dual-write invariant established for ResOp.
     #[test]
     fn bind_inputarg_makes_set_forwarded_dual_write_to_inputarg() {
         use crate::value::InputArg;

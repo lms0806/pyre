@@ -75,7 +75,7 @@ pub struct BaseJitCell {
     pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream `warmstate.py:188` stores
+    /// TODO: upstream `warmstate.py:188` stores
     /// `wref_procedure_token` as a `weakref.ref(token)` so warmstate
     /// holds only a weak handle; `MemoryManager.alive_loops` is the only
     /// long-lived strong owner (`memmgr.py:9-14`).  Pyre still stores
@@ -492,7 +492,7 @@ impl WarmEnterState {
         self.disable_noninlinable_function(green_key_hash);
     }
 
-    /// PRE-EXISTING-ADAPTATION: pyre-only cold fast path check. RPython
+    /// TODO: pyre-only cold fast path check. RPython
     /// warmstate.py:467 just calls jitcounter.tick(hash, increment_threshold)
     /// directly; this read-only peek exists to skip GreenKey allocation
     /// in jitdriver.rs for cold keys.
@@ -590,7 +590,7 @@ impl WarmEnterState {
     /// bucket head via the legacy entry point. Migrating
     /// `finish_tracing`, `abort_tracing`, `clear_loop_token`, and
     /// `mark_dont_trace` to the typed chain-walk is tracked as a
-    /// pre-existing PRE-EXISTING-ADAPTATION follow-up so the typed
+    /// pre-existing TODO follow-up so the typed
     /// path's full lifecycle stays self-consistent on its own buckets.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
         let hash = key.get_uhash();
@@ -845,7 +845,7 @@ impl WarmEnterState {
 
     /// Reset ALL counters to zero. Used after invalidation with incomplete
     /// resume data (NONE fail_args) to prevent immediate recompilation.
-    /// PRE-EXISTING-ADAPTATION: RPython has no equivalent; this is a
+    /// TODO: RPython has no equivalent; this is a
     /// pyre-only recovery path.
     pub fn decay_all_counters_to_zero(&mut self) {
         self.counter.reset_all();
@@ -863,7 +863,7 @@ impl WarmEnterState {
         self.cells.get(&green_key_hash)
     }
 
-    /// PRE-EXISTING-ADAPTATION: walk the warmstate cells to find a
+    /// TODO: walk the warmstate cells to find a
     /// `JitCellToken` by number. Used by `MetaInterp::record_loop_or_bridge`
     /// to widen the CALL_ASSEMBLER keepalive search to cover targets
     /// that live only on a `BaseJitCell.loop_token` (most importantly
@@ -992,7 +992,7 @@ impl WarmEnterState {
     /// pyjitpl.py:2295 `self.jitlog.setup_once()` parity (per-warmstate
     /// adaptation).
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy owns one `JitLogger` on
+    /// TODO: PyPy owns one `JitLogger` on
     /// `MetaInterpStaticData` (`rlib/rjitlog/rjitlog.py:347-354`) and
     /// `setup_once` re-reads `PYPYLOG` and writes a header.  Pyre's
     /// `Logger` is owned per-`WarmEnterState` instead, so the global

@@ -9,15 +9,13 @@
 //! folding must not corrupt the `(next_offset, Instruction, oparg)`
 //! triple.
 //!
-//! This covers the F2.4 bullet "new `tests/test_bytecode_py314.rs`
-//! asserting every 3.14 opcode decodes" from the roadmap
-//! (`.claude/plans/majestic-forging-meteor.md` Phase 2).
+//! This covers the "new `tests/test_bytecode_py314.rs` asserting every
+//! 3.14 opcode decodes" bullet from the roadmap.
 //!
-//! F2.4 also asked for a port of `test_objspace.py` bytecode-shape
-//! tests, but those are integration tests that drive
-//! `build_flow(func)` — they require `FlowContext`, which lands in
-//! Phase 3 F3.5. A separate `tests/test_objspace.rs` will be added
-//! alongside the flowcontext port.
+//! A port of `test_objspace.py` bytecode-shape tests is also planned,
+//! but those are integration tests that drive `build_flow(func)` —
+//! they require `FlowContext`. A separate `tests/test_objspace.rs`
+//! will be added alongside the flowcontext port.
 
 use majit_translate::flowspace::bytecode::{ConstantData, HostCode, Instruction};
 use rustpython_compiler::{Mode, compile as rp_compile};

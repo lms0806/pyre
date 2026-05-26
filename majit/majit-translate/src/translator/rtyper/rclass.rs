@@ -74,7 +74,7 @@ use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList
 /// mangled_name)` to `llops`. The full `getclsfield` is ported on
 /// [`ClassRepr`] (`rclass.rs:1096`) and on the rooted [`RootClassRepr`]
 /// (`rclass.rs:1828`); this freestanding helper stays as a
-/// PRE-EXISTING-ADAPTATION bridge for the pyre IR representation of
+/// TODO: bridge for the pyre IR representation of
 /// vtable method slots (see the `OpKind::VtableMethodPtr` comment
 /// block in `model.rs`).
 pub fn class_get_method_ptr(
@@ -2886,7 +2886,7 @@ impl Repr for InstanceRepr {
     /// the rtyper's repr cache so the borrow-cell-backed
     /// `iprebuiltinstances` and `initialize_prebuilt_data` (rclass.py:
     /// 947-975, including the class-level `read_attribute` /
-    /// `convert_desc_or_const` branch ported as Task #149) can run.
+    /// `convert_desc_or_const` branch) can run.
     /// The Variable-arm field-init is in
     /// [`InstanceRepr::initialize_prebuilt_data`].
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {

@@ -251,7 +251,7 @@ impl LLType {
 /// emits `path_hash(concat!(module_path!(), "::", stringify!(Struct)))`
 /// at expansion time, the analyzer computes the same hash from
 /// `field.owner_root`, and both routes converge on the same
-/// `LLType::Struct(hash)` cache key. (Task #316 routing.)
+/// `LLType::Struct(hash)` cache key.
 ///
 /// Determinism is within-process only — `DefaultHasher::new()` returns a
 /// hasher with fixed SipHash keys at construction
@@ -866,7 +866,7 @@ impl GcCache {
     // order so `setup_descrs()` enumerates the full population and
     // `compute_bitstrings()` sees every descr.
     //
-    // PRE-EXISTING-ADAPTATION: temporary surface while mint sites
+    // TODO: temporary surface while mint sites
     // migrate to `get_*_descr(LLType, ...)`.  Each migrated site
     // drops `register_external_*` in favour of the keyed cache-or-mint
     // call.  The end state retires every `register_external_*` call
@@ -1889,14 +1889,14 @@ pub trait FailDescr: Descr {
     /// history.py:470 TargetToken descriptor identifying the JUMP target.
     /// Present only when `is_external_jump()` is true.
     ///
-    /// Returns an owned `DescrRef` (cloned `Arc`) — Session 5i-cl moved
+    /// Returns an owned `DescrRef` (cloned `Arc`) — the
     /// the cranelift implementation to a backend-static side-table that
     /// cannot hand out a borrow under a lock.
     fn target_descr(&self) -> Option<DescrRef> {
         None
     }
 
-    /// Pyre-only cranelift cross-loop JUMP target publish (Slice 7-Tβ8).
+    /// Pyre-only cranelift cross-loop JUMP target publish.
     /// Writes the target `DescrRef` into the per-emission slot read
     /// back via `target_descr` / `is_external_jump`.  Default panics —
     /// only Resume-family descrs (`ResumeGuardDescr` /
@@ -2084,7 +2084,7 @@ pub trait FailDescr: Descr {
 
     /// Exit slot indices that carry opaque force-token handles.
     ///
-    /// Returns owned `Vec<usize>` (cloned per call) — Session 5i-cl moved
+    /// Returns owned `Vec<usize>` (cloned per call) — the
     /// the cranelift implementation to `FORCE_TOKEN_SLOTS_TABLE`, a
     /// backend-static side-table that cannot hand out a borrow under a
     /// lock.
@@ -2297,7 +2297,7 @@ pub trait FailDescr: Descr {
 
     /// Read back any attached vector resume info.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream `descr.rd_vector_info` is a
+    /// TODO: upstream `descr.rd_vector_info` is a
     /// head-linked singly-linked `Option<AccumInfo>` chain (walk via
     /// `.prev`). Pyre stores the head-linked chain internally
     /// (`AccumInfo.prev` field matches upstream), but this trait
@@ -4511,7 +4511,7 @@ pub fn make_malloc_array_nonstandard_calldescr() -> DescrRef {
 /// gc.py:45 + gc.py:460-467 generate_function('malloc_str', ...).
 /// CallDescr for CALL_R(malloc_str_fn, type_id, length) -> Ref.
 ///
-/// PRE-EXISTING-ADAPTATION: upstream `malloc_str` is generated as
+/// TODO: upstream `malloc_str` is generated as
 /// `[lltype.Signed]` (length only) and captures `str_type_id` via Python
 /// closure scope (gc.py:451 `str_type_id = self.str_descr.tid`).  Rust
 /// `extern "C" fn` cannot lexically capture, so the type id is threaded
@@ -4539,7 +4539,7 @@ pub fn make_malloc_str_calldescr() -> DescrRef {
 /// gc.py:45 + gc.py:469-476 generate_function('malloc_unicode', ...).
 /// CallDescr for CALL_R(malloc_unicode_fn, type_id, length) -> Ref.
 ///
-/// PRE-EXISTING-ADAPTATION: see `make_malloc_str_calldescr` — the type
+/// TODO: see `make_malloc_str_calldescr` — the type
 /// id is threaded as an explicit arg because `extern "C" fn` cannot
 /// lexically capture `unicode_type_id` the way upstream's
 /// `malloc_unicode` closure does (gc.py:455 `unicode_type_id =

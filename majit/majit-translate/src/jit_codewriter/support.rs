@@ -19,7 +19,7 @@
 //! `call.rs::find_all_graphs_bfs` therefore registers the helper
 //! fnaddrs but does not push them onto `todo`, mirroring upstream
 //! `@dont_look_inside` for the same helper.  See the
-//! PRE-EXISTING-ADAPTATION block at that callsite for the convergence
+//! TODO block at that callsite for the convergence
 //! path.
 //!
 //! [`builtin_func_for_spec`] is a line-by-line port of
@@ -241,7 +241,7 @@ pub enum NormalizeSlot {
     /// literals (`'a'`) panic in the parser per the comment on
     /// [`parse_literal_slot`] — RPython's `lltype.Char` has no
     /// pyre IR analogue and conflating it with `lltype.Signed`
-    /// would be a NEW-DEVIATION.
+    /// would be a deviation.
     ConstInt(i64),
     /// `support.py:714 argtuple = eval(args, argname2index)` — float
     /// literal injection (e.g. `1.5`, `2.0e3`).  Upstream wraps as
@@ -301,7 +301,7 @@ pub enum NormalizedArg {
 /// names, registered via `mark_oopspec_argnames`) and returns
 /// `(operation_name, argtuple)` matching the upstream 2-tuple.
 ///
-/// **NEW-DEVIATION** vs upstream `eval(args, argname2index)`:
+/// **Deviation** vs upstream `eval(args, argname2index)`:
 /// the inner expression is parsed by a narrow comma-split + per-slot
 /// literal recogniser ([`parse_literal_slot`]), NOT by a full Python
 /// `eval`.  The slots pyre recognises are exactly:
@@ -384,7 +384,7 @@ pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlo
 ///     which has no `ConcreteType` variant in pyre — the
 ///     `Constant('a', lltype.Char)` ≠ `Constant(97, lltype.Signed)`
 ///     identity is load-bearing for descr-typed dispatch, and a
-///     `ConstInt(byte)` fallback would be a speculative NEW-DEVIATION
+///     `ConstInt(byte)` fallback would be a speculative deviation
 ///     with no upstream basis in the current `rpython/` source.
 fn parse_literal_slot(
     s: &str,
@@ -1180,7 +1180,7 @@ mod tests {
         // mirrors the raise via panic.  IndirectCall is included
         // because upstream does NOT have an `indirect_call` arm
         // (the previous pyre `_ => None` for IndirectCall was a
-        // NEW-DEVIATION; this test pins the corrected behaviour).
+        // deviation; this test pins the corrected behaviour).
         let cc = CallControl::new();
         let op = SpaceOperation {
             result: None,
@@ -1390,7 +1390,7 @@ mod tests {
         // `Constant('a', lltype.Char)` — a `lltype.Char`-tagged
         // constant.  Pyre has no `ConcreteType::Char` variant, and
         // `lltype.Char` ≠ `lltype.Signed`, so a `ConstInt(byte)`
-        // fallback would be a speculative NEW-DEVIATION.
+        // fallback would be a speculative deviation.
         // `parse_literal_slot` must panic on char literals until
         // `NormalizeSlot::ConstChar(u8)` + `OpKind::ConstChar` land.
         // Confirmed by `grep -rn '@oopspec' rpython/` returning zero

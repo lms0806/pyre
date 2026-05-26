@@ -21,7 +21,7 @@
 //! * `class ItemHolder(Holder)` (callparse.py:155-164) — projects the
 //!   `index`-th item of a tuple-typed parent holder.
 //!
-//! ## PRE-EXISTING-ADAPTATION: `ArgumentsForRtype` storage duplication
+//! ## TODO: `ArgumentsForRtype` storage duplication
 //!
 //! Upstream `class ArgumentsForRtype(ArgumentsForTranslation):` inherits
 //! `_match_signature` and `arguments_w`/`keywords`/`w_stararg`
@@ -43,7 +43,7 @@
 //! `_match_signature` body in this file collapses into a single shared
 //! implementation. Tracking item: cascade R1 follow-up after R1.m.
 //!
-//! ## PRE-EXISTING-ADAPTATION: `Holder::Item` parent sharing
+//! ## TODO: `Holder::Item` parent sharing
 //!
 //! Upstream `VarHolder.items()` (callparse.py:100-103) builds
 //! `ItemHolder(self, i)` so every sibling `ItemHolder` shares the
@@ -80,7 +80,7 @@ use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 /// (callparse.py:7-14).
 ///
 /// Storage mirrors `ArgumentsForTranslation` over [`Holder`] (see the
-/// PRE-EXISTING-ADAPTATION note in the module doc).
+/// TODO note in the module doc).
 #[derive(Clone, Debug)]
 pub struct ArgumentsForRtype {
     /// RPython `CallSpec.arguments_w`.
@@ -423,7 +423,7 @@ impl Holder {
     /// length — in that case it returns the parent holder unchanged
     /// (avoiding a needless wrap-and-unwrap).
     ///
-    /// PRE-EXISTING-ADAPTATION: collapse optimisation deferred. The
+    /// TODO: collapse optimisation deferred. The
     /// upstream Python check `h.holder == holders[0].holder` defaults
     /// to object-identity (`is`); porting it requires either
     /// `PartialEq` on `Holder` (which transitively requires

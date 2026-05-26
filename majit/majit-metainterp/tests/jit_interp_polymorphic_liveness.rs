@@ -1,4 +1,4 @@
-//! Phase 4 Epic B.5: regression guard for polymorphic per-pc liveness.
+//! Regression guard for polymorphic per-pc liveness.
 //!
 //! Background: B.2 ports `rpython/jit/codewriter/liveness.py:33-79
 //! _compute_liveness_must_continue` (backward dataflow over `op_metadata`),
@@ -366,7 +366,7 @@ fn install_canonical_liveness_registers_dispatch_jitcode_singleton() {
     );
 }
 
-/// Slice 4.3 regression pin: `BC_INLINE_CALL` targets in the dispatch
+/// Regression pin: `BC_INLINE_CALL` targets in the dispatch
 /// JitCode descr table must be `RuntimeBhDescr::JitCode` (frame-chain
 /// interpreter path), never fnaddr handlers (which target native call
 /// wrappers). Production runtime enforcement at

@@ -53,7 +53,7 @@ pub(super) struct Lowerer<'c> {
     /// macro expansion).  Set by
     /// `try_generate_jitcode_body_parts_with_caller_bindings` (the sole
     /// dispatch-arm-body lowerer entry).  Pyre's per-arm trace JitCode
-    /// is a PRE-EXISTING-ADAPTATION not present in RPython, so omitting
+    /// is a TODO not present in RPython, so omitting
     /// `loop_header` there is consistent with upstream's single-JitCode
     /// model where `loop_header` lives only in the dispatch-equivalent
     /// JitCode.

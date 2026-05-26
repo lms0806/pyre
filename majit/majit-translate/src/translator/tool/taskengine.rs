@@ -10,7 +10,7 @@
 //! iterates the plan calling `self._do(goal, callable, ...)`, which
 //! subclasses override for timing / logging.
 //!
-//! **Rust adaptation** (PRE-EXISTING-ADAPTATION, documented):
+//! **Rust adaptation** (documented):
 //!
 //! Python's `dir(self)` reflection has no direct Rust equivalent —
 //! there is no runtime way to enumerate the `task_<name>` methods of

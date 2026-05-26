@@ -10,16 +10,16 @@
 //! closeblock(Link([w_type, w_value], exceptblock))    # flowcontext.py:1253
 //! ```
 //!
-//! ## PRE-EXISTING-ADAPTATION pinned by these tests
+//! ## TODO: pinned adaptation
 //!
 //! Upstream `Constant` (`flowspace/model.py:354`) lives directly
 //! inside `SpaceOperation.args` (`flowspace/model.py:436` — `args` is
 //! a mixed `Variable | Constant` list), so `simple_call.args[0]` is
 //! the class Constant in upstream.  Pyre's `OpKind::Call.args` is
 //! still `Vec<Variable>` — migrating it to `Vec<LinkArg>` is the
-//! orthodox fix and is a multi-session port.  Until that lands, the
-//! AST helper carries the constant exception class as the *second
-//! segment* of the `simple_call` Call's `FunctionPath` target —
+//! orthodox fix.  Until that lands, the AST helper carries the
+//! constant exception class as the *second segment* of the
+//! `simple_call` Call's `FunctionPath` target —
 //! `["simple_call", exc_class_name]` — and the tests pin that shape.
 //! See `front/raise.rs` module docstring for the rejected attempts
 //! and the orthodox-migration plan.
@@ -112,11 +112,10 @@ fn lookup_op_by_result<'a>(
         .find(|op| op.result.as_ref() == Some(v))
 }
 
-/// PRE-EXISTING-ADAPTATION shape check — pins the
-/// `["simple_call", exc_class_name]` two-segment path encoding that
-/// the helper currently uses for the constant class operand.  See
-/// the module docstring (top of this file) for the orthodox-fix
-/// migration plan tracked separately.
+/// TODO: shape check — pins the `["simple_call", exc_class_name]`
+/// two-segment path encoding that the helper currently uses for the
+/// constant class operand.  See the module docstring (top of this
+/// file) for the orthodox-fix migration plan.
 ///
 /// ```text
 /// evalue = op.simple_call(const(ExcClass), *message_args)   # path encodes class
@@ -136,9 +135,9 @@ fn assert_exc_from_raise_shape(
     let etype_op =
         lookup_op_by_result(graph, &etype).expect("etype must be produced by a real op (op.type)");
     // evalue = op.simple_call(...) with the constant exception class
-    // encoded as path segment 1 (PRE-EXISTING-ADAPTATION — see the
-    // file-level docstring for the rejected attempts to put the
-    // class at args[0] and the orthodox-fix migration plan).
+    // encoded as path segment 1 (TODO — see the file-level docstring
+    // for the rejected attempts to put the class at args[0] and the
+    // orthodox-fix migration plan).
     let evalue_args = match &evalue_op.kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments },
@@ -154,8 +153,8 @@ fn assert_exc_from_raise_shape(
                 segments.get(1).map(String::as_str),
                 Some(expected_exc_class),
                 "evalue Call must carry the constant exception class \
-                 `{}` as its second path segment (PRE-EXISTING-ADAPTATION \
-                 of RPython `simple_call(const(ExcClass), ...)`); got \
+                 `{}` as its second path segment (TODO: \
+                 should be `simple_call(const(ExcClass), ...)`); got \
                  {:?}",
                 expected_exc_class,
                 segments
@@ -228,9 +227,9 @@ fn panic_exceptblock_link_pair_is_two_rpython_op_calls() {
     let (_etype, _evalue, evalue_args) = assert_exc_from_raise_shape(&sf.graph, "PanicError");
     // panic!(make_msg()) forwards the evaluated message Call result
     // as the single positional arg of the `simple_call` op.  The
-    // class is encoded in the path's second segment (PRE-EXISTING-
-    // ADAPTATION), so `evalue_args` here only enumerates the
-    // message slots.
+    // class is encoded in the path's second segment (TODO: move to
+    // args[0]), so `evalue_args` here only enumerates the message
+    // slots.
     assert_eq!(
         evalue_args.len(),
         1,
@@ -290,8 +289,8 @@ fn bare_panic_uses_rpython_simple_call_with_no_message_args() {
     // `panic!()` → `simple_call(const(PanicError))` (class-only) +
     // `op.type(evalue)`.  The helper always emits a real Call; it
     // never produces a fresh null placeholder in the exceptblock
-    // Link.  Under the PRE-EXISTING-ADAPTATION the class lives in
-    // the path's second segment, so `simple_call`'s `args` vector is
+    // Link.  Under the current adaptation the class lives in the
+    // path's second segment, so `simple_call`'s `args` vector is
     // empty for a bare panic.
     let func = parse_fn(
         r#"

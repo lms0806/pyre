@@ -19,7 +19,7 @@
 //! `gc_cache.get_*_descr(LLType, ...)` cache-or-mint API can still
 //! publish their freshly-minted descrs.
 //!
-//! PRE-EXISTING-ADAPTATION: this module is the temporary surface for
+//! TODO: this module is the temporary surface for
 //! mint sites that bypass the keyed cache.  Each migrated site drops
 //! its `register_*` call in favour of `gc_cache.get_*_descr(LLType, ...)`;
 //! the end state retires this module entirely once every production
@@ -28,7 +28,7 @@
 use crate::descr::{DescrRef, gc_cache};
 
 /// `descr.py:236-247 get_size_descr` cache-miss publication — register
-/// a freshly-minted size descr.  PRE-EXISTING-ADAPTATION: prefer
+/// a freshly-minted size descr.  TODO: prefer
 /// `gc_cache.get_size_descr(LLType::Struct(...), ...)`.
 pub fn register_size(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_size(descr);
@@ -45,7 +45,7 @@ pub fn register_keyed_size(key: crate::descr::LLType, descr: DescrRef) {
 }
 
 /// `descr.py:225-235 get_field_descr` cache-miss publication.
-/// PRE-EXISTING-ADAPTATION: prefer
+/// TODO: prefer
 /// `gc_cache.get_field_descr(LLType::Struct(...), ...)`.
 pub fn register_field(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_field(descr);
@@ -68,7 +68,7 @@ pub fn register_keyed_field(
 }
 
 /// `descr.py:354-364 get_array_descr` cache-miss publication.
-/// PRE-EXISTING-ADAPTATION: prefer
+/// TODO: prefer
 /// `gc_cache.get_array_descr(LLType::Array(...), ...)`.
 pub fn register_array(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_array(descr);
@@ -82,7 +82,7 @@ pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
 }
 
 /// `descr.py:374-385 get_arraylen_descr` cache-miss publication.
-/// PRE-EXISTING-ADAPTATION: prefer
+/// TODO: prefer
 /// `gc_cache.get_field_arraylen_descr(LLType::Array(...), ...)`.
 pub fn register_array_len(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_arraylen(descr);
@@ -98,7 +98,7 @@ pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
 }
 
 /// `descr.py:404-414 get_interiorfield_descr` cache-miss publication.
-/// PRE-EXISTING-ADAPTATION: prefer the keyed cache-or-mint path once
+/// TODO: prefer the keyed cache-or-mint path once
 /// `gc_cache.get_interiorfield_descr` lands.
 pub fn register_interior_field(descr: DescrRef) {
     gc_cache()

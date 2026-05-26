@@ -7,7 +7,7 @@
 //! `finish_type`, `enforce_signature_args`, and
 //! `enforce_signature_return`.
 //!
-//! ## PRE-EXISTING-ADAPTATION: AnnotationSpec enum
+//! ## TODO: AnnotationSpec enum
 //!
 //! Upstream `annotation(t, bookkeeper=None)` accepts a polymorphic
 //! Python `t` value — a type object, list, dict, tuple, `SomeObject`

@@ -1,6 +1,6 @@
 //! Synthetic CPU shim for pyre's runtime per-CodeObject jitcodes.
 //!
-//! PRE-EXISTING-ADAPTATION: RPython's `cpu.bh_call_*` (see
+//! RPython's `cpu.bh_call_*` (see
 //! `rpython/jit/backend/model.py:266-273` and `rpython/jit/metainterp/blackhole.py:1225-1319`
 //! for both `bhimpl_residual_call_*` and `bhimpl_inline_call_*`) receives a real
 //! function address (`adr2int(jitcode.fnaddr)`) and dispatches to native code.
@@ -11,10 +11,8 @@
 //! `bhimpl_residual_call_*`/`bhimpl_inline_call_*` reach those sub-jitcodes
 //! through the same `cpu.bh_call_*` interface, this module reserves a
 //! synthetic fnaddr space (the high bit of `i64`) whose payload is the
-//! callee jitcode's index.  A future `Backend` shim (Slice 3 Phase 1 Slice 1B
-//! of `~/.claude/plans/pyre-call-family-canonical-migration.md`) decodes the
-//! synthetic fnaddr back to the jitcode index and runs a nested
-//! `BlackholeInterpreter`.
+//! callee jitcode's index.  A `Backend` shim decodes the synthetic fnaddr
+//! back to the jitcode index and runs a nested `BlackholeInterpreter`.
 //!
 //! Real function addresses on x86_64 / aarch64 user space occupy the lower 48
 //! bits with the upper bits zero-extended, so they are always non-negative as
@@ -63,15 +61,14 @@ pub fn decode_synthetic(fnaddr: i64) -> Option<usize> {
 /// Backend shim that will eventually dispatch synthetic fnaddrs to pyre
 /// runtime sub-jitcodes via a nested `BlackholeInterpreter`.
 ///
-/// Slice 1B (this slice) installs the [`crate::Backend`] trait skeleton so
-/// the type satisfies the trait and can be plugged into
-/// `BlackholeInterpBuilder.cpu`.  All required compilation/execution methods
-/// `unreachable!` because SyntheticCpu only services `bh_call_*` dispatch,
-/// never native compilation or trace execution.  The four `bh_call_*`
-/// overrides currently `unimplemented!` — the actual decode-and-dispatch
-/// path lives in `majit-metainterp` (which depends on `majit-backend`, not
-/// vice versa), so the cross-crate wiring is deferred to Slice 1C / Phase 2
-/// of `~/.claude/plans/pyre-call-family-canonical-migration.md`.
+/// Installs the [`crate::Backend`] trait skeleton so the type satisfies the
+/// trait and can be plugged into `BlackholeInterpBuilder.cpu`.  All required
+/// compilation/execution methods `unreachable!` because SyntheticCpu only
+/// services `bh_call_*` dispatch, never native compilation or trace
+/// execution.  The four `bh_call_*` overrides currently `unimplemented!` —
+/// the actual decode-and-dispatch path lives in `majit-metainterp` (which
+/// depends on `majit-backend`, not vice versa), so the cross-crate wiring
+/// is deferred.
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct SyntheticCpu {
@@ -164,14 +161,14 @@ impl crate::Backend for SyntheticCpu {
     /// `bhimpl_residual_call_*` and `bhimpl_inline_call_*` both routing
     /// through `cpu.bh_call_*`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's synthetic dispatch must decode `func`
-    /// via [`decode_synthetic`] and run a nested `BlackholeInterpreter`
-    /// against the resulting jitcode index.  `BlackholeInterpreter` lives in
-    /// `majit-metainterp`, which depends on `majit-backend`, so the dispatch
-    /// cannot be implemented here without a circular dependency.  Slice 1C
-    /// / Phase 2 of the call-family migration plan decides the wiring shape
-    /// (dispatcher closure injection vs `SyntheticCpu` relocation vs new
-    /// trait callback).  Until then, the override panics so an
+    /// Pyre's synthetic dispatch must decode `func` via
+    /// [`decode_synthetic`] and run a nested `BlackholeInterpreter`
+    /// against the resulting jitcode index.  `BlackholeInterpreter` lives
+    /// in `majit-metainterp`, which depends on `majit-backend`, so the
+    /// dispatch cannot be implemented here without a circular dependency.
+    /// The cross-crate wiring shape (dispatcher closure injection vs
+    /// `SyntheticCpu` relocation vs new trait callback) is deferred.
+    /// Until then, the override panics so an
     /// accidentally-active synthetic backend in production fails loudly
     /// rather than silently returning 0 / `NULL` / 0.0 / `()` from the
     /// trait defaults.
@@ -183,7 +180,7 @@ impl crate::Backend for SyntheticCpu {
         _args_f: Option<&[i64]>,
         _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        unimplemented!("synthetic bh_call_i dispatch awaits Slice 1C / Phase 2 cross-crate wiring")
+        unimplemented!("synthetic bh_call_i dispatch awaits cross-crate wiring")
     }
 
     fn bh_call_r(
@@ -194,7 +191,7 @@ impl crate::Backend for SyntheticCpu {
         _args_f: Option<&[i64]>,
         _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        unimplemented!("synthetic bh_call_r dispatch awaits Slice 1C / Phase 2 cross-crate wiring")
+        unimplemented!("synthetic bh_call_r dispatch awaits cross-crate wiring")
     }
 
     fn bh_call_f(
@@ -205,7 +202,7 @@ impl crate::Backend for SyntheticCpu {
         _args_f: Option<&[i64]>,
         _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        unimplemented!("synthetic bh_call_f dispatch awaits Slice 1C / Phase 2 cross-crate wiring")
+        unimplemented!("synthetic bh_call_f dispatch awaits cross-crate wiring")
     }
 
     fn bh_call_v(
@@ -216,7 +213,7 @@ impl crate::Backend for SyntheticCpu {
         _args_f: Option<&[i64]>,
         _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        unimplemented!("synthetic bh_call_v dispatch awaits Slice 1C / Phase 2 cross-crate wiring")
+        unimplemented!("synthetic bh_call_v dispatch awaits cross-crate wiring")
     }
 }
 
@@ -251,7 +248,7 @@ mod tests {
 
     #[test]
     fn implements_backend_trait() {
-        // Slice 1B structural check: SyntheticCpu satisfies the Backend
+        // Structural check: SyntheticCpu satisfies the Backend
         // trait (all required methods supplied, even if dormant).  An
         // accidentally-deleted trait method, or a signature drift, would
         // fail this coercion.

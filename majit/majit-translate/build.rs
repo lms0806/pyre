@@ -1,7 +1,7 @@
 //! Phase F build script: force cargo to rebuild this crate when
 //! pyre-interpreter source changes.
 //!
-//! ## Positioning (PRE-EXISTING-ADAPTATION)
+//! ## Positioning (TODO)
 //!
 //! RPython has no build-script layer; `rpython/jit/codewriter/` consumes
 //! `translator.graphs` built in-process by the rtyper. pyre ships the

@@ -400,7 +400,7 @@ pub trait JitCodeSym {
     /// Bridge state-field JIT's `__JitSym` storage onto
     /// `MIFrame.int_regs` / `int_values` ahead of guard capture.
     ///
-    /// PRE-EXISTING-ADAPTATION (state-field JIT divergence):
+    /// TODO (state-field JIT divergence):
     /// RPython stores live state in `MIFrame.{int,ref,float}_regs`
     /// directly via `setfield_*` opimpls during dispatch
     /// (`pyjitpl.py:74-95 MIFrame.setup` + per-opcode register
@@ -413,17 +413,17 @@ pub trait JitCodeSym {
     /// `int_regs` / `int_values`, so this hook copies the
     /// `__JitSym` slots into the frame's banks at the canonical
     /// liveness indices defined by `live_slots_for_state_field_jit`
-    /// (Task #89 orth-6): scalars at `0..num_scalars`, then
+    /// (orth-6): scalars at `0..num_scalars`, then
     /// flattened arrays, then virt-array (ptr, len) pairs.  Virt-
     /// array value mirrors are cached at `JitState::initialize_sym`
     /// time from the user state's `<varr>.as_ptr() as i64` /
-    /// `<varr>.len() as i64` (Task #89 framestack-lift Session 3b-1)
+    /// `<varr>.len() as i64` (framestack-lift 1)
     /// — accurate iff the Vec does not reallocate during tracing
     /// (true for the 6 macro examples that use fixed-capacity
     /// `vec![0i64; program.len()]`).
     ///
     /// Convergence path: when the macro switches to RPython
-    /// MIFrame-regs storage (Task #89 orth-9 step 4 reshape), this
+    /// MIFrame-regs storage (orth-9 step 4 reshape), this
     /// method's default no-op impl matches RPython's "regs already
     /// populated by dispatch" semantics and the macro override drops
     /// out.  Until then, callers with a state-field JIT pass
@@ -431,7 +431,7 @@ pub trait JitCodeSym {
     /// `TraceRecordBuffer::capture_resumedata` so the framestack-walk
     /// snapshot has matching slot data.
     ///
-    /// Codex review (2026-04-26): this is a NEW-DEVIATION bridge
+    /// Codex review (2026-04-26): this is a TODO bridge
     /// hook with no RPython counterpart.  RPython's dispatch
     /// (`pyjitpl.py:opimpl_setfield_gc_*`,
     /// `opimpl_int_add` etc.) writes directly into
@@ -444,7 +444,7 @@ pub trait JitCodeSym {
     /// (the proc-macro can derive symbolic state-field accesses
     /// statically), and this trait method is the back-door that
     /// re-establishes the RPython invariant just before the snapshot
-    /// is captured.  Convergence path: Task #72 (codegen.rs / macro
+    /// is captured.  Convergence path: (codegen.rs / macro
     /// → register-machine jitcode) eliminates `__JitSym` as a
     /// distinct storage; macro-emitted opimpls then write directly to
     /// `MIFrame.regs`, and this method (along with its `__JitSym`
@@ -710,7 +710,7 @@ where
     ) -> OpRef {
         if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
             let fail_types = sym.fail_args_types();
-            // Task #91 slice 3a: snapshot is the source of truth — the
+            // slice 3a: snapshot is the source of truth — the
             // optimizer's `store_final_boxes_in_guard`
             // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
             // the snapshot built below, so the inline `fail_args` copy
@@ -727,7 +727,7 @@ where
             } else {
                 ctx.record_guard(opcode, args, fail_args.len())
             };
-            // Task #89 framestack-lift Session 3b-3b: capture a
+            // framestack-lift 3b: capture a
             // matching snapshot and patch the guard's
             // rd_resume_position so the optimizer's
             // store_final_boxes_in_guard derives fail_args from the
@@ -1014,7 +1014,7 @@ where
             cache_key.interior_fields,
         );
         let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
-            // PRE-EXISTING-ADAPTATION: `make_array_descr_from_lltype_shape`
+            // TODO: `make_array_descr_from_lltype_shape`
             // takes the u32 gc tid; this caller has the u64 cache key.
             // Truncate `as u32` until gc_cache routing resolves the proper
             // allocated tid here.
@@ -1260,7 +1260,7 @@ where
     ///     `OS_LIBFFI_CALL`.  Until those land, this invariant ensures
     ///     the dispatch hole stays fail-loud rather than dormant.
     ///
-    /// PRE-EXISTING-ADAPTATION: line-by-line port of `direct_libffi_call`
+    /// TODO: line-by-line port of `direct_libffi_call`
     /// is gated on the libffi infrastructure above; the invariant
     /// surfaces any future producer that emits the oopspec without the
     /// matching dispatcher implementation.
@@ -1621,7 +1621,7 @@ where
                     return TraceAction::Abort;
                 };
                 // Concrete struct pointer for pyjitpl.py:934-945
-                // cache-hit sanity check (Slice 2 plumbing; Slice 3
+                // cache-hit sanity check (plumbing;
                 // wires the check itself).
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let (opref, value) =
@@ -2539,7 +2539,7 @@ where
                 // routing change reads the same descriptor RPython
                 // would).
                 let _jitdriver_sd = &ctx.metainterp_sd().jitdrivers_sd[jdindex];
-                // Slice 91.5 — register-byte bounds.  Each of the six
+                // 5 — register-byte bounds.  Each of the six
                 // register lists encodes `[len:u8][reg:u8 * N]` with
                 // greens/reds split by kind in `(I, R, F, I, R, F)`
                 // order (mirrors `bhimpl_jit_merge_point`'s
@@ -3256,7 +3256,7 @@ where
                     }
                 }
             }
-            // ── Slice 4 Slice 1c.0: canonical typed (i/r/f) recording arms ──
+            // ── 0: canonical typed (i/r/f) recording arms ──
             //
             // Mirror of the void arm above for the int / ref / float
             // result kinds.  RPython's `pyjitpl.py:1995-2068
@@ -4107,7 +4107,7 @@ where
             // BC_CALL_ASSEMBLER_VOID retains the legacy `(fn_ptr_idx:u16,
             // num_args:u16, [(kind:u8, reg:u16)]...)` layout — the
             // assembler-token path is not in the canonical *_v family
-            // and Slice 4 of pyre-call-family-canonical-migration.md
+            // and of pyre-call-family-canonical-migration.md
             // owns its migration.
             // pyjitpl.py:1376-1432 _opimpl_recursive_call →
             // do_recursive_call → do_residual_call(assembler_call=True).
@@ -4541,7 +4541,7 @@ where
                 // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                // PRE-EXISTING-ADAPTATION (`pyjitpl.py:2033 do_residual_call`
+                // TODO: `pyjitpl.py:2033 do_residual_call`
                 // float-result branch): pyre's `call_assembler` wrapper at
                 // `concrete_ptr` is an `extern "C" fn(...) -> i64` whose
                 // result carries the f64 pre-packed via `f64::to_bits()`.
@@ -6219,7 +6219,7 @@ mod tests {
 
     // ── canonical residual_call_*_{i,r,f} may_force tests ──
     //
-    // After Slice 4 Phase B.1.1 the legacy non-Pure walker arms
+    // The legacy non-Pure walker arms
     // (BC_CALL_MAY_FORCE_INT/REF/FLOAT) are deleted; canonical
     // residual_call_*_{i,r,f} via `call_may_force_*_canonical_via_target`
     // is the sole vable+guard emit path covered here.  Same semantic
@@ -6573,7 +6573,7 @@ mod tests {
         // `JitCodeSym` impls (e.g. `DummySym`, `NoopSym`, the `()` unit
         // bridge) inherit this default — they must not silently
         // overwrite frame banks during the framestack-lift wiring
-        // (Session 3a-prep guarantee for non-state-field JIT users).
+        // (guarantee for non-state-field JIT users).
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
         builder.load_const_i_value(1, 0);
@@ -6663,8 +6663,7 @@ mod tests {
 
     #[test]
     fn record_state_guard_attaches_snapshot_when_sym_supplies_fail_args() {
-        // Task #89 framestack-lift Session 3b-3c contract:
-        // when a JitCodeSym implementation returns `Some(_)` from
+        // When a JitCodeSym implementation returns `Some(_)` from
         // `fail_args_with_ctx` and overrides `populate_frame_int_regs`
         // (the macro-emitted state-field-JIT shape), every guard
         // recorded via `record_state_guard` must
@@ -6674,7 +6673,7 @@ mod tests {
         //       `recorder.rs:228 set_last_op_resume_position`),
         //   (c) populate the snapshot's frame.boxes from the same
         //       slots `populate_frame_int_regs` writes.
-        // This locks Session 3b-3b's wire-up so a future regression
+        // This ensures a future regression
         // (e.g. accidentally dropping the `set_last_guard_resume_position`
         // call) is caught at the unit level rather than only via the
         // macro-example end-to-end suites.

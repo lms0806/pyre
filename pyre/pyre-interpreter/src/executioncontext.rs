@@ -67,7 +67,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr(w_frame, "f_lineno") {
         if !new_f_lineno_obj.is_null() && unsafe { pyre_object::is_int(new_f_lineno_obj) } {
             let new_lineno = unsafe { pyre_object::w_int_get_value(new_f_lineno_obj) };
-            // PRE-EXISTING-ADAPTATION (Task #224): pyframe.py:683-764
+            // TODO: pyframe.py:683-764
             // `PyFrame.fset_f_lineno` is the upstream setter. It runs
             // line-jump validation against the bytecode (block stack
             // unwinding through SETUP_LOOP/SETUP_EXCEPT, code address
@@ -123,7 +123,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // f_backref vref to materialise the parent frame.  Pyre's
         // wrapper has to do the same eagerly because the wrapper is a
         // plain pyre_object instance (no `__getattr__` slot wired to
-        // the live struct yet — Task #224).  Recursion depth tracks
+        // the live struct yet).  Recursion depth tracks
         // the live stack depth, which is bounded by Python's
         // recursion limit; the wrappers are short-lived (allocated
         // per callback invocation) so the per-trace overhead scales
@@ -620,8 +620,8 @@ impl WRootFinalizerQueue {
     /// Returns the next `w_obj` whose finalizer should run, or `None`
     /// when the death queue is empty.
     ///
-    /// PRE-EXISTING-ADAPTATION: the real death queue requires the GC
-    /// integration epic (Task #224 PyFrame=PyObject) to land a
+    /// TODO: the real death queue requires GC
+    /// integration to land a
     /// `WRootFinalizerQueue` instance backed by `rgc.FinalizerQueue`.
     /// Until then this is a constant-`None` stub so callers
     /// (`UserDelAction::_run_finalizers`) can mirror PyPy's loop shape
@@ -1088,7 +1088,7 @@ impl ExecutionContext {
     /// whose lifetime spans the `_trace` call.  PyPy's `pyopcode.py:148
     /// ec.exception_trace(self, operr)` passes the live caller-held
     /// `operr`, but the post-call mutation is unobserved in pyre because
-    /// the temp falls out of scope here.  Slice 3 of the OperationError
+    /// the temp falls out of scope here.  The OperationError
     /// port (caller threads its live operr through) will close that gap.
     pub fn exception_trace(
         &mut self,
@@ -1438,7 +1438,7 @@ impl ExecutionContext {
 
     /// Create a fresh module/global dict storage seeded with builtins.
     ///
-    /// PRE-EXISTING-ADAPTATION vs `pypy/interpreter/main.py:43-45`: PyPy
+    /// TODO vs `pypy/interpreter/main.py:43-45`: PyPy
     /// emits `space.setitem(w_globals, '__builtins__', space.builtin)`
     /// PyPy `pyopcode.py:773-774 setdefault('__builtins__', ...)` and
     /// the `Module.__init__` flow seed a freshly-imported module's
@@ -1566,7 +1566,7 @@ impl AbstractActionFlag {
     /// pypy/interpreter/executioncontext.py:531-556
     /// `_rebuild_action_dispatcher`.
     ///
-    /// PRE-EXISTING-ADAPTATION (justified): PyPy rebuilds an inner
+    /// TODO(justified): PyPy rebuilds an inner
     /// closure on every `register_*_action` call so that
     /// `periodic_actions = unrolling_iterable(self._periodic_actions)`
     /// captures the current periodic-action list at codegen time;
@@ -2005,7 +2005,7 @@ pub trait AsyncActionOps {
     /// ```
     ///
     /// Pyre stores `actionflag` on `ExecutionContext` rather than on
-    /// `space` (PRE-EXISTING-ADAPTATION — pyre's space is an opaque
+    /// `space` (TODO — pyre's space is an opaque
     /// `PyObjectRef`).  To keep PyPy's `self.space.actionflag.fire(self)`
     /// directness, the actionflag back-reference is cached on the base
     /// `AsyncAction` at registration time (see
@@ -2152,10 +2152,10 @@ pub struct UserDelAction {
     /// `pypy/interpreter/executioncontext.py:640` —
     /// `self.space.finalizer_queue` access target.
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy reads the queue via `self.space`
+    /// TODO: PyPy reads the queue via `self.space`
     /// (typed `ObjSpace`).  Pyre's `space` is an opaque `PyObjectRef`,
-    /// so the queue is held as a UserDelAction field instead.  When the
-    /// GC integration epic (Task #224) lands a typed space surface this
+    /// so the queue is held as a UserDelAction field instead.  When
+    /// GC integration lands a typed space surface this
     /// can be folded back into `space.finalizer_queue`.
     pub finalizer_queue: WRootFinalizerQueue,
 }
@@ -2215,7 +2215,7 @@ impl UserDelAction {
     ///
     /// `self.space.finalizer_queue` is read via the local
     /// `self.finalizer_queue` field (see struct doc for
-    /// PRE-EXISTING-ADAPTATION).
+    /// TODO).
     pub fn _run_finalizers(&mut self) {
         loop {
             let w_obj = self.finalizer_queue.next_dead();

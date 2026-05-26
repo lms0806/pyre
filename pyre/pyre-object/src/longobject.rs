@@ -39,7 +39,7 @@ impl crate::lltype::GcType for W_LongObject {
 
 /// Allocate a new W_LongObject on the heap.
 ///
-/// Phase 1: uses `Box::leak` (objects are never freed).
+/// Uses `Box::leak` (objects are never freed).
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity

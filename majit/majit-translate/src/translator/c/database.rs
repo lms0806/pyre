@@ -30,7 +30,7 @@ pub enum GcPolicyClass {
     /// `gcpolicy` was supplied to `CBuilder.__init__`, upstream
     /// returns the policy *object* itself. The Rust port keeps the
     /// `Rc<dyn Any>` so the policy's methods/state survive the call;
-    /// dropping to a pointer-string was a NEW-DEVIATION that erased
+    /// dropping to a pointer-string was a deviation that erased
     /// the live state.
     Custom(Rc<dyn Any>),
 }
@@ -178,7 +178,7 @@ impl LowLevelDatabase {
     /// For function pointers, RPython returns the C function name; the
     /// local `lltype.getfunctionptr` port stores that in `_func._name`.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream `:194-:` walks every non-NULL
+    /// TODO: upstream `:194-:` walks every non-NULL
     /// pointer through `getcontainernode()` to register the underlying
     /// `_obj` as a containerlist root + bump the `containerstats[kind]`
     /// counter. The local port returns the name string but skips the

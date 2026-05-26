@@ -54,7 +54,7 @@ fn register_to_box_float(opref: OpRef, value: i64) -> OpBox {
 ///
 /// RPython pyjitpl.py: class MIFrame
 ///
-/// PRE-EXISTING-ADAPTATION: RPython holds `self.metainterp` as a
+/// TODO: RPython holds `self.metainterp` as a
 /// back-pointer to the owning MetaInterp; pyre takes `&mut MetaInterp`
 /// as a parameter on call sites instead so that the borrow checker
 /// allows `MetaInterp::framestack` to own a `Vec<MIFrame>` without

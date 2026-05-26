@@ -226,12 +226,12 @@ fn _translate_cache(cache: &Cache, link: &LinkRef) -> Cache {
 /// Returns `true` when the block grew at least one `same_as` op
 /// (cache hit replacing a getfield / cast_pointer).
 ///
-/// PRE-EXISTING-ADAPTATION: the upstream constant-folding sub-paths
-/// at `:93-103` (immutable-field read on `Constant(_ptr)`) and
-/// `:113-122` (`lltype.cast_pointer` on a Constant pointer) are
-/// intentionally not lifted here. They depend on `lltype._ptr` field
-/// access and `lltype.cast_pointer`'s `_parentable` chain — both of
-/// which are PRE-EXISTING-ADAPTATIONs in `lltype.rs:1183-1185`.
+/// TODO: the upstream constant-folding sub-paths at `:93-103`
+/// (immutable-field read on `Constant(_ptr)`) and `:113-122`
+/// (`lltype.cast_pointer` on a Constant pointer) are intentionally
+/// not lifted here. They depend on `lltype._ptr` field access and
+/// `lltype.cast_pointer`'s `_parentable` chain — both of which are
+/// TODOs in `lltype.rs:1183-1185`.
 /// Upstream itself notes at `:118-119` that "constfold also handles
 /// the case", so the cache-side port is complete on its own:
 /// constfold catches the constant pointer reads, storesink catches
@@ -477,7 +477,7 @@ fn fold_constant_cast_pointer(
 /// Returns `None` for `Void` / `Struct` / `Array` / `Opaque` /
 /// `InteriorPtr` — those container values have no flat `ConstValue`
 /// variant today, so the fold-to-Constant fast path is skipped and
-/// the cache path takes over. This is a PRE-EXISTING-ADAPTATION
+/// the cache path takes over. This is a TODO
 /// versus upstream `storesink.py:100-102`, which lifts every
 /// `getattr(arg0.value, field)` into a Constant unconditionally.
 /// Convergence path: extend `ConstValue` with `LLStruct(_struct)` /
@@ -512,8 +512,8 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
         LowLevelValue::Ptr(p) => Some(ConstValue::LLPtr(p.clone())),
         LowLevelValue::Address(a) => Some(ConstValue::LLAddress(a.clone())),
         // Void / Struct / Array / Opaque / InteriorPtr have no flat
-        // ConstValue equivalent today — defer (PRE-EXISTING-ADAPTATION
-        // documented above).
+        // ConstValue equivalent today — defer (TODO: documented
+        // above).
         _ => None,
     }
 }

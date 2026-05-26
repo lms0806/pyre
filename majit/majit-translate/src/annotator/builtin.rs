@@ -121,7 +121,7 @@ pub(crate) fn arg_at<'a>(
 }
 
 // (Retired 2026-05-12, strict-parity pass.)  The
-// `args_s_concrete_or_panic` eager-prefix helper was a NEW-DEVIATION
+// `args_s_concrete_or_panic` eager-prefix helper was a deviation
 // from `unaryop.py:940 simple_call_SomeBuiltin`'s bind-then-body
 // sequence (upstream's analyser body raises `AttributeError` on the
 // FIRST slot touch, not at a blanket prefix unwrap).  Every
@@ -1191,7 +1191,7 @@ pub fn lltype_cast_ptr_to_int(
 ///     return SomePtr(ll_ptrtype=PtrT.const)
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION (Task #345): the Rust frontend's
+/// TODO: the Rust frontend's
 /// `Expr::Cast { ValueType::Ref }` carries only the opaque high-level
 /// `Ref` (no concrete Ptr lltype is known at lowering time), so the
 /// frontend lowers `Int → Ref` to a **1-arg** `simple_call(lltype.\
@@ -1239,7 +1239,7 @@ pub fn lltype_cast_int_to_ptr(
 /// `int_type.SIGN == False` → `SomeInteger(unsigned=True,
 /// knowntype=r_uint)`.
 ///
-/// PRE-EXISTING-ADAPTATION (Task #344): upstream dispatch is via
+/// TODO: upstream dispatch is via
 /// `extregistry._about_` keyed on the class object; pyre keys on the
 /// `"rarithmetic.r_uint"` qualname through `BUILTIN_ANALYZERS`.  The
 /// body is parity-correct — only the lookup mechanism diverges,

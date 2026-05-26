@@ -1,4 +1,4 @@
-//! Slice 1 gate: dispatch JitCode IR shape unit tests.
+//! Dispatch JitCode IR shape unit tests.
 //!
 //! Verifies the singleton dispatch JitCode emitted by `__dispatch_jitcode_*`
 //! contains the expected portal IR (BC_JIT_MERGE_POINT, BC_LOOP_HEADER) +
@@ -224,7 +224,7 @@ fn dispatch_jitcode_contains_loop_back_goto() {
     );
 }
 
-/// Slice 1.4: the dispatch JitCode body must contain the opcode-fetch IR ops
+/// The dispatch JitCode body must contain the opcode-fetch IR ops
 /// lowered from `let opcode = program[pc]; pc += 1;`:
 ///   1. BC_GETARRAYITEM_GC_I — loads program[pc] into an int register
 ///   2. BC_INT_ADD           — increments pc_reg by 1 (via load_const + int_add)
@@ -259,7 +259,7 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
     );
 }
 
-/// Slice 1.5: the dispatch JitCode body must emit one BC_GOTO_IF_NOT_INT_EQ
+/// The dispatch JitCode body must emit one BC_GOTO_IF_NOT_INT_EQ
 /// per non-default arm (OP_NOP, OP_INC_A → ≥ 2 checks).
 ///
 /// pyopcode.py:183+ if/elif chain over opcode constants.
@@ -284,7 +284,7 @@ fn dispatch_jitcode_emits_chain_of_int_eq_dispatch() {
     );
 }
 
-/// Slice 1.7: the dispatch JitCode default arm must emit a typed return.
+/// The dispatch JitCode default arm must emit a typed return.
 /// dispatch_minimal returns `state.a` (i64 / Int binding) so the JitCode
 /// must end with BC_INT_RETURN.
 ///
@@ -413,7 +413,7 @@ fn dispatch_minimal_traces_via_dispatch_jitcode_singleton() {
     );
 }
 
-/// Slice 2.1: JitDriver::register_dispatch_jitcode stores the dispatch JitCode
+/// JitDriver::register_dispatch_jitcode stores the dispatch JitCode
 /// as an Arc singleton and dispatch_jitcode() returns None before registration
 /// and Some after.
 ///
@@ -564,7 +564,7 @@ mod oparg_minimal {
                 // `transform_function`'s `rewrite_body` substitution
                 // (`mod.rs:1535 driver.back_edge_structured(...)`); the
                 // dispatch JitCode lowerer cannot yet lower `if`+`continue`
-                // inside arm bodies (multi-session lowerer epic), so the
+                // inside arm bodies (lowerer not yet ported), so the
                 // fixture body is reduced to the macro call alone — that
                 // is the smallest shape that exercises the call-site LH
                 // emit per RPython parity.
@@ -684,7 +684,7 @@ mod oparg_minimal {
     /// opcode fetch. The existing `state_fields` macro lowering
     /// (`majit-macros/src/jit_interp/jitcode_lower.rs:1429`,
     /// `assembler.rs:345`, `dispatch.rs:1233`) already emits the op;
-    /// A.2.4 reduces to a verification slice that pins position and
+    /// This test pins position and
     /// count so a future refactor cannot silently drop the store or
     /// reorder it across the opcode fetch.
     #[test]
@@ -751,10 +751,10 @@ mod oparg_minimal {
     /// helper picks the R variant directly without requiring a Ref
     /// binding to be threaded through the dispatch loop.
     ///
-    /// Codex BLOCKER 4 (optimizer-no-hoist verification) is deferred
-    /// to A.2.5.c — this test only pins the dispatch JitCode body
-    /// shape, which is the byte stream the install gate sees, not the
-    /// optimized loop IR. A future epic can add an optimized-IR
+    /// Optimizer-no-hoist verification is deferred — this test only
+    /// pins the dispatch JitCode body shape, which is the byte stream
+    /// the install gate sees, not the optimized loop IR. A future
+    /// effort can add an optimized-IR
     /// observability harness and assert the call survives across two
     /// consecutive iterations without dedup or hoisting.
     #[test]

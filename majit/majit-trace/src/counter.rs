@@ -127,7 +127,7 @@ impl JitCounter {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION: no RPython counterpart. Read-only peek
+    /// TODO: no RPython counterpart. Read-only peek
     /// used by warmstate's cold fast path to avoid GreenKey allocation.
     pub fn would_tick_fire(&self, hash: u64, increment: f64) -> bool {
         let index = self._get_index(hash);
@@ -198,7 +198,7 @@ impl JitCounter {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION: no RPython equivalent.
+    /// TODO: no RPython equivalent.
     /// Zero all timetable entries.
     pub fn reset_all(&mut self) {
         for entry in &mut self.timetable {

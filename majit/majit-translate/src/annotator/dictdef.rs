@@ -9,7 +9,7 @@
 //!   extend `ListItem`. Rust has no single inheritance, so the
 //!   subclass-only fields (`custom_eq_hash`, `s_rdict_eqfn`,
 //!   `s_rdict_hashfn`) live flattened on [`super::listdef::ListItem`]
-//!   itself — see the `PRE-EXISTING-ADAPTATION` doc on that struct.
+//!   itself — see the TODO doc on that struct.
 //!   `DictKey` / `DictValue` here become zero-sized namespaces for the
 //!   subclass's `__init__` / `merge` associated functions, matching
 //!   the upstream class shape at the call-site level. The `patch()`
@@ -34,7 +34,7 @@ use super::model::{SomeBool, SomeInteger, SomeValue, UnionError, union};
 /// namespace for the subclass constructor + `merge` override. The
 /// subclass-specific `custom_eq_hash` / `s_rdict_eqfn` /
 /// `s_rdict_hashfn` fields live on [`ListItem`] itself (see that
-/// struct's PRE-EXISTING-ADAPTATION).
+/// struct's TODO doc).
 #[derive(Debug)]
 pub struct DictKey;
 

@@ -548,9 +548,8 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
 /// jitexc.py JitException hierarchy — structural parity with RPython.
 ///
 /// `_run_forever` must exit via exactly one of these variants.
-/// Introduced in Phase 0 of the "portal locals → vable array" epic;
-/// call sites still return `BlackholeResult` and will be migrated in
-/// Phase 6 once `consume_vable_info` guarantees resume data validity.
+/// Call sites still return `BlackholeResult` and will be migrated
+/// once `consume_vable_info` guarantees resume data validity.
 #[allow(dead_code)] // populated progressively over the epic
 pub enum JitException {
     /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
@@ -967,8 +966,7 @@ pub fn resume_in_blackhole(
                 section.values.len(),
             );
         }
-        // Phase 0 probe (Tasks #158/#159/#122 epic, plan
-        // ~/.claude/plans/staged-sauteeing-koala.md): when
+        // Probe: when
         // MAJIT_PROBE_LIVENESS env is set, log the per-ref-bank
         // (reg_idx → section.values[k]) mapping plus null/concrete
         // status. Goal P0-Q1: distinguish "trace export missing this
@@ -1039,8 +1037,7 @@ pub fn resume_in_blackhole(
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
         bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
-        // PRE-EXISTING-ADAPTATION (Task #122 epic, blocked on Task #185
-        // SSA-authoritative `live_r` rewire + Task #158 graph regalloc):
+        // TODO (blocked on SSA-authoritative `live_r` rewire + graph regalloc):
         //
         // RPython structure (`pypy/module/pypyjit/interp_jit.py:67
         // reds = ['frame', 'ec']`):
@@ -1248,9 +1245,9 @@ pub fn resume_in_blackhole(
                 // lives in the BH side: clear exception_last_value on
                 // handle_exception_in_frame + reset the caller
                 // BH_LAST_EXC_VALUE thread-local once the exception is
-                // consumed. Tracked by Task #122 (rd_numb resume
-                // unification), blocked by Task #158 (register-layout
-                // refactor) + Task #159 (liveness pipeline rework).
+                // consumed. Blocked on rd_numb resume
+                // unification, register-layout refactor, and
+                // liveness pipeline rework.
                 return BlackholeResult::Failed;
             };
 
@@ -1807,7 +1804,7 @@ fn jit_blackhole_resume_from_guard(
     // reconstructs the entry green_key.  This contract is
     // Python-portal-specific and would NOT hold for a non-virtualizable
     // JIT or a portal whose first fail arg is a scalar.  Convergence:
-    // Phase E.3+ unification (Task #235) replaces `(green_key, trace_id,
+    // Unification replaces `(green_key, trace_id,
     // fail_index)` keying with descr identity — at which point this
     // whole recovery block collapses.
     let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
@@ -3988,7 +3985,7 @@ pub fn cranelift_resumedata_deopt(
     true
 }
 
-/// Path 1 Slice 1 — pyre-jit side of the on-demand
+/// Pyre-jit side of the on-demand
 /// `ExitRecoveryLayout` reconstruction callback registered into
 /// cranelift via `register_recovery_layout` (eval.rs:init_callbacks).
 /// Used by `CraneliftFailDescr::recovery_layout_ref` to derive the
@@ -4000,8 +3997,8 @@ pub fn cranelift_resumedata_deopt(
 /// Returns `None` for synthetic descrs (FINISH / external-JUMP /
 /// overlay) without a `ResumeGuardDescr` meta_descr or for descrs
 /// whose `compiled_loops` entry has been evicted; callers fall back
-/// to the meta-side slot read (current behaviour) until Slice 3
-/// deletes the slot entirely.
+/// to the meta-side slot read (current behaviour) until
+/// the slot is deleted entirely.
 #[cfg(feature = "cranelift")]
 pub fn cranelift_recovery_layout_for_descr(
     descr_addr: usize,

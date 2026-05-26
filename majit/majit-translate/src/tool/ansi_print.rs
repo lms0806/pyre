@@ -177,7 +177,7 @@ impl AnsiLogger {
     /// `:62` end-to-end: upstream raises `AttributeError(name)` which
     /// is process-fatal unless the caller has a try/except. Rust's
     /// closest analogue is `panic!`; `debug_assert!` would silently
-    /// drop the check in release, which is a NEW-DEVIATION because
+    /// drop the check in release, which would be a deviation because
     /// the strict-name invariant disappears at runtime. Use the
     /// always-on form instead.
     pub fn method(&self, subname: &str, text: &str) {

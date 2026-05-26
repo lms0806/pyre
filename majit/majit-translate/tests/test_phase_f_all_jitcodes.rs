@@ -1,4 +1,4 @@
-//! Phase F acceptance: the embedded pyre-interpreter JitCode registry
+//! Acceptance: the embedded pyre-interpreter JitCode registry
 //! materialises every `opcode_*` handler graph and the trait impls those
 //! handlers reach via `direct_call`.
 //!
@@ -13,7 +13,7 @@
 //!   `AllJitCodes::in_order`. The test re-checks the surface invariant.
 //!
 //! The test is READ-ONLY against pyre-jit; no pyre-jit binary links
-//! against `generated` yet (Phase G), so baseline `./pyre/check.py`
+//! against `generated` yet, so baseline `./pyre/check.py`
 //! 14/14+14/14 is unaffected.
 
 use majit_translate::generated::with_all_jitcodes;
@@ -22,8 +22,8 @@ use majit_translate::generated::with_all_jitcodes;
 fn all_jitcodes_covers_every_opcode_handler() {
     with_all_jitcodes(|reg| {
         // Every `opcode_*` freestanding handler in pyopcode.rs must appear
-        // in the registry. The Phase E.0.1 harness confirmed the transform
-        // pipeline covers 28+; Phase F must preserve that count.
+        // in the registry. The harness confirmed the transform pipeline
+        // covers 28+; this count must be preserved.
         assert!(
             reg.len() >= 28,
             "expected >=28 JitCodes in the registry, got {}",
@@ -134,8 +134,8 @@ fn all_jitcodes_registry_contains_inherent_impl_methods() {
 /// Loop-free `opcode_*` helpers defined in
 /// `pyre-interpreter/src/shared_opcode.rs:50-172` — these pass upstream
 /// `rpython/jit/codewriter/policy.py:53-62 look_inside_graph`
-/// (no backedges → inlinable). Task #101 wired the BFS reachability so
-/// all of these land in the JitCode registry.
+/// (no backedges → inlinable). BFS reachability ensures all of these
+/// land in the JitCode registry.
 const SHARED_OPCODE_HELPERS_INLINABLE: &[&str] = &[
     "opcode_make_function",
     "opcode_build_list",
@@ -159,7 +159,7 @@ const SHARED_OPCODE_HELPERS_LOOP_REJECTED: &[&str] = &["opcode_call", "opcode_un
 
 #[test]
 fn all_jitcodes_registry_contains_loop_free_shared_opcode_helpers() {
-    // Task #101 fix anchor: every loop-free `shared_opcode.rs` helper
+    // Every loop-free `shared_opcode.rs` helper
     // must reach `AllJitCodes::by_path`. Before the fix (lib.rs:459-480
     // parallel registration under `[<Trait>, <method>]`), `PyFrame`'s
     // empty `impl OpcodeStepExecutor for PyFrame {}` block failed to

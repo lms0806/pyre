@@ -489,8 +489,7 @@ pub(super) fn call_result_matches_binding(
 
 /// Build the runtime guard that wraps `live_placeholder*` for an
 /// inferred-policy callee.  See [`LiveMarkerCondition`] for the
-/// PRE-EXISTING-ADAPTATION rationale and the convergence path
-/// (Tasks #146/#235) that retires this wrapper.
+/// TODO rationale and the convergence path that retires this wrapper.
 pub(super) fn inferred_policy_live_condition(func: &Expr, can_raise_codes: &[u8]) -> TokenStream {
     let policy_path =
         helper_policy_path(func).expect("inferred helper policy requires a path expression");
@@ -940,13 +939,12 @@ impl Register {
     }
 }
 
-// ── Op metadata for backward liveness analysis (Phase 4 Epic B) ─────
+// ── Op metadata for backward liveness analysis ─────
 //
 // `op_metadata[i]` describes the i-th emitted op so a downstream backward
-// walker (Slice B.2.B) can produce per-marker live sets matching RPython
+// walker can produce per-marker live sets matching RPython
 // `liveness.py:33-79 _compute_liveness_must_continue`. Currently only the
-// `LiveMarker` sites are populated — remaining emit sites are migrated in
-// Slice B.2.A.ii.
+// `LiveMarker` sites are populated.
 //
 // `kind` and `control` are split because future op categories (binop,
 // load_const, jump, ...) carry the same `Linear`/`UnconditionalJump`/etc
@@ -1034,7 +1032,7 @@ pub(super) enum ControlFlowClass {
     Terminal,
 }
 
-/// PRE-EXISTING-ADAPTATION (no upstream counterpart).
+/// TODO: no upstream counterpart.
 ///
 /// `rpython/jit/codewriter/liveness.py:82-116`'s `-live-` is always
 /// unconditional; `jtransform.py:311-312` decides whether to emit one at
@@ -1096,7 +1094,7 @@ impl OpMeta {
     }
 
     /// Conditional `-live-` for inferred-policy callees.  See
-    /// [`LiveMarkerCondition`] for the PRE-EXISTING-ADAPTATION rationale
+    /// [`LiveMarkerCondition`] for the TODO rationale
     /// and convergence path.
     pub(super) fn live_marker_if(condition: TokenStream) -> Self {
         let mut marker = Self::live_marker();

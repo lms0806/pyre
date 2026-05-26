@@ -18,9 +18,9 @@
 //! needs `SomeInstance(classdef=PyFrame)`, which needs a ClassDef for
 //! `PyFrame`, which needs a ClassDesc, which needs a `HostObject`. If
 //! synthesizing that `HostObject::Class` and feeding it to
-//! `Bookkeeper.getuniqueclassdef` already works, then every M3 / M2.5d
-//! slice 2 milestone below reduces to WIRING the existing pieces —
-//! not adding new primitives.
+//! `Bookkeeper.getuniqueclassdef` already works, then the milestones
+//! below reduce to WIRING the existing pieces — not adding new
+//! primitives.
 //!
 //! Upstream pipeline:
 //!   `bookkeeper.py:367-373 getdesc` (class branch)

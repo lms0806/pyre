@@ -437,14 +437,14 @@ pub trait JitState: Sized {
     /// guards to also carry an `rd_resume_position` overrides this
     /// hook.
     ///
-    /// PRE-EXISTING-ADAPTATION (Task #89 framestack-lift Session 4):
+    /// TODO (framestack-lift ):
     /// this is the JitState-level entry point for the framestack-lift
     /// epic.  It mirrors `JitCodeSym::populate_frame_int_regs`
     /// (`pyjitpl/dispatch.rs:113-146`) but is reachable from
     /// `merge_point` / `force_finish_trace` where the generic `S::Sym`
     /// is not constrained to implement `JitCodeSym`.  Once
     /// `JitState::Sym: JitCodeSym` becomes the universal contract
-    /// (Task #89 orth-9 step 4 reshape), this hook collapses into the
+    /// (orth-9 step 4 reshape), this hook collapses into the
     /// `JitCodeSym` method directly.
     fn populate_frame_for_guard(
         _sym: &Self::Sym,

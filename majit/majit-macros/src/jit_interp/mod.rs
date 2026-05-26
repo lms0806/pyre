@@ -74,7 +74,7 @@ pub struct JitInterpConfig {
     /// list `[program, pc(+ optional vable)]` with declared greens
     /// filtered out (the pre-Issue-#6 pyre behavior).
     pub reds: Vec<Expr>,
-    /// Slice 92.2 — per-green type tag from `greens = [name: tag]` syntax.
+    /// Per-green type tag from `greens = [name: tag]` syntax.
     /// Lockstep with [`Self::greens`] (same length, same order).  `None`
     /// at a given index means the green flows through the
     /// `<_ as GreenAsI64>::__green_repr` trait dispatch unchanged;
@@ -973,11 +973,11 @@ fn rewrite_body(
         }
     }
 
-    /// Slice 92.2 — emit a single `(i64, majit_ir::GreenType)` pair for one
-    /// green expression, dispatching on the optional per-green type tag.
+    /// Emit a single `(i64, majit_ir::GreenType)` pair for one green
+    /// expression, dispatching on the optional per-green type tag.
     /// Untagged (`None`) greens flow through the
-    /// `<_ as GreenAsI64>::__green_repr` trait — preserving the
-    /// pre-Slice-92 behavior. Tagged greens emit explicit casts so
+    /// `<_ as GreenAsI64>::__green_repr` trait. Tagged greens emit
+    /// explicit casts so
     /// `&str`-bearing greens carry `GreenType::Str` instead of being
     /// silently routed through the blanket `impl<T: ?Sized>` Ref impl.
     fn emit_green_repr(spec_expr: &Expr, tag: Option<green_type_tag::GreenTypeTag>) -> TokenStream {
@@ -1019,7 +1019,7 @@ fn rewrite_body(
             // mirrors that contract by storing the fat pointer at a
             // stable address rather than the bare data pointer.
             //
-            // PRE-EXISTING-ADAPTATION (allocation lifetime divergence
+            // TODO: allocation lifetime divergence
             // from RPython, intentionally deferred):
             //
             //   * RPython: `rstr.STR*` is GC-allocated *once per
@@ -1046,7 +1046,7 @@ fn rewrite_body(
             // `GreenKey::values` from `Vec<i64>` to a typed enum
             // carrying `Box<str>` for str/unicode greens, with the
             // macro emitting a temporary the cache promotes on
-            // insertion) is a multi-session refactor and is
+            // insertion) is a larger refactor and is
             // intentionally deferred — a global intern side-table
             // was rejected as non-orthodox (RPython does not
             // maintain one).  Functional behavior matches RPython
@@ -1086,7 +1086,7 @@ fn rewrite_body(
             // Float / Ref greens equal under bit-equal Int values they
             // should not be equal to.
             //
-            // Slice 92.2 — `green_type_tags` is the lockstep
+            // `green_type_tags` is the lockstep
             // `Vec<Option<GreenTypeTag>>` carried alongside `greens`
             // (`JitInterpConfig.green_type_tags`).  Tagged greens
             // bypass the trait dispatch with explicit casts so str /
@@ -1402,12 +1402,12 @@ fn rewrite_body(
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
-                    // Slice 2.3: jit_merge_point!() in #[jit_interp] dispatch portals
+                    // jit_merge_point!() in #[jit_interp] dispatch portals
                     // expands to a single merge_wrapper invocation.  The wrapper
                     // (generate_merge_wrapper) clones the dispatch JitCode Arc and calls
                     // `driver.merge_point(...)` exactly once — there is no additional
                     // outer merge-point hook.  The BC_JIT_MERGE_POINT(_C) IR op lives
-                    // inside the dispatch JitCode body (lower_dispatch_body, Slice 1.2),
+                    // inside the dispatch JitCode body (lower_dispatch_body),
                     // not in the outer Rust source.
                     //
                     // RPython parity: source-level jit_merge_point() is a codewriter

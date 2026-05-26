@@ -14,7 +14,7 @@
 //! `insn_byte` (#86d), import paths (#86e), classification doc
 //! comments (#86f), and remove the back-compat re-exports (#88).
 //!
-//! PRE-EXISTING-ADAPTATION: pyre's runtime jitcode builder uses
+//! TODO: pyre's runtime jitcode builder uses
 //! fixed `BC_*` byte values (compile-time stable) instead of
 //! RPython's dynamic `setdefault(key, len(self.insns))` allocation.
 //! Compile-time stability is required because pyre serialises
@@ -68,10 +68,10 @@ pub const BC_INLINE_CALL: u8 = 17;
 /// is the handler shared with the
 /// [`BC_GOTO_IF_NOT_INT_IS_TRUE`] alias per `blackhole.py:913
 /// bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`.  Slot 18
-/// (formerly `BC_RESIDUAL_CALL_VOID`, freed by Slice 1c of
-/// `pyre-call-family-canonical-migration.md`) now houses this
-/// canonical key so each `(opname, argcodes)` per
-/// `assembler.py:221 setdefault()` keeps its own byte.
+/// (formerly `BC_RESIDUAL_CALL_VOID`, freed by the call-family
+/// canonical migration) now houses this canonical key so each
+/// `(opname, argcodes)` per `assembler.py:221 setdefault()` keeps
+/// its own byte.
 pub const BC_GOTO_IF_NOT: u8 = 18;
 pub const BC_MOVE_I: u8 = 21;
 // Canonical RPython keys taking previously-freed slots 22-26 and 28-31
@@ -93,33 +93,32 @@ pub const BC_RECORD_KNOWN_RESULT_R_IR_V: u8 = 31;
 pub const BC_MOVE_R: u8 = 27;
 // Float-typed bytecodes
 pub const BC_MOVE_F: u8 = 33;
-// slot 34 (formerly BC_CALL_FLOAT) freed by Slice 4 Phase B.4 — see
-// the BC_CALL_REF (slot 28) note above for the canonical replacement.
-// slot 35 (formerly BC_CALL_PURE_FLOAT) freed by Parity #14 Slice C.5
-// — see slot 23 above.
-// slots 38..=40 (formerly BC_CALL_MAY_FORCE_{INT,REF,FLOAT}) freed by
-// Slice 4 Phase B.4 — the may_force policy now rides on
+// slot 34 (formerly BC_CALL_FLOAT) freed — see the BC_CALL_REF
+// (slot 28) note above for the canonical replacement.
+// slot 35 (formerly BC_CALL_PURE_FLOAT) freed — see slot 23 above.
+// slots 38..=40 (formerly BC_CALL_MAY_FORCE_{INT,REF,FLOAT}) freed —
+// the may_force policy now rides on
 // `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
 // by the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_{I,R,F}` family
 // (`effectinfo.py:201`).
-// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed by Slice 1c — same
+// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed — same
 // EffectInfo-carries-policy rationale as above; see slots 38..=40.
-// slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed by Slice 4 Phase B.4
+// slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
 // — release-GIL policy rides on
 // `EffectInfo.call_release_gil_target` (`effectinfo.py:255
 // is_call_release_gil`).
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
 // resoperation.py:1243-1244 (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
-// slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed by Slice 4 Phase
-// B.4 — see slot 42 above.
-// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed by Slice 1c — see
-// slot 42 above.
+// slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed — see slot 42
+// above.
+// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed — see slot 42
+// above.
 // slots 46..=48 (formerly BC_CALL_LOOPINVARIANT_{INT,REF,FLOAT}) freed
-// by Slice 4 Phase B.4 — loop-invariant policy rides on
+// — loop-invariant policy rides on
 // `EffectInfo.extraeffect = EF_LOOPINVARIANT` (`effectinfo.py:202`).
-// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed by Slice 1c — see
-// slots 46..=48 above.
+// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed — see slots
+// 46..=48 above.
 pub const BC_CALL_ASSEMBLER_INT: u8 = 50;
 pub const BC_CALL_ASSEMBLER_REF: u8 = 51;
 pub const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
@@ -277,8 +276,8 @@ pub const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
 // canonical residual_call_*_v opcodes — RPython `blackhole.py:1240-1255`
 // `bhimpl_residual_call_{r,ir,irf}_v`. Distinct opcodes per argcode shape so
 // `setup_insns` (`blackhole.rs:3241`) keeps its 1:1 opcode→key invariant.
-// Slice 0 of `pyre-call-family-canonical-migration.md` reserves these slots
-// in the 159-255 free range; emit-site migration lives in Slice 1.
+// These slots are reserved in the 159-255 free range from the
+// call-family canonical migration.
 pub const BC_RESIDUAL_CALL_R_V: u8 = 159;
 pub const BC_RESIDUAL_CALL_IR_V: u8 = 160;
 pub const BC_RESIDUAL_CALL_IRF_V: u8 = 161;
@@ -583,7 +582,7 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("void_return/", BC_VOID_RETURN);
 
     // `abort/` and `abort_permanent/` are pyre-only Rust adaptations and
-    // live in `pyre_extension_insns()` (Task #94c) — their byte values
+    // live in `pyre_extension_insns()` — their byte values
     // are still `BC_ABORT` / `BC_ABORT_PERMANENT`, but they are kept out
     // of the canonical-mirror table to keep `wellknown_bh_insns()` a
     // strict subset of RPython's `Assembler.insns`. See the comment on
@@ -595,7 +594,7 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("unreachable/", BC_UNREACHABLE);
 
     // The 6 `*_state_*` keys were quarantined into
-    // `pyre_extension_insns()` (Task #94b' / #94c). They model the
+    // `pyre_extension_insns()`. They model the
     // proc-macro-generated JIT-machine-state addressing scheme and have
     // no RPython counterpart — see the doc-comment on
     // `pyre_extension_insns` for the proc-macro/runtime-bridge
@@ -654,7 +653,7 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
     m.insert("jit_merge_point/iIRFIRF", BC_JIT_MERGE_POINT);
     // RPython `blackhole.py:1240-1255` `bhimpl_residual_call_{r,ir,irf}_v`.
-    // Slice 1c of `pyre-call-family-canonical-migration.md` retired the
+    // The call-family canonical migration retired the
     // legacy `BC_RESIDUAL_CALL_VOID` (=18) byte layout in favour of the
     // canonical `iRd / iIRd / iIRFd` argcode triple; the freed slot is
     // documented at the const-table site above.
@@ -1038,7 +1037,7 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
     m.insert("load_state_varray/dii", BC_LOAD_STATE_VARRAY);
     m.insert("store_state_varray/dii", BC_STORE_STATE_VARRAY);
-    // PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.
+    // TODO: pyre nested-bytecode `inline_call`.
     //
     // RPython's canonical `inline_call_*` keys (`/dIRF>i`, `/dIR>r`, …)
     // dispatch through a real C-ABI `fnaddr` stored on `BhDescr::JitCode`.
@@ -1052,7 +1051,7 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     // Generic walkers must consult `decode_op_at` (which knows `P`) for
     // length, not the canonical argcodes table.
     m.insert("inline_call_pyre_nested/P", BC_INLINE_CALL);
-    // PRE-EXISTING-ADAPTATION: pyre `call_assembler_*` adapters.
+    // TODO: pyre `call_assembler_*` adapters.
     //
     // `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
     // (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat
@@ -1067,7 +1066,7 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     m.insert("call_assembler_ref_pyre/P", BC_CALL_ASSEMBLER_REF);
     m.insert("call_assembler_float_pyre/P", BC_CALL_ASSEMBLER_FLOAT);
     m.insert("call_assembler_void_pyre/P", BC_CALL_ASSEMBLER_VOID);
-    // PRE-EXISTING-ADAPTATION: pyre `cond_call` / `record_known_result`
+    // TODO: pyre `cond_call` / `record_known_result`
     // adapters.
     //
     // `JitCodeBuilder::call_cond_like` / `call_cond_value_like`

@@ -757,7 +757,7 @@ fn cpu_tracker_field(tracker: &CpuTotalTracker, kind: i32) -> &AtomicUsize {
 /// that don't have a paired debug scope upstream (count-only kinds like
 /// OPS / ABORT_*).  Used by [`JitProfiler::start_event`] /
 /// [`JitProfiler::end_event`] to emit grep-able scope markers under the
-/// single `MAJIT_LOG` switch (see `memmgr.rs` PRE-EXISTING-ADAPTATION
+/// single `MAJIT_LOG` switch (see `memmgr.rs` TODO
 /// note for the channel-registry deferral).
 fn debug_channel_for_event(event: i32) -> Option<&'static str> {
     match event {

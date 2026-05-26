@@ -53,7 +53,7 @@ pub fn w_method_new(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
     // the `lltype::malloc_typed` call below. All three inputs are live
     // PyObjectRef roots that must survive a potential collection inside
-    // the allocation point once Phase 2 swaps the malloc body to a
+    // the allocation point once the malloc body swaps to a
     // managed allocator.
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_function);

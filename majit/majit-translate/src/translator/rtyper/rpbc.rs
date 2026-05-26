@@ -2021,7 +2021,7 @@ impl Repr for FunctionsPBCRepr {
                 // non-NULL sentinels (so equality checks against None
                 // and against each other resolve correctly).
                 //
-                // PRE-EXISTING-ADAPTATION: pyre's parity equivalent is
+                // TODO: pyre's parity equivalent is
                 // a fresh `_ptr` carrying [`DelayedPointer`] as the
                 // `_obj0` slot. `_ptr`'s PartialEq (lltype.rs:1048-1051)
                 // falls back to `_identity` for any non-Ok(Some)
@@ -2032,7 +2032,7 @@ impl Repr for FunctionsPBCRepr {
                 // without needing the llmemory/rffi int-to-ptr
                 // machinery.
                 //
-                // **Convergence path** (PRE-EXISTING-ADAPTATION fix
+                // **Convergence path** (TODO:
                 // queue): once `rffi.cast` (rpython/rtyper/lltypesystem/
                 // rffi.py) and the `llmemory.cast_int_to_adr` chain
                 // (rpython/rtyper/lltypesystem/llmemory.py) port lands

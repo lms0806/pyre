@@ -16,7 +16,7 @@
 //! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`force_attributes_into_classes`] |
 //! | `ClassDesc` (classdesc.py:488-600) | [`ClassDesc`] |
 //!
-//! ## PRE-EXISTING-ADAPTATION: cyclic ClassDef ↔ ClassDesc
+//! ## TODO: cyclic ClassDef ↔ ClassDesc
 //!
 //! Upstream stores `classdef.classdesc: ClassDesc` and `classdesc.classdef:
 //! ClassDef` as mutual Python references — cycle collection handles the
@@ -35,7 +35,7 @@
 //! `subdefs` / `parentdefs` are `Weak` because they point across the
 //! subclass graph.
 //!
-//! ## PRE-EXISTING-ADAPTATION: identity equality
+//! ## TODO: identity equality
 //!
 //! Upstream `ClassDef` equality is Python object identity (`is`): two
 //! `ClassDef` structs with the same `name` are still distinct if they
@@ -44,7 +44,7 @@
 //! matching upstream. Name-based comparisons must walk
 //! `borrow().name`.
 //!
-//! ## PRE-EXISTING-ADAPTATION: HostObject class-dict reflection
+//! ## TODO: HostObject class-dict reflection
 //!
 //! [`HostObject::Class`] exposes `class_get(name)` /
 //! `class_contains(name)` as the reflection surface upstream reads via

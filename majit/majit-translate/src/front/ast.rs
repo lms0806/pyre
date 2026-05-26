@@ -84,7 +84,7 @@ impl Lowered {
     /// Clone [`Self::value`] for call sites that need an owned
     /// `Option<Variable>`.  `graph` is retained in the signature for
     /// caller-side symmetry with [`Self::from_value_var`] (both take
-    /// the graph handle even though the carrier flip made the
+    /// the graph handle even though the carrier change made the
     /// projection unnecessary); future cleanup can drop the param at
     /// both sides together.
     pub fn value_var(&self, _graph: &FunctionGraph) -> Option<crate::flowspace::model::Variable> {
@@ -1684,7 +1684,7 @@ pub fn lower_expr_into_graph(
 /// `Block.inputargs` entries + `GraphBuildContext.bind_local_id`
 /// bindings.
 ///
-/// Closes the Cat 2.1 "adapter cross-block body Input" Skip family
+/// Closes the "adapter cross-block body Input" Skip family
 /// for `__opcode_dispatch__::*` synthesized arm graphs:
 /// without this pre-binding, an arm body that references
 /// `execute_opcode_step`'s formal parameters (`frame`, `instruction`,
@@ -2030,7 +2030,7 @@ struct LoopFrame {
 
 /// Names statically reachable as locals from inside a loop body —
 /// produced by `loop_body_locals` ahead of the loop walk so the eager
-/// phi allocator (Slice 5b.3) can pre-build the loop header's
+/// phi allocator can pre-build the loop header's
 /// inputarg list without running a `framestate.union` work-list to
 /// fixpoint.
 ///
@@ -2097,14 +2097,14 @@ fn visit_stmt_for_loop_locals(stmt: &syn::Stmt, state: &mut LoopBodyLocals) {
         syn::Stmt::Item(_) => {
             // `fn`, `struct`, `use`, etc. — item definitions live in
             // their own scope and do not refer to enclosing locals.
-            // Slice 5b.2 contract: skip.
+            // Skip — items live in their own scope.
         }
         syn::Stmt::Macro(_) => {
             // Macro invocations cannot be statically introspected
             // for local references.  Conservatively skip; if a macro
             // mutates a local that later participates in the
             // back-edge, the `Link.__init__` arity check at build
-            // time fails loud (Slice 5 risk #1).
+            // time fails loud.
         }
     }
 }
@@ -2187,7 +2187,7 @@ fn visit_expr_for_loop_locals(expr: &syn::Expr, state: &mut LoopBodyLocals) {
             visit_expr_for_loop_locals(&l.expr, state);
         }
         syn::Expr::Closure(_) => {
-            // Slice 5b.2 contract: skip closure body.  A closure
+            // Skip closure body.  A closure
             // captures enclosing locals via a synthetic capture list;
             // those captures do not flow through the loop's
             // straight-line control path, so bindings inside the
@@ -2379,7 +2379,7 @@ fn is_compound_assign(op: syn::BinOp) -> bool {
 /// such a name allocates it as a fresh `OpKind::Input` at its def
 /// block as it does today.
 ///
-/// The caller (Slice 5c.1+) is responsible for closing the back-edge
+/// The caller is responsible for closing the back-edge
 /// from `body_tail` to `header_entry` by fetching, per name in the
 /// returned `Vec<String>`, the body's current `ctx.local_value_ids[name]`
 /// and pushing those vids onto a `set_goto(body_tail, header_entry,
@@ -2463,11 +2463,11 @@ fn allocate_loop_header_phis(
 
 /// Walk `header.inputargs` and recover, in inputarg order, the local
 /// name attached to each Variable.  Used by `Expr::While` / `Expr::Loop`
-/// (Slice 5c.1+) to capture the FROZEN header-phi name list once the
+/// to capture the FROZEN header-phi name list once the
 /// loop header is fully populated — both by
 /// `allocate_loop_header_phis`'s eager phis and by any cond-driven
 /// cross-block lazy installs and carry-through Variables threaded in
-/// via `ensure_variable_at_block` (Slice 4.2).  The returned list
+/// via `ensure_variable_at_block`.  The returned list
 /// drives the back-edge close and `Expr::Continue` per-name link-arg
 /// threading; it must match `header.inputargs.len()`.
 ///
@@ -2918,7 +2918,7 @@ impl<'a> GraphBuildContext<'a> {
     /// (carry-through type widening: `Unknown` cells inherit the
     /// concrete sibling kind via `FrameState::union`'s wildcard rule).
     ///
-    /// Slice 4.2 production entry — used by `lower_if_expr`'s
+    /// Production entry — used by `lower_if_expr`'s
     /// `!want_phi && both_open` migration to rebind ctx after the
     /// merge block has been created via `create_block_from_framestate`
     /// + `set_goto_from_framestate`.  Loop-body scope cleanup (#134)
@@ -3262,7 +3262,7 @@ impl<'a> GraphBuildContext<'a> {
     /// instead of allocating a `Variable` first.  If slot `idx` does
     /// not yet exist on `graph`, a placeholder `Variable` is minted
     /// via [`FunctionGraph::bind_variable_at`] so the carrier always
-    /// holds a real handle (post-Slice 402 carrier flip).
+    /// holds a real handle.
     #[cfg(test)]
     fn bind_local_id_at(
         &mut self,
@@ -3312,7 +3312,7 @@ impl<'a> GraphBuildContext<'a> {
     /// pair.  Lets readers extract the backing `Variable` handle
     /// directly without re-projecting through `graph.must_variable_at`.
     /// `_graph` is retained for caller-side symmetry with the
-    /// pre-carrier-flip signature.
+    /// previous signature.
     fn local_var_of(
         &self,
         name: &str,
@@ -3368,7 +3368,7 @@ impl LocalBindingSnapshot {
     }
 }
 
-/// Lazy cross-block local installer — Slice 2 of the Cat 2.1 epic.
+/// Lazy cross-block local installer.
 ///
 /// Triggered from `Expr::Path`'s cross-block branch when the local
 /// `name` is bound in a block other than `current_block`.  Allocates a
@@ -3397,7 +3397,7 @@ impl LocalBindingSnapshot {
 /// boundary (eager) so blocks with no cross-block readers stay
 /// zero-arity.
 ///
-/// **Stage B2 (final)**: the Slice 2 conservative fence is gone — the
+/// **Stage B2 (final)**: the conservative fence is gone — the
 /// installer fires for every cross-block local read regardless of
 /// `current_block`'s op count.  The hazard the fence used to mask was
 /// (a) duplicate phi inputargs for the same name (closed by the
@@ -3504,7 +3504,7 @@ fn lazy_install_local_at_current_block_var(
     // recursive install.  Predecessor snapshots fold their observed
     // `graph_value_type` via the wildcard rule (`Unknown` carries
     // the concrete sibling through; concrete-vs-different-concrete
-    // widens to Unknown — Slice P2 retired the abort-on-disagreement
+    // widens to Unknown — the abort-on-disagreement path was retired,
     // path, types are downstream concerns per
     // `framestate.py:union`).
     struct PredSnap {
@@ -3547,9 +3547,9 @@ fn lazy_install_local_at_current_block_var(
         // observable across this merge.  Mirrors upstream's pattern
         // where flow-space `Variable` carries no type and rtyper
         // assigns `concretetype` post-flow (`framestate.py:union`
-        // never inspects types).  Pyre's prior NEW-DEVIATION here
+        // never inspects types).  Pyre's prior deviation here
         // failed the install on concrete disagreement; that gate
-        // was retired in slice P2 after a dry-run audit confirmed
+        // was retired after a dry-run audit confirmed
         // zero fixture / production conflicts (cargo lib 2557/0/3
         // + check.py 14/14×2 PASS).
         let observed_type = graph_value_type_var(graph, &snap_var).unwrap_or(ValueType::Unknown);
@@ -3664,12 +3664,12 @@ fn lazy_install_local_at_current_block_var(
         } else {
             snap.snap_var
         };
-        // Phase 2 type-validation: retired in slice P2.  Phase 1's
+        // Type-validation: retired.  Phase 1's
         // wildcard fold (`(Some(_), _) => Unknown` arm) widens
         // disagreeing concrete kinds to Unknown so the freshly-
         // installed inputarg's `ty` is the upper bound observable
         // across this merge.  Per-link resolved-type validation here
-        // was a NEW-DEVIATION duplicating that fold; the audit dry-
+        // was a deviation duplicating that fold; the audit dry-
         // run confirmed it never fired on production fixtures.
         // Types are downstream concerns (annotator + rtyper);
         // flowspace's job is the merge shape, not the kind
@@ -4114,7 +4114,7 @@ fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>) -> 
     // the destructured locals individually, but pyre's
     // `argname2index` lookup is positional and cannot multiplex one
     // slot to many names.  Emitting a `"_"` placeholder there would
-    // be a NEW-DEVIATION (the hint would shadow no real upstream
+    // be a deviation (the hint would shadow no real upstream
     // identifier and silently mis-bind any oopspec literal that
     // happens to spell `_`).  When such a pattern appears, refuse to
     // emit the argnames hint entirely so `decode_builtin_call` falls
@@ -4552,14 +4552,13 @@ fn lower_if_expr(
     let mut then_block = graph.create_block();
     let mut else_block = graph.create_block();
 
-    // Cat 2.1 Slice 2 / Stage A1: capture the locals frame as it
-    // was when `*block` closed via `set_branch` so a later
-    // cross-block read in the merge block can thread back
-    // through either arm's `Link.args` even when the arm itself
-    // rebinds nothing.  Stored on `Block.framestate` (per-block,
-    // captured at close time) — both exits of one set_branch
-    // share the same pre-branch snapshot, so the per-edge
-    // duplication of Slice 2 collapses into a single field.
+    // Capture the locals frame as it was when `*block` closed via
+    // `set_branch` so a later cross-block read in the merge block
+    // can thread back through either arm's `Link.args` even when the
+    // arm itself rebinds nothing.  Stored on `Block.framestate`
+    // (per-block, captured at close time) — both exits of one
+    // set_branch share the same pre-branch snapshot, so the per-edge
+    // duplication collapses into a single field.
     // RPython parity: `flowspace/flowcontext.py:38
     // SpamBlock.framestate`.
     let pre_branch_snapshot = ctx.getstate(graph, 0);
@@ -4585,7 +4584,7 @@ fn lower_if_expr(
         options,
         ctx,
     )?;
-    // Cat 2.1 Slice 2: snapshot then-arm's locals state BEFORE
+    // Snapshot then-arm's locals state BEFORE
     // else-arm lowering mutates `ctx.local_value_ids`.  Used
     // only if then-arm is open (will `set_goto` to merge); a
     // closed arm's snapshot is unused.
@@ -4639,9 +4638,9 @@ fn lower_if_expr(
     let both_open = then_open && else_open;
 
     // Pre-compute the unioned framestate when both arms are open — it is
-    // reused below for (a) Slice 4.2's migration path
+    // reused below for (a) the migration path
     // (`create_block_from_framestate` + `set_goto_from_framestate`) and
-    // (b) the legacy lean-merge-block ctx update (`None`-kill + lazy
+    // (b) the lean-merge-block ctx update (`None`-kill + lazy
     // phi-install).  Doing the union once avoids duplicating
     // `FrameState::union`'s O(slots) walk.
     let merged_when_both_open: Option<FrameState> = if both_open {
@@ -4654,7 +4653,7 @@ fn lower_if_expr(
         None
     };
 
-    // Slice 4.2: when both arms are open and there is no value-phi to
+    // When both arms are open and there is no value-phi to
     // thread (the result is `()` — a statement-shaped `if`), the merge
     // joins via `flowcontext.py:443 SpamBlock(newstate)` — a block whose
     // `inputargs` are every Variable in `merged.getvariables()` plus
@@ -4782,7 +4781,7 @@ fn lower_if_expr(
     //     post-merge reads of the name resolve to the new
     //     phi vid without re-driving the lazy installer.
     if migrate {
-        // Slice 4.2 migration path: `create_block_from_framestate`
+        // Migration path: `create_block_from_framestate`
         // already threaded every Variable in `merged.getvariables()`
         // into `merge_block.inputargs`, and `set_goto_from_framestate`
         // pushed the per-arm `getoutputargs` projection onto each
@@ -5556,16 +5555,12 @@ fn lower_expr(
             {
                 return Ok(Lowered::from_value_var(graph, &var));
             }
-            // Cat 2.1 Slice 2 / Stage A1: cross-block read of a
-            // single-segment local — try lazy install first (allocates
-            // an inputarg in `*block` + threads `Link.args` back to
-            // every predecessor whose closing site recorded a snapshot
-            // in `Block.framestate`).  Falls back to the legacy naked
-            // `OpKind::Input` emit when any predecessor lacks a
-            // recorded snapshot, so non-if/else closing sites that
-            // have not yet opted into Slice 2-6 wiring still build a
-            // graph (just one whose cross-block reads remain pinned
-            // by the cutover anchor for that flavour).
+            // Cross-block read of a single-segment local — try lazy
+            // install first (allocates an inputarg in `*block` +
+            // threads `Link.args` back to every predecessor whose
+            // closing site recorded a snapshot in `Block.framestate`).
+            // Falls back to the legacy naked `OpKind::Input` emit when
+            // any predecessor lacks a recorded snapshot.
             if path.path.segments.len() == 1
                 && path.qself.is_none()
                 && ctx
@@ -5999,7 +5994,7 @@ fn lower_expr(
             // desugar, `binary_op_name(&bin.op)` emits the literal
             // `"and"` / `"or"` opname which then trips
             // `flowspace_adapter.rs:422 normalize_binop_name`'s
-            // fail-loud arm, blocking Slice 10 of the rtyper cutover.
+            // fail-loud arm, blocking the rtyper cutover.
             if matches!(bin.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
                 let is_and = matches!(bin.op, syn::BinOp::And(_));
 
@@ -6037,7 +6032,7 @@ fn lower_expr(
                 // FAST` inside rhs writes to a local already-in-flight
                 // through the join.
                 //
-                // Body-input-retirement-epic.md Phase 2 brings the
+                // A future migration brings the
                 // same pattern to `Expr::If` / `Expr::Match` so all
                 // fork/join shapes use the consistent
                 // `[result, ...locals]` Link.args contract; the
@@ -6230,7 +6225,7 @@ fn lower_expr(
             // through `same_as` would propagate the operand's Ref
             // concretetype to the result and leak a kind-mismatched
             // `int_mod/ri>i` opname when the result is later used as
-            // an integer operand (Task #141 / Task #85 lock-in at
+            // an integer operand (lock-in at
             // `pyre-jit-trace/src/jitcode_runtime.rs:1340`).
             if matches!(source_ty.as_ref(), Some(ValueType::Ref(_)))
                 && result_ty == ValueType::Unsigned
@@ -6407,7 +6402,7 @@ fn lower_expr(
                 let saved_locals = LocalBindingSnapshot::capture(ctx);
                 bind_pattern_locals(&arm.pat, scrutinee_type_string.as_deref(), ctx);
                 let arm_lowered_result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
-                // Slice 4a: snapshot this arm's exit framestate BEFORE
+                // Snapshot this arm's exit framestate BEFORE
                 // `restore` wipes the per-arm rebinds.  The merge
                 // block's lazy installer uses
                 // `Block.framestate` on each predecessor to thread
@@ -6483,7 +6478,7 @@ fn lower_expr(
                     Vec::new()
                 };
                 graph.set_goto(*tail, merge, goto_args);
-                // Slice 4a: stamp the arm tail's framestate so the
+                // Stamp the arm tail's framestate so the
                 // merge block's lazy installer can thread `Link.args`
                 // back through this predecessor.  Mirrors the
                 // `Expr::If` then/else stamp at the equivalent
@@ -6607,8 +6602,8 @@ fn lower_expr(
                 // local to two different concrete kinds, so the
                 // `.expect(...)` documents the contract.
                 //
-                // PRE-EXISTING-ADAPTATION (no SpamBlock /
-                // recloseblock chain — fused into direct construction).
+                // TODO: no SpamBlock / recloseblock chain — fused into
+                // direct construction.
                 // Upstream's `mergeblock` (`flowcontext.py:425-463`)
                 // generalises by creating a fresh `SpamBlock(newstate)`
                 // (`:443`), marking the prior block dead via
@@ -6653,9 +6648,9 @@ fn lower_expr(
                 // Type unification across arms is annotator-side per
                 // upstream `framestate.py:union` (Hlvalue identity
                 // only).  The prior carry-through retag block was a
-                // NEW-DEVIATION dependent on the retired
+                // deviation dependent on the retired
                 // `FrameStateEntry::value_type` field; it has been
-                // removed in Path-Z Slice 2.3 (mirrors the If/else
+                // removed (mirrors the If/else
                 // counterpart).  Convergence: same as If/else —
                 // annotator/rtyper port handles type unification at
                 // its proper layer.
@@ -6758,13 +6753,13 @@ fn lower_expr(
             let header_entry = graph.create_block();
             let exit = graph.create_block();
 
-            // Slice 5c.1 eager phi pre-allocation.  Capture the
-            // pre-loop local-binding snapshot, close pre-loop's exit
-            // to the header, then statically pre-scan the body for
-            // its read/rebound names so `allocate_loop_header_phis`
-            // can install header phis BEFORE the body walk.  This
-            // replaces Slice 5a's lazy back-edge install (which blew
-            // up with cycle / arity / kind-mismatch errors), in line
+            // Eager phi pre-allocation.  Capture the pre-loop
+            // local-binding snapshot, close pre-loop's exit to the
+            // header, then statically pre-scan the body for its
+            // read/rebound names so `allocate_loop_header_phis` can
+            // install header phis BEFORE the body walk.  This replaces
+            // the earlier lazy back-edge install (which blew up with
+            // cycle / arity / kind-mismatch errors), in line
             // with RPython's work-list `mergeblock`+`union` fixpoint
             // semantics adapted for pyre's static AST.
             //
@@ -6883,7 +6878,7 @@ fn lower_expr(
             Ok(Lowered::no_value())
         }
         syn::Expr::Loop(l) => {
-            // Slice 5c.2 eager phi pre-allocation.  `Expr::Loop` has
+            // Eager phi pre-allocation.  `Expr::Loop` has
             // no cond block — `body_entry` IS the loop head and the
             // `continue` target.  Otherwise the shape mirrors
             // `Expr::While` (5c.1): pre-loop snapshot capture, body
@@ -6950,7 +6945,7 @@ fn lower_expr(
             // true arm binds the next item into the body and whose
             // false arm falls through (`rpython/flowspace/
             // flowcontext.py:782,787,1378`).  Pyre has NO `Iter` /
-            // `Next` op yet (Slice 6 port).  The shape below is
+            // `Next` op yet.  The shape below is
             // deliberately NOT claiming op-level equivalence with
             // upstream's iter/next — it emits a SINGLE `Unknown`
             // marker tagged `ForLoop` at the header that stands for
@@ -6959,7 +6954,7 @@ fn lower_expr(
             // `build_flow`-visible part of the construct is complete
             // even when the loop ops themselves are stubbed.
             //
-            // Slice 5c.3 eager phi pre-allocation: applied identically
+            // Eager phi pre-allocation: applied identically
             // to `Expr::Loop` / `Expr::While`.  The iterable is
             // single-evaluation (RPython `flowcontext.py:1378
             // GET_ITER` evaluates it once before the loop), so its
@@ -7131,18 +7126,18 @@ fn lower_expr(
             if let Some(frame) = ctx.loop_stack.last().cloned() {
                 if graph.block(*block).is_open() {
                     // `continue` jumps to the loop's continue_target —
-                    // for `while` / `loop` (Slice 5c.1+) this is the
+                    // for `while` / `loop` this is the
                     // header with its eager-phi inputargs.  Thread
                     // per-name args from `ctx.local_value_ids[name]`
                     // using the header's CURRENT inputarg name list
-                    // (Cat 2-2 Phase B α.1: recomputed on demand from
+                    // (recomputed on demand from
                     // `frame.continue_target.inputargs` at close time
                     // so any lazy install that added an inputarg
                     // during body walk is automatically threaded).
                     // RPython parity for the slot-by-slot mapping:
                     // `flowspace/framestate.py:92 getoutputargs`.
                     //
-                    // Audit Cat 2-1: stamp the continue source's
+                    // Stamp the continue source's
                     // framestate so the post-loop lazy installer can
                     // thread reads of pre-loop locals (NOT in
                     // `must_merge`) back through this back-edge —
@@ -7182,7 +7177,7 @@ fn lower_expr(
         // the enclosing flow.  Pyre currently lowers the whole
         // expression to a single `Unknown` placeholder for the
         // closure *value* and leaves the body uncompiled.  An earlier
-        // attempt to walk the body in-place was a NEW-DEVIATION (it
+        // attempt to walk the body in-place was a deviation (it
         // treated the closure as a synchronous block, which broke
         // callers that pass the closure itself as a function-typed
         // argument — e.g. `|_| {}` produced no value for
@@ -7222,7 +7217,7 @@ fn lower_expr(
             // `flowspace/flowcontext.py:1163`) always pushes a fresh
             // tuple object — the result is a NEW value distinct from
             // any individual element.  Pyre has no `NewTuple` op yet
-            // (Slice 5 port), so the construct lowers to a single
+            // (deferred), so the construct lowers to a single
             // `Unknown` marker tagged `Tuple` that stands in for the
             // whole tuple-builder; callers that read the result get a
             // well-formed Variable but coverage audits still flag the
@@ -8490,7 +8485,7 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                 // Convergence path: emit a metadata-only walk over
                 // `pyre/pyre-object/src/*.rs` that registers
                 // `fn_return_types` without subjecting raw-pointer
-                // `unsafe fn` bodies to graph analysis (multi-session;
+                // `unsafe fn` bodies to graph analysis (deferred;
                 // the shortlist retires once the metadata-only walk
                 // lands).
                 if let Some(joined_str) = joined.strip_prefix("pyre_object::") {
@@ -9562,7 +9557,7 @@ fn cast_builtin_name(
         // (rbuiltin.py:551-557) — `genop('cast_int_to_ptr', [v_input],
         //   resulttype=hop.r_result.lowleveltype)`.
         //
-        // PRE-EXISTING-ADAPTATION (Task #345): the upstream surface is
+        // TODO: the upstream surface is
         // a 2-arg call `simple_call(lltype.cast_int_to_ptr, PTRTYPE,
         // oddint)` where `PTRTYPE` is a constant Ptr type marker
         // (`ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and
@@ -11037,7 +11032,7 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
             // minimum-viable substitute that keeps method-call sites
             // type-coherent; full MAKE_FUNCTION parity requires
             // routing each closure through a synthetic FunctionGraph
-            // + `PyreCallRegistry` entry (multi-session epic).
+            // + `PyreCallRegistry` entry (deferred).
             if matches!(
                 method.as_str(),
                 "with" | "with_borrow" | "with_borrow_mut" | "unwrap_or_else"
@@ -11855,7 +11850,7 @@ mod tests {
 
     #[test]
     fn match_arm_rebind_threads_phi_inputarg_through_lazy_installer() {
-        // Slice 4 / Stage D parity test: a pre-match local rebound on
+        // Parity test: a pre-match local rebound on
         // every match arm must resolve to a merge-block phi inputarg
         // when read after the match, with both predecessor links
         // carrying the arm-specific rebind value.  RPython parity:
@@ -11865,7 +11860,7 @@ mod tests {
         // currentstate.getoutputargs(newstate)` produces the
         // predecessor-side `Link.args`.
         //
-        // Without Slice 4a's per-arm `Block.framestate` stamp, the
+        // Without the per-arm `Block.framestate` stamp, the
         // lazy installer's predecessor walk would find no snapshot
         // on the arm tails and fall back to a naked `OpKind::Input`
         // emit — the resulting graph would still type-check but the
@@ -11935,7 +11930,7 @@ mod tests {
 
     #[test]
     fn while_loop_back_edge_threads_modified_local_through_header_phi() {
-        // Slice 5a parity test: a while loop whose body rebinds a
+        // Parity test: a while loop whose body rebinds a
         // pre-loop local must produce a header inputarg phi for that
         // local with link args from BOTH the pre-loop block (forward
         // edge, supplying the pre-loop value) AND the body tail
@@ -13516,11 +13511,11 @@ mod tests {
         );
     }
 
-    // ── FrameState — Cat 2.1 cross-block locals threading scaffold ──
+    // ── FrameState — cross-block locals threading scaffold ──
     //
-    // Slice 1: data-type + pure-function tests only.  The
-    // capture/install methods are exercised through Slices 2-6 when
-    // wired into the lowering path; here we pin the storage-order
+    // Data-type + pure-function tests only.  The capture/install
+    // methods are exercised through the lowering path; here we pin
+    // the storage-order
     // contract (Stage A2: first-bind positional, mirroring RPython
     // `co_varnames` slot order) + the rebind detection contract that
     // later slices depend on.
@@ -13742,7 +13737,7 @@ mod tests {
         assert!(merged.entries[1].is_none(), "padded slot stays as None");
     }
 
-    // Path-Z Slice 2.3 retired the `UnionError::TypeMismatch`
+    // The `UnionError::TypeMismatch` variant was retired:
     // variant: per-slot type unification belongs on the annotator side
     // (`Variable.annotation`, `framestate.py:union` is Hlvalue-identity
     // only).  Two prior tests exercising that failure surface
@@ -13754,7 +13749,7 @@ mod tests {
     fn frame_state_union_carries_through_same_vid() {
         // RPython `flowspace/framestate.py:108-109 if w1 == w2: return
         // w1`: matching Hlvalue identity carries through unchanged.
-        // Type unification is annotator-side post-Path-Z-Slice-2.3, so
+        // Type unification is annotator-side, so
         // this fixture only verifies the vid-identity carry-through;
         // any per-arm type metadata flows on `Variable.concretetype`
         // at the rtyper layer.
@@ -14001,7 +13996,7 @@ mod tests {
 
     #[test]
     fn loop_body_locals_excludes_closure_captures() {
-        // Slice 5b.2 contract: the static pre-scan reaches every
+        // The static pre-scan reaches every
         // straight-line statement in the loop body (including nested
         // blocks, `if` / `match` / nested loops, and `unsafe` blocks)
         // but does NOT descend into `Expr::Closure` bodies.  A name
@@ -14048,7 +14043,7 @@ mod tests {
 
     #[test]
     fn allocate_loop_header_phis_eager_install_and_pre_loop_link_args() {
-        // Slice 5b.3 contract: the eager allocator must (a) emit one
+        // The eager allocator must (a) emit one
         // `OpKind::Input` per surviving name at `header_entry` and
         // append its phi vid to `header_entry.inputargs`, (b) push the
         // pre-loop vid onto `pre_loop_block.exits[0].args` so the
@@ -14068,7 +14063,7 @@ mod tests {
 
         // Seed pre-loop bindings for `x` and `y` by emitting
         // `OpKind::Input` at the start block; this approximates the
-        // pre-loop state Slice 5c.1 will hand to the allocator.
+        // pre-loop state the allocator will receive.
         let pre_x = graph
             .push_op_var(
                 pre_loop_block,
@@ -14089,8 +14084,8 @@ mod tests {
                 true,
             )
             .expect("OpKind::Input must produce a Variable");
-        // Close pre-loop block with the empty-args goto Slice 5c.1
-        // installs before calling the allocator.
+        // Close pre-loop block with the empty-args goto installed
+        // before calling the allocator.
         graph.set_goto(pre_loop_block, header_entry, vec![]);
 
         let empty_registry = StructFieldRegistry::default();
@@ -14112,7 +14107,7 @@ mod tests {
 
         // `pre_loop_snapshot` is produced by ctx in the real lowering;
         // mirror that here so the allocator walks the same first-bind
-        // positional order Slice 5c.1 will feed it.
+        // positional order the allocator will see.
         let pre_loop_snapshot = ctx.getstate(&graph, 0);
         assert_eq!(pre_loop_snapshot.entries.len(), 2);
 
@@ -14183,7 +14178,7 @@ mod tests {
         assert_eq!(current_y_slot, pre_y_slot);
     }
 
-    /// Slice 5d nested-pattern coverage #1: nested while loops where
+    /// Nested-pattern coverage #1: nested while loops where
     /// the inner loop's `continue` re-enters the inner header.  The
     /// outer header's phi for the outer counter must remain
     /// independent of the inner control flow — every link landing on
@@ -14550,7 +14545,7 @@ mod tests {
         );
     }
 
-    /// Slice 5d nested-pattern coverage #2: `break` from a deeply
+    /// Nested-pattern coverage #2: `break` from a deeply
     /// nested `if` arm whose framestate has been mutated by a sibling
     /// arm's `LocalBindingSnapshot::restore`.  The lowering must close
     /// the break source's block with a goto to the loop's exit and the
@@ -14603,7 +14598,7 @@ mod tests {
         }
     }
 
-    /// Slice 5d nested-pattern coverage #3 (PyPy-parity revision):
+    /// Nested-pattern coverage #3 (PyPy-parity revision):
     /// a `loop` with NO `break` whose body contains only side-effect-
     /// free ops.  After `prune_dead_phis` (RPython
     /// `transform_dead_op_vars`, `simplify.py:422-524`) DCEs the
@@ -14627,7 +14622,7 @@ mod tests {
         let _program = build_semantic_program(&parsed).expect("source must lower");
     }
 
-    /// Slice 5d nested-pattern coverage #4: a `loop` where the only
+    /// Nested-pattern coverage #4: a `loop` where the only
     /// exit is `break` — body_tail is closed by the break (or the
     /// `is_open` check skips an empty back-edge).  Exit is reachable
     /// post-loop.  Smoke test for the back-edge `is_open` guard at
@@ -15703,7 +15698,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // mergeblock helper (Slice 4.1 scaffold).
+    // mergeblock helper scaffold.
     //
     // Tests cover the three control-flow arms of
     // `flowspace/flowcontext.py:424-463 mergeblock`:

@@ -10,7 +10,7 @@
 //! the version tag change less often.
 //! ```
 //!
-//! Phase 5b shipping surface: the `ModuleDictStrategy` struct itself
+//! The `ModuleDictStrategy` struct itself
 //! plus the supporting `VersionTag` / `ModuleDictStorage` types.
 //! Bodies are stubbed against an in-memory `Vec<(String,
 //! PyObjectRef)>` because the cell-indirection layer
@@ -907,7 +907,7 @@ impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
     /// still allocates the destination through `w_dict_new()` (which
     /// installs `OBJECT_DICT_STRATEGY`) — line-by-line parity for the
     /// destination strategy lands when typed strategy storage is in
-    /// place (Task #147).
+    /// place.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let new_dict = crate::dictmultiobject::w_dict_new();
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {

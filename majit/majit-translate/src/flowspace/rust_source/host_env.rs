@@ -233,7 +233,7 @@ static HOST_CLASS_MINTS: LazyLock<Mutex<HashMap<String, HostObject>>> =
 /// coverage — a miss must keep falling through to the raw
 /// `getattr` op until mint-on-demand is retired).
 ///
-/// PRE-EXISTING-ADAPTATION: this helper exists *only* because the
+/// TODO: this helper exists *only* because the
 /// mint-on-demand layer is a stand-in for missing walker coverage;
 /// once mint is retired, every Constant<HostObject::Class> reaching
 /// the constfold path will be walker-registered and the helper is
@@ -413,7 +413,7 @@ pub(super) fn register_module_global(module_id: ModuleId, name: &str, value: Con
 
 // Walker-built pygraph registry keyed on `HostObject` identity.
 //
-// **PRE-EXISTING-ADAPTATION (Position-2 adapter, walker-pass-only
+// **TODO (Position-2 adapter, walker-pass-only
 // transient).** Upstream `TranslationContext._prebuilt_graphs` is a
 // context-owned `RefCell<HashMap<…>>` (`translator.py:50`), so the
 // regular path is `build_flow(func)` followed by
@@ -444,7 +444,7 @@ pub(super) fn register_module_global(module_id: ModuleId, name: &str, value: Con
 //
 // Full retirement of the thread-local requires Translator-binding
 // through the walker entry surface (so the walker writes directly
-// into `ctx._walker_pygraphs`); that is the multi-session work
+// into `ctx._walker_pygraphs`); that is the work
 // captured in plan
 // `~/.claude/plans/annotator-monomorphization-tier1-abstract-lake.md`
 // "Strict-parity Point 1: HOST_RUST_PYGRAPHS as Position-2 adapter".

@@ -45,7 +45,7 @@ impl crate::lltype::GcType for W_StrObject {
 
 /// Allocate a new W_StrObject on the heap.
 ///
-/// Phase 1: uses `Box::leak` for simplicity (objects are never freed).
+/// Uses `Box::leak` for simplicity (objects are never freed).
 /// The inner `String` is also `Box::into_raw`'d so it can be recovered.
 pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = crate::lltype::malloc_raw(s.to_string());

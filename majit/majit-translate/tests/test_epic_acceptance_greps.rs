@@ -1,15 +1,15 @@
-//! Epic acceptance invariants — the "what this epic must NOT introduce"
+//! Acceptance invariants — the "what must NOT be introduced"
 //! side of the parity contract in `docs/plans/lucky-growing-puzzle.md`.
 //!
 //! The plan's verification protocol lists three grep invariants the
-//! codebase must uphold after the epic lands. Each invariant maps to a
+//! codebase must uphold. Each invariant maps to a
 //! specific RPython structural decision that pyre must NOT diverge from:
 //!
 //! | Invariant | RPython anchor | Why |
 //! |---|---|---|
-//! | `HashMap<Instruction, ...>` = 0 | `rpython/jit/codewriter/call.py:87 self.jitcodes = {}` | upstream keys jitcodes by `graph`, not by opcode variant. A variant-keyed map in pyre would mean the codewriter lowers per-opcode-arm instead of per-graph — that is the CPython-3.13-bytecode coupling the epic removes. |
-//! | `_may_raise \| TryOp \| OpKind::Try` = 0 | `rpython/jit/codewriter/jtransform.py:456 rewrite_op_direct_call` + `rpython/translator/exceptiontransform.py` | upstream routes raising calls through the existing `residual_call_*` opname family and lowers `?`/`PyResult` to exceptional successor edges on the existing `Terminator`. A fresh opname family would be a NEW-DEVIATION. |
-//! | `compile_pyre_interpreter` = 0 | (pyre-specific legacy name) | Phase E replaces the pyre-specific opcode-walking entry point with `CodeWriter::make_jitcodes`. A lingering `compile_pyre_interpreter` definition means the legacy path survives in parallel. |
+//! | `HashMap<Instruction, ...>` = 0 | `rpython/jit/codewriter/call.py:87 self.jitcodes = {}` | upstream keys jitcodes by `graph`, not by opcode variant. A variant-keyed map in pyre would mean the codewriter lowers per-opcode-arm instead of per-graph — that is the CPython-3.13-bytecode coupling that was removed. |
+//! | `_may_raise \| TryOp \| OpKind::Try` = 0 | `rpython/jit/codewriter/jtransform.py:456 rewrite_op_direct_call` + `rpython/translator/exceptiontransform.py` | upstream routes raising calls through the existing `residual_call_*` opname family and lowers `?`/`PyResult` to exceptional successor edges on the existing `Terminator`. A fresh opname family would be a deviation. |
+//! | `compile_pyre_interpreter` = 0 | (pyre-specific legacy name) | The pyre-specific opcode-walking entry point is replaced with `CodeWriter::make_jitcodes`. A lingering `compile_pyre_interpreter` definition means the legacy path survives in parallel. |
 //!
 //! The tests walk `majit-translate/src/` and strip line comments before
 //! matching; a mention inside `//` / `//!` is acceptable (typically this
@@ -96,7 +96,7 @@ fn no_variant_keyed_jitcode_map() {
     assert!(
         hits.is_empty(),
         "Plan acceptance violated: a variant-keyed Instruction → ... map \
-         reintroduces the CPython-3.13-bytecode coupling that Phase E \
+         reintroduces the CPython-3.13-bytecode coupling that was \
          removed. Use `HashMap<CallPath, ...>` instead — see \
          `rpython/jit/codewriter/call.py:87 self.jitcodes = {{}}`."
     );
@@ -122,13 +122,13 @@ fn no_new_opname_family_for_exceptions() {
          (`rpython/jit/codewriter/jtransform.py:rewrite_op_direct_call`) \
          and `?`/`PyResult` must lower to exceptional successor edges on \
          the existing `Terminator` (`rpython/translator/exceptiontransform.py`). \
-         A fresh `_may_raise` / `OpKind::Try` / `TryOp` is NEW-DEVIATION \
+         A fresh `_may_raise` / `OpKind::Try` / `TryOp` is a deviation \
          and must be removed."
     );
 }
 
 /// Plan verification protocol item: the legacy `compile_pyre_interpreter`
-/// entry point must not re-emerge after Phase E. Phase E replaces it with
+/// entry point must not re-emerge. It is replaced with
 /// `CodeWriter::make_jitcodes` (upstream `codewriter.py:74`). A surviving
 /// definition means the pyre-bytecode-walking path lives in parallel with
 /// the graph-keyed one.
@@ -140,7 +140,7 @@ fn no_legacy_compile_pyre_interpreter() {
     assert!(
         hits.is_empty(),
         "Plan acceptance violated: `compile_pyre_interpreter` resurfaced. \
-         Phase E replaces it with `CodeWriter::make_jitcodes` \
+         It is replaced with `CodeWriter::make_jitcodes` \
          (`rpython/jit/codewriter/codewriter.py:74`). Remove the legacy \
          definition."
     );

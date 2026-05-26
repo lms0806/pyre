@@ -2,11 +2,10 @@
 //!
 //! RPython basis: `rpython/flowspace/argument.py` (127 LOC).
 //!
-//! Phase 2 F2.2 landed `Signature` first because
-//! `bytecode.HostCode::signature` required it. Phase 3 F3.2 (this
-//! extension) adds `CallSpec`, `_rawshape`, `flatten`, `as_list`, and
-//! `fromshape`. Order matches upstream `argument.py`: `Signature`
-//! first, then `CallSpec`.
+//! `Signature` landed first because `bytecode.HostCode::signature`
+//! required it. This extension adds `CallSpec`, `_rawshape`, `flatten`,
+//! `as_list`, and `fromshape`. Order matches upstream `argument.py`:
+//! `Signature` first, then `CallSpec`.
 
 /// Descriptor for a function's formal parameter list.
 ///

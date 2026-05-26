@@ -9,7 +9,7 @@ use crate::state::PyreJitState;
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's green-key is fixed `(W_CodeObject*, pc)`
+/// TODO: pyre's green-key is fixed `(W_CodeObject*, pc)`
 /// and reduced to a single `u64` identityhash + Signed cast over the
 /// two-tuple. RPython's `hash_whatever(TYPE, x)` (`warmstate.py:115`)
 /// hashes individual primitives from a structural tuple of green boxes

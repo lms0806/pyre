@@ -179,7 +179,7 @@ pub struct Optimizer {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// Phase 1 emit ops carried into Phase 2's lookup surface (Slice 0.6).
+    /// Phase 1 emit ops carried into Phase 2's lookup surface (6).
     ///
     /// Mirror of `OptContext.phase1_emit_ops`; populated at the end of
     /// `optimize_with_constants_and_inputs_at` from `ctx.new_operations`,
@@ -559,7 +559,7 @@ impl Optimizer {
             VirtualStateInfo::Unknown(_tp) => {
                 // virtualstate.py:655-683 make_inputargs parity: each
                 // NotVirtualStateInfo leaf is realized as an InputArg* whose
-                // `Box.type` is intrinsic. Slice 0.5: type lookup now resolves
+                // `Box.type` is intrinsic. 5: type lookup now resolves
                 // through the variant tag of `opref` (typed via
                 // `OpRef::input_arg_typed` / `op_typed` upstream) at priority
                 // 0 of `opref_type`; the side-table seed is dead.
@@ -755,7 +755,7 @@ impl Optimizer {
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
-            // `value_types` write needed (Slice 0.5).
+            // `value_types` write needed (5).
             ctx.new_operations.push(std::rc::Rc::new(op));
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
@@ -1980,7 +1980,7 @@ impl Optimizer {
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
-        // 3. (removed) Slice 0.5: transformed trace ops carry `op.type_`
+        // 3. (removed) 5: transformed trace ops carry `op.type_`
         //    intrinsically (resoperation.py:1693 parity); the pipeline
         //    emits each op into `new_operations` before moving to the
         //    next, so `OptContext::op_at` resolves the type of any
@@ -2114,7 +2114,7 @@ impl Optimizer {
         // is restored at the end of the block.
         let imported_loop_state_taken = self.imported_loop_state.take();
         if let Some(ref exported_state) = imported_loop_state_taken {
-            // Slice 0.5: post-Slice-P5 every `end_arg` OpRef from the
+            // 5: post-Slice-P5 every `end_arg` OpRef from the
             // exported state is typed via `OpRef::input_arg_typed` /
             // `op_typed`, so its variant tag carries Box.type and the
             // side-table refresh is dead.
@@ -3514,7 +3514,7 @@ impl Optimizer {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION: aggregate per-pass `export_arg_int_bounds`
+    /// TODO: aggregate per-pass `export_arg_int_bounds`
     /// HashMaps for hand-off to the next peeling iteration.  RPython
     /// preserves `IntBound` across iterations through Box-stable
     /// `OptInfo.IntBound` forwarding; pyre's flat-OpRef rebuilds
@@ -3579,7 +3579,7 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) {
-        // Slice 0.5: Box.type lives intrinsically on `OpRef.ty()` (variant
+        // 5: Box.type lives intrinsically on `OpRef.ty()` (variant
         // tag, history.py:220 + resoperation.py:1693 parity) and on
         // `Op.type_` once the op lands in `new_operations`, so the
         // side-table refresh that `register_value_type` used to perform
@@ -3665,8 +3665,8 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    // Slice 0.5: replace's new op carries `Op.type_` from
-                    // construction (Slice 0.1) and a typed `op.pos` so
+                    // 5: replace's new op carries `Op.type_` from
+                    // construction (1) and a typed `op.pos` so
                     // downstream `op_at` lookups resolve it directly
                     // without a side-table refresh.
                     current_op = op;
@@ -3688,7 +3688,7 @@ impl Optimizer {
                         current_op.opcode,
                         op.opcode,
                     );
-                    // Slice 0.5: Restart's new op carries `Op.type_` from
+                    // 5: Restart's new op carries `Op.type_` from
                     // construction; no side-table refresh needed.
                     self.propagate_from_pass_range(0, end_pass, &op, ctx);
                     // Run any postprocess callbacks accumulated in the outer
@@ -3857,7 +3857,7 @@ impl Optimizer {
                 op.pos.get(),
                 op.getarglist()
             );
-            // Slice 0.5: returns_bool ops are constructed Int-typed
+            // 5: returns_bool ops are constructed Int-typed
             // (asserted above) and `Op.type_ == Int` already provides the
             // type to `opref_type` via the priority-2 op_at fast path.
             let op_pos_box = ctx
@@ -5630,7 +5630,7 @@ mod tests {
 
     #[test]
     fn test_phase_carry_holds_emit_only() {
-        // Slice 0.6: phase1_emit_ops is rebuilt at end-of-phase from
+        // 6: phase1_emit_ops is rebuilt at end-of-phase from
         // `ctx.new_operations` filtered by non-NONE pos and non-Void type
         // (resoperation.py:1693 parity). Phase 1 inputarg slot OpRefs are
         // resolved from Phase 2 through `OptContext::inputarg_type`
@@ -5664,7 +5664,7 @@ mod tests {
 
     #[test]
     fn test_inputarg_type_resolves_phase1_slots_from_phase2_context() {
-        // Slice 0.6 step 1: from a Phase-2-like context (`inputarg_base > 0`)
+        // 6 step 1: from a Phase-2-like context (`inputarg_base > 0`)
         // `OptContext::inputarg_type` must resolve low OpRefs in
         // `[0, num_inputs)` as Phase 1 inputarg slot lookups against the
         // shared `inputargs` list (history.py:220 parity for `box.type`

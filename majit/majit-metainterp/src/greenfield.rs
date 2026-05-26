@@ -23,7 +23,7 @@
 ///                                    for GTYPE, fieldname in self.green_fields]
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION: pyre has no `cpu` / `lltype` GTYPE handle,
+/// TODO: pyre has no `cpu` / `lltype` GTYPE handle,
 /// so `green_fields` carries `(gtype_name: String, fieldname: String)`
 /// and `green_field_descrs` carries the host-resolved descriptor
 /// indices.  `jitdriver_sd` is omitted on the metainterp side because

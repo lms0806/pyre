@@ -52,7 +52,7 @@ use crate::pyframe::PyFrame;
 /// pointers are pushed onto `majit_gc::shadow_stack` rather than a local
 /// `Vec` — this matches RPython's `framework.py` shadow-stack
 /// (rpython/memory/gctransform/shadowstack.py:281) and lets the GC's
-/// Phase 1b root-walker forward both pointers in place when a minor
+/// root-walker forward both pointers in place when a minor
 /// collection runs while the guard is on the stack.
 pub struct CurrentFrameGuard {
     save_point: usize,
@@ -187,8 +187,8 @@ unsafe fn walk_raw_function_roots(
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     CURRENT_FRAME.with(|cf| {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
-        // nursery-allocated `PyFrame` (Phase 2.3 옵션 B
-        // `emit_new_pyframe_inline_self_recursive`) the visitor copies
+        // nursery-allocated `PyFrame`
+        // (`emit_new_pyframe_inline_self_recursive`) the visitor copies
         // it to the survivor space and rewrites the cell to the new
         // address. For `std::alloc`-backed frames the visitor's
         // `is_nursery_object_start` guard short-circuits, leaving the
@@ -203,7 +203,7 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         visitor(unsafe { &mut *cf_slot_ptr });
         // Saved previous-frame / previous-ec-topframe roots now live on
         // `majit_gc::shadow_stack` (pushed by `push_current_frame_previous_root`)
-        // and are forwarded by the GC's Phase 1b walker; no extra visit here.
+        // and are forwarded by the GC's root walker; no extra visit here.
 
         let mut frame = cf.get();
         if !frame.is_null() {
@@ -234,7 +234,7 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // standard tracer ALSO covers their gc_ptr_offsets when it
             // reaches the survivor copy; visiting the locals array
             // items here from the original nursery payload is safe
-            // because Phase 1e runs before any internal-slot
+            // because root visiting runs before any internal-slot
             // forwarding (the original payload is still intact). We
             // intentionally do NOT call `majit_gc::gc_owns_object`
             // here to gate this branch — that hook re-enters
@@ -2203,7 +2203,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── CopyFreeVars ──
     // CPython 3.13: copy n freevars from function closure to frame cell slots
     fn copy_free_vars(&mut self, _count: usize) -> Result<(), PyError> {
-        // Phase 1: no-op — closure passing needs call-site integration
+        // No-op — closure passing needs call-site integration
         // The closure tuple is on the Function, but COPY_FREE_VARS
         // runs inside the callee frame which doesn't have a reference to
         // the function object. Need to pass closure during frame creation.
@@ -3252,7 +3252,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── StoreSlice (a[b:c] = d) ──
     fn store_slice(&mut self) -> Result<(), PyError> {
-        // Phase 1 stub — rarely used in hot loops
+        // Stub — rarely used in hot loops
         Err(PyError::type_error("STORE_SLICE not yet implemented"))
     }
 
@@ -4476,7 +4476,7 @@ result = f.x + g.x";
         }
     }
 
-    // ── Phase 1 opcode tests ──
+    // ── Opcode tests ──
 
     #[test]
     fn test_contains_op_in() {
@@ -4547,7 +4547,7 @@ result = f.x + g.x";
         let source = "x = [1, 2, 3]\ndel x[0]\nresult = x[0]";
         let (result, _) = run_exec_frame(source);
         // After del x[0], x[0] becomes PY_NULL; accessing may succeed or fail
-        // Phase 1: just check it doesn't crash during del
+        // Just check it doesn't crash during del
         let _ = result;
     }
 
@@ -4841,7 +4841,7 @@ except ValueError:
 ";
         let (res, _) = run_exec_frame(source);
         // Should fail because ZeroDivisionError != ValueError
-        // But Phase 1: bare except catches all, specific except may not work yet
+        // Bare except catches all, specific except may not work yet
         let _ = res; // Don't assert — depends on CHECK_EXC_MATCH impl
     }
 

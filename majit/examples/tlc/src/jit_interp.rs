@@ -131,7 +131,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     // `(live_i, live_r, live_f)` triple into `staticdata.liveness_info`
     // before the first `jit_merge_point!()` so that
     // `MIFrame::get_list_of_active_boxes` can decode the
-    // macro-emitted `live/<offset>` placeholders (Task #89 orth-8).
+    // macro-emitted `live/<offset>` placeholders.
     {
         use majit_metainterp::JitState as _;
         state

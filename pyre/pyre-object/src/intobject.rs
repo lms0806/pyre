@@ -1,7 +1,7 @@
 //! W_IntObject — Python `int` type backed by i64.
 //!
-//! Phase 1 uses a fixed i64 representation. BigInt support (like PyPy's
-//! `W_LongObject`) will be added in Phase 4.
+//! Uses a fixed i64 representation. BigInt support (like PyPy's
+//! `W_LongObject`) will be added later.
 
 use std::sync::LazyLock;
 
@@ -78,11 +78,11 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// (`instantiate(W_IntObject)` upstream).
 ///
 /// The allocation path goes through [`crate::lltype::malloc_typed`]
-/// (Task #145 Step 2), which carries `W_INT_GC_TYPE_ID` +
+/// which carries `W_INT_GC_TYPE_ID` +
 /// `W_INT_OBJECT_SIZE` via the [`crate::lltype::GcType`] impl above —
 /// the Rust analog of `gct_fv_gc_malloc`'s compile-time `c_type_id`
 /// / `c_size` (`rpython/memory/gctransform/framework.py:807-811`).
-/// Phase 1: `malloc_typed` is `Box::into_raw`; future GC integration
+/// `malloc_typed` is currently `Box::into_raw`; future GC integration
 /// replaces only that body, this constructor stays unchanged.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {

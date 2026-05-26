@@ -826,7 +826,7 @@ impl Assembler {
     /// The `live/<offset>` 2-byte slot in a JitCode is patched by the
     /// caller via `JitCodeBuilder::patch_live_offset` once the offset is
     /// known.  Used by the deferred-patch path in
-    /// `JitCodeBuilder::finalize_liveness` (Phase 4 / Epic B.3-B.4) where
+    /// `JitCodeBuilder::finalize_liveness` where
     /// the lowerer collects per-marker triples first, then registers and
     /// patches them in a single post-emission pass.
     pub fn _register_liveness_offset(
@@ -1196,7 +1196,7 @@ impl Assembler {
             // register index (same byte shape as `emit_reg`). Pyre's model
             // forces constants through a standalone materialization op since
             // operands are always `Variable`; lowering that limitation is
-            // multi-session (requires op-level constant operands). Until
+            // deferred (requires op-level constant operands). Until
             // then, emit as `int_copy/i>i` — canonical register-to-register
             // move — since `emit_const_i` already returns a pool-region
             // register index (`num_regs_i + pool_pos`) and both src and dst
@@ -1859,7 +1859,7 @@ impl Assembler {
     /// verbatim into the serialized pipeline.insns blob the runtime
     /// decoder reads.
     ///
-    /// PRE-EXISTING-ADAPTATION (byte-stability vs. dynamic-range
+    /// TODO: byte-stability vs. dynamic-range
     /// trade-off).  Upstream `assembler.py:221 setdefault(key,
     /// len(self.insns))` allocates densely from 0 — every emitted key
     /// consumes one of the full 256 byte slots, no reservation.  Pyre

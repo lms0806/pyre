@@ -13818,7 +13818,7 @@ fn exec_code_module(
         // app-level `SourceFileLoader` + `spec_from_file_location`
         // helpers.  Pyre lacks the importlib bootstrap machinery
         // (`SourceFileLoader`, `ModuleSpec`, `spec_from_file_location`
-        // are not yet ported), so as a PRE-EXISTING-ADAPTATION we seed
+        // are not yet ported), so as a TODO we seed
         // `__loader__`/`__spec__` with `None` only when missing —
         // matching PyPy's `if not loader / if not spec` guards
         // (_bootstrap_external.py:1732, 1739).  When the importlib
@@ -13889,7 +13889,7 @@ fn load_source_module(
     //
     // `__package__` is set by PyPy `interp_import._prepare_module`
     // (`pypy/module/imp/interp_import.py`); pyre has no `_prepare_module`
-    // yet, so we still seed it here as a PRE-EXISTING-ADAPTATION until
+    // yet, so we still seed it here as a TODO until
     // the prepare-module path is ported.
     let pkg = if let Some(dot) = modulename.rfind('.') {
         &modulename[..dot]
@@ -13912,7 +13912,7 @@ fn load_source_module(
     // W_ModuleDictObject identity.  Forward writes via the module dict
     // fan out to the DictStorage; back-mirror updates the strategy
     // storage in step — the frame-side `*mut DictStorage` carrier
-    // stays valid until Phase 5e migrates `PyFrame.w_globals` to
+    // stays valid until `PyFrame.w_globals` migrates to
     // `PyObjectRef`.  The simpler builtin module loader path (no
     // frame globals dependency) already uses `W_ModuleDictObject`.
     let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);

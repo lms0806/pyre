@@ -9,7 +9,7 @@
 //! counterpart duplicates CallSpec's field shape over
 //! [`SomeValue`] instead of extending CallSpec directly.
 //!
-//! ## PRE-EXISTING-ADAPTATION: CallSpec ↔ ArgumentsForTranslation
+//! ## TODO: CallSpec ↔ ArgumentsForTranslation
 //!
 //! Upstream Python:
 //! ```python

@@ -345,7 +345,7 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 /// performs the type dispatch inline and delegates to one of the
 /// `handle_fail_*` helpers below.
 ///
-/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre does not yet carry
+/// **TODO**: pyre does not yet carry
 /// `FailDescr::handle_fail` as a virtual method because descrs are
 /// stored as raw `usize` sentinels rather than `Box<dyn FailDescr>`,
 /// and `metainterp_sd` / `jitdriver_sd` are not plumbed through
@@ -585,7 +585,7 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 ///         resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
 ///     assert 0, "unreachable"
 ///
-/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre's CA slow path runs
+/// **TODO**: pyre's CA slow path runs
 /// the bridge-tracer hook (`CA_BRIDGE_FN` → `jit_ca_handle_guard_failure`
 /// in pyre-jit/src/call_jit.rs:2425) and then the blackhole hook
 /// (`CA_BLACKHOLE_FN`) sequentially, instead of choosing one via the
@@ -806,7 +806,7 @@ mod tests {
     fn test_helper_trampoline_does_not_execute_bridge() {
         // compile.py:701 parity: helper does NOT re-enter bridges.
         // Bridges are executed via patched guard jumps, not the helper.
-        // Session 5f: `bridge_addr` moved off the descr to the backend
+        // `bridge_addr` moved off the descr to the backend
         // side-table; the helper-trampoline path never queries that
         // table, so this test simply confirms the trampoline returns
         // the blackhole result (or 0) regardless of bridge presence.

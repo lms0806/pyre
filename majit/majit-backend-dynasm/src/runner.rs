@@ -220,7 +220,7 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
-/// Host-side old-gen allocation trampoline (Task #141). Used by
+/// Host-side old-gen allocation trampoline. Used by
 /// pyre-object allocators (`w_int_new`, `w_float_new`) whose
 /// callers cannot register the returned pointer as a GC root before
 /// subsequent allocations. MiniMark's old-gen is mark-sweep
@@ -252,7 +252,7 @@ fn dynasm_collect_full() {
     });
 }
 
-/// Host-side root-register trampoline (Task #141 option a). Bridges
+/// Host-side root-register trampoline. Bridges
 /// `majit_gc::gc_add_root` to the active backend's `RootSet`.
 ///
 /// # Safety
@@ -405,7 +405,7 @@ pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
 /// overflow.  Called with `(base_size, item_size, length)`; returns the
 /// payload pointer.
 ///
-/// **PRE-EXISTING-ADAPTATION (str/unicode/var slowpath collapse).**
+/// **TODO (str/unicode/var slowpath collapse).**
 /// PyPy `x86/assembler.py:231-323 _build_malloc_slowpath(kind)` builds
 /// four distinct trampolines (`'fixed'`, `'str'`, `'unicode'`, `'var'`)
 /// stored as separate fields on the assembler
@@ -1503,7 +1503,7 @@ impl DynasmBackend {
         // `aarch64/assembler.rs:1403` / `:1532`); the per-Compiled trace
         // identity is the `CompiledCode::trace_id` field rather than a
         // per-descr `trace_id()` read.  Look up by position so the
-        // descr's internal per-emission state is not required — Session 7
+        // descr's internal per-emission state is not required —
         // singleton FINISH descrs share an Arc across emissions and
         // would otherwise answer `fail_index_per_trace()` / `trace_id()`
         // with the trait default `0`.
@@ -1734,7 +1734,7 @@ impl Backend for DynasmBackend {
         // `compile.py:183-186` walks `loop.operations` and writes
         // `op.descr.rd_loop_token` directly.  Pyre's `compiled.fail_descrs`
         // hold the same `DescrRef`s the metainterp stamped onto each
-        // guard op (Session 6 unification), so the write lands on the
+        // guard op (unified descr), so the write lands on the
         // same `ResumeGuardDescr` Arc upstream targets.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             for descr in &compiled.fail_descrs {
@@ -2430,7 +2430,7 @@ impl Backend for DynasmBackend {
             new_clt.update_frame_info(old_clt, old_weak, baseofs);
             // Keep the backend-specific frame_depth in lockstep so bridge
             // codegen's existing readers (CompiledCode.frame_depth) also
-            // see the propagated value. PRE-EXISTING-ADAPTATION: RPython
+            // see the propagated value. TODO: RPython
             // reads the depth back from `compiled_loop_token.frame_info`;
             // dynasm's codegen reads `CompiledCode.frame_depth`. Writing
             // both keeps the orthodox field authoritative while the
@@ -2536,7 +2536,7 @@ impl Backend for DynasmBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        // PRE-EXISTING-ADAPTATION: `BhDescr.get_type_id()` returns the
+        // TODO: `BhDescr.get_type_id()` returns the
         // u64 `path_hash` cache key, but `dynasm_alloc_*` expects the
         // u32 GC tid.  Truncate `as u32` until gc_cache routing.
         let type_id = arraydescr.get_type_id() as u32;
@@ -2569,9 +2569,8 @@ impl Backend for DynasmBackend {
     /// On ARM64/x86-64 the C ABI assigns integer and float args to independent
     /// register files, so a typed `extern "C" fn(I × ints, F × floats) -> i64`
     /// transmute lands them correctly regardless of original interleaving.
-    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch` (Slice 0d
-    /// of pyre-call-family-canonical-migration) which owns the arity table
-    /// previously embedded in cranelift's `compiler.rs`.
+    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch` which
+    /// owns the arity table previously embedded in cranelift's `compiler.rs`.
     fn bh_call_i(
         &self,
         func: i64,
@@ -3409,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn compile_loop_accepts_nonzero_inputarg_indices() {
         let mut backend = DynasmBackend::new();
         let inputargs = vec![InputArg::new_int(10), InputArg::new_int(20)];
@@ -3430,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_gc_alloc_and_init_with_configured_runtime() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::new();
@@ -3498,7 +3497,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_collecting_alloc_preserves_initialized_header_and_payload() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -3583,7 +3582,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_varsize_frame_fastpath_does_not_overlap_previous_object_payload() {
         let mut gc = MiniMarkGC::new();
         gc.register_type(TypeInfo::simple(24));
@@ -3667,7 +3666,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_varsize_frame_gcstore_round_trips_first_user_slot() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -3720,7 +3719,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_round_trips_ref_input_through_rewritten_jitframe() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -3772,7 +3771,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_supports_direct_self_recursive_dispatch() {
         let mut backend = make_call_assembler_backend();
 
@@ -3847,7 +3846,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_supports_direct_self_recursive_ref_dispatch() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -3945,7 +3944,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_self_recursive_virtualizable_ref_arg_preserves_input0() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4041,7 +4040,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_uses_gc_rewritten_vable_frame_without_double_materializing() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4126,7 +4125,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_self_recursive_virtualizable_bridge_reads_input0_from_compiled_bridge() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4231,7 +4230,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_double_recursive_virtualizable_call_assembler_keeps_entry_input0_live() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4355,7 +4354,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_bridge_materializes_register_ref_inputs_for_resolve_opref_ops() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4438,7 +4437,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_bridge_materializes_two_register_ref_inputs_before_unused_raw_load() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4541,7 +4540,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_label_uses_absolute_jitframe_input_slots_for_resolve_opref_ops() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4586,7 +4585,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_ref_from_immediately_preceding_callr() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4650,7 +4649,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_helper_ref_when_rewritten_with_second_ref_arg() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -4719,7 +4718,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_fresh_callr_ref_with_second_ref_arg_across_collecting_callee_alloc()
      {
         install_test_libc_jitframe_tracer();
@@ -4800,7 +4799,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_two_ref_inputs_across_collecting_callee_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -4871,7 +4870,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_ref_input_across_collecting_callee_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -4933,7 +4932,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_call_assembler_preserves_fresh_callr_ref_across_collecting_frame_alloc() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -4998,7 +4997,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_plain_call_returns_fresh_gc_ref_without_call_assembler() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -5039,7 +5038,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness"]
     fn test_plain_call_preserves_ref_result_across_collecting_helper_call() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::with_config(GcConfig {

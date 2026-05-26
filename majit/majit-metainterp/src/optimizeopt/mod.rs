@@ -780,7 +780,7 @@ pub struct OptContext {
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<majit_ir::OpRc>,
-    /// Epic H H-3.0b: per-position BoxRef pool for the input ops being
+    /// Per-position BoxRef pool for the input ops being
     /// optimized. `box_pool[i]` mirrors the `AbstractValue` for the
     /// trace position whose `OpRef::raw() == i` (recorder issuance order:
     /// inputargs first, then ops). Empty when the optimizer is invoked
@@ -2182,7 +2182,7 @@ impl OptContext {
             op.type_,
             op.opcode.result_type(),
             "Op.type_ ({:?}) disagrees with opcode.result_type() ({:?}) at \
-             {:?} (opcode={:?}) — Slice 0.1 dual-source contract violation",
+             {:?} (opcode={:?}) — dual-source contract violation",
             op.type_,
             op.opcode.result_type(),
             pos,
@@ -2205,7 +2205,7 @@ impl OptContext {
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
         if op.pos.get().is_none() || op.pos.get().is_constant() {
-            // Slice 0.5 follow-up: tag the freshly allocated position with
+            // follow-up: tag the freshly allocated position with
             // the producer op's result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
             // (resoperation.py:1693 `opclasses[opnum].type` parity).
@@ -2317,7 +2317,7 @@ impl OptContext {
             }
         }
 
-        // Slice 0.5: the op is about to be pushed into `new_operations`,
+        // the op is about to be pushed into `new_operations`,
         // after which `op_at` resolves its intrinsic `op.type_`
         // (resoperation.py:1693 parity) and `opref_type` returns it via
         // the primary fast path. The pre-Slice-0.5 `register_value_type`
@@ -2361,13 +2361,13 @@ impl OptContext {
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
     pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
         if op.pos.get().is_none() {
-            // Slice 0.5 follow-up: typed allocation, same rationale as `emit`.
+            // follow-up: typed allocation, same rationale as `emit`.
             op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
             self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
         }
         let pos_ref = op.pos.get();
-        // Slice 0.5: queued ops carry their intrinsic `op.type_` (Slice
+        // queued ops carry their intrinsic `op.type_` (Slice
         // 0.1 / resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
@@ -2802,7 +2802,7 @@ impl OptContext {
             {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
-            // RPython PreambleOp carries Box.type intrinsically. Slice 0.5:
+            // RPython PreambleOp carries Box.type intrinsically.
             // the replay `result` OpRef is typed via the upstream factory
             // (`op_typed` per Slice P5/P6); priority 0 of `opref_type`
             // resolves it from the variant tag without a side-table seed.
@@ -4241,7 +4241,7 @@ impl OptContext {
         }
     }
 
-    /// PRE-EXISTING-ADAPTATION: RPython's virtualizable handling lives
+    /// TODO: RPython's virtualizable handling lives
     /// tracing-side (`pyjitpl.py:1120-1145 _nonstandard_virtualizable`),
     /// not in optimizeopt — there is no direct `is_virtualizable` helper
     /// in `optimizer.py`. The pyre dedicated `PtrInfo::Virtualizable`
@@ -4663,7 +4663,7 @@ impl OptContext {
             }
         }
         // optimizer.py:427: if box.is_constant(): return
-        // BoxRef-routing short-circuit (Epic H H-3.2c slice 63):
+        // BoxRef-routing short-circuit (slice 63):
         // `replaced` is already Vec chain-walked, so `box[replaced]`'s
         // forwarded is the terminal slot. If it's `Box(const_box)` (the
         // make_constant mirror), `const_value()` returns Some(value);
@@ -5862,7 +5862,7 @@ impl OptContext {
     /// `new_operations` (in-place replace at `optimizer.rs:3391`,
     /// `rewrite.rs:1579/1674`, plus `remove(jump_idx)` at
     /// `optimizer.rs:2605`) make a maintained `pos_to_index` brittle.
-    /// Slice 0.2 unifies on this single API; converting it to O(1)
+    /// unifies on this single API; converting it to O(1)
     /// (via a maintained index or layout invariant) is deferred to a
     /// later slice once those mutation patterns are stabilised.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
@@ -5895,7 +5895,7 @@ impl OptContext {
         let op = self.op_at(opref)?;
         // history.py:220 ConstInt.type, resoperation.py:567 IntOp.type:
         // Box.type is intrinsic to the producing op. `op.type_` was
-        // populated at construction (Slice 0.1) from `opcode.result_type()`.
+        // populated at construction () from `opcode.result_type()`.
         if op.type_ == majit_ir::Type::Void {
             None
         } else {
@@ -5962,7 +5962,7 @@ impl OptContext {
             return Some(val.get_type());
         }
         // 3. Producing op's intrinsic `type_` (resoperation.py:1693
-        //    `opclasses[opnum].type` parity). Slice 0.1 populates this
+        //    `opclasses[opnum].type` parity). populates this
         //    at construction; this is the primary fast path post-Slice-0.5.
         if let Some(tp) = self.get_op_result_type(resolved) {
             return Some(tp);
@@ -6018,7 +6018,7 @@ impl OptContext {
     /// Vec by raw position recovers Phase 1 slot types from Phase 2
     /// without a separate side-table (history.py:220 parity).
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre stores the InputArg type on a
+    /// TODO: pyre stores the InputArg type on a
     /// graph-level side-table instead of a per-Box `BoxKind::InputArg`
     /// variant tag because the Box layout splits ResOp / InputArg /
     /// Const at construction time only.  Retiring this helper requires

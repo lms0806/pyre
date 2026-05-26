@@ -283,7 +283,7 @@ pub enum CallKind {
 /// identity check for the VTYPEPTR (struct-pointer type) the
 /// virtualizable describes.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre has no `lltype` so VTYPEPTR identity is
+/// TODO: pyre has no `lltype` so VTYPEPTR identity is
 /// expressed via a `usize` token (typically the SizeDescr identity from
 /// `majit_ir::descr::descr_identity`).  Hosts attach their rich
 /// `VirtualizableInfo` (defined in `majit-metainterp::virtualizable`) by
@@ -297,7 +297,7 @@ pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
 
 /// greenfield.py `GreenFieldInfo.green_fields` membership test.
 ///
-/// PRE-EXISTING-ADAPTATION: same crate-boundary reasoning as
+/// TODO: same crate-boundary reasoning as
 /// `VirtualizableInfoHandle`.  Hosts implement this on their rich
 /// `GreenFieldInfo` so `CallControl.could_be_green_field`
 /// (call.py:387-393) can walk `jd.greenfield_info` without depending on
@@ -309,7 +309,7 @@ pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
 
 /// `virtualref.py VirtualRefInfo` opaque carrier handle.
 ///
-/// PRE-EXISTING-ADAPTATION: same crate-boundary reasoning as
+/// TODO: same crate-boundary reasoning as
 /// `VirtualizableInfoHandle`.  `VirtualRefInfo` is defined in
 /// `majit-metainterp::virtualref` (the JIT runtime side); codewriter
 /// sits below metainterp in the crate graph and cannot import it.
@@ -420,7 +420,7 @@ pub struct JitDriverStaticData {
     pub virtualizables: Vec<String>,
     /// Type names (GTYPEs) for each red variable, parallel to `reds`.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream looks up GTYPE via
+    /// TODO: upstream looks up GTYPE via
     /// `jd._JIT_ENTER_FUNCTYPE.ARGS[index]` at warmspot time; pyre
     /// propagates the matching struct names from `setup_jitdriver` so
     /// `make_virtualizable_infos` can build `(GTYPE, fieldname)`
@@ -660,7 +660,7 @@ pub struct CallControl {
 
     // TODO(parity): retire this side-table when resolve_method uses
     // graph identity instead of string matching (plan §M3).
-    /// PRE-EXISTING-ADAPTATION: `ClassDefKey → impl_type` side-table.
+    /// TODO: `ClassDefKey → impl_type` side-table.
     /// No direct counterpart in call.py — upstream uses
     /// `getfunctionptr(graph)` (call.py:181) which keys on graph
     /// identity, not on a classdef→string mapping. This side-table
@@ -1629,7 +1629,7 @@ impl CallControl {
     ///
     /// Like [`Self::fielddescrof`] this produces a fresh analyzer-time
     /// Arc that does not share identity with the runtime descr
-    /// (Task #316). The struct element is resolved by extracting
+    /// The struct element is resolved by extracting
     /// `ARRAY.OF` from the full container type string (`Vec<Point>` →
     /// `"Point"`), then looking up the named field's offset/size from
     /// `self.struct_fields`. The containing array's
@@ -2099,7 +2099,7 @@ impl CallControl {
     ///         jd.virtualizable_info = vinfos[VTYPEPTR]
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream owns this method on
+    /// TODO: upstream owns this method on
     /// `WarmRunnerDesc` (warmspot.py:451) so it can mutate the single
     /// shared `jitdrivers_sd` list (the same Python list object is
     /// referenced by both `WarmRunnerDesc.jitdrivers_sd` and
@@ -2321,7 +2321,7 @@ impl CallControl {
     ///         return None
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: `VTYPEPTR` is an RPython lltype pointer;
+    /// TODO: `VTYPEPTR` is an RPython lltype pointer;
     /// pyre represents VTYPEPTR identity as a `usize` token supplied by
     /// the host (typically `descr_identity(&size_descr)` from
     /// `majit_ir::descr`).  Hosts install per-driver
@@ -2370,7 +2370,7 @@ impl CallControl {
     ///     return False
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: `GTYPE` is an RPython lltype; pyre
+    /// TODO: `GTYPE` is an RPython lltype; pyre
     /// represents it by name (`&str`).  The host attaches a
     /// [`GreenFieldInfoHandle`] whose `contains_green_field` implements
     /// the `(GTYPE, fieldname) in green_fields` membership test.
@@ -2454,7 +2454,7 @@ impl CallControl {
         //         todo.append(c_func.value._obj.graph)
         // ```
         //
-        // PRE-EXISTING-ADAPTATION: pyre's BFS seed is a partial port
+        // TODO: pyre's BFS seed is a partial port
         // of `call.py:59-64`, not a strict line-by-line mirror.
         // Upstream seeds all four `inline_calls_to` entries (`int_abs`,
         // `int_floordiv`, `int_mod`, `ll_math.ll_math_sqrt`) into
@@ -2466,7 +2466,7 @@ impl CallControl {
         // `extern "C"` function pointer carries no body the walker can
         // read, and pyre has no `MixLevelHelperAnnotator` to fabricate
         // one.  Fabricating a one-op shim graph that calls the host
-        // helper would be a NEW-DEVIATION, not parity — the shim has
+        // helper would be a deviation, not parity — the shim has
         // no `oopspec` / `_jit_*_` hints, no canraise / effect
         // analysis grounded in the helper body, and would override
         // any real source-level helper graph registered later under
@@ -2747,7 +2747,7 @@ fn return_type_string_to_kind(s: &str) -> char {
 /// Unknown/ambiguous slots default to `Ref`, matching
 /// `resolve_non_void_arg_types`' fallback.
 ///
-/// PRE-EXISTING-ADAPTATION: when `inputargs` is empty we fall back to
+/// TODO: when `inputargs` is empty we fall back to
 /// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
 /// under `jit_codewriter::jtransform::tests` build graphs directly via
 /// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
@@ -3340,7 +3340,7 @@ impl CallControl {
     ///
     /// When `classdef_hint` is `None` (producer did not cover the site
     /// yet — annotator coverage gap), fall through to exact-match
-    /// lookup against `receiver_root`. PRE-EXISTING-ADAPTATION remains
+    /// lookup against `receiver_root`. The deviation remains
     /// on the receiver-root keying itself (no upstream basis in
     /// `bookkeeper.py:431-442 getmethoddesc`) — retired once every
     /// Method op carries a populated `classdef_hint`.
@@ -3387,8 +3387,8 @@ impl CallControl {
 
         // TODO(parity): retire when §M3 annotator wiring publishes
         // classdef hints before BFS runs.
-        // PRE-EXISTING-ADAPTATION: receiver-agnostic "unique concrete
-        // impl" fallback.  Upstream `call.py:175-187
+        // TODO: receiver-agnostic "unique concrete impl" fallback.
+        // Upstream `call.py:175-187
         // getfunctionptr(graph)` keys on graph identity, never on
         // method name, so this branch has no RPython counterpart.
         // Pyre keeps it as a BFS-coverage adaptation: the codewriter
@@ -3439,7 +3439,7 @@ impl CallControl {
     /// and the side-table has an entry naming an impl actually
     /// registered for `name`, return the mapped `impl_type` directly;
     /// otherwise fall through to exact-match against `receiver_root`.
-    /// PRE-EXISTING-ADAPTATION on the receiver-root keying itself
+    /// The deviation on the receiver-root keying itself
     /// remains until every Method op carries a populated
     /// `classdef_hint`.
     fn resolve_method_impl_type<'b>(
@@ -3475,9 +3475,9 @@ impl CallControl {
             }
         }
 
-        // PRE-EXISTING-ADAPTATION: receiver-agnostic "unique concrete
-        // impl" fallback — see the matching branch in
-        // [`Self::resolve_method`] for the rationale.  Retired
+        // TODO: receiver-agnostic "unique concrete impl" fallback — see
+        // the matching branch in [`Self::resolve_method`] for the
+        // rationale.  Retired
         // alongside it once the annotator publishes classdef hints
         // before BFS.
         let concrete_impls: Vec<&String> = impls
@@ -3625,7 +3625,7 @@ impl CallControl {
     /// `try_fold_pure_call_via_executor`
     /// (pyre-jit-trace/src/jitcode_dispatch.rs:3099) which dereferences
     /// the constant_i as a C function pointer — SIGSEGV on the hash.
-    /// Pyre's symbolic placeholder is a NEW-DEVIATION vs RPython (where
+    /// Pyre's symbolic placeholder is a deviation vs RPython (where
     /// every callee has a real `MixLevelHelperAnnotator.constfunc(impl)`
     /// address); the gate restores the upstream-equivalent invariant
     /// that `EF_ELIDABLE_CANNOT_RAISE` callees are always executable.
@@ -6707,8 +6707,8 @@ mod tests {
             graph,
         );
 
-        // PRE-EXISTING-ADAPTATION: receiver-agnostic unique-impl
-        // fallback in `resolve_method` enables BFS to monomorphise
+        // TODO: receiver-agnostic unique-impl fallback in
+        // `resolve_method` enables BFS to monomorphise
         // generic-receiver call sites at trait dispatch.  Retired
         // when the annotator publishes classdef hints before BFS
         // (plan §M3).
@@ -6809,7 +6809,7 @@ mod tests {
         );
 
         let unknown_key = ClassDefKey::from_raw(0xBEEF);
-        // Falls through to unique-impl PRE-EXISTING-ADAPTATION.
+        // Falls through to unique-impl fallback.
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), Some(unknown_key))
                 .is_some()

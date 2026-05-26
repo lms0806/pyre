@@ -1729,7 +1729,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     //       datatype = tt
     //       bytesize = baseop.cast_to_bytesize()
     // INT_SIGNEXT is excluded by the static-bytesize gate (see
-    // PRE-EXISTING-ADAPTATION in `vectorization_info_for_op`): the dynamic
+    // TODO in `vectorization_info_for_op`): the dynamic
     // arg1.value path needs const-pool threading.
     if first_op.opcode.is_typecast() {
         if let Some(bs) = first_op.opcode.cast_to_bytesize_static() {

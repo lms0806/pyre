@@ -1050,9 +1050,9 @@ pub trait BoxEnv {
 /// the interior-mutable slots.
 ///
 /// This alias is the migration target for `Vec<Op>` storage sites
-/// (BoxPool removal plan Slice 1).  Sites already migrated traffic in
+/// (BoxPool removal plan).  Sites already migrated traffic in
 /// `OpRc`; the remaining `Vec<Op>` sites keep the legacy clone-on-copy
-/// shape until they are migrated and `BoxPool` retires (Slice 8).
+/// shape until they are migrated and `BoxPool` retires.
 pub type OpRc = std::rc::Rc<Op>;
 
 /// A single IR operation.
@@ -1068,13 +1068,13 @@ pub struct Op {
     pub opcode: OpCode,
     /// `resoperation.py:281 AbstractResOp` operand list. `RefCell` so
     /// `setarg` / `initarglist` can mutate through a shared `Op` reached
-    /// via `Rc<Op>` (BoxPool removal Slice 1 prep) — RPython writes
+    /// via `Rc<Op>` (BoxPool removal prep) — RPython writes
     /// `op._args[i] = ...` on the same Python object the trace list,
     /// optimizer state, and backend input lists all observe.
     pub args: std::cell::RefCell<SmallVec<[OpRef; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached
-    /// through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython's
+    /// through `Rc<Op>` (BoxPool removal prep): RPython's
     /// `op.setdescr(...)` writes through the same slot every observer
     /// sees.
     pub descr: std::cell::RefCell<Option<DescrRef>>,
@@ -1092,14 +1092,14 @@ pub struct Op {
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.  `RefCell` so
     /// the optimizer can rewrite fail_args on a shared `Op` reached
-    /// through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython writes
+    /// through `Rc<Op>` (BoxPool removal prep): RPython writes
     /// `op._fail_args = [...]` on the same Python object the trace list,
     /// optimizer state, and backend input list all see.
     pub fail_args: std::cell::RefCell<Option<SmallVec<[OpRef; 3]>>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     /// `RefCell` so the optimizer can stamp types onto a shared `Op`
-    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython
+    /// reached through `Rc<Op>` (BoxPool removal prep): RPython
     /// writes `op.fail_arg_types = [...]` on the same Python object the
     /// trace/backend/short preamble all observe.
     pub fail_arg_types: std::cell::RefCell<Option<Vec<Type>>>,
@@ -1121,9 +1121,9 @@ pub struct Op {
     pub vecinfo: std::cell::RefCell<Option<std::boxed::Box<VectorizationInfo>>>,
 
     /// `resoperation.py:233-242 AbstractResOpOrInputArg._forwarded` parity
-    /// slot. Empty (`Forwarded::None`) until Slice 8.C dual-writes wire
-    /// `BoxRef::set_forwarded_*` to this field. Slice 8.D migrates readers
-    /// from `BoxRef.forwarded` to this field; Slice 8.E retires `BoxRef`.
+    /// slot. Empty (`Forwarded::None`) until dual-writes wire
+    /// `BoxRef::set_forwarded_*` to this field. Migrates readers
+    /// from `BoxRef.forwarded` to this field; retires `BoxRef`.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 }
 

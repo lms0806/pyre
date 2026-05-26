@@ -24,7 +24,7 @@ pub struct Layout {
     /// typeobject.py:116 — parent layout (identity comparison).
     pub base_layout: *const Layout,
     /// typedef.py:43 — `acceptable_as_base_class = '__new__' in rawdict`.
-    /// PRE-EXISTING-ADAPTATION: in RPython this lives on TypeDef, accessed
+    /// TODO: in RPython this lives on TypeDef, accessed
     /// via `layout.typedef.acceptable_as_base_class`. Stored on Layout
     /// here because Rust has no TypeDef struct yet — Layout.typedef is
     /// `*const PyType` (≈ CLASSTYPE), and many types share INSTANCE_TYPE

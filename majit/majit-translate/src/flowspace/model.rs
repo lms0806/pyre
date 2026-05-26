@@ -1304,7 +1304,7 @@ fn host_descriptor_get(
 ///   (operation.py:637-642); caller raises `FlowingError` (flowspace)
 ///   or an `AnnotatorError` (annotator).
 ///
-/// PRE-EXISTING-ADAPTATION: primitive constants (Int / Float / Str / …)
+/// TODO: primitive constants (Int / Float / Str / …)
 /// would upstream execute Python's real `getattr` — e.g. `(1).real`
 /// evaluates through Python's `int.real` descriptor — and the Rust
 /// port has no Python runtime to defer to. The current port only
@@ -2279,7 +2279,7 @@ fn alloc_var_id() -> u64 {
 /// [`Variable::new`] / [`Variable::named`] / [`Variable::copy`], each
 /// of which allocates independent cells.
 ///
-/// PRE-EXISTING-ADAPTATION: This Rc-sharing is a minimal Rust-language
+/// TODO: This Rc-sharing is a minimal Rust-language
 /// adaptation for the unavoidable gap between Python's attribute-on-
 /// object model and Rust's value-type struct. CLAUDE.md permits it
 /// because the alternative (lossy per-clone-slot `annotation`) breaks
@@ -5167,7 +5167,7 @@ mod tests {
         assert_eq!(op2.args[1], Hlvalue::Variable(b));
     }
 
-    // --- HostObject class_dict / mro — Phase 5 P5.2 classdesc c2 ---
+    // --- HostObject class_dict / mro ---
 
     #[test]
     fn class_dict_get_set_roundtrip() {

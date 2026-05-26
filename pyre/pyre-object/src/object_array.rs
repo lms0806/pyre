@@ -47,7 +47,7 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// use `std::alloc::alloc`, not
 /// `MiniMarkGC::alloc_varsize_typed(PY_OBJECT_ARRAY_GC_TYPE_ID,
 /// cap)`. Until Phase L2 cuts the allocator over (blocked on
-/// Task #141 GC-root infrastructure + Drop source-of-truth
+/// GC-root infrastructure + Drop source-of-truth
 /// decision), the matching `PY_OBJECT_ARRAY_GC_TYPE_ID` and
 /// `W_LIST_GC_TYPE_ID.gc_ptr_offsets = [offset_of!(items)]` are
 /// inactive at collection time — the walker rejects the
@@ -175,7 +175,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 /// root tracking; the `try_gc_owns_object` infra in
 /// `gc_hook.rs` is in place to support that follow-up. See
 /// `40d4a041d7` docstring for the same finding on `w_int_new`/
-/// `w_float_new`. Captured in Task #98 / `l1_step4ab*` memory.
+/// `w_float_new`.
 ///
 /// The capacity header is initialized; items are left uninitialized —
 /// the caller must write all `capacity` slots before exposing the

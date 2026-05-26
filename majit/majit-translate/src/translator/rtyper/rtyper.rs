@@ -364,7 +364,7 @@ pub struct RPythonTyper {
     /// [`RPythonTyper::initialize_exceptiondata`].
     ///
     /// `RefCell<Option<_>>` instead of eagerly initialising in
-    /// [`RPythonTyper::new`] is a PRE-EXISTING-ADAPTATION (option 1A
+    /// [`RPythonTyper::new`] is a TODO (option 1A
     /// from the porting plan): `RootClassRepr::new` does not need
     /// `self`, but `ExceptionData::new` consumes the populated
     /// `rootclass_repr` at rtyper.py:71, and that write lands after
@@ -387,7 +387,7 @@ pub struct RPythonTyper {
     /// [`rmodel::rtyper_makerepr`] arms that route to
     /// [`rclass::getinstancerepr`]) can upgrade back into
     /// `Rc<RPythonTyper>` without plumbing a new parameter through
-    /// every `getrepr` call site. PRE-EXISTING-ADAPTATION; upstream
+    /// every `getrepr` call site. TODO: upstream
     /// Python sidesteps this by storing `rtyper` on every Repr's
     /// `self.rtyper` directly.
     self_weak: RefCell<Weak<Self>>,
@@ -529,7 +529,7 @@ impl RPythonTyper {
     /// consumes the populated `self.rootclass_repr` / `self.instance_reprs`
     /// state — that read has to happen after the typer is already
     /// reachable via `Rc`, which `new()` cannot observe. The dual-phase
-    /// shape is a PRE-EXISTING-ADAPTATION documented on the field
+    /// shape is a TODO documented on the field
     /// declarations; callers must invoke this exactly once after
     /// `new()` so the `__init__`-complete invariant (`rootclass_repr`
     /// and `exceptiondata` are both `Some`) is restored.
@@ -710,7 +710,7 @@ impl RPythonTyper {
             // except AttributeError: pass`.
             let sandbox_name = graph.func._sandbox_external_name.clone();
             if let Some(name) = sandbox_name {
-                // PRE-EXISTING-ADAPTATION: rtyper.py:577-582 sandbox
+                // TODO: rtyper.py:577-582 sandbox
                 // trampoline path. Upstream:
                 //
                 //     args_s = [v.annotation for v in graph.getargs()]
@@ -750,7 +750,7 @@ impl RPythonTyper {
                 //      `getannmixlevel().delayedfunction(...)` chain.
                 //
                 // Surfacing as `TyperError` keeps the behavior strict
-                // — main's silent fallthrough was a NEW-DEVIATION;
+                // — main's silent fallthrough was a deviation;
                 // the error preserves "sandbox not yet supported"
                 // visibility without inventing a stub trampoline.
                 return Err(TyperError::message(format!(
@@ -2130,8 +2130,8 @@ impl RPythonTyper {
             // Body parity verbatim from rtyper.py:478-481.
             //
             // The other 13 typed numeric / ptr / Unsigned cast names
-            // retired across Slices A.3 / B.1 / A.4a / A.4b / A.4c —
-            // frontend now routes every typed `(source, target)` pair
+            // are now retired — frontend routes every typed
+            // `(source, target)` pair
             // through `simple_call(<host_callable>, v)` per upstream
             // `__builtin__.int/float/bool` / `lltype.cast_*` /
             // `rarithmetic.intmask` / `rarithmetic.r_uint`, reaching
@@ -4888,8 +4888,8 @@ impl LowLevelOpList {
     ///     `genop('direct_call', ...)` mirroring upstream
     ///     `:878-882`.
     ///
-    /// PRE-EXISTING-ADAPTATIONs (parity debt — not "by API choice";
-    /// each is reachable only after the multi-session
+    /// TODOs (parity debt — not "by API choice";
+    /// each is reachable only after the
     /// `LowLevelFunction → HostObject` refactor lands):
     ///
     ///   * **`args_s` derivation** at upstream `:850-862`. Local
@@ -6287,8 +6287,8 @@ mod tests {
         //
         // `SomeWeakRef` is the still-unported witness variant
         // (rweakref.py port not landed). Earlier this test exercised
-        // `SomeString`; the Item 3 epic (Slice 3) ported `string_repr`
-        // / `unicode_repr`, so rotated onto another unported variant
+        // `SomeString`; `string_repr` / `unicode_repr` are now ported,
+        // so rotated onto another unported variant
         // (robject.py / rproperty.py / rweakref.py — pick whichever
         // remains unported next).
         use crate::annotator::model::SomeWeakRef;
@@ -6479,7 +6479,7 @@ mod tests {
         //
         // `SomeWeakRef` is the still-unported witness variant
         // (rweakref.py). Earlier this test used `SomeString`; that
-        // landed in Slice 3 of the Item 3 epic, so rotated to
+        // is now ported, so rotated to
         // `SomeWeakRef`.
         use crate::annotator::model::SomeWeakRef;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);

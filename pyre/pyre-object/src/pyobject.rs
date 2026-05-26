@@ -56,7 +56,7 @@ pub struct PyObject {
 /// The universal Python object reference — a raw pointer to `PyObject`.
 ///
 /// `pyre` currently passes this through the JIT as an integer-sized raw pointer.
-/// Phase 1 uses leaked Box allocations; a proper GC will replace this later.
+/// Uses leaked Box allocations; a proper GC will replace this later.
 // Safety: PyType instances are read-only static data, safe to share across threads.
 unsafe impl Sync for PyType {}
 unsafe impl Send for PyType {}

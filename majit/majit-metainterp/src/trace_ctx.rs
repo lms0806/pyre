@@ -320,10 +320,10 @@ pub struct TraceCtx {
     /// in `_snapshot_data` / `_snapshot_array_data` byte streams).
     /// `capture_resumedata` pushes one entry per guard; the returned id
     /// is stored on the guard op's `rd_resume_position`.  Grows
-    /// monotonically across `cut_trace` (matches the pre-Task #70
+    /// monotonically across `cut_trace` (matches the pre-
     /// behavior — see `cut_trace` for rationale).  Will migrate to the
     /// byte-stream form carried by `TraceRecordBuffer` alongside the
-    /// eventual field swap (Task #59 / #70).
+    /// eventual field swap (/ #70).
     pub(crate) snapshots: Vec<crate::recorder::Snapshot>,
     /// pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
     /// The source loop token of the bridge trace, populated at
@@ -376,7 +376,7 @@ pub struct TraceCtx {
     /// `raising_exception` flag so the eventual exception is preserved
     /// (`pyjitpl.py:3391-3393` comment).
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `TraceAction::Abort` carries no
+    /// TODO: pyre's `TraceAction::Abort` carries no
     /// payload, so the dispatch site (`finalize_standard_virtualizable_may_force`)
     /// stashes the full `SwitchToBlackhole` here and the jitdriver-side
     /// consumer drains it.  Currently only `stb.reason` is consumed —
@@ -390,7 +390,7 @@ pub struct TraceCtx {
     /// Full `pyjitpl.py:2907 / 2949` cancel-tracing semantics needs
     /// `BlackholeInterpBuilder` + `last_exc_value` plumbed to the
     /// `TraceAction::Abort` consumer and a JitException return surface
-    /// on the back-edge runner — multi-session followup.
+    /// on the back-edge runner — followup.
     ///
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
@@ -1220,7 +1220,7 @@ impl TraceCtx {
 
     /// Typed counterpart to [`Self::const_value`] — returns the
     /// `Value` (`Int`/`Ref`/`Float`/`Void`) directly instead of the
-    /// raw `i64` cast.  Task #297 convergence path: optimizer /
+    /// raw `i64` cast.  convergence path: optimizer /
     /// guard-recovery consumers that need to distinguish Ref vs Int
     /// constants should migrate to this reader so the raw-i64 API can
     /// retire once the backend `set_constants` signature flips.
@@ -2079,14 +2079,14 @@ impl TraceCtx {
     /// vector mirrors `[static_field_0, ..., array_0_item_0, ...,
     /// vable_box_identity]`. Caller is responsible for ensuring the
     /// boxes vector is up-to-date with the trace's current state at the
-    /// point of the call (Slice 3 of the Task #21 fix plan).
+    /// point of the call (of the fix plan).
     ///
     /// Skips emission when the active vable is non-standard or when
     /// virtualizable infrastructure is absent. Safe to call multiple
     /// times — unlike `gen_store_back_in_vable`, repeat calls re-emit
     /// the writebacks rather than no-op'ing.
     ///
-    /// Dormant — wired up by Slice 2 (`close_loop_args_at` invocation
+    /// Dormant — wired up by (`close_loop_args_at` invocation
     /// behind the `inputarg_types.len() <= 1 + NUM_EXTRA_REDS` gate so
     /// descriptor=None paths see no new emission).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2420,7 +2420,7 @@ impl TraceCtx {
                 // framestack walk (see `MetaInterp::replace_box` in
                 // pyjitpl/mod.rs); reaching that walk from TraceCtx
                 // requires a MetaInterp backref which does not exist
-                // today — Task #68 C tracks the architectural move.
+                // today — C tracks the architectural move.
                 self.replace_box(vable_opref, standard_box);
                 return false;
             }
@@ -3334,7 +3334,7 @@ impl TraceCtx {
 #[cfg(test)]
 #[allow(deprecated)] // test fixtures rebuild Op streams via OpRef::from_raw; production
 // trace_ctx path has 0 OpRef::from_raw callers (Untyped OpRef Retirement
-// Epic, Slice 2A — narrow the P1.5 gate from crate-level to mod-level).
+// Epic, — narrow the P1.5 gate from crate-level to mod-level).
 mod tests {
     use super::*;
     use crate::jit_state::JitState;

@@ -99,8 +99,7 @@ pub struct PyJitCodeMetadata {
     pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
-    /// Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
-    /// `~/.claude/plans/staged-sauteeing-koala.md`): post-regalloc
+    /// Post-regalloc
     /// color of each Python-semantic stack slot.
     /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, nlocals + d)`
     /// for `d in 0..code.max_stackdepth` (= CPython `co_stacksize`).
@@ -123,7 +122,7 @@ pub struct PyJitCodeMetadata {
     /// the map when JIT-traced PCs did not reach the static peak; the
     /// `co_stacksize` invariant restores parity with the runtime.
     ///
-    /// After Phase 2.1c (commit `3fd64d5b0f3`, regalloc.rs:448-466 +
+    /// After the stack-slot input-arg pinning removal (regalloc.rs:448-466 +
     /// :527-535) the stack-slot input-arg pinning is gone, so this
     /// map is no longer the identity `[stack_base, stack_base+1, …]`
     /// — entries are whatever color `apply_rename` produced. Decoders
@@ -159,7 +158,7 @@ pub struct PyJitCodeMetadata {
     /// Today `enforce_input_args` (`flatten.py:88-100` parity)
     /// pins each local-i inputarg color to identity (`color = i`),
     /// so this map is `[0, 1, ..., nlocals-1]` for every populated
-    /// jitcode. Slice 3b-2 (`get_list_of_active_boxes`) derives the
+    /// jitcode. `get_list_of_active_boxes` derives the
     /// semantic index from the color via this map for locals and
     /// `stack_slot_color_map` for stack slots.
     pub pyre_color_for_semantic_local: Vec<u16>,
@@ -237,7 +236,7 @@ impl DerefMut for PyJitCode {
 /// indices the per-CodeObject codewriter emits for the portal red args.
 /// The slot positions are `(nlocals + max_stackdepth + 11)` and
 /// `(nlocals + max_stackdepth + 12)` respectively; slot `+10` was the
-/// dedicated `null_ref_reg` PY_NULL holder before Tier 4 Epic A retired
+/// dedicated `null_ref_reg` PY_NULL holder before it was retired
 /// it, and the portal reds kept their numerical positions so
 /// layout-sensitive tests stay stable.
 ///
@@ -251,7 +250,6 @@ impl DerefMut for PyJitCode {
 /// `MetainterpCodeWriter::compile` and `canonical_bridge.rs`
 /// `install_portal_for` route through this helper so they cannot drift.
 ///
-/// Item 10 epic prerequisite (Task #122 / #185 / #158 plan).
 #[inline]
 pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (u16, u16) {
     let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;

@@ -6,7 +6,7 @@
 //!
 //! RPython has no direct counterpart. In upstream, `rpython/jit/codewriter/codewriter.py:74 CodeWriter.make_jitcodes()` is handed `translator.graphs` — graphs already produced by `rpython/rtyper/` from RPython source. The codewriter never sees interpreter source files.
 //!
-//! pyre cannot inherit that assumption. Rust functions must become `FunctionGraph`s somewhere, and this module is where. Every file under `front/` is therefore classified as `PRE-EXISTING-ADAPTATION` per the repo's parity rules: Rust-specific lowering that has no RPython structural match.
+//! pyre cannot inherit that assumption. Rust functions must become `FunctionGraph`s somewhere, and this module is where. Every file under `front/` is Rust-specific lowering that has no RPython structural match.
 //!
 //! ## Why this is the right layer
 //!

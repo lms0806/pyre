@@ -2,10 +2,10 @@
 //!
 //! Files in this module mirror upstream `rpython/rtyper/` 1:1 by name
 //! and by structure (`rclass.py` → `rclass.rs`, `rpbc.py` → `rpbc.rs`).
-//! The standalone `majit-rtyper` crate (roadmap Phase 6) is still
-//! pending; the per-graph type resolution machinery lives in
-//! [`legacy_resolve`] inside this tree (relocated from the deleted
-//! `translate_legacy/` subtree at Slice 10).  The dual-gate Skip arm
+//! The standalone `majit-rtyper` crate is still pending; the
+//! per-graph type resolution machinery lives in [`legacy_resolve`]
+//! inside this tree (relocated from the deleted `translate_legacy/`
+//! subtree).  The dual-gate Skip arm
 //! drives [`legacy_annotator::annotate`] +
 //! [`legacy_resolve::resolve_types`] for graphs that the real
 //! `RPythonTyper::specialize` path does not yet cover.

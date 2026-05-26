@@ -1,4 +1,4 @@
-//! Slice 92.1 — per-green type tag parsing for `#[jit_interp(greens = ...)]`.
+//! Per-green type tag parsing for `#[jit_interp(greens = ...)]`.
 //!
 //! Extends the bracketed `greens = [pc, code: str, env: ref]` syntax so each
 //! green can carry an optional type tag. Tagged greens override the trait
@@ -22,7 +22,7 @@ use syn::{
 };
 
 /// Per-green type tag.  Maps to `majit_ir::GreenType` at codegen time
-/// (Slice 92.2).  `Int / Ref / Float` are siblings of the `GreenAsI64`
+/// at codegen time.  `Int / Ref / Float` are siblings of the `GreenAsI64`
 /// trait's automatic dispatch (the tag forces the bucket explicitly);
 /// `Str / Unicode` opt-in to content-comparison through the hardcoded
 /// `default_str_eq` / `default_str_hash` / `default_unicode_hash` in

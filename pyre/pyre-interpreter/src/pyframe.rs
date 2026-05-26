@@ -65,7 +65,7 @@ pub struct PyFrame {
     /// during a handler) both sides hold "current/just-completed opcode"
     /// modulo bytes-vs-instruction units.
     ///
-    /// PRE-EXISTING-ADAPTATION (pattern-level, not semantic): RPython's
+    /// TODO(pattern-level, not semantic): RPython's
     /// dispatch carries the next-to-execute pc as a separate `next_instr`
     /// local variable advanced by `next_instr += 2` after the opcode read.
     /// pyre packs the same information into `last_instr` plus the
@@ -142,7 +142,7 @@ pub struct PyFrame {
 /// every `PyFrame` is heap-allocated outside the nursery (`std::alloc`
 /// + a leaked `Box`) and roots are visited by the custom walker
 /// (`pyre-interpreter::eval::walk_pyframe_roots`); this id is therefore
-/// metadata-only at registration time. Phase 2.3 옵션 B's
+/// metadata-only at registration time.
 /// `emit_new_pyframe_inline_self_recursive` will be the first writer.
 ///
 /// Asserts the same id is returned by `gc.register_type(...)` so any
@@ -976,7 +976,7 @@ impl PyFrame {
     /// Test-helper constructor — creates a frame with a fresh execution
     /// context.
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy has no equivalent — tests there call
+    /// TODO: PyPy has no equivalent — tests there call
     /// `space.appexec` or build the context explicitly before invoking
     /// `space.createframe`.  Pyre keeps `PyFrame::new` for test
     /// ergonomics (~67 callers across `pyre-interpreter`, `pyre-jit`,
@@ -993,7 +993,7 @@ impl PyFrame {
     /// the module-entry `__dict__` (with `__name__ = "__main__"`), and
     /// returns the resulting heap-allocated frame.
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy's `space.createframe(code, w_globals,
+    /// TODO: PyPy's `space.createframe(code, w_globals,
     /// outer_func)` (`baseobjspace.py:796`) takes already-constructed
     /// `code` and `w_globals` Python objects and reads execution context
     /// from `space.threadlocals`. PyPy callers (`pypy/interpreter/main.py

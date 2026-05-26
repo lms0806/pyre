@@ -21,7 +21,7 @@
 //! produce (`parse → front → SemanticProgram` operates on Rust source,
 //! not CPython callables). `RPythonTyper::specialize`
 //! (`rtyper.rs:1743`) does NOT consume `PyGraph` directly — it iterates
-//! `RPythonAnnotator.annotated` / `all_blocks`, which Slice 2's
+//! `RPythonAnnotator.annotated` / `all_blocks`, which
 //! `specialize_legacy_graph` will populate with the
 //! [`FlowspaceAdapterOutput`] this adapter returns. Skipping the PyGraph
 //! wrapping avoids fabricating fake `GraphFunc` / `HostCode` instances.
@@ -138,7 +138,7 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
 ///    to carry a *fresh* prevblock-side `Variable` whose only "defining
 ///    site" is the link itself — the value flows into the target
 ///    block's inputarg via this synthetic Variable. The adapter must
-///    seed a `Variable` for each such slot so Slice 1c's link
+///    seed a `Variable` for each such slot so the link
 ///    translation can resolve the operand without tripping the
 ///    "undefined operand" invariant in `lookup_operand`.
 ///
@@ -148,7 +148,7 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
 ///    Seeded for the same reason.
 ///
 /// Each slot is seeded exactly once via `entry().or_insert_with`,
-/// preserving operand identity across multiple readers — Slice 1b's op
+/// preserving operand identity across multiple readers — the op
 /// translator looks up the same Variable instance for every reader of a
 /// given slot, matching upstream Python's reference semantics where
 /// `op.args[i]` and `op2.args[j]` may be the same `Variable` object.
@@ -266,7 +266,7 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> SlotToVaria
 /// (`OpKind::ConstInt(n)` produces a fresh slot consumed
 /// elsewhere). The adapter must recombine: every slot defined as a
 /// const becomes a `Hlvalue::Constant`; every other defined slot
-/// remains a `Hlvalue::Variable` from the Slice 1a map.
+/// remains a `Hlvalue::Variable` from the variable map.
 ///
 /// Constants are wrapped with their low-level concretetype attached,
 /// matching RPython's `Constant.concretetype` shape. The legacy graph
@@ -323,7 +323,7 @@ pub fn build_value_to_hlvalue_map(
 
 /// Look up the `Hlvalue` for a slot operand. Surfaces a
 /// fail-loud `TyperError` when the operand is undefined (every
-/// referenced slot must have been seeded by Slice 1a's
+/// referenced slot must have been seeded by
 /// [`build_value_to_variable_map`] or shadowed by
 /// [`build_value_to_hlvalue_map`]'s const inlining).
 ///
@@ -538,16 +538,15 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 /// `flowspace::SpaceOperation`s.
 ///
 /// Returns `Ok(Vec::new())` when the op is **fully consumed by other
-/// adapter infrastructure** — `OpKind::Input` (handled by Slice 1c
-/// block topology, where the result `Variable` becomes a
+/// adapter infrastructure** — `OpKind::Input` (handled by block
+/// topology assembly, where the result `Variable` becomes a
 /// `block.inputargs` entry) and `OpKind::ConstInt` / `ConstFloat`
 /// (handled by [`build_value_to_hlvalue_map`], which inlines the
 /// constant at every consuming op's args site).
 ///
-/// Returns `Err(TyperError)` for variants whose lowering is deferred to
-/// a Slice 1b followup commit. The error message names the specific
-/// variant so Slice 4's dual-gate failure cleanly identifies which
-/// followup needs to land.
+/// Returns `Err(TyperError)` for variants whose lowering is deferred.
+/// The error message names the specific variant so the dual-gate
+/// failure cleanly identifies which followup needs to land.
 /// Project an operand `Variable` to its backing legacy slot index on
 /// `graph`, or surface the missing bridge as a `TyperError` so the
 /// dual-gate classifies the producer bug instead of unwinding the
@@ -569,7 +568,7 @@ fn operand_value_id(
 }
 
 /// Format `op.result`'s slot index for diagnostic messages.  After
-/// Slice 2.9, `op.result: Option<Variable>` Debug-formats opaquely;
+/// `op.result: Option<Variable>` Debug-formats opaquely;
 /// this helper projects the registered `Variable` back to its backing
 /// slot on `graph` for readable fail-loud output.
 fn fmt_op_result_slot(graph: &crate::model::FunctionGraph, op: &SpaceOperation) -> String {
@@ -671,7 +670,7 @@ pub fn translate_op(
             )])
         }
 
-        // ─── Slice 1b: FieldRead / FieldWrite ports ───
+        // ─── FieldRead / FieldWrite ports ───
         // RPython `flowspace/operation.py:617 GetAttr.opname = 'getattr'`
         // and `setattr` (operation.py: same module). The high-level
         // attribute-access op carries the field name as a
@@ -712,7 +711,7 @@ pub fn translate_op(
             )])
         }
 
-        // ─── Slice 1b: ArrayRead / ArrayWrite ports ───
+        // ─── ArrayRead / ArrayWrite ports ───
         // RPython `flowspace/operation.py: GetItem.opname = 'getitem'`
         // and `setitem`. The base[index] form maps directly to
         // `getitem(base, index)` / `setitem(base, index, value)`; the
@@ -749,7 +748,7 @@ pub fn translate_op(
             )])
         }
 
-        // ─── Slice 1b: InteriorFieldRead / InteriorFieldWrite ports ───
+        // ─── InteriorFieldRead / InteriorFieldWrite ports ───
         // RPython `effectinfo.py:313-340` notes that `getinteriorfield_gc`
         // implicitly carries both a `readarray` and a `readinteriorfield`
         // effect — the array-of-structs pattern is fundamentally a
@@ -809,7 +808,7 @@ pub fn translate_op(
             ])
         }
 
-        // ─── Slice 1b: Call port (CallTarget per variant) ───
+        // ─── Call port (CallTarget per variant) ───
         // RPython `flowspace/operation.py:663 SimpleCall.opname =
         // 'simple_call'`. The first arg is a Constant wrapping the
         // callable (or a Variable carrying a runtime function pointer).
@@ -857,7 +856,7 @@ pub fn translate_op(
             let arg_hls = arg_hls?;
             let result = resolve_result_hlvalue(op, value_map, graph)?;
             match target {
-                // Slice A.3c — `FunctionPath` resolves through
+                // `FunctionPath` resolves through
                 // `PyreCallRegistry`, returning the registry entry's
                 // `HostObject::UserFunction` instead of an opaque
                 // wrapper. The rtyper's `pair_simple_call` then
@@ -917,7 +916,7 @@ pub fn translate_op(
                     //     Mirrors upstream's `frame.globals[<alias>]`
                     //     hit branch.
                     //
-                    // 3b. PRE-EXISTING-ADAPTATION: `segments` already
+                    // 3b. TODO: `segments` already
                     //     spell out the fully-qualified Rust path
                     //     (`rpython::rtyper::lltypesystem::lltype::
                     //     cast_ptr_to_int`) without a matching `use`
@@ -979,7 +978,7 @@ pub fn translate_op(
                         && let Some(attr) = module.module_get(&segments[segments.len() - 1])
                     {
                         // Branch 3b — fully-qualified inline path,
-                        // PRE-EXISTING-ADAPTATION as documented above.
+                        // TODO as documented above.
                         attr
                     } else {
                         return Err(TyperError::message(format!(
@@ -1171,8 +1170,8 @@ pub fn translate_op(
 }
 
 /// Stable variant name for fail-loud messages. Matches the RPython
-/// convention of identifying ops by their opname stem so Slice 4
-/// dual-gate failures are immediately greppable.
+/// convention of identifying ops by their opname stem so dual-gate
+/// failures are immediately greppable.
 fn opkind_variant_name(kind: &OpKind) -> &'static str {
     #[allow(unreachable_patterns)]
     match kind {
@@ -1259,9 +1258,9 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         // (`flowspace/flowcontext.py:258,417`) and drops the function
         // before reaching the rtyper.  No real-path lowering exists;
         // the dual-gate Skip-classifies the graph and the legacy path
-        // covers it.  The Slice 10C ratchet that synthesised a
+        // covers it.  The ratchet that synthesised a
         // `SomeInstance(None) -> Ptr -> GcRef` projection was a
-        // NEW-DEVIATION (no upstream peer) and has been reverted —
+        // deviation (no upstream peer) and has been reverted —
         // closing this entry requires retiring every Abort emit-site
         // in the front-end (Expr::ForLoop placeholder, etc.) and
         // replacing them with proper RPython-orthodox lowerings.
@@ -1271,8 +1270,8 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
 }
 
 /// Output of [`function_graph_to_flowspace`] — the assembled
-/// `flowspace::FunctionGraph` plus enough side tables for Slice 2's
-/// `specialize_legacy_graph` wrapper to drive `RPythonTyper::specialize`
+/// `flowspace::FunctionGraph` plus enough side tables for
+/// `specialize_legacy_graph` to drive `RPythonTyper::specialize`
 /// against pyre's annotator surface and read back per-slot
 /// concretetypes.
 #[derive(Debug)]
@@ -1280,17 +1279,17 @@ pub struct FlowspaceAdapterOutput {
     /// Assembled `flowspace::FunctionGraph` carrying every legacy block
     /// translated to a `flowspace::Block` over `Hlvalue` operands.
     /// Wrapped in `Rc<RefCell<_>>` to match RPython's
-    /// `FunctionDesc.cache` ownership shape — Slice 2 hands this to
+    /// `FunctionDesc.cache` ownership shape — handed to
     /// `RPythonAnnotator` directly.
     pub graph: Rc<RefCell<FlowspaceGraph>>,
-    /// slot → flowspace::Variable (Slice 1a output) — Slice 2 reads
-    /// `Variable.concretetype` per slot after `specialize` returns.
+    /// slot → flowspace::Variable — `Variable.concretetype` per slot
+    /// is read after `specialize` returns.
     pub value_to_var: SlotToVariable,
     /// Legacy constant define slot -> `Constant.concretetype`.
     /// Materialised at lift time from `OpKind::ConstInt` / `ConstFloat`
     /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
-    /// matching RPython's `Constant.concretetype` ground truth.  Slice 2
-    /// reads the per-slot `LowLevelType` directly so the projector
+    /// matching RPython's `Constant.concretetype` ground truth.  The
+    /// per-slot `LowLevelType` is read directly so the projector
     /// does not have to reconstruct the kind from the reduced legacy
     /// `ValueType` view.
     pub constant_concretetypes: HashMap<usize, LowLevelType>,
@@ -1360,7 +1359,7 @@ fn legacy_const_define_hlvalue(
 /// Translate a single legacy `LinkArg` into a `Hlvalue`. `LinkArg::Value`
 /// resolves through `value_map` (which carries Variable identities for
 /// regular operands and inlined constants for `OpKind::ConstInt` /
-/// `ConstFloat` defines per Slice 1b-core's
+/// `ConstFloat` defines per
 /// [`build_value_to_hlvalue_map`]). `LinkArg::Const` materialises a
 /// fresh `Hlvalue::Constant`.
 ///
@@ -1541,14 +1540,14 @@ pub(crate) fn derive_subject_inputcells(
 ///    exitcase) via [`link_arg_to_hlvalue`] / [`exitcase_to_hlvalue`],
 ///    and translate `exitswitch` via the `value_map`.
 ///
-/// Slice 1c lands the topology assembly. Per-OpKind operation
-/// translation depends on Slice 1b followups; Slice 1c uses
-/// [`translate_op`] as-is, which means any legacy graph carrying an
+/// Topology assembly. Per-OpKind operation translation depends on
+/// followups; [`translate_op`] is used as-is, which means any
+/// legacy graph carrying an
 /// unported OpKind variant surfaces a fail-loud `TyperError` from this
 /// function. Trivial graphs (only `Input` / `ConstInt` / `ConstFloat`
 /// op definitions) flow through cleanly.
 ///
-/// Phase 2 (addpendingblock conversion) — production path no longer
+/// Addpendingblock conversion — production path no longer
 /// pre-seeds `Variable.annotation` from `legacy_annotator::annotate`.
 /// Once the cutover entry queues the subject's startblock onto the
 /// orthodox `addpendingblock` queue
@@ -1568,7 +1567,7 @@ pub(crate) fn derive_subject_inputcells(
 /// this function so `seed_variable` reads the right shell.
 pub fn function_graph_to_flowspace(
     legacy: &FunctionGraph,
-    // Slice A.2 plumbing — see [`translate_op`].
+    // Call resolution plumbing — see [`translate_op`].
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
     let mut value_to_var: SlotToVariable = HashMap::new();
@@ -1963,7 +1962,7 @@ mod tests {
     }
 
     /// Helper: empty `PyreCallRegistry` for tests that don't exercise
-    /// the Slice A.2/A.3 Call resolution path.  The registry's
+    /// the Call resolution path.  The registry's
     /// bookkeeper is freshly minted because translate_op tests don't
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> PyreCallRegistry {
@@ -2186,7 +2185,7 @@ mod tests {
     fn build_value_to_variable_map_dedupes_by_value_id() {
         // Two ops both reading the same inputarg (legacy graphs are SSA
         // — every slot has one definition, but multiple readers).
-        // Slice 1a must produce one Variable identity per slot.
+        // Must produce one Variable identity per slot.
         let mut graph = LegacyGraph::new("dedup_test");
         // Slots 0..2 are canonical (returnvar / etype / evalue);
         // alloc one more so slot 3 has a backing Variable.
@@ -2278,7 +2277,7 @@ mod tests {
         );
     }
 
-    // ───── Slice 1b-core tests: dispatcher + skip arms + fail-loud ─────
+    // ───── dispatcher + skip arms + fail-loud ─────
 
     #[test]
     fn build_value_to_hlvalue_map_inlines_const_defines() {
@@ -2353,8 +2352,8 @@ mod tests {
             .expect("Input must translate to skip");
         assert!(
             result.is_empty(),
-            "Input define has no SpaceOperation analogue (handled by Slice 1c \
-             via block.inputargs); translate_op must yield empty Vec"
+            "Input define has no SpaceOperation analogue (handled by block \
+             topology via block.inputargs); translate_op must yield empty Vec"
         );
     }
 
@@ -3055,7 +3054,7 @@ mod tests {
 
     #[test]
     fn translate_op_undefined_operand_surfaces_invariant_break() {
-        // Although Slice 1b-core's only implemented arm with operands is
+        // Although the only currently implemented arm with operands is
         // gone (Call → followup), the lookup_operand helper is shared
         // with future arms. Validate it surfaces a clear "adapter
         // invariant broken" message and embeds the enriched diagnostic
@@ -3085,7 +3084,7 @@ mod tests {
         );
     }
 
-    // ───── Slice 1c tests: topology assembly ─────
+    // ───── topology assembly ─────
 
     fn link_to_returnblock(args: Vec<LinkArg>, returnblock_id: BlockId) -> crate::model::Link {
         let mut link = crate::model::Link::new_mixed(args, returnblock_id, None);
@@ -3095,7 +3094,7 @@ mod tests {
 
     fn legacy_minimal_identity_return_graph() -> LegacyGraph {
         // Smallest valid legacy graph: one inputarg, returns it
-        // directly. Slice 1c must produce a flowspace::FunctionGraph
+        // directly. Must produce a flowspace::FunctionGraph
         // whose startblock has the single inputarg Variable,
         // exits→returnblock, and the returnblock's inputarg is the same
         // Variable identity (so RPythonTyper.getreturnvar resolves
@@ -3231,9 +3230,9 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_const_define_op_inlined_in_link_args() {
-        // ConstInt(7) defines slot 2. Slice 1b's
-        // build_value_to_hlvalue_map inlines it into Link.args as
-        // Hlvalue::Constant — Slice 1c's link translation must use that
+        // ConstInt(7) defines slot 2. build_value_to_hlvalue_map
+        // inlines it into Link.args as Hlvalue::Constant — link
+        // translation must use that
         // mapping rather than wrapping the unused Variable.
         let mut graph = LegacyGraph::new("const_link_arg");
         let startblock = Block {

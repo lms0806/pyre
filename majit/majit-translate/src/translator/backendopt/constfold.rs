@@ -881,8 +881,8 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
 /// RPython `constant_fold_graph(graph)` at `constfold.py:316-370`.
 ///
 /// Two-phase fold:
-/// - Phase 1 (`:317-320`): per-block constant fold.
-/// - Phase 2 (`:325-370`): fixpoint loop combining `constant_diffuse`
+/// - Pass 1 (`:317-320`): per-block constant fold.
+/// - Pass 2 (`:325-370`): fixpoint loop combining `constant_diffuse`
 ///   (block-level constant promotion / `same_as` hoisting) with the
 ///   link-level pass — for each incoming constant link, fold the
 ///   target block's prefix and either (a) rewire the link past the
@@ -1047,7 +1047,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
 /// `ConstValue`s, so the local port relies on the caller passing a
 /// `ConstValue` shape that user code provably cannot construct (e.g.
 /// `ConstValue::SpecTag(unique_u64)`). Passing a `ConstValue::Str`
-/// or any other user-reachable variant would be **NEW-DEVIATION** —
+/// or any other user-reachable variant would be a **deviation** —
 /// any same-valued constant in user code would be silently rewritten.
 pub fn replace_symbolic(graph: &FunctionGraph, symbolic: &ConstValue, value: Constant) -> bool {
     assert!(
@@ -1104,7 +1104,7 @@ pub const WE_ARE_JITTED_TAG_ID: u64 = u64::MAX - 0x57E_A1E_71D;
 /// `replace_symbolic` keys on Python `is` identity. The Rust port
 /// uses [`WE_ARE_JITTED_TAG_ID`] as the identity-bearing
 /// `ConstValue::SpecTag` shape; passing any user-reachable
-/// `ConstValue` would be a NEW-DEVIATION (silent rewriting of
+/// `ConstValue` would be a deviation (silent rewriting of
 /// matching values). Once `rlib/jit.py` is ported and emits
 /// `Constant(ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID), Signed)` at
 /// every `we_are_jitted()` call site, this function performs the
@@ -1167,7 +1167,7 @@ fn fixup_op_result(opname: &str, result: ConstValue) -> ConstValue {
 ///     return container._as_ptr()
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION (`lltype._parentable` / `_keepparent` /
+/// TODO: `lltype._parentable` / `_keepparent` /
 /// `_parentstructure()` not yet ported — see
 /// `rtyper/lltypesystem/lltype.rs:1209` "structured error pending a
 /// `_parent_link` port"). Until the parent-link infra lands, the

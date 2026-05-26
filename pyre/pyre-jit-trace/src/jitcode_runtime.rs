@@ -127,7 +127,7 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
 // jitcode the codewriter side stored in
 // `JitDriverStaticData.mainjitcode`.
 //
-// Production identity: `pyre-jit-trace/build.rs:33-54` (Task #140)
+// Production identity: `pyre-jit-trace/build.rs:33-54`
 // includes `pyre/pyre-jit/src/eval.rs` in the source-only walk so the
 // scan below picks up the `eval_loop_jit` jitcode whose
 // `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
@@ -448,7 +448,7 @@ pub fn all_descr_refs() -> &'static [DescrRef] {
 /// + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
 /// a return value instead of panicking.
 ///
-/// PRE-EXISTING-ADAPTATION (diagnostic). RPython has no equivalent
+/// TODO(diagnostic). RPython has no equivalent
 /// of this Result-returning shape because upstream's `setup_insns`
 /// has total opname coverage at startup. The strict variant
 /// [`build_default_bh_builder`] is the production path; this helper is
@@ -646,7 +646,7 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
                 }
                 cursor += 1;
             }
-            // PRE-EXISTING-ADAPTATION pseudo-argcode for pyre-only
+            // TODO: pseudo-argcode for pyre-only
             // helper-side opnames.  Each `*_pyre/P` opname carries its
             // own flat payload shape; see `pyre_p_payload_len` for the
             // table.
@@ -879,7 +879,7 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
                     _ => return None,
                 });
             }
-            // PRE-EXISTING-ADAPTATION: pyre `*_pyre/P` payloads are
+            // TODO: pyre `*_pyre/P` payloads are
             // opaque to the canonical operand-resolver — no matching
             // `ResolvedOperand` variant exists.  Advance the cursor by
             // the per-opname computed length so the trailing
@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
     }
 
-    // Task #85 closure check: the strict builder covers every opname in
+    // Closure check: the strict builder covers every opname in
     // the generated insns table.  Earlier revisions kept this ignored
     // while kind-flow bugs emitted pyre-only mixed signatures such as
     // `int_ge/ir>i` and a late `int_mod/ii>i` leak; those are now fixed
@@ -1338,7 +1338,7 @@ mod tests {
     // blackhole aliases.
     #[test]
     fn build_default_bh_builder_matches_insns_table() {
-        // Slice 3a: the runtime-side `BlackholeInterpBuilder` is reachable
+        // The runtime-side `BlackholeInterpBuilder` is reachable
         // from pyre-jit-trace. After `setup_insns + wire_bhimpl_handlers`
         // it must carry the same byte<->opname mapping as the build-time
         // insns bincode, and it must resolve the three well-known
@@ -1379,14 +1379,14 @@ mod tests {
 
     #[test]
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
-        // Task #85 lock-in: every generated opname must be wired by
+        // Lock-in: every generated opname must be wired by
         // `wire_bhimpl_handlers`.  Any entry here means codewriter /
         // regalloc emitted a kind shape that no RPython blackhole handler
         // has — fix at upstream emission, do NOT add a `*_r>i` /
         // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // These are the current Task #85 kind-flow gaps emitted by
+        // These are the current kind-flow gaps emitted by
         // generated helper jitcodes. Keep them as an explicit snapshot
         // rather than wiring aliases: RPython has only the integer-kind
         // comparison handler here, so new entries still indicate an
@@ -1394,7 +1394,7 @@ mod tests {
         let expected: Vec<String> = vec!["int_le/ri>i".to_string(), "int_le/rr>i".to_string()];
         assert_eq!(
             unwired, expected,
-            "Task #85 unwired-opname snapshot drifted. If a new entry \
+            "Unwired-opname snapshot drifted. If a new entry \
              appeared, find the new kind-flow bug upstream instead of \
              adding a bhhandler alias.  Existing entries document a \
              pending upstream rewrite — see the `expected` literal.",

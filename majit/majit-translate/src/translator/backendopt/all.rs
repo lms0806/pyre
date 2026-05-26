@@ -70,7 +70,7 @@ pub fn backend_optimizations(
     // unported pass as a `TaskError` when (and only when) the live
     // config requests it — exactly the upstream "pass raises mid-
     // pipeline" semantic. Earlier "collect every missing leaf up
-    // front" was a NEW-DEVIATION that skipped the ported passes
+    // front" was a deviation that skipped the ported passes
     // entirely.
 
     // Upstream `:51-53 print_statistics`. The first emission carries
@@ -352,7 +352,7 @@ pub(crate) fn inline_malloc_removal_phase(
     // `remove_mallocs(translator, graphs)` and call it from here.
     if boolopt(config, "mallocs")? {
         return Err(TaskError {
-            message: "all.py:160 remove_mallocs: PRE-EXISTING-ADAPTATION — \
+            message: "all.py:160 remove_mallocs: TODO — \
                       malloc.py (566 LOC LLTypeMallocRemover / \
                       BaseMallocRemover escape-analysis pass) is \
                       unported. Upstream default has mallocs=True so the \

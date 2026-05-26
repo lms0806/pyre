@@ -59,7 +59,7 @@ pub struct TreeLoop {
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.
     pub snapshots: Vec<crate::recorder::Snapshot>,
-    /// Epic H H-3.0a: per-position BoxRef pool inherited from the
+    /// H-3.0a: per-position BoxRef pool inherited from the
     /// `recorder::Trace` that produced this loop. `box_pool[i]` is the
     /// `AbstractValue` mirror of the operation at `op_count == i`
     /// (inputargs followed by ops, in record order). Empty for tests
@@ -1739,11 +1739,11 @@ impl TraceCtx {
 
     /// history.py: cut — restore recorder to a saved position.
     ///
-    /// Does NOT truncate `self.snapshots` — matches the pre-Task #70
+    /// Does NOT truncate `self.snapshots` — matches the pre-
     /// `recorder::Trace::cut` behavior where snapshots grew monotonically
     /// even across rewinds. Downstream code only indexes new snapshot ids
     /// minted after each cut, so stale entries are harmless; truncating
-    /// regresses bench (tested under Task #70).
+    /// regresses bench (tested under ).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
     }
@@ -1861,7 +1861,7 @@ impl TraceCtx {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
 
-    /// PRE-EXISTING-ADAPTATION: low-level / single-frame snapshot helper
+    /// TODO: low-level / single-frame snapshot helper
     /// used by callers that record guards without a populated framestack
     /// to walk.
     ///
@@ -1881,7 +1881,7 @@ impl TraceCtx {
     /// callers using this path don't manage virtualizables or virtual
     /// refs.
     ///
-    /// Convergence (Task #89): once `S::Sym` is lifted into
+    /// Convergence: once `S::Sym` is lifted into
     /// `MIFrame::populate_for_guard`, both call sites can route through
     /// the standard `capture_resumedata(snapshot)` flow built from the
     /// live framestack and this helper dissolves.
@@ -2049,7 +2049,7 @@ impl TraceCtx {
 
     /// `history.py:204` `Const.same_constant`-adjacent typed reader.
     /// Returns the typed `Value` (Int/Ref/Float/Void) for a constant
-    /// `OpRef`.  Task #297 convergence path: every `constant_value` /
+    /// `OpRef`.  convergence path: every `constant_value` /
     /// `raw_bits` consumer that needs to distinguish primitive types
     /// (rather than treat them all as `i64`) should migrate here.
     /// Internally identical to [`ConstantPool::get_value`].
@@ -2125,7 +2125,7 @@ impl TraceCtx {
     //
     // See `step2e_traceposition_parity_2026_04_22` memory +
     // `rpython-trace-jitcode-hidden-candle.md` plan (Step 3–5) for the
-    // multi-session route.
+    // route.
 
     pub(crate) fn do_record_op(
         recorder: &mut Trace,
@@ -2220,7 +2220,7 @@ impl TraceCtx {
     /// Pyre analog of RPython's `MetaInterp.history.trace` access — after
     /// tracing ends, downstream callers (optimizer, bridge export) see
     /// the loop as `TreeLoop { inputargs, ops, snapshots }`. Snapshots
-    /// come from the TraceCtx-owned side table (Task #70 moved them off
+    /// come from the TraceCtx-owned side table (moved them off
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(self) -> crate::history::TreeLoop {
         // H-3.0a: forward the recorder's BoxRef pool so the optimizer
@@ -2600,7 +2600,7 @@ impl TraceCtx {
     /// call.py:210-335 in full (raise / random-effects / write /
     /// collect / virtualizable / quasi-immut analyzers); the remaining
     /// gap is plumbing the per-callsite EI it produces back to runtime
-    /// trace recording — Task #64 (analyzer-rollout) is that plumbing
+    /// trace recording — (analyzer-rollout) is that plumbing
     /// work, not a missing analyzer.
     pub fn call_typed(
         &mut self,
@@ -3726,7 +3726,7 @@ impl TraceCtx {
         result
     }
 
-    // ── Slice 4 Slice 1c.0: typed (i/r/f) `_with_effect` recorders ──
+    // ── 0: typed (i/r/f) `_with_effect` recorders ──
     //
     // Mirrors the void-family `_with_effect` wrappers (call_*_void_typed_with_effect)
     // for the int/ref/float result kinds.  Pyre's canonical typed

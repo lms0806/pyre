@@ -1353,7 +1353,7 @@ fn dispatch_op(
     }
 }
 
-/// Phase 3c consumer for the `residual_call_{kinds}_{reskind}` shape
+/// Consumer for the `residual_call_{kinds}_{reskind}` shape
 /// emitted by `codewriter::emit_residual_call_shape`.
 ///
 /// SSARepr arg layout (as produced by `emit_residual_call_shape`):
@@ -1497,7 +1497,7 @@ fn dispatch_residual_call(
         reskind,
     );
 
-    // Slice 3 of the EffectInfo wire-up epic: derive the dispatch branch
+    // Derive the dispatch branch
     // from `stub.effect_info`. Mirrors `pyjitpl.py:1995-2126
     // do_residual_call`'s precedence — the optimizer upstream picks
     // `call_may_force` / `call_release_gil` / `call_loopinvariant` /
@@ -1519,7 +1519,7 @@ fn dispatch_residual_call(
         return;
     }
 
-    // Slice 4 Slice 1c.1: the int / ref / float arms route through the
+    // The int / ref / float arms route through the
     // canonical `residual_call_<kind>_canonical_via_target_with_effect_info`
     // wrappers (jitcode/assembler.rs:2026 / 2067 / 2171), threading
     // `stub.effect_info` end-to-end exactly like the void path at line
@@ -1559,7 +1559,7 @@ fn dispatch_residual_call(
             // and `:1462 is_call_release_gil` excludes
             // `CALL_RELEASE_GIL_R` from the predicate.  No upstream
             // dispatcher / optimizer / backend can consume a
-            // `CALL_RELEASE_GIL_R` op; emitting one is a NEW-DEVIATION
+            // `CALL_RELEASE_GIL_R` op; emitting one is a deviation
             // surface that pyre rejects at the codewriter layer.
             panic!(
                 "dispatch_residual_call: ReleaseGil + ResKind::Ref has no upstream \

@@ -48,16 +48,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `cast_ptr_to_int` call whose operand reached the typer without a
 /// producer-set `SomeValue::Ptr` annotation — i.e. the struct's
 /// `Ptr(GcStruct(...))` is not in the walker lltype catalog yet
-/// (Phase 1 / Phase 5 of the typed-ref-someptr-followup-epic).
+/// (typed-ref-someptr-followup progression).
 ///
-/// Phase 4 progression gate (swap deletion): this counter must read 0
+/// Progression gate (swap deletion): this counter must read 0
 /// across a representative production run.  Read it via
 /// [`swap_fallback_hits`]; reset between runs via
 /// [`reset_swap_fallback_hits`].
 pub(crate) static SWAP_FALLBACK_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the current value of the `cast_ptr_to_int` swap fallback hit
-/// counter.  Used by Phase 4 readiness checks + by unit tests.
+/// counter.  Used by readiness checks + by unit tests.
 pub fn swap_fallback_hits() -> u64 {
     SWAP_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -147,8 +147,8 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     landed.  Outstanding: `cast_primitive` (rbuiltin.py:471, needs
 ///     `gen_cast` helper + the cast-table at `rbuiltin.py:480+`).
 ///   * rbuiltin.py:462-600 — `llmemory.*` family (need `Address` /
-///     `_fakeaddress` ports — Task #234).  `cast_ptr_to_int` /
-///     `cast_int_to_ptr` (rbuiltin.py:543/551) landed in Slice B.1 —
+///     `_fakeaddress` ports).  `cast_ptr_to_int` /
+///     `cast_int_to_ptr` (rbuiltin.py:543/551) are ported —
 ///     frontend `expr as T` for `Ref↔Int` emits `Call { target:
 ///     FunctionPath { segments: ["rpython", "rtyper", "lltypesystem",
 ///     "lltype", "cast_*"] }, args }`, routed through the
@@ -160,10 +160,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     has no constant carrier for the target Ptr type; the result
 ///     lltype is recovered from `hop.r_result.lowleveltype` (matches
 ///     upstream's `resulttype=hop.r_result.lowleveltype`).
-///     PRE-EXISTING-ADAPTATION: `InstanceRepr→PtrRepr` swap in
-///     `rtype_cast_ptr_to_int` body awaits
-///     typed-ref-someptr-followup-epic Phase 2 (typed `&Foo` lift to
-///     `SomePtr`).
+///     TODO: `InstanceRepr→PtrRepr` swap in
+///     `rtype_cast_ptr_to_int` body awaits typed `&Foo` lift to
+///     `SomePtr`.
 ///   * rbuiltin.py:632-648 — `objectmodel.free_non_gc_object` landed
 ///     via `Repr::gc_flavor_str()` (default `None`, `InstanceRepr`
 ///     overrides) — the `std::any::Any` downcast that the original
@@ -1283,7 +1282,7 @@ fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 /// `cast_bool_to_uint` per the source repr (rint.py:202-213,
 /// rint.py:657-675, rbool.py:62-71).
 ///
-/// PRE-EXISTING-ADAPTATION (Task #344): upstream dispatch goes through
+/// TODO: upstream dispatch goes through
 /// `extregistry._about_` lookup keyed on the class object; pyre keys
 /// on the qualname-keyed BUILTIN_TYPER `module_entries` table because
 /// no extregistry port exists yet.  Body is parity-correct — only
@@ -2868,25 +2867,24 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     use crate::translator::rtyper::rmodel::PtrRepr;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    // PRE-EXISTING-ADAPTATION (typed-ref-someptr-followup-epic, Phase 3
-    // landed: this block IS the retirement-readiness diagnostic for
-    // the legacy late InstanceRepr→PtrRepr swap).  pyre's surface DSL
+    // TODO: this block IS the retirement-readiness diagnostic for
+    // the legacy late InstanceRepr→PtrRepr swap.  pyre's surface DSL
     // has no `lltype.*` HostObject, so typed `&Foo` references whose
     // owning struct is NOT in the walker lltype catalog lift to
     // `SomeInstance(classdef=None)` instead of upstream's
-    // `SomePtr(ll_ptrtype)`.  Phase 2 lifted catalog-registered
-    // typed-refs to `SomeValue::Ptr` at producer time
+    // `SomePtr(ll_ptrtype)`.  Catalog-registered typed-refs lift to
+    // `SomeValue::Ptr` at producer time
     // (`flowspace/rust_source/build_flow.rs::annotate_typed_ptr_inputs`)
     // so the rtyper makerepr path
     // (`rmodel.rs:2545 SomeValue::Ptr → PtrRepr`) lands them in
     // `hop.args_r[0]` already as `PtrRepr` — the swap below is now
     // load-bearing only for unregistered structs.
     //
-    // Phase 4 progression gate: SWAP_FALLBACK_HITS reading 0 across a
+    // Progression gate: SWAP_FALLBACK_HITS reading 0 across a
     // representative production run (currently `pyre/check.py`) is the
-    // sign every reachable struct has been added to the walker catalog
-    // (Phase 1 / Phase 5); once that holds the swap can be deleted in
-    // favour of the line-by-line `rbuiltin.py:541-549` port below.
+    // sign every reachable struct has been added to the walker catalog;
+    // once that holds the swap can be deleted in favour of the
+    // line-by-line `rbuiltin.py:541-549` port below.
     let producer_set_someptr = matches!(
         hop.args_v.borrow()[0].clone(),
         Hlvalue::Variable(ref var) if matches!(
@@ -2918,7 +2916,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
                 return Err(TyperError::message(format!(
                     "rtype_cast_ptr_to_int: operand concretetype must be Ptr(...) for \
                      late InstanceRepr→PtrRepr swap (typed-ref-someptr-followup-epic \
-                     Phase 3 fallback path), got {other:?}"
+                     fallback path), got {other:?}"
                 )));
             }
         };
@@ -2984,7 +2982,7 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 /// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py:551-557)
 /// — two formal inputs.
 ///
-/// PRE-EXISTING-ADAPTATION (Task #345): pyre's frontend emits a 1-arg
+/// TODO: pyre's frontend emits a 1-arg
 /// `Call { target: FunctionPath { segments: ["rpython", "rtyper",
 /// "lltypesystem", "lltype", "cast_int_to_ptr"] }, args: [operand] }`
 /// because at `Expr::Cast` lowering time the frontend has only
