@@ -74,7 +74,8 @@ enum DictArgKey {
 impl DictArgKey {
     fn from_arg(arg: OpRef, ctx: &OptContext) -> Self {
         let resolved = ctx.get_box_replacement(arg);
-        match ctx.get_constant(resolved) {
+        let cval = ctx.get_constant(resolved);
+        match cval {
             Some(value) => DictArgKey::Const(value),
             None => DictArgKey::Op(resolved),
         }
@@ -297,7 +298,9 @@ impl CachedField {
                 if let (Some(v1), Some(v2)) = (e1.as_opref(), e2.as_opref()) {
                     let v1r = ctx.get_box_replacement(v1);
                     let v2r = ctx.get_box_replacement(v2);
-                    if ctx.is_constant(v1r) && ctx.is_constant(v2r) && v1r != v2r {
+                    let c1 = ctx.get_constant(v1r);
+                    let c2 = ctx.get_constant(v2r);
+                    if matches!((c1, c2), (Some(a), Some(b)) if a != b) {
                         return true;
                     }
                 }
@@ -469,7 +472,9 @@ impl ArrayCachedItem {
                 continue;
             }
             // heap.py:293-294: if not value.is_constant(): continue
-            let (Some(c1), Some(c2)) = (ctx.get_constant(v1), ctx.get_constant(v2)) else {
+            let c1 = ctx.get_constant(v1);
+            let c2 = ctx.get_constant(v2);
+            let (Some(c1), Some(c2)) = (c1, c2) else {
                 continue;
             };
             // heap.py:296: if not value1.same_constant(value2): return CANNOT_ALIAS
@@ -887,7 +892,9 @@ impl OptHeap {
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
         let array = ctx.get_box_replacement(op.arg(0));
-        let index_val = ctx.get_constant_int(op.arg(1))?;
+        let index_val = ctx
+            .get_box_replacement_box(op.arg(1))
+            .and_then(|b| ctx.get_constant_int_box(&b))?;
         Some((array, descr.index(), index_val))
     }
 
@@ -1400,7 +1407,10 @@ impl OptHeap {
         if op.num_args() < 5 {
             return false;
         }
-        let flag = match ctx.get_constant_int_or_bound(op.arg(4)) {
+        let flag = match ctx
+            .get_box_replacement_box(op.arg(4))
+            .and_then(|b| ctx.get_constant_int_or_bound_box(&b))
+        {
             Some(v) => v,
             None => return false,
         };
@@ -1454,7 +1464,8 @@ impl OptHeap {
             // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
             if flag != FLAG_LOOKUP {
                 let known_ge_zero = ctx
-                    .get_int_bound(res_v)
+                    .get_box_replacement_box(res_v)
+                    .and_then(|b| ctx.peek_intbound_box(&b))
                     .map_or(false, |b| b.known_ge_const(0));
                 if !known_ge_zero {
                     return false;
@@ -1532,18 +1543,18 @@ impl OptHeap {
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6
-            && ctx.is_constant(op.arg(3))
-            && ctx.is_constant(op.arg(4))
-            && ctx.is_constant(op.arg(5))
+            && ctx.get_constant_int(op.arg(3)).is_some()
+            && ctx.get_constant_int(op.arg(4)).is_some()
+            && ctx.get_constant_int(op.arg(5)).is_some()
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
             && op.num_args() >= 5
-            && ctx.is_constant(op.arg(2))
-            && ctx.is_constant(op.arg(3))
-            && ctx.is_constant(op.arg(4))
+            && ctx.get_constant_int(op.arg(2)).is_some()
+            && ctx.get_constant_int(op.arg(3)).is_some()
+            && ctx.get_constant_int(op.arg(4)).is_some()
         {
             return;
         }
@@ -2659,7 +2670,7 @@ impl OptHeap {
         //   cached_result = submap.lookup_cached(arrayinfo, indexop)
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
-            let indexb = ctx.getintbound(op.arg(1));
+            let indexb = ctx.getintbound_via_box(op.arg(1));
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
             let descr_idx = descr.index();
@@ -2702,7 +2713,7 @@ impl OptHeap {
                 //   submap.cache_varindex_write(arrayinfo, ...)
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
-                    let indexb = ctx.getintbound(op.arg(1));
+                    let indexb = ctx.getintbound_via_box(op.arg(1));
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
                     let arrayinfo = ctx.get_box_replacement(op.arg(0));
                     let indexbox = ctx.get_box_replacement(op.arg(1));
@@ -2777,31 +2788,86 @@ impl OptHeap {
                     }
                     return self.emit_residual_call(op, ctx);
                 }
-                OopSpecIndex::Arraycopy | OopSpecIndex::Arraymove => {
-                    // ARRAYCOPY/ARRAYMOVE: only invalidate affected array entries.
-                    // Call args: [func_addr, source, dest, source_start, dest_start, length, ...]
-                    // args[2] = dest array, args[4] = dest_start, args[5] = length
+                OopSpecIndex::Arraycopy => {
+                    // ARRAYCOPY: precise range handling only when
+                    // heapcache.py:393-397 would see actual ConstInt
+                    // source_start, dest_start, and length.
                     self.mark_escaped_varargs(op, ctx);
                     self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
 
-                    let dest_ref = if op.num_args() > 2 {
+                    let dest_ref = if op.num_args() >= 6 {
                         op.arg(2)
                     } else {
                         OpRef::NONE
                     };
-                    let dest_start = if op.num_args() > 4 {
+                    let source_start = if op.num_args() >= 6 {
+                        ctx.get_constant_int(op.arg(3))
+                    } else {
+                        None
+                    };
+                    let dest_start = if op.num_args() >= 6 {
                         ctx.get_constant_int(op.arg(4))
                     } else {
                         None
                     };
-                    let length = if op.num_args() > 5 {
+                    let length = if op.num_args() >= 6 {
                         ctx.get_constant_int(op.arg(5))
                     } else {
                         None
                     };
+                    let precise_range =
+                        source_start.is_some() && dest_start.is_some() && length.is_some();
 
                     if !dest_ref.is_none() {
-                        self.invalidate_array_caches_for_copy(ctx, dest_ref, dest_start, length);
+                        self.invalidate_array_caches_for_copy(
+                            ctx,
+                            dest_ref,
+                            if precise_range { dest_start } else { None },
+                            if precise_range { length } else { None },
+                        );
+                    } else {
+                        self.clean_caches(ctx);
+                    }
+
+                    return OptimizationResult::Emit(op.clone());
+                }
+                OopSpecIndex::Arraymove => {
+                    // ARRAYMOVE: args are [func_addr, array, source_start,
+                    // dest_start, length]. As with ARRAYCOPY, require actual
+                    // ConstInt starts/length before taking the precise range.
+                    self.mark_escaped_varargs(op, ctx);
+                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+
+                    let dest_ref = if op.num_args() >= 5 {
+                        op.arg(1)
+                    } else {
+                        OpRef::NONE
+                    };
+                    let source_start = if op.num_args() >= 5 {
+                        ctx.get_constant_int(op.arg(2))
+                    } else {
+                        None
+                    };
+                    let dest_start = if op.num_args() >= 5 {
+                        ctx.get_constant_int(op.arg(3))
+                    } else {
+                        None
+                    };
+                    let length = if op.num_args() >= 5 {
+                        ctx.get_constant_int(op.arg(4))
+                    } else {
+                        None
+                    };
+                    let precise_range =
+                        source_start.is_some() && dest_start.is_some() && length.is_some();
+
+                    if !dest_ref.is_none() {
+                        self.invalidate_array_caches_for_copy(
+                            ctx,
+                            dest_ref,
+                            if precise_range { dest_start } else { None },
+                            if precise_range { length } else { None },
+                        );
                     } else {
                         self.clean_caches(ctx);
                     }
@@ -2976,7 +3042,10 @@ impl OptHeap {
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
+                        if let Some(index) = ctx
+                            .get_box_replacement_box(pending_op.arg(1))
+                            .and_then(|b| ctx.get_constant_int_box(&b))
+                        {
                             let array = ctx.get_box_replacement(pending_op.arg(0));
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some((array, pending_op));
@@ -3043,13 +3112,19 @@ impl OptHeap {
                         Some(Self::field_cache_identity(&descr)),
                     )
                 } else if op.num_args() > 1 {
-                    let idx = ctx.get_constant_int(op.arg(1)).map(|v| v as u32);
+                    let idx = ctx
+                        .get_box_replacement_box(op.arg(1))
+                        .and_then(|b| ctx.get_constant_int_box(&b))
+                        .map(|v| v as u32);
                     (idx, idx.map(|v| v as usize))
                 } else {
                     (None, None)
                 };
                 if let Some(idx) = dep_field_idx {
-                    if let Some(dep_ptr) = ctx.get_constant_int(obj) {
+                    if let Some(dep_ptr) = ctx
+                        .get_box_replacement_box(obj)
+                        .and_then(|b| ctx.get_constant_int_box(&b))
+                    {
                         ctx.add_quasi_immutable_dep((dep_ptr as u64, idx));
                     }
                 }

@@ -175,10 +175,12 @@ impl StrPtrInfoExt for StrPtrInfo {
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
         if let Some(lgtop) = self.lgtop {
-            return ctx.get_constant_int(lgtop).or_else(|| {
-                ctx.get_int_bound(lgtop)
-                    .filter(|b| b.is_constant())
-                    .map(|b| b.get_constant_int())
+            return ctx.get_box_replacement_box(lgtop).and_then(|b| {
+                ctx.get_constant_int_box(&b).or_else(|| {
+                    ctx.peek_intbound_box(&b)
+                        .filter(|ib| ib.is_constant())
+                        .map(|ib| ib.get_constant_int())
+                })
             });
         }
         match &self.variant {
@@ -189,7 +191,10 @@ impl StrPtrInfoExt for StrPtrInfo {
             // vstring.py:171-175: VStringPlainInfo.getstrlen
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
             // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop
-            VStringVariant::Slice(info) => ctx.get_constant_int_or_bound(info.lgtop),
+            VStringVariant::Slice(info) => {
+                let b = ctx.get_box_replacement_box(info.lgtop)?;
+                ctx.get_constant_int_or_bound_box(&b)
+            }
             // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
                 let vleft_box = ctx.get_box_replacement_box(info.vleft);
@@ -221,7 +226,11 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Plain(info) => {
                 let mut chars = Vec::with_capacity(info._chars.len());
                 for ch in &info._chars {
-                    chars.push(ctx.get_constant_int((*ch)?)?);
+                    let ch_opref = (*ch)?;
+                    // vstring.py:179: `c.is_constant()` for Plain strings
+                    // accepts only an actual ConstInt, not a synthesized
+                    // ConstInt from a constant IntBound.
+                    chars.push(ctx.get_constant_int(ch_opref)?);
                 }
                 Some(chars)
             }
@@ -230,8 +239,11 @@ impl StrPtrInfoExt for StrPtrInfo {
                 let s_box = ctx.get_box_replacement_box(info.s);
                 let source = s_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let source_chars = source.get_constant_string_spec(ctx, mode)?;
-                let start = usize::try_from(ctx.get_constant_int_or_bound(info.start)?).ok()?;
-                let length = usize::try_from(ctx.get_constant_int_or_bound(info.lgtop)?).ok()?;
+                let start_box = ctx.get_box_replacement_box(info.start)?;
+                let start = usize::try_from(ctx.get_constant_int_or_bound_box(&start_box)?).ok()?;
+                let lgtop_box = ctx.get_box_replacement_box(info.lgtop)?;
+                let length =
+                    usize::try_from(ctx.get_constant_int_or_bound_box(&lgtop_box)?).ok()?;
                 let stop = start.checked_add(length)?;
                 if stop > source_chars.len() {
                     return None;
@@ -260,7 +272,8 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Slice(info) => {
                 // vstring.py:491: index = _int_add(sinfo.start, index)
                 // Accept intbound-constant starts, not just literal constants.
-                let start = ctx.get_constant_int_or_bound(info.start)?;
+                let start_box = ctx.get_box_replacement_box(info.start)?;
+                let start = ctx.get_constant_int_or_bound_box(&start_box)?;
                 let s_box = ctx.get_box_replacement_box(info.s);
                 let source = s_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 source.strgetitem(index as i64 + start, ctx)
@@ -1496,6 +1509,39 @@ mod tests {
         );
         assert_eq!(info.get_known_str_length(&ctx, 0), Some(3));
         assert_eq!(info.strgetitem(1, &ctx), Some(OpRef::int_op(11)));
+    }
+
+    #[test]
+    fn test_str_ptr_info_plain_constant_string_spec_rejects_intbound_constant_chars() {
+        let mut ctx = OptContext::new(16);
+        let ch = OpRef::int_op(10);
+        let ch_box = ctx
+            .ensure_box(ch)
+            .expect("body-namespace OpRef must have a BoxRef slot");
+        ctx.setintbound(&ch_box, &IntBound::from_constant(97));
+
+        assert_eq!(
+            ctx.get_box_replacement_box(ch)
+                .and_then(|b| ctx.get_constant_int_box(&b)),
+            Some(97),
+            "test setup should expose a get_constant_box-style IntBound constant",
+        );
+
+        let info = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            lgtop: None,
+            mode: 0,
+            length: 1,
+            variant: VStringVariant::Plain(VStringPlainInfo {
+                _chars: vec![Some(ch)],
+            }),
+            last_guard_pos: -1,
+            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+        });
+
+        // vstring.py:178-183 checks `c.is_constant()` directly for Plain
+        // strings; a constant IntBound is not enough here.
+        assert_eq!(info.get_constant_string_spec(&ctx, 0), None);
     }
 
     #[test]

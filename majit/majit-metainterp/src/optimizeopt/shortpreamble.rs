@@ -1570,7 +1570,12 @@ impl ProducedShortOp {
             invented_name: self.invented_name,
             preamble_op: getarrayitem_op.clone(),
         };
-        if obj_resolved.is_constant() || ctx.get_constant(obj_resolved).is_some() {
+        if obj_resolved.is_constant()
+            || ctx
+                .get_box_replacement_box(obj_resolved)
+                .and_then(|b| ctx.get_constant_box(&b))
+                .is_some()
+        {
             if let Some(info) = ctx.get_const_info_array_mut(obj_resolved, descr.clone()) {
                 info.set_preamble_item(index as usize, pop.clone());
             }

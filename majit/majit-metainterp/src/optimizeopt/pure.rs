@@ -625,7 +625,10 @@ impl OptPure {
                         // `preamble_pure_ops` upstream paths
                         // (optimizer.py:343 get_box_replacement).
                         let arg = ctx.get_box_replacement(arg);
-                        match ctx.get_constant(arg) {
+                        match ctx
+                            .get_box_replacement_box(arg)
+                            .and_then(|b| b.const_value())
+                        {
                             Some(v) if v == *expected_value => {}
                             _ => {
                                 args_match = false;
@@ -804,7 +807,10 @@ impl OptPure {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
             let forced = self.force_box(op.arg(i), ctx);
-            let Some(const_value) = ctx.get_constant(forced) else {
+            let Some(const_value) = ctx
+                .get_box_replacement_box(forced)
+                .and_then(|b| ctx.get_constant_box(&b))
+            else {
                 return None;
             };
             arg_consts.push(const_value);
@@ -869,7 +875,7 @@ impl Optimization for OptPure {
                 });
                 if all_args_const {
                     if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                        ctx.find_or_record_constant_int(postponed.pos.get(), folded);
+                        ctx.make_constant(postponed.pos.get(), Value::Int(folded));
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
                     }

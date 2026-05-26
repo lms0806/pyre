@@ -71,11 +71,16 @@ impl OptIntBounds {
         }
     }
 
-    /// optimizer.py:99-113 getintbound — thin wrapper over `ctx.getintbound`.
-    /// optimizer.py:100 `assert op.type == 'i'` is enforced inside
-    /// `ctx.getintbound`.
+    #[cfg(test)]
     fn getintbound(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
         ctx.getintbound(opref)
+    }
+
+    fn getintbound_box(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
+        match ctx.get_box_replacement_box(opref) {
+            Some(b) => ctx.getintbound_handle(&b).borrow().clone(),
+            None => ctx.getintbound_via_box(opref),
+        }
     }
 
     /// Intersect a bound into the stored bound for opref. RPython:
@@ -134,8 +139,8 @@ impl OptIntBounds {
     fn optimize_int_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -150,8 +155,8 @@ impl OptIntBounds {
     fn optimize_int_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -166,8 +171,8 @@ impl OptIntBounds {
     fn optimize_int_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -182,8 +187,8 @@ impl OptIntBounds {
     fn optimize_int_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -200,18 +205,18 @@ impl OptIntBounds {
     fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0 (4 forms)
         if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_sub.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_sub.arg(1));
-            let b_arg0_0 = self.getintbound(arg0_0, ctx);
+            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
             if let Some(inner_eq) = self.as_operation(arg0_1, OpCode::IntEq, ctx) {
                 let inner_0 = ctx.get_box_replacement(inner_eq.arg(0));
                 let inner_1 = ctx.get_box_replacement(inner_eq.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
                 if autogen_eq(inner_0, &b_inner_0, arg0_0, &b_arg0_0)
                     && autogen_eq(arg1, &b1, inner_1, &b_inner_1)
@@ -231,12 +236,12 @@ impl OptIntBounds {
         if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
             let arg1_0 = ctx.get_box_replacement(arg1_sub.arg(0));
             let arg1_1 = ctx.get_box_replacement(arg1_sub.arg(1));
-            let b_arg1_0 = self.getintbound(arg1_0, ctx);
+            let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
             if let Some(inner_eq) = self.as_operation(arg1_1, OpCode::IntEq, ctx) {
                 let inner_0 = ctx.get_box_replacement(inner_eq.arg(0));
                 let inner_1 = ctx.get_box_replacement(inner_eq.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // eq_sub_eq: int_eq(a, int_sub(x, int_eq(x, a))) => 0
                 if autogen_eq(inner_0, &b_inner_0, arg1_0, &b_arg1_0)
                     && autogen_eq(inner_1, &b_inner_1, arg0, &b0)
@@ -306,8 +311,8 @@ impl OptIntBounds {
     fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // ne_same: int_ne(x, x) => 0
         if autogen_eq(arg1, &b1, arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
@@ -339,8 +344,8 @@ impl OptIntBounds {
     fn optimize_uint_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_unsigned_lt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -355,8 +360,8 @@ impl OptIntBounds {
     fn optimize_uint_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_unsigned_gt(&b1) {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -371,8 +376,8 @@ impl OptIntBounds {
     fn optimize_uint_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_unsigned_le(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -387,8 +392,8 @@ impl OptIntBounds {
     fn optimize_uint_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
@@ -413,8 +418,8 @@ impl OptIntBounds {
     fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // add_zero: int_add(0, x) => x
         if b0.is_constant() && b0.get_constant_int() == 0 {
             let b_old = ctx
@@ -443,8 +448,8 @@ impl OptIntBounds {
             if let Some(arg1_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg1_add.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg1_add.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // add_reassoc_consts: int_add(C2, int_add(C1, x)) => int_add(x, C1+C2)
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
@@ -460,8 +465,8 @@ impl OptIntBounds {
             } else if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg1_sub.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg1_sub.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // add_sub_c_x_c: int_add(C2, int_sub(C1, x)) => int_sub(C1+C2, x)
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
@@ -480,8 +485,8 @@ impl OptIntBounds {
             if let Some(arg0_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg0_add.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg0_add.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 if b1.is_constant() {
                     let c_outer = b1.get_constant_int();
                     // add_reassoc_consts: int_add(int_add(C1, x), C2) => int_add(x, C1+C2)
@@ -500,8 +505,8 @@ impl OptIntBounds {
             } else if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg0_sub.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg0_sub.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 if b1.is_constant() {
                     let c_outer = b1.get_constant_int();
                     // add_sub_c_x_c: int_add(int_sub(C1, x), C2) => int_sub(C1+C2, x)
@@ -529,8 +534,8 @@ impl OptIntBounds {
     fn optimize_int_sub(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // sub_x_x: int_sub(x, x) => 0
         if autogen_eq(arg1, &b1, arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
@@ -540,8 +545,8 @@ impl OptIntBounds {
         if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1));
-            let b0_0 = self.getintbound(arg0_0, ctx);
-            let b0_1 = self.getintbound(arg0_1, ctx);
+            let b0_0 = self.getintbound_box(arg0_0, ctx);
+            let b0_1 = self.getintbound_box(arg0_1, ctx);
             if autogen_eq(arg1, &b1, arg0_1, &b0_1) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -566,8 +571,8 @@ impl OptIntBounds {
             // sub_or_x_y_y: int_sub(int_or(x, y), y) => x  (when x & y == 0)
             let arg0_0 = ctx.get_box_replacement(arg0_int_or.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_int_or.arg(1));
-            let b0_0 = self.getintbound(arg0_0, ctx);
-            let b0_1 = self.getintbound(arg0_1, ctx);
+            let b0_0 = self.getintbound_box(arg0_0, ctx);
+            let b0_1 = self.getintbound_box(arg0_1, ctx);
             if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -592,8 +597,8 @@ impl OptIntBounds {
             // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x  (when x & y == 0)
             let arg0_0 = ctx.get_box_replacement(arg0_int_xor.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_int_xor.arg(1));
-            let b0_0 = self.getintbound(arg0_0, ctx);
-            let b0_1 = self.getintbound(arg0_1, ctx);
+            let b0_0 = self.getintbound_box(arg0_0, ctx);
+            let b0_1 = self.getintbound_box(arg0_1, ctx);
             if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
@@ -639,8 +644,8 @@ impl OptIntBounds {
         } else if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1));
-            let b0_0 = self.getintbound(arg0_0, ctx);
-            let b0_1 = self.getintbound(arg0_1, ctx);
+            let b0_0 = self.getintbound_box(arg0_0, ctx);
+            let b0_1 = self.getintbound_box(arg0_1, ctx);
             if b1.is_constant() {
                 let c_outer = b1.get_constant_int();
                 // sub_add_consts: int_sub(int_add(C1, x), C2) => int_sub(x, C-C1)
@@ -659,8 +664,8 @@ impl OptIntBounds {
         } else if let Some(arg0_int_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_int_sub.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_int_sub.arg(1));
-            let b0_0 = self.getintbound(arg0_0, ctx);
-            let b0_1 = self.getintbound(arg0_1, ctx);
+            let b0_0 = self.getintbound_box(arg0_0, ctx);
+            let b0_1 = self.getintbound_box(arg0_1, ctx);
             if b1.is_constant() {
                 let c_outer = b1.get_constant_int();
                 // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
@@ -680,8 +685,8 @@ impl OptIntBounds {
         if let Some(arg1_int_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
             let arg1_0 = ctx.get_box_replacement(arg1_int_add.arg(0));
             let arg1_1 = ctx.get_box_replacement(arg1_int_add.arg(1));
-            let b1_0 = self.getintbound(arg1_0, ctx);
-            let b1_1 = self.getintbound(arg1_1, ctx);
+            let b1_0 = self.getintbound_box(arg1_0, ctx);
+            let b1_1 = self.getintbound_box(arg1_1, ctx);
             // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
             if autogen_eq(arg1_1, &b1_1, arg0, &b0) {
                 return replace_with(op, OpCode::IntNeg, &[arg1_0]);
@@ -699,8 +704,8 @@ impl OptIntBounds {
     fn optimize_int_mul(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // mul_zero: int_mul(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -751,8 +756,8 @@ impl OptIntBounds {
             // mul_lshift: int_mul(int_lshift(1, y), x) => int_lshift(x, y)
             let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_0.is_constant()
                 && b_inner_0.get_constant_int() == 1
                 && b_inner_1.known_ge_const(0)
@@ -778,8 +783,8 @@ impl OptIntBounds {
             // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
             let inner_0 = ctx.get_box_replacement(arg1_lshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg1_lshift.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_0.is_constant()
                 && b_inner_0.get_constant_int() == 1
                 && b_inner_1.known_ge_const(0)
@@ -797,8 +802,8 @@ impl OptIntBounds {
     fn optimize_int_and(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // and_known_result: int_and(a, b) bound is constant => ConstInt(C)
         let bound = b0.and_bound(&b1);
         if bound.is_constant() {
@@ -880,8 +885,8 @@ impl OptIntBounds {
             if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg1_and.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg1_and.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // and_reassoc_consts: int_and(C2, int_and(C1, x)) => int_and(x, C1&C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() & c_outer;
@@ -898,8 +903,8 @@ impl OptIntBounds {
         } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_0.is_constant() {
                 if b1.is_constant() {
                     // and_reassoc_consts: int_and(int_and(C1, x), C2) => int_and(x, C1&C2)
@@ -927,8 +932,8 @@ impl OptIntBounds {
         } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_or.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_or.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // and_or: int_and(int_or(x, y), z) => int_and(x, z)
             if b_inner_1.and_bound(&b1).known_eq_const(0) {
                 return replace_with(op, OpCode::IntAnd, &[inner_0, arg1]);
@@ -942,8 +947,8 @@ impl OptIntBounds {
         if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
             let inner_0 = ctx.get_box_replacement(arg1_and.arg(0));
             let inner_1 = ctx.get_box_replacement(arg1_and.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
             if autogen_eq(inner_0, &b_inner_0, arg0, &b0) {
                 return replace_with(op, OpCode::IntAnd, &[arg0, inner_1]);
@@ -955,8 +960,8 @@ impl OptIntBounds {
         } else if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
             let inner_0 = ctx.get_box_replacement(arg1_or.arg(0));
             let inner_1 = ctx.get_box_replacement(arg1_or.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // and_or: int_and(z, int_or(x, y)) => int_and(x, z)
             if b_inner_1.and_bound(&b0).known_eq_const(0) {
                 return replace_with(op, OpCode::IntAnd, &[inner_0, arg0]);
@@ -982,8 +987,8 @@ impl OptIntBounds {
     fn optimize_int_or(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // or_known_result: int_or(a, b) bound is constant => ConstInt(C)
         let bound = b0.or_bound(&b1);
         if bound.is_constant() {
@@ -1034,8 +1039,8 @@ impl OptIntBounds {
             if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg1_or.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg1_or.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // or_reassoc_consts: int_or(C2, int_or(C1, x)) => int_or(x, C1|C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() | c_outer;
@@ -1052,16 +1057,16 @@ impl OptIntBounds {
         } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_and.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_and.arg(1));
-            let b_arg0_0 = self.getintbound(arg0_0, ctx);
-            let b_arg0_1 = self.getintbound(arg0_1, ctx);
+            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
+            let b_arg0_1 = self.getintbound_box(arg0_1, ctx);
             // or_and_two_parts shapes when outer = int_and(C, x):
             if b_arg0_0.is_constant() {
                 let c_arg0_0 = b_arg0_0.get_constant_int();
                 if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
                     let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0));
                     let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1));
-                    let b_arg1_0 = self.getintbound(arg1_0, ctx);
-                    let b_arg1_1 = self.getintbound(arg1_1, ctx);
+                    let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
                     if b_arg1_0.is_constant() {
                         // int_or(int_and(C1, x), int_and(C2, x)) => int_and(x, C1|C2)
                         if autogen_eq(arg1_1, &b_arg1_1, arg0_1, &b_arg0_1) {
@@ -1097,8 +1102,8 @@ impl OptIntBounds {
                 if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
                     let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0));
                     let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1));
-                    let b_arg1_0 = self.getintbound(arg1_0, ctx);
-                    let b_arg1_1 = self.getintbound(arg1_1, ctx);
+                    let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
                     if b_arg1_0.is_constant() {
                         // int_or(int_and(x, C1), int_and(C2, x)) => int_and(x, C)
                         if autogen_eq(arg1_1, &b_arg1_1, arg0_0, &b_arg0_0) {
@@ -1132,8 +1137,8 @@ impl OptIntBounds {
         } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
             let arg0_0 = ctx.get_box_replacement(arg0_or.arg(0));
             let arg0_1 = ctx.get_box_replacement(arg0_or.arg(1));
-            let b_arg0_0 = self.getintbound(arg0_0, ctx);
-            let b_arg0_1 = self.getintbound(arg0_1, ctx);
+            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
+            let b_arg0_1 = self.getintbound_box(arg0_1, ctx);
             if b_arg0_0.is_constant() && b1.is_constant() {
                 // or_reassoc_consts: int_or(int_or(C1, x), C2) => int_or(x, C1|C2)
                 let folded = b_arg0_0.get_constant_int() | b1.get_constant_int();
@@ -1159,8 +1164,8 @@ impl OptIntBounds {
         if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
             let arg1_0 = ctx.get_box_replacement(arg1_or.arg(0));
             let arg1_1 = ctx.get_box_replacement(arg1_or.arg(1));
-            let b_arg1_0 = self.getintbound(arg1_0, ctx);
-            let b_arg1_1 = self.getintbound(arg1_1, ctx);
+            let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
+            let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
             // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
             if autogen_eq(arg1_0, &b_arg1_0, arg0, &b0) {
                 return replace_with(op, OpCode::IntOr, &[arg0, arg1_1]);
@@ -1179,8 +1184,8 @@ impl OptIntBounds {
     fn optimize_int_xor(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // xor_known_result: int_xor(a, b) bound is constant => ConstInt(C)
         let bound = b0.xor_bound(&b1);
         if bound.is_constant() {
@@ -1212,8 +1217,8 @@ impl OptIntBounds {
         } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // xor_absorb: int_xor(int_xor(a, b), b) => a
             if autogen_eq(arg1, &b1, inner_1, &b_inner_1) {
                 let b_old = ctx
@@ -1252,8 +1257,8 @@ impl OptIntBounds {
         } else if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
             let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0));
             let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // xor_absorb: int_xor(b, int_xor(a, b)) => a
             if autogen_eq(inner_1, &b_inner_1, arg0, &b0) {
                 let b_old = ctx
@@ -1283,8 +1288,8 @@ impl OptIntBounds {
             if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
                 let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0));
                 let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1));
-                let b_inner_0 = self.getintbound(inner_0, ctx);
-                let b_inner_1 = self.getintbound(inner_1, ctx);
+                let b_inner_0 = self.getintbound_box(inner_0, ctx);
+                let b_inner_1 = self.getintbound_box(inner_1, ctx);
                 // xor_reassoc_consts: int_xor(C2, int_xor(C1, x)) => int_xor(x, C1^C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() ^ c_outer;
@@ -1309,8 +1314,8 @@ impl OptIntBounds {
         } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_0.is_constant() && b1.is_constant() {
                 // xor_reassoc_consts: int_xor(int_xor(C1, x), C2) => int_xor(x, C1^C2)
                 let folded = b_inner_0.get_constant_int() ^ b1.get_constant_int();
@@ -1382,8 +1387,8 @@ impl OptIntBounds {
     fn optimize_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // lshift_zero_x: int_lshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1403,14 +1408,14 @@ impl OptIntBounds {
         if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_0.is_constant() {
                 let c_arg0_0 = b_inner_0.get_constant_int();
                 if let Some(rshift) = self.as_operation(inner_1, OpCode::IntRshift, ctx) {
                     let r0 = ctx.get_box_replacement(rshift.arg(0));
                     let r1 = ctx.get_box_replacement(rshift.arg(1));
-                    let b_r1 = self.getintbound(r1, ctx);
+                    let b_r1 = self.getintbound_box(r1, ctx);
                     if b_r1.is_constant() && b1.is_constant() {
                         let c_r1 = b_r1.get_constant_int();
                         let c_arg1 = b1.get_constant_int();
@@ -1424,7 +1429,7 @@ impl OptIntBounds {
                 } else if let Some(urshift) = self.as_operation(inner_1, OpCode::UintRshift, ctx) {
                     let r0 = ctx.get_box_replacement(urshift.arg(0));
                     let r1 = ctx.get_box_replacement(urshift.arg(1));
-                    let b_r1 = self.getintbound(r1, ctx);
+                    let b_r1 = self.getintbound_box(r1, ctx);
                     if b_r1.is_constant() && b1.is_constant() {
                         let c_r1 = b_r1.get_constant_int();
                         let c_arg1 = b1.get_constant_int();
@@ -1439,7 +1444,7 @@ impl OptIntBounds {
             } else if let Some(rshift) = self.as_operation(inner_0, OpCode::IntRshift, ctx) {
                 let r0 = ctx.get_box_replacement(rshift.arg(0));
                 let r1 = ctx.get_box_replacement(rshift.arg(1));
-                let b_r1 = self.getintbound(r1, ctx);
+                let b_r1 = self.getintbound_box(r1, ctx);
                 if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
                     let c_r1 = b_r1.get_constant_int();
                     let c_arg0_1 = b_inner_1.get_constant_int();
@@ -1454,7 +1459,7 @@ impl OptIntBounds {
             } else if let Some(urshift) = self.as_operation(inner_0, OpCode::UintRshift, ctx) {
                 let r0 = ctx.get_box_replacement(urshift.arg(0));
                 let r1 = ctx.get_box_replacement(urshift.arg(1));
-                let b_r1 = self.getintbound(r1, ctx);
+                let b_r1 = self.getintbound_box(r1, ctx);
                 if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
                     let c_r1 = b_r1.get_constant_int();
                     let c_arg0_1 = b_inner_1.get_constant_int();
@@ -1470,7 +1475,7 @@ impl OptIntBounds {
         } else if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1486,7 +1491,7 @@ impl OptIntBounds {
         } else if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1));
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1500,7 +1505,7 @@ impl OptIntBounds {
         } else if let Some(arg0_urshift) = self.as_operation(arg0, OpCode::UintRshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_urshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_urshift.arg(1));
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1521,8 +1526,8 @@ impl OptIntBounds {
     fn optimize_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // rshift_zero_x: int_rshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1537,8 +1542,8 @@ impl OptIntBounds {
         if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // rshift_lshift: int_rshift(int_lshift(x, y), y) => x
             if autogen_eq(arg1, &b1, inner_1, &b_inner_1)
                 && b_inner_0.lshift_bound_cannot_overflow(&b_inner_1)
@@ -1567,7 +1572,7 @@ impl OptIntBounds {
         if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1));
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1588,7 +1593,7 @@ impl OptIntBounds {
     /// is_true_bool / is_true_true / is_true_and_minint.
     fn optimize_int_is_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         // is_true_true: int_is_true(x) => 1
         // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
         if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
@@ -1609,8 +1614,8 @@ impl OptIntBounds {
         if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
-            let b_inner_0 = self.getintbound(inner_0, ctx);
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_0 = self.getintbound_box(inner_0, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             // is_true_and_minint: int_is_true(int_and(MININT, x)) => int_lt(x, 0)
             if b_inner_0.is_constant() && b_inner_0.get_constant_int() == i64::MIN {
                 let zero_ref = ctx.make_constant_int(0);
@@ -1628,7 +1633,7 @@ impl OptIntBounds {
     /// autogenintrules.py:1403-1411 optimize_INT_IS_ZERO — rules: is_zero_true.
     fn optimize_int_is_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         // is_zero_true: int_is_zero(x) => 0
         // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
         if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
@@ -1642,7 +1647,7 @@ impl OptIntBounds {
     /// force_ge_zero_pos / force_ge_zero_neg.
     fn optimize_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         // force_ge_zero_neg: int_force_ge_zero(x) => 0  (when x < 0)
         if b0.known_lt_const(0) {
             self.make_constant_int(op, 0, ctx);
@@ -1668,8 +1673,8 @@ impl OptIntBounds {
     fn optimize_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // urshift_zero_x: uint_rshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1695,7 +1700,7 @@ impl OptIntBounds {
         if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
             let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
             let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
-            let b_inner_1 = self.getintbound(inner_1, ctx);
+            let b_inner_1 = self.getintbound_box(inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1725,12 +1730,12 @@ impl OptIntBounds {
     fn postprocess_int_add(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         // intbounds.py:119-123: if arg0 is arg1: b = b0.lshift_bound(1) (x+x is even)
         let b = if arg0 == arg1 {
             b0.lshift_bound(&IntBound::from_constant(1))
         } else {
-            let b1 = self.getintbound(arg1, ctx);
+            let b1 = self.getintbound_box(arg1, ctx);
             b0.add_bound(&b1)
         };
         self.intersect_bound(op.pos.get(), &b, ctx);
@@ -1770,8 +1775,8 @@ impl OptIntBounds {
     fn postprocess_int_sub(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         let b = b0.sub_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
         // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
@@ -1790,15 +1795,15 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_mul(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.mul_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_and(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.and_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
@@ -1807,8 +1812,8 @@ impl OptIntBounds {
     fn postprocess_int_or(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // intbounds.py:65: if b0.and_bound(b1).known_eq_const(0):
         if b0.and_bound(&b1).known_eq_const(0) {
             // intbounds.py:66-69:
@@ -1825,8 +1830,8 @@ impl OptIntBounds {
     fn postprocess_int_xor(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         // intbounds.py:78: if b0.and_bound(b1).known_eq_const(0):
         if b0.and_bound(&b1).known_eq_const(0) {
             // intbounds.py:79-82:
@@ -1844,8 +1849,8 @@ impl OptIntBounds {
     fn postprocess_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         let b = b0.lshift_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
         // intbounds.py:185: only synthesize reverse if lshift cannot overflow
@@ -1855,47 +1860,47 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.rshift_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.urshift_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.py_div_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_mod(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.mod_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_neg(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b = self.getintbound(op.arg(0), ctx);
+        let b = self.getintbound_box(op.arg(0), ctx);
         let result = b.neg_bound();
         self.intersect_bound(op.pos.get(), &result, ctx);
     }
 
     fn postprocess_int_invert(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b = self.getintbound(op.arg(0), ctx);
+        let b = self.getintbound_box(op.arg(0), ctx);
         let result = b.invert_bound();
         self.intersect_bound(op.pos.get(), &result, ctx);
     }
 
     fn postprocess_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b_arg = self.getintbound(op.arg(0), ctx);
+        let b_arg = self.getintbound_box(op.arg(0), ctx);
         let mut result = IntBound::nonnegative();
         if b_arg.upper >= 0 {
             let _ = result.make_le(&b_arg);
@@ -1968,8 +1973,8 @@ impl OptIntBounds {
     // ── INT_SIGNEXT optimization ──
 
     fn optimize_int_signext(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let b = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         if b1.is_constant() {
             let byte_size = b1.get_constant_int();
             let numbits = byte_size * 8;
@@ -1991,7 +1996,7 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_signext(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         if b1.is_constant() {
             let byte_size = b1.get_constant_int();
             let numbits = byte_size * 8;
@@ -2008,8 +2013,8 @@ impl OptIntBounds {
 
     /// intbounds.py:244-256 optimize_INT_ADD_OVF
     fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntAdd, None, None);
@@ -2023,11 +2028,11 @@ impl OptIntBounds {
     fn postprocess_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         let b = if arg0 == arg1 {
             b0.mul2_bound_no_overflow()
         } else {
-            let b1 = self.getintbound(arg1, ctx);
+            let b1 = self.getintbound_box(arg1, ctx);
             b0.add_bound_no_overflow(&b1)
         };
         self.intersect_bound(op.pos.get(), &b, ctx);
@@ -2042,8 +2047,8 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntSub, None, None);
@@ -2055,16 +2060,16 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         let b = b0.sub_bound_no_overflow(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     /// intbounds.py:298-305 optimize_INT_MUL_OVF
     fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let b0 = self.getintbound_box(op.arg(0), ctx);
+        let b1 = self.getintbound_box(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntMul, None, None);
@@ -2078,11 +2083,11 @@ impl OptIntBounds {
     fn postprocess_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         let b = if arg0 == arg1 {
             b0.square_bound_no_overflow()
         } else {
-            let b1 = self.getintbound(arg1, ctx);
+            let b1 = self.getintbound_box(arg1, ctx);
             b0.mul_bound_no_overflow(&b1)
         };
         self.intersect_bound(op.pos.get(), &b, ctx);
@@ -2162,7 +2167,10 @@ impl OptIntBounds {
         let cond_ref = ctx.get_box_replacement(op.arg(0));
 
         // Constant check: if condition is known constant nonzero, remove guard.
-        if let Some(val) = ctx.get_constant_int(cond_ref) {
+        if let Some(val) = ctx
+            .get_box_replacement_box(cond_ref)
+            .and_then(|b| ctx.get_constant_int_box(&b))
+        {
             if val != 0 {
                 return OptimizationResult::Remove;
             }
@@ -2173,7 +2181,7 @@ impl OptIntBounds {
         }
 
         // Bound check: if bound proves always nonzero, remove guard.
-        let b = self.getintbound(cond_ref, ctx);
+        let b = self.getintbound_box(cond_ref, ctx);
         if b.known_gt_const(0) {
             return OptimizationResult::Remove;
         }
@@ -2184,7 +2192,10 @@ impl OptIntBounds {
     fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let cond_ref = ctx.get_box_replacement(op.arg(0));
 
-        if let Some(val) = ctx.get_constant_int(cond_ref) {
+        if let Some(val) = ctx
+            .get_box_replacement_box(cond_ref)
+            .and_then(|b| ctx.get_constant_int_box(&b))
+        {
             if val == 0 {
                 return OptimizationResult::Remove;
             }
@@ -2194,7 +2205,7 @@ impl OptIntBounds {
             return OptimizationResult::PassOn;
         }
 
-        let b = self.getintbound(cond_ref, ctx);
+        let b = self.getintbound_box(cond_ref, ctx);
         if b.known_eq_const(0) {
             return OptimizationResult::Remove;
         }
@@ -2238,7 +2249,7 @@ impl OptIntBounds {
     /// `matches!(.., Ok(true))` is the line-by-line equivalent of the
     /// RPython `if`.
     fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound(box2, ctx);
+        let b2 = self.getintbound_box(box2, ctx);
         let changed1 = ctx
             .ensure_box(box1)
             .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_lt(&b2), Ok(true))))
@@ -2246,7 +2257,7 @@ impl OptIntBounds {
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound(box1, ctx);
+        let b1 = self.getintbound_box(box1, ctx);
         let changed2 = ctx
             .ensure_box(box2)
             .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_gt(&b1), Ok(true))))
@@ -2258,7 +2269,7 @@ impl OptIntBounds {
 
     /// intbounds.py:572-578 make_int_le
     fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound(box2, ctx);
+        let b2 = self.getintbound_box(box2, ctx);
         let changed1 = ctx
             .ensure_box(box1)
             .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_le(&b2), Ok(true))))
@@ -2266,7 +2277,7 @@ impl OptIntBounds {
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound(box1, ctx);
+        let b1 = self.getintbound_box(box1, ctx);
         let changed2 = ctx
             .ensure_box(box2)
             .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_ge(&b1), Ok(true))))
@@ -2288,7 +2299,7 @@ impl OptIntBounds {
 
     /// intbounds.py:586-592 make_unsigned_lt
     fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound(box2, ctx);
+        let b2 = self.getintbound_box(box2, ctx);
         let changed1 = ctx
             .ensure_box(box1)
             .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_unsigned_lt(&b2), Ok(true))))
@@ -2296,7 +2307,7 @@ impl OptIntBounds {
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound(box1, ctx);
+        let b1 = self.getintbound_box(box1, ctx);
         let changed2 = ctx
             .ensure_box(box2)
             .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_unsigned_gt(&b1), Ok(true))))
@@ -2308,7 +2319,7 @@ impl OptIntBounds {
 
     /// intbounds.py:594-600 make_unsigned_le
     fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound(box2, ctx);
+        let b2 = self.getintbound_box(box2, ctx);
         let changed1 = ctx
             .ensure_box(box1)
             .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_unsigned_le(&b2), Ok(true))))
@@ -2316,7 +2327,7 @@ impl OptIntBounds {
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound(box1, ctx);
+        let b1 = self.getintbound_box(box1, ctx);
         let changed2 = ctx
             .ensure_box(box2)
             .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_unsigned_ge(&b1), Ok(true))))
@@ -2348,7 +2359,7 @@ impl OptIntBounds {
     ///         self.propagate_bounds_backward(arg1)
     /// ```
     fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
-        let b1 = self.getintbound(arg1, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         let changed0 = ctx
             .ensure_box(arg0)
             .map(|b| ctx.with_intbound_mut(&b, |b0| matches!(b0.intersect(&b1), Ok(true))))
@@ -2356,7 +2367,7 @@ impl OptIntBounds {
         if changed0 {
             self.propagate_bounds_backward(arg0, ctx);
         }
-        let b0 = self.getintbound(arg0, ctx);
+        let b0 = self.getintbound_box(arg0, ctx);
         let changed1 = ctx
             .ensure_box(arg1)
             .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.intersect(&b0), Ok(true))))
@@ -2382,7 +2393,7 @@ impl OptIntBounds {
     ///             self.propagate_bounds_backward(arg1)
     /// ```
     fn make_ne(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
-        let b1 = self.getintbound(arg1, ctx);
+        let b1 = self.getintbound_box(arg1, ctx);
         if b1.is_constant() {
             let v1 = b1.get_constant_int();
             let did = ctx
@@ -2393,7 +2404,7 @@ impl OptIntBounds {
                 self.propagate_bounds_backward(arg0, ctx);
             }
         } else {
-            let b0 = self.getintbound(arg0, ctx);
+            let b0 = self.getintbound_box(arg0, ctx);
             if b0.is_constant() {
                 let v0 = b0.get_constant_int();
                 let did = ctx
@@ -2426,7 +2437,7 @@ impl OptIntBounds {
     /// call so the producing op of a now-constant value also gets a chance
     /// to tighten its other arguments.
     fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &mut OptContext) {
-        let b = self.getintbound(opref, ctx);
+        let b = self.getintbound_box(opref, ctx);
         if b.is_constant() {
             self.make_constant_int_ref(opref, b.get_constant_int(), ctx);
         }
@@ -2454,13 +2465,13 @@ impl OptIntBounds {
         if arg0_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b)) {
             return;
         }
-        let r = self.getintbound(op.pos.get(), ctx);
+        let r = self.getintbound_box(op.pos.get(), ctx);
         if !r.is_constant() {
             return;
         }
         let r_const = r.get_constant_int();
         if r_const == valnonzero {
-            let b1 = self.getintbound(arg0, ctx);
+            let b1 = self.getintbound_box(arg0, ctx);
             if b1.known_nonnegative() {
                 if let Some(bx) = &arg0_box {
                     let _ = ctx.with_intbound_mut(bx, |bm| bm.make_gt_const(0));
@@ -2508,9 +2519,9 @@ impl OptIntBounds {
                 if arg0_is_raw || arg1_is_raw {
                     return;
                 }
-                let b1 = self.getintbound(arg0, ctx);
-                let b2 = self.getintbound(arg1, ctx);
-                let r = self.getintbound(op.pos.get(), ctx);
+                let b1 = self.getintbound_box(arg0, ctx);
+                let b2 = self.getintbound_box(arg1, ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.sub_bound(&b2);
                 let changed0 = arg0_box
                     .as_ref()
@@ -2532,9 +2543,9 @@ impl OptIntBounds {
             OpCode::IntSub | OpCode::IntSubOvf => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let b1 = self.getintbound(arg0, ctx);
-                let b2 = self.getintbound(arg1, ctx);
-                let r = self.getintbound(op.pos.get(), ctx);
+                let b1 = self.getintbound_box(arg0, ctx);
+                let b2 = self.getintbound_box(arg1, ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.add_bound(&b2);
                 let changed0 = ctx
                     .ensure_box(arg0)
@@ -2556,12 +2567,12 @@ impl OptIntBounds {
             OpCode::IntMul | OpCode::IntMulOvf => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let b1 = self.getintbound(arg0, ctx);
-                let b2 = self.getintbound(arg1, ctx);
+                let b1 = self.getintbound_box(arg0, ctx);
+                let b2 = self.getintbound_box(arg1, ctx);
                 if op.opcode != OpCode::IntMulOvf && !b1.mul_bound_cannot_overflow(&b2) {
                     return;
                 }
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.py_div_bound(&b2);
                 let changed0 = ctx
                     .ensure_box(arg0)
@@ -2583,12 +2594,12 @@ impl OptIntBounds {
             OpCode::IntLshift => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let b1 = self.getintbound(arg0, ctx);
-                let b2 = self.getintbound(arg1, ctx);
+                let b1 = self.getintbound_box(arg0, ctx);
+                let b2 = self.getintbound_box(arg1, ctx);
                 if !b1.lshift_bound_cannot_overflow(&b2) {
                     return;
                 }
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if let Ok(b) = r.lshift_bound_backwards(&b2) {
                     let changed = ctx
                         .ensure_box(arg0)
@@ -2604,11 +2615,11 @@ impl OptIntBounds {
             // intbounds.py:759-767 propagate_bounds_INT_RSHIFT
             OpCode::IntRshift => {
                 let arg0 = op.arg(0);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                let b2 = self.getintbound_box(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.rshift_bound_backwards(&b2);
                 let changed = ctx
                     .ensure_box(arg0)
@@ -2621,11 +2632,11 @@ impl OptIntBounds {
             // intbounds.py:749-757 propagate_bounds_UINT_RSHIFT
             OpCode::UintRshift => {
                 let arg0 = op.arg(0);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                let b2 = self.getintbound_box(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.urshift_bound_backwards(&b2);
                 let changed = ctx
                     .ensure_box(arg0)
@@ -2639,9 +2650,9 @@ impl OptIntBounds {
             OpCode::IntAnd => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let r = self.getintbound(op.pos.get(), ctx);
-                let b0 = self.getintbound(arg0, ctx);
-                let b1 = self.getintbound(arg1, ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
+                let b0 = self.getintbound_box(arg0, ctx);
+                let b1 = self.getintbound_box(arg1, ctx);
                 let arg0_box = ctx.ensure_box(arg0);
                 let arg1_box = ctx.ensure_box(arg1);
                 if let Ok(b) = b0.and_bound_backwards(&r) {
@@ -2671,9 +2682,9 @@ impl OptIntBounds {
             OpCode::IntOr => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let r = self.getintbound(op.pos.get(), ctx);
-                let b0 = self.getintbound(arg0, ctx);
-                let b1 = self.getintbound(arg1, ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
+                let b0 = self.getintbound_box(arg0, ctx);
+                let b1 = self.getintbound_box(arg1, ctx);
                 let arg0_box = ctx.ensure_box(arg0);
                 let arg1_box = ctx.ensure_box(arg1);
                 if let Ok(b) = b0.or_bound_backwards(&r) {
@@ -2703,9 +2714,9 @@ impl OptIntBounds {
             OpCode::IntXor => {
                 let arg0 = op.arg(0);
                 let arg1 = op.arg(1);
-                let r = self.getintbound(op.pos.get(), ctx);
-                let b0 = self.getintbound(arg0, ctx);
-                let b1 = self.getintbound(arg1, ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
+                let b0 = self.getintbound_box(arg0, ctx);
+                let b1 = self.getintbound_box(arg1, ctx);
                 let arg0_box = ctx.ensure_box(arg0);
                 let arg1_box = ctx.ensure_box(arg1);
                 // xor is its own inverse
@@ -2729,7 +2740,7 @@ impl OptIntBounds {
             // intbounds.py:481-487 propagate_bounds_INT_INVERT
             OpCode::IntInvert => {
                 let arg0 = op.arg(0);
-                let bres = self.getintbound(op.pos.get(), ctx);
+                let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.invert_bound();
                 let changed = ctx
                     .ensure_box(arg0)
@@ -2744,7 +2755,7 @@ impl OptIntBounds {
             // intbounds.py:489-495 propagate_bounds_INT_NEG
             OpCode::IntNeg => {
                 let arg0 = op.arg(0);
-                let bres = self.getintbound(op.pos.get(), ctx);
+                let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.neg_bound();
                 let changed = ctx
                     .ensure_box(arg0)
@@ -2758,7 +2769,7 @@ impl OptIntBounds {
             }
             // intbounds.py:608-615 propagate_bounds_INT_LT
             OpCode::IntLt => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_int_lt(op.arg(0), op.arg(1), ctx);
@@ -2770,7 +2781,7 @@ impl OptIntBounds {
             }
             // intbounds.py:617-624 propagate_bounds_INT_GT
             OpCode::IntGt => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_int_gt(op.arg(0), op.arg(1), ctx);
@@ -2782,7 +2793,7 @@ impl OptIntBounds {
             }
             // intbounds.py:626-633 propagate_bounds_INT_LE
             OpCode::IntLe => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_int_le(op.arg(0), op.arg(1), ctx);
@@ -2794,7 +2805,7 @@ impl OptIntBounds {
             }
             // intbounds.py:635-642 propagate_bounds_INT_GE
             OpCode::IntGe => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_int_ge(op.arg(0), op.arg(1), ctx);
@@ -2806,7 +2817,7 @@ impl OptIntBounds {
             }
             // intbounds.py:644-651 propagate_bounds_INT_EQ
             OpCode::IntEq => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() && r.lower == 1 {
                     self.make_eq(op.arg(0), op.arg(1), ctx);
                 } else if r.is_constant() && r.lower == 0 {
@@ -2815,7 +2826,7 @@ impl OptIntBounds {
             }
             // intbounds.py:653-656 propagate_bounds_INT_NE
             OpCode::IntNe => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() && r.lower == 0 {
                     self.make_eq(op.arg(0), op.arg(1), ctx);
                 } else if r.is_constant() && r.lower == 1 {
@@ -2824,7 +2835,7 @@ impl OptIntBounds {
             }
             // intbounds.py:379-386 propagate_bounds_UINT_LT
             OpCode::UintLt => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_unsigned_lt(op.arg(0), op.arg(1), ctx);
@@ -2836,7 +2847,7 @@ impl OptIntBounds {
             }
             // intbounds.py:400-407 propagate_bounds_UINT_GT
             OpCode::UintGt => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_unsigned_gt(op.arg(0), op.arg(1), ctx);
@@ -2848,7 +2859,7 @@ impl OptIntBounds {
             }
             // intbounds.py:421-428 propagate_bounds_UINT_LE
             OpCode::UintLe => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_unsigned_le(op.arg(0), op.arg(1), ctx);
@@ -2860,7 +2871,7 @@ impl OptIntBounds {
             }
             // intbounds.py:442-449 propagate_bounds_UINT_GE
             OpCode::UintGe => {
-                let r = self.getintbound(op.pos.get(), ctx);
+                let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
                         self.make_unsigned_ge(op.arg(0), op.arg(1), ctx);
@@ -3169,8 +3180,8 @@ impl Optimization for OptIntBounds {
                             majit_ir::OopSpecIndex::IntPyDiv => {
                                 if op.num_args() >= 3 {
                                     // intbounds.py:165-169 post_call_INT_PY_DIV.
-                                    let b1 = self.getintbound(op.arg(1), ctx);
-                                    let b2 = self.getintbound(op.arg(2), ctx);
+                                    let b1 = self.getintbound_box(op.arg(1), ctx);
+                                    let b2 = self.getintbound_box(op.arg(2), ctx);
                                     let result_bound = b1.py_div_bound(&b2);
                                     self.intersect_bound(op.pos.get(), &result_bound, ctx);
                                 }
@@ -3178,8 +3189,8 @@ impl Optimization for OptIntBounds {
                             majit_ir::OopSpecIndex::IntPyMod => {
                                 if op.num_args() >= 3 {
                                     // intbounds.py:171-175 post_call_INT_PY_MOD.
-                                    let b1 = self.getintbound(op.arg(1), ctx);
-                                    let b2 = self.getintbound(op.arg(2), ctx);
+                                    let b1 = self.getintbound_box(op.arg(1), ctx);
+                                    let b2 = self.getintbound_box(op.arg(2), ctx);
                                     let result_bound = b1.mod_bound(&b2);
                                     self.intersect_bound(op.pos.get(), &result_bound, ctx);
                                 }
@@ -3235,7 +3246,10 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) = ctx.get_int_bound(arg) {
+            if let Some(bound) = ctx
+                .get_box_replacement_box(arg)
+                .and_then(|b| ctx.peek_intbound_box(&b))
+            {
                 if bound.is_unbounded() {
                     continue;
                 }

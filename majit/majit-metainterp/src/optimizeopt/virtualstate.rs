@@ -1284,8 +1284,12 @@ impl VirtualState {
                 &mut state,
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
-                    let runtime_value =
-                        runtime_box.and_then(|runtime_box| state.ctx.get_constant(runtime_box));
+                    let runtime_value = runtime_box.and_then(|rb| {
+                        state
+                            .ctx
+                            .get_box_replacement_box(rb)
+                            .and_then(|b| state.ctx.get_constant_box(&b))
+                    });
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
                     );
@@ -1482,7 +1486,12 @@ impl VirtualState {
                 // Merely having a runtime box is not enough; RPython checks
                 // `self.constbox.same_constant(runtime_box.constbox())`.
                 if runtime_box
-                    .and_then(|runtime_box| state.ctx.get_constant(runtime_box))
+                    .and_then(|rb| {
+                        state
+                            .ctx
+                            .get_box_replacement_box(rb)
+                            .and_then(|b| state.ctx.get_constant_box(&b))
+                    })
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
                     state.extra_guards.push(GuardRequirement::GuardValue {
@@ -2571,7 +2580,10 @@ fn export_single_value_inner(
     // returns Some exactly when the chain terminates at a Const Box,
     // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
     // export LEVEL_CONSTANT regardless of OpRef namespace.
-    if let Some(value) = ctx.get_constant(opref) {
+    if let Some(value) = ctx
+        .get_box_replacement_box(opref)
+        .and_then(|b| ctx.get_constant_box(&b))
+    {
         return VirtualStateInfo::Constant(value);
     }
 

@@ -84,8 +84,8 @@ pub fn copy_str_content(
     };
 
     // vstring.py:341-347: determine inline threshold M using intbound
-    let srcoffset_bound = ctx.getintbound(srcoffsetbox);
-    let lgt_bound = ctx.getintbound(lengthbox);
+    let srcoffset_bound = ctx.getintbound_via_box(srcoffsetbox);
+    let lgt_bound = ctx.getintbound_via_box(lengthbox);
     // vstring.py:343: isinstance(srcbox, ConstPtr)
     let src_is_const = ctx
         .get_box_replacement_box(srcbox)
@@ -114,7 +114,7 @@ pub fn copy_str_content(
                     // vstring.py:350-351: charbox = optstring.strgetitem(
                     //     None, srcbox, srcoffsetbox, mode)
                     // vstring.py:495: vindex = self.getintbound(index)
-                    let vindex = ctx.getintbound(src_offset);
+                    let vindex = ctx.getintbound_via_box(src_offset);
                     let resolved_idx = if vindex.is_constant() {
                         Some(vindex.get_constant_int())
                     } else {
@@ -489,7 +489,10 @@ impl OptString {
     /// `pure(STRLEN, op) = length_arg` for CSE via the pure cache.
     fn _optimize_newstr(&mut self, op: &Op, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
         let len_ref = op.arg(0);
-        if let Some(len) = ctx.get_constant_int(len_ref) {
+        if let Some(len) = ctx
+            .get_box_replacement_box(len_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
                 // vstring.py:450: self.make_vstring_plain(op, mode, length)
                 let b = ctx
@@ -537,7 +540,10 @@ impl OptString {
         let char_ref = op.arg(2);
         let char_resolved = ctx.get_box_replacement(char_ref);
 
-        if let Some(idx) = ctx.get_constant_int(idx_ref) {
+        if let Some(idx) = ctx
+            .get_box_replacement_box(idx_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             let i = idx as usize;
             let did_write = self
                 .with_plain_info_mut(str_ref, ctx, |info| {
@@ -562,7 +568,10 @@ impl OptString {
         let str_ref = ctx.get_box_replacement(op.arg(0));
         let idx_ref = op.arg(1);
 
-        if let Some(idx) = ctx.get_constant_int(idx_ref) {
+        if let Some(idx) = ctx
+            .get_box_replacement_box(idx_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_box_replacement(ch_ref);
                 let b_old = ctx
@@ -611,10 +620,12 @@ impl OptString {
     }
 
     fn get_constant_int_bound(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
-        ctx.get_int_bound(opref)
-            .filter(|bound| bound.is_constant())
-            .map(|bound| bound.get_constant_int())
-            .or_else(|| ctx.get_constant_int(opref))
+        ctx.get_box_replacement_box(opref).and_then(|b| {
+            ctx.peek_intbound_box(&b)
+                .filter(|bound| bound.is_constant())
+                .map(|bound| bound.get_constant_int())
+                .or_else(|| ctx.get_constant_int_box(&b))
+        })
     }
 
     /// vstring.py:556-589 _optimize_COPYSTRCONTENT
@@ -925,8 +936,18 @@ impl OptString {
         };
         // vstring.py:706-712: isinstance(ConstInt) + different values
         if let (Some(l1), Some(l2)) = (l1box, l2box) {
-            let l1c = ctx.get_constant_int(l1);
-            let l2c = ctx.get_constant_int(l2);
+            let l1c = ctx
+                .get_box_replacement_box(l1)
+                .and_then(|b_| match b_.const_value() {
+                    Some(Value::Int(i)) => Some(i),
+                    _ => None,
+                });
+            let l2c = ctx
+                .get_box_replacement_box(l2)
+                .and_then(|b_| match b_.const_value() {
+                    Some(Value::Int(i)) => Some(i),
+                    _ => None,
+                });
             if let (Some(v1), Some(v2)) = (l1c, l2c) {
                 if v1 != v2 {
                     ctx.make_constant(op.pos.get(), Value::Int(0));
@@ -989,7 +1010,13 @@ impl OptString {
         } else {
             None
         };
-        let l2_const = l2box.and_then(|r| ctx.get_constant_int(r));
+        let l2_const = l2box.and_then(|r| {
+            ctx.get_box_replacement_box(r)
+                .and_then(|b_| match b_.const_value() {
+                    Some(Value::Int(i)) => Some(i),
+                    _ => None,
+                })
+        });
         // vstring.py:742-756: isinstance(l2box, ConstInt) checks
         if let Some(l2val) = l2_const {
             if l2val == 0 {
@@ -1020,7 +1047,13 @@ impl OptString {
                 } else {
                     None
                 };
-                let l1_const = l1box.and_then(|r| ctx.get_constant_int(r));
+                let l1_const = l1box.and_then(|r| {
+                    ctx.get_box_replacement_box(r)
+                        .and_then(|b_| match b_.const_value() {
+                            Some(Value::Int(i)) => Some(i),
+                            _ => None,
+                        })
+                });
                 if l1_const == Some(1) {
                     // vstring.py:761-768: both length 1 → compare chars
                     let c1 = self.strgetitem(arg1, 0, ctx);
@@ -1090,7 +1123,7 @@ impl OptString {
         };
         // vstring.py:795-805: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
-            let l2info = ctx.getintbound(l2ref);
+            let l2info = ctx.getintbound_via_box(l2ref);
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
                 if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
@@ -1193,8 +1226,18 @@ impl OptString {
         let l1box = ctx.getstrlen_opref(op.arg(1), mode);
         let l2box = ctx.getstrlen_opref(op.arg(2), mode);
         // vstring.py:825-828: isinstance(ConstInt) and both == 1
-        let l1c = ctx.get_constant_int(l1box);
-        let l2c = ctx.get_constant_int(l2box);
+        let l1c = ctx
+            .get_box_replacement_box(l1box)
+            .and_then(|b_| match b_.const_value() {
+                Some(Value::Int(i)) => Some(i),
+                _ => None,
+            });
+        let l2c = ctx
+            .get_box_replacement_box(l2box)
+            .and_then(|b_| match b_.const_value() {
+                Some(Value::Int(i)) => Some(i),
+                _ => None,
+            });
         if l1c == Some(1) && l2c == Some(1) {
             // vstring.py:830-836: extract chars and INT_SUB
             if let (Some(char1), Some(char2)) = (
@@ -1252,7 +1295,9 @@ impl OptString {
     fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() >= 3 {
             let arg1 = ctx.get_box_replacement(op.arg(1));
-            let length = ctx.get_constant_int(op.arg(2));
+            let length = ctx
+                .get_box_replacement_box(op.arg(2))
+                .and_then(|b| ctx.get_constant_int_box(&b));
             // vstring.py:844-845: i2.is_constant() && i1.is_virtual() &&
             // isinstance(i1, VStringPlainInfo)
             if let Some(length) = length {

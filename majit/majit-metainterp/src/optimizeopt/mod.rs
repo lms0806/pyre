@@ -884,20 +884,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        // RPython resume.py:201-204:
-        //   box = box.get_box_replacement()
-        //   if isinstance(box, Const): ...
-        // `get_constant` walks the chain and reads either the constant-
-        // namespace `const_pool` or the terminal `Forwarded::Box(target)`
-        // const_value — covering both arms of upstream's
-        // `isinstance(box, Const)` after chain walk.
         if self.ctx.get_constant(opref).is_some() {
             return true;
         }
-        // info.py: ConstPtrInfo.is_constant() → True
-        let opref_box = self.ctx.get_box_replacement_box(opref);
         matches!(
-            opref_box.as_ref().and_then(|b| self.ctx.peek_ptr_info(b)),
+            self.ctx
+                .get_box_replacement_box(opref)
+                .as_ref()
+                .and_then(|b| self.ctx.peek_ptr_info(b)),
             Some(crate::optimizeopt::info::PtrInfo::Constant(_))
         )
     }
@@ -909,10 +903,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
             Some(Value::Void) => (0, majit_ir::Type::Int),
             None => {
-                // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo
-                let opref_box = self.ctx.get_box_replacement_box(opref);
-                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
-                    opref_box.as_ref().and_then(|b| self.ctx.peek_ptr_info(b))
+                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self
+                    .ctx
+                    .get_box_replacement_box(opref)
+                    .as_ref()
+                    .and_then(|b| self.ctx.peek_ptr_info(b))
                 {
                     (gcref.0 as i64, majit_ir::Type::Ref)
                 } else {
@@ -948,7 +943,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 return tp;
             }
         }
-        // Constant type (history.py:220 ConstInt.type parity).
         if let Some(val) = self.ctx.get_constant(resolved) {
             return val.get_type();
         }
@@ -2753,7 +2747,7 @@ impl OptContext {
         // source directly (RPython parity for non-invented `op = self.res`).
         let result = self.get_box_replacement(preamble_op.op);
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = self.get_constant(preamble_source).is_some();
+        let is_constant = self.is_constant(preamble_source);
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -4402,6 +4396,22 @@ impl OptContext {
     /// optimizer.py:99-113: getintbound(op) — get or create IntBound for
     /// an int-typed box. Lazy: creates unbounded on first access and stores
     /// it on the BoxRef's `_forwarded` slot.
+    pub(crate) fn getintbound_via_box(
+        &mut self,
+        opref: OpRef,
+    ) -> crate::optimizeopt::intutils::IntBound {
+        match self.get_box_replacement_box(opref) {
+            Some(b) => self.getintbound_handle(&b).borrow().clone(),
+            None => {
+                let b = self
+                    .ensure_box(opref)
+                    .expect("getintbound_via_box: OpRef must resolve to a BoxRef");
+                self.getintbound_handle(&b).borrow().clone()
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
         use crate::optimizeopt::info::OpInfo;
         // optimizer.py:100: assert op.type == 'i'
@@ -4411,7 +4421,6 @@ impl OptContext {
             self.opref_type(opref)
         );
         let replaced = self.get_box_replacement(opref);
-        // optimizer.py:102-103: if isinstance(op, ConstInt): return from_constant
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return crate::optimizeopt::intutils::IntBound::from_constant(v as i64);
         }
@@ -4875,26 +4884,17 @@ impl OptContext {
         None
     }
 
-    /// Get the constant value for an operation, if known.
+    /// Actual-Const reader: `box = box.get_box_replacement(); isinstance(box, Const)`.
     ///
-    /// BoxRef-routing reader. The constant value lives in
-    /// `Forwarded::Box(target)` where `target` is a `BoxKind::Const(v)`,
-    /// matching `optimizer.py:432 box.set_forwarded(constbox)` shape
-    /// written by `make_constant` and `make_equal_to(_, const_target)`.
+    /// This intentionally does not use `get_constant_box`, because PyPy's
+    /// `optimizer.get_constant_box` also synthesizes `ConstInt` from constant
+    /// `IntBound`. Call this only for source sites that literally test
+    /// `isinstance(..., Const)` / `box.is_constant()` / direct `ConstInt`.
     pub fn get_constant(&self, opref: OpRef) -> Option<Value> {
-        let opref = self.get_box_replacement(opref);
-        if opref.is_constant() {
-            return self.const_pool.get(&opref.const_index()).copied();
-        }
-        if let Some(b) = self.box_pool.get(opref)
-            && let crate::r#box::Forwarded::Const(c, _) = b.get_forwarded()
-        {
-            return Some(c.to_value());
-        }
-        None
+        self.get_box_replacement_box(opref)
+            .and_then(|b| b.const_value())
     }
 
-    /// Whether `opref` has a known constant value.
     pub fn is_constant(&self, opref: OpRef) -> bool {
         self.get_constant(opref).is_some()
     }
@@ -4937,13 +4937,13 @@ impl OptContext {
     /// vstring.py:237 `optstring.getintbound(box).is_constant()` pattern.
     /// Returns the constant value if known either from the constant pool
     /// or from IntBound analysis.
-    pub fn get_constant_int_or_bound(&self, opref: OpRef) -> Option<i64> {
-        let resolved = self.get_box_replacement(opref);
-        self.get_constant_int(resolved).or_else(|| {
-            self.get_int_bound(resolved)
-                .filter(|b| b.is_constant())
-                .map(|b| b.get_constant_int())
-        })
+    pub fn get_constant_int_or_bound_box(&self, b: &crate::r#box::BoxRef) -> Option<i64> {
+        if let Some(Value::Int(i)) = self.get_constant_box(b) {
+            return Some(i);
+        }
+        self.peek_intbound_box(b)
+            .filter(|ib| ib.is_constant())
+            .map(|ib| ib.get_constant_int())
     }
 
     /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
@@ -5117,7 +5117,10 @@ impl OptContext {
             return;
         }
         // optimizer.py:756: b = self.getintbound(op.getarg(0))
-        let Some(bound) = self.get_int_bound(arg0_resolved) else {
+        let Some(bound) = self
+            .get_box_replacement_box(arg0_resolved)
+            .and_then(|b| self.peek_intbound_box(&b))
+        else {
             return;
         };
         if !bound.is_bool() {
@@ -5500,6 +5503,7 @@ impl OptContext {
     /// OpRef-taking wrapper around [`Self::peek_intbound`]; preserved for
     /// legacy callers in rewrite.rs that gate optimizations on "is a
     /// bound known?". Retires when those callers migrate to BoxRef.
+    #[cfg(test)]
     pub fn get_int_bound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
         self.get_box_replacement_box(opref)
             .as_ref()
@@ -5540,11 +5544,6 @@ impl OptContext {
     ///
     /// If `opref` is not already a known constant, records the value.
     /// Returns `opref` (which is now known to be this constant).
-    pub fn find_or_record_constant_int(&mut self, opref: OpRef, value: i64) -> OpRef {
-        self.make_constant(opref, Value::Int(value));
-        opref
-    }
-
     /// Get constant float value, if known.
     pub fn get_constant_float(&self, opref: OpRef) -> Option<f64> {
         self.get_constant(opref).and_then(|v| match v {
@@ -5603,6 +5602,20 @@ impl OptContext {
             }
         }
         None
+    }
+
+    pub fn get_constant_int_box(&self, op: &crate::r#box::BoxRef) -> Option<i64> {
+        match self.get_constant_box(op)? {
+            Value::Int(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn get_constant_float_box(&self, op: &crate::r#box::BoxRef) -> Option<f64> {
+        match self.get_constant_box(op)? {
+            Value::Float(f) => Some(f),
+            _ => None,
+        }
     }
 
     /// optimizer.py:810-816 `constant_fold(op)`:
@@ -5891,18 +5904,6 @@ impl OptContext {
     /// RPython box.type parity: find the result type of the operation
     /// that produces this OpRef. Returns None if the OpRef is an
     /// inputarg or was not produced by any emitted operation.
-    pub fn get_op_result_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
-        let op = self.op_at(opref)?;
-        // history.py:220 ConstInt.type, resoperation.py:567 IntOp.type:
-        // Box.type is intrinsic to the producing op. `op.type_` was
-        // populated at construction () from `opcode.result_type()`.
-        if op.type_ == majit_ir::Type::Void {
-            None
-        } else {
-            Some(op.type_)
-        }
-    }
-
     /// optimizer.py: clear_newoperations()
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
@@ -5964,8 +5965,10 @@ impl OptContext {
         // 3. Producing op's intrinsic `type_` (resoperation.py:1693
         //    `opclasses[opnum].type` parity). populates this
         //    at construction; this is the primary fast path post-Slice-0.5.
-        if let Some(tp) = self.get_op_result_type(resolved) {
-            return Some(tp);
+        if let Some(op) = self.op_at(resolved) {
+            if op.type_ != majit_ir::Type::Void {
+                return Some(op.type_);
+            }
         }
         // 5. PtrInfo-derived type (history.py:220 box.type parity for
         //    virtual heads across phase boundaries). Phase 1 virtualizes
@@ -6100,30 +6103,6 @@ impl OptContext {
     /// Mirrors PyPy `self.inputargs[idx]` (optimizer.py:34).
     pub fn inputarg_at(&self, idx: usize) -> Option<majit_ir::OpRef> {
         self.inputargs.get(idx).copied()
-    }
-
-    /// `Box.type` strict accessor. Panics when no source carries a type for
-    /// `opref`, matching `history.py:802 record_same_as(box.type)`'s
-    /// no-guess-on-miss policy: RPython Boxes always have an intrinsic type,
-    /// so a missing type is a structural bug.
-    ///
-    /// Use this whenever the call site previously read a HashMap with
-    /// `unwrap_or(Type::Int|Ref)` — those defaults silently absorbed bugs
-    /// that would have been audible under the upstream invariant.  Sites
-    /// that legitimately need a fallback (e.g. inputarg-stub harnesses,
-    /// out-of-process compile.rs paths without an `OptContext`) should
-    /// stay on `opref_type` and document the deviation.
-    #[track_caller]
-    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
-        self.opref_type(opref).unwrap_or_else(|| {
-            panic!(
-                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
-                 every OpRef must have a type via variant tag / constant / \
-                 producer op.type_ / inputarg slot. history.py:802 parity.",
-                opref,
-                self.get_box_replacement(opref),
-            )
-        })
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -6905,8 +6884,7 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let arg0 = self.get_box_replacement(op.arg(0));
-        if arg0.is_constant() || self.get_constant(arg0).is_some() {
-            // info.py:750-752 ConstPtrInfo.setfield → _get_info(parent_descr, optheap)
+        if arg0.is_constant() || self.is_constant(arg0) {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
             if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
                 info.setfield(field_idx, value);
@@ -6930,8 +6908,7 @@ impl OptContext {
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
         let arg0 = self.get_box_replacement(op.arg(0));
-        if arg0.is_constant() || self.get_constant(arg0).is_some() {
-            // info.py:746-748 ConstPtrInfo.setitem → _get_array_info.
+        if arg0.is_constant() || self.is_constant(arg0) {
             if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
                     info.setitem(index, value);
@@ -7052,8 +7029,9 @@ impl OptContext {
         // contract: extract whatever GcRef we can (Ref → the gcref, raw
         // pointer Int → cast, anything else → null sentinel) and let the
         // downstream user decide whether to act on it.
-        if arg0.is_constant() || self.get_constant(arg0).is_some() {
-            let gcref = match self.get_constant(arg0) {
+        let arg0_const = self.get_constant(arg0);
+        if arg0.is_constant() || arg0_const.is_some() {
+            let gcref = match arg0_const {
                 Some(Value::Ref(g)) => g,
                 Some(Value::Int(bits)) => majit_ir::GcRef(bits as usize),
                 // Float / Void / no-constant fall back to a null sentinel —

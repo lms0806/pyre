@@ -1640,7 +1640,10 @@ impl Optimizer {
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF => {
                 // Check arg(0) is not null constant.
-                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
+                if let Some(0) = ctx
+                    .get_box_replacement_box(op.arg(0))
+                    .and_then(|b| ctx.get_constant_int_box(&b))
+                {
                     return false; // would deref null
                 }
                 true
@@ -4361,7 +4364,7 @@ impl Optimizer {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx.getintbound(arg0);
+        let b = ctx.getintbound_via_box(arg0);
         if !b.is_bool() {
             return op;
         }
@@ -4460,7 +4463,10 @@ mod tests {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 // Check if second arg is constant 0
-                if let Some(0) = ctx.get_constant_int(op.arg(1)) {
+                if let Some(0) = ctx
+                    .get_box_replacement_box(op.arg(1))
+                    .and_then(|b| ctx.get_constant_int_box(&b))
+                {
                     // Replace with first arg
                     let old = op.pos.get();
                     let new = op.arg(0);

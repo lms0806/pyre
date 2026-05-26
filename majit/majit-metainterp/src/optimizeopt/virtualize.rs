@@ -481,7 +481,10 @@ impl OptVirtualize {
 
     fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let size_ref = op.arg(0);
-        if let Some(size) = ctx.get_constant_int(size_ref) {
+        if let Some(size) = ctx
+            .get_box_replacement_box(size_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             // virtualize.py:28-29 `if not info.reasonable_array_index(size):`
             // — defined at info.py:487-492 with upper bound 150000.
             if crate::optimizeopt::info::reasonable_array_index(size) {
@@ -574,11 +577,14 @@ impl OptVirtualize {
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
-        let value_as_constant: Option<usize> = ctx.get_constant(value_ref).and_then(|v| match v {
-            majit_ir::Value::Int(i) => Some(i as usize),
-            majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
-            _ => None,
-        });
+        let value_as_constant: Option<usize> = ctx
+            .get_box_replacement_box(value_ref)
+            .and_then(|b| ctx.get_constant_box(&b))
+            .and_then(|v| match v {
+                majit_ir::Value::Int(i) => Some(i as usize),
+                majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
+                _ => None,
+            });
 
         // RPython virtualize.py:200-202: virtual SetfieldGc always updates
         // the field, even for imported virtual heads. Body computation must
@@ -783,7 +789,10 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
+        if let Some(index) = ctx
+            .get_box_replacement_box(index_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             let idx = index as usize;
             let did_virtual_write = ctx
                 .ensure_box(array_ref)
@@ -830,7 +839,10 @@ impl OptVirtualize {
             .and_then(|b| ctx.peek_ptr_info(b))
         {
             if let PtrInfo::VirtualArray(vinfo) = info {
-                if let Some(index) = ctx.get_constant_int(index_ref) {
+                if let Some(index) = ctx
+                    .get_box_replacement_box(index_ref)
+                    .and_then(|b_| ctx.get_constant_int_box(&b_))
+                {
                     // info.py:580-582: getitem returns None for
                     // negative, out-of-range, or uninitialized slots.
                     // virtualize.py:282-284: None → InvalidLoop.
@@ -916,7 +928,10 @@ impl OptVirtualize {
             .as_ref()
             .and_then(|b| ctx.peek_ptr_info(b))
         {
-            if let Some(index) = ctx.get_constant_int(index_ref) {
+            if let Some(index) = ctx
+                .get_box_replacement_box(index_ref)
+                .and_then(|b_| ctx.get_constant_int_box(&b_))
+            {
                 // info.py:651-656 _compute_index: negative or out-of-range → -1
                 // info.py:663-668 getinteriorfield_virtual: -1 → None
                 // virtualize.py:394-396: None → InvalidLoop
@@ -971,7 +986,10 @@ impl OptVirtualize {
             })
             .expect("optimize_setinteriorfield_gc: op without InteriorFieldDescr");
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
+        if let Some(index) = ctx
+            .get_box_replacement_box(index_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             let elem_idx = index as usize;
             let did_write = ctx
                 .ensure_box(array_ref)
@@ -1034,7 +1052,10 @@ impl OptVirtualize {
             return OptimizationResult::PassOn;
         }
         let arg0 = ctx.get_box_replacement(op.arg(0));
-        let Some(offset) = ctx.get_constant_int(op.arg(1)) else {
+        let Some(offset) = ctx
+            .get_box_replacement_box(op.arg(1))
+            .and_then(|b| ctx.get_constant_int_box(&b))
+        else {
             return OptimizationResult::PassOn;
         };
         let arg0_box = ctx.get_box_replacement_box(op.arg(0));
@@ -1052,7 +1073,10 @@ impl OptVirtualize {
         let buf_ref = op.arg(0);
         let offset_ref = op.arg(1);
 
-        if let Some(offset) = ctx.get_constant_int(offset_ref) {
+        if let Some(offset) = ctx
+            .get_box_replacement_box(offset_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             // virtualize.py:358-371: walk through RawSlicePtrInfo to the
             // underlying VirtualRawBuffer, accumulating any slice offset.
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
@@ -1106,7 +1130,10 @@ impl OptVirtualize {
         let offset_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
 
-        if let Some(offset) = ctx.get_constant_int(offset_ref) {
+        if let Some(offset) = ctx
+            .get_box_replacement_box(offset_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             // virtualize.py:374-385: same slice→parent walk as raw_load.
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
                 Some((p, o)) => (p, o),
@@ -1188,7 +1215,10 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
+        if let Some(index) = ctx
+            .get_box_replacement_box(index_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {
                     // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
@@ -1320,7 +1350,10 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
+        if let Some(index) = ctx
+            .get_box_replacement_box(index_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
             if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {
                     // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
@@ -1639,7 +1672,7 @@ impl OptVirtualize {
         // `Type::Ref` slot whose constant null is `Value::Ref(GcRef(0))`
         // (see `optimize_virtual_ref_finish`).
         let token_is_constant_null = matches!(
-            ctx.get_constant(token_ref),
+            ctx.get_box_replacement_box(token_ref).and_then(|b| ctx.get_constant_box(&b)),
             Some(Value::Ref(r)) if r.0 == 0
         );
         if !token_is_constant_null {
@@ -1930,9 +1963,14 @@ impl Optimization for OptVirtualize {
                             //   self.make_virtual_raw_memory(sizebox.getint(), op)
                             //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
-                                if let Some(size) = ctx.get_constant_int(op.arg(1)) {
+                                if let Some(size) = ctx
+                                    .get_box_replacement_box(op.arg(1))
+                                    .and_then(|b| ctx.get_constant_int_box(&b))
+                                {
                                     // virtualize.py:53 func = source_op.getarg(0).getint()
-                                    let func = ctx.get_constant_int(op.arg(0)).unwrap_or(0);
+                                    let func = ctx.get_constant_int(op.arg(0)).expect(
+                                        "virtualize.py:53 source_op.getarg(0) must be ConstInt",
+                                    );
                                     self.make_virtual_raw_memory(size as usize, func, op, ctx);
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;
