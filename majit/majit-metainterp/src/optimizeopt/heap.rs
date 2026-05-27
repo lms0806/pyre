@@ -60,6 +60,14 @@ use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, descr::descr_id
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
+#[inline]
+fn make_nonnull_opref(ctx: &mut OptContext, opref: OpRef) {
+    let resolved = ctx.get_box_replacement(opref);
+    if let Some(box_ref) = ctx.ensure_box(resolved) {
+        ctx.make_nonnull(&box_ref);
+    }
+}
+
 /// util.py:100-128 args_dict() / args_eq(): same_box semantics — identity
 /// for non-Const boxes, value-equality for Const subclasses (history.py:204).
 /// Two distinct Const slots holding the same value must hash and compare
@@ -2001,6 +2009,7 @@ impl OptHeap {
             // First read after QUASIIMMUT_FIELD: emit the load, then cache
             // the result so it survives calls (unlike normal mutable fields).
             self.quasi_immut_cache.insert(key, op.pos.get());
+            make_nonnull_opref(ctx, op.arg(0));
             self.cache_field(obj, &descr);
             ctx.structinfo_setfield(op, field_idx, op.pos.get());
             return OptimizationResult::Emit(op.clone());
@@ -2010,6 +2019,9 @@ impl OptHeap {
         // heap.py postprocess_GETFIELD_GC_I:
         //     structinfo = self.ensure_ptr_info_arg0(op)
         //     structinfo.setfield(descr, op.getarg(0), op, ...)
+        // heap.py optimize_GETFIELD_GC_I default path also marks the base:
+        //     self.make_nonnull(op.getarg(0))
+        make_nonnull_opref(ctx, op.arg(0));
         self.cache_field(obj, &descr);
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
@@ -2577,7 +2589,6 @@ impl OptHeap {
             //      routes constant arg0 through `_get_array_info` /
             //      `const_infos[gcref]` and regular arg0 through
             //      `ensure_ptr_info_arg0(op).as_mut().setitem(...)`.
-            let array_ref = ctx.get_box_replacement(op.arg(0));
             if const_index >= 0 {
                 ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
                     if let Some(mut bound) = arrayinfo.getlenbound(None) {
@@ -2596,9 +2607,7 @@ impl OptHeap {
             // when it falls through to record the new value (matching
             // pyre's `arrayinfo_setitem` below), `make_nonnull` still
             // fires.
-            if let Some(array_box) = ctx.ensure_box(array_ref) {
-                ctx.make_nonnull(&array_box);
-            }
+            make_nonnull_opref(ctx, op.arg(0));
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
@@ -2632,9 +2641,7 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0)) (optimizer.py:440-451).
-        if let Some(arg0_box) = ctx.ensure_box(op.arg(0)) {
-            ctx.make_nonnull(&arg0_box);
-        }
+        make_nonnull_opref(ctx, op.arg(0));
         OptimizationResult::Emit(op.clone())
     }
 

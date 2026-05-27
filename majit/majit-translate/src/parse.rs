@@ -192,11 +192,12 @@ pub struct ModuleStaticDecl {
     /// Full type text rendered via `quote::ToTokens`.  Diagnostic
     /// only; the front-end resolver should key off `type_root`.
     pub type_str: String,
-    /// Compile-time literal value, when the initialiser expression
-    /// is a single `syn::Lit::{Bool, Int, Float}` literal.  `None`
-    /// for non-literal initialisers (e.g. `new_pytype("int")`,
-    /// `std::ptr::null_mut()`, composite struct literal) — those
-    /// need addressable-host-value annotator wiring instead.
+    /// Compile-time literal value, when the initialiser expression is
+    /// in the small module-global subset handled by
+    /// [`literal_value_from_expr_with_bindings`].  `None` for
+    /// non-literal initialisers (e.g. `new_pytype("int")`,
+    /// `std::ptr::null_mut()`, composite struct literal) — those need
+    /// addressable-host-value annotator wiring instead.
     pub literal: Option<ModuleStaticLiteral>,
 }
 
@@ -303,7 +304,21 @@ pub(crate) fn collect_module_statics(
     items: &[Item],
 ) -> std::collections::HashMap<(String, String), ModuleStaticDecl> {
     let mut statics = std::collections::HashMap::new();
-    collect_module_statics_into(items, "", &mut statics);
+    let mut initializers = indexmap::IndexMap::new();
+    collect_module_statics_into(items, "", &mut statics, &mut initializers);
+
+    let mut memo = std::collections::HashMap::new();
+    for key in initializers.keys().cloned().collect::<Vec<_>>() {
+        let literal = resolve_module_static_literal(
+            &key,
+            &initializers,
+            &mut memo,
+            &mut std::collections::HashSet::new(),
+        );
+        if let Some(decl) = statics.get_mut(&key) {
+            decl.literal = literal;
+        }
+    }
     statics
 }
 
@@ -311,6 +326,7 @@ fn collect_module_statics_into(
     items: &[Item],
     prefix: &str,
     statics: &mut std::collections::HashMap<(String, String), ModuleStaticDecl>,
+    initializers: &mut indexmap::IndexMap<(String, String), syn::Expr>,
 ) {
     use quote::ToTokens;
     for item in items {
@@ -318,14 +334,15 @@ fn collect_module_statics_into(
             Item::Const(c) => {
                 let type_str = c.ty.to_token_stream().to_string();
                 let type_root = type_root_ident(&c.ty);
-                let literal = literal_value_from_expr(&c.expr);
+                let key = (prefix.to_string(), c.ident.to_string());
+                initializers.insert(key.clone(), c.expr.as_ref().clone());
                 statics.insert(
-                    (prefix.to_string(), c.ident.to_string()),
+                    key,
                     ModuleStaticDecl {
                         kind: ModuleStaticKind::Const,
                         type_root,
                         type_str,
-                        literal,
+                        literal: None,
                     },
                 );
             }
@@ -341,14 +358,15 @@ fn collect_module_statics_into(
             Item::Static(s) if matches!(s.mutability, syn::StaticMutability::None) => {
                 let type_str = s.ty.to_token_stream().to_string();
                 let type_root = type_root_ident(&s.ty);
-                let literal = literal_value_from_expr(&s.expr);
+                let key = (prefix.to_string(), s.ident.to_string());
+                initializers.insert(key.clone(), s.expr.as_ref().clone());
                 statics.insert(
-                    (prefix.to_string(), s.ident.to_string()),
+                    key,
                     ModuleStaticDecl {
                         kind: ModuleStaticKind::Static,
                         type_root,
                         type_str,
-                        literal,
+                        literal: None,
                     },
                 );
             }
@@ -359,7 +377,12 @@ fn collect_module_statics_into(
                     } else {
                         format!("{}::{}", prefix, m.ident)
                     };
-                    collect_module_statics_into(nested_items, &nested_prefix, statics);
+                    collect_module_statics_into(
+                        nested_items,
+                        &nested_prefix,
+                        statics,
+                        initializers,
+                    );
                 }
             }
             _ => {}
@@ -367,13 +390,44 @@ fn collect_module_statics_into(
     }
 }
 
+fn resolve_module_static_literal(
+    key: &(String, String),
+    initializers: &indexmap::IndexMap<(String, String), syn::Expr>,
+    memo: &mut std::collections::HashMap<(String, String), Option<ModuleStaticLiteral>>,
+    visiting: &mut std::collections::HashSet<(String, String)>,
+) -> Option<ModuleStaticLiteral> {
+    if let Some(value) = memo.get(key) {
+        return *value;
+    }
+    let expr = initializers.get(key)?;
+    if !visiting.insert(key.clone()) {
+        return None;
+    }
+    let value = literal_value_from_expr_with_bindings(expr, &key.0, initializers, memo, visiting);
+    visiting.remove(key);
+    memo.insert(key.clone(), value);
+    value
+}
+
 /// Decode a const / static initialiser expression into a
-/// [`ModuleStaticLiteral`] when it is a single primitive literal.
-/// Returns `None` for any non-literal expression — calls, struct
-/// literals, casts, references, etc.  Negative integer / float
-/// literals (`-1`, `-3.14`) are recognised as a `syn::UnOp::Neg`
-/// wrapping a positive `Lit`; nothing more elaborate is supported.
-fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
+/// [`ModuleStaticLiteral`] when it is in pyre's conservative
+/// module-global subset: primitive bool/int/float literals, unary
+/// `-`/`!`, integer binary operators, representable primitive casts,
+/// parens/groups, and bare names present in the same inline-module
+/// global table regardless of declaration order.  Returns `None` for
+/// calls, references, composite literals, multi-segment paths, casts
+/// whose result cannot be represented by [`ModuleStaticLiteral`], and
+/// anything else that needs real host-value annotator wiring.
+fn literal_value_from_expr_with_bindings(
+    expr: &syn::Expr,
+    current_prefix: &str,
+    initializers: &indexmap::IndexMap<(String, String), syn::Expr>,
+    memo: &mut std::collections::HashMap<(String, String), Option<ModuleStaticLiteral>>,
+    visiting: &mut std::collections::HashSet<(String, String)>,
+) -> Option<ModuleStaticLiteral> {
+    let mut recurse = |e: &syn::Expr| {
+        literal_value_from_expr_with_bindings(e, current_prefix, initializers, memo, visiting)
+    };
     match expr {
         syn::Expr::Lit(lit) => literal_value_from_lit(&lit.lit, false),
         syn::Expr::Unary(syn::ExprUnary {
@@ -384,7 +438,7 @@ fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
             if let syn::Expr::Lit(inner) = &**expr {
                 literal_value_from_lit(&inner.lit, true)
             } else {
-                match literal_value_from_expr(expr)? {
+                match recurse(expr)? {
                     ModuleStaticLiteral::Int(n) => Some(ModuleStaticLiteral::Int(-n)),
                     ModuleStaticLiteral::Float(bits) => Some(ModuleStaticLiteral::Float(
                         (-f64::from_bits(bits)).to_bits(),
@@ -397,7 +451,7 @@ fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
             op: syn::UnOp::Not(_),
             expr,
             ..
-        }) => match literal_value_from_expr(expr)? {
+        }) => match recurse(expr)? {
             ModuleStaticLiteral::Bool(b) => Some(ModuleStaticLiteral::Bool(!b)),
             ModuleStaticLiteral::Int(n) => Some(ModuleStaticLiteral::Int(!n)),
             _ => None,
@@ -405,8 +459,8 @@ fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
         syn::Expr::Binary(syn::ExprBinary {
             left, op, right, ..
         }) => {
-            let lhs = literal_value_from_expr(left)?;
-            let rhs = literal_value_from_expr(right)?;
+            let lhs = recurse(left)?;
+            let rhs = recurse(right)?;
             match (lhs, rhs) {
                 (ModuleStaticLiteral::Int(a), ModuleStaticLiteral::Int(b)) => {
                     let result = match op {
@@ -427,11 +481,162 @@ fn literal_value_from_expr(expr: &syn::Expr) -> Option<ModuleStaticLiteral> {
                 _ => None,
             }
         }
-        syn::Expr::Cast(syn::ExprCast { expr, .. }) => literal_value_from_expr(expr),
-        syn::Expr::Group(g) => literal_value_from_expr(&g.expr),
-        syn::Expr::Paren(p) => literal_value_from_expr(&p.expr),
+        syn::Expr::Path(syn::ExprPath {
+            qself: None, path, ..
+        }) if path.segments.len() == 1 && path.segments[0].arguments.is_none() => {
+            let name = path.segments[0].ident.to_string();
+            let key = (current_prefix.to_string(), name);
+            resolve_module_static_literal(&key, initializers, memo, visiting)
+        }
+        syn::Expr::Cast(syn::ExprCast { expr, ty, .. }) => literal_value_cast(recurse(expr)?, ty),
+        syn::Expr::Group(g) => recurse(&g.expr),
+        syn::Expr::Paren(p) => recurse(&p.expr),
         _ => None,
     }
+}
+
+fn literal_value_cast(value: ModuleStaticLiteral, ty: &syn::Type) -> Option<ModuleStaticLiteral> {
+    let target = primitive_cast_target(ty)?;
+    match (value, target) {
+        (ModuleStaticLiteral::Bool(b), PrimitiveCastTarget::Int(t)) => {
+            cast_i64_to_int(if b { 1 } else { 0 }, t)
+        }
+        (ModuleStaticLiteral::Int(n), PrimitiveCastTarget::Int(t)) => cast_i64_to_int(n, t),
+        (ModuleStaticLiteral::Int(n), PrimitiveCastTarget::Float(FloatCastTarget::F32)) => {
+            Some(ModuleStaticLiteral::Float(((n as f32) as f64).to_bits()))
+        }
+        (ModuleStaticLiteral::Int(n), PrimitiveCastTarget::Float(FloatCastTarget::F64)) => {
+            Some(ModuleStaticLiteral::Float((n as f64).to_bits()))
+        }
+        (ModuleStaticLiteral::Float(bits), PrimitiveCastTarget::Int(t)) => {
+            cast_f64_to_int(f64::from_bits(bits), t)
+        }
+        (ModuleStaticLiteral::Float(bits), PrimitiveCastTarget::Float(FloatCastTarget::F32)) => {
+            Some(ModuleStaticLiteral::Float(
+                ((f64::from_bits(bits) as f32) as f64).to_bits(),
+            ))
+        }
+        (ModuleStaticLiteral::Float(bits), PrimitiveCastTarget::Float(FloatCastTarget::F64)) => {
+            Some(ModuleStaticLiteral::Float(bits))
+        }
+        // Rust does not support arbitrary numeric/float casts to bool via `as`.
+        (_, PrimitiveCastTarget::Bool) => None,
+        // Rust supports bool -> integer, but not bool -> float via `as`.
+        (ModuleStaticLiteral::Bool(_), PrimitiveCastTarget::Float(_)) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveCastTarget {
+    Int(IntCastTarget),
+    Float(FloatCastTarget),
+    Bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntCastTarget {
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatCastTarget {
+    F32,
+    F64,
+}
+
+fn primitive_cast_target(ty: &syn::Type) -> Option<PrimitiveCastTarget> {
+    match ty {
+        syn::Type::Path(path) if path.qself.is_none() => {
+            let segment = path.path.segments.last()?;
+            if !segment.arguments.is_empty() {
+                return None;
+            }
+            match segment.ident.to_string().as_str() {
+                "i8" => Some(PrimitiveCastTarget::Int(IntCastTarget::I8)),
+                "i16" => Some(PrimitiveCastTarget::Int(IntCastTarget::I16)),
+                "i32" => Some(PrimitiveCastTarget::Int(IntCastTarget::I32)),
+                "i64" => Some(PrimitiveCastTarget::Int(IntCastTarget::I64)),
+                "isize" => Some(PrimitiveCastTarget::Int(IntCastTarget::Isize)),
+                "u8" => Some(PrimitiveCastTarget::Int(IntCastTarget::U8)),
+                "u16" => Some(PrimitiveCastTarget::Int(IntCastTarget::U16)),
+                "u32" => Some(PrimitiveCastTarget::Int(IntCastTarget::U32)),
+                "u64" => Some(PrimitiveCastTarget::Int(IntCastTarget::U64)),
+                "usize" => Some(PrimitiveCastTarget::Int(IntCastTarget::Usize)),
+                "f32" => Some(PrimitiveCastTarget::Float(FloatCastTarget::F32)),
+                "f64" => Some(PrimitiveCastTarget::Float(FloatCastTarget::F64)),
+                "bool" => Some(PrimitiveCastTarget::Bool),
+                _ => None,
+            }
+        }
+        syn::Type::Paren(paren) => primitive_cast_target(&paren.elem),
+        syn::Type::Group(group) => primitive_cast_target(&group.elem),
+        _ => None,
+    }
+}
+
+fn cast_i64_to_int(n: i64, target: IntCastTarget) -> Option<ModuleStaticLiteral> {
+    let value = match target {
+        IntCastTarget::I8 => (n as i8) as i64,
+        IntCastTarget::I16 => (n as i16) as i64,
+        IntCastTarget::I32 => (n as i32) as i64,
+        IntCastTarget::I64 => n,
+        IntCastTarget::Isize => (n as isize) as i64,
+        IntCastTarget::U8 => (n as u8) as i64,
+        IntCastTarget::U16 => (n as u16) as i64,
+        IntCastTarget::U32 => (n as u32) as i64,
+        IntCastTarget::U64 => {
+            let u = n as u64;
+            if u > i64::MAX as u64 {
+                return None;
+            }
+            u as i64
+        }
+        IntCastTarget::Usize => {
+            let u = n as usize;
+            if (u as u128) > (i64::MAX as u128) {
+                return None;
+            }
+            u as i64
+        }
+    };
+    Some(ModuleStaticLiteral::Int(value))
+}
+
+fn cast_f64_to_int(n: f64, target: IntCastTarget) -> Option<ModuleStaticLiteral> {
+    let value = match target {
+        IntCastTarget::I8 => (n as i8) as i64,
+        IntCastTarget::I16 => (n as i16) as i64,
+        IntCastTarget::I32 => (n as i32) as i64,
+        IntCastTarget::I64 => n as i64,
+        IntCastTarget::Isize => (n as isize) as i64,
+        IntCastTarget::U8 => (n as u8) as i64,
+        IntCastTarget::U16 => (n as u16) as i64,
+        IntCastTarget::U32 => (n as u32) as i64,
+        IntCastTarget::U64 => {
+            let u = n as u64;
+            if u > i64::MAX as u64 {
+                return None;
+            }
+            u as i64
+        }
+        IntCastTarget::Usize => {
+            let u = n as usize;
+            if (u as u128) > (i64::MAX as u128) {
+                return None;
+            }
+            u as i64
+        }
+    };
+    Some(ModuleStaticLiteral::Int(value))
 }
 
 fn literal_value_from_lit(lit: &syn::Lit, negative: bool) -> Option<ModuleStaticLiteral> {
@@ -1461,7 +1666,8 @@ mod tests {
             pub const NEG_FLOAT: f64 = -2.5;
             // Non-literal initialisers must NOT carry a literal payload:
             pub const FROM_FN: u32 = compute();
-            pub const CAST_EXPR: u64 = 1u64 << 32;
+            pub const SHIFT_EXPR: u64 = 1u64 << 32;
+            pub const ACTUAL_CAST: i64 = 1 as i64;
         "#,
         );
 
@@ -1501,8 +1707,124 @@ mod tests {
         }
         assert!(get("FROM_FN").literal.is_none());
         assert!(
-            matches!(get("CAST_EXPR").literal, Some(ModuleStaticLiteral::Int(v)) if v == 1i64 << 32)
+            matches!(get("SHIFT_EXPR").literal, Some(ModuleStaticLiteral::Int(v)) if v == 1i64 << 32)
         );
+        assert!(matches!(
+            get("ACTUAL_CAST").literal,
+            Some(ModuleStaticLiteral::Int(1))
+        ));
+    }
+
+    #[test]
+    fn collect_module_statics_folds_representable_primitive_casts() {
+        let parsed = parse_source(
+            r#"
+            pub const IDENTITY: i64 = 1 as i64;
+            pub const WRAP_U8: u8 = 256 as u8;
+            pub const NEG_TO_U8: u8 = -1 as u8;
+            pub const BOOL_TO_INT: u8 = true as u8;
+            pub const INT_TO_FLOAT: f64 = 3 as f64;
+            pub const FLOAT_TO_INT: i64 = 3.9 as i64;
+            pub const FLOAT_TO_F32: f64 = 1.1 as f32 as f64;
+            pub const UNREPRESENTABLE_U64: u64 = -1 as u64;
+            pub const INVALID_BOOL_CAST: bool = 1 as bool;
+        "#,
+        );
+
+        let get = |name: &str| {
+            parsed
+                .module_statics
+                .get(&(String::new(), name.to_string()))
+                .unwrap_or_else(|| panic!("{name} collected"))
+        };
+        assert!(matches!(
+            get("IDENTITY").literal,
+            Some(ModuleStaticLiteral::Int(1))
+        ));
+        assert!(matches!(
+            get("WRAP_U8").literal,
+            Some(ModuleStaticLiteral::Int(0))
+        ));
+        assert!(matches!(
+            get("NEG_TO_U8").literal,
+            Some(ModuleStaticLiteral::Int(255))
+        ));
+        assert!(matches!(
+            get("BOOL_TO_INT").literal,
+            Some(ModuleStaticLiteral::Int(1))
+        ));
+        match get("INT_TO_FLOAT").literal {
+            Some(ModuleStaticLiteral::Float(bits)) => assert_eq!(f64::from_bits(bits), 3.0),
+            other => panic!("expected INT_TO_FLOAT to carry Float literal, got {other:?}"),
+        }
+        assert!(matches!(
+            get("FLOAT_TO_INT").literal,
+            Some(ModuleStaticLiteral::Int(3))
+        ));
+        match get("FLOAT_TO_F32").literal {
+            Some(ModuleStaticLiteral::Float(bits)) => {
+                assert_eq!(f64::from_bits(bits), 1.1f32 as f64);
+            }
+            other => panic!("expected FLOAT_TO_F32 to carry Float literal, got {other:?}"),
+        }
+        assert!(get("UNREPRESENTABLE_U64").literal.is_none());
+        assert!(get("INVALID_BOOL_CAST").literal.is_none());
+    }
+
+    #[test]
+    fn collect_module_statics_resolves_module_global_literal_bindings() {
+        let parsed = parse_source(
+            r#"
+            pub const BASE: i64 = 40;
+            pub const DERIVED: i64 = BASE + 2;
+            pub static IMMUTABLE_BASE: i64 = 5;
+            pub const FROM_STATIC: i64 = IMMUTABLE_BASE * 3;
+            pub const FORWARD: i64 = LATER + 1;
+            pub const FORWARD_CHAIN: i64 = FORWARD + 1;
+            pub const LATER: i64 = 9;
+            mod nested {
+                pub const INNER_BASE: i64 = 7;
+                pub const INNER_DERIVED: i64 = INNER_BASE + 1;
+                pub const INNER_FORWARD: i64 = INNER_LATER + 1;
+                pub const INNER_LATER: i64 = 11;
+                pub const FROM_OUTER: i64 = BASE + 1;
+                pub const MULTI_SEGMENT: i64 = super::BASE + 1;
+            }
+        "#,
+        );
+
+        let get = |prefix: &str, name: &str| {
+            parsed
+                .module_statics
+                .get(&(prefix.to_string(), name.to_string()))
+                .unwrap_or_else(|| panic!("{prefix}::{name} collected"))
+        };
+        assert!(matches!(
+            get("", "DERIVED").literal,
+            Some(ModuleStaticLiteral::Int(42))
+        ));
+        assert!(matches!(
+            get("", "FROM_STATIC").literal,
+            Some(ModuleStaticLiteral::Int(15))
+        ));
+        assert!(matches!(
+            get("", "FORWARD").literal,
+            Some(ModuleStaticLiteral::Int(10))
+        ));
+        assert!(matches!(
+            get("", "FORWARD_CHAIN").literal,
+            Some(ModuleStaticLiteral::Int(11))
+        ));
+        assert!(matches!(
+            get("nested", "INNER_DERIVED").literal,
+            Some(ModuleStaticLiteral::Int(8))
+        ));
+        assert!(matches!(
+            get("nested", "INNER_FORWARD").literal,
+            Some(ModuleStaticLiteral::Int(12))
+        ));
+        assert!(get("nested", "FROM_OUTER").literal.is_none());
+        assert!(get("nested", "MULTI_SEGMENT").literal.is_none());
     }
 
     /// PyPy parity regression guard: `static mut` storage carries a

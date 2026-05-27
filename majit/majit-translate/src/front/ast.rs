@@ -10186,11 +10186,12 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 // level but stays in the Float class either way.
                 "f32" | "f64" => ValueType::Float,
                 // Anything else is a user type / GC ref / opaque struct.
-                // Carry the joined path segments so downstream consumers
-                // (`valuetype_to_someshell` host-registry lookup) can
-                // narrow `SomeInstance(classdef=None)` to a registered
-                // `ClassDef` / `SomePtr(<ll_ptrtype>)` per the
-                // typed-ref-someptr-followup epic.
+                // Carry the joined path segments as diagnostic metadata
+                // on the legacy tag. Precise typed pointers must be
+                // attached by producers that can resolve the actual
+                // HostObject/lltype identity; `valuetype_to_someshell`
+                // deliberately keeps `Ref(_)` on the classdef-less
+                // fallback.
                 _ => ValueType::Ref(type_root_ident(ty)),
             }
         }

@@ -70,16 +70,15 @@ pub enum ValueType {
     /// resolves through `getinstancerepr(rtyper, None, Gc)` to the
     /// abstract `object`-root `InstanceRepr`).
     ///
-    /// `valuetype_to_someshell::Ref` arm
-    /// (`annotation_state.rs:58-88`) currently projects every
-    /// `Ref(_)` to `SomeInstance(classdef=None)`; the typed-ref-
-    /// someptr-followup epic (`memory/long_term_resolve_plan_2026_05_24.md`
-    /// + task #88) flips the producer-side `classify_fn_arg_ty` to
-    /// emit `Ref(Some(<type_root>))` and the consumer to lift the
-    /// known cases to `SomeInstance(classdef=Some(..))` or
-    /// `SomeValue::Ptr(SomePtr::new(<ll_ptrtype>))` via the
-    /// host-registry lookup before falling through to the
-    /// classdef-less projection.
+    /// `valuetype_to_someshell::Ref` intentionally projects every
+    /// `Ref(_)` fallback to `SomeInstance(classdef=None)`.  Typed
+    /// pointer precision must be attached before that fallback by a
+    /// producer that has the real lltype object in hand, e.g. the
+    /// Rust-source walker writing
+    /// `SomeValue::Ptr(SomePtr::new(<ll_ptrtype>))` directly into
+    /// `Variable.annotation`.  Reconstructing `SomePtr` later from this
+    /// root string would lose RPython's module/global context and
+    /// object-identity-based lltype semantics.
     Ref(Option<String>),
     Float,
     Void,

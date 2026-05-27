@@ -17,6 +17,7 @@ quote = { workspace = true }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+indexmap = { workspace = true }
 majit-ir = { workspace = true }
 libc = { workspace = true }
 # PRE-EXISTING-ADAPTATION, parity rule #1.

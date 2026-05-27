@@ -1821,22 +1821,7 @@ impl RPythonAnnotator {
         inputcells: &[Option<SomeValue>],
     ) {
         let blk = block.borrow();
-        let oldcells: Vec<SomeValue> = blk
-            .inputargs
-            .iter()
-            .map(|a| match a {
-                Hlvalue::Variable(v) => v
-                    .annotation
-                    .borrow()
-                    .as_ref()
-                    .map(|rc| (**rc).clone())
-                    .expect("mergeinputargs: inputarg lacks annotation"),
-                Hlvalue::Constant(c) => self
-                    .bookkeeper
-                    .immutableconstant(c)
-                    .expect("mergeinputargs: constant immutablevalue failed"),
-            })
-            .collect();
+        let oldcells: Vec<SomeValue> = blk.inputargs.iter().map(|a| self.binding(a)).collect();
         drop(blk);
 
         // `annrpython.py:432` calls `unionof(c1, c2)` directly —

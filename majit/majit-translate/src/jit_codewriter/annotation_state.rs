@@ -30,7 +30,7 @@ use crate::model::ValueType;
 /// |--------------------|------------------------|--------------------------|
 /// | `Int`              | `Integer(SomeInteger)` | `model.py:206-224` -> `SomeValue::Integer` arm. |
 /// | `Float`            | `Float(SomeFloat)`     | `model.py:164-183` -> `SomeValue::Float` arm. |
-/// | `Ref`              | `Instance(SomeInstance{classdef:None,..})` | `model.py:438` `SomeInstance.__init__(classdef, can_be_None=False, flags={})`.  `classdef=None` denotes the abstract `object`-only instance — the legitimate RPython placeholder when the bookkeeper has not narrowed the ClassDef.  Routes through `rclass.py:445-447 SomeInstance.rtyper_makerepr` -> `getinstancerepr(rtyper, None, Gc)` -> `InstanceRepr::new_rootinstance` -> `Ptr(GcStruct(OBJECT))` -> `lowleveltype_to_concrete` GC-arm -> `ConcreteType::GcRef`, matching legacy `resolve_types(Ref) -> GcRef`.  Convergence path: a producer (frontend / annotator with bookkeeper) attaches a richer `SomeInstance(classdef=Some(..))` directly onto `Variable.annotation` once the ClassDef is known (RPython `annrpython.py:289-294 setbinding`). |
+/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py:438`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py:445-447`. |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
 /// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs:418`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
@@ -56,34 +56,17 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         ValueType::Bool => Some(SomeValue::Bool(crate::annotator::model::SomeBool::default())),
         ValueType::Float => Some(SomeValue::Float(SomeFloat::default())),
         ValueType::Ref(_) => {
-            // RPython `SomeInstance(classdef=None, can_be_None=False,
-            // flags={})` (model.py:438).  Upstream-orthodox abstract
-            // instance for cases where the bookkeeper has not yet
-            // narrowed the ClassDef.
-            //
-            // TODO (blocked on M2.5g): for typed `&Foo` Rust
-            // references the upstream-orthodox lift is
-            // `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), not
-            // `SomeInstance(classdef=None)`.  Pyre's
-            // `front/ast.rs::classify_fn_arg_ty` collapses `&T`/`*T`
-            // into `ValueType::Ref` without a Ptr-carrier variant
-            // because the surface DSL has no `lltype.*` HostObject,
-            // so this fallback receives both genuine "un-narrowed
-            // instance" cases AND typed-ref cases.  Producers that
-            // already know the operand is a typed pointer should call
-            // `AnnotationState::set_some(vid, SomeValue::Ptr(
-            // SomePtr::new(t)))` directly to bypass this fallback —
-            // the downstream `cast_ptr_to_int` typer's late
-            // InstanceRepr→PtrRepr swap (`rbuiltin.rs:2174-2194`)
-            // exists specifically because no such producer is wired
-            // for typed `&Foo` yet.  Convergence: M2.5g registry
-            // walker lands → frontend lifts typed `&Foo` directly to
-            // `SomeValue::Ptr` at `value_type_for_type` time.
-            Some(SomeValue::Instance(SomeInstance::new(
-                None,
-                false,
-                BTreeMap::new(),
-            )))
+            // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
+            // (`llannotation.py:64-70`), but the correct Ptr must come
+            // from the producer (annotator with bookkeeper / host-class
+            // registry) writing `Variable.annotation` directly — not
+            // from a process-global root-string lookup here.  A global
+            // bare-name index conflates cross-module same-name structs
+            // and bypasses RPython's object-identity-based lltype cache.
+            // This fallback projection therefore keeps all Ref variants
+            // classdef-less; producers with a real Ptr bypass it by
+            // seeding `Variable.annotation` directly.
+            Some(ref_fallback_instance())
         }
         ValueType::State => {
             // TODO: no upstream equivalent.  Pyre's `State`
@@ -118,6 +101,10 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
     }
 }
 
+fn ref_fallback_instance() -> SomeValue {
+    SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()))
+}
+
 /// Reduce a `SomeValue` lattice node to its `ValueType` discriminator.
 /// Inverse of [`valuetype_to_someshell`].
 ///
@@ -147,5 +134,24 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // shell directly; this reduced projection falls back to `Ref`
         // so GC-pointer lowering applies.
         _ => ValueType::Ref(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_ref_uses_instance_fallback() {
+        let shell = valuetype_to_someshell(&ValueType::Ref(Some("SomeStruct".to_string())))
+            .expect("Ref projects");
+        match shell {
+            SomeValue::Instance(inst) => {
+                assert!(inst.classdef.is_none());
+                assert!(!inst.can_be_none);
+                assert!(inst.flags.is_empty());
+            }
+            other => panic!("typed Ref must use fallback Instance, got {other:?}"),
+        }
     }
 }
