@@ -5972,108 +5972,336 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_str_new(&out))
 }
 
-/// unicodehelper.py:399 _utf8_code_length classification
-fn utf8_error_reason(data: &[u8], valid_end: usize, error_len: Option<usize>) -> &'static str {
-    if error_len.is_none() {
-        return "unexpected end of data";
-    }
-    let b = data[valid_end];
-    match b {
-        // continuation byte at start, overlong 2-byte, or >= 0xF5
-        0x80..=0xBF | 0xC0..=0xC1 | 0xF5..=0xFF => "invalid start byte",
-        // valid start byte but bad continuation
-        _ => "invalid continuation byte",
-    }
-}
-
 /// interp_codecs.py:298/363 — encode-only handlers raise TypeError on decode
 fn decode_error_encode_only_handler() -> crate::PyError {
     crate::PyError::type_error("don't know how to handle UnicodeDecodeError in error callback")
 }
 
+/// interp_exceptions.py:1061-1070 W_UnicodeDecodeError.descr_str format
+fn unicode_decode_error_msg(
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> String {
+    if end == start + 1 {
+        format!(
+            "'{codec}' codec can't decode byte 0x{:02x} in position {start}: {reason}",
+            data[start]
+        )
+    } else {
+        format!(
+            "'{codec}' codec can't decode bytes in position {start}-{}: {reason}",
+            end - 1
+        )
+    }
+}
+
+/// unicodehelper.py:15-22 — strict errorhandler raises UnicodeDecodeError
+fn utf8_strict_handler(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Result<(), crate::PyError> {
+    Err(crate::PyError::new(
+        crate::PyErrorKind::UnicodeDecodeError,
+        unicode_decode_error_msg("utf-8", data, start, end, reason),
+    ))
+}
+
+/// Handle a decode error for non-strict modes.
+/// Returns replacement text to append to `out`, or Err for fatal handlers.
+/// `start` and `end` define the error span in `data`.
+fn utf8_error_handler(
+    err_mode: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut String,
+) -> Result<usize, crate::PyError> {
+    match err_mode {
+        "strict" => {
+            utf8_strict_handler(data, start, end, reason)?;
+            unreachable!()
+        }
+        "ignore" => Ok(end),
+        "replace" => {
+            out.push('\u{FFFD}');
+            Ok(end)
+        }
+        // interp_codecs.py:515-555 surrogateescape / :431-513 surrogatepass
+        // PyPy stores surrogates via rutf8 allow_surrogates=True (WTF-8).
+        // pyre's W_StrObject backs onto Rust String (&str = valid UTF-8),
+        // so surrogate codepoints cannot be represented.  Re-raise.
+        "surrogateescape" | "surrogatepass" => Err(crate::PyError::new(
+            crate::PyErrorKind::UnicodeDecodeError,
+            unicode_decode_error_msg("utf-8", data, start, end, reason),
+        )),
+        "backslashreplace" => {
+            for &b in &data[start..end] {
+                out.push_str(&format!("\\x{:02x}", b));
+            }
+            Ok(end)
+        }
+        "xmlcharrefreplace" | "namereplace" => Err(decode_error_encode_only_handler()),
+        _ => Err(crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )),
+    }
+}
+
+/// runicode.py:118-127 _utf8_code_length table
+/// Indexed by (byte - 0x80).  0 = invalid start, 2/3/4 = expected sequence length.
+const UTF8_CODE_LENGTH: [u8; 128] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 80-8F
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 90-9F
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // A0-AF
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // B0-BF
+    0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // C0-C1 + C2-CF
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // D0-DF
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // E0-EF
+    4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F0-F4 + F5-FF
+];
+
+/// rutf8.py:326-328
+fn invalid_cont_byte(b: u8) -> bool {
+    (b as i8) >= -0x40 // equivalent: b < 0x80 || b > 0xBF
+}
+
+/// rutf8.py:339-343
+/// Surrogates (ED A0..BF) are always rejected — pyre's Rust String cannot
+/// hold surrogate codepoints; the error handler deals with surrogatepass.
+fn invalid_byte_2_of_3(ch1: u8, ch2: u8) -> bool {
+    invalid_cont_byte(ch2) || (ch1 == 0xE0 && ch2 < 0xA0) || (ch1 == 0xED && ch2 > 0x9F)
+}
+
+/// rutf8.py:345-348
+fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
+    invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
+}
+
+/// unicodehelper.py:377-537 _str_decode_utf8_slowpath
+/// Structural port of PyPy's _utf8_code_length state machine.
+/// PyPy appends raw UTF-8 bytes to a StringBuilder; Rust reconstructs
+/// Unicode scalar values via char::from_u32.  Surrogates are always
+/// rejected by invalid_byte_2_of_3 and routed to the error handler.
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<String, crate::PyError> {
-    let mut out = String::new();
+    let s = data;
+    let size = s.len();
+    let mut result = String::new();
     let mut pos = 0;
-    while pos < data.len() {
-        match std::str::from_utf8(&data[pos..]) {
-            Ok(s) => {
-                out.push_str(s);
-                break;
-            }
-            Err(e) => {
-                let valid_end = pos + e.valid_up_to();
-                out.push_str(unsafe { std::str::from_utf8_unchecked(&data[pos..valid_end]) });
-                let bad_len = e.error_len().unwrap_or(data.len() - valid_end);
-                let bad = &data[valid_end..valid_end + bad_len];
-                match err_mode {
-                    "strict" => {
-                        let reason = utf8_error_reason(data, valid_end, e.error_len());
-                        if e.error_len().is_none() {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::UnicodeDecodeError,
-                                format!(
-                                    "'utf-8' codec can't decode bytes in position {}--{}: {reason}",
-                                    valid_end,
-                                    data.len() - 1
-                                ),
-                            ));
-                        }
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::UnicodeDecodeError,
-                            format!(
-                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: {reason}",
-                                data[valid_end], valid_end
-                            ),
-                        ));
-                    }
-                    "ignore" => {}
-                    "replace" => out.push('\u{FFFD}'),
-                    // interp_codecs.py:515-555 surrogateescape / :431-513 surrogatepass
-                    // produce U+DC80..U+DCFF / U+D800..U+DFFF respectively.
-                    // PyPy stores these via rutf8 allow_surrogates=True (WTF-8).
-                    // pyre's W_StrObject backs onto Rust String (&str = valid UTF-8),
-                    // so surrogate codepoints cannot be represented.  Re-raise the
-                    // original decode error rather than violating the String invariant.
-                    "surrogateescape" | "surrogatepass" => {
-                        let reason = utf8_error_reason(data, valid_end, e.error_len());
-                        if e.error_len().is_none() {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::UnicodeDecodeError,
-                                format!(
-                                    "'utf-8' codec can't decode bytes in position {}--{}: {reason}",
-                                    valid_end,
-                                    data.len() - 1
-                                ),
-                            ));
-                        }
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::UnicodeDecodeError,
-                            format!(
-                                "'utf-8' codec can't decode byte 0x{:02x} in position {}: {reason}",
-                                data[valid_end], valid_end
-                            ),
-                        ));
-                    }
-                    "backslashreplace" => {
-                        for &b in bad {
-                            out.push_str(&format!("\\x{:02x}", b));
-                        }
-                    }
-                    "xmlcharrefreplace" | "namereplace" => {
-                        return Err(decode_error_encode_only_handler());
-                    }
-                    _ => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::LookupError,
-                            format!("unknown error handler name '{err_mode}'"),
-                        ));
-                    }
+    let final_ = true; // pyre always decodes complete buffers
+
+    while pos < size {
+        let ordch1 = s[pos];
+        // unicodehelper.py:394 fast path for ASCII
+        if ordch1 <= 0x7F {
+            result.push(ordch1 as char);
+            pos += 1;
+            continue;
+        }
+
+        // unicodehelper.py:399
+        let n = UTF8_CODE_LENGTH[(ordch1 - 0x80) as usize];
+
+        // unicodehelper.py:400 truncated sequence
+        if pos + n as usize > size {
+            let charsleft = size - pos - 1; // 0, 1, or 2
+            // unicodehelper.py:407
+            if charsleft == 0 {
+                if !final_ {
+                    break;
                 }
-                pos = valid_end + bad_len;
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 1,
+                    "unexpected end of data",
+                    &mut result,
+                )?;
+                continue;
             }
+            let ordch2 = s[pos + 1];
+            if n == 3 {
+                // unicodehelper.py:417-434
+                if invalid_byte_2_of_3(ordch1, ordch2) {
+                    pos = utf8_error_handler(
+                        err_mode,
+                        s,
+                        pos,
+                        pos + 1,
+                        "invalid continuation byte",
+                        &mut result,
+                    )?;
+                    continue;
+                }
+                if !final_ {
+                    break;
+                }
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 2,
+                    "unexpected end of data",
+                    &mut result,
+                )?;
+                continue;
+            } else if n == 4 {
+                // unicodehelper.py:435-459
+                if invalid_byte_2_of_4(ordch1, ordch2) {
+                    pos = utf8_error_handler(
+                        err_mode,
+                        s,
+                        pos,
+                        pos + 1,
+                        "invalid continuation byte",
+                        &mut result,
+                    )?;
+                    continue;
+                }
+                if charsleft == 2 && invalid_cont_byte(s[pos + 2]) {
+                    pos = utf8_error_handler(
+                        err_mode,
+                        s,
+                        pos,
+                        pos + 2,
+                        "invalid continuation byte",
+                        &mut result,
+                    )?;
+                    continue;
+                }
+                if !final_ {
+                    break;
+                }
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + charsleft + 1,
+                    "unexpected end of data",
+                    &mut result,
+                )?;
+                continue;
+            }
+            unreachable!("n must be 3 or 4 when charsleft > 0");
+        }
+
+        // unicodehelper.py:462 n == 0 → invalid start byte
+        if n == 0 {
+            pos = utf8_error_handler(err_mode, s, pos, pos + 1, "invalid start byte", &mut result)?;
+            continue;
+        }
+
+        if n == 2 {
+            // unicodehelper.py:471-482
+            let ordch2 = s[pos + 1];
+            if invalid_cont_byte(ordch2) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 1,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            // 110yyyyy 10zzzzzz
+            let cp = ((ordch1 as u32 & 0x1F) << 6) | (ordch2 as u32 & 0x3F);
+            if let Some(c) = char::from_u32(cp) {
+                result.push(c);
+            }
+            pos += 2;
+        } else if n == 3 {
+            // unicodehelper.py:484-503
+            let ordch2 = s[pos + 1];
+            let ordch3 = s[pos + 2];
+            if invalid_byte_2_of_3(ordch1, ordch2) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 1,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            if invalid_cont_byte(ordch3) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 2,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            // 1110xxxx 10yyyyyy 10zzzzzz
+            let cp = ((ordch1 as u32 & 0x0F) << 12)
+                | ((ordch2 as u32 & 0x3F) << 6)
+                | (ordch3 as u32 & 0x3F);
+            if let Some(c) = char::from_u32(cp) {
+                result.push(c);
+            }
+            pos += 3;
+        } else {
+            // n == 4, unicodehelper.py:505-532
+            let ordch2 = s[pos + 1];
+            let ordch3 = s[pos + 2];
+            let ordch4 = s[pos + 3];
+            if invalid_byte_2_of_4(ordch1, ordch2) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 1,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            if invalid_cont_byte(ordch3) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 2,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            if invalid_cont_byte(ordch4) {
+                pos = utf8_error_handler(
+                    err_mode,
+                    s,
+                    pos,
+                    pos + 3,
+                    "invalid continuation byte",
+                    &mut result,
+                )?;
+                continue;
+            }
+            // 11110www 10xxxxxx 10yyyyyy 10zzzzzz
+            let cp = ((ordch1 as u32 & 0x07) << 18)
+                | ((ordch2 as u32 & 0x3F) << 12)
+                | ((ordch3 as u32 & 0x3F) << 6)
+                | (ordch4 as u32 & 0x3F);
+            if let Some(c) = char::from_u32(cp) {
+                result.push(c);
+            }
+            pos += 4;
         }
     }
-    Ok(out)
+    Ok(result)
 }
 
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object
