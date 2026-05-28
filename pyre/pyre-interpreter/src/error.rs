@@ -533,6 +533,26 @@ impl PyError {
         }
     }
 
+    pub fn index_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::IndexError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
+    pub fn lookup_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::LookupError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     pub fn os_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::OSError,
@@ -961,6 +981,11 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     }
     #[cfg(not(feature = "host_env"))]
     {
+        // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
+        // also returns silently when the source can't be read; with
+        // host_env off the interpreter must not reach `std::fs`
+        // directly, so we treat every source as unreadable and let the
+        // traceback render `^^^` markers without the offending line.
         let _ = (filename, lineno);
         None
     }

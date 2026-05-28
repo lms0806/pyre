@@ -1,4 +1,5 @@
-//! sys module — PyPy equivalent: pypy/module/sys/
+//! sys module — PyPy: pypy/module/sys/
 
-pub mod moduledef;
 pub mod state;
+
+crate::pyre_module_init!(interp_sys);

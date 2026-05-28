@@ -524,7 +524,9 @@ pub struct BuiltinCode {
 pub const BUILTIN_CODE_OBJECT_SIZE: usize = std::mem::size_of::<BuiltinCode>();
 
 impl pyre_object::lltype::GcType for BuiltinCode {
-    const TYPE_ID: u32 = BUILTIN_CODE_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        BUILTIN_CODE_GC_TYPE_ID
+    }
     const SIZE: usize = BUILTIN_CODE_OBJECT_SIZE;
 }
 
@@ -712,7 +714,7 @@ mod tests {
     fn builtin_code_gc_type_id_matches_descr() {
         assert_eq!(BUILTIN_CODE_GC_TYPE_ID, 13);
         assert_eq!(
-            <BuiltinCode as pyre_object::lltype::GcType>::TYPE_ID,
+            <BuiltinCode as pyre_object::lltype::GcType>::type_id(),
             BUILTIN_CODE_GC_TYPE_ID
         );
         assert_eq!(
@@ -764,4 +766,33 @@ mod tests {
         assert_eq!(sig.scope_length(), 2);
         assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
     }
+}
+
+// ── fsencode_w ───────────────────────────────────────────────────────
+// PyPy equivalent: `space.fsencode_w(w_obj)` —
+// `pypy/interpreter/baseobjspace.py:1232 fsencode_w` accepts str,
+// bytes, or any object implementing `__fspath__` and returns the
+// filesystem-encoded path as a Rust string.  Used by the
+// `#[pyre_function]` / `#[pyre_methods]` `PyPath` typed-receiver alias
+// (gateway.py visit_fsencode line 365) and by posix call sites that
+// previously inlined the same extraction.
+pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+    unsafe {
+        if pyre_object::is_str(obj) {
+            return Ok(pyre_object::w_str_get_value(obj).to_string());
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
+            return Ok(String::from_utf8_lossy(data).into_owned());
+        }
+    }
+    if let Ok(fspath) = crate::baseobjspace::getattr(obj, "__fspath__") {
+        let result = crate::call_function(fspath, &[obj]);
+        if !result.is_null() && unsafe { pyre_object::is_str(result) } {
+            return Ok(unsafe { pyre_object::w_str_get_value(result).to_string() });
+        }
+    }
+    Err(crate::PyError::type_error(
+        "expected str, bytes or os.PathLike",
+    ))
 }
