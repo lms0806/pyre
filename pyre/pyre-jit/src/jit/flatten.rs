@@ -3983,7 +3983,8 @@ where
     }
     let frame_var = ctx.portal_frame_var.expect(
         "lower_simple_call_hlop_to_insn requires LoweringContext::portal_frame_var \
-         to be seeded from portal_graph_inputvars(code).0; see codewriter.rs:3939",
+         to be seeded from portal_graph_inputvars(code).0; simple_call must not \
+         survive canonical lowering",
     );
     // First arg is the callable, rest are call arguments.  All Ref.
     // The lowered ListR is `[portal_frame, callable, args...]` because
@@ -4187,12 +4188,9 @@ fn build_residual_call_r_v_insn_from_operands(
 /// `[ConstInt(fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
 /// Descr] → Reg(Ref, dst)`.
 ///
-/// LoadConst has no frontend HLOp (the graph dual-write at
-/// codewriter.rs:4954-4965 IS the canonical post-rtype graph
-/// representation), so this slice adds no probe-side
-/// `lower_load_const_hlop_to_insn` — only the production-side
-/// builder.  Future `flatten_graph(graph, regallocs)` migration can
-/// reuse this helper without further refactor.
+/// LoadConst has no frontend HLOp: `flowcontext.py:841-843` pushes a
+/// Constant into the graph shadow.  This helper is the walker/backend
+/// adaptation that materializes that value from pyre's runtime CodeObject.
 pub fn build_load_const_fn_residual_call_ir_r_insn(
     load_const_fn_idx: u16,
     idx: i64,
@@ -8335,9 +8333,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "portal_frame_var")]
     fn lower_simple_call_hlop_panics_without_portal_frame_var() {
-        // The contract is fail-loud when `portal_frame_var` is None —
-        // simple_call needs the portal frame in the lowered residual_call
-        // operand list and there is no defensible default.
+        // PyPy's jtransform never leaves a lowered call as raw
+        // `simple_call`.  If pyre lacks the frame operand needed by its
+        // explicit-frame helper ABI, fail loudly instead of passing the
+        // HLOp through to canonical SSARepr.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let ctx = LoweringContext {
