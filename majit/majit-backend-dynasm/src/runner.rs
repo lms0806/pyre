@@ -2902,6 +2902,66 @@ impl Backend for DynasmBackend {
         self.write_float_at_mem(array_ptr, offset, newvalue);
     }
 
+    /// llmodel.py:648-651 bh_setinteriorfield_gc_i.  Interior address is
+    /// `array_base + arraydescr.basesize + fielddescr.offset + index *
+    /// arraydescr.itemsize`; the integer field is `field_size` bytes wide.
+    fn bh_setinteriorfield_gc_i(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: i64,
+        descr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_i: descr is not an InteriorField: {descr:?}");
+        };
+        let (base_size, itemsize, _) = array.unpack_arraydescr_size();
+        let (foff, fsize, _) = field.unpack_fielddescr_size();
+        let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
+        self.write_int_at_mem(array_ptr, offset, fsize, newvalue);
+    }
+
+    /// llmodel.py:648-651 bh_setinteriorfield_gc_r.  Pointer-typed
+    /// interior field: `WORD`-wide store plus the array write barrier.
+    fn bh_setinteriorfield_gc_r(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: majit_ir::GcRef,
+        descr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_r: descr is not an InteriorField: {descr:?}");
+        };
+        let (base_size, itemsize, _) = array.unpack_arraydescr_size();
+        let (foff, _, _) = field.unpack_fielddescr_size();
+        let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
+        unsafe {
+            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
+        }
+        if array_ptr != 0 {
+            dynasm_write_barrier_from_array(array_ptr as u64);
+        }
+    }
+
+    /// llmodel.py:648-651 bh_setinteriorfield_gc_f.  Float-typed interior
+    /// field: `sizeof(FLOATSTORAGE)`-wide store via `write_float_at_mem`.
+    fn bh_setinteriorfield_gc_f(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        newvalue: f64,
+        descr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_f: descr is not an InteriorField: {descr:?}");
+        };
+        let (base_size, itemsize, _) = array.unpack_arraydescr_size();
+        let (foff, _, _) = field.unpack_fielddescr_size();
+        let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
+        self.write_float_at_mem(array_ptr, offset, newvalue);
+    }
+
     /// llmodel.py:705-707 bh_getfield_gc_f delegates to read_float_at_mem.
     /// `getfield_vable_f/rd>f` and the floating-point array reader rely
     /// on this — the trait default returns 0.0, which silently produces

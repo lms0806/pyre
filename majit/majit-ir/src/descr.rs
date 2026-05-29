@@ -3359,6 +3359,14 @@ impl SimpleFieldDescr {
         self
     }
 
+    /// descr.py:158 `self.index = index_in_parent` — the field's
+    /// positional index within its struct, returned by `get_index()`
+    /// and read back by `InteriorFieldDescr.get_index()` (descr.py:393).
+    pub fn with_index_in_parent(mut self, index_in_parent: usize) -> Self {
+        self.index_in_parent = index_in_parent;
+        self
+    }
+
     /// Compat shim: with_signed(true) → FLAG_SIGNED, with_signed(false) → FLAG_UNSIGNED.
     pub fn with_signed(mut self, signed: bool) -> Self {
         self.flag = if signed {

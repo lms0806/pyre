@@ -1111,6 +1111,17 @@ pub enum BhDescr {
         /// arrays whose item type is an inline struct.
         interior_fields: Vec<BhInteriorFieldSpec>,
     },
+    /// Interior-field descriptor: for getinteriorfield/setinteriorfield
+    /// on arrays of inline structs.  `descr.py:388
+    /// InteriorFieldDescr(arraydescr, fielddescr)` composes the
+    /// containing `ArrayDescr` with the `FieldDescr` of the targeted
+    /// struct field.  The blackhole resolves the interior address as
+    /// `array_base + arraydescr.basesize + fielddescr.offset + index *
+    /// arraydescr.itemsize` (`llmodel.py:648-649`).
+    InteriorField {
+        array: Box<BhDescr>,
+        field: Box<BhDescr>,
+    },
     /// Plain `SizeDescr` (no vtable / NEW_WITH_VTABLE descr).
     ///
     /// `descr.py:120 get_size_descr` + `:188 init_size_descr` populate
@@ -1354,6 +1365,41 @@ impl BhDescr {
             // paths reconstruct identity from structural fields only.
             array_type_id: None,
             interior_fields: Vec::new(),
+        }
+    }
+
+    /// Build the runtime BhDescr shape from a live `FieldDescr`,
+    /// preserving the structural fields RPython stores on `FieldDescr`.
+    /// Sibling of `from_array_descr`; used by resume/blackhole paths that
+    /// receive a live `FieldDescr` (e.g. an
+    /// `InteriorFieldDescr.fielddescr`).
+    pub fn from_field_descr(fd: &dyn majit_ir::descr::FieldDescr) -> Self {
+        let spec = BhFieldSpec::from_field_descr(fd);
+        BhDescr::Field {
+            offset: spec.offset,
+            field_size: spec.field_size,
+            field_type: spec.field_type,
+            field_flag: spec.field_flag,
+            is_field_signed: spec.is_field_signed,
+            is_immutable: spec.is_immutable,
+            is_quasi_immutable: spec.is_quasi_immutable,
+            index_in_parent: spec.index_in_parent,
+            // Resume/blackhole reconstruct identity from structural
+            // fields only; the parent SizeDescr backref is not surfaced
+            // by the live `FieldDescr` trait.
+            parent: None,
+            name: spec.name,
+            owner: String::new(),
+        }
+    }
+
+    /// Build the runtime BhDescr shape from a live `InteriorFieldDescr`,
+    /// composing its `arraydescr` and `fielddescr` summaries.
+    /// `descr.py:388 InteriorFieldDescr(arraydescr, fielddescr)`.
+    pub fn from_interior_field_descr(ifd: &dyn majit_ir::descr::InteriorFieldDescr) -> Self {
+        BhDescr::InteriorField {
+            array: Box::new(BhDescr::from_array_descr(ifd.array_descr())),
+            field: Box::new(BhDescr::from_field_descr(ifd.field_descr())),
         }
     }
 

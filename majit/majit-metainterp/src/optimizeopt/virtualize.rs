@@ -3331,6 +3331,188 @@ mod tests {
         );
     }
 
+    /// rpython/jit/metainterp/optimizeopt/test/test_util.py:351-360:
+    /// `complexarray = GcArray(Struct('complex', ('real', Float),
+    /// ('imag', Float)))` with `complexarraydescr = cpu.arraydescrof(...)`,
+    /// `complexrealdescr = cpu.interiorfielddescrof(complexarray, "real")`,
+    /// `compleximagdescr = cpu.interiorfielddescrof(complexarray, "imag")`.
+    /// Returns `(complexarraydescr, complexrealdescr, compleximagdescr)`.
+    fn complex_array_descrs() -> (DescrRef, DescrRef, DescrRef) {
+        // base_size 0, item_size 16 (two 8-byte floats); FLAG_STRUCT marks
+        // `is_array_of_structs()` (descr.py:264-266).
+        let arr = Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+            90,
+            0,
+            16,
+            90,
+            Type::Float,
+            majit_ir::ArrayFlag::Struct,
+        ));
+        let real_fd: Arc<dyn majit_ir::descr::FieldDescr> = {
+            let mut fd = majit_ir::SimpleFieldDescr::new(0, 0, 8, Type::Float, false);
+            fd.index_in_parent = 0;
+            Arc::new(fd)
+        };
+        let imag_fd: Arc<dyn majit_ir::descr::FieldDescr> = {
+            let mut fd = majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Float, false);
+            fd.index_in_parent = 1;
+            Arc::new(fd)
+        };
+        let real: DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            0,
+            arr.clone(),
+            real_fd,
+        ));
+        let imag: DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            1,
+            arr.clone(),
+            imag_fd,
+        ));
+        // descr.py:373 get_array_descr sets arraydescr.all_interiorfielddescrs.
+        arr.set_all_interiorfielddescrs(vec![real.clone(), imag.clone()]);
+        (arr as DescrRef, real, imag)
+    }
+
+    #[test]
+    fn test_new_array_struct_virtual() {
+        // virtualize.py:30-32 array-of-structs NEW_ARRAY_CLEAR virtualization,
+        // mirroring the virtual roundtrip exercised by
+        // rpython/jit/metainterp/optimizeopt/test/test_optimizebasic.py:2526
+        // test_dirty_array_of_structs_field_after_force:
+        //   p1 = new_array_clear(1, descr=complexarraydescr)
+        //   setinteriorfield_gc(p1, 0, f_real, descr=complexrealdescr)
+        //   setinteriorfield_gc(p1, 0, f_imag, descr=compleximagdescr)
+        //   f2 = getinteriorfield_gc_f(p1, 0, descr=complexrealdescr)
+        // The array stays virtual; `f2` forwards to `f_real`; all ops removed.
+        let (arr, real, imag) = complex_array_descrs();
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
+            Op::with_descr(
+                OpCode::SetinteriorfieldGc,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(51),
+                    OpRef::float_op(60),
+                ],
+                real.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetinteriorfieldGc,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(51),
+                    OpRef::float_op(61),
+                ],
+                imag.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetinteriorfieldGcF,
+                &[OpRef::input_arg_ref(0), OpRef::int_op(51)],
+                real.clone(),
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![
+            (OpRef::int_op(50), Value::Int(1)),
+            (OpRef::int_op(51), Value::Int(0)),
+        ];
+
+        let result = run_pass_with_constants(&ops, &constants);
+        assert!(
+            result.is_empty(),
+            "all interiorfield ops on virtual array-of-struct should be removed; \
+             got {} ops: {:?}",
+            result.len(),
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_new_array_struct_forced_at_call() {
+        // info.py:670-684 ArrayStructInfo._force_elements: when the virtual
+        // array-of-structs escapes (here via call_n), it is reconstructed as
+        // NEW_ARRAY_CLEAR + one SETINTERIORFIELD_GC per stored field, emitted
+        // before the escaping op.
+        //   p0 = new_array_clear(1, descr=complexarraydescr)
+        //   setinteriorfield_gc(p0, 0, f_real, descr=complexrealdescr)
+        //   setinteriorfield_gc(p0, 0, f_imag, descr=compleximagdescr)
+        //   call_n(p0)   <- p0 escapes, force it
+        let (arr, real, imag) = complex_array_descrs();
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
+            Op::with_descr(
+                OpCode::SetinteriorfieldGc,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(51),
+                    OpRef::float_op(60),
+                ],
+                real.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetinteriorfieldGc,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(51),
+                    OpRef::float_op(61),
+                ],
+                imag.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
+        ];
+        assign_positions(&mut ops);
+
+        // Forcing-on-escape is driven by the full `Optimizer`, not the
+        // single-op `run_pass_with_constants` loop.  Mirror `run_pass_typed`
+        // but seed the size/index constants (position-keyed, optimizer.rs
+        // :2058-2064) and mark the float value slots 60/61 so they don't
+        // collide with the Ref-typed inputarg seeding.
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptVirtualize::new()));
+        let mut types = vec![Type::Ref; 1024];
+        types[60] = Type::Float;
+        types[61] = Type::Float;
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
+        opt.snapshot_boxes = snapshots;
+        let mut constants = majit_ir::VecAssoc::new();
+        constants.insert(50u32, Value::Int(1));
+        constants.insert(51u32, Value::Int(0));
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
+
+        // Forced reconstruction: NEW_ARRAY_CLEAR, 2× SETINTERIORFIELD_GC, CALL_N.
+        assert_eq!(
+            result.first().map(|o| o.opcode),
+            Some(OpCode::NewArrayClear),
+            "forced array-of-struct should re-emit NEW_ARRAY_CLEAR first; got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        let setinterior = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::SetinteriorfieldGc)
+            .count();
+        assert_eq!(
+            setinterior,
+            2,
+            "both stored interior fields should be re-emitted; got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.last().map(|o| o.opcode),
+            Some(OpCode::CallN),
+            "escaping call_n must come after the reconstruction; got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_arraylen_gc_on_virtual() {
         // Virtual array of length 5 -> arraylen_gc returns constant 5

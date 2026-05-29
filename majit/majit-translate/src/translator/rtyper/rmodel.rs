@@ -2462,6 +2462,16 @@ pub enum ReprKey {
     /// RPython `SomeTypedAddressAccess.rtyper_makekey = (self.__class__, self.type)`
     /// (raddress.py:24-25).
     TypedAddressAccess(LowLevelType),
+    /// RPython `SomePtr.rtyper_makekey = (self.__class__, self.ll_ptrtype)`
+    /// (rptr.py). Keyed on [`LowLevelType::stable_repr_key`] of the
+    /// pointer lltype — a deterministic, lock-free serialization so two
+    /// distinct pointer types never collide (the prior `Pending(Debug)`
+    /// path rendered concurrently-locked forward-reference `Mutex`es as
+    /// `<locked>`, collapsing distinct types onto one cache entry).
+    Ptr(String),
+    /// RPython `SomeInteriorPtr.rtyper_makekey = (self.__class__,
+    /// self.ll_ptrtype)` (rptr.py). Same stable-key rationale as [`Ptr`].
+    InteriorPtr(String),
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -2605,6 +2615,25 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         SomeValue::Address(_) => ReprKey::Address,
         // raddress.py:24-25: SomeTypedAddressAccess.rtyper_makekey = (self.__class__, self.type).
         SomeValue::TypedAddressAccess(s) => ReprKey::TypedAddressAccess(s.access_type.clone()),
+        // rptr.py — SomePtr / SomeInteriorPtr rtyper_makekey =
+        // (self.__class__, self.ll_ptrtype). Key on the lltype's
+        // lock-free stable serialization rather than its Debug string:
+        // Debug routes through `Mutex::fmt`, which prints `<locked>`
+        // when the shared forward-reference target is held by another
+        // thread, collapsing distinct pointer types (e.g. Ptr(STR) vs
+        // Ptr(UNICODE)) onto one cache bucket under concurrency.
+        SomeValue::Ptr(s) => ReprKey::Ptr(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::from(
+                s.ll_ptrtype.clone(),
+            )
+            .stable_repr_key(),
+        ),
+        SomeValue::InteriorPtr(s) => ReprKey::InteriorPtr(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::from(
+                s.ll_ptrtype.clone(),
+            )
+            .stable_repr_key(),
+        ),
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical

@@ -4296,16 +4296,18 @@ fn bridge_decode_box(
     resume_data: &majit_metainterp::ResumeDataResult,
     fail_values: &[i64],
     fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
     cache: &mut BridgeVirtualCache,
 ) -> (OpRef, majit_ir::Value) {
     use majit_ir::resumedata::RebuiltValue;
+    let callinfocollection = ctx.callinfocollection.clone();
     match v {
         RebuiltValue::Box(n, tp) => {
             let opref = OpRef::input_arg_typed(*n as u32, *tp);
             let bits = fail_values[*n];
             let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
             // resume.py:1264 assert box.type == kind
-            debug_assert!(
+            assert!(
                 effective_tp == expected_kind,
                 "bridge_decode_box: Box({n}) type {effective_tp:?} != expected {expected_kind:?}"
             );
@@ -4318,7 +4320,7 @@ fn bridge_decode_box(
                 _ => ctx.const_int(c.getint()),
             };
             // resume.py:1264 assert box.type == kind
-            debug_assert!(
+            assert!(
                 c.get_type() == expected_kind,
                 "bridge_decode_box: Const type {:?} != expected {:?}",
                 c.get_type(),
@@ -4335,6 +4337,8 @@ fn bridge_decode_box(
                     fail_values,
                     resume_data.num_failargs,
                     resume_data.storage.as_ref(),
+                    backend,
+                    callinfocollection.as_ref(),
                     cache,
                 );
                 (opref, majit_ir::Value::Int(value))
@@ -4345,6 +4349,8 @@ fn bridge_decode_box(
                     fail_values,
                     resume_data.num_failargs,
                     resume_data.storage.as_ref(),
+                    backend,
+                    callinfocollection.as_ref(),
                     cache,
                 );
                 (opref, majit_ir::Value::Ref(gcref))
@@ -4356,7 +4362,7 @@ fn bridge_decode_box(
 
 /// resume.py:1245-1264 decode_box concrete parity for tagged fieldnums.
 /// Converts a tagged i16 (from `rd_virtuals[*].fieldnums`) into raw i64
-/// bits suitable for `write_field_bytes`.
+/// bits suitable for backend concrete setters/calls.
 fn decode_tagged_concrete(
     tagged: i16,
     expected_kind: Type,
@@ -4364,6 +4370,8 @@ fn decode_tagged_concrete(
     fail_values: &[i64],
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    backend: &dyn majit_backend::Backend,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
     cache: &mut BridgeVirtualCache,
 ) -> i64 {
     use majit_ir::resumedata::{
@@ -4401,6 +4409,8 @@ fn decode_tagged_concrete(
                     fail_values,
                     num_failargs,
                     storage,
+                    backend,
+                    callinfocollection,
                     cache,
                 )
             } else {
@@ -4410,6 +4420,8 @@ fn decode_tagged_concrete(
                     fail_values,
                     num_failargs,
                     storage,
+                    backend,
+                    callinfocollection,
                     cache,
                 );
                 gcref.0 as i64
@@ -4419,33 +4431,316 @@ fn decode_tagged_concrete(
     }
 }
 
+fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_translate::jitcode::BhDescr {
+    majit_translate::jitcode::BhDescr::Field {
+        offset: fd.offset,
+        field_size: fd.field_size,
+        field_type: fd.field_type,
+        field_flag: majit_ir::ArrayFlag::from_field_type(fd.field_type),
+        is_field_signed: matches!(fd.field_type, Type::Int),
+        is_immutable: false,
+        is_quasi_immutable: false,
+        index_in_parent: fd.index as usize,
+        parent: None,
+        name: String::new(),
+        owner: String::new(),
+    }
+}
+
+fn bh_size_descr_from_size_descr(
+    size_descr: &dyn majit_ir::descr::SizeDescr,
+    vtable: usize,
+) -> majit_translate::jitcode::BhDescr {
+    majit_translate::jitcode::BhDescr::Size {
+        size: size_descr.size(),
+        // descr.py type_id is the dense GC tid for alloc_nursery_typed,
+        // not the cache_key structural identity
+        type_id: size_descr.type_id() as u64,
+        vtable,
+        owner: String::new(),
+        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size_descr),
+    }
+}
+
+fn bh_array_descr_from_descr(descr: &majit_ir::DescrRef) -> majit_translate::jitcode::BhDescr {
+    let ad = descr
+        .as_array_descr()
+        .expect("resume.py: allocate_array requires ArrayDescr");
+    majit_translate::jitcode::BhDescr::from_array_descr(ad)
+}
+
+fn decode_tagged_for_kind(
+    tagged: i16,
+    kind: Type,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    backend: &dyn majit_backend::Backend,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
+    cache: &mut BridgeVirtualCache,
+) -> i64 {
+    decode_tagged_concrete(
+        tagged,
+        kind,
+        rd_virtuals,
+        fail_values,
+        num_failargs,
+        storage,
+        backend,
+        callinfocollection,
+        cache,
+    )
+}
+
+fn setfield_concrete_from_tagged(
+    backend: &dyn majit_backend::Backend,
+    struct_ptr: i64,
+    fd: &majit_ir::FieldDescrInfo,
+    fieldnum: i16,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
+    cache: &mut BridgeVirtualCache,
+) {
+    let descr = bh_field_descr_from_info(fd);
+    match fd.field_type {
+        Type::Ref => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
+        }
+        Type::Float => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Float,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setfield_gc_f(struct_ptr, f64::from_bits(value as u64), &descr);
+        }
+        _ => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Int,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setfield_gc_i(struct_ptr, value, &descr);
+        }
+    }
+}
+
+fn setarrayitem_concrete_from_tagged(
+    backend: &dyn majit_backend::Backend,
+    array_ptr: i64,
+    index: usize,
+    arraydescr: &dyn majit_ir::descr::ArrayDescr,
+    bh_descr: &majit_translate::jitcode::BhDescr,
+    fieldnum: i16,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
+    cache: &mut BridgeVirtualCache,
+) {
+    if arraydescr.is_array_of_pointers() {
+        let value = decode_tagged_for_kind(
+            fieldnum,
+            Type::Ref,
+            rd_virtuals,
+            fail_values,
+            num_failargs,
+            storage,
+            backend,
+            callinfocollection,
+            cache,
+        );
+        backend.bh_setarrayitem_gc_r(
+            array_ptr,
+            index as i64,
+            majit_ir::GcRef(value as usize),
+            bh_descr,
+        );
+    } else if arraydescr.is_array_of_floats() {
+        let value = decode_tagged_for_kind(
+            fieldnum,
+            Type::Float,
+            rd_virtuals,
+            fail_values,
+            num_failargs,
+            storage,
+            backend,
+            callinfocollection,
+            cache,
+        );
+        backend.bh_setarrayitem_gc_f(
+            array_ptr,
+            index as i64,
+            f64::from_bits(value as u64),
+            bh_descr,
+        );
+    } else {
+        let value = decode_tagged_for_kind(
+            fieldnum,
+            Type::Int,
+            rd_virtuals,
+            fail_values,
+            num_failargs,
+            storage,
+            backend,
+            callinfocollection,
+            cache,
+        );
+        backend.bh_setarrayitem_gc_i(array_ptr, index as i64, value, bh_descr);
+    }
+}
+
+/// resume.py:1543-1552 BlackholeResumeDataReader.setinteriorfield_{int,
+/// ref,float}: dispatch on the `InteriorFieldDescr.fielddescr` type to
+/// `cpu.bh_setinteriorfield_gc_{i,r,f}`.
+fn setinteriorfield_concrete_from_tagged(
+    backend: &dyn majit_backend::Backend,
+    array_ptr: i64,
+    index: usize,
+    interior_descr: &dyn majit_ir::descr::Descr,
+    fieldnum: i16,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    num_failargs: i32,
+    storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
+    cache: &mut BridgeVirtualCache,
+) {
+    let ifd = interior_descr
+        .as_interior_field_descr()
+        .expect("VArrayStructInfo: fielddescr is not an InteriorFieldDescr");
+    let bh = majit_translate::jitcode::BhDescr::from_interior_field_descr(ifd);
+    match ifd.field_descr().field_type() {
+        Type::Ref => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setinteriorfield_gc_r(
+                array_ptr,
+                index as i64,
+                majit_ir::GcRef(value as usize),
+                &bh,
+            );
+        }
+        Type::Float => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Float,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setinteriorfield_gc_f(
+                array_ptr,
+                index as i64,
+                f64::from_bits(value as u64),
+                &bh,
+            );
+        }
+        _ => {
+            let value = decode_tagged_for_kind(
+                fieldnum,
+                Type::Int,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            backend.bh_setinteriorfield_gc_i(array_ptr, index as i64, value, &bh);
+        }
+    }
+}
+
+fn bh_call_r_for_oopspec(
+    backend: &dyn majit_backend::Backend,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
+    oopspec: majit_ir::OopSpecIndex,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+) -> majit_ir::GcRef {
+    let cic = callinfocollection.expect(
+        "TraceCtx.callinfocollection missing — concrete VStr/VUni materialization \
+         requires resume.py DirectReader funcptr_for_oopspec parity",
+    );
+    let (calldescr, func) = cic
+        .callinfo_for_oopspec(oopspec)
+        .expect("callinfo_for_oopspec missing entry for concrete VStr/VUni materialization");
+    let cd = calldescr
+        .as_call_descr()
+        .expect("VStr/VUni oopspec calldescr must be CallDescr");
+    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+    backend.bh_call_r(*func as i64, args_i, args_r, None, &bh_calldescr)
+}
+
 /// resume.py:945-956 getvirtual_ptr concrete parity.
 /// Lazily allocate a concrete object for virtual index `vidx`, caching in
 /// `BridgeVirtualCache.concrete_ptr_cache` so shared/recursive virtuals
 /// allocate exactly once.
 ///
-/// resume.py:618-760 polymorphic dispatch by RdVirtualInfo variant:
-///   VirtualInfo  → allocate_with_vtable + set w_class + setfields
-///   VStructInfo  → allocate_struct + setfields (no vtable)
-///   VArray*      → allocate_array + fill elements (not yet implemented)
-///   VStr*/VRaw*  → variant-specific allocation (not yet implemented)
+/// resume.py:618-760 polymorphic dispatch by RdVirtualInfo variant.
+/// BlackholeResumeDataReader (resume.py:1430-1460) routes each kind
+/// through the CPU backend: bh_new_with_vtable, bh_new, bh_new_array,
+/// bh_newstr, bh_newunicode, bh_call_i/r.
 fn materialize_concrete_virtual_ptr(
     vidx: usize,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     fail_values: &[i64],
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    backend: &dyn majit_backend::Backend,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
     cache: &mut BridgeVirtualCache,
 ) -> majit_ir::GcRef {
     if let Some(cached) = cache.get_concrete_ptr(vidx) {
         return cached;
     }
-    let Some(virtuals) = rd_virtuals else {
-        return majit_ir::GcRef::NULL;
-    };
-    let Some(entry) = virtuals.get(vidx) else {
-        return majit_ir::GcRef::NULL;
-    };
+    // resume.py:953 assert self.rd_virtuals is not None
+    let virtuals = rd_virtuals.expect("materialize_concrete_virtual_ptr: rd_virtuals is None");
+    // resume.py:954 self.rd_virtuals[index].allocate(self, index) — direct indexing
+    let entry = &virtuals[vidx];
     match entry.as_ref() {
         // resume.py:618-621 VirtualInfo.allocate
         majit_ir::RdVirtualInfo::VirtualInfo {
@@ -4454,34 +4749,28 @@ fn materialize_concrete_virtual_ptr(
             fieldnums,
             ..
         } => {
-            let Some(descr) = descr.as_ref() else {
-                return majit_ir::GcRef::NULL;
-            };
-            let Some(size_descr) = descr.as_size_descr() else {
-                return majit_ir::GcRef::NULL;
-            };
+            let descr = descr.as_ref().expect("VirtualInfo: descr is None");
+            let size_descr = descr.as_size_descr().expect("VirtualInfo: not a SizeDescr");
             let vtable = size_descr.vtable();
-            let obj_size = size_descr.size();
-            if vtable == 0 || obj_size < std::mem::size_of::<pyre_object::PyObject>() {
+            // resume.py:1111 allocate_with_vtable(descr) → cpu.bh_new_with_vtable(descr)
+            let bh_descr = bh_size_descr_from_size_descr(size_descr, vtable);
+            let ptr = backend.bh_new_with_vtable(&bh_descr);
+            if ptr == 0 {
                 return majit_ir::GcRef::NULL;
             }
-            let Some(layout) = std::alloc::Layout::from_size_align(obj_size, 8).ok() else {
-                return majit_ir::GcRef::NULL;
-            };
-            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
-            if raw.is_null() {
-                return majit_ir::GcRef::NULL;
+            // Pyre adaptation: bh_new_with_vtable writes vtable at
+            // vtable_offset but PyObject.w_class needs separate init
+            // (pyobject.rs:51). Matches materialize_virtual_object at
+            // state.rs:7220.
+            if vtable != 0 {
+                unsafe {
+                    let pyobj = ptr as *mut pyre_object::PyObject;
+                    (*pyobj).w_class = pyre_object::pyobject::get_instantiate(
+                        &*(vtable as *const pyre_object::pyobject::PyType),
+                    );
+                }
             }
-            // resume.py:619 allocate_with_vtable(descr)
-            unsafe {
-                let ptr = raw as *mut pyre_object::PyObject;
-                (*ptr).ob_type = vtable as *const pyre_object::pyobject::PyType;
-                // rclass.py:739-743 set w_class from cached instantiate
-                (*ptr).w_class = pyre_object::pyobject::get_instantiate(
-                    &*(vtable as *const pyre_object::pyobject::PyType),
-                );
-            }
-            let gcref = majit_ir::GcRef(raw as usize);
+            let gcref = majit_ir::GcRef(ptr as usize);
             // resume.py:620 cache BEFORE filling fields (circular ref safe)
             cache.set_concrete_ptr(vidx, gcref);
             // resume.py:597-603 setfields
@@ -4489,18 +4778,18 @@ fn materialize_concrete_virtual_ptr(
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                let value = decode_tagged_concrete(
+                setfield_concrete_from_tagged(
+                    backend,
+                    ptr,
+                    fd,
                     fnum,
-                    fd.field_type,
                     rd_virtuals,
                     fail_values,
                     num_failargs,
                     storage,
+                    callinfocollection,
                     cache,
                 );
-                unsafe {
-                    write_field_bytes(raw, fd.offset, fd.field_size, value);
-                }
             }
             gcref
         }
@@ -4511,69 +4800,335 @@ fn materialize_concrete_virtual_ptr(
             fieldnums,
             ..
         } => {
-            let Some(descr) = typedescr.as_ref() else {
-                return majit_ir::GcRef::NULL;
-            };
-            let Some(size_descr) = descr.as_size_descr() else {
-                return majit_ir::GcRef::NULL;
-            };
-            let obj_size = size_descr.size();
-            if obj_size == 0 {
+            let descr = typedescr.as_ref().expect("VStructInfo: typedescr is None");
+            let size_descr = descr.as_size_descr().expect("VStructInfo: not a SizeDescr");
+            // resume.py:1114 allocate_struct(typedescr) → cpu.bh_new(typedescr)
+            let bh_descr = bh_size_descr_from_size_descr(size_descr, 0);
+            let ptr = backend.bh_new(&bh_descr);
+            if ptr == 0 {
                 return majit_ir::GcRef::NULL;
             }
-            let Some(layout) = std::alloc::Layout::from_size_align(obj_size, 8).ok() else {
-                return majit_ir::GcRef::NULL;
-            };
-            // resume.py:635 allocate_struct(typedescr) — raw allocation, no vtable
-            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
-            if raw.is_null() {
-                return majit_ir::GcRef::NULL;
-            }
-            let gcref = majit_ir::GcRef(raw as usize);
+            let gcref = majit_ir::GcRef(ptr as usize);
             cache.set_concrete_ptr(vidx, gcref);
             // resume.py:637 setfields
             for (fd, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                let value = decode_tagged_concrete(
+                setfield_concrete_from_tagged(
+                    backend,
+                    ptr,
+                    fd,
                     fnum,
-                    fd.field_type,
                     rd_virtuals,
                     fail_values,
                     num_failargs,
                     storage,
+                    callinfocollection,
                     cache,
                 );
-                unsafe {
-                    write_field_bytes(raw, fd.offset, fd.field_size, value);
+            }
+            gcref
+        }
+        // resume.py:650-670 VArrayInfo.allocate
+        majit_ir::RdVirtualInfo::VArrayInfoClear {
+            arraydescr,
+            fieldnums,
+            ..
+        }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+            arraydescr,
+            fieldnums,
+            ..
+        } => {
+            let length = fieldnums.len();
+            let is_clear = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+            );
+            // resume.py:1117 allocate_array(length, arraydescr, clear)
+            // → cpu.bh_new_array_clear / bh_new_array
+            let descr = arraydescr.as_ref().expect("VArrayInfo: arraydescr is None");
+            let ad = descr
+                .as_array_descr()
+                .expect("VArrayInfo: not an ArrayDescr");
+            let bh_descr = bh_array_descr_from_descr(descr);
+            let ptr = if is_clear {
+                backend.bh_new_array_clear(length as i64, &bh_descr)
+            } else {
+                backend.bh_new_array(length as i64, &bh_descr)
+            };
+            if ptr == 0 {
+                return majit_ir::GcRef::NULL;
+            }
+            let gcref = majit_ir::GcRef(ptr as usize);
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:660-670 setarrayitem per element
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                setarrayitem_concrete_from_tagged(
+                    backend,
+                    ptr,
+                    i,
+                    ad,
+                    &bh_descr,
+                    fnum,
+                    rd_virtuals,
+                    fail_values,
+                    num_failargs,
+                    storage,
+                    callinfocollection,
+                    cache,
+                );
+            }
+            gcref
+        }
+        // resume.py:747-760 VArrayStructInfo.allocate
+        majit_ir::RdVirtualInfo::VArrayStructInfo {
+            arraydescr,
+            fielddescrs,
+            size,
+            fieldnums,
+            ..
+        } => {
+            // resume.py:749 array = decoder.allocate_array(self.size,
+            // self.arraydescr, clear=True) — uses the live `self.arraydescr`
+            // directly.
+            let array_descr = arraydescr
+                .as_ref()
+                .expect("VArrayStructInfo: arraydescr is None");
+            let bh_array = bh_array_descr_from_descr(array_descr);
+            // resume.py:749 clear=True → bh_new_array_clear
+            let ptr = backend.bh_new_array_clear(*size as i64, &bh_array);
+            if ptr == 0 {
+                return majit_ir::GcRef::NULL;
+            }
+            let gcref = majit_ir::GcRef(ptr as usize);
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:752-759:
+            //   p = 0
+            //   for i in range(self.size):
+            //       for j in range(len(self.fielddescrs)):
+            //           num = self.fieldnums[p]
+            //           if not tagged_eq(num, UNINITIALIZED):
+            //               decoder.setinteriorfield(i, array, num,
+            //                   self.fielddescrs[j])
+            //           p += 1
+            let num_fields = fielddescrs.len();
+            // resume.py:752-759 iterates exactly size × len(fielddescrs)
+            // entries with no bounds guard; a short stream is an encoder
+            // bug, surfaced here instead of silently truncated.
+            assert_eq!(
+                fieldnums.len(),
+                *size * num_fields,
+                "VArrayStructInfo fieldnums len {} != size {} * fielddescrs {}",
+                fieldnums.len(),
+                size,
+                num_fields,
+            );
+            let mut p = 0;
+            for i in 0..*size {
+                for j in 0..num_fields {
+                    let fnum = fieldnums[p];
+                    p += 1;
+                    if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                        continue;
+                    }
+                    setinteriorfield_concrete_from_tagged(
+                        backend,
+                        ptr,
+                        i,
+                        fielddescrs[j].as_ref(),
+                        fnum,
+                        rd_virtuals,
+                        fail_values,
+                        num_failargs,
+                        storage,
+                        callinfocollection,
+                        cache,
+                    );
                 }
             }
             gcref
         }
-        // Pointer virtuals that need backend/CPU allocation must not be
-        // fabricated with std::alloc here. PyPy routes these through
-        // ResumeDataBoxReader.allocate_array / allocate_string /
-        // concat_strings / slice_string so the returned pointer has the
-        // runtime GC layout. Until pyre exposes the same execute-and-record
-        // allocator at this layer, fail closed instead of writing fake
-        // objects into virtualrefs.
-        majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
-        | majit_ir::RdVirtualInfo::VArrayInfoNotClear { .. }
-        | majit_ir::RdVirtualInfo::VArrayStructInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
-        | majit_ir::RdVirtualInfo::VRawBufferInfo { .. }
-        | majit_ir::RdVirtualInfo::VRawSliceInfo { .. }
-        | majit_ir::RdVirtualInfo::Empty => majit_ir::GcRef::NULL,
+        // resume.py:763-783 VStrPlainInfo.allocate
+        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
+            let length = fieldnums.len();
+            // resume.py:1134 allocate_string(length) → cpu.bh_newstr(length)
+            let ptr = backend.bh_newstr(length as i64);
+            if ptr == 0 {
+                return majit_ir::GcRef::NULL;
+            }
+            let gcref = majit_ir::GcRef(ptr as usize);
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:1138 string_setitem → cpu.bh_strsetitem
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let value = decode_tagged_concrete(
+                    fnum,
+                    Type::Int,
+                    rd_virtuals,
+                    fail_values,
+                    num_failargs,
+                    storage,
+                    backend,
+                    callinfocollection,
+                    cache,
+                );
+                backend.bh_strsetitem(ptr, i as i64, value);
+            }
+            gcref
+        }
+        // resume.py:820-840 VUniPlainInfo.allocate
+        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+            let length = fieldnums.len();
+            // resume.py:1162 allocate_unicode(length) → cpu.bh_newunicode(length)
+            let ptr = backend.bh_newunicode(length as i64);
+            if ptr == 0 {
+                return majit_ir::GcRef::NULL;
+            }
+            let gcref = majit_ir::GcRef(ptr as usize);
+            cache.set_concrete_ptr(vidx, gcref);
+            // resume.py:1166 unicode_setitem → cpu.bh_unicodesetitem
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let value = decode_tagged_concrete(
+                    fnum,
+                    Type::Int,
+                    rd_virtuals,
+                    fail_values,
+                    num_failargs,
+                    storage,
+                    backend,
+                    callinfocollection,
+                    cache,
+                );
+                backend.bh_unicodesetitem(ptr, i as i64, value);
+            }
+            gcref
+        }
+        // resume.py:785-805 VStrConcatInfo / VUniConcatInfo
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+            assert!(fieldnums.len() == 2, "concat: expected 2 fieldnums");
+            let str1 = decode_tagged_concrete(
+                fieldnums[0],
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            let str2 = decode_tagged_concrete(
+                fieldnums[1],
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            let oopspec = if matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+            ) {
+                majit_ir::descr::OopSpecIndex::StrConcat
+            } else {
+                majit_ir::descr::OopSpecIndex::UniConcat
+            };
+            // resume.py:1462-1497 DirectReader concat_* resolves funcptr
+            // via callinfocollection.funcptr_for_oopspec, not a placeholder.
+            let gcref = bh_call_r_for_oopspec(
+                backend,
+                callinfocollection,
+                oopspec,
+                None,
+                Some(&[str1, str2]),
+            );
+            cache.set_concrete_ptr(vidx, gcref);
+            gcref
+        }
+        // resume.py:805-818 VStrSliceInfo / VUniSliceInfo
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+            assert!(fieldnums.len() == 3, "slice: expected 3 fieldnums");
+            let strbox = decode_tagged_concrete(
+                fieldnums[0],
+                Type::Ref,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            let start = decode_tagged_concrete(
+                fieldnums[1],
+                Type::Int,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            let length = decode_tagged_concrete(
+                fieldnums[2],
+                Type::Int,
+                rd_virtuals,
+                fail_values,
+                num_failargs,
+                storage,
+                backend,
+                callinfocollection,
+                cache,
+            );
+            let stop = start + length;
+            let oopspec = if matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+            ) {
+                majit_ir::descr::OopSpecIndex::StrSlice
+            } else {
+                majit_ir::descr::OopSpecIndex::UniSlice
+            };
+            // resume.py:1472-1507 DirectReader slice_* passes stop =
+            // start + length to the funcptr resolved from callinfocollection.
+            let gcref = bh_call_r_for_oopspec(
+                backend,
+                callinfocollection,
+                oopspec,
+                Some(&[start, stop]),
+                Some(&[strbox]),
+            );
+            cache.set_concrete_ptr(vidx, gcref);
+            gcref
+        }
+        // Raw virtuals are INT-kind — should not appear in getvirtual_ptr
+        majit_ir::RdVirtualInfo::VRawBufferInfo { .. }
+        | majit_ir::RdVirtualInfo::VRawSliceInfo { .. } => {
+            panic!(
+                "materialize_concrete_virtual_ptr: raw virtual at vidx={vidx} is INT-kind, not PTR"
+            )
+        }
+        majit_ir::RdVirtualInfo::Empty => majit_ir::GcRef::NULL,
     }
 }
 
-/// resume.py:947-956 getvirtual_int concrete parity.  Only raw-buffer
+/// resume.py:958-967 getvirtual_int concrete parity.  Only raw-buffer
 /// virtuals are INT virtuals (`VAbstractRawInfo.kind = INT`).
 fn materialize_concrete_virtual_int(
     vidx: usize,
@@ -4581,17 +5136,18 @@ fn materialize_concrete_virtual_int(
     fail_values: &[i64],
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    backend: &dyn majit_backend::Backend,
+    callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
     cache: &mut BridgeVirtualCache,
 ) -> i64 {
     if let Some(cached) = cache.get_concrete_int(vidx) {
         return cached;
     }
-    let Some(virtuals) = rd_virtuals else {
-        return 0;
-    };
-    let Some(entry) = virtuals.get(vidx) else {
-        return 0;
-    };
+    // resume.py:959 assert self.virtuals_cache is not None (cache is not None by construction)
+    // resume.py:962 self.rd_virtuals[index] — direct indexing, not silent fallback
+    let virtuals = rd_virtuals.expect("materialize_concrete_virtual_int: rd_virtuals is None");
+    let entry = &virtuals[vidx];
+    // resume.py:964 assert v.is_about_raw and isinstance(v, VAbstractRawInfo)
     match entry.as_ref() {
         // resume.py:700-709 VRawBufferInfo.allocate_int
         majit_ir::RdVirtualInfo::VRawBufferInfo {
@@ -4601,22 +5157,26 @@ fn materialize_concrete_virtual_int(
             descrs,
             fieldnums,
         } => {
-            let (driver, _) = crate::driver::driver_pair();
-            // resume.py:1124-1132 allocate_raw_buffer uses
-            // callinfocollection.callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
-            let effect = majit_ir::descr::EffectInfo {
-                oopspecindex: majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar,
-                ..majit_ir::descr::EffectInfo::MOST_GENERAL
-            };
-            let calldescr =
-                majit_translate::jitcode::BhCallDescr::from_arg_classes("i".into(), 'i', effect);
-            let buffer = driver.meta_interp().backend().bh_call_i(
-                *func,
-                Some(&[*size as i64]),
-                None,
-                None,
-                &calldescr,
+            // resume.py:1452-1456 BlackholeResumeDataReader.allocate_raw_buffer:
+            //   cic = self.callinfocollection
+            //   calldescr, _ = cic.callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
+            //   return self.cpu.bh_call_i(func, [size], None, None, calldescr)
+            // No fallback upstream — a missing CIC entry is a metainterp-setup
+            // bug, surfaced fail-loud rather than papered over with a synthetic
+            // calldescr.
+            let cic = callinfocollection.expect("allocate_raw_buffer: callinfocollection is None");
+            let (descr_ref, _) = cic
+                .callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar)
+                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) not registered");
+            let cd = descr_ref
+                .as_call_descr()
+                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR): not a CallDescr");
+            let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+                cd.arg_classes(),
+                cd.result_class(),
+                cd.get_extra_info().clone(),
             );
+            let buffer = backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &calldescr);
             cache.set_concrete_int(vidx, buffer);
             if buffer == 0 {
                 return 0;
@@ -4625,23 +5185,50 @@ fn materialize_concrete_virtual_int(
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                let item_kind = match descrs[i].item_type {
-                    0 => Type::Ref,
-                    2 => Type::Float,
-                    _ => Type::Int,
-                };
-                let value = decode_tagged_concrete(
-                    fnum,
-                    item_kind,
-                    rd_virtuals,
-                    fail_values,
-                    num_failargs,
-                    storage,
-                    cache,
+                // resume.py:1543 assert not descr.is_array_of_pointers()
+                assert!(
+                    descrs[i].item_type != 0,
+                    "setrawbuffer_item: pointer arraydescr in raw buffer"
                 );
-                let fs = descrs[i].item_size.min(8);
-                unsafe {
-                    write_field_bytes(buffer as *mut u8, off as usize, fs, value);
+                // resume.py:1545-1552 setrawbuffer_item: the arraydescr drives
+                // the store width via the backend's write_{int,float}_at_mem,
+                // so the value is stored through bh_raw_store_{f,i} with the
+                // real descr — no caller-side field-size truncation.
+                let store_descr =
+                    majit_translate::jitcode::BhDescr::from_array_descr_info(&descrs[i]);
+                if descrs[i].item_type == 2 {
+                    let value = decode_tagged_concrete(
+                        fnum,
+                        Type::Float,
+                        rd_virtuals,
+                        fail_values,
+                        num_failargs,
+                        storage,
+                        backend,
+                        callinfocollection,
+                        cache,
+                    );
+                    // resume.py:1548-1549 bh_raw_store_f(ptr, offset, floatval, descr)
+                    backend.bh_raw_store_f(
+                        buffer,
+                        off as i64,
+                        f64::from_bits(value as u64),
+                        &store_descr,
+                    );
+                } else {
+                    let value = decode_tagged_concrete(
+                        fnum,
+                        Type::Int,
+                        rd_virtuals,
+                        fail_values,
+                        num_failargs,
+                        storage,
+                        backend,
+                        callinfocollection,
+                        cache,
+                    );
+                    // resume.py:1550-1552 bh_raw_store_i(ptr, offset, intval, descr)
+                    backend.bh_raw_store_i(buffer, off as i64, value, &store_descr);
                 }
             }
             buffer
@@ -4659,6 +5246,8 @@ fn materialize_concrete_virtual_int(
                 fail_values,
                 num_failargs,
                 storage,
+                backend,
+                callinfocollection,
                 cache,
             );
             let buffer = base + *offset;
@@ -4689,18 +5278,12 @@ fn materialize_bridge_virtual(
         return cached;
     }
 
-    let Some(virtuals) = rd_virtuals else {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-virtual] missing rd_virtuals (vidx={}), abort materialization",
-                vidx
-            );
-        }
-        return OpRef::NONE;
-    };
-    let Some(entry) = virtuals.get(vidx) else {
-        return OpRef::NONE;
-    };
+    // resume.py:947 assert self.virtuals_cache is not None — a TAGVIRTUAL in
+    // the stream guarantees rd_virtuals is present; None is an encoder bug.
+    let virtuals = rd_virtuals.expect("materialize_bridge_virtual: rd_virtuals is None");
+    // resume.py:951 self.rd_virtuals[index] — direct indexing, IndexError on
+    // an out-of-range virtual number is a bug, not a silent NONE fallback.
+    let entry = &virtuals[vidx];
 
     // resume.py:1556-1564 decode_box parity for fieldnums (i16 tagged).
     fn decode_fieldnum(
@@ -4813,20 +5396,14 @@ fn materialize_bridge_virtual(
             if value.is_none() {
                 continue;
             }
-            let signed = matches!(
-                fd_info.field_type,
-                majit_ir::Type::Int | majit_ir::Type::Float
-            );
-            // RPython: decoder.setfield(struct, fieldnum, fielddescr).
-            // fielddescr carries parent_descr so descr_index() resolves
-            // to index_in_parent (small sequential) not stable_field_index (268M hash).
-            let field_descr = crate::descr::make_field_descr_with_parent(
-                parent_descr.clone(),
-                fd_info.offset,
-                fd_info.field_size,
-                fd_info.field_type,
-                signed,
-            );
+            // resume.py:597-603 self.setfields → decoder.setfield(struct,
+            // fieldnum, fielddescr): reuse the parent SizeDescr's live
+            // FieldDescr (canonical immutable / quasi-immutable / ei_index)
+            // rather than reconstructing a partial copy. The descr is keyed
+            // by index_in_parent (small sequential), not the 268M-hash
+            // stable_field_index.
+            let field_descr =
+                crate::descr::make_field_descr_with_parent(parent_descr.clone(), fd_info.offset);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
             // Bridge virtual rematerialisation — `upd.setfield(valuebox)`
             // parity: cache stores the Box identity (`value` OpRef).
@@ -4990,27 +5567,16 @@ fn materialize_bridge_virtual(
             arraydescr,
             fielddescrs,
             size,
-            base_size,
-            item_size,
             fieldnums,
             ..
         } => {
             let len_ref = ctx.const_int(*size as i64);
-            // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
-            //
-            // When `arraydescr` is missing from the resume payload (older
-            // serialization, test scaffolds), synthesize one keyed by
-            // shape (`base_size`, `item_size`, `size`) so distinct array
-            // shapes get distinct descriptor identities.  The previous
-            // `arraydescr.as_ref().map_or(0, ...)` always evaluated `0`
-            // inside the `None` branch and aliased every fallback descr
-            // to a single registry slot.
-            let array_descr = arraydescr.clone().unwrap_or_else(|| {
-                let shape_idx = (*base_size as u32).wrapping_mul(0x0001_0001)
-                    ^ (*item_size as u32).wrapping_mul(0x0100_0001)
-                    ^ (*size as u32);
-                crate::descr::make_struct_array_descr(shape_idx, *base_size, *item_size)
-            });
+            // resume.py:749: array = decoder.allocate_array(self.size,
+            // self.arraydescr, clear=True) — uses the live `self.arraydescr`
+            // directly.
+            let array_descr = arraydescr
+                .as_ref()
+                .expect("VArrayStructInfo: arraydescr is None");
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
@@ -5025,12 +5591,20 @@ fn materialize_bridge_virtual(
             //               decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
             //           p += 1
             let num_fields = fielddescrs.len();
+            // resume.py:752-759 iterates exactly size × len(fielddescrs)
+            // entries of self.fieldnums with no bounds guard; a short stream
+            // is an encoder bug, surfaced here instead of silently truncated.
+            assert_eq!(
+                fieldnums.len(),
+                *size * num_fields,
+                "VArrayStructInfo fieldnums len {} != size {} * fielddescrs {}",
+                fieldnums.len(),
+                size,
+                num_fields,
+            );
             let mut p = 0;
             for i in 0..*size {
                 for j in 0..num_fields {
-                    if p >= fieldnums.len() {
-                        break;
-                    }
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -5513,6 +6087,8 @@ impl JitState for PyreJitState {
         // concrete GcRef (for shadow values / continue_tracing). RPython's
         // VirtualCache stores both in one object; pyre unifies them here.
         let mut virtuals_cache = BridgeVirtualCache::new(rd_virtuals.map_or(0, |v| v.len()));
+        let (driver, _) = crate::driver::driver_pair();
+        let backend = driver.meta_interp().backend();
 
         // resume.py:1245 decode_box parity — unified via bridge_decode_box.
         // Each call returns (OpRef, Value), eliminating the separate
@@ -5554,15 +6130,35 @@ impl JitState for PyreJitState {
             first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
         let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
         let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
-        for v in vvals {
+        // virtualizable_gen.rs PyFrame layout: the resume payload prefix is
+        //   [vable, last_instr:Int, pycode:Ref, valuestackdepth:Int,
+        //    debugdata:Ref, lastblock:Ref, w_globals:Ref, locals_cells_stack_w...].
+        // virtualizable.py:139 read_boxes consumes typed boxes per declared
+        // field type, so decode_box's `kind` must be the field type — not a
+        // uniform Ref. last_instr/valuestackdepth are signed ints (matching
+        // publish_last_instr_to_vable's const_int), the rest Ref.
+        const VABLE_VALUE_TYPES: &[Type] = &[
+            Type::Ref, // vable pointer
+            Type::Int, // last_instr
+            Type::Ref, // pycode
+            Type::Int, // valuestackdepth
+            Type::Ref, // debugdata
+            Type::Ref, // lastblock
+            Type::Ref, // w_globals
+        ];
+        for (i, v) in vvals.iter().enumerate() {
+            // locals_cells_stack_w array items (index ≥ scalar prefix) are
+            // Ref (W_Root array).
+            let expected = VABLE_VALUE_TYPES.get(i).copied().unwrap_or(Type::Ref);
             let (op, val) = bridge_decode_box(
                 ctx,
                 v,
-                Type::Ref,
+                expected,
                 rd_virtuals,
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             oprefs.push(op);
@@ -5639,6 +6235,7 @@ impl JitState for PyreJitState {
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             let reg_idx = reg_idx as usize;
@@ -5658,6 +6255,7 @@ impl JitState for PyreJitState {
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             let reg_idx = reg_idx as usize;
@@ -5677,6 +6275,7 @@ impl JitState for PyreJitState {
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             let reg_idx = reg_idx as usize;
@@ -5905,6 +6504,7 @@ impl JitState for PyreJitState {
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             let (vref_opref, vref_val) = bridge_decode_box(
@@ -5915,17 +6515,16 @@ impl JitState for PyreJitState {
                 resume_data,
                 fail_values,
                 fail_types,
+                backend,
                 &mut virtuals_cache,
             );
             let virt_ptr = value_to_usize(&virt_val);
             let vref_ptr = value_to_usize(&vref_val);
             sym.virtualref_boxes.push((virt_opref, virt_ptr));
             sym.virtualref_boxes.push((vref_opref, vref_ptr));
-            // resume.py:1397 calls continue_tracing after
-            // ResumeDataBoxReader has materialized the virtual. Pyre only has
-            // concrete ptr materialization for struct-like virtuals at this
-            // layer; array/string virtuals deliberately fail closed above
-            // instead of fabricating placeholder objects.
+            // resume.py:1397 continue_tracing is unconditional per RPython;
+            // guarded here because some ptr virtuals may still return NULL
+            // when the backend lacks the allocator (bh_newstr etc).
             if virt_ptr != 0 {
                 unsafe {
                     vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);

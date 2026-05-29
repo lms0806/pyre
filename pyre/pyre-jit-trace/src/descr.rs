@@ -451,38 +451,25 @@ pub fn make_field_descr(
 ///
 /// The `index_in_parent` is computed by scanning the parent SizeDescr's
 /// `all_fielddescrs` for a matching offset.
-pub fn make_field_descr_with_parent(
-    parent: DescrRef,
-    offset: usize,
-    field_size: usize,
-    field_type: Type,
-    signed: bool,
-) -> DescrRef {
-    // Derive index_in_parent from the parent SizeDescr's field list.
-    let index = parent
+pub fn make_field_descr_with_parent(parent: DescrRef, offset: usize) -> DescrRef {
+    // resume.py:597-603 self.setfields → decoder.setfield(struct, fieldnum,
+    // fielddescr) uses the parent's canonical FieldDescr. Return the *live*
+    // field descr the parent SizeDescr already owns (full immutable /
+    // quasi-immutable / name / ei_index) instead of minting a partial copy
+    // that drops those properties; the parent SizeDescr is the same live
+    // descr the original trace recorded against, so its `all_fielddescrs()`
+    // are the canonical field descriptors keyed by index_in_parent.
+    let sd = parent
         .as_size_descr()
-        .and_then(|sd| {
-            sd.all_fielddescrs()
-                .iter()
-                .enumerate()
-                .find(|(_, fd)| fd.as_field_descr().map_or(false, |f| f.offset() == offset))
-                .map(|(i, _)| i)
-        })
+        .expect("make_field_descr_with_parent: parent is not a SizeDescr");
+    let fd = sd
+        .all_fielddescrs()
+        .iter()
+        .find(|fd| fd.offset() == offset)
         .unwrap_or_else(|| {
             panic!("FieldDescr offset {offset} is not present in parent SizeDescr all_fielddescrs")
         });
-    Arc::new(PyreFieldDescr {
-        offset,
-        field_size,
-        field_type,
-        signed,
-        immutable: false,
-        quasi_immutable: false,
-        name: "",
-        index_in_parent: index,
-        parent_descr: Some(Arc::downgrade(&parent)),
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+    fd.clone() as DescrRef
 }
 
 pub fn make_field_descr_full(
@@ -2357,20 +2344,6 @@ pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
     )
 }
 
-/// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).
-/// resume.py:749: allocate_array(self.size, self.arraydescr, clear=True).
-pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: usize) -> DescrRef {
-    make_struct_array_descr_full(
-        descr_index,
-        base_size,
-        item_size,
-        Some(0),
-        0,
-        Type::Void,
-        &[],
-    )
-}
-
 fn simple_field_spec_from_bh(
     spec: &majit_translate::jitcode::BhFieldSpec,
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
@@ -2610,30 +2583,6 @@ fn field_descr_from_bh_field(
     // freshly-minted field descr so `compute_bitstrings` enumerates it.
     majit_ir::descr_registry::register_field(arc.clone());
     arc
-}
-
-pub fn make_struct_array_descr_full(
-    descr_index: u32,
-    base_size: usize,
-    item_size: usize,
-    len_offset: Option<usize>,
-    type_id: u32,
-    item_type: Type,
-    interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
-) -> DescrRef {
-    // No cache key plumbed — fall through to the keyed variant with
-    // `cache_key = 0` (no-identity sentinel).  Callers that have a
-    // real u64 path_hash should call `make_struct_array_descr_full_keyed`.
-    make_struct_array_descr_full_keyed(
-        descr_index,
-        base_size,
-        item_size,
-        len_offset,
-        type_id,
-        0,
-        item_type,
-        interior_fields,
-    )
 }
 
 /// Keyed sibling: accepts the u64 `cache_key` (= `path_hash(array_type_id)`)
@@ -3158,6 +3107,82 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 };
                 simple_descr_group_from_bh_size(&spec).size_descr.clone()
             }
+        }
+        BhDescr::InteriorField { array, field } => {
+            // `descr.py:388 InteriorFieldDescr(arraydescr, fielddescr)`:
+            // recompose the array + field sub-descrs.  The nested
+            // BhDescrs are always `BhDescr::Array` / `BhDescr::Field`
+            // (`BhDescr::from_interior_field_descr`); a short stream is an
+            // encoder bug surfaced here rather than silently mis-typed.
+            let (base_size, itemsize, type_id, item_type) = match array.as_ref() {
+                BhDescr::Array {
+                    base_size,
+                    itemsize,
+                    type_id,
+                    item_type,
+                    ..
+                } => (*base_size, *itemsize, *type_id, *item_type),
+                other => panic!(
+                    "BhDescr::InteriorField array slot must be BhDescr::Array, got {other:?}"
+                ),
+            };
+            // `descr.py:389` asserts `arraydescr.flag == FLAG_STRUCT`, so a
+            // round-tripped array-of-structs descr must carry FLAG_STRUCT
+            // (`from_item_type(item_type, is_struct=true)`); a plain element
+            // array keeps the item-type flag.
+            let array_flag =
+                majit_ir::descr::ArrayFlag::from_item_type(item_type, array.is_array_of_structs());
+            let array_descr: Arc<dyn majit_ir::descr::ArrayDescr> =
+                Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+                    u32::MAX,
+                    base_size,
+                    itemsize,
+                    type_id as u32,
+                    item_type,
+                    array_flag,
+                ));
+            let (offset, field_size, field_type, field_flag, index_in_parent, name) =
+                match field.as_ref() {
+                    BhDescr::Field {
+                        offset,
+                        field_size,
+                        field_type,
+                        field_flag,
+                        index_in_parent,
+                        name,
+                        ..
+                    } => (
+                        *offset,
+                        *field_size,
+                        *field_type,
+                        *field_flag,
+                        *index_in_parent,
+                        name.clone(),
+                    ),
+                    other => panic!(
+                        "BhDescr::InteriorField field slot must be BhDescr::Field, got {other:?}"
+                    ),
+                };
+            // `descr.py:393` `InteriorFieldDescr.get_index()` delegates to
+            // `fielddescr.get_index()` (= `index_in_parent`), read back by
+            // `info.py:573-594` getinteriorfield/setinteriorfield_virtual.
+            let field_descr: Arc<dyn majit_ir::descr::FieldDescr> = Arc::new(
+                majit_ir::descr::SimpleFieldDescr::new_with_name(
+                    u32::MAX,
+                    offset,
+                    field_size,
+                    field_type,
+                    false,
+                    field_flag,
+                    name,
+                )
+                .with_index_in_parent(index_in_parent),
+            );
+            Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                0,
+                array_descr,
+                field_descr,
+            ))
         }
         BhDescr::Call { calldescr } => make_call_descr_from_bh(calldescr),
         BhDescr::JitCode { jitcode_index, .. } => make_jitcode_descr(*jitcode_index),

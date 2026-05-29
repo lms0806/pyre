@@ -2613,6 +2613,14 @@ impl ForwardReference {
     pub fn resolved(&self) -> Option<LowLevelType> {
         self.target.lock().unwrap().clone()
     }
+
+    /// Pointer identity of the shared `become()` target cell. Stable and
+    /// unique per forward reference (clones share the `Arc`), and read
+    /// without locking the `Mutex` — usable as a deterministic key
+    /// component even while another thread holds the lock.
+    pub fn target_id(&self) -> usize {
+        Arc::as_ptr(&self.target) as *const () as usize
+    }
 }
 
 impl PartialEq for ForwardReference {
@@ -2696,6 +2704,161 @@ impl LowLevelType {
                 | LowLevelType::Opaque(_)
                 | LowLevelType::ForwardReference(_)
         )
+    }
+
+    /// Deterministic, lock-free serialization for use as a hash-map key.
+    /// Unlike `format!("{self:?}")`, this never invokes `Mutex::fmt`,
+    /// whose `try_lock` renders `<locked>` under concurrent access and
+    /// thereby collapses two distinct unresolved-looking forward
+    /// references to the same string. Every `ForwardReference` is keyed
+    /// by its `target_id` (stable and unique per named type), which also
+    /// terminates cyclic type graphs without recursion.
+    pub fn stable_repr_key(&self) -> String {
+        let mut out = String::new();
+        self.write_stable_repr_key(&mut out);
+        out
+    }
+
+    fn write_stable_repr_key(&self, out: &mut String) {
+        use std::fmt::Write;
+        match self {
+            LowLevelType::Void => out.push('v'),
+            LowLevelType::Signed => out.push('i'),
+            LowLevelType::Unsigned => out.push('u'),
+            LowLevelType::SignedLongLong => out.push_str("ill"),
+            LowLevelType::SignedLongLongLong => out.push_str("illl"),
+            LowLevelType::UnsignedLongLong => out.push_str("ull"),
+            LowLevelType::UnsignedLongLongLong => out.push_str("ulll"),
+            LowLevelType::Bool => out.push('b'),
+            LowLevelType::Float => out.push('f'),
+            LowLevelType::SingleFloat => out.push_str("sf"),
+            LowLevelType::LongFloat => out.push_str("lf"),
+            LowLevelType::Char => out.push('c'),
+            LowLevelType::UniChar => out.push_str("uc"),
+            LowLevelType::Address => out.push_str("ad"),
+            LowLevelType::Func(t) => {
+                out.push_str("Fn(");
+                for a in &t.args {
+                    a.write_stable_repr_key(out);
+                    out.push(',');
+                }
+                out.push(';');
+                t.result.write_stable_repr_key(out);
+                out.push(')');
+            }
+            LowLevelType::Struct(t) => {
+                // RPython `LowLevelType.__eq__` (`lltype.py:103-107`) compares
+                // `self.__class__` + the full `self.__dict__`.  A name+gckind
+                // key collides any two `GcStruct`s that share a name but
+                // differ in field layout, varsize, hints, or rtti identity, so
+                // serialize each of those structural attributes.  Recursion
+                // terminates: by-value field nesting is a finite tree (a struct
+                // cannot inline itself), and pointer cycles run through
+                // `ForwardReference` which writes `F{target_id}` and stops.
+                write!(out, "St({}/{:?}", t._name, t._gckind).unwrap();
+                // Field layout: ordered `_names` + each field's type key.
+                out.push_str(";f:");
+                for name in &t._names {
+                    out.push_str(name);
+                    out.push('=');
+                    match t._flds.get(name) {
+                        Some(field_ty) => field_ty.write_stable_repr_key(out),
+                        None => out.push('?'),
+                    }
+                    out.push(',');
+                }
+                // `lltype.py:286` `_arrayfld` — the inlined varsize tail field.
+                if let Some(arrayfld) = &t._arrayfld {
+                    write!(out, ";a:{arrayfld}").unwrap();
+                }
+                Self::write_hints_stable_key(out, &t._hints);
+                // `RttiStruct._runtime_type_info` (`lltype.py:382-389`)
+                // distinguishes two structurally-equal `GcStruct(rtti=True)`
+                // builds by per-instance identity.
+                if let Some(rtti) = &t._runtime_type_info {
+                    write!(out, ";r:{}", rtti._identity).unwrap();
+                }
+                out.push(')');
+            }
+            LowLevelType::Array(t) => {
+                write!(out, "Ar/{:?}(", t._gckind).unwrap();
+                t.OF.write_stable_repr_key(out);
+                Self::write_hints_stable_key(out, &t._hints);
+                out.push(')');
+            }
+            LowLevelType::FixedSizeArray(t) => {
+                write!(out, "FAr/{:?}/{}(", t._gckind, t.length).unwrap();
+                t.OF.write_stable_repr_key(out);
+                Self::write_hints_stable_key(out, &t._hints);
+                out.push(')');
+            }
+            LowLevelType::Opaque(t) => write!(out, "Op({}/{:?})", t.tag, t._gckind).unwrap(),
+            LowLevelType::ForwardReference(t) => write!(out, "F{}", t.target_id()).unwrap(),
+            LowLevelType::Ptr(t) => {
+                out.push_str("P(");
+                LowLevelType::from(t.TO.clone()).write_stable_repr_key(out);
+                out.push(')');
+            }
+            LowLevelType::InteriorPtr(t) => {
+                out.push_str("IP(");
+                t.PARENTTYPE.write_stable_repr_key(out);
+                out.push(';');
+                t.TO.write_stable_repr_key(out);
+                for off in &t.offsets {
+                    match off {
+                        InteriorOffset::Field(s) => write!(out, ".{s}").unwrap(),
+                        InteriorOffset::Index(i) => write!(out, "[{i}]").unwrap(),
+                    }
+                }
+                out.push(')');
+            }
+        }
+    }
+
+    /// Append a deterministic, lock-free key for a `_hints` dict — part of
+    /// the structural identity that `LowLevelType.__eq__` (`lltype.py:107`)
+    /// compares via `self.__dict__`.  Keys are sorted for determinism
+    /// (mirrors upstream `__hash__`'s `items.sort()`, `lltype.py:151`).
+    fn write_hints_stable_key(out: &mut String, hints: &FrozenDict<ConstValue>) {
+        if hints.is_empty() {
+            return;
+        }
+        let mut items: Vec<(&String, &ConstValue)> = hints.iter().collect();
+        items.sort_by(|(left, _), (right, _)| left.cmp(right));
+        out.push_str(";h:");
+        for (key, value) in items {
+            out.push_str(key);
+            out.push('=');
+            Self::write_const_value_stable_key(out, value);
+            out.push(',');
+        }
+    }
+
+    /// Lock-free serialization of a hint [`ConstValue`].  Avoids the
+    /// `Debug` path because `ConstValue::LowLevelType` embeds a
+    /// `LowLevelType` whose `Mutex`-backed `ForwardReference` renders
+    /// `<locked>` under concurrency; that variant recurses through the
+    /// cycle-terminating `write_stable_repr_key` instead.  Variants that
+    /// never appear in lltype struct/array hints collapse to a stable `?`
+    /// marker rather than recursing into unbounded payloads.
+    fn write_const_value_stable_key(out: &mut String, value: &ConstValue) {
+        use std::fmt::Write;
+        match value {
+            ConstValue::Bool(b) => write!(out, "b{}", *b as u8).unwrap(),
+            ConstValue::Int(i) => write!(out, "i{i}").unwrap(),
+            ConstValue::Float(bits) => write!(out, "f{bits}").unwrap(),
+            ConstValue::ByteStr(bytes) => {
+                write!(out, "s{}", String::from_utf8_lossy(bytes)).unwrap()
+            }
+            ConstValue::UniStr(s) => write!(out, "u{s}").unwrap(),
+            ConstValue::None => out.push('N'),
+            ConstValue::Placeholder => out.push('_'),
+            ConstValue::LowLevelType(t) => {
+                out.push('T');
+                t.write_stable_repr_key(out);
+            }
+            _ => out.push('?'),
+        }
     }
 
     /// RPython `LowLevelType._is_varsize` (`lltype.py:191-192`). Default
@@ -3431,6 +3594,47 @@ mod tests {
         };
         assert_eq!(inner.tag, "RuntimeTypeInfo");
         assert_eq!(inner._gckind, GcKind::Raw);
+    }
+
+    fn fwd_ptr_to_named_struct(name: &str) -> LowLevelType {
+        let body =
+            StructType::gc_with_hints(name, vec![("hash".into(), LowLevelType::Signed)], vec![]);
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Struct(Box::new(body))).unwrap();
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }))
+    }
+
+    #[test]
+    fn stable_repr_key_distinguishes_distinct_forward_reference_pointers() {
+        let a = fwd_ptr_to_named_struct("rpy_a");
+        let b = fwd_ptr_to_named_struct("rpy_b");
+        assert_ne!(a.stable_repr_key(), b.stable_repr_key());
+    }
+
+    #[test]
+    fn stable_repr_key_is_invariant_to_forward_reference_resolution_state() {
+        // A forward-reference pointer keys on the target Arc identity, so
+        // the key is identical whether or not the target has been
+        // `become()`-resolved — and never observes `Mutex::fmt`'s
+        // `<locked>` rendering. Two clones of the same pointer (sharing
+        // one Arc) therefore key identically regardless of timing.
+        let fwd = ForwardReference::gc();
+        let unresolved = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd.clone()),
+        }));
+        let key_before = unresolved.stable_repr_key();
+        fwd.r#become(LowLevelType::Struct(Box::new(StructType::gc_with_hints(
+            "rpy_resolved",
+            vec![("hash".into(), LowLevelType::Signed)],
+            vec![],
+        ))))
+        .unwrap();
+        let resolved = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+        assert_eq!(key_before, resolved.stable_repr_key());
     }
 
     #[test]
