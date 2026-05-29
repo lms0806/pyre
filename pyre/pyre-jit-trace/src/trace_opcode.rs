@@ -4749,14 +4749,14 @@ impl MIFrame {
             // trace's quasi-immut dependency would be silently dropped.
             self.flush_guard_not_invalidated(ctx);
             ctx.heap_cache_mut()
-                .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
+                .class_now_known(obj, expected_type as usize as i64);
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
         self.generate_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
         // heapcache.py:470-473: class_now_known sets class + nullity.
         ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
+            .class_now_known(obj, expected_type as usize as i64);
     }
 
     pub(crate) fn trace_guarded_int_payload(
@@ -7177,7 +7177,7 @@ impl MIFrame {
                     let cls_const = ctx.const_int(exc_class_ptr as usize as i64);
                     this.generate_guard(ctx, OpCode::GuardClass, &[exc_box, cls_const]);
                     ctx.heap_cache_mut()
-                        .class_now_known(exc_box, majit_ir::GcRef(exc_class_ptr as usize));
+                        .class_now_known(exc_box, exc_class_ptr as usize as i64);
                 }
             });
         }

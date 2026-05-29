@@ -805,7 +805,9 @@ pub struct OptGuard {
     truthy_values: VecSet<OpRef>,
 
     /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
-    known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::GcRef>,
+    /// The class operand is `expectedclassbox.getint()` — a `ConstInt` vtable
+    /// address (model.py:199-201), never a traced ref.
+    known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 
     /// guard.py: values known to be specific constants (from GuardValue).
     known_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
@@ -868,9 +870,8 @@ impl OptGuard {
                         .get_box_replacement_box(op.arg(1))
                         .and_then(|cb| cb.const_int())
                     {
-                        let val = majit_ir::GcRef(class_val as usize);
                         let key = op.arg(0);
-                        self.known_classes.insert(key, val);
+                        self.known_classes.insert(key, class_val);
                     }
                 }
             }
@@ -914,7 +915,7 @@ impl OptGuard {
                         .get_box_replacement_box(op.arg(1))
                         .and_then(|cb| cb.const_int())
                     {
-                        return known_class.0 as i64 == expected;
+                        return known_class == expected;
                     }
                 }
                 // RPython: setinfo_from_preamble sets PtrInfo.KnownClass or
@@ -925,7 +926,7 @@ impl OptGuard {
                 {
                     if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
                         if let Some(class_ptr) = ctx.get_known_class(&b) {
-                            return class_ptr.0 as i64 == expected;
+                            return class_ptr == expected;
                         }
                     }
                 }
@@ -961,7 +962,7 @@ impl OptGuard {
                         .get_box_replacement_box(op.arg(1))
                         .and_then(|cb| cb.const_int())
                     {
-                        return known_class.0 as i64 == expected;
+                        return known_class == expected;
                     }
                 }
                 // Check class via imported PtrInfo
@@ -971,7 +972,7 @@ impl OptGuard {
                 {
                     if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
                         if let Some(class_ptr) = ctx.get_known_class(&b) {
-                            return class_ptr.0 as i64 == expected;
+                            return class_ptr == expected;
                         }
                     }
                 }

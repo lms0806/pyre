@@ -171,7 +171,9 @@ pub enum VirtualStateInfo {
     /// `debug_assert_no_typeptr_in_virtual_fields`.
     Virtual {
         descr: DescrRef,
-        known_class: Option<GcRef>,
+        /// Known class as the immortal vtable address (`ConstInt(vtable)`,
+        /// virtualstate.py:748) — a plain integer, never a traced ref.
+        known_class: Option<i64>,
         /// ob_type field descriptor for force path (pyre offset 0).
         ob_type_descr: Option<DescrRef>,
         /// Field values as VirtualStateInfo (recursive). Excludes typeptr.
@@ -209,7 +211,9 @@ pub enum VirtualStateInfo {
     /// virtualstate.py:505 NotVirtualStateInfoPtr with level=LEVEL_KNOWNCLASS.
     /// Implicitly Ref-typed in RPython via the class hierarchy; pyre keeps
     /// the explicit invariant that this variant is only emitted for Ref.
-    KnownClass { class_ptr: GcRef },
+    /// `class_ptr` is the immortal vtable address (`ConstInt(vtable)`,
+    /// virtualstate.py:511/748) — a plain integer, never a traced ref.
+    KnownClass { class_ptr: i64 },
     /// Value is known non-null.
     ///
     /// virtualstate.py:505 NotVirtualStateInfoPtr with level=LEVEL_NONNULL.
@@ -648,14 +652,8 @@ impl VirtualState {
         ) {
             match info {
                 VirtualStateInfo::Constant(value) => visit_value(value, visitor),
-                VirtualStateInfo::Virtual {
-                    known_class,
-                    fields,
-                    ..
-                } => {
-                    if let Some(gcref) = known_class.as_mut() {
-                        visitor(gcref);
-                    }
+                VirtualStateInfo::Virtual { fields, .. } => {
+                    // known_class is an immortal vtable integer, not a traced ref.
                     for (_, child) in fields {
                         visit_node(child, visitor, seen);
                     }
@@ -677,8 +675,9 @@ impl VirtualState {
                         }
                     }
                 }
-                VirtualStateInfo::KnownClass { class_ptr } => visitor(class_ptr),
-                VirtualStateInfo::NonNull
+                // KnownClass.class_ptr is an immortal vtable integer, not a traced ref.
+                VirtualStateInfo::KnownClass { .. }
+                | VirtualStateInfo::NonNull
                 | VirtualStateInfo::IntBounded(_)
                 | VirtualStateInfo::Unknown(_) => {}
             }
@@ -2339,7 +2338,8 @@ pub enum GuardRequirement {
     GuardClass {
         arg_index: usize,
         box_opref: OpRef,
-        expected_class: GcRef,
+        /// Immortal vtable address (`ConstInt(vtable)`), not a traced ref.
+        expected_class: i64,
     },
     /// Emit GUARD_NONNULL_CLASS on the arg at this index.
     /// virtualstate.py:603 NotVirtualStateInfoPtr._generate_guards_knownclass,
@@ -2349,7 +2349,8 @@ pub enum GuardRequirement {
     GuardNonnullClass {
         arg_index: usize,
         box_opref: OpRef,
-        expected_class: GcRef,
+        /// Immortal vtable address (`ConstInt(vtable)`), not a traced ref.
+        expected_class: i64,
     },
     /// Emit GUARD_NONNULL on the arg at this index.
     GuardNonnull { arg_index: usize, box_opref: OpRef },
@@ -2402,7 +2403,7 @@ impl GuardRequirement {
                 // backend/model.py:199-201 `cls_of_box()` returns
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
-                let class_const = ctx.make_constant_int(expected_class.0 as i64);
+                let class_const = ctx.make_constant_int(*expected_class);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
                 op.setfailargs(Default::default());
                 vec![op]
@@ -2423,7 +2424,7 @@ impl GuardRequirement {
                 // virtualstate.py:603 GUARD_NONNULL_CLASS [box, self.known_class].
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
-                let class_const = ctx.make_constant_int(expected_class.0 as i64);
+                let class_const = ctx.make_constant_int(*expected_class);
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
                 op.setfailargs(Default::default());
                 vec![op]
@@ -2855,23 +2856,15 @@ mod tests {
     fn test_nonnull_compatibility() {
         let nn = VirtualStateInfo::NonNull;
         assert!(nn.is_compatible(&VirtualStateInfo::NonNull));
-        assert!(nn.is_compatible(&VirtualStateInfo::KnownClass {
-            class_ptr: GcRef(0x100)
-        }));
+        assert!(nn.is_compatible(&VirtualStateInfo::KnownClass { class_ptr: 0x100 }));
         assert!(!nn.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
     }
 
     #[test]
     fn test_known_class_compatibility() {
-        let kc1 = VirtualStateInfo::KnownClass {
-            class_ptr: GcRef(0x100),
-        };
-        let kc2 = VirtualStateInfo::KnownClass {
-            class_ptr: GcRef(0x100),
-        };
-        let kc3 = VirtualStateInfo::KnownClass {
-            class_ptr: GcRef(0x200),
-        };
+        let kc1 = VirtualStateInfo::KnownClass { class_ptr: 0x100 };
+        let kc2 = VirtualStateInfo::KnownClass { class_ptr: 0x100 };
+        let kc3 = VirtualStateInfo::KnownClass { class_ptr: 0x200 };
 
         assert!(kc1.is_compatible(&kc2));
         assert!(!kc1.is_compatible(&kc3));
@@ -2931,9 +2924,7 @@ mod tests {
         ]);
         let s2 = VirtualState::new(vec![
             VirtualStateInfo::Constant(Value::Int(42)),
-            VirtualStateInfo::KnownClass {
-                class_ptr: GcRef(0x100),
-            },
+            VirtualStateInfo::KnownClass { class_ptr: 0x100 },
         ]);
 
         assert!(s1.is_compatible(&s2));
@@ -2980,9 +2971,7 @@ mod tests {
         // this by routing the const-pool gcref through the `Cpu` hook
         // installed below.
         let s1 = VirtualState::new(vec![
-            VirtualStateInfo::KnownClass {
-                class_ptr: GcRef(0x100),
-            },
+            VirtualStateInfo::KnownClass { class_ptr: 0x100 },
             VirtualStateInfo::NonNull,
         ]);
         let s2 = VirtualState::new(vec![
@@ -3006,7 +2995,7 @@ mod tests {
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b0,
-            crate::optimizeopt::info::PtrInfo::known_class(GcRef(0x100), false),
+            crate::optimizeopt::info::PtrInfo::known_class(0x100, false),
         );
         let runtime_boxes = vec![rb0, rb1];
         let guards = s1
@@ -3296,7 +3285,7 @@ mod tests {
         let mut state = VirtualState::new(vec![
             VirtualStateInfo::Virtual {
                 descr: descr.clone(),
-                known_class: Some(GcRef(0x1000)),
+                known_class: Some(0x1000),
                 ob_type_descr: None,
                 fields: vec![],
                 field_descrs: Vec::new(),

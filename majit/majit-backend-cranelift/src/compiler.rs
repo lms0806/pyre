@@ -3854,6 +3854,33 @@ fn missing_legacy_constant(opref: OpRef, where_: &str) -> ! {
     )
 }
 
+/// Resolve a non-Const operand that is expected to be bound to a declared
+/// Cranelift variable. RPython's regalloc `loc()` (regalloc.py:611-622) maps a
+/// non-Const box either to a register/frame binding or — when it has none —
+/// raises `KeyError` (regalloc.py:95-103); it never turns the box's identity
+/// or slot position into a runtime immediate. An OpRef reaching here without a
+/// `def_var` is that same binding-invariant violation, so panic at the parity
+/// hole instead of baking the internal slot index as a literal `iconst`.
+fn use_declared_var_or_panic(builder: &mut FunctionBuilder, opref: OpRef, what: &str) -> CValue {
+    let is_declared = DECLARED_VARS_DEBUG.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|dv| dv.contains(&opref.raw()))
+    });
+    if !is_declared {
+        panic!(
+            "cranelift {what}: OpRef({}) (raw={}) has no def_var and is not a \
+             constant — RPython env[box] would KeyError (regalloc.py:611-622). \
+             The optimizer site that emitted this unbound OpRef must bind it \
+             (or InvalidLoop in validate_oprefs_for_compile) instead of \
+             falling back to its slot index as a literal immediate",
+            opref.raw(),
+            opref.raw()
+        );
+    }
+    builder.use_var(var(opref.raw()))
+}
+
 fn resolve_opref(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
@@ -3885,35 +3912,12 @@ fn resolve_opref(
     if opref.is_constant() {
         missing_legacy_constant(opref, "resolve_opref");
     }
-    // RPython parity guard: every Box reaching codegen MUST be bound —
-    // an inputarg, a label arg, a constant, or a previous op result
-    // (regalloc.py invariant). Pyre's `validate_oprefs_for_compile`
-    // (compiler.rs:4013) already rejects undefined OpRefs that flow
-    // into a dereferencing first arg with `BackendError::CompilationFailed`
-    // (the equivalent of RPython's `InvalidLoop` abort, routing the
-    // bridge to the blackhole resume path). Anything that reaches this
-    // point without a `def_var` is a binding-invariant violation —
-    // panic so the parity hole surfaces at the optimizer site that
-    // emitted the unbound OpRef instead of being papered over with
-    // `iconst(0)`.
-    let is_declared = DECLARED_VARS_DEBUG.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .is_some_and(|dv| dv.contains(&opref.raw()))
-    });
-    if !is_declared {
-        panic!(
-            "cranelift resolve_opref: OpRef({}) (raw={}) has no def_var \
-             and is not in constants — RPython parity violation: every \
-             Box reaching codegen must be bound. The optimizer site that \
-             emitted this unbound OpRef must be fixed (or InvalidLoop'd in \
-             validate_oprefs_for_compile) instead of falling back to a \
-             zero load",
-            opref.raw(),
-            opref.raw()
-        );
-    }
-    builder.use_var(var(opref.raw()))
+    // Every Box reaching codegen MUST be bound — an inputarg, a label arg, a
+    // constant, or a previous op result (regalloc.py invariant). Pyre's
+    // `validate_oprefs_for_compile` already routes undefined first-arg
+    // dereferences to `CompilationFailed` (RPython's `InvalidLoop` abort);
+    // an unbound OpRef reaching this point is a binding-invariant violation.
+    use_declared_var_or_panic(builder, opref, "resolve_opref")
 }
 
 fn resolve_binop(
@@ -4801,7 +4805,7 @@ fn resolve_opref_or_imm(
     if opref.is_constant() {
         missing_legacy_constant(opref, "resolve_opref_or_imm");
     }
-    builder.ins().iconst(cl_types::I64, opref.raw() as i64)
+    use_declared_var_or_panic(builder, opref, "resolve_opref_or_imm")
 }
 
 fn resolve_failarg_opref(
@@ -4861,7 +4865,18 @@ fn resolve_constant_i64(
             ),
         ));
     }
-    Ok(opref.raw() as i64)
+    // Not a constant and not a bound operand. RPython regalloc `loc()` would
+    // KeyError (regalloc.py:611-622/95-103) — never bake the box's slot index
+    // as an immediate. Route to the recoverable unsupported-semantics path
+    // (InvalidLoop / blackhole) rather than miscompiling a position as a value.
+    Err(unsupported_semantics(
+        opcode,
+        &format!(
+            "{what}: operand {:?} is neither a constant nor a bound box; \
+             RPython regalloc loc() would KeyError",
+            opref
+        ),
+    ))
 }
 
 fn resolve_rewriter_immediate_i64(
@@ -4886,7 +4901,17 @@ fn resolve_rewriter_immediate_i64(
             ),
         ));
     }
-    Ok(opref.raw() as i64)
+    // Not a constant and not a bound operand. RPython regalloc `loc()` would
+    // KeyError (regalloc.py:611-622/95-103) — never bake the box's slot index
+    // as an immediate. Route to the recoverable unsupported-semantics path.
+    Err(unsupported_semantics(
+        opcode,
+        &format!(
+            "{what}: operand {:?} is neither a constant nor a bound box; \
+             RPython regalloc loc() would KeyError",
+            opref
+        ),
+    ))
 }
 
 fn type_for_opref(
@@ -11955,24 +11980,15 @@ impl CraneliftBackend {
                         "ZERO_ARRAY scale_size",
                     )?;
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let start = builder.ins().iconst(
-                        cl_types::I64,
-                        resolve_rewriter_immediate_i64(
-                            &constants,
-                            op.opcode,
-                            op.arg(1),
-                            "ZERO_ARRAY start",
-                        )?,
-                    );
-                    let size = builder.ins().iconst(
-                        cl_types::I64,
-                        resolve_rewriter_immediate_i64(
-                            &constants,
-                            op.opcode,
-                            op.arg(2),
-                            "ZERO_ARRAY size",
-                        )?,
-                    );
+                    // regalloc.py:1450-1453 `consider_zero_array`: startindex
+                    // (arg 1) and length (arg 2) flow through
+                    // `make_sure_var_in_reg` — they may be runtime boxes, not
+                    // just ConstInt. Only the two scale args (3, 4) are
+                    // asserted `ConstInt` by the rewriter. Resolve start/size
+                    // as boxes-or-consts; baking them as immediates would
+                    // miscompile a register operand.
+                    let start = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let size = resolve_opref(&mut builder, &constants, op.arg(2));
 
                     let start_bytes = match scale_start {
                         0 => builder.ins().iconst(cl_types::I64, 0),

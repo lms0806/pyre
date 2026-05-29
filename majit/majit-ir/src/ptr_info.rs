@@ -171,8 +171,10 @@ pub struct VStringConcatInfo {
 pub struct VirtualInfo {
     /// The size descriptor of this object.
     pub descr: DescrRef,
-    /// Known class (if any).
-    pub known_class: Option<GcRef>,
+    /// Known class, as the immortal vtable address (`ConstInt(ptr2int(typeptr))`,
+    /// model.py:199-201). Held as a plain integer — never a traced `GcRef` —
+    /// because the vtable is a prebuilt static the GC never moves.
+    pub known_class: Option<i64>,
     /// ob_type field descriptor for force path. In RPython the vtable is
     /// set by allocate_with_vtable, not as a struct field. pyre stores
     /// ob_type at offset 0 explicitly. This descr lets force emit
@@ -211,8 +213,9 @@ pub struct VirtualArrayInfo {
 pub struct InstancePtrInfo {
     /// Best-known instance descriptor, if any.
     pub descr: Option<DescrRef>,
-    /// Known class pointer, if guarded exactly.
-    pub known_class: Option<GcRef>,
+    /// Known class, as the immortal vtable address (`ConstInt(ptr2int(typeptr))`,
+    /// model.py:199-201) — a plain integer, not a traced `GcRef`.
+    pub known_class: Option<i64>,
     /// info.py:175 _fields — cached field values.
     /// RPython stores both normal Boxes and PreambleOp sentinels in the
     /// same list. Rust mirrors this with `Vec<(u32, FieldEntry)>`.
@@ -493,16 +496,10 @@ impl PtrInfo {
             }
         }
 
-        fn visit_optional_gcref(slot: &mut Option<GcRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(gcref) = slot.as_mut() {
-                visitor(gcref);
-            }
-        }
-
         match self {
             PtrInfo::Constant(gcref) => visitor(gcref),
             PtrInfo::Instance(info) => {
-                visit_optional_gcref(&mut info.known_class, visitor);
+                // known_class is an immortal vtable integer, not a traced ref.
                 for (_, entry) in &mut info.fields {
                     visit_field(entry, visitor);
                 }
@@ -518,7 +515,7 @@ impl PtrInfo {
                 }
             }
             PtrInfo::Virtual(info) => {
-                visit_optional_gcref(&mut info.known_class, visitor);
+                // known_class is an immortal vtable integer, not a traced ref.
                 for (_, opref) in &mut info.fields {
                     visit_opref(opref, visitor);
                 }
@@ -665,7 +662,7 @@ impl PtrInfo {
     /// `optimizer.py:137-152 make_constant_class` parity. PyPy stores
     /// known-class state on `InstancePtrInfo` itself (with `descr=None` and
     /// an empty `_fields`).
-    pub fn known_class(class_ptr: GcRef, _is_nonnull: bool) -> Self {
+    pub fn known_class(class_ptr: i64, _is_nonnull: bool) -> Self {
         PtrInfo::Instance(InstancePtrInfo {
             descr: None,
             known_class: Some(class_ptr),
@@ -675,7 +672,7 @@ impl PtrInfo {
     }
 
     /// Create a non-virtual InstancePtrInfo.
-    pub fn instance(descr: Option<DescrRef>, known_class: Option<GcRef>) -> Self {
+    pub fn instance(descr: Option<DescrRef>, known_class: Option<i64>) -> Self {
         PtrInfo::Instance(InstancePtrInfo {
             descr,
             known_class,
@@ -704,7 +701,7 @@ impl PtrInfo {
     }
 
     /// Create a Virtual PtrInfo (allocation removed).
-    pub fn virtual_obj(descr: DescrRef, known_class: Option<GcRef>) -> Self {
+    pub fn virtual_obj(descr: DescrRef, known_class: Option<i64>) -> Self {
         PtrInfo::Virtual(VirtualInfo {
             descr,
             known_class,

@@ -2681,7 +2681,7 @@ impl TraceCtx {
         }
         self.record_op(OpCode::RecordExactClass, &[opref, cls_const]);
         let cls_value = match self.constants_get_value(cls_const) {
-            Some(Value::Int(vtable)) => majit_ir::GcRef(vtable as usize),
+            Some(Value::Int(vtable)) => vtable,
             other => panic!(
                 "trace_record_exact_class: cls_const {:?} must resolve to a \
                  ConstInt vtable address; got {:?} — bytecode argcodes are /ri",

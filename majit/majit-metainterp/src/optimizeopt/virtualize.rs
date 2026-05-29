@@ -451,7 +451,7 @@ impl OptVirtualize {
         // handles the nonnull check inside, so the upstream contract
         // is "always carry the vtable value; let consumers interpret
         // null as 'no known class' at read time".
-        let known_class = descr.as_size_descr().map(|sd| majit_ir::GcRef(sd.vtable()));
+        let known_class = descr.as_size_descr().map(|sd| sd.vtable() as i64);
         let vinfo = VirtualInfo {
             descr,
             known_class,
@@ -629,7 +629,7 @@ impl OptVirtualize {
                         if is_typeptr {
                             if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
-                                    vinfo.known_class = Some(majit_ir::GcRef(class_val));
+                                    vinfo.known_class = Some(class_val as i64);
                                 }
                             }
                             return Some(OptimizationResult::Remove);
@@ -718,8 +718,7 @@ impl OptVirtualize {
             // known_class (info.py:324-325 get_known_class).
             if let PtrInfo::Virtual(ref vinfo) = info {
                 if is_typeptr {
-                    if let Some(gc_ref) = vinfo.known_class {
-                        let class_val = gc_ref.as_usize() as i64;
+                    if let Some(class_val) = vinfo.known_class {
                         ctx.make_constant(op.pos.get(), majit_ir::Value::Int(class_val));
                         return OptimizationResult::Remove;
                     }
@@ -1488,9 +1487,7 @@ impl OptVirtualize {
 
         // virtualize.py:123-125: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
-        let known_class = Some(majit_ir::GcRef(
-            crate::virtualref::JIT_VIRTUAL_REF_VTABLE as usize,
-        ));
+        let known_class = Some(crate::virtualref::JIT_VIRTUAL_REF_VTABLE as i64);
         let fields = vec![
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),

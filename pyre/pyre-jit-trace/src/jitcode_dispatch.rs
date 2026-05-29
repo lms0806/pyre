@@ -5674,7 +5674,7 @@ fn handle(
                         walker_capture_snapshot_for_last_guard(ctx, op.pc);
                         ctx.trace_ctx
                             .heap_cache_mut()
-                            .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
+                            .class_now_known(exc, exc_class_ptr as usize as i64);
                     }
                 }
             }

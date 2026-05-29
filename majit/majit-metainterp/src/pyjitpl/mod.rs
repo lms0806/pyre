@@ -1419,6 +1419,15 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(slot);
             }
         }
+        // heapcache.py:50-104 — the heapcache caches field values /
+        // replacements / loop-invariant results as `OpRef`. With inline
+        // consts (history.py:314 `ConstPtr.value`) those value slots can be
+        // `ConstPtrInline(GcRef)`; they are returned on cache hits and
+        // emitted into the op-graph, so a stale gcref is a use-after-move.
+        // Forward them in place. (Cache *keys* are intentionally left stale —
+        // a forwarded lookup key misses and repopulates, like
+        // `call_pure_results` below.)
+        trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
         // NOTE: `trace_ctx.call_pure_results: VecAssoc<Vec<Value>, Value>`
         // (pyjitpl.py:3572-3573) also stores Ref slots. RPython's
         // args_dict stores Const boxes and the GC traces their gcrefs

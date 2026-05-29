@@ -12,7 +12,7 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
@@ -334,9 +334,7 @@ pub struct ImportedVirtual {
 
 #[derive(Clone, Debug)]
 pub enum ImportedVirtualKind {
-    Instance {
-        known_class: Option<majit_ir::GcRef>,
-    },
+    Instance { known_class: Option<i64> },
     Struct,
 }
 
@@ -1743,7 +1741,6 @@ impl Optimizer {
         class_value: i64,
         update_last_guard: bool,
     ) {
-        let class_ptr = GcRef(class_value as usize);
         // optimizer.py:138: op = op.get_box_replacement()
         let resolved = op.get_box_replacement(false);
         // optimizer.py:139: opinfo = op.get_forwarded()
@@ -1754,11 +1751,11 @@ impl Optimizer {
         let updated_existing = ctx
             .with_ptr_info_mut(&resolved, |info| match info {
                 PtrInfo::Instance(iinfo) => {
-                    iinfo.known_class = Some(class_ptr);
+                    iinfo.known_class = Some(class_value);
                     true
                 }
                 PtrInfo::Virtual(vinfo) => {
-                    vinfo.known_class = Some(class_ptr);
+                    vinfo.known_class = Some(class_value);
                     true
                 }
                 _ => false,
@@ -1773,7 +1770,7 @@ impl Optimizer {
                 .and_then(|p| p.get_last_guard_pos())
                 .map(|p| p as i32)
                 .unwrap_or(-1);
-            let mut new_info = PtrInfo::known_class(class_ptr, true);
+            let mut new_info = PtrInfo::known_class(class_value, true);
             new_info.set_last_guard_pos(old_guard_pos);
             ctx.set_ptr_info(&resolved, new_info);
         }

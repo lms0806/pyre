@@ -756,6 +756,31 @@ pub struct RegisterManager {
     pub spill_moves: Vec<(Loc, Loc)>,
 }
 
+/// Resolve a constant `OpRef` to its `i64` bit pattern.
+///
+/// Inline-Const variants (history.py:227/268/314 `ConstXxx.value`) carry the
+/// value directly. The legacy pool-indexed variants (`ConstInt(u32)` etc.)
+/// must be present in the optimizer's `constants` snapshot. A legacy const
+/// absent from `constants` means the optimizer producer never seeded it —
+/// `ConstInt.value` is always present in RPython, so the backend must never
+/// silently substitute `0`, which would miscompile the constant as zero.
+/// Panic at the parity hole instead, matching the Cranelift backend's
+/// `missing_legacy_constant`.
+fn const_bits_or_panic(v: OpRef, constants: &majit_ir::VecAssoc<u32, i64>, where_: &str) -> i64 {
+    if let Some(bits) = v.inline_const_bits() {
+        return bits;
+    }
+    constants.get(&v.raw()).copied().unwrap_or_else(|| {
+        panic!(
+            "dynasm {where_}: legacy pool-indexed const OpRef (raw={}) is absent \
+             from the constants snapshot — the optimizer producer must seed it \
+             (or mint an inline Const) instead of the backend baking 0. RPython \
+             ConstInt.value (history.py:227) is always present.",
+            v.raw()
+        )
+    })
+}
+
 impl RegisterManager {
     /// regalloc.py:368
     pub fn new(
@@ -1193,11 +1218,9 @@ impl RegisterManager {
     ) -> Loc {
         if v.is_constant() {
             // history.py:227/268/314 — inline-Const variants carry the
-            // value directly; legacy pool-indexed variants fall through
-            // to the constants snapshot.
-            let val = v
-                .inline_const_bits()
-                .unwrap_or_else(|| constants.get(&v.raw()).copied().unwrap_or(0));
+            // value directly; legacy pool-indexed variants resolve through
+            // the constants snapshot.
+            let val = const_bits_or_panic(v, constants, "loc");
             if tp == Type::Float || self.is_float_constant(v) {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
@@ -1520,9 +1543,7 @@ impl RegisterManager {
         // history.py:227/268/314 — inline-Const variants carry the value
         // directly; legacy pool-indexed Const variants look up the i64
         // raw bits via the constants snapshot.
-        let val = v
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&v.raw()).copied().unwrap_or(0));
+        let val = const_bits_or_panic(v, constants, "convert_to_imm");
         if self.is_float_constant(v) {
             Loc::Immed(ImmedLoc::new_float(val))
         } else {
@@ -2345,8 +2366,7 @@ impl<'a> RegAlloc<'a> {
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
     pub(crate) fn const_value(&self, v: OpRef) -> i64 {
-        v.inline_const_bits()
-            .unwrap_or_else(|| self.constants.get(&v.raw()).copied().unwrap_or(0))
+        const_bits_or_panic(v, &self.constants, "const_value")
     }
 
     // ── walk_operations + consider_* ──

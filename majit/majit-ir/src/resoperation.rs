@@ -1251,8 +1251,10 @@ pub struct GuardPendingFieldEntry {
 pub struct VirtualFieldsInfo {
     /// Type descriptor for the virtual object.
     pub descr: Option<DescrRef>,
-    /// Known class pointer (for NewWithVtable).
-    pub known_class: Option<GcRef>,
+    /// Known class pointer (for NewWithVtable) — an immortal vtable address
+    /// carried as `ConstInt(ptr2int(typeptr))` (model.py:199-201), never a
+    /// traced ref.
+    pub known_class: Option<i64>,
     /// Field OpRefs (after get_box_replacement). Order matches the
     /// virtual's field descriptor list.
     pub field_oprefs: Vec<OpRef>,

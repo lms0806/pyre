@@ -370,9 +370,10 @@ pub struct HeapCache {
     /// is the natural no-HashMap substitute.
     heap_array_cache: vecset::VecMap<u32, vecset::VecMap<i64, CacheEntry>>,
 
-    /// Known class map: object_ref -> class pointer.
-    /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
-    known_class: Vec<Option<GcRef>>,
+    /// Known class map: object_ref -> class pointer. The class pointer is a
+    /// `ConstInt` vtable address (model.py:199-201), an integer the GC never
+    /// traces — not a ref. RPython: CacheEntry 내부. Vec indexed by OpRef.0.
+    known_class: Vec<Option<i64>>,
 
     /// Quasi-immutable fields known in this trace.
     /// heapcache.py: `quasi_immut_known`.
@@ -1017,7 +1018,7 @@ impl HeapCache {
     /// layer can decode it. The HF_KNOWN_CLASS flag itself must still be set
     /// for legacy pool-indexed ConstInt guards whose value is not available
     /// inside heapcache.py's notify path.
-    pub fn class_now_known_maybe(&mut self, opref: OpRef, class: Option<GcRef>) {
+    pub fn class_now_known_maybe(&mut self, opref: OpRef, class: Option<i64>) {
         if opref.is_constant() {
             return;
         }
@@ -1036,7 +1037,7 @@ impl HeapCache {
         self.nullity_now_known(opref, true);
     }
 
-    pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
+    pub fn class_now_known(&mut self, opref: OpRef, class: i64) {
         self.class_now_known_maybe(opref, Some(class));
     }
 
@@ -1055,7 +1056,7 @@ impl HeapCache {
     /// Mirrors heapcache.py:467 — only valid when the version is current,
     /// because the side `known_class` Vec may hold stale entries from
     /// before the last `reset_keep_likely_virtuals`.
-    pub fn get_known_class(&self, opref: OpRef) -> Option<GcRef> {
+    pub fn get_known_class(&self, opref: OpRef) -> Option<i64> {
         if opref.is_constant() {
             return None;
         }
@@ -1063,6 +1064,58 @@ impl HeapCache {
             return None;
         }
         self.known_class.get(opref.raw() as usize).and_then(|v| *v)
+    }
+
+    /// Forward every inline `OpRef::ConstPtrInline(GcRef)` cached as a
+    /// *value* so it survives a moving minor collection. history.py:314
+    /// `ConstPtr.value` is a gcref field the Python GC traces through the
+    /// box object graph; pyre caches the inline gcref in plain `OpRef`
+    /// slots and must forward them explicitly.
+    ///
+    /// Only value slots are forwarded — these are returned on cache hits
+    /// and emitted into the op-graph (`replaced_with_const` /
+    /// `loopinvariant_result` / `CacheEntry` field values), so a stale one
+    /// is a use-after-move. The `cache_anything` / `cache_seen_allocation`
+    /// / `quasi_immut_known` *keys* are deliberately left stale: a forwarded
+    /// lookup key simply misses the stale-keyed entry and the cache
+    /// repopulates (same contract as the `call_pure_results` cache), and an
+    /// in-place key rewrite would break the sorted-`VecMap` ordering.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let Some(gcref) = slot.as_const_ptr_inline_mut() {
+                visitor(gcref);
+            }
+        }
+        fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+            for value in entry.cache_anything.values_mut() {
+                forward(value, visitor);
+            }
+            for value in entry.cache_seen_allocation.values_mut() {
+                forward(value, visitor);
+            }
+            if let Some(slot) = entry.last_const_box.as_mut() {
+                forward(slot, visitor);
+            }
+        }
+        for entry in self.heap_cache.values_mut() {
+            forward_entry(entry, visitor);
+        }
+        for index_map in self.heap_array_cache.values_mut() {
+            for entry in index_map.values_mut() {
+                forward_entry(entry, visitor);
+            }
+        }
+        if let Some(slot) = self.loopinvariant_result.as_mut() {
+            forward(slot, visitor);
+        }
+        for slot in self.replaced_with_const.iter_mut().flatten() {
+            forward(slot, visitor);
+        }
+        for deps in self.heapc_deps.iter_mut().flatten() {
+            for slot in deps.iter_mut().flatten() {
+                forward(slot, visitor);
+            }
+        }
     }
 
     /// heapcache.py:493-494 is_unescaped.
@@ -1120,8 +1173,7 @@ impl HeapCache {
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
             let class = args
                 .get(1)
-                .and_then(|class_val| class_val.const_int_value())
-                .map(|class_val| GcRef(class_val as usize));
+                .and_then(|class_val| class_val.const_int_value());
             self.class_now_known_maybe(args[0], class);
         }
         // heapcache.py: GUARD_NONNULL → known non-null.
@@ -2332,7 +2384,7 @@ mod tests {
     fn test_known_class() {
         let mut cache = HeapCache::new();
         let obj = OpRef::ref_op(0);
-        let cls = GcRef(0x1000);
+        let cls = 0x1000_i64;
 
         assert!(!cache.is_class_known(obj));
         assert_eq!(cache.get_known_class(obj), None);
@@ -2358,13 +2410,68 @@ mod tests {
     fn test_notify_guard_class_preserves_inline_class_value() {
         let mut cache = HeapCache::new();
         let obj = OpRef::ref_op(3);
-        let cls_ref = GcRef(0xCAFE);
-        let cls = OpRef::const_int_inline(cls_ref.0 as i64);
+        let cls_val = 0xCAFE_i64;
+        let cls = OpRef::const_int_inline(cls_val);
 
         cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
 
         assert!(cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), Some(cls_ref));
+        assert_eq!(cache.get_known_class(obj), Some(cls_val));
+    }
+
+    #[test]
+    fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
+        // history.py:314 parity: a ConstPtrInline cached as a replacement
+        // value must survive a moving minor collection. Forward it and read
+        // back through maybe_replace_with_const.
+        let mut cache = HeapCache::new();
+        let old = OpRef::ref_op(3);
+        let new = OpRef::const_ptr_inline(GcRef(0x1000));
+        cache.replace_box(old, new);
+        assert_eq!(cache.maybe_replace_with_const(old), new);
+
+        cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
+            gcref.0 = gcref.0.wrapping_add(0x1_0000);
+        });
+
+        assert_eq!(
+            cache.maybe_replace_with_const(old),
+            OpRef::const_ptr_inline(GcRef(0x1_1000))
+        );
+    }
+
+    #[test]
+    fn test_walk_const_ptr_refs_leaves_cache_keys_stale() {
+        // Cache *keys* are intentionally not forwarded: an in-place key
+        // rewrite would break the sorted-VecMap ordering, and a stale key
+        // simply misses + repopulates (the live lookup arrives already
+        // forwarded). A `ConstPtrInline` object used as a `cache_anything`
+        // key must therefore stay at its pre-collection address.
+        let mut cache = HeapCache::new();
+        let const_obj = OpRef::const_ptr_inline(GcRef(0x2000));
+        let field = 7;
+        // A non-const cached value so the walk leaves the value slot alone
+        // and the assertions isolate the key's address.
+        cache.getfield_now_known(const_obj, field, OpRef::ref_op(20), IDENTITY_ORACLE);
+
+        cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
+            gcref.0 = gcref.0.wrapping_add(0x1_0000);
+        });
+
+        // The entry is still keyed by the original (pre-move) address...
+        assert_eq!(
+            cache.getfield_cached(const_obj, field, IDENTITY_ORACLE),
+            Some(OpRef::ref_op(20))
+        );
+        // ...and was NOT re-keyed to the forwarded address.
+        assert_eq!(
+            cache.getfield_cached(
+                OpRef::const_ptr_inline(GcRef(0x1_2000)),
+                field,
+                IDENTITY_ORACLE
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2381,7 +2488,7 @@ mod tests {
     fn test_reset() {
         let mut cache = HeapCache::new();
         cache.new_object(OpRef::ref_op(0));
-        cache.class_now_known(OpRef::ref_op(0), GcRef(0x1000));
+        cache.class_now_known(OpRef::ref_op(0), 0x1000);
         cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
 
         cache.reset();

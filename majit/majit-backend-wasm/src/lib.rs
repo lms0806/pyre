@@ -136,6 +136,22 @@ pub struct WasmBackend {
     vtable_offset: Option<usize>,
 }
 
+/// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
+/// without a value in the constants pool. `set_constants_pool` runs before
+/// `assemble`, so every legitimate legacy const is already present; an arg
+/// landing here means the optimizer producer failed to seed it. RPython
+/// `ConstInt.value` (history.py:227) is always present, so never register a
+/// placeholder `0` — that would emit the constant as zero. Panic at the parity
+/// hole, matching the dynasm/cranelift backends.
+fn missing_legacy_const(arg: majit_ir::OpRef) -> ! {
+    panic!(
+        "wasm collect_constants_from_ops: legacy pool-indexed const OpRef \
+         (raw={}) is absent from the constants pool — the optimizer producer \
+         must seed it (or mint an inline Const) instead of registering 0.",
+        arg.raw()
+    );
+}
+
 impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
@@ -293,13 +309,14 @@ impl WasmBackend {
         .unwrap_or_default()
     }
 
-    /// Collect constants from ops (constant OpRefs that appear as args).
+    /// Validate that every constant OpRef appearing as an arg is resolvable.
     ///
     /// Inline-Const variants (`ConstIntInline`/`ConstFloatInline`/
     /// `ConstPtrInline`) carry `.value` on the OpRef itself (history.py:
-    /// 227/268/314) so they need no `self.constants` side-table entry and
-    /// would `panic!` from `raw()`. Only legacy idx-keyed `ConstInt(u32)`
-    /// / `ConstFloat(u32)` / `ConstPtr(u32)` are registered here.
+    /// 227/268/314), so they need no `self.constants` side-table entry and
+    /// are skipped. A legacy idx-keyed `ConstInt(u32)` / `ConstFloat(u32)` /
+    /// `ConstPtr(u32)` must have been seeded by `set_constants_pool`; one that
+    /// is missing is a producer gap and panics rather than defaulting to 0.
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
             for &arg in op.getarglist().iter() {
@@ -307,7 +324,7 @@ impl WasmBackend {
                     && arg.inline_const_bits().is_none()
                     && !self.constants.contains_key(&arg.raw())
                 {
-                    self.constants.insert(arg.raw(), 0);
+                    missing_legacy_const(arg);
                 }
             }
             if let Some(fail_args) = op.getfailargs() {
@@ -316,7 +333,7 @@ impl WasmBackend {
                         && arg.inline_const_bits().is_none()
                         && !self.constants.contains_key(&arg.raw())
                     {
-                        self.constants.insert(arg.raw(), 0);
+                        missing_legacy_const(arg);
                     }
                 }
             }

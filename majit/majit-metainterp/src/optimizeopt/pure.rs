@@ -2400,11 +2400,12 @@ mod tests {
         // re-exported to ShortBoxes via short_preamble_pure_ops.
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
-        // legacy-const-ok: this test exercises the legacy idx-Const ->
-        // ctx.const_pool seeding path that note_known_constants_from_ctx
-        // (shortpreamble.rs:570) iterates. Inline-Const variants skip the
-        // pool entirely and would not surface here.
-        let const_opref = OpRef::const_int(10);
+        // history.py:227 — the imported pure op carries an inline `Const`
+        // arg (`ConstInt.value`). seed_constant takes the inline branch (no
+        // const_pool), and the constant is recognised downstream via
+        // `is_constant()`, so the short-preamble producer re-exports the op
+        // without any const_pool / known_constants bridge.
+        let const_opref = OpRef::const_int_inline(7);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
         ctx.imported_short_pure_ops
             .push(crate::optimizeopt::ImportedShortPureOp::new(

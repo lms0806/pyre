@@ -644,7 +644,7 @@ pub fn trace_unbox_int(
         let type_const = ctx.const_int(int_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(int_type_addr as usize));
+            .class_now_known(obj, int_type_addr);
     }
     getfield_gc_i_pureornot(ctx, obj, intval_descr)
 }
@@ -865,7 +865,7 @@ pub fn trace_unbox_float(
         let type_const = ctx.const_int(float_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
+            .class_now_known(obj, float_type_addr);
     }
     getfield_gc_f_pureornot(ctx, obj, floatval_descr)
 }
@@ -1267,7 +1267,7 @@ pub fn generated_binary_float_value(
                 let type_const = ctx.const_int(float_type_addr);
                 frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
                 ctx.heap_cache_mut()
-                    .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
+                    .class_now_known(obj, float_type_addr);
             }
             {
                 let ff_descr = crate::descr::float_floatval_descr();

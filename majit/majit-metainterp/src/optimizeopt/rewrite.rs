@@ -2310,7 +2310,7 @@ impl OptRewrite {
                 // ConstInt vtable addresses (`expectedclassbox.getint()`).
                 let expected = ctx.get_constant_int(op.arg(1));
                 if let Some(expected) = expected {
-                    if known_class.0 as i64 == expected {
+                    if known_class == expected {
                         return OptimizationResult::Remove;
                     }
                     // rewrite.py:404-407: known class mismatch is a
@@ -3618,7 +3618,7 @@ impl Optimization for OptRewrite {
                             .and_then(|b| ctx.getptrinfo(b))
                             .and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
                         {
-                            debug_assert_eq!(known.0 as i64, expected_class);
+                            debug_assert_eq!(known, expected_class);
                             return OptimizationResult::Remove;
                         }
                         if let Some(b) = ctx.ensure_box(obj) {

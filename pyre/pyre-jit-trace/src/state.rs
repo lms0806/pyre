@@ -2208,8 +2208,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(type_addr);
         frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(type_addr as usize));
+        ctx.heap_cache_mut().class_now_known(obj, type_addr);
     }
     crate::generated::trace_unbox_int(
         ctx,
@@ -2246,8 +2245,7 @@ pub(crate) fn trace_unbox_long_with_resume(
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(long_type_addr);
         frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(long_type_addr as usize));
+        ctx.heap_cache_mut().class_now_known(obj, long_type_addr);
     }
     let fits_fn =
         ctx.const_int(pyre_object::longobject::jit_w_long_fits_int as *const () as usize as i64);
@@ -2270,8 +2268,7 @@ pub(crate) fn trace_unbox_float_with_resume(
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
         frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut()
-            .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
+        ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
     }
     crate::generated::trace_unbox_float(
         ctx,

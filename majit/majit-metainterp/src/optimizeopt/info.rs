@@ -308,7 +308,7 @@ pub trait PtrInfoExt {
     /// when discriminating constant pointers. The `cpu` argument routes
     /// `cls_of_box` through the `Cpu` trait so backends overriding the
     /// typeptr-at-offset-0 read (`gcremovetypeptr`) are honored.
-    fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<GcRef>;
+    fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<i64>;
 
     /// info.py:83 `make_guards(op, short, optimizer)`.
     fn make_guards(&self, op: OpRef, short: &mut Vec<Op>, ctx: &mut crate::optimizeopt::OptContext);
@@ -373,7 +373,7 @@ impl PtrInfoExt for PtrInfo {
     ///   `check_is_object` call entirely and still returns
     ///   `cls_of_box(self._const)`; this port follows that.
     /// - Everything else: `None`.
-    fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<GcRef> {
+    fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<i64> {
         match self {
             PtrInfo::Instance(v) => v.known_class,
             PtrInfo::Virtual(v) => v.known_class,
@@ -394,11 +394,7 @@ impl PtrInfoExt for PtrInfo {
                 // the typeptr-at-offset-0 read (e.g. `gcremovetypeptr`)
                 // are honored here too.
                 let vtable = cpu.cls_of_gcref(*gcref);
-                if vtable == 0 {
-                    None
-                } else {
-                    Some(GcRef(vtable as usize))
-                }
+                if vtable == 0 { None } else { Some(vtable) }
             }
             _ => None,
         }
@@ -467,12 +463,12 @@ impl PtrInfoExt for PtrInfo {
                 // `remove_gctypeptr=false` (e.g. a future heap-only
                 // PyObject layout) gets the upstream guard sequence
                 // without further changes.
-                if let Some(cls) = &info.known_class {
+                if let Some(cls) = info.known_class {
                     // info.py:341-345 stores `_known_class` on PtrInfo, but
                     // the emitted guard operand is the same ConstInt vtable
                     // address produced by backend/model.py:199-201
                     // `cls_of_box()`.
-                    let class_ref = alloc_const(ctx, Value::Int(cls.0 as i64));
+                    let class_ref = alloc_const(ctx, Value::Int(cls));
                     if !ctx.remove_gctypeptr {
                         short.push(Op::new(OpCode::GuardNonnull, &[op]));
                         short.push(Op::new(OpCode::GuardIsObject, &[op]));
@@ -1406,7 +1402,7 @@ mod tests {
         assert!(constant.is_nonnull());
         assert!(constant.is_constant());
 
-        let kc = PtrInfo::known_class(GcRef(0x2000), true);
+        let kc = PtrInfo::known_class(0x2000, true);
         assert!(kc.is_nonnull());
         // Instance arm — no cpu read; DefaultCpu is a placeholder.
         assert!(kc.get_known_class(&crate::cpu::DefaultCpu).is_some());
@@ -1416,7 +1412,7 @@ mod tests {
     fn test_ptr_info_virtual_factories() {
         let descr: DescrRef = Arc::new(TestDescr);
 
-        let virtual_obj = PtrInfo::virtual_obj(descr.clone(), Some(GcRef(0x3000)));
+        let virtual_obj = PtrInfo::virtual_obj(descr.clone(), Some(0x3000));
         assert!(virtual_obj.is_virtual());
         assert!(virtual_obj.is_nonnull());
         assert!(virtual_obj.get_descr().is_some());
@@ -1763,7 +1759,7 @@ mod tests {
         let guards = constant.guard_opcodes();
         assert!(guards.contains(&OpCode::GuardValue));
 
-        let kc = PtrInfo::known_class(GcRef(0x2000), true);
+        let kc = PtrInfo::known_class(0x2000, true);
         let guards = kc.guard_opcodes();
         assert!(guards.contains(&OpCode::GuardNonnullClass));
     }

@@ -3470,10 +3470,7 @@ impl OptContext {
         // unroll.py:75-77: known_class → make_constant_class(op, class, False)
         if let Some(cls) = preamble_info.get_known_class(self.cpu.as_ref()) {
             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                self,
-                &op_box,
-                cls.0 as i64,
-                false, // update_last_guard=False (unroll.py:77)
+                self, &op_box, cls, false, // update_last_guard=False (unroll.py:77)
             );
         }
 
@@ -6713,13 +6710,14 @@ impl OptContext {
     /// `bridgeopt.rs`) routes through `ctx.cls_of_box(box)`.  Future
     /// `bh_*` runtime calls will land on the same `Cpu` trait and lose
     /// the `OptContext::cls_of_box` wrapper as that surface fills out.
-    pub fn cls_of_box(&self, op: &crate::r#box::BoxRef) -> Option<majit_ir::GcRef> {
-        // model.py:199-201 `cpu.cls_of_box(box)` — DefaultCpu walks the
-        // BoxRef to its Const terminal and dereferences the GcRef
-        // typeptr-at-offset-0. Returns 0 for non-Ref / null boxes.
+    pub fn cls_of_box(&self, op: &crate::r#box::BoxRef) -> Option<i64> {
+        // model.py:199-201 `cpu.cls_of_box(box)` returns `ConstInt(ptr2int(
+        // typeptr))` — the immortal vtable address as a plain integer, never
+        // a traced ref. DefaultCpu walks the BoxRef to its Const terminal and
+        // dereferences the typeptr-at-offset-0. Returns 0 for non-Ref / null.
         let typeptr = self.cpu.cls_of_box(op);
         if typeptr != 0 {
-            return Some(majit_ir::GcRef(typeptr as usize));
+            return Some(typeptr);
         }
         // resoperation.py:612-642 `RefOp._resref` fallback — when the
         // BoxRef chain has no Const terminal, read the mixin slot
@@ -6739,11 +6737,7 @@ impl OptContext {
         }
         let synth = crate::r#box::BoxRef::new_const(value);
         let typeptr = self.cpu.cls_of_box(&synth);
-        if typeptr == 0 {
-            None
-        } else {
-            Some(majit_ir::GcRef(typeptr as usize))
-        }
+        if typeptr == 0 { None } else { Some(typeptr) }
     }
 
     /// info.py:880 `getptrinfo(op).get_known_class(cpu)` parity.
@@ -6751,7 +6745,7 @@ impl OptContext {
     /// Delegates to `getptrinfo(&BoxRef)` + `PtrInfo::get_known_class` so
     /// constant pointers are handled via `cls_of_box` the same way
     /// `Instance` / `Virtual` read their stored `known_class`.
-    pub fn get_known_class(&self, op: &crate::r#box::BoxRef) -> Option<majit_ir::GcRef> {
+    pub fn get_known_class(&self, op: &crate::r#box::BoxRef) -> Option<i64> {
         self.getptrinfo(op)?.get_known_class(self.cpu.as_ref())
     }
 
@@ -8931,7 +8925,7 @@ mod constant_ptr_info_tests {
             let info = ctx
                 .get_const_info_mut(opref, None)
                 .expect("Ref constant should have const_infos slot");
-            *info = PtrInfo::known_class(GcRef(0x1111_2222), true);
+            *info = PtrInfo::known_class(0x1111_2222, true);
         }
         // Second lookup: the slot must contain the previously written
         // PtrInfo, not a freshly minted Instance.
@@ -8940,7 +8934,7 @@ mod constant_ptr_info_tests {
             .expect("Ref constant should still have const_infos slot");
         match info {
             PtrInfo::Instance(iinfo) => {
-                assert_eq!(iinfo.known_class.map(|c| c.0), Some(0x1111_2222));
+                assert_eq!(iinfo.known_class, Some(0x1111_2222));
             }
             other => panic!("expected Instance(known_class=Some) after re-lookup, got {other:?}"),
         }
@@ -9405,7 +9399,7 @@ mod ensure_ptr_info_arg0_tests {
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &pos0_box,
-            PtrInfo::instance(Some(instance_parent_descr()), Some(GcRef(0xc0de))),
+            PtrInfo::instance(Some(instance_parent_descr()), Some(0xc0de)),
         );
         let op = field_op_with_parent(struct_parent_descr());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -9655,7 +9649,7 @@ mod opt_box_env_tests {
             &target_box,
             PtrInfo::Virtual(VirtualInfo {
                 descr: Arc::new(DummySizeDescr),
-                known_class: Some(GcRef(0x1234)),
+                known_class: Some(0x1234),
                 ob_type_descr: None,
                 fields: Vec::new(),
                 last_guard_pos: -1,

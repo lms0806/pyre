@@ -88,12 +88,12 @@ fn is_trace_runtime_ref(
 /// resoperation.py:233-242 / :700). PyPy's Python GC walks `_forwarded`
 /// transitively; pyre pins each GcRef on the shadow stack instead.
 /// Used by `ExportedState::root_all_gcrefs` to keep
-/// `PtrInfo::Constant` / `PtrInfo::Instance.known_class` / `Const::Ref`
-/// payloads live across GC pauses.
+/// `PtrInfo::Constant` / `Const::Ref` payloads live across GC pauses.
+/// (`PtrInfo::Instance.known_class` is an immortal vtable integer, not a
+/// traced ref, so it is not rooted.)
 fn root_forwarded_gcref(
     forwarded: &crate::r#box::Forwarded,
     info_constant_field: ExportedGcRefField,
-    info_known_class_field: ExportedGcRefField,
     const_ref_field: ExportedGcRefField,
     dummy_key: OpRef,
     rooted_refs: &mut Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -106,14 +106,8 @@ fn root_forwarded_gcref(
                 let ss_idx = majit_gc::shadow_stack::push(*gcref);
                 rooted_refs.push((dummy_key, info_constant_field, ss_idx));
             }
-            PtrInfo::Instance(iinfo) => {
-                if let Some(gcref) = iinfo.known_class {
-                    if !gcref.is_null() {
-                        let ss_idx = majit_gc::shadow_stack::push(gcref);
-                        rooted_refs.push((dummy_key, info_known_class_field, ss_idx));
-                    }
-                }
-            }
+            // PtrInfo::Instance.known_class is an immortal vtable integer
+            // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
     } else if let crate::r#box::Forwarded::Const(majit_ir::Const::Ref(gcref), _) = forwarded
@@ -143,26 +137,6 @@ fn refresh_forwarded_ptrinfo_constant(
     };
     if let Some(rc) = rc {
         *rc.borrow_mut() = PtrInfo::Constant(updated);
-    }
-}
-
-fn refresh_forwarded_ptrinfo_known_class(
-    forwarded: &std::cell::RefCell<crate::r#box::Forwarded>,
-    updated: majit_ir::GcRef,
-) {
-    use crate::optimizeopt::info::{OpInfo, PtrInfo};
-    let rc = match &*forwarded.borrow() {
-        crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
-            if matches!(&*rc.borrow(), PtrInfo::Instance(_)) =>
-        {
-            Some(rc.clone())
-        }
-        _ => None,
-    };
-    if let Some(rc) = rc {
-        if let PtrInfo::Instance(iinfo) = &mut *rc.borrow_mut() {
-            iinfo.known_class = Some(updated);
-        }
     }
 }
 
@@ -2044,14 +2018,6 @@ pub struct ExportedState {
 enum ExportedGcRefField {
     /// exported_infos[OpRef].ptr_info = PtrInfo::Constant(GcRef)
     InfoPtrInfoConstant,
-    /// exported_infos[OpRef].ptr_info = PtrInfo::Instance with known_class set
-    /// (PyPy `InstancePtrInfo._known_class`; majit folds the former
-    /// `KnownClass` variant into `Instance(descr=None, known_class=Some(_))`).
-    InfoPtrInfoKnownClass,
-    /// virtual_state.state[index] = KnownClass { class_ptr }
-    VirtualStateKnownClass(usize),
-    /// virtual_state.state[index] = Virtual { known_class }
-    VirtualStateVirtualClass(usize),
     /// virtual_state.state[index] = Constant(Value::Ref)
     VirtualStateConstantRef(usize),
     /// short_box_const_values[OpRef] = Value::Ref(...)
@@ -2059,15 +2025,11 @@ enum ExportedGcRefField {
     /// `partial_trace_inputargs[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))`.
     /// PyPy `InputArg._forwarded` host (resoperation.py:700).
     PartialTraceInputArgInfoPtrInfoConstant(usize),
-    /// `partial_trace_inputargs[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))`.
-    PartialTraceInputArgInfoPtrInfoKnownClass(usize),
     /// `partial_trace_inputargs[index].forwarded = Const(Const::Ref(_), _)`.
     PartialTraceInputArgConstRef(usize),
     /// `partial_trace_operations[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))`.
     /// PyPy `AbstractResOp._forwarded` host (resoperation.py:233-242).
     PartialTraceOpInfoPtrInfoConstant(usize),
-    /// `partial_trace_operations[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))`.
-    PartialTraceOpInfoPtrInfoKnownClass(usize),
     /// `partial_trace_operations[index].forwarded = Const(Const::Ref(_), _)`.
     PartialTraceOpConstRef(usize),
 }
@@ -2388,19 +2350,8 @@ impl ExportedState {
                             ss_idx,
                         ));
                     }
-                    // InstancePtrInfo.known_class: GcRef for the class pointer.
-                    PtrInfo::Instance(iinfo) => {
-                        if let Some(gcref) = iinfo.known_class {
-                            if !gcref.is_null() {
-                                let ss_idx = majit_gc::shadow_stack::push(gcref);
-                                self.rooted_refs.push((
-                                    key,
-                                    ExportedGcRefField::InfoPtrInfoKnownClass,
-                                    ss_idx,
-                                ));
-                            }
-                        }
-                    }
+                    // InstancePtrInfo.known_class is an immortal vtable integer
+                    // (ConstInt), never a traced ref — no rooting needed.
                     _ => {}
                 }
             }
@@ -2415,25 +2366,8 @@ impl ExportedState {
         let dummy_key = OpRef::NONE;
         for (i, entry) in self.virtual_state.state.iter().enumerate() {
             match &entry.info {
-                VirtualStateInfo::KnownClass { class_ptr } if !class_ptr.is_null() => {
-                    let ss_idx = majit_gc::shadow_stack::push(*class_ptr);
-                    self.rooted_refs.push((
-                        dummy_key,
-                        ExportedGcRefField::VirtualStateKnownClass(i),
-                        ss_idx,
-                    ));
-                }
-                VirtualStateInfo::Virtual {
-                    known_class: Some(gcref),
-                    ..
-                } if !gcref.is_null() => {
-                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                    self.rooted_refs.push((
-                        dummy_key,
-                        ExportedGcRefField::VirtualStateVirtualClass(i),
-                        ss_idx,
-                    ));
-                }
+                // KnownClass.class_ptr and Virtual.known_class are immortal
+                // vtable integers (ConstInt), never traced refs — not rooted.
                 VirtualStateInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
                     let ss_idx = majit_gc::shadow_stack::push(*gcref);
                     self.rooted_refs.push((
@@ -2467,15 +2401,14 @@ impl ExportedState {
         // `partial_trace.inputargs` / `partial_trace.operations`
         // (compile.py:362) keep every preamble-pass `AbstractValue`
         // instance alive; their `_forwarded` slots may carry GcRef
-        // payloads (`PtrInfo::Constant`, `PtrInfo::Instance.known_class`,
-        // or `Const::Ref`). Root each so `compile_retrace` chain walks
-        // observe live handles.
+        // payloads (`PtrInfo::Constant` or `Const::Ref`; `Instance.known_class`
+        // is an immortal vtable integer, never a traced ref). Root each so
+        // `compile_retrace` chain walks observe live handles.
         for (i, ia) in self.partial_trace_inputargs.iter().enumerate() {
             let forwarded = ia.forwarded.borrow().clone();
             root_forwarded_gcref(
                 &forwarded,
                 ExportedGcRefField::PartialTraceInputArgInfoPtrInfoConstant(i),
-                ExportedGcRefField::PartialTraceInputArgInfoPtrInfoKnownClass(i),
                 ExportedGcRefField::PartialTraceInputArgConstRef(i),
                 dummy_key,
                 &mut self.rooted_refs,
@@ -2486,7 +2419,6 @@ impl ExportedState {
             root_forwarded_gcref(
                 &forwarded,
                 ExportedGcRefField::PartialTraceOpInfoPtrInfoConstant(i),
-                ExportedGcRefField::PartialTraceOpInfoPtrInfoKnownClass(i),
                 ExportedGcRefField::PartialTraceOpConstRef(i),
                 dummy_key,
                 &mut self.rooted_refs,
@@ -2540,46 +2472,6 @@ impl ExportedState {
                         *info = crate::optimizeopt::info::OpInfo::ptr(PtrInfo::Constant(updated));
                     }
                 }
-                ExportedGcRefField::InfoPtrInfoKnownClass => {
-                    if let Some(info) = self.exported_infos.get_mut(&key) {
-                        if let crate::optimizeopt::info::OpInfo::Ptr(rc) = info {
-                            if let PtrInfo::Instance(iinfo) = &mut *rc.borrow_mut() {
-                                iinfo.known_class = Some(updated);
-                            }
-                        }
-                    }
-                }
-                ExportedGcRefField::VirtualStateKnownClass(i) => {
-                    if let Some(slot) = self.virtual_state.state.get_mut(*i)
-                        && matches!(&slot.info, VirtualStateInfo::KnownClass { .. })
-                    {
-                        *slot = VirtualStateInfoNode::new_rc(VirtualStateInfo::KnownClass {
-                            class_ptr: updated,
-                        });
-                        virtual_state_dirty = true;
-                    }
-                }
-                ExportedGcRefField::VirtualStateVirtualClass(i) => {
-                    if let Some(slot) = self.virtual_state.state.get_mut(*i) {
-                        if let VirtualStateInfo::Virtual {
-                            descr,
-                            ob_type_descr,
-                            fields,
-                            field_descrs,
-                            ..
-                        } = &slot.info
-                        {
-                            *slot = VirtualStateInfoNode::new_rc(VirtualStateInfo::Virtual {
-                                descr: descr.clone(),
-                                known_class: Some(updated),
-                                ob_type_descr: ob_type_descr.clone(),
-                                fields: fields.clone(),
-                                field_descrs: field_descrs.clone(),
-                            });
-                            virtual_state_dirty = true;
-                        }
-                    }
-                }
                 ExportedGcRefField::VirtualStateConstantRef(i) => {
                     if let Some(entry) = self.virtual_state.state.get_mut(*i) {
                         *entry = VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
@@ -2598,11 +2490,6 @@ impl ExportedState {
                         refresh_forwarded_ptrinfo_constant(&ia.forwarded, updated);
                     }
                 }
-                ExportedGcRefField::PartialTraceInputArgInfoPtrInfoKnownClass(i) => {
-                    if let Some(ia) = self.partial_trace_inputargs.get(*i) {
-                        refresh_forwarded_ptrinfo_known_class(&ia.forwarded, updated);
-                    }
-                }
                 ExportedGcRefField::PartialTraceInputArgConstRef(i) => {
                     if let Some(ia) = self.partial_trace_inputargs.get(*i) {
                         refresh_forwarded_const_ref(&ia.forwarded, updated);
@@ -2611,11 +2498,6 @@ impl ExportedState {
                 ExportedGcRefField::PartialTraceOpInfoPtrInfoConstant(i) => {
                     if let Some(op) = self.partial_trace_operations.get(*i) {
                         refresh_forwarded_ptrinfo_constant(&op.forwarded, updated);
-                    }
-                }
-                ExportedGcRefField::PartialTraceOpInfoPtrInfoKnownClass(i) => {
-                    if let Some(op) = self.partial_trace_operations.get(*i) {
-                        refresh_forwarded_ptrinfo_known_class(&op.forwarded, updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceOpConstRef(i) => {
@@ -5636,7 +5518,7 @@ mod tests {
             ]),
             crate::optimizeopt::virtualstate::VirtualState::new(vec![
                 crate::optimizeopt::virtualstate::VirtualStateInfo::KnownClass {
-                    class_ptr: GcRef(0x1234),
+                    class_ptr: 0x1234,
                 },
             ]),
         ];
@@ -5699,7 +5581,7 @@ mod tests {
             used_boxes: vec![old_ref],
             jump_args: vec![old_ref],
             exported_state: Some(VirtualState::new(vec![VirtualStateInfo::KnownClass {
-                class_ptr: old,
+                class_ptr: old.as_usize() as i64,
             }])),
             constants,
             inputarg_infos: vec![Some(PtrInfo::Constant(old))],
@@ -6318,19 +6200,16 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
-        // legacy-const-ok: exercises the legacy idx-Const → inline-Const
-        // conversion at the import boundary. Producer-side `const_ptr(23)`
-        // is the legacy ConstantPool key; consumer-side reads the inline
-        // variant that carries the value directly (history.py:314).
-        ctx.seed_constant(OpRef::const_ptr(23), Value::Ref(ptr));
+        // history.py:314 — the producer emits the ConstPtr arg inline; the
+        // GCREF value rides on the OpRef itself, so the exported short op
+        // carries `ConstPtrInline(ptr)` directly (no ConstantPool).
+        let const_arg = OpRef::const_ptr_inline(ptr);
+        ctx.seed_constant(const_arg, Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::with_descr(
-                        OpCode::GetfieldGcPureI,
-                        &[OpRef::const_ptr(23)],
-                        field_descr.clone(),
-                    );
+                    let mut op =
+                        Op::with_descr(OpCode::GetfieldGcPureI, &[const_arg], field_descr.clone());
                     op.pos.set(OpRef::int_op(11));
                     op
                 },
@@ -6355,13 +6234,10 @@ mod tests {
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
         // history.py:314 ConstPtr.value inline: the imported constant
-        // lands at `OpRef::ConstPtrInline(ptr)` directly. The legacy
-        // producer-side `OpRef::const_ptr(23)` is the import source key,
-        // not a consumer-side slot; ctx2 was never seeded with idx 23 so
-        // `get_constant(legacy idx 23)` remains None.
+        // round-trips as `OpRef::ConstPtrInline(ptr)`, carrying the GCREF
+        // value directly with no ConstantPool slot.
         let fresh_const = OpRef::const_ptr_inline(ptr);
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
-        assert_eq!(ctx2.get_constant(OpRef::const_ptr(23)), None);
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(
@@ -6382,12 +6258,10 @@ mod tests {
     fn test_import_short_loopinvariant_uses_producer_const_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
-        // legacy-const-ok: exercises legacy idx-Const → inline-Const
-        // conversion at the import boundary. Producer-side `const_int(7)`
-        // is the legacy ConstantPool key; consumer reads the inline
-        // variant (history.py:227).
-        let func = OpRef::const_int(7);
+        // history.py:227 — the producer emits the CallLoopinvariant func
+        // address as an inline `ConstInt`; the value rides on the OpRef.
         let func_ptr = 0xCAFE;
+        let func = OpRef::const_int_inline(func_ptr);
         ctx.seed_constant(func, Value::Int(func_ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
@@ -6424,12 +6298,9 @@ mod tests {
                 .map(|(_, v)| *v),
             Some(OpRef::int_op(11))
         );
-        // The producer-side `func` was a legacy `OpRef::const_int(7)`;
-        // ctx2 was never seeded with idx 7, so it remains None.
-        assert_eq!(ctx2.get_constant(func), None);
-        // history.py:227 ConstInt.value inline — the imported func
-        // address lands at `OpRef::ConstIntInline(func_ptr)`, which
-        // carries the value directly.
+        // history.py:227 ConstInt.value inline — the inline func address
+        // arg `OpRef::ConstIntInline(func_ptr)` carries the value directly,
+        // so the consumer reads it without any ConstantPool slot.
         assert_eq!(
             ctx2.get_constant(OpRef::const_int_inline(func_ptr)),
             Some(Value::Int(func_ptr))
@@ -6438,12 +6309,11 @@ mod tests {
 
     #[test]
     fn test_import_short_loopinvariant_result_uses_short_inputarg_slot() {
-        // legacy-const-ok: exercises legacy idx-Const seeded into producer
-        // ctx (the import path reads the inline variant on the consumer
-        // side; this test asserts the source-side mapping survives the
-        // round-trip).
-        let func = OpRef::const_int(7);
+        // history.py:227 — the CallLoopinvariant func address is an inline
+        // `ConstInt` arg; the value rides on the OpRef and the import path
+        // keys `imported_loop_invariant_results` by that value.
         let func_ptr = 0xBEEF;
+        let func = OpRef::const_int_inline(func_ptr);
         let source = OpRef::int_op(11);
         let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
