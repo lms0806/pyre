@@ -2308,12 +2308,6 @@ mod tests {
     }
 }
 
-/// resume.py:1124-1132: allocate_raw_buffer uses
-/// callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) to get the calldescr.
-pub fn make_raw_malloc_calldescr() -> DescrRef {
-    majit_ir::make_raw_malloc_calldescr()
-}
-
 /// CallDescr for `pyre_object::longobject::jit_w_long_fits_int(obj) -> i64`.
 /// `rbigint.fits_int()` is not annotated `@jit.elidable` upstream; it is only
 /// used as a cannot-raise runtime guard before the elidable `toint()` call.
@@ -3114,25 +3108,53 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // BhDescrs are always `BhDescr::Array` / `BhDescr::Field`
             // (`BhDescr::from_interior_field_descr`); a short stream is an
             // encoder bug surfaced here rather than silently mis-typed.
-            let (base_size, itemsize, type_id, item_type) = match array.as_ref() {
-                BhDescr::Array {
+            let (base_size, itemsize, len_offset, type_id, item_type, interior_fields) =
+                match array.as_ref() {
+                    BhDescr::Array {
+                        base_size,
+                        itemsize,
+                        len_offset,
+                        type_id,
+                        item_type,
+                        interior_fields,
+                        ..
+                    } => (
+                        *base_size,
+                        *itemsize,
+                        *len_offset,
+                        *type_id,
+                        *item_type,
+                        interior_fields,
+                    ),
+                    other => panic!(
+                        "BhDescr::InteriorField array slot must be BhDescr::Array, got {other:?}"
+                    ),
+                };
+            // `descr.py:389` asserts `arraydescr.flag == FLAG_STRUCT`, so a
+            // round-tripped array-of-structs descr must carry FLAG_STRUCT and
+            // `descr.py:372-375` `all_interiorfielddescrs`.  Route struct
+            // arrays through the full factory (cache_key=0, local mint, no
+            // aliasing) so the rebuilt descr re-attaches the interior list the
+            // producer (`from_interior_field_descr`) serialized; a plain
+            // element array keeps the bare mint (descr.py only attaches the
+            // list when `ARRAY.OF` is a Struct).
+            let array_descr: Arc<dyn majit_ir::descr::ArrayDescr> = if array.is_array_of_structs() {
+                let dyn_descr = make_struct_array_descr_full_keyed(
+                    u32::MAX,
                     base_size,
                     itemsize,
-                    type_id,
+                    len_offset,
+                    type_id as u32,
+                    0,
                     item_type,
-                    ..
-                } => (*base_size, *itemsize, *type_id, *item_type),
-                other => panic!(
-                    "BhDescr::InteriorField array slot must be BhDescr::Array, got {other:?}"
-                ),
-            };
-            // `descr.py:389` asserts `arraydescr.flag == FLAG_STRUCT`, so a
-            // round-tripped array-of-structs descr must carry FLAG_STRUCT
-            // (`from_item_type(item_type, is_struct=true)`); a plain element
-            // array keeps the item-type flag.
-            let array_flag =
-                majit_ir::descr::ArrayFlag::from_item_type(item_type, array.is_array_of_structs());
-            let array_descr: Arc<dyn majit_ir::descr::ArrayDescr> =
+                    interior_fields,
+                );
+                majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleArrayDescr>(dyn_descr)
+                    .expect(
+                        "make_struct_array_descr_full_keyed(cache_key=0) mints SimpleArrayDescr",
+                    )
+            } else {
+                let array_flag = majit_ir::descr::ArrayFlag::from_item_type(item_type, false);
                 Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
                     u32::MAX,
                     base_size,
@@ -3140,7 +3162,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     type_id as u32,
                     item_type,
                     array_flag,
-                ));
+                ))
+            };
             let (offset, field_size, field_type, field_flag, index_in_parent, name) =
                 match field.as_ref() {
                     BhDescr::Field {
@@ -3178,8 +3201,15 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 )
                 .with_index_in_parent(index_in_parent),
             );
+            // The first arg is the per-trace analyzer descr-slot (`Descr::index()`),
+            // defaulted here to the `u32::MAX` "no setup_descrs index assigned"
+            // sentinel — matching the canonical `get_interiorfield_descr` mint
+            // (descr.rs:814) and the array-of-structs restore sibling
+            // (descr.rs:2734). It is NOT `get_index()`: descr.py:393
+            // `InteriorFieldDescr.get_index()` delegates to `fielddescr.get_index()`
+            // (= `index_in_parent`), already round-tripped on `field_descr` above.
             Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
-                0,
+                u32::MAX,
                 array_descr,
                 field_descr,
             ))

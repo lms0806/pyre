@@ -2866,7 +2866,7 @@ fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcod
     }
 }
 
-fn bh_interior_field_specs_from_array_descr(
+pub(crate) fn bh_interior_field_specs_from_array_descr(
     array_descr: &dyn majit_ir::descr::ArrayDescr,
 ) -> Vec<crate::jitcode::BhInteriorFieldSpec> {
     array_descr

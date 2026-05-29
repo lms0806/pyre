@@ -1381,9 +1381,8 @@ impl ConcreteValue {
 use pyre_interpreter::DictStorage;
 
 use crate::descr::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
-    float_floatval_descr, int_intval_descr, make_array_descr_with_type, w_float_size_descr,
-    w_int_size_descr,
+    PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr_with_type,
+    w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -1819,42 +1818,6 @@ pub(crate) fn float_array_descr() -> DescrRef {
         false,
         Some("pyre::float_array_nolength".to_string()),
     )
-}
-
-/// Descriptor for `Ptr(GcArray(Signed))` materialized from resume data:
-/// `[len][items...]` with the block pointer addressing the length word.
-fn gc_int_array_descr() -> DescrRef {
-    make_array_descr_with_type(
-        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
-        8,
-        GC_INT_ARRAY_GC_TYPE_ID,
-        Some(0),
-        Type::Int,
-        true,
-    )
-}
-
-/// Descriptor for `Ptr(GcArray(Float))` materialized from resume data:
-/// `[len][items...]` with the block pointer addressing the length word.
-fn gc_float_array_descr() -> DescrRef {
-    make_array_descr_with_type(
-        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
-        8,
-        GC_FLOAT_ARRAY_GC_TYPE_ID,
-        Some(0),
-        Type::Float,
-        false,
-    )
-}
-
-/// resume.py:656 arraydescr kind dispatch for virtual array materialization.
-/// kind: 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
-pub(crate) fn array_descr_for_kind(kind: u8, _descr_index: u32) -> DescrRef {
-    match kind {
-        0 => pyobject_gcarray_descr(),
-        2 => gc_float_array_descr(),
-        _ => gc_int_array_descr(),
-    }
 }
 
 /// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.
@@ -4773,8 +4736,13 @@ fn materialize_concrete_virtual_ptr(
             let gcref = majit_ir::GcRef(ptr as usize);
             // resume.py:620 cache BEFORE filling fields (circular ref safe)
             cache.set_concrete_ptr(vidx, gcref);
-            // resume.py:597-603 setfields
-            for (fd, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+            // resume.py:597-603 setfields — range(len(fielddescrs)), index
+            // fieldnums[i]. The len-equality assert (resume.py:606) is in
+            // debug_prints, not this allocate path: a short fieldnums raises
+            // IndexError here, a longer one is ignored.
+            for i in 0..fielddescrs.len() {
+                let fd = &fielddescrs[i];
+                let fnum = fieldnums[i];
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
@@ -4810,8 +4778,13 @@ fn materialize_concrete_virtual_ptr(
             }
             let gcref = majit_ir::GcRef(ptr as usize);
             cache.set_concrete_ptr(vidx, gcref);
-            // resume.py:637 setfields
-            for (fd, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+            // resume.py:637 setfields — range(len(fielddescrs)), index
+            // fieldnums[i]. The len-equality assert (resume.py:606) is in
+            // debug_prints, not this allocate path: a short fieldnums raises
+            // IndexError here, a longer one is ignored.
+            for i in 0..fielddescrs.len() {
+                let fd = &fielddescrs[i];
+                let fnum = fieldnums[i];
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
@@ -5124,7 +5097,14 @@ fn materialize_concrete_virtual_ptr(
                 "materialize_concrete_virtual_ptr: raw virtual at vidx={vidx} is INT-kind, not PTR"
             )
         }
-        majit_ir::RdVirtualInfo::Empty => majit_ir::GcRef::NULL,
+        // resume.py:954 getvirtual_ptr calls rd_virtuals[index].allocate()
+        // directly; a None/Empty slot is never referenced by a TAGVIRTUAL tag
+        // in a well-formed resume stream, so reaching it is a corrupt-stream
+        // bug, not a NULL fallback (mirrors materialize_concrete_virtual_int
+        // and eval.rs materialize_virtual, which already panic on Empty).
+        majit_ir::RdVirtualInfo::Empty => panic!(
+            "materialize_concrete_virtual_ptr: null rd_virtuals[{vidx}] (resume.py: null rd_virtuals[index])"
+        ),
     }
 }
 
@@ -5178,10 +5158,16 @@ fn materialize_concrete_virtual_int(
             );
             let buffer = backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &calldescr);
             cache.set_concrete_int(vidx, buffer);
+            // resume.py:705-708 iterate by len(self.offsets), indexing
+            // self.descrs[i] and self.fieldnums[i] by the same i — a short
+            // descrs/fieldnums raises IndexError here (encoder bug), a longer
+            // one is ignored. No len-equality assert (VRawBufferInfo has none).
             if buffer == 0 {
                 return 0;
             }
-            for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
+            for i in 0..offsets.len() {
+                let off = offsets[i];
+                let fnum = fieldnums[i];
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
@@ -5388,7 +5374,13 @@ fn materialize_bridge_virtual(
         resume_data: &majit_metainterp::ResumeDataResult,
         cache: &mut BridgeVirtualCache,
     ) {
-        for (fd_info, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+        // resume.py:597-603 setfields — range(len(fielddescrs)), index
+        // fieldnums[i]. The len-equality assert (resume.py:606) is in
+        // debug_prints, not this allocate path: a short fieldnums raises
+        // IndexError here, a longer one is ignored.
+        for i in 0..fielddescrs.len() {
+            let fd_info = &fielddescrs[i];
+            let fnum = fieldnums[i];
             if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                 continue;
             }
@@ -5508,7 +5500,6 @@ fn materialize_bridge_virtual(
                 majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
             );
             let kind = *kind;
-            let descr_index = arraydescr.as_ref().map_or(0, |d| d.index());
             let length = fieldnums.len();
             let len_ref = ctx.const_int(length as i64);
             // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
@@ -5517,14 +5508,9 @@ fn materialize_bridge_virtual(
             } else {
                 OpCode::NewArray
             };
-            // resume.py:648-651 self.arraydescr parity: use the stored
-            // descriptor when capture_resumedata recorded it. Fall back
-            // to the kind+descr_index synthesis only when upstream
-            // VArrayInfo never stored one — keeps the dispatch but
-            // preserves identity when the producer had it.
-            let array_descr = arraydescr
-                .clone()
-                .unwrap_or_else(|| array_descr_for_kind(kind, descr_index));
+            // resume.py:645 AbstractVArrayInfo.__init__ asserts arraydescr is
+            // not None; resume.py:652 allocate reads self.arraydescr directly.
+            let array_descr = arraydescr.clone().expect("VArrayInfo: arraydescr is None");
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
@@ -5645,12 +5631,34 @@ fn materialize_bridge_virtual(
             //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
-            let calldescr = crate::descr::make_raw_malloc_calldescr();
-            let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
+            // resume.py:1124-1126: calldescr comes from the shared
+            // callinfocollection, not a freshly minted synthetic descr. The
+            // func is NOT taken from callinfo_for_oopspec (resume.py:1127-1130:
+            // several malloc variants share the oopspec), so only the calldescr
+            // is read from the CIC and *func from the VRawBufferInfo is kept.
+            let cic = ctx
+                .callinfocollection
+                .as_ref()
+                .expect(
+                    "TraceCtx.callinfocollection missing — bridge-virtual \
+                     VRawBufferInfo materialization requires pyjitpl to populate \
+                     it (resume.py:1124-1126)",
+                )
+                .clone();
+            let (calldescr, _) = cic
+                .callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar)
+                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) not registered");
+            let buffer =
+                ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr.clone());
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
-            // resume.py:705-708: setrawbuffer_item for each offset/descr
-            for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
+            // resume.py:705-708 iterate by len(self.offsets), indexing
+            // self.descrs[i] and self.fieldnums[i] by the same i — a short
+            // descrs/fieldnums raises IndexError here (encoder bug), a longer
+            // one is ignored. No len-equality assert (VRawBufferInfo has none).
+            for i in 0..offsets.len() {
+                let off = offsets[i];
+                let fnum = fieldnums[i];
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
@@ -5867,7 +5875,15 @@ fn materialize_bridge_virtual(
             }
             string
         }
-        majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
+        // resume.py:951/954 getvirtual_ptr direct-indexes rd_virtuals[index];
+        // the function preamble already documents this as fail-loud ("not a
+        // silent NONE fallback"). An Empty hole here means the resume stream
+        // tagged a virtual index that was never assigned a real virtual
+        // (encoder/decoder asymmetry) — surface it rather than poison the
+        // operand chain with OpRef::NONE.
+        majit_ir::RdVirtualInfo::Empty => panic!(
+            "materialize_bridge_virtual: null rd_virtuals[{vidx}] (resume.py: null rd_virtuals[index])"
+        ),
     }
 }
 
@@ -6522,13 +6538,15 @@ impl JitState for PyreJitState {
             let vref_ptr = value_to_usize(&vref_val);
             sym.virtualref_boxes.push((virt_opref, virt_ptr));
             sym.virtualref_boxes.push((vref_opref, vref_ptr));
-            // resume.py:1397 continue_tracing is unconditional per RPython;
-            // guarded here because some ptr virtuals may still return NULL
-            // when the backend lacks the allocator (bh_newstr etc).
-            if virt_ptr != 0 {
-                unsafe {
-                    vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
-                }
+            // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called
+            // unconditionally for every (vref, real_object) pair. The
+            // is_virtual_ref(vref) guard (virtualref.py:123) and the
+            // `assert real_object` invariant (virtualref.py:125, ported as
+            // debug_assert!) both live inside continue_tracing itself
+            // (virtualref.rs:419/424) — the outer virt_ptr guard masked
+            // exactly the case RPython asserts on, so do not pre-gate here.
+            unsafe {
+                vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
             }
         }
 

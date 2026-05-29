@@ -1397,8 +1397,23 @@ impl BhDescr {
     /// composing its `arraydescr` and `fielddescr` summaries.
     /// `descr.py:388 InteriorFieldDescr(arraydescr, fielddescr)`.
     pub fn from_interior_field_descr(ifd: &dyn majit_ir::descr::InteriorFieldDescr) -> Self {
+        // `descr.py:372-375 get_array_descr` attaches `all_interiorfielddescrs`
+        // to the struct-array descr the `InteriorFieldDescr` is built from
+        // (`descr.py:430 get_interiorfield_descr` reuses that same cached
+        // arraydescr).  `from_array_descr` leaves the list empty for the other
+        // resume callers; carry it across the BhDescr boundary here so the
+        // restore path can re-attach it (`make_descr_from_bh` →
+        // `make_struct_array_descr_full_keyed`).
+        let mut array = BhDescr::from_array_descr(ifd.array_descr());
+        if let BhDescr::Array {
+            interior_fields, ..
+        } = &mut array
+        {
+            *interior_fields =
+                super::assembler::bh_interior_field_specs_from_array_descr(ifd.array_descr());
+        }
         BhDescr::InteriorField {
-            array: Box::new(BhDescr::from_array_descr(ifd.array_descr())),
+            array: Box::new(array),
             field: Box::new(BhDescr::from_field_descr(ifd.field_descr())),
         }
     }
