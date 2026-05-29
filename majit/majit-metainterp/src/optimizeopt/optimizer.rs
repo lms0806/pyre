@@ -3779,6 +3779,7 @@ impl Optimizer {
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
         let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
+
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
         // guards even when the guard is emitted by an earlier pass.
@@ -3799,6 +3800,7 @@ impl Optimizer {
         for i in 0..op.num_args() {
             op.setarg(i, self.force_box(op.arg(i), ctx));
         }
+
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
         // Pyre defers the fold into JitStatsCounters via update_counters
         // (see field doc for the rationale).
