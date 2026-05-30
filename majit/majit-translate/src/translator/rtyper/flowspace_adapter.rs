@@ -581,6 +581,45 @@ fn fmt_op_result_slot(graph: &crate::model::FunctionGraph, op: &SpaceOperation) 
     }
 }
 
+/// `true` for exactly the `OpKind`s that [`translate_op`] maps to
+/// `Ok(Vec::new())` — ops fully consumed by other adapter infrastructure
+/// (pre-pass constants, JIT-trace markers) plus the pre-folded 0-arg
+/// synthetic unit-variant ctor.  None of these survive into the converted
+/// flowspace block as a raising operation.
+///
+/// The `Expr::Try` guard in `front/ast.rs` consults this to decide whether
+/// a `?`-operand recorded a real raising flowspace op: a surviving
+/// (non-skipped) tail op is a raising op the `?` closes the block against;
+/// a skipped tail op (e.g. a cross-block `OpKind::Input`) is not, so the
+/// block must NOT be closed as canraise.  KEEP IN SYNC with `translate_op`'s
+/// `Ok(Vec::new())` arms below.
+pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
+    if let OpKind::Call {
+        target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
+        args,
+        ..
+    } = kind
+        && args.is_empty()
+    {
+        let mut segments = owner_path.clone();
+        segments.push(name.clone());
+        if crate::front::ast::is_synthetic_unit_variant_path(&segments) {
+            return true;
+        }
+    }
+    matches!(
+        kind,
+        OpKind::Input { .. }
+            | OpKind::ConstInt(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::GuardTrue { .. }
+            | OpKind::GuardFalse { .. }
+            | OpKind::GuardValue { .. }
+            | OpKind::VableForce { .. }
+    )
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<usize, Hlvalue>,
@@ -1001,6 +1040,20 @@ pub fn translate_op(
                         // Branch 3b — fully-qualified inline path,
                         // TODO as documented above.
                         attr
+                    } else if segments.len() == 2
+                        && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
+                    {
+                        // Branch 4 — associated-function call
+                        // `Type::method(self, ...)` whose impl method is
+                        // registered under a module-qualified key
+                        // `[...module..., Type, method]`.  The exact
+                        // lookup at layer 1 missed because the call site
+                        // spells only `[Type, method]`; recover the
+                        // canonical entry by its `[Type, method]` tail,
+                        // mirroring the bound method-call suffix match
+                        // (`call.rs:3155 target_to_path`).  Upstream
+                        // resolves both spellings to one `FunctionDesc`.
+                        entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
                             "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \

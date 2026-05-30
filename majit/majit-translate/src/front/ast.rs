@@ -2529,6 +2529,23 @@ fn allocate_loop_header_phis(
             .expect("OpKind::Input always produces a result");
         graph.name_value_var(&phi_var, name.clone());
         graph.push_inputarg_var(header_entry, phi_var.clone());
+        // The pre-loop snapshot's binding for `name` may live in a
+        // block that dominates `pre_loop_block` but is not
+        // `pre_loop_block` itself — e.g. an outer loop header phi for a
+        // variable the inner loop merges but the intervening body block
+        // never reads directly.  Pushing that out-of-scope var onto the
+        // pre-loop→header link references a slot undefined at the link
+        // source.  Re-thread it through the lazy installer so the link
+        // arg is a `pre_loop_block`-defined slot.  RPython parity:
+        // `flowspace`'s fixed-size `locals_w` carries every live slot
+        // through each block, so the pre-loop link arg is always a slot
+        // live at `pre_loop_block` (`framestate.py:92 getoutputargs`).
+        let entry_var = if graph.variable_defined_in_block(pre_loop_block, &entry_var) {
+            entry_var
+        } else {
+            lazy_install_local_at_current_block_var(graph, ctx, pre_loop_block, &name, None)
+                .unwrap_or(entry_var)
+        };
         let entry_arg = LinkArg::Value(entry_var);
         graph.block_mut(pre_loop_block).exits[0]
             .args
@@ -2580,23 +2597,42 @@ fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
 /// name into ctx, so a missing entry indicates a broken invariant
 /// upstream of this call.
 fn link_arg_vars_from_ctx(
-    graph: &FunctionGraph,
-    ctx: &GraphBuildContext<'_>,
+    graph: &mut FunctionGraph,
+    ctx: &mut GraphBuildContext<'_>,
+    closing_block: BlockId,
     header_phi_names: &[String],
 ) -> Vec<crate::flowspace::model::Variable> {
-    header_phi_names
-        .iter()
-        .map(|name| {
-            let (var, _def_block) = ctx.local_var_of(name, graph).unwrap_or_else(|| {
-                panic!(
-                    "header phi name {:?} must have a current ctx binding at the closing \
-                     predecessor",
-                    name
-                )
-            });
+    let mut out = Vec::with_capacity(header_phi_names.len());
+    for name in header_phi_names {
+        let (var, _def_block) = ctx.local_var_of(name, graph).unwrap_or_else(|| {
+            panic!(
+                "header phi name {:?} must have a current ctx binding at the closing \
+                 predecessor",
+                name
+            )
+        });
+        // Strict superset of the prior raw-`ctx` lookup: a name whose
+        // current binding is already defined in `closing_block`
+        // (rebound or read in the loop body) threads its own var
+        // unchanged.  A loop-invariant read-only name that the body's
+        // forward threading dropped — its `ctx` binding points at a
+        // dominating defining block outside `closing_block`'s scope —
+        // is re-threaded through the lazy installer so the back-edge /
+        // `continue` link references a `closing_block`-defined slot
+        // rather than an out-of-scope definition.  RPython parity:
+        // `flowspace`'s fixed-size `locals_w` frame carries every live
+        // slot through each block, so `framestate.py:92 getoutputargs`
+        // projects the loop-header phi from a slot live at the closing
+        // predecessor, never an out-of-scope definition.
+        let resolved = if graph.variable_defined_in_block(closing_block, &var) {
             var
-        })
-        .collect()
+        } else {
+            lazy_install_local_at_current_block_var(graph, ctx, closing_block, name, None)
+                .unwrap_or(var)
+        };
+        out.push(resolved);
+    }
+    out
 }
 
 impl<'a> GraphBuildContext<'a> {
@@ -3818,6 +3854,27 @@ fn lazy_install_local_at_current_block_var(
         graph.block_mut(pred_block).exits[exit_idx].args.push(arg);
     }
 
+    // Re-establish `ctx`'s binding for `name` to *this* block's freshly
+    // installed inputarg.  The predecessor-threading loop above recurses
+    // into `lazy_install_local_at_current_block_var(pred_block, ..)` when
+    // a predecessor inherited `name` from a dominator, and each recursive
+    // frame rebinds `ctx.local_value_ids[name]` to *its* block's inputarg
+    // (the bind before the loop).  Because `ctx` is a single shared frame
+    // those inner rebinds leak past their own scope, so without this
+    // restore a caller that reads `name` right after the install resolves
+    // to the deepest predecessor's Variable instead of `current_block`'s
+    // — the read then threads an out-of-`current_block`-scope slot onto a
+    // later branch's `Link.args` and trips the adapter's
+    // "undefined operand slot" invariant.  RPython has no such leak:
+    // `flowspace/flowcontext.py:407 setstate(block.framestate)`
+    // re-establishes `frame.locals_w` for whichever block is being
+    // recorded, so a read of `name` while recording `current_block`
+    // always yields that block's slot Variable.  Re-asserting the bind
+    // here is pyre's static-AST analogue of that per-block setstate.
+    ctx.bind_local_id_var(name.to_string(), &new_var, graph, current_block);
+    ctx.local_value_types
+        .insert(name.to_string(), value_type.clone());
+
     Some(new_var)
 }
 
@@ -5028,6 +5085,29 @@ fn lower_if_expr(
         else_exit_ctx.restore(ctx);
     }
 
+    // Stamp the merge block's entry framestate for the lean merge
+    // paths.  `want_phi` / `migrate` build the merge via
+    // `create_block_with_arg_vars` / `create_block_from_framestate`
+    // and already carry a usable per-slot view; the lean paths use a
+    // bare `create_block()` (0 inputargs) and would otherwise leave
+    // the merge with no recorded snapshot until it later closes via
+    // its own branch.  A back-edge or post-merge cross-block read
+    // that recurses through this merge before it closes then hits the
+    // "no recorded snapshot" bail in
+    // `lazy_install_local_at_current_block_var` (predecessor
+    // `framestate.as_ref()?`) and falls back to a body-`Input`
+    // (rejected as "adapter cross-block body Input") or threads an
+    // out-of-scope slot.  At this point `ctx` already reflects the
+    // surviving arm's bindings (closed-arm restore) or the merged
+    // bindings (both-open None-kill + phi install), so its snapshot
+    // is the merge's entry state.  RPython parity:
+    // `flowspace/flowcontext.py:407-408 record_block(block)` calls
+    // `setstate(block.framestate)` at every block entry.
+    if !want_phi && !migrate && graph.block(merge_block).framestate.is_none() {
+        let merge_entry_snapshot = ctx.getstate(graph, 0);
+        graph.block_mut(merge_block).framestate = Some(merge_entry_snapshot);
+    }
+
     *block = merge_block;
     // If NEITHER arm remains open, the merge block is
     // unreachable — mark the enclosing path as closed so the
@@ -5385,6 +5465,49 @@ fn lower_expr(
                 args_vars.push(ctx.popvid_var(graph));
             }
             args_vars.reverse();
+            // `<prim>::from(x)` is the function-call spelling of a
+            // numeric widening.  RPython has no `from`; it spells the
+            // same conversion as the `int(v)` / `r_uint(v)` builtin
+            // calls (rbuiltin.py:178), so route the single-arg primitive
+            // `from` through the same coercion chain as `x as T`
+            // (`Expr::Cast`) instead of emitting an unregistered
+            // `FunctionPath` call that misses `PyreCallRegistry`.
+            if let syn::Expr::Path(p) = &*call.func
+                && args_vars.len() == 1
+                && let Some(target_ty) = numeric_from_target_type(&p.path)
+            {
+                let operand_var = args_vars.into_iter().next().expect("args_vars.len() == 1");
+                let source_ty = graph_value_type_var(graph, &operand_var);
+                let var = lower_value_cast(graph, *block, operand_var, source_ty, target_ty);
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
+            // `std::ptr::eq(a, b)` is pointer identity — the same
+            // comparison pyre's `BinOp { op: "eq" }` on two Ref operands
+            // produces, which jtransform rewrites to `ptr_eq`
+            // (jtransform.rs:849 / jtransform.py:1243 rewrite_op_ptr_eq).
+            // Emit that BinOp instead of an unregistered FunctionPath
+            // call that misses `PyreCallRegistry`.
+            if let syn::Expr::Path(p) = &*call.func
+                && args_vars.len() == 2
+                && is_ptr_eq_path(&p.path)
+            {
+                let mut it = args_vars.into_iter();
+                let lhs = it.next().expect("args_vars.len() == 2");
+                let rhs = it.next().expect("args_vars.len() == 2");
+                let var = graph
+                    .push_op_var(
+                        *block,
+                        OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs,
+                            rhs,
+                            result_ty: ValueType::Bool,
+                        },
+                        true,
+                    )
+                    .expect("OpKind::BinOp has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
             let target = canonical_call_target(&call.func, ctx);
             // RPython parity: same rationale as the MethodCall arm above
             // — `op.result.concretetype` is set from the registered
@@ -5991,9 +6114,30 @@ fn lower_expr(
                 let pre_fork_locals = ctx.local_value_ids.clone();
                 let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
                 merged_names.sort();
+                // Each pre-fork local must be defined in `*block` before
+                // it can ride the fork's `Link.args`.  Pyre threads
+                // locals lazily (on cross-block read), so a local bound
+                // in a dominator but never read in `*block` still points
+                // at the dominator's Variable; threading that
+                // out-of-scope slot onto an arm link trips the adapter's
+                // "undefined operand slot" invariant.  Lazy-install the
+                // slot at `*block` (walking the predecessor chain to
+                // install inputargs and append each edge's `Link.args`)
+                // so the carried Variable is `*block`-local.  RPython
+                // needs no analogue: `flowcontext.py:835 LOAD_FAST` /
+                // `getoutputargs` thread every `frame.locals_w` slot at
+                // every edge eagerly.
                 let pre_fork_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
                     .iter()
-                    .map(|name| pre_fork_locals[name].0.clone())
+                    .map(|name| {
+                        let var = pre_fork_locals[name].0.clone();
+                        if graph.variable_defined_in_block(*block, &var) {
+                            var
+                        } else {
+                            lazy_install_local_at_current_block_var(graph, ctx, *block, name, None)
+                                .unwrap_or(var)
+                        }
+                    })
                     .collect();
 
                 let (join_block, join_arg_vars) =
@@ -6126,9 +6270,30 @@ fn lower_expr(
                 let pre_fork_locals = ctx.local_value_ids.clone();
                 let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
                 merged_names.sort();
+                // Each pre-fork local must be defined in `*block` before
+                // it can ride the fork's `Link.args`.  Pyre threads
+                // locals lazily (on cross-block read), so a local bound
+                // in a dominator but never read in `*block` still points
+                // at the dominator's Variable; threading that
+                // out-of-scope slot onto an arm link trips the adapter's
+                // "undefined operand slot" invariant.  Lazy-install the
+                // slot at `*block` (walking the predecessor chain to
+                // install inputargs and append each edge's `Link.args`)
+                // so the carried Variable is `*block`-local.  RPython
+                // needs no analogue: `flowcontext.py:835 LOAD_FAST` /
+                // `getoutputargs` thread every `frame.locals_w` slot at
+                // every edge eagerly.
                 let pre_fork_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
                     .iter()
-                    .map(|name| pre_fork_locals[name].0.clone())
+                    .map(|name| {
+                        let var = pre_fork_locals[name].0.clone();
+                        if graph.variable_defined_in_block(*block, &var) {
+                            var
+                        } else {
+                            lazy_install_local_at_current_block_var(graph, ctx, *block, name, None)
+                                .unwrap_or(var)
+                        }
+                    })
                     .collect();
 
                 let (mut rhs_block, rhs_local_arg_vars) =
@@ -6355,65 +6520,12 @@ fn lower_expr(
                     .expect("OpKind::Call has has_result=true");
                 return Ok(Lowered::from_value_var(graph, &var));
             }
-            // RPython has no `expr as T` syntax — numeric conversions go
-            // through `int(v)` / `float(v)` / `bool(v)` builtin calls
-            // (`rbuiltin.py:178-189 rtype_builtin_int/float/bool`), and
-            // the rtyper's `Repr.rtype_int/float/bool` per-Repr methods
-            // (rint.py:137-147, rfloat.py:48-58, rbool.py:55-70) emit
-            // the low-level `cast_*_to_*` / `*_is_true` op as a side
-            // effect of `inputargs(target_lltype)` coercion through
-            // `pair_X_Y_convert_from_to`.  Pyre routes Rust's `as T`
-            // through the same canonical chain — `Call { target:
-            // FunctionPath { segments: vec!["int"/"float"/"bool"] } }`
-            // resolves through `flowspace_adapter`'s HOST_ENV fallback
-            // to the `__builtin__` class HostObject, annotates as
-            // `SomeBuiltin(analyser_name="int")`, then rtypes through
-            // `BuiltinFunctionRepr.rtype_simple_call →
-            // BUILTIN_TYPER[...]`.
-            if let Some(segments) = cast_builtin_name(source_ty.as_ref(), &result_ty) {
-                let var = graph
-                    .push_op_var(
-                        *block,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: segments.iter().map(|s| s.to_string()).collect(),
-                            },
-                            args: vec![operand_var],
-                            result_ty,
-                        },
-                        true,
-                    )
-                    .expect("OpKind::Call has has_result=true");
-                return Ok(Lowered::from_value_var(graph, &var));
-            }
-            // Identity / source-type-unknown casts: emit
-            // `OpKind::UnaryOp { op: "same_as", result_ty, .. }` so
-            // the target `ValueType` propagates through the graph
-            // (graph_value_type reads producer op's result_ty).
-            // RPython has no `expr as T` syntax, so identity coercion
-            // is implicit at use sites via the rtyper's
-            // `inputargs(target_lltype)` → `convertvar` →
-            // `pair(SrcRepr, TgtRepr).convert_from_to` chain — but
-            // pyre's surface DSL has `as T` which carries a target
-            // type the downstream pipeline needs to see.  The
-            // low-level `same_as` (rtyper.py:478-481) is the canonical
-            // RPython op for type-preserving copy; the rtyper's
-            // `"same_as"` arm dispatches to `rbuiltin::rtype_same_as`
-            // which emits the matching LL op while preserving the
-            // operand's lltype.  Backendopt's `removenoops::\
-            // remove_same_as` collapses identity copies post-rtyper
-            // when safe (removenoops.py:47-48).
-            let var = graph
-                .push_op_var(
-                    *block,
-                    OpKind::UnaryOp {
-                        op: "same_as".to_string(),
-                        operand: operand_var,
-                        result_ty,
-                    },
-                    true,
-                )
-                .expect("OpKind::UnaryOp has has_result=true");
+            // The canonical `int()` / `float()` / `bool()` / `cast_*`
+            // coercion chain — and the identity `same_as` fallback
+            // (rtyper.py:478-481) for source-type-unknown / identity
+            // casts — is shared with the `<prim>::from(x)` function-call
+            // spelling; see `lower_value_cast`.
+            let var = lower_value_cast(graph, *block, operand_var, source_ty, result_ty);
             Ok(Lowered::from_value_var(graph, &var))
         }
 
@@ -6940,9 +7052,13 @@ fn lower_expr(
                 // `flowspace/framestate.py:92 getoutputargs` produces
                 // the same slot-by-slot mapping for the closing
                 // predecessor link.
-                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
-                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
+                // Resolve each phi name to a `body_tail`-defined var,
+                // threading any dropped loop-invariant before the
+                // snapshot so it reflects the threaded bindings.
+                let back_edge_vars =
+                    link_arg_vars_from_ctx(graph, ctx, body_tail, &header_phi_names);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 graph.set_goto(body_tail, header_entry, back_edge_vars);
                 // Audit Cat 2-1: stamp the body-tail's framestate
                 // so the post-loop lazy installer can thread reads
@@ -7013,9 +7129,10 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, body_entry);
-                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
+                let back_edge_vars =
+                    link_arg_vars_from_ctx(graph, ctx, body_tail, &header_phi_names);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 graph.set_goto(body_tail, body_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
@@ -7129,9 +7246,10 @@ fn lower_expr(
                 // Audit Cat 2-1: stamp body-tail's framestate (see
                 // the matching `Expr::While` body-tail stamp for the
                 // cycle-safety rationale).
-                let body_tail_snapshot = ctx.getstate(graph, 0);
                 let header_phi_names = header_phi_name_list(graph, header_entry);
-                let back_edge_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
+                let back_edge_vars =
+                    link_arg_vars_from_ctx(graph, ctx, body_tail, &header_phi_names);
+                let body_tail_snapshot = ctx.getstate(graph, 0);
                 graph.set_goto(body_tail, header_entry, back_edge_vars);
                 graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
@@ -7241,9 +7359,9 @@ fn lower_expr(
                     // the recursive install at the header short-
                     // circuits via the same-block graph-state
                     // idempotency check on `block.inputargs`.
-                    let pre_continue_snapshot = ctx.getstate(graph, 0);
                     let header_phi_names = header_phi_name_list(graph, frame.continue_target);
-                    let arg_vars = link_arg_vars_from_ctx(graph, ctx, &header_phi_names);
+                    let arg_vars = link_arg_vars_from_ctx(graph, ctx, *block, &header_phi_names);
+                    let pre_continue_snapshot = ctx.getstate(graph, 0);
                     graph.set_goto(*block, frame.continue_target, arg_vars);
                     graph.block_mut(*block).framestate = Some(pre_continue_snapshot);
                 }
@@ -7340,40 +7458,177 @@ fn lower_expr(
                 .as_deref()
                 .and_then(transparent_result_ok_type)
                 .map(type_string_to_value_type);
+            // RPython `flowspace/flowcontext.py:379-393 do_op`:
+            // `guessexception` (which installs
+            // `block.exitswitch = c_last_exception`) runs only AFTER an
+            // operation is recorded, and only when `op.canraise` is
+            // non-empty.  A bare-local read (`kwargs?`) records no
+            // operation, so the block must NOT be closed as canraise.
+            // Snapshot the operations cursor before lowering the operand,
+            // then classify by the kind of op the operand actually
+            // appended: a surviving (non-adapter-skipped) tail op is a
+            // real raising flowspace op (Call / getattr / getitem) that
+            // `?` closes the block against; a bare value records nothing
+            // or only a cross-block `OpKind::Input` that the adapter skips
+            // (`flowspace_adapter::translate_op_is_skipped`), neither of
+            // which can raise.
+            let block_before = *block;
+            let len_before = graph.block(*block).operations.len();
             let inner_pre_var =
                 get_value_var!(lower_expr(graph, block, &t.expr, options, ctx)?, graph);
+            let recorded_raising_op = {
+                let ops = &graph.block(*block).operations;
+                let last_is_raising = ops
+                    .last()
+                    .map(|op| {
+                        !crate::translator::rtyper::flowspace_adapter::translate_op_is_skipped(
+                            &op.kind,
+                        )
+                    })
+                    .unwrap_or(false);
+                if *block == block_before {
+                    // Operand stayed in this block: it raises iff it
+                    // appended a surviving op as the new tail.
+                    ops.len() > len_before && last_is_raising
+                } else {
+                    // Operand moved the cursor (nested `?`, if-expr
+                    // operand): its final op landed in the new `*block`;
+                    // that op is what `?` raises against.
+                    last_is_raising
+                }
+            };
             ctx.pushvid_var(&inner_pre_var);
             let inner_var = ctx.popvid_var(graph);
             if let Some(ok_ty) = ok_ty {
                 retag_result_value_type(graph, &inner_var, ok_ty);
             }
-            let continuation = graph.create_block();
-            let continuation_arg = graph.alloc_value_var();
-            graph.push_inputarg_var(continuation, continuation_arg.clone());
-            // RPython `flowcontext.py:130-133` — fresh prevblock-side
-            // `Variable('last_exception')` + `Variable('last_exc_value')`.
-            let last_exception_var = graph.alloc_value_var();
-            let last_exc_value_var = graph.alloc_value_var();
-            let exc_block = graph.exceptblock;
-            graph.set_goto(*block, continuation, vec![inner_var.clone()]);
-            let normal_link = Link::from_variables(graph, vec![inner_var], continuation, None);
-            let exc_link = Link::from_variables(
-                graph,
-                vec![last_exception_var.clone(), last_exc_value_var.clone()],
-                exc_block,
-                Some(exception_exitcase()),
-            )
-            .extravars(
-                Some(LinkArg::Value(last_exception_var)),
-                Some(LinkArg::Value(last_exc_value_var)),
-            );
-            graph.set_control_flow_metadata(
-                *block,
-                Some(ExitSwitch::LastException),
-                vec![normal_link, exc_link],
-            );
-            *block = continuation;
-            Ok(Lowered::from_value_var(graph, &continuation_arg))
+            if recorded_raising_op {
+                // ── `?` on a raising operand (a call) ──
+                // The operand's recorded op is the block's last (raising)
+                // op; close the block with `exitswitch = c_last_exception`
+                // and a normal + exception link (`flowcontext.py:147`).
+                let continuation = graph.create_block();
+                let continuation_arg = graph.alloc_value_var();
+                graph.push_inputarg_var(continuation, continuation_arg.clone());
+                // RPython `flowcontext.py:130-133` — fresh prevblock-side
+                // `Variable('last_exception')` + `Variable('last_exc_value')`.
+                let last_exception_var = graph.alloc_value_var();
+                let last_exc_value_var = graph.alloc_value_var();
+                let exc_block = graph.exceptblock;
+                graph.set_goto(*block, continuation, vec![inner_var.clone()]);
+                let normal_link = Link::from_variables(graph, vec![inner_var], continuation, None);
+                let exc_link = Link::from_variables(
+                    graph,
+                    vec![last_exception_var.clone(), last_exc_value_var.clone()],
+                    exc_block,
+                    Some(exception_exitcase()),
+                )
+                .extravars(
+                    Some(LinkArg::Value(last_exception_var)),
+                    Some(LinkArg::Value(last_exc_value_var)),
+                );
+                graph.set_control_flow_metadata(
+                    *block,
+                    Some(ExitSwitch::LastException),
+                    vec![normal_link, exc_link],
+                );
+                // Stamp the canraise `?`-source block's framestate before
+                // switching to the continuation, mirroring the branch
+                // source stamp (`lower_if_expr` `pre_branch_snapshot`).
+                // The canraise continuation receives only `inner_var` on
+                // its normal link, so a cross-block read of any other local
+                // in the continuation (or a successor) walks back to this
+                // `?`-source via `lazy_install_local_at_current_block_var`,
+                // which bails at `pred_block.framestate.as_ref()?` when the
+                // source carries no framestate — falling through to a naked
+                // body-`Input` op the adapter rejects as "cross-block body
+                // Input" (the cat14 skip).  Branch and loop sources already
+                // stamp here; the canraise close was the lone gap.  Guarded
+                // on `framestate.is_none()` so an enclosing construct that
+                // already stamped this block is not overwritten.
+                if graph.block(*block).framestate.is_none() {
+                    let pre_try_snapshot = ctx.getstate(graph, 0);
+                    graph.block_mut(*block).framestate = Some(pre_try_snapshot);
+                }
+                *block = continuation;
+                Ok(Lowered::from_value_var(graph, &continuation_arg))
+            } else {
+                // ── `?` on a bare value (no recorded raising op) ──
+                // RPython models a value-test early-return NOT as canraise
+                // but as a `guessbool` branch on the value
+                // (`flowcontext.py:107-122` `block.exitswitch =
+                // w_condition`).  pyre lacks a typed enum-discriminant op,
+                // so — mirroring the composite-pattern `match` arm
+                // (`front/ast.rs` `match { Some(_) => .., None => .. }`,
+                // "two-arm truthy split" on the scrutinee) — the
+                // transparent Option/Result value itself is the branch
+                // condition: truthy (`Some`/`Ok`) continues with the
+                // unwrapped value; falsy (`None`/`Err`) early-returns the
+                // same (transparent) value through the returnblock.  Unwrap
+                // is identity at this layer (`transparent_result_ok_type` /
+                // `transparent_option_inner_type` strip the wrapper string
+                // only); a falsy Option is the null `None` ref and a falsy
+                // Result is the `Err`-carrying value — both are valid
+                // returns for the enclosing fn's transparent return repr.
+                //
+                // Locals threading mirrors the UNARY_NOT bool-fork: every
+                // pre-fork local rides the success `Link.args` ↔
+                // continuation `inputargs` so post-`?` reads resolve to the
+                // threaded values (`flowcontext.py:835 LOAD_FAST` /
+                // `getoutputargs` thread every `frame.locals_w` slot at
+                // every edge).
+                let pre_fork_locals = ctx.local_value_ids.clone();
+                let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+                merged_names.sort();
+                let pre_fork_local_vars: Vec<crate::flowspace::model::Variable> = merged_names
+                    .iter()
+                    .map(|name| {
+                        let var = pre_fork_locals[name].0.clone();
+                        if graph.variable_defined_in_block(*block, &var) {
+                            var
+                        } else {
+                            lazy_install_local_at_current_block_var(graph, ctx, *block, name, None)
+                                .unwrap_or(var)
+                        }
+                    })
+                    .collect();
+
+                let (continuation, continuation_args) =
+                    graph.create_block_with_arg_vars(merged_names.len() + 1);
+                let continuation_value_arg = continuation_args[0].clone();
+                let continuation_local_args: Vec<crate::flowspace::model::Variable> =
+                    continuation_args[1..].to_vec();
+
+                // Failure arm receives the (transparent) failing value and
+                // returns it unchanged through the returnblock.
+                let (failure_arm, failure_args) = graph.create_block_with_arg_vars(1);
+                let failure_value_arg = failure_args[0].clone();
+
+                let mut success_link_args: Vec<crate::flowspace::model::Variable> =
+                    Vec::with_capacity(merged_names.len() + 1);
+                success_link_args.push(inner_var.clone());
+                success_link_args.extend(pre_fork_local_vars.iter().cloned());
+
+                // `set_branch` builds `ExitCase::Bool(true)` for the
+                // `if_true` arm: truthy (`Some`/`Ok`) → continuation,
+                // falsy (`None`/`Err`) → failure arm.
+                graph.set_branch(
+                    *block,
+                    inner_var.clone(),
+                    continuation,
+                    success_link_args,
+                    failure_arm,
+                    vec![inner_var],
+                );
+                graph.set_return(failure_arm, Some(failure_value_arg));
+
+                for (name, arg_var) in merged_names.iter().zip(continuation_local_args.iter()) {
+                    ctx.bind_local_id_var(name.clone(), arg_var, graph, continuation);
+                }
+
+                *block = continuation;
+                Ok(Lowered::from_value_var(graph, &continuation_value_arg))
+            }
         }
 
         // ── unsafe { stmts } ──
@@ -8926,14 +9181,30 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
                 let owner_path = segments[..segments.len() - 1].to_vec();
                 return CallTarget::synthetic_transparent_ctor_with_owner(owner_path, last);
             }
-            if segments.len() == 1 && !ctx.module_prefix.is_empty() {
-                let mut qualified = ctx
-                    .module_prefix
-                    .split("::")
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
-                qualified.extend(segments);
-                segments = qualified;
+            if segments.len() == 1 {
+                if let Some(full) = ctx.use_imports.get(&segments[0]) {
+                    // LOAD_GLOBAL parity (`flowcontext.py:845-866`): a bare
+                    // call name binds in the caller's lexical scope, where
+                    // an imported name resolves to its import target (the
+                    // callee's home path).  `walk_use_tree` (`parse.rs:738`)
+                    // records each `use` item keyed by the bare alias, so
+                    // resolving the import here lets a bare
+                    // `items_block_items_base()` call reach the free
+                    // function registered under its callee-home path
+                    // instead of being mis-qualified with the caller's own
+                    // module (or left as a bare name the free-function
+                    // conflict guard never registered).  Mirrors the
+                    // import-first ladder in `qualify_type_name_with_imports`.
+                    segments = full.split("::").map(str::to_string).collect();
+                } else if !ctx.module_prefix.is_empty() {
+                    let mut qualified = ctx
+                        .module_prefix
+                        .split("::")
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>();
+                    qualified.extend(segments);
+                    segments = qualified;
+                }
             }
             CallTarget::function_path(segments)
         }
@@ -9695,6 +9966,94 @@ fn cast_builtin_name(
         }
         _ => None,
     }
+}
+
+/// Maps a primitive numeric type name to its `ValueType` for the
+/// `<prim>::from` coercion path.  Mirrors the primitive arms of
+/// `classify_fn_arg_ty` (u* → `Unsigned` so `cast_builtin_name` selects
+/// the `r_uint` / `intmask` bridges, not the int identity).  Returns
+/// `None` for non-primitive receivers so `Foo::from` stays an ordinary
+/// call.
+fn numeric_type_name_to_value_type(name: &str) -> Option<ValueType> {
+    match name {
+        "i8" | "i16" | "i32" | "i64" | "isize" => Some(ValueType::Int),
+        "u8" | "u16" | "u32" | "u64" | "usize" => Some(ValueType::Unsigned),
+        "f32" | "f64" => Some(ValueType::Float),
+        _ => None,
+    }
+}
+
+/// Recognizes `<prim>::from` — the infallible numeric widening
+/// conversion.  Returns the target `ValueType` when `path` is exactly
+/// `<primitive numeric type>::from`, else `None`.  `try_from` is
+/// excluded: its `Result<T, E>` result needs the Ok-elision / unwrap
+/// composition handled elsewhere.
+fn numeric_from_target_type(path: &syn::Path) -> Option<ValueType> {
+    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    match segments.as_slice() {
+        [ty, method] if method.as_str() == "from" => numeric_type_name_to_value_type(ty),
+        _ => None,
+    }
+}
+
+/// Recognizes `std::ptr::eq` / `core::ptr::eq` / `ptr::eq` — pointer
+/// identity comparison.  RPython spells this as `a is b`, lowered to
+/// `ptr_eq` (rmodel.py:300 rtype_is_); pyre produces the same op from a
+/// `BinOp { op: "eq" }` on two Ref operands, which jtransform rewrites
+/// Ref==Ref → `ptr_eq` (jtransform.rs:849 / jtransform.py:1243
+/// rewrite_op_ptr_eq).
+fn is_ptr_eq_path(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    match segments.as_slice() {
+        [a, b, c] => {
+            matches!(a.as_str(), "std" | "core") && b.as_str() == "ptr" && c.as_str() == "eq"
+        }
+        [a, b] => a.as_str() == "ptr" && b.as_str() == "eq",
+        _ => false,
+    }
+}
+
+/// Lowers a numeric / Bool / pointer value cast of `operand_var` (whose
+/// source annotation is `source_ty`) to `result_ty`.  Routes through the
+/// canonical `int()` / `float()` / `bool()` / `cast_*` builtin-call
+/// chain (`cast_builtin_name`, rbuiltin.py:178-189) when a typed
+/// coercion is required, else emits the identity-preserving `same_as`
+/// (rtyper.py:478-481).  Shared by `Expr::Cast` (`x as T`) and the
+/// `<prim>::from(x)` function-call spelling, which RPython expresses
+/// with the same `int(v)` / `r_uint(v)` builtin calls.
+fn lower_value_cast(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    operand_var: crate::flowspace::model::Variable,
+    source_ty: Option<ValueType>,
+    result_ty: ValueType,
+) -> crate::flowspace::model::Variable {
+    if let Some(segments) = cast_builtin_name(source_ty.as_ref(), &result_ty) {
+        return graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: segments.iter().map(|s| s.to_string()).collect(),
+                    },
+                    args: vec![operand_var],
+                    result_ty,
+                },
+                true,
+            )
+            .expect("OpKind::Call has has_result=true");
+    }
+    graph
+        .push_op_var(
+            block,
+            OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand: operand_var,
+                result_ty,
+            },
+            true,
+        )
+        .expect("OpKind::UnaryOp has has_result=true")
 }
 
 // `cast_op_name` retired in Slice C.1 — after the numeric / Bool /

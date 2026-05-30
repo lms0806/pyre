@@ -493,16 +493,67 @@ fn literal_value_from_expr_with_bindings(
         }
         syn::Expr::Path(syn::ExprPath {
             qself: None, path, ..
-        }) if path.segments.len() == 1 && path.segments[0].arguments.is_none() => {
-            let name = path.segments[0].ident.to_string();
-            let key = (current_prefix.to_string(), name);
-            resolve_module_static_literal(&key, initializers, memo, visiting)
+        }) if path.segments.iter().all(|s| s.arguments.is_none()) => {
+            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let key = resolve_path_to_key(current_prefix, &segs, initializers);
+            key.and_then(|k| resolve_module_static_literal(&k, initializers, memo, visiting))
         }
         syn::Expr::Cast(syn::ExprCast { expr, ty, .. }) => literal_value_cast(recurse(expr)?, ty),
         syn::Expr::Group(g) => recurse(&g.expr),
         syn::Expr::Paren(p) => recurse(&p.expr),
         _ => None,
     }
+}
+
+fn resolve_path_to_key(
+    current_prefix: &str,
+    segments: &[String],
+    initializers: &indexmap::IndexMap<(String, String), syn::Expr>,
+) -> Option<(String, String)> {
+    if segments.len() == 1 {
+        return Some((current_prefix.to_string(), segments[0].clone()));
+    }
+    // Handle `super::NAME` — resolve to parent module prefix.
+    if segments[0] == "super" {
+        let parent = if let Some(idx) = current_prefix.rfind("::") {
+            &current_prefix[..idx]
+        } else {
+            ""
+        };
+        return resolve_path_to_key(parent, &segments[1..], initializers);
+    }
+    // Handle `self::NAME` — stays in current prefix.
+    if segments[0] == "self" {
+        return resolve_path_to_key(current_prefix, &segments[1..], initializers);
+    }
+    // Handle `crate::...` — strip crate prefix.
+    if segments[0] == "crate" || PYRE_INTERNAL_CRATES.contains(&segments[0].as_str()) {
+        let module = segments[1..segments.len() - 1].join("::");
+        let name = segments.last()?.clone();
+        let key = (module, name);
+        if initializers.contains_key(&key) {
+            return Some(key);
+        }
+        return None;
+    }
+    // Multi-segment relative: `nested::NAME` → (current_prefix::nested, NAME)
+    let module_part = segments[..segments.len() - 1].join("::");
+    let name = segments.last()?.clone();
+    let qualified = if current_prefix.is_empty() {
+        module_part.clone()
+    } else {
+        format!("{}::{}", current_prefix, module_part)
+    };
+    let key = (qualified, name.clone());
+    if initializers.contains_key(&key) {
+        return Some(key);
+    }
+    // Fallback: try module_part alone (top-level nested mod).
+    let key = (module_part, name);
+    if initializers.contains_key(&key) {
+        return Some(key);
+    }
+    None
 }
 
 fn literal_value_cast(value: ModuleStaticLiteral, ty: &syn::Type) -> Option<ModuleStaticLiteral> {
@@ -1834,7 +1885,10 @@ mod tests {
             Some(ModuleStaticLiteral::Int(12))
         ));
         assert!(get("nested", "FROM_OUTER").literal.is_none());
-        assert!(get("nested", "MULTI_SEGMENT").literal.is_none());
+        assert!(matches!(
+            get("nested", "MULTI_SEGMENT").literal,
+            Some(ModuleStaticLiteral::Int(41))
+        ));
     }
 
     /// PyPy parity regression guard: `static mut` storage carries a

@@ -300,6 +300,17 @@ pub struct Bookkeeper {
     /// build the bookkeeper directly, in which case
     /// `get_pyre_classdef_by_name` leaves `attrs` empty.
     pub pyre_struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
+    /// TODO: no upstream equivalent.  Interning table mapping a struct
+    /// type-root name to its canonical host class `HostObject`.  Because
+    /// `HostObject` equality is `Arc` pointer identity (`model.rs:233`),
+    /// two `HostObject::new_class(name, ...)` calls produce distinct
+    /// descs/classdefs; interning resolves a type-root string to one
+    /// class OBJECT exactly once so subsequent `getuniqueclassdef`
+    /// lookups key the same `ClassDef` by identity — the pyre analog of
+    /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py:103-104)
+    /// where `t` is the already-resolved class object.  Used by
+    /// [`Self::getuniqueclassdef_for_struct_root`].
+    pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -473,6 +484,7 @@ impl Bookkeeper {
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             pyre_stub_classdefs: RefCell::new(HashMap::new()),
             pyre_struct_fields: RefCell::new(None),
+            pyre_struct_root_classes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1476,6 +1488,144 @@ impl Bookkeeper {
             .get(name)
             .cloned()
             .expect("phase-1 fabrication invariant: root name is always cached after the loop")
+    }
+
+    /// Resolve a struct type-root name to its canonical, bookkeeper-
+    /// REGISTERED `ClassDef`, with instance attributes projected from
+    /// the threaded `StructFieldRegistry`.
+    ///
+    /// Orthodox counterpart of the name-keyed
+    /// [`Self::get_pyre_classdef_by_name`] stub.  pyre's `W_IntObject` /
+    /// `PyFrame` / `W_DictObject` Rust structs are ports of RPython
+    /// classes (`W_Root` subclasses), so their annotation is
+    /// `SomeInstance(classdef)` — `InstanceRepr._setup_repr`
+    /// (`rclass.py:501-509`) later lowers `classdef.attrs` into
+    /// `Ptr(GcStruct(OBJECT, inst_<field>...))`.  RPython derives a
+    /// `ClassDef` ONLY by class-object identity
+    /// (`getuniqueclassdef(cls)` -> `getdesc(cls)` -> id() key,
+    /// `bookkeeper.py:339-345`, `uid.py:24-48`); there is no
+    /// name->classdef path.  Pyre mirrors this by resolving the
+    /// type-root string to a host class OBJECT exactly once
+    /// ([`Self::intern_struct_root_class`]), then routing through the
+    /// existing [`Self::getuniqueclassdef`] so the `ClassDef` lands in
+    /// `descs`/`classdefs` keyed by identity.
+    ///
+    /// The struct fields are instance attributes: RPython discovers them
+    /// by annotating `setattr`/`__init__`, but pyre has no such pass for
+    /// host structs, so the registry projection (via
+    /// [`Self::project_pyre_field_type`]) stands in.  The whole reachable
+    /// struct-field graph is registered and projected — an explicit
+    /// work-list bounds recursion at the registry's struct-chain depth —
+    /// so a field typed as another struct resolves to a fully populated
+    /// inner `SomeInstance(classdef)` rather than the attrs-empty inner
+    /// stub left by `get_pyre_classdef_by_name`.
+    pub fn getuniqueclassdef_for_struct_root(
+        self: &Rc<Self>,
+        root: &str,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // Pass 1 — register every reachable struct as an identity-keyed
+        // `ClassDef` and publish it into `pyre_stub_classdefs` so
+        // `project_pyre_field_type`'s bare-name arm resolves inner struct
+        // references to the registered classdef.  The work-list keeps
+        // recursion bound at type-string nesting depth, not the
+        // registry's struct-chain depth (200+ would overflow the stack).
+        let mut worklist: Vec<String> = vec![root.to_string()];
+        let mut graph: Vec<String> = Vec::new();
+        while let Some(n) = worklist.pop() {
+            if self.pyre_stub_classdefs.borrow().contains_key(&n) {
+                continue;
+            }
+            let host = self.intern_struct_root_class(&n);
+            let classdef = self.getuniqueclassdef(&host)?;
+            self.pyre_stub_classdefs
+                .borrow_mut()
+                .insert(n.clone(), classdef);
+            graph.push(n.clone());
+            let referenced: Vec<String> = {
+                let guard = self.pyre_struct_fields.borrow();
+                if let Some(reg) = guard.as_ref() {
+                    if let Some(fields) = reg.fields.get(&n) {
+                        let mut out: Vec<String> = Vec::new();
+                        for (field_name, field_ty) in fields {
+                            if field_name == "__class__" {
+                                continue;
+                            }
+                            collect_referenced_struct_names(field_ty, reg, &mut out);
+                        }
+                        out
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            for r in referenced {
+                if !self.pyre_stub_classdefs.borrow().contains_key(&r) {
+                    worklist.push(r);
+                }
+            }
+        }
+        // Pass 2 — project each registered node's fields into its
+        // `classdef.attrs`.  All nodes are published from pass 1, so a
+        // field referencing another struct resolves to the registered
+        // inner classdef.
+        for n in &graph {
+            let fields: Option<Vec<(String, String)>> = {
+                let guard = self.pyre_struct_fields.borrow();
+                guard.as_ref().and_then(|r| r.fields.get(n).cloned())
+            };
+            let Some(fields) = fields else {
+                continue;
+            };
+            let classdef = self
+                .pyre_stub_classdefs
+                .borrow()
+                .get(n)
+                .cloned()
+                .expect("pass-1 registration invariant: node is always cached");
+            for (field_name, field_ty) in &fields {
+                if field_name == "__class__" {
+                    continue;
+                }
+                let s_value = self.project_pyre_field_type(field_ty);
+                let mut classdef_mut = classdef.borrow_mut();
+                let attr = classdef_mut
+                    .attrs
+                    .entry(field_name.clone())
+                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
+                if matches!(attr.s_value, SomeValue::Impossible) {
+                    attr.s_value = s_value;
+                }
+            }
+        }
+        self.pyre_stub_classdefs
+            .borrow()
+            .get(root)
+            .cloned()
+            .ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "getuniqueclassdef_for_struct_root({root:?}): root not registered after pass 1"
+                ))
+            })
+    }
+
+    /// Resolve a struct type-root name to its canonical host class
+    /// `HostObject`, minting it on first sight and caching by name in
+    /// [`Self::pyre_struct_root_classes`].  Because `HostObject`
+    /// equality is `Arc` pointer identity, this interning is what makes
+    /// `getuniqueclassdef` return the SAME `ClassDef` for repeated
+    /// lookups of one type-root — the pyre analog of resolving a type
+    /// name to one class object before `getuniqueclassdef(cls)`.
+    fn intern_struct_root_class(self: &Rc<Self>, name: &str) -> HostObject {
+        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(name) {
+            return existing.clone();
+        }
+        let host = crate::flowspace::model::HostObject::new_class(name.to_string(), Vec::new());
+        self.pyre_struct_root_classes
+            .borrow_mut()
+            .insert(name.to_string(), host.clone());
+        host
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type
@@ -2964,6 +3114,129 @@ mod tests {
             .insert("x".to_string(), attrs_attr);
         bk.classdefs.borrow_mut().push(classdef);
         bk.check_no_flags_on_instances();
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_registers_by_identity_and_projects_fields() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "PyFrame".to_string(),
+            vec![
+                ("pycode".to_string(), "PyCode".to_string()),
+                ("depth".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "PyCode".to_string(),
+            vec![("argcount".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        let cd1 = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame registers");
+        // Identity: a second lookup returns the SAME ClassDef Rc — the
+        // type-root string resolves to one interned host class object.
+        let cd2 = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame re-lookup");
+        assert!(
+            Rc::ptr_eq(&cd1, &cd2),
+            "type-root resolves to one identity-keyed ClassDef"
+        );
+
+        // Orthodox registration: the ClassDef lands in
+        // `bookkeeper.classdefs` (not a side-cache-only stub).
+        let registered = bk.classdef_snapshot().iter().any(|c| Rc::ptr_eq(c, &cd1));
+        assert!(
+            registered,
+            "ClassDef must be registered in bookkeeper.classdefs by identity"
+        );
+
+        // Instance attributes projected from the registry.
+        {
+            let g = cd1.borrow();
+            let depth = g.attrs.get("depth").expect("depth attr projected");
+            assert!(
+                matches!(depth.s_value, SomeValue::Integer(_)),
+                "i64 field -> SomeInteger"
+            );
+            let pycode = g.attrs.get("pycode").expect("pycode attr projected");
+            assert!(
+                matches!(pycode.s_value, SomeValue::Instance(_)),
+                "struct-typed field -> SomeInstance(inner classdef)"
+            );
+        }
+
+        // The transitively-referenced inner struct is ALSO registered
+        // with its own fields projected (closes the attrs-empty
+        // inner-stub gap of `get_pyre_classdef_by_name`).
+        let inner = bk
+            .getuniqueclassdef_for_struct_root("PyCode")
+            .expect("PyCode registers");
+        assert!(
+            inner.borrow().attrs.contains_key("argcount"),
+            "inner struct's own fields are projected too"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_terminates_on_cyclic_graph() {
+        // Localizes the route-b stack overflow (task #100): the seed fired
+        // for `FixedObjectArray` (fields `len: usize`, `_items:
+        // [PyObjectRef; 0]`) and the build aborted with a stack overflow.
+        // Reproduce the real shape — an array struct referencing the
+        // boxed-object root, which cycles back through the type object —
+        // and assert transitive registration TERMINATES (returns a
+        // populated classdef) rather than recursing forever.  If this test
+        // overflows, the overflow is IN transitive registration; if it
+        // passes, the overflow is downstream (rtyper repr setup).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("_items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "PyObjectRef".to_string(),
+            vec![("typ".to_string(), "W_TypeObject".to_string())],
+        );
+        reg.fields.insert(
+            "W_TypeObject".to_string(),
+            vec![
+                // cycle: W_TypeObject -> PyObjectRef -> W_TypeObject
+                ("base".to_string(), "PyObjectRef".to_string()),
+                // self-reference: W_TypeObject -> W_TypeObject
+                ("mro".to_string(), "Vec<W_TypeObject>".to_string()),
+            ],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("FixedObjectArray")
+            .expect("cyclic graph registers without overflow");
+        // `_items` projects to a SomeList of the boxed-object instance.
+        assert!(
+            cd.borrow().attrs.contains_key("_items"),
+            "array field projected"
+        );
+        // The cyclic inner structs are registered exactly once each.
+        let ty = bk
+            .getuniqueclassdef_for_struct_root("W_TypeObject")
+            .expect("W_TypeObject registers");
+        let ty2 = bk
+            .getuniqueclassdef_for_struct_root("W_TypeObject")
+            .expect("W_TypeObject re-lookup");
+        assert!(
+            Rc::ptr_eq(&ty, &ty2),
+            "cycle node interned to one identity-keyed ClassDef"
+        );
     }
 
     #[test]

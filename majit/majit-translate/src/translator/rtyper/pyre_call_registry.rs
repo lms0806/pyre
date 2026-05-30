@@ -234,6 +234,15 @@ impl PyreCallRegistry {
         *self.use_imports.borrow_mut() = map;
     }
 
+    /// Thread the program-wide `StructFieldRegistry` into the shared
+    /// bookkeeper so `get_pyre_classdef_by_name` / `project_pyre_field_type`
+    /// can project struct fields onto a classdef.  Called once from
+    /// `dual_gate_registry` after `PyreCallRegistry::new` with
+    /// `CallControl::struct_fields().clone()`, mirroring `set_use_imports`.
+    pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
+        self.bookkeeper.set_pyre_struct_fields(registry);
+    }
+
     /// Look up the fully-qualified path that `alias` resolves to in
     /// the lexical scope of `source_module`.  Returns `Some(full)` if
     /// the source file imported `alias` (or `use <full> as alias`)
@@ -337,6 +346,47 @@ impl PyreCallRegistry {
         }
         let canonical = self.aliases.borrow().get(key).cloned()?;
         self.entries.borrow().get(&canonical).cloned()
+    }
+
+    /// Resolve an associated-function call spelled `Type::method`
+    /// (segments `["Type", "method"]`) to the impl-method graph
+    /// registered under a longer module-qualified key whose final
+    /// segments are `suffix` (e.g. `["pyframe", "PyFrame", "peek_at"]`).
+    ///
+    /// `direct_call` parity: upstream resolves the unbound spelling
+    /// `Type.method(self, ...)` and the bound spelling `obj.method(...)`
+    /// to the *same* `FunctionDesc` — the attribute access folds to one
+    /// graph (`rpbc.py`), with no key divergence.  Pyre's exact-segment
+    /// `FunctionPathKey` makes the two spellings miss each other, so the
+    /// bound `Method` call path already recovers the short spelling via
+    /// `CallControl::method_suffix_index` (`call.rs:3155 target_to_path`).
+    /// This is its associated-function counterpart: it runs only after
+    /// the exact [`Self::lookup`] missed and returns `Some` only when
+    /// exactly one registered entry ends with `suffix` — an ambiguous
+    /// tail (two distinct module-qualified entries sharing the same
+    /// `[Type, method]`) stays unresolved, mirroring
+    /// `SuffixMatch::Ambiguous`.
+    pub fn lookup_by_method_suffix(&self, suffix: &[String]) -> Option<Rc<PyreFunctionEntry>> {
+        if suffix.is_empty() {
+            return None;
+        }
+        let mut found: Option<Rc<PyreFunctionEntry>> = None;
+        for (key, entry) in self.entries.borrow().iter() {
+            // Only a strictly-longer key carries the module prefix that
+            // distinguishes the associated-function call from its bare
+            // spelling; an equal-length key would already be the exact
+            // [`Self::lookup`] hit.
+            if key.segments().len() <= suffix.len() {
+                continue;
+            }
+            if key.segments().ends_with(suffix) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(entry.clone());
+            }
+        }
+        found
     }
 
     /// Look up or insert. The first caller for a given path:
@@ -559,6 +609,72 @@ mod tests {
             "unregistered path must return None"
         );
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn lookup_by_method_suffix_resolves_unique_module_qualified_entry() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        // Impl method registered under its module-qualified key.
+        let canonical = registry.get_or_register(
+            FunctionPathKey::from_segments(["pyframe", "PyFrame", "peek_at"]),
+            signature(&["self", "depth"]),
+        );
+        // The exact two-segment associated-function spelling misses the
+        // direct lookup but resolves via the `[Type, method]` tail.
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["PyFrame", "peek_at"]))
+                .is_none(),
+            "the bare `Type::method` spelling must miss the exact lookup"
+        );
+        let resolved = registry
+            .lookup_by_method_suffix(&["PyFrame".to_string(), "peek_at".to_string()])
+            .expect("suffix lookup must recover the module-qualified entry");
+        assert!(
+            Rc::ptr_eq(&resolved, &canonical),
+            "suffix lookup must return the same Rc as the canonical entry"
+        );
+    }
+
+    #[test]
+    fn lookup_by_method_suffix_returns_none_on_ambiguous_tail() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        // Two distinct module-qualified entries share the same
+        // `[PyFrame, peek_at]` tail — the call site cannot disambiguate.
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["a", "PyFrame", "peek_at"]),
+            signature(&["self", "depth"]),
+        );
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["b", "PyFrame", "peek_at"]),
+            signature(&["self", "depth"]),
+        );
+        assert!(
+            registry
+                .lookup_by_method_suffix(&["PyFrame".to_string(), "peek_at".to_string()])
+                .is_none(),
+            "an ambiguous `[Type, method]` tail must stay unresolved"
+        );
+    }
+
+    #[test]
+    fn lookup_by_method_suffix_ignores_equal_length_exact_entry() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        // A two-segment entry IS the exact-lookup hit; the suffix
+        // matcher only handles strictly-longer module-qualified keys.
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["PyFrame", "peek_at"]),
+            signature(&["self", "depth"]),
+        );
+        assert!(
+            registry
+                .lookup_by_method_suffix(&["PyFrame".to_string(), "peek_at".to_string()])
+                .is_none(),
+            "an equal-length entry belongs to the exact lookup, not the suffix matcher"
+        );
     }
 
     #[test]

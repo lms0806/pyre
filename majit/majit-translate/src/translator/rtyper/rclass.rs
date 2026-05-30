@@ -4224,6 +4224,71 @@ mod tests {
     }
 
     #[test]
+    fn instance_repr_setup_terminates_on_cyclic_struct_graph() {
+        // Localizes the route-b stack overflow (task #100) at the RTYPER
+        // layer. `getuniqueclassdef_for_struct_root` (transitive
+        // registration) is already proven cycle-safe (bookkeeper test
+        // `getuniqueclassdef_for_struct_root_terminates_on_cyclic_graph`).
+        // This test exercises the DOWNSTREAM consumer: building + setting
+        // up the `InstanceRepr` for a classfull instance whose attrs form
+        // a cycle (`FixedObjectArray._items: [PyObjectRef;0]` →
+        // `PyObjectRef.typ: W_TypeObject` → `W_TypeObject.base:
+        // PyObjectRef`). If `_setup_repr` / `getrepr` / `call_all_setups`
+        // recurse without bound on the instance graph, this overflows;
+        // RPython's deferred-setup worklist + `None` recursion sentinel
+        // keep it bounded.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::front::StructFieldRegistry;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // Pure-instance cycle (no Vec/array fields, whose `ListRepr` is
+        // not yet ported): Outer.obj -> Boxed.typ -> TypeObj.base ->
+        // Boxed, closing the loop with two back-edges. Each field is a
+        // bare struct name → projects to `SomeInstance(inner classdef)`,
+        // so setup recurses purely through `InstanceRepr`s.
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Outer".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("obj".to_string(), "Boxed".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "Boxed".to_string(),
+            vec![("typ".to_string(), "TypeObj".to_string())],
+        );
+        reg.fields.insert(
+            "TypeObj".to_string(),
+            vec![
+                // cycle back-edge: TypeObj.base -> Boxed -> TypeObj
+                ("base".to_string(), "Boxed".to_string()),
+                // self-reference back-edge: TypeObj.parent -> TypeObj
+                ("parent".to_string(), "TypeObj".to_string()),
+            ],
+        );
+        ann.bookkeeper.set_pyre_struct_fields(std::rc::Rc::new(reg));
+        let cd = ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root("Outer")
+            .expect("cyclic graph registers");
+
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr (cyclic)");
+        rtyper
+            .call_all_setups()
+            .expect("call_all_setups drains cyclic pending reprs");
+        assert!(
+            matches!(inst.lowleveltype(), LowLevelType::Ptr(_)),
+            "cyclic instance repr lowered to a Ptr without overflow"
+        );
+    }
+
+    #[test]
     fn instance_repr_create_instance_allocates_immortal_struct() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::HostObject;

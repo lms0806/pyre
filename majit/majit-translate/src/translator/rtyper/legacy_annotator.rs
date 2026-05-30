@@ -349,7 +349,11 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         | OpKind::JitMergePoint { .. }
         | OpKind::LoopHeader { .. } => ValueType::Void,
         OpKind::CurrentTraceLength => ValueType::Int,
-        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Int,
+        // `jit.isconstant` / `jit.isvirtual` are declared at
+        // `rlib/jit.py:269-292` returning `NonConstant(False)` — a
+        // Python `bool`.  RPython annotates them as `SomeBool`, not
+        // `SomeInteger`.
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Bool,
         // RPython: vtable entry is a `Ptr(FuncType)` address.
         OpKind::VtableMethodPtr { .. } => ValueType::Int,
         OpKind::IndirectCall { result_ty, .. } => result_ty.clone(),
@@ -400,6 +404,14 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
             }
         }
         (ValueType::Ref(_), ValueType::Ref(_)) => ValueType::Ref(None),
+        // SomeBool ⊂ SomeInteger: `pair(SomeBool, SomeInteger).union`
+        // dispatches through inheritance to `pair(SomeInteger,
+        // SomeInteger).union` at `binaryop.py:178` and returns
+        // SomeInteger.  Bool unions with the signed Int variant
+        // (knowntype=int) only; Unsigned widens to Unknown so the
+        // unsigned-signedness UnionError at `binaryop.py:191` is not
+        // silently coerced away.
+        (ValueType::Bool, ValueType::Int) | (ValueType::Int, ValueType::Bool) => ValueType::Int,
         _ => ValueType::Unknown,
     }
 }

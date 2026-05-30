@@ -1177,6 +1177,14 @@ impl CallControl {
         self.struct_fields = registry;
     }
 
+    /// Program-wide struct field shapes accumulated at pipeline init.
+    /// Threaded into the dual-gate bookkeeper so
+    /// `get_pyre_classdef_by_name` / `project_pyre_field_type` can
+    /// project a struct's fields onto its classdef.
+    pub fn struct_fields(&self) -> &crate::front::StructFieldRegistry {
+        &self.struct_fields
+    }
+
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
         self.known_struct_names.contains(name)

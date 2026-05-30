@@ -1749,6 +1749,154 @@ fn id(x: &Foo) -> &Foo { x }
     }
 
     #[test]
+    fn anchor_cat1_ptr_eq_lowers_to_binop_eq() {
+        let _lock = anchor_lock();
+        // Cat 1 anchor: `std::ptr::eq(a, b)` is pointer identity; it
+        // previously lowered to an unregistered FunctionPath
+        // ["std","ptr","eq"] → the "not registered in PyreCallRegistry"
+        // Skip.  The front-end now emits BinOp { op: "eq" } on the two
+        // Ref operands, which jtransform rewrites to ptr_eq
+        // (jtransform.rs:849), so the cat1 signature must be gone.
+        let graph = build_anchor_graph(
+            r#"
+struct W {
+    x: i64,
+}
+fn same(a: &W, b: &W) -> bool {
+    std::ptr::eq(a, b)
+}
+"#,
+            "same",
+        );
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
+        let err = match &result {
+            Ok(()) => String::new(),
+            Err(e) => e.clone(),
+        };
+        assert!(
+            !err.contains("not registered in PyreCallRegistry"),
+            "`std::ptr::eq` must lower to BinOp eq (→ ptr_eq) instead of \
+             an unregistered FunctionPath call; got: {err}"
+        );
+    }
+
+    #[test]
+    fn anchor_cat1_numeric_from_routes_through_cast() {
+        let _lock = anchor_lock();
+        // Cat 1 anchor: `i64::from(x)` (the function-call spelling of an
+        // `as` widening) previously lowered to an OpKind::Call whose
+        // target is FunctionPath ["i64","from"], which misses
+        // PyreCallRegistry and every HOST_ENV fallback → the "not
+        // registered in PyreCallRegistry" Skip.  The front-end now
+        // recognizes `<prim>::from` and routes it through the same
+        // coercion chain as `x as T` (here Unsigned→Int via
+        // rarithmetic.intmask, which is registered), so the cat1
+        // signature must be gone.
+        let graph = build_anchor_graph(
+            r#"
+fn widen(x: u32) -> i64 {
+    i64::from(x)
+}
+"#,
+            "widen",
+        );
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
+        let err = match &result {
+            Ok(()) => String::new(),
+            Err(e) => e.clone(),
+        };
+        assert!(
+            !err.contains("not registered in PyreCallRegistry"),
+            "`<prim>::from` must route through the cast chain (intmask) \
+             instead of an unregistered FunctionPath call; got: {err}"
+        );
+    }
+
+    #[test]
+    fn anchor_cat1_bare_imported_call_resolves_via_use_import() {
+        let _lock = anchor_lock();
+        // Cat 1 anchor: a bare imported free-function call binds in the
+        // caller's lexical scope (LOAD_GLOBAL), so it must lower to the
+        // import target's path — not the caller's own module, and not a
+        // bare name.  Before the fix, `canonical_call_target` qualified a
+        // bare name only with the caller's `module_prefix` (or left it
+        // bare), so `helper(x)` missed the free function registered under
+        // its callee-home key.  Now the use-import resolves the bare name
+        // to `["objmod","helper"]`.
+        let graph = build_anchor_graph(
+            r#"
+mod objmod {
+    pub fn helper(x: i64) -> i64 { x }
+}
+use objmod::helper;
+fn caller(x: i64) -> i64 { helper(x) }
+"#,
+            "caller",
+        );
+        let call_targets: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_targets
+                .iter()
+                .any(|s| s.as_slice() == ["objmod".to_string(), "helper".to_string()]),
+            "bare imported `helper()` must lower to the import path \
+             [\"objmod\",\"helper\"]; got call targets: {call_targets:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_cat14_try_canraise_continuation_reads_param() {
+        let _lock = anchor_lock();
+        // Cat 14 anchor: a `?` on a call (`step()?`) closes its block as
+        // canraise (the call is the recorded raising op), opening a
+        // continuation.  The continuation reads `x` cross-block.  Before
+        // the canraise `?`-source stamped its framestate,
+        // `lazy_install_local_at_current_block_var` bailed at
+        // `pred_block.framestate.as_ref()?`, dropping `x` to a naked
+        // body-`Input` the adapter rejects as "cross-block body Input".
+        // The stamp threads `x` via the predecessor link, so the cat14
+        // signature must be gone.  The graph still fails on a SEPARATE
+        // downstream blocker (`step` is not registered in the anchor's
+        // call registry — Epic A), so a full dual-gate green is not
+        // reachable for an isolated `?` fixture; we assert only that the
+        // cat14 threading gap is closed.
+        let graph = build_anchor_graph(
+            r#"
+fn step() -> Result<i64, i64> { Ok(0) }
+fn pop_and_store(x: i64) -> Result<i64, i64> {
+    step()?;
+    Ok(x)
+}
+"#,
+            "pop_and_store",
+        );
+        run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph);
+        let err = match &result {
+            Ok(()) => String::new(),
+            Err(e) => e.clone(),
+        };
+        assert!(
+            !err.contains("cross-block body Input"),
+            "Cat 14 canraise `?`-source framestate stamp must thread the \
+             cross-block `x` read so no naked body-`Input` reaches the \
+             adapter; got cat14 error: {err}"
+        );
+    }
+
+    #[test]
     fn anchor_ref_identity_dual_gate_agrees() {
         let _lock = anchor_lock();
         // Cat 3.1 anchor: a typed-`Ref` identity graph must agree under
@@ -2527,6 +2675,108 @@ fn cross_block(x: i64, cond: bool) -> i64 {
                     target_arity,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn anchor_cat_2_1_loop_invariant_live_var_threads_to_backedge() {
+        let _lock = anchor_lock();
+        // A variable live across a loop back-edge but not rebound or
+        // read inside the body's forward path (a loop-invariant the
+        // body only passes through, or — in the nested case — an outer
+        // variable the inner loop merges) must still be threaded
+        // through every body block so the loop-header phi is supplied
+        // from a slot defined at the closing predecessor.  RPython's
+        // fixed-size `locals_w` frame carries every live slot through
+        // each block (`flowspace/framestate.py:92 getoutputargs`); the
+        // pyre front-end re-threads dropped names via the lazy
+        // installer at the back-edge close
+        // (`link_arg_vars_from_ctx`) and at the pre-loop→header edge
+        // (`allocate_loop_header_phis`).  Without it the back-edge /
+        // pre-loop link references an out-of-scope slot and the rtyper
+        // adapter rejects it as "undefined operand slot ... Link.args".
+        let cases: &[(&str, &str)] = &[
+            // single `while` + `break`: `cond` / `n` are live across the
+            // back-edge but only read in the header / the break guard.
+            (
+                "loop_break_invariant",
+                "fn loop_break_invariant(n: i64, cond: bool) -> i64 { \
+                 let mut i: i64 = 0; \
+                 while i < n { if cond { break; } i = i + 1; } i }\n",
+            ),
+            // nested `while`: `count` is merged by the inner loop but the
+            // outer body block that bridges to the inner loop never reads
+            // it directly, so the outer-header→body edge would otherwise
+            // drop it before the inner-header phi needs it.
+            (
+                "nested_loop_outer_var",
+                "fn nested_loop_outer_var(n: i64) -> i64 { \
+                 let mut count: i64 = 0; let mut i: i64 = 0; \
+                 while i < n { let mut j: i64 = 0; \
+                 while j < n { count = count + 1; j = j + 1; } \
+                 i = i + 1; } count }\n",
+            ),
+        ];
+        for (name, src) in cases {
+            let graph = build_anchor_graph(src, name);
+            dual_gate_check(&graph).unwrap_or_else(|e| {
+                panic!("{name} must thread loop-live vars to the back-edge: {e}")
+            });
+            // Every link's `args` arity must equal the target's
+            // inputargs arity (`flowspace/model.py:114 Link.__init__`).
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    let target_arity = graph.block(link.target).inputargs.len();
+                    assert_eq!(
+                        link.args.len(),
+                        target_arity,
+                        "{name}: Link B{} -> B{} arity {} != target inputargs {}",
+                        block.id.0,
+                        link.target.0,
+                        link.args.len(),
+                        target_arity,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `&&` / `||` short-circuit forks carry every pre-fork local on
+    /// both arm Links (`[lhs_raw, ...locals]` shortcut, `[...locals]`
+    /// rhs).  A local that was bound in a dominator but never read in
+    /// the fork block points at the dominator's Variable; pyre threads
+    /// locals lazily, so that slot is not yet a block-local inputarg of
+    /// the fork block and threading it onto an arm Link trips the
+    /// flowspace adapter's "undefined operand slot" invariant.  The
+    /// `&&`-chain shapes below stack two/three such forks so the second
+    /// and third conditions read locals (`a`, `b`) that the first fork's
+    /// merge dropped — exercising both the predecessor-recursion ctx
+    /// rebind leak (the carried `a` slot) and the never-read dominator
+    /// local (`b`).  All must reach Match via the real dual-gate path.
+    #[test]
+    fn anchor_cat_2_1_shortcircuit_chain_threads_pre_fork_locals() {
+        let _lock = anchor_lock();
+        let cases: &[(&str, &str)] = &[
+            (
+                "m1",
+                "fn m1(x: i64, y: i64) -> i64 { let a: i64 = x + 1; let b: i64 = y + 1; if a > 0 && b > 0 { return a; } a + b }\n",
+            ),
+            (
+                "m2",
+                "fn m2(x: i64, y: i64) -> i64 { let a: i64 = x + 1; let b: i64 = y + 1; if a > 0 && b > 0 { return a; } if a < 0 && b < 0 { return b; } a + b }\n",
+            ),
+            (
+                "m3",
+                "fn m3(x: i64, y: i64) -> i64 { let a: i64 = x + 1; let b: i64 = y + 1; if a > 0 && b > 0 { return a; } if a < 0 && b < 0 { return b; } if a > b && b > a { return 0; } a + b }\n",
+            ),
+        ];
+        for (name, src) in cases {
+            let g = build_anchor_graph(src, name);
+            assert!(
+                dual_gate_check(&g).is_ok(),
+                "{name}: &&-chain pre-fork local threading must reach Match, got {:?}",
+                dual_gate_check(&g),
+            );
         }
     }
 
