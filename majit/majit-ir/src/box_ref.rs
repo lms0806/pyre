@@ -124,17 +124,9 @@ pub enum BoxKind {
     InputArg { position: u32 },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
-    /// `const_index` is a pyre-only field carrying the
-    /// `OpRef::Const{Int,Float,Ptr}.const_index()` so the chain walker
-    /// can reconstruct a constant-namespace OpRef when advancing past
-    /// `Forwarded::Box(const_box)` written by `replace_op(_, const_target)`.
-    /// `None` for `BoxRef::new_const(value)` (no index in scope —
-    /// `make_constant` used to pick this path before slice 18 split it
-    /// off; remaining `None` callers are test fixtures).
-    Const {
-        value: Value,
-        const_index: Option<u32>,
-    },
+    /// The Const carries its `value` directly (history.py:227/268/314); the
+    /// chain walker reconstructs the inline-Const OpRef from it.
+    Const { value: Value },
 }
 
 /// Variant of the `_forwarded` slot.
@@ -174,17 +166,12 @@ pub enum Forwarded {
     /// — forwarding terminates here; the constant value is carried
     /// inline. Chain walkers stop on this variant (`not_const=true`
     /// returns the pre-Const box; `not_const=false` materializes a
-    /// terminal const-bearing `BoxRef` for legacy callers).
+    /// terminal const-bearing `BoxRef`).
     ///
-    /// The trailing `Option<u32>` is the pyre-only `const_pool`
-    /// constant-namespace index that lets `box_to_opref` reconstruct
-    /// an `OpRef::Const{Int,Float,Ptr}(idx)` from a chain-walked-to-
-    /// Const terminal. PyPy has no analog (callers hold the Python
-    /// `Const` object directly). Sidecar to be retired alongside the
-    /// broader OpRef-reverse-lookup machinery; tagged `None` for
-    /// indexless seed_constant plantings (`optimizer.py:432` body
-    /// arm) and test plantings.
-    Const(Const, Option<u32>),
+    /// PyPy has no analog (callers hold the Python `Const` object
+    /// directly); `box_to_opref` reconstructs the inline-Const OpRef
+    /// from the payload value (history.py:227/268/314).
+    Const(Const),
 
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
@@ -277,34 +264,11 @@ impl BoxRef {
     }
 
     /// New `Const*` Box. `type_` is inferred from `value`.
-    /// No `const_index` — used by callers without a const-namespace
-    /// OpRef in scope (test fixtures, default constructors).
     pub fn new_const(value: Value) -> Self {
         let type_ = value.get_type();
         Self(Rc::new(Box {
             type_,
-            kind: BoxKind::Const {
-                value,
-                const_index: None,
-            },
-            value: Cell::new(None),
-            op_handle: RefCell::new(None),
-            inputarg_handle: RefCell::new(None),
-        }))
-    }
-
-    /// New `Const*` Box carrying a `const_index`. Used by
-    /// `replace_op(_, const_target)` so the chain walker can reconstruct
-    /// `OpRef::Const{Int,Float,Ptr}(const_index)` when advancing past
-    /// `Forwarded::Box(const_box)`.
-    pub fn new_const_with_index(value: Value, const_index: u32) -> Self {
-        let type_ = value.get_type();
-        Self(Rc::new(Box {
-            type_,
-            kind: BoxKind::Const {
-                value,
-                const_index: Some(const_index),
-            },
+            kind: BoxKind::Const { value },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
             inputarg_handle: RefCell::new(None),
@@ -312,17 +276,18 @@ impl BoxRef {
     }
 
     /// Bind this Box to its corresponding `Op` so subsequent
-    /// `set_forwarded_*` / `clear_forwarded` calls dual-write through to
-    /// `op.forwarded`. Stores a `Weak<Op>` to avoid an Rc cycle. Called by
+    /// `set_forwarded_*` / `clear_forwarded` calls write through to
+    /// `op.forwarded` (the canonical host; there is no Box-side mirror).
+    /// Stores a `Weak<Op>` to avoid an Rc cycle. Called by
     /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
     /// if called on a non-ResOp Box.
     ///
-    /// Late-binding carry-over: at bind time the `Box`'s forwarded state
-    /// becomes the source of truth for the bound `Op`. Copy `Box.forwarded`
-    /// into `op.forwarded` unconditionally — including when the box is
-    /// `Forwarded::None` — so any stale forwarding the `OpRc` happened to
-    /// carry (e.g. from a clone path) is overwritten and post-bind
-    /// `get_forwarded` reads exactly what the writer set.
+    /// Late-binding carry-over: at bind time the box's effective forwarded
+    /// state (`self.get_forwarded()`) becomes the source of truth for the
+    /// bound `Op`. Copy it into `op.forwarded` unconditionally — including
+    /// when it is `Forwarded::None` — so any stale forwarding the `OpRc`
+    /// happened to carry (e.g. from a clone path) is overwritten and
+    /// post-bind `get_forwarded` reads exactly what the writer set.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
@@ -351,10 +316,10 @@ impl BoxRef {
     /// `Weak<InputArg>` so subsequent `set_forwarded_*` / `clear_forwarded`
     /// route through `inputarg.forwarded` (`resoperation.py:700
     /// AbstractInputArg._forwarded`). Panics if called on a non-InputArg
-    /// box. Late-binding carry-over: `Box.forwarded` is copied into
-    /// `inputarg.forwarded` unconditionally so any forwarding written
-    /// before bind survives the handoff and post-bind readers see what
-    /// was set.
+    /// box. Late-binding carry-over: the effective forwarded state
+    /// (`self.get_forwarded()`) is copied into `inputarg.forwarded`
+    /// unconditionally so any forwarding written before bind survives the
+    /// handoff and post-bind readers see what was set.
     pub fn bind_inputarg(&self, ia: &crate::value::InputArgRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::InputArg { .. }),
@@ -378,46 +343,18 @@ impl BoxRef {
             .and_then(|w| w.upgrade())
     }
 
-    /// Extract the `const_index` field for chain-walker reconstruction.
-    /// Returns `None` for non-Const boxes and for Consts created via
-    /// `new_const` (no index in scope).
-    pub fn const_index(&self) -> Option<u32> {
-        match &self.0.kind {
-            BoxKind::Const { const_index, .. } => *const_index,
-            _ => None,
-        }
-    }
-
-    /// New `Const*` Box carrying an explicit `source_opref`. Used when
-    /// the caller already holds the constant's OpRef (inline-Const
-    /// variant or legacy pool-indexed). Adapts to the `const_index`
-    /// field internally.
-    pub fn new_const_from_opref(value: Value, source_opref: OpRef) -> Self {
-        debug_assert!(
-            source_opref.is_constant(),
-            "BoxRef::new_const_from_opref: source_opref must be a Const variant, got {source_opref:?}"
-        );
-        match source_opref {
-            OpRef::ConstInt(_) | OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => {
-                Self::new_const_with_index(value, source_opref.const_index())
-            }
-            _ => Self::new_const(value),
-        }
-    }
-
     /// Return the source OpRef the Const Box was constructed from.
-    /// Returns `None` for non-Const boxes.
+    /// Returns `None` for non-Const boxes. The Const carries its value
+    /// directly (history.py:227/268/314), so reconstruction is the inline
+    /// variant.
     pub fn source_opref(&self) -> Option<OpRef> {
         match &self.0.kind {
-            BoxKind::Const { value, const_index } => {
-                let opref = match const_index {
-                    Some(idx) => OpRef::const_typed(*idx, value.get_type()),
-                    None => match value {
-                        Value::Int(v) => OpRef::const_int_inline(*v),
-                        Value::Float(v) => OpRef::const_float_inline(*v),
-                        Value::Ref(v) => OpRef::const_ptr_inline(*v),
-                        Value::Void => OpRef::None,
-                    },
+            BoxKind::Const { value } => {
+                let opref = match value {
+                    Value::Int(v) => OpRef::const_int(*v),
+                    Value::Float(v) => OpRef::const_float(*v),
+                    Value::Ref(v) => OpRef::const_ptr(*v),
+                    Value::Void => OpRef::None,
                 };
                 Some(opref)
             }
@@ -633,10 +570,8 @@ impl BoxRef {
     /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
     /// `box.set_forwarded(constbox)` is well-typed; here it terminates
     /// the chain in a value-typed payload rather than allocating a
-    /// `BoxKind::Const` carrier. `const_index` is the pyre-side sidecar
-    /// for `box_to_opref` OpRef reconstruction; pass `None` when the
-    /// const has no const-namespace OpRef (PyPy parity site).
-    pub fn set_forwarded_const(&self, value: Const, const_index: Option<u32>) {
+    /// `BoxKind::Const` carrier.
+    pub fn set_forwarded_const(&self, value: Const) {
         // Same Const-as-source invariant as the other set_forwarded_*
         // variants — Const has no `_forwarded` slot per PyPy.
         assert!(
@@ -644,7 +579,7 @@ impl BoxRef {
             "set_forwarded_const on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        self.write_forwarded(Forwarded::Const(value, const_index));
+        self.write_forwarded(Forwarded::Const(value));
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
@@ -811,21 +746,15 @@ impl BoxRef {
                     };
                     cur = BoxRef::from_bound_inputarg(&ia_rc);
                 }
-                Forwarded::Const(c, idx) => {
+                Forwarded::Const(c) => {
                     if not_const {
                         return cur;
                     }
                     // Materialize a terminal Const-bearing BoxRef so
-                    // legacy callers that expect `.const_value()` /
-                    // `BoxKind::Const` on the walker output keep
-                    // working until the BoxRef return type itself is
-                    // retired. Index sidecar round-trips so
-                    // `box_to_opref` can rebuild
-                    // `OpRef::Const{Int,Float,Ptr}(idx)`.
-                    return match idx {
-                        Some(i) => BoxRef::new_const_with_index(c.to_value(), i),
-                        None => BoxRef::new_const(c.to_value()),
-                    };
+                    // callers that expect `.const_value()` / `BoxKind::Const`
+                    // on the walker output keep working until the BoxRef
+                    // return type itself is retired.
+                    return BoxRef::new_const(c.to_value());
                 }
             }
         }
@@ -1364,9 +1293,9 @@ mod tests {
         assert!(a.int_bound_mut().is_none());
     }
 
-    /// After `bind_op`, `set_forwarded_*` dual-writes through
-    /// to `op.forwarded`, so a reader on `op.forwarded` sees the same
-    /// state as `box.get_forwarded()`.
+    /// After `bind_op`, `set_forwarded_*` writes through to
+    /// `op.forwarded` (the single canonical host), so a reader on
+    /// `op.forwarded` sees the same state as `box.get_forwarded()`.
     #[test]
     fn bind_op_makes_set_forwarded_dual_write_to_op() {
         use crate::resoperation::{Op, OpCode};
@@ -1423,7 +1352,7 @@ mod tests {
 
     /// After `bind_inputarg`, `set_forwarded_*` writes through to
     /// `inputarg.forwarded` and `get_forwarded` reads from it — same
-    /// dual-write invariant established for ResOp.
+    /// single-canonical-host invariant established for ResOp.
     #[test]
     fn bind_inputarg_makes_set_forwarded_dual_write_to_inputarg() {
         use crate::value::InputArg;

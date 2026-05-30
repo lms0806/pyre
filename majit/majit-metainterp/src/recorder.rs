@@ -1160,7 +1160,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         // Simulate a pooled constant reference.
-        let const_ref = OpRef::const_int_inline(0);
+        let const_ref = OpRef::const_int(0);
         let add = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
 
         rec.close_loop(&[add]);
@@ -1176,7 +1176,7 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
-        let const_ref = OpRef::const_int_inline(1);
+        let const_ref = OpRef::const_int(1);
         let add1 = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
         let add2 = rec.record_op(OpCode::IntAdd, &[add1, const_ref]);
 

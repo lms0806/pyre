@@ -125,7 +125,7 @@ impl OptIntBounds {
     /// so cache keys silently key-mismatch.
     ///
     /// Mint via `make_constant_int` (constant namespace, inline-Const
-    /// variant `OpRef::ConstIntInline(value)` per history.py:227).
+    /// variant `OpRef::ConstInt(value)` per history.py:227).
     /// Constants minted at this site land in a namespace disjoint from
     /// any op/inputarg Box family, so no aliasing hazard remains.
     fn get_or_make_const(&self, value: i64, ctx: &mut OptContext) -> OpRef {

@@ -4546,11 +4546,7 @@ mod tests {
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![
-                OpRef::const_int_inline(42),
-                OpRef::int_op(1),
-                OpRef::int_op(2),
-            ],
+            vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
@@ -4590,11 +4586,7 @@ mod tests {
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![
-                OpRef::const_int_inline(42),
-                OpRef::int_op(1),
-                OpRef::int_op(2),
-            ],
+            vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
@@ -4796,7 +4788,7 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int_inline(99).into()],
+                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(99).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
@@ -4858,7 +4850,7 @@ mod tests {
             0,
             8,
             vec![
-                OpRef::const_int_inline(42),
+                OpRef::const_int(42),
                 OpRef::int_op(1),
                 OpRef::ref_op(2),
                 OpRef::int_op(3),

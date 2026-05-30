@@ -216,7 +216,7 @@ impl Guard {
         let ncp = next_const_pos;
         let cv = const_values;
         let ops = var.get_operations(|value| {
-            let cref = OpRef::const_int_inline(value);
+            let cref = OpRef::const_int(value);
             *ncp += 1;
             cv.insert(cref, value);
             cref
@@ -592,7 +592,7 @@ impl GuardStrengthenOpt {
                         let ncp = &mut self.next_const_pos;
                         let cv = &mut self.const_values;
                         let result = index_var.emit_operations(&mut self._newoperations, |value| {
-                            let cref = OpRef::const_int_inline(value);
+                            let cref = OpRef::const_int(value);
                             *ncp += 1;
                             cv.insert(cref, value);
                             cref

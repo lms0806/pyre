@@ -17,6 +17,35 @@ use crate::r#box::BoxRef;
 /// is still pending.
 pub type History = crate::trace_ctx::TraceCtx;
 
+/// Stateless `SameConstantOracle` resolving operands purely from the
+/// inline-Const OpRef variants (`history.py:227/268/314` `.value`), with
+/// no constant pool. Line-for-line mirror of `ConstantPool::same_constant`
+/// (history.py:251 ConstInt / :292 ConstFloat / :338 ConstPtr): reject
+/// non-constants, `is`-equal short-circuit, disjoint-subclass type check
+/// (history.py:220/261/307), then value compare. The value resolution
+/// reads `inline_const_to_value` instead of the pool, so it is identical
+/// to the pool method for inline operands — the only operands the recorder
+/// produces.
+pub struct ConstOprefOracle;
+
+impl majit_trace::heapcache::SameConstantOracle for ConstOprefOracle {
+    fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+        if !a.is_constant() || !b.is_constant() {
+            return false;
+        }
+        if a == b {
+            return true;
+        }
+        if a.ty() != b.ty() {
+            return false;
+        }
+        match (a.inline_const_to_value(), b.inline_const_to_value()) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 /// Cut position for a materialized `TreeLoop`.
 ///
 /// RPython's byte-stream opencoder uses the full 5-tuple cut point, but the
@@ -1242,7 +1271,7 @@ mod tests {
     fn test_check_consistency_const_arg_ok() {
         // history.py:580: constants are always valid args
         let inputargs = vec![InputArg::new_int(0)];
-        let const_ref = OpRef::const_int_inline(0);
+        let const_ref = OpRef::const_int(0);
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
         op0.pos.set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop(1)])];
@@ -1294,7 +1323,7 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.setfailargs(smallvec::smallvec![OpRef::const_int_inline(0)]);
+        guard.setfailargs(smallvec::smallvec![OpRef::const_int(0)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1511,7 +1540,7 @@ mod tests {
         op0.pos.set(iop(1));
         ops.push(op0);
         // post-cut: uses a constant
-        let const_ref = OpRef::const_int_inline(0);
+        let const_ref = OpRef::const_int(0);
         let mut op1 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
         op1.pos.set(iop(2));
         ops.push(op1);
@@ -1718,7 +1747,6 @@ mod tests {
 use crate::call_descr::{
     EffectInfoSlot, make_call_descr_from_target_slot, make_call_may_force_descr,
 };
-use crate::constant_pool::ConstantPool;
 use crate::jitdriver::JitDriverStaticData;
 use crate::recorder::{Trace, TracePosition};
 use crate::trace_ctx::TraceCtx;
@@ -1797,7 +1825,7 @@ impl TraceCtx {
         // RPython box-getref-base invariant where the two boxes share
         // `getref_base()`.
         let new_ptr_for_const = if newbox.is_constant() {
-            self.constants.raw_bits(newbox).map(|v| v as usize)
+            newbox.inline_const_bits().map(|v| v as usize)
         } else {
             None
         };
@@ -1823,7 +1851,7 @@ impl TraceCtx {
 
     /// Record a regular IR operation.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
-        Self::do_record_op(&mut self.recorder, &self.constants, opcode, args)
+        Self::do_record_op(&mut self.recorder, opcode, args)
     }
 
     /// Record an operation with a descriptor (e.g., calls).
@@ -1833,7 +1861,7 @@ impl TraceCtx {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
-        Self::do_record_op_with_descr(&mut self.recorder, &self.constants, opcode, args, descr)
+        Self::do_record_op_with_descr(&mut self.recorder, opcode, args, descr)
     }
 
     /// Record a guard with auto-generated FailDescr.
@@ -2044,7 +2072,7 @@ impl TraceCtx {
 
     /// Look up a constant value by its OpRef (>= 10_000).
     pub fn constant_value(&self, opref: OpRef) -> Option<i64> {
-        self.constants.raw_bits(opref)
+        opref.inline_const_bits()
     }
 
     /// `history.py:204` `Const.same_constant`-adjacent typed reader.
@@ -2052,9 +2080,10 @@ impl TraceCtx {
     /// `OpRef`.  convergence path: every `constant_value` /
     /// `raw_bits` consumer that needs to distinguish primitive types
     /// (rather than treat them all as `i64`) should migrate here.
-    /// Internally identical to [`ConstantPool::get_value`].
+    /// The typed value is carried inline on the constant `OpRef`'s
+    /// variant tag (`history.py:227/268/314`).
     pub fn constant_typed_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
-        self.constants.get_value(opref)
+        opref.inline_const_to_value()
     }
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
@@ -2066,7 +2095,7 @@ impl TraceCtx {
     /// no longer used.
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let _ = num_live;
-        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, None)
+        Self::do_record_guard(&mut self.recorder, opcode, args, None)
     }
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
@@ -2090,7 +2119,7 @@ impl TraceCtx {
         args: &[OpRef],
         fail_arg_types: Vec<Type>,
     ) -> OpRef {
-        let opref = Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, None);
+        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
         self.recorder.set_last_op_fail_arg_types(fail_arg_types);
         opref
     }
@@ -2127,18 +2156,12 @@ impl TraceCtx {
     // `rpython-trace-jitcode-hidden-candle.md` plan (Step 3–5) for the
     // route.
 
-    pub(crate) fn do_record_op(
-        recorder: &mut Trace,
-        _constants: &ConstantPool,
-        opcode: OpCode,
-        args: &[OpRef],
-    ) -> OpRef {
+    pub(crate) fn do_record_op(recorder: &mut Trace, opcode: OpCode, args: &[OpRef]) -> OpRef {
         recorder.record_op(opcode, args)
     }
 
     pub(crate) fn do_record_op_with_descr(
         recorder: &mut Trace,
-        _constants: &ConstantPool,
         opcode: OpCode,
         args: &[OpRef],
         descr: DescrRef,
@@ -2148,7 +2171,6 @@ impl TraceCtx {
 
     pub(crate) fn do_record_guard(
         recorder: &mut Trace,
-        _constants: &ConstantPool,
         opcode: OpCode,
         args: &[OpRef],
         descr: Option<DescrRef>,
@@ -2156,29 +2178,19 @@ impl TraceCtx {
         recorder.record_guard(opcode, args, descr)
     }
 
-    pub(crate) fn do_close_loop(
-        recorder: &mut Trace,
-        _constants: &ConstantPool,
-        jump_args: &[OpRef],
-    ) {
+    pub(crate) fn do_close_loop(recorder: &mut Trace, jump_args: &[OpRef]) {
         recorder.close_loop(jump_args);
     }
 
     pub(crate) fn do_close_loop_with_descr(
         recorder: &mut Trace,
-        _constants: &ConstantPool,
         jump_args: &[OpRef],
         descr: Option<DescrRef>,
     ) {
         recorder.close_loop_with_descr(jump_args, descr);
     }
 
-    pub(crate) fn do_finish(
-        recorder: &mut Trace,
-        _constants: &ConstantPool,
-        finish_args: &[OpRef],
-        descr: DescrRef,
-    ) {
+    pub(crate) fn do_finish(recorder: &mut Trace, finish_args: &[OpRef], descr: DescrRef) {
         recorder.finish(finish_args, descr);
     }
 
@@ -2200,19 +2212,19 @@ impl TraceCtx {
     /// pyjitpl.py:3188-3190 `history.record1(rop.JUMP, ..., descr=ptoken)` —
     /// close the loop with an implicit no-descr JUMP.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
-        Self::do_close_loop(&mut self.recorder, &self.constants, jump_args);
+        Self::do_close_loop(&mut self.recorder, jump_args);
     }
 
     /// pyjitpl.py:3188-3190 close-loop variant with an explicit JUMP
     /// descriptor (tentative target token recorded before compile_trace).
     pub fn close_loop_with_descr(&mut self, jump_args: &[OpRef], descr: Option<DescrRef>) {
-        Self::do_close_loop_with_descr(&mut self.recorder, &self.constants, jump_args, descr);
+        Self::do_close_loop_with_descr(&mut self.recorder, jump_args, descr);
     }
 
     /// pyjitpl.py:1637 `history.record1(rop.FINISH, ..., descr=token)` —
     /// finalize a non-looping trace with explicit FailDescr.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
-        Self::do_finish(&mut self.recorder, &self.constants, finish_args, descr);
+        Self::do_finish(&mut self.recorder, finish_args, descr);
     }
 
     /// Consume the TraceCtx and return the completed `TreeLoop`.
@@ -2276,12 +2288,7 @@ impl TraceCtx {
     /// Record a FINISH op with a single result value.
     /// pyjitpl.py:1637 history.record1(rop.FINISH, ..., descr=token)
     pub fn record_finish(&mut self, result: OpRef, _tp: Type) {
-        Self::do_record_op(
-            &mut self.recorder,
-            &self.constants,
-            OpCode::Finish,
-            &[result],
-        );
+        Self::do_record_op(&mut self.recorder, OpCode::Finish, &[result]);
     }
 
     /// pyjitpl.py:2789-2791 `blackhole_if_trace_too_long` check:
@@ -2358,11 +2365,8 @@ impl TraceCtx {
         if (opref.raw() as usize) < self.recorder.num_inputargs() {
             return Some(self.recorder.inputarg_types()[opref.raw() as usize]);
         }
-        if opref.is_constant() {
-            if let Some(tp) = self.constants.constant_type(opref) {
-                return Some(tp);
-            }
-        }
+        // A constant carries its type on its variant tag, already consulted
+        // above via `opref.ty()`; no separate constant-type lookup is needed.
         // Untyped-OpRef fallback: `opref.ty()` returned None above, so a
         // variant-aware `get_op_by_pos` would never match a typed
         // `op.pos`. Look the op up by raw position only — once the
@@ -2610,7 +2614,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
@@ -2624,10 +2628,9 @@ impl TraceCtx {
         // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
         // those branches.
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -2663,7 +2666,7 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
@@ -2671,10 +2674,9 @@ impl TraceCtx {
         // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
         // `call_typed` for the full rationale): invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -2747,7 +2749,7 @@ impl TraceCtx {
             effect_info.check_is_elidable() && !effect_info.check_can_raise(false),
             "call_typed_with_effect_pure requires EF_ELIDABLE_CANNOT_RAISE"
         );
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = Vec::with_capacity(args.len() + 1);
@@ -2763,10 +2765,9 @@ impl TraceCtx {
         // pyjitpl.py:2683-2684 _record_helper_varargs heap invalidation parity:
         // invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -2822,16 +2823,16 @@ impl TraceCtx {
         // pyjitpl.py:3562-3565: check if all args are Const
         let all_const = normargboxes
             .iter()
-            .all(|arg| self.constants.get_value(*arg).is_some());
+            .all(|arg| arg.inline_const_to_value().is_some());
         if all_const {
             // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
             // history.py:227/268/314 — Const{Int,Float,Ptr}.value inline.
             let const_opref = match resbox_as_const {
-                Value::Int(v) => OpRef::const_int_inline(v),
-                Value::Float(v) => OpRef::const_float_inline(v),
-                Value::Ref(r) => OpRef::const_ptr_inline(r),
-                Value::Void => OpRef::const_int_inline(0),
+                Value::Int(v) => OpRef::const_int(v),
+                Value::Float(v) => OpRef::const_float(v),
+                Value::Ref(r) => OpRef::const_ptr(r),
+                Value::Void => OpRef::const_int(0),
             };
             return const_opref;
         }
@@ -2879,8 +2880,8 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) {
-        let cond_ref = OpRef::const_int_inline(condition);
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let cond_ref = OpRef::const_int(condition);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
         let mut call_args = vec![cond_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2897,8 +2898,8 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        let value_ref = OpRef::const_int_inline(value);
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let value_ref = OpRef::const_int(value);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2925,9 +2926,9 @@ impl TraceCtx {
         slot: EffectInfoSlot,
     ) -> OpRef {
         // history.py:314 ConstPtr.value inline (Slice 7b op-graph walker
-        // forwards `OpRef::ConstPtrInline(GcRef)` slots in `op.args`).
-        let value_ref = OpRef::const_ptr_inline(majit_ir::GcRef(value as usize));
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        // forwards `OpRef::ConstPtr(GcRef)` slots in `op.args`).
+        let value_ref = OpRef::const_ptr(majit_ir::GcRef(value as usize));
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -2985,12 +2986,12 @@ impl TraceCtx {
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
         // Slice 7b op-graph walker forwards Ref slots.
         let result_ref = match result_type {
-            Type::Int => OpRef::const_int_inline(result_value),
-            Type::Float => OpRef::const_float_inline(f64::from_bits(result_value as u64)),
-            Type::Ref => OpRef::const_ptr_inline(majit_ir::GcRef(result_value as usize)),
-            Type::Void => OpRef::const_int_inline(0),
+            Type::Int => OpRef::const_int(result_value),
+            Type::Float => OpRef::const_float(f64::from_bits(result_value as u64)),
+            Type::Ref => OpRef::const_ptr(majit_ir::GcRef(result_value as usize)),
+            Type::Void => OpRef::const_int(0),
         };
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
         let mut call_args = vec![result_ref, func_ref];
         call_args.extend_from_slice(args);
@@ -3162,7 +3163,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
@@ -3179,10 +3180,9 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -3228,7 +3228,7 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
         let mut call_args = vec![func_ref];
@@ -3239,10 +3239,9 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -3383,8 +3382,8 @@ impl TraceCtx {
         let _ = func_ptr;
         // history.py:227 ConstInt.value inline for saveerr flags + static
         // function pointer.
-        let savebox = OpRef::const_int_inline(saveerr as i64);
-        let funcbox = OpRef::const_int_inline(realfuncaddr as i64);
+        let savebox = OpRef::const_int(saveerr as i64);
+        let funcbox = OpRef::const_int(realfuncaddr as i64);
 
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
@@ -3403,10 +3402,9 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -3443,7 +3441,7 @@ impl TraceCtx {
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
     ) {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(Type::Void);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
@@ -3456,10 +3454,9 @@ impl TraceCtx {
         // canonical heap_cache.invalidate_caches_varargs BEFORE the
         // history record.
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -3680,7 +3677,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         // RPython `heapcache.py:629-639` keys by descriptor identity
@@ -3708,10 +3705,9 @@ impl TraceCtx {
         // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -3930,7 +3926,7 @@ impl TraceCtx {
         effect_info: majit_ir::EffectInfo,
         concrete_resvalue: i64,
     ) -> OpRef {
-        let func_ref = OpRef::const_int_inline(func_ptr as usize as i64);
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
@@ -3950,10 +3946,9 @@ impl TraceCtx {
         // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
-            self.constants.refresh_from_gc();
-            let constants = &self.constants;
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-            let const_value = |opref| match constants.get_value(opref) {
+            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+                &crate::history::ConstOprefOracle;
+            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
@@ -4028,10 +4023,9 @@ impl TraceCtx {
         // opnum of the recorded op.  Match upstream by passing the
         // result-typed CALL_MAY_FORCE_* opnum to the invalidation call.
         let result = self.record_op_with_descr(opcode, args, descr);
-        self.constants.refresh_from_gc();
-        let constants = &self.constants;
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-        let const_value = |opref| match constants.get_value(opref) {
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            &crate::history::ConstOprefOracle;
+        let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
@@ -4097,10 +4091,9 @@ impl TraceCtx {
             crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
         let opcode = OpCode::call_assembler_for_type(result_type);
         let result = self.record_op_with_descr(opcode, args, descr);
-        self.constants.refresh_from_gc();
-        let constants = &self.constants;
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
-        let const_value = |opref| match constants.get_value(opref) {
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            &crate::history::ConstOprefOracle;
+        let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };

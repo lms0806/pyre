@@ -481,7 +481,7 @@ impl PtrInfo {
     /// must walk the actual `OpRef` / `GcRef` slots explicitly.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+            if let Some(slot) = opref.as_const_ptr_mut() {
                 visitor(slot);
             }
         }

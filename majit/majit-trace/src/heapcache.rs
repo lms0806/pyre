@@ -1015,9 +1015,7 @@ impl HeapCache {
     /// ```
     ///
     /// pyre additionally remembers the concrete class pointer when this
-    /// layer can decode it. The HF_KNOWN_CLASS flag itself must still be set
-    /// for legacy pool-indexed ConstInt guards whose value is not available
-    /// inside heapcache.py's notify path.
+    /// layer can decode it.
     pub fn class_now_known_maybe(&mut self, opref: OpRef, class: Option<i64>) {
         if opref.is_constant() {
             return;
@@ -1066,7 +1064,7 @@ impl HeapCache {
         self.known_class.get(opref.raw() as usize).and_then(|v| *v)
     }
 
-    /// Forward every inline `OpRef::ConstPtrInline(GcRef)` cached as a
+    /// Forward every inline `OpRef::ConstPtr(GcRef)` cached as a
     /// *value* so it survives a moving minor collection. history.py:314
     /// `ConstPtr.value` is a gcref field the Python GC traces through the
     /// box object graph; pyre caches the inline gcref in plain `OpRef`
@@ -1082,7 +1080,7 @@ impl HeapCache {
     /// in-place key rewrite would break the sorted-`VecMap` ordering.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(gcref) = slot.as_const_ptr_inline_mut() {
+            if let Some(gcref) = slot.as_const_ptr_mut() {
                 visitor(gcref);
             }
         }
@@ -2176,8 +2174,8 @@ mod tests {
     #[test]
     fn unique_const_heuristic_canonicalises_to_last_via_same_constant() {
         let mut entry = CacheEntry::new();
-        let a = OpRef::const_ptr_inline(majit_ir::GcRef(0xA000));
-        let b = OpRef::const_ptr_inline(majit_ir::GcRef(0xB000));
+        let a = OpRef::const_ptr(majit_ir::GcRef(0xA000));
+        let b = OpRef::const_ptr(majit_ir::GcRef(0xB000));
         let oracle = FixedSameConstantOracle {
             same_pairs: vec![(a, b)],
         };
@@ -2202,7 +2200,7 @@ mod tests {
     fn unique_const_heuristic_skips_non_ref_constants() {
         let mut entry = CacheEntry::new();
         let oracle = FixedSameConstantOracle { same_pairs: vec![] };
-        let ci = OpRef::const_int_inline(42);
+        let ci = OpRef::const_int(42);
         assert_eq!(entry._unique_const_heuristic(ci, &oracle), ci);
         assert!(entry.last_const_box.is_none());
     }
@@ -2395,23 +2393,11 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_guard_class_marks_known_for_legacy_constint() {
-        let mut cache = HeapCache::new();
-        let obj = OpRef::ref_op(3);
-        let cls = OpRef::const_int(7);
-
-        cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
-
-        assert!(cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), None);
-    }
-
-    #[test]
     fn test_notify_guard_class_preserves_inline_class_value() {
         let mut cache = HeapCache::new();
         let obj = OpRef::ref_op(3);
         let cls_val = 0xCAFE_i64;
-        let cls = OpRef::const_int_inline(cls_val);
+        let cls = OpRef::const_int(cls_val);
 
         cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
 
@@ -2421,12 +2407,12 @@ mod tests {
 
     #[test]
     fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
-        // history.py:314 parity: a ConstPtrInline cached as a replacement
+        // history.py:314 parity: a ConstPtr cached as a replacement
         // value must survive a moving minor collection. Forward it and read
         // back through maybe_replace_with_const.
         let mut cache = HeapCache::new();
         let old = OpRef::ref_op(3);
-        let new = OpRef::const_ptr_inline(GcRef(0x1000));
+        let new = OpRef::const_ptr(GcRef(0x1000));
         cache.replace_box(old, new);
         assert_eq!(cache.maybe_replace_with_const(old), new);
 
@@ -2436,7 +2422,7 @@ mod tests {
 
         assert_eq!(
             cache.maybe_replace_with_const(old),
-            OpRef::const_ptr_inline(GcRef(0x1_1000))
+            OpRef::const_ptr(GcRef(0x1_1000))
         );
     }
 
@@ -2445,10 +2431,10 @@ mod tests {
         // Cache *keys* are intentionally not forwarded: an in-place key
         // rewrite would break the sorted-VecMap ordering, and a stale key
         // simply misses + repopulates (the live lookup arrives already
-        // forwarded). A `ConstPtrInline` object used as a `cache_anything`
+        // forwarded). A `ConstPtr` object used as a `cache_anything`
         // key must therefore stay at its pre-collection address.
         let mut cache = HeapCache::new();
-        let const_obj = OpRef::const_ptr_inline(GcRef(0x2000));
+        let const_obj = OpRef::const_ptr(GcRef(0x2000));
         let field = 7;
         // A non-const cached value so the walk leaves the value slot alone
         // and the assertions isolate the key's address.
@@ -2465,11 +2451,7 @@ mod tests {
         );
         // ...and was NOT re-keyed to the forwarded address.
         assert_eq!(
-            cache.getfield_cached(
-                OpRef::const_ptr_inline(GcRef(0x1_2000)),
-                field,
-                IDENTITY_ORACLE
-            ),
+            cache.getfield_cached(OpRef::const_ptr(GcRef(0x1_2000)), field, IDENTITY_ORACLE),
             None
         );
     }
@@ -2587,7 +2569,7 @@ mod tests {
     fn test_replace_box_marks_old_as_const() {
         let mut cache = HeapCache::new();
         let old = OpRef::ref_op(5);
-        let new = OpRef::const_ptr_inline(majit_ir::GcRef(0xDEAD));
+        let new = OpRef::const_ptr(majit_ir::GcRef(0xDEAD));
 
         cache.arraylen_now_known(old, old);
         cache.replace_box(old, new);

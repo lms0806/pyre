@@ -386,7 +386,7 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
         for slot in map.iter_mut() {
             if let Some(boxes) = slot {
                 for sb in boxes {
-                    if let majit_ir::OpRef::ConstPtrInline(gcref) = sb.opref {
+                    if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
                         if !gcref.is_null() {
                             slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                         }
@@ -472,9 +472,9 @@ fn snapshot_map_from_trace_snapshots(
                 // history.py:227/268/314 `Const{Int,Float,Ptr}.value` is
                 // inline on the Box itself; mint the inline-Const OpRef
                 // directly so the value travels on the OpRef into resume
-                // numbering. The legacy pool-indexed Const path required
-                // `OptContext::const_pool` seeding from `constants`, which
-                // Slice 6 retired (see
+                // numbering. The former pool-indexed Const path required
+                // `OptContext::const_pool` seeding from `constants`, now
+                // retired (see
                 // `merge_backend_constants_from_ctx`'s `const_pool.is_empty()`
                 // assert) — without seeding, the encoder's
                 // `OptBoxEnv::get_const` fallthrough resolved a Ref-typed
@@ -1022,7 +1022,7 @@ pub struct MetaInterp<M: Clone> {
     /// invalidation flag on each dep. Cleared on each compile attempt.
     pub last_quasi_immutable_deps: Vec<(u64, u32)>,
     /// Addresses of live `SnapshotBox.opref` slots containing
-    /// `OpRef::ConstPtrInline` during compilation. RPython traces the
+    /// `OpRef::ConstPtr` during compilation. RPython traces the
     /// `ConstPtr.value` field in place; pyre's root walker follows these
     /// slots directly so a moving GC updates the snapshot boxes the optimizer
     /// will read.
@@ -1306,18 +1306,18 @@ pub struct JitHooks {
 /// framework.py `root_walker.walk_roots` per-op helper: visit every
 /// inline `ConstPtr.value` slot stored in `op.args` and `op.fail_args`.
 /// history.py:314 `ConstPtr.value` is inline on the Box object; pyre
-/// stores it inline on `OpRef::ConstPtrInline(GcRef)` so each `&mut
+/// stores it inline on `OpRef::ConstPtr(GcRef)` so each `&mut
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
 fn walk_op_const_ptr_refs(op: &mut Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args.borrow_mut().iter_mut() {
-        if let Some(slot) = arg.as_const_ptr_inline_mut() {
+        if let Some(slot) = arg.as_const_ptr_mut() {
             visitor(slot);
         }
     }
     if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
         for arg in fail_args.iter_mut() {
-            if let Some(slot) = arg.as_const_ptr_inline_mut() {
+            if let Some(slot) = arg.as_const_ptr_mut() {
                 visitor(slot);
             }
         }
@@ -1390,7 +1390,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed
-    /// retrace state. Every `OpRef::ConstPtrInline(GcRef)` appearing
+    /// retrace state. Every `OpRef::ConstPtr(GcRef)` appearing
     /// in `partial.ops[i].args[j]` (or `fail_args[j]`) carries an
     /// inline Ref per history.py:314 `ConstPtr.value`. RPython's
     /// `TreeLoop.operations` (`history.py:508`) is walked through the
@@ -1412,7 +1412,7 @@ impl<M: Clone> MetaInterp<M> {
     /// (`pyjitpl.py:1607 self.history = History()`) holds the in-progress
     /// `TreeLoop.operations` and is traced through the Python object
     /// graph automatically.  pyre's recorder stores ops as
-    /// `Vec<Op>` in Rust memory, so any `OpRef::ConstPtrInline(GcRef)`
+    /// `Vec<Op>` in Rust memory, so any `OpRef::ConstPtr(GcRef)`
     /// stored in `op.args[j]` or `op.fail_args[j]` (history.py:314
     /// `ConstPtr.value`) needs explicit walking to survive minor
     /// collection.
@@ -1423,7 +1423,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         // pyjitpl.py:2451 `self.framestack` — `MIFrame.copy_constants()`
         // (frame.rs:404-407) stores `jitcode.constants_r` entries as
-        // `OpRef::ConstPtrInline(GcRef)` in `ref_regs`. history.py:314
+        // `OpRef::ConstPtr(GcRef)` in `ref_regs`. history.py:314
         // `ConstPtr.value` is an inline gcref field traced through the
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
@@ -1431,7 +1431,7 @@ impl<M: Clone> MetaInterp<M> {
         for frame in self.framestack.frames.iter_mut() {
             for slot in frame.ref_regs.iter_mut() {
                 if let Some(opref) = slot.as_mut() {
-                    if let Some(gcref) = opref.as_const_ptr_inline_mut() {
+                    if let Some(gcref) = opref.as_const_ptr_mut() {
                         visitor(gcref);
                     }
                 }
@@ -1446,18 +1446,18 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
         // constants into `initial_inputarg_consts`. Inline
-        // `ConstPtrInline(GcRef)` entries here live outside the op-graph
+        // `ConstPtr(GcRef)` entries here live outside the op-graph
         // and must be forwarded by the same GC walker — history.py:314
         // `ConstPtr.value` is a gcref attribute of the Box.
         for opref in trace_ctx.initial_inputarg_consts.iter_mut() {
-            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+            if let Some(slot) = opref.as_const_ptr_mut() {
                 visitor(slot);
             }
         }
         // heapcache.py:50-104 — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
         // consts (history.py:314 `ConstPtr.value`) those value slots can be
-        // `ConstPtrInline(GcRef)`; they are returned on cache hits and
+        // `ConstPtr(GcRef)`; they are returned on cache hits and
         // emitted into the op-graph, so a stale gcref is a use-after-move.
         // Forward them in place. (Cache *keys* are intentionally left stale —
         // a forwarded lookup key misses and repopulates, like
@@ -1473,7 +1473,7 @@ impl<M: Clone> MetaInterp<M> {
         // CALL_PURE recording.
     }
 
-    /// GC walker for ConstPtrInline GcRefs from snapshot maps during
+    /// GC walker for ConstPtr GcRefs from snapshot maps during
     /// compilation. Cleared after compilation completes.
     pub fn walk_compile_snapshot_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         for &slot_addr in &self.compile_snapshot_refs {
@@ -1483,7 +1483,7 @@ impl<M: Clone> MetaInterp<M> {
             // compilation is paused for GC, mirroring RPython's in-place field
             // update of `ConstPtr.value`.
             let opref = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
-            if let Some(gcref) = opref.as_const_ptr_inline_mut() {
+            if let Some(gcref) = opref.as_const_ptr_mut() {
                 visitor(gcref);
             }
         }
@@ -4080,12 +4080,12 @@ impl<M: Clone> MetaInterp<M> {
         // `pyjitpl.py:1823 assert box.getref_base() == lastbox.getref_base()`
         // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
         // alias boxes that share `getref_base()` but differ in box identity;
-        // an `OpRef`-identity assert would reject those.  Look up
-        // `virtual_obj`'s ref value through `ctx.constants` when it is a
+        // an `OpRef`-identity assert would reject those.  Read
+        // `virtual_obj`'s ref value off its variant tag when it is a
         // ConstPtr, falling back to the pre-pop side-table pointer that the
         // matching `opimpl_virtual_ref(virtual_obj, virtual_obj_ptr)`
         // recorded as `lastbox_ptr`.
-        let virtual_obj_ptr = match ctx.constants.get_value(virtual_obj) {
+        let virtual_obj_ptr = match virtual_obj.inline_const_to_value() {
             Some(Value::Ref(r)) => r.as_usize(),
             _ => lastbox_ptr,
         };
@@ -4260,7 +4260,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let constants = std::mem::take(&mut ctx.constants).into_inner();
+        let constants = majit_ir::VecAssoc::new();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
@@ -4385,21 +4385,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
     ) -> *const u8 {
         // history.py:314 ConstPtr.value lives inline on the OpRef
-        // (Slice 7 inline-Const cutover). The legacy
-        // `ctx.constants.get_value` pool lookup never sees these entries
-        // so it must be tried as a fallback only for legacy callers.
+        // (Slice 7 inline-Const cutover).
         driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx).copied())
-            .and_then(|const_ref| {
-                if let Some(gcref) = const_ref.as_const_ptr_inline() {
-                    return Some(gcref.0 as *const u8);
-                }
-                match ctx.constants.get_value(const_ref) {
-                    Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
-                    _ => None,
-                }
-            })
+            .and_then(|const_ref| const_ref.as_const_ptr())
+            .map(|gcref| gcref.0 as *const u8)
             .unwrap_or(std::ptr::null())
     }
 
@@ -4695,11 +4686,11 @@ impl<M: Clone> MetaInterp<M> {
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
         let trace_snapshots = preamble_data.base.snapshots().to_vec();
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
-        // sees the post-GC addresses for any object that moved since the last
-        // `get_or_insert_typed`.
-        ctx.constants.refresh_from_gc();
-        let mut constants = ctx.constants.into_inner_typed();
+        // The ConstantPool value map is empty in production (every
+        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
+        // carries constants in OpRef variants), so the typed egress is
+        // always empty.  Start the typed-constant map fresh.
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
@@ -5486,9 +5477,9 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        // history.py:220 box.type parity: ConstantPool stores typed
-        // `Value` intrinsically — the snapshot is the canonical shape.
-        let mut constants = ctx.constants.snapshot();
+        // The ConstantPool value map is empty in production, so the
+        // snapshot is always empty.  Start the typed-constant map fresh.
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -5727,9 +5718,9 @@ impl<M: Clone> MetaInterp<M> {
             });
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
-            // history.py:220 box.type parity: ConstantPool stores typed
-            // `Value` intrinsically — the snapshot is the canonical shape.
-            let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = ctx.constants.snapshot();
+            // The ConstantPool value map is empty in production, so the
+            // snapshot is always empty.  Start the typed-constant map fresh.
+            let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
             let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
@@ -6303,10 +6294,11 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
-        // sees the post-GC addresses for any object that moved.
-        ctx.constants.refresh_from_gc();
-        let mut constants = ctx.constants.into_inner_typed();
+        // The ConstantPool value map is empty in production (every
+        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
+        // carries constants in OpRef variants), so the typed egress is
+        // always empty.  Start the typed-constant map fresh.
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -6726,10 +6718,11 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
 
-        // Refresh shadow-stack-rooted Ref constants so `into_inner_typed`
-        // sees the post-GC addresses for any object that moved.
-        ctx.constants.refresh_from_gc();
-        let mut constants = ctx.constants.into_inner_typed();
+        // The ConstantPool value map is empty in production (every
+        // `get_or_insert{,_typed}` writer is test-only; S0 inline-Const
+        // carries constants in OpRef variants), so the typed egress is
+        // always empty.  Start the typed-constant map fresh.
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -9709,7 +9702,7 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py:124 frontend_boxes come directly from the guard
         // failure values in fail_arg_types order.
         self.pending_frontend_boxes = Some(fail_values.to_vec());
-        let compiled = match self.compiled_loops.get(&green_key) {
+        let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
                 // Source loop already evicted — bail out of the bridge
@@ -9783,26 +9776,6 @@ impl<M: Clone> MetaInterp<M> {
         // vinfo-bearing slot — a no-op for single-portal pyre and the
         // same shape `virtualizable_info()` already used.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(None);
-
-        // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
-        // references a parent-loop constant and a bridge that allocates
-        // a fresh one never land on the same "slot". majit's legacy
-        // idx-Const path uses per-trace, zero-based constant indices
-        // (ConstantPool), so a bridge's first legacy const_int returns
-        // idx 0 — the same index the parent loop used.
-        // `compile_entry_bridge` later
-        // copies the parent's `constant_types` into the bridge
-        // optimizer's type map (so shared parent-constant references
-        // type-check); that copy overwrites the bridge's own fresh type
-        // for the colliding index and `getintbound` panics with
-        // Int/Ref mismatch. Reserve bridge's pool past the parent's
-        // highest const index so every new allocation is disjoint.
-        if let Some((_, source_trace)) = Self::trace_for_exit(compiled, norm_tid) {
-            let max_const = source_trace.constants.keys().copied().max();
-            if let (Some(max), Some(ref mut ctx)) = (max_const, self.tracing.as_mut()) {
-                ctx.constants.reserve_index_past(max);
-            }
-        }
 
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
@@ -16056,7 +16029,7 @@ mod metainterp_static_data_tests {
         // ConstPtr / ConstFloat at this slot.
         let allboxes = [
             (JitArgKind::Int, OpRef::int_op(0), 0),
-            (JitArgKind::Int, OpRef::const_int_inline(0xfeed), 0xfeed),
+            (JitArgKind::Int, OpRef::const_int(0xfeed), 0xfeed),
         ];
         let _ = meta.do_recursive_call(&jd, &allboxes, descr_ref, &descr_view, 0, 0, false);
     }
@@ -17523,8 +17496,8 @@ mod tests {
         let op = mk_op(
             OpCode::PtrEq,
             &[
-                OpRef::const_ptr_inline(GcRef(0x4000)),
-                OpRef::const_ptr_inline(GcRef::NULL),
+                OpRef::const_ptr(GcRef(0x4000)),
+                OpRef::const_ptr(GcRef::NULL),
             ],
             10,
         );
@@ -17540,8 +17513,8 @@ mod tests {
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
-        assert_eq!(ops[0].arg(0).as_const_ptr_inline(), Some(GcRef(0x5000)));
-        assert_eq!(ops[0].arg(1).as_const_ptr_inline(), Some(GcRef(0x6000)));
+        assert_eq!(ops[0].arg(0).as_const_ptr(), Some(GcRef(0x5000)));
+        assert_eq!(ops[0].arg(1).as_const_ptr(), Some(GcRef(0x6000)));
     }
 
     #[test]
@@ -17553,8 +17526,8 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 11);
         guard.setfailargs(smallvec::smallvec![
-            OpRef::const_ptr_inline(GcRef(0x7000)),
-            OpRef::const_int_inline(123),
+            OpRef::const_ptr(GcRef(0x7000)),
+            OpRef::const_int(123),
         ]);
         meta.partial_trace = Some(PartialTrace {
             ops: vec![guard],
@@ -17569,25 +17542,22 @@ mod tests {
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
         let fail_args = ops[0].getfailargs().expect("guard has fail_args");
-        assert_eq!(fail_args[0].as_const_ptr_inline(), Some(GcRef(0x8000)));
+        assert_eq!(fail_args[0].as_const_ptr(), Some(GcRef(0x8000)));
         // Non-Ref inline-Const slots untouched.
-        assert_eq!(fail_args[1], OpRef::const_int_inline(123));
+        assert_eq!(fail_args[1], OpRef::const_int(123));
     }
 
     #[test]
     fn walk_active_trace_refs_forwards_inline_const_ptr() {
         // history.py:314 parity for the in-progress recorder: a
         // minor collection during tracing must forward inline
-        // `OpRef::ConstPtrInline(GcRef)` slots stored in the active
+        // `OpRef::ConstPtr(GcRef)` slots stored in the active
         // `Trace::ops` Vec.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
         trace_ctx.recorder.push_op_for_test(mk_op(
             OpCode::PtrEq,
-            &[
-                OpRef::const_ptr_inline(GcRef(0xA000)),
-                OpRef::input_arg_int(0),
-            ],
+            &[OpRef::const_ptr(GcRef(0xA000)), OpRef::input_arg_int(0)],
             5,
         ));
         meta.tracing = Some(trace_ctx);
@@ -17599,7 +17569,7 @@ mod tests {
         });
 
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
-        assert_eq!(ops[0].arg(0).as_const_ptr_inline(), Some(GcRef(0xB000)));
+        assert_eq!(ops[0].arg(0).as_const_ptr(), Some(GcRef(0xB000)));
     }
 
     #[test]

@@ -22,23 +22,11 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 /// constants (ConstFloat/ConstPtr) and box references fall through
 /// to the register form. PyPy reads `arg.getint()` directly because
 /// the int is inlined on `ConstInt` (history.py:227 `ConstInt.value`);
-/// pyre's inline-Const variant `OpRef::ConstIntInline` carries the i64
-/// on the OpRef itself, while the legacy `OpRef::ConstInt(idx)` form
-/// must look the value up through `val`. `ConstInt` always exposes a
-/// value (`arg.getint()` never fails), so a legacy pool-indexed
-/// `ConstInt` with no `val` is an invariant break, not a non-immediate.
-fn check_imm_box(arg: OpRef, val: Option<i64>) -> bool {
+/// pyre's inline-Const variant `OpRef::ConstInt` carries the i64
+/// on the OpRef itself (`arg.getint()` never fails).
+fn check_imm_box(arg: OpRef) -> bool {
     match arg {
-        OpRef::ConstIntInline(v) => v >= 0 && v < DEFAULT_IMM_SIZE,
-        OpRef::ConstInt(_) => {
-            let v = val.unwrap_or_else(|| {
-                panic!(
-                    "check_imm_box: legacy ConstInt {arg:?} missing from constants pool — \
-                     ConstInt always carries a value (regalloc.py:169 arg.getint())"
-                )
-            });
-            v >= 0 && v < DEFAULT_IMM_SIZE
-        }
+        OpRef::ConstInt(v) => v >= 0 && v < DEFAULT_IMM_SIZE,
         _ => false,
     }
 }
@@ -196,14 +184,8 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        // history.py:227 — inline-Const carries its value; only consult the
-        // legacy pool for `OpRef::ConstInt(_)` to avoid `.raw()` panic.
-        let rhs_val = if matches!(rhs, OpRef::ConstInt(_)) {
-            self.constants.get(&rhs.raw()).copied()
-        } else {
-            None
-        };
-        let imm_rhs = check_imm_box(rhs, rhs_val);
+        // history.py:227 — inline-Const carries its value directly.
+        let imm_rhs = check_imm_box(rhs);
         let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
         let rhs_loc = if imm_rhs {
             self.loc(rhs, Type::Int)
@@ -321,23 +303,9 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        // history.py:227 — inline-Const variants carry the value on the
-        // OpRef. `check_imm_box` short-circuits on inline-Const so `val`
-        // is only consulted for the legacy idx form; gate the
-        // `constants.get(&arg.raw())` lookup behind that to avoid
-        // `.raw()` panicking on inline-Const variants.
-        let lhs_val = if matches!(lhs, OpRef::ConstInt(_)) {
-            self.constants.get(&lhs.raw()).copied()
-        } else {
-            None
-        };
-        let rhs_val = if matches!(rhs, OpRef::ConstInt(_)) {
-            self.constants.get(&rhs.raw()).copied()
-        } else {
-            None
-        };
-        let imm_lhs = check_imm_box(lhs, lhs_val);
-        let imm_rhs = check_imm_box(rhs, rhs_val);
+        // history.py:227 — inline-Const variants carry the value on the OpRef.
+        let imm_lhs = check_imm_box(lhs);
+        let imm_rhs = check_imm_box(rhs);
         let (l0, l1) = if !imm_lhs && imm_rhs {
             let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
             let r1 = self.loc(rhs, Type::Int);

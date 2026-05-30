@@ -774,16 +774,15 @@ where
             let all_liveness = ctx.metainterp_sd().liveness_info.clone();
             // `pyjitpl.py:2610` `_snapshot_box_list` — clone the per-trace
             // virtualizable / virtualref boxes so the snapshot builder
-            // can read them without keeping a `&TraceCtx` borrow alive
-            // alongside `&mut ctx.constants`.  Both vectors are short
-            // (one per live `@jit.virtualizable`, two per live vref).
+            // can read them without keeping a `&TraceCtx` borrow alive.
+            // Both vectors are short (one per live `@jit.virtualizable`,
+            // two per live vref).
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
                 &all_liveness,
-                &mut ctx.constants,
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
@@ -5742,7 +5741,6 @@ pub fn build_state_field_snapshot(
     frames: &mut MIFrameStack,
     op_live: u8,
     all_liveness: &[u8],
-    pool: &mut crate::constant_pool::ConstantPool,
     after_residual_call: bool,
     virtualizable_boxes: &[OpRef],
     virtualref_boxes: &[(OpRef, usize)],
@@ -5762,7 +5760,7 @@ pub fn build_state_field_snapshot(
         // pyjitpl.py:194-198's residual-call branch only fires once.
         let boxes = frame.get_list_of_active_snapshot_boxes(
             !is_top,
-            if is_top { None } else { Some(&mut *pool) },
+            /* clear_result_register */ !is_top,
             op_live,
             all_liveness,
             if is_top { after_residual_call } else { false },
@@ -6829,13 +6827,10 @@ mod tests {
         }
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
-        let mut pool = crate::constant_pool::ConstantPool::new();
-
         let snapshot = build_state_field_snapshot(
             &mut stack,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
-            &mut pool,
             false,
             &[],
             &[],
@@ -6892,13 +6887,10 @@ mod tests {
         frame.int_values[1] = Some(420);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
-        let mut pool = crate::constant_pool::ConstantPool::new();
-
         let snapshot = build_state_field_snapshot(
             &mut stack,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
-            &mut pool,
             false,
             &[],
             &[],
@@ -6948,13 +6940,10 @@ mod tests {
         let mut stack = MIFrameStack::empty();
         stack.frames.push(root);
         stack.frames.push(sub);
-        let mut pool = crate::constant_pool::ConstantPool::new();
-
         let snapshot = build_state_field_snapshot(
             &mut stack,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
-            &mut pool,
             false,
             &[],
             &[],
@@ -7008,13 +6997,10 @@ mod tests {
         frame.int_values[0] = Some(50);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
-        let mut pool = crate::constant_pool::ConstantPool::new();
-
         let snapshot = build_state_field_snapshot(
             &mut stack,
             jitcode::insns::BC_LIVE,
             asm.all_liveness(),
-            &mut pool,
             false,
             &[],
             &[],

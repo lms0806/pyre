@@ -140,7 +140,7 @@ mod tests {
         finish_args: &[OpRef],
     ) -> (TreeLoop, VecAssoc<u32, i64>) {
         ctx.finish(finish_args, make_fail_descr(finish_args.len()));
-        let constants = std::mem::take(&mut ctx.constants).into_inner();
+        let constants = VecAssoc::new();
         let trace = ctx.into_tree_loop();
         (trace, constants)
     }

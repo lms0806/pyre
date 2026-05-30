@@ -291,7 +291,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
             continue;
         }
         let value = match b.get_forwarded() {
-            crate::r#box::Forwarded::Const(c, _) => c.to_value(),
+            crate::r#box::Forwarded::Const(c) => c.to_value(),
             _ => continue,
         };
         if idx < live_positions.len() && live_positions[idx] {
@@ -299,16 +299,6 @@ pub(crate) fn merge_backend_constants_from_ctx(
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
         constants.entry_or_insert_with(key, || value);
-    }
-    // legacy-const-ok: transitional fallback for idx-Const operands that
-    // enter the optimizer through legacy constants snapshots. RPython's
-    // Const boxes carry `.value` directly (history.py:227/268/314); the
-    // long-term shape is inline Const OpRefs only. Until every ingress is
-    // normalized to inline Const, preserve these pool-backed constants at
-    // the backend boundary instead of dropping them.
-    for (const_idx, value) in ctx.const_pool.iter() {
-        let key = OptContext::const_ref_for_value(const_idx, value).raw();
-        constants.insert(key, value.clone());
     }
 }
 
@@ -349,7 +339,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, crate::r#box::Forwarded::Const(_, _)) {
+        if !matches!(forwarded, crate::r#box::Forwarded::Const(_)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -2067,26 +2057,11 @@ impl Optimizer {
         // directly from the `Value`'s type tag without any external
         // `constant_types` side table.
         //
-        // The `constants` HashMap holds two keyspaces:
-        //   * idx with CONST_BIT set → constant-pool index; mint
-        //     `OpRef::const_*(pool_idx)` matching the `Value` variant.
-        //   * idx without CONST_BIT → inline-value-at-op-position slot;
-        //     mint `OpRef::*_op(idx)` matching the `Value` variant.
+        // The `constants` map keys inline-value-at-op-position slots: each
+        // `idx` mints `OpRef::*_op(idx)` matching the `Value` variant.
         for (&idx, value) in constants.iter() {
-            let opref = if OpRef::raw_is_constant(idx) {
-                let pool_idx = OpRef::raw_const_index(idx);
-                OptContext::const_ref_for_value(pool_idx, value)
-            } else {
-                OptContext::op_ref_for_value(idx, value)
-            };
+            let opref = OptContext::op_ref_for_value(idx, value);
             ctx.seed_constant(opref, value.clone());
-        }
-        // Advance next_const_idx past all seeded constant-namespace entries
-        // so new allocations (intdiv, make_guards) don't collide with
-        // constants inherited from a previous phase.
-        if !ctx.const_pool.is_empty() {
-            let max_idx = ctx.const_pool.max_index().unwrap_or(0);
-            ctx.next_const_idx = ctx.next_const_idx.max(max_idx + 1);
         }
 
         // Setup all passes
@@ -2693,7 +2668,6 @@ impl Optimizer {
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
                 crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
-            short_boxes.note_known_constants_from_ctx(&ctx);
             for &arg in &preview_short_args {
                 // RPython shortpreamble.py:255-259 parity: each label arg
                 // is `box.type`, where Box objects intrinsically carry one
@@ -2969,7 +2943,7 @@ impl Optimizer {
                 if old_idx < num_inputs as u32 {
                     continue;
                 }
-                if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
+                if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_)) {
                     continue;
                 }
                 remap.insert(old_idx, next_const_pos);
@@ -5519,63 +5493,6 @@ mod tests {
                 .all(|op| new_positions.contains(&op.arg(0).raw())),
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
-        );
-    }
-
-    #[test]
-    fn test_force_like_extra_ops_skip_preexisting_constant_slots_without_virtual_inputs() {
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(QueueForceLikeExtraOps {
-            queued: false,
-            field_descr: std::sync::Arc::new(TestDescr(11)),
-        }));
-        opt.add_pass(Box::new(OptHeap::new()));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
-        ];
-        ops[0].pos.set(OpRef::int_op(66));
-        ops[1].pos.set(OpRef::void_op(67));
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            2,
-            crate::r#box::BoxPool::new(),
-        );
-
-        let new_positions: majit_ir::vec_set::VecSet<_> = result
-            .iter()
-            .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.get().raw())
-            .collect();
-        // With high-bit constant namespace, constant OpRefs never collide with
-        // operation positions, so the New op lands at next_pos (68) directly.
-        assert_eq!(new_positions.len(), 1, "got {:?}", result);
-        assert!(
-            new_positions.contains(&68),
-            "queued New should get next available slot; got {:?}",
-            result
-        );
-        assert!(
-            result
-                .iter()
-                .filter(|op| op.opcode == OpCode::SetfieldGc)
-                .all(|op| new_positions.contains(&op.arg(0).raw())),
-            "SetfieldGc targets must remain emitted New refs; got {:?}",
-            result
-        );
-        assert_eq!(
-            constants.get(&OpRef::const_int(0).raw()),
-            Some(&majit_ir::Value::Int(472))
-        );
-        assert!(
-            !constants.contains_key(&68),
-            "live New position must not collide with constant map {:?}",
-            constants
         );
     }
 

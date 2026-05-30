@@ -1070,7 +1070,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let __saved_int_values: Vec<Option<i64>> =
                     __root.int_values[..__n].to_vec();
                 sym.populate_frame_int_regs(__root);
-                let mut __pool = majit_metainterp::ConstantPool::new();
                 // pyjitpl.py:2586-2610 `capture_resumedata(framestack,
                 // virtualizable_boxes, virtualref_boxes,
                 // last_snapshot)` — the snapshot must carry the live
@@ -1080,7 +1079,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     frames,
                     __op_live,
                     __all_liveness,
-                    &mut __pool,
                     false,
                     __virtualizable_boxes,
                     __virtualref_boxes,

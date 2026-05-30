@@ -10958,7 +10958,7 @@ impl CraneliftBackend {
                             gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let flags = MemFlags::trusted();
                         // history.py:227 ConstInt.value inline — read directly
-                        // from `OpRef::ConstIntInline(v)`, fall through to the
+                        // from `OpRef::ConstInt(v)`, fall through to the
                         // legacy pool for `OpRef::ConstInt(idx)` arms.
                         let size_val = op.arg(0).inline_const_bits().unwrap_or_else(|| {
                             constants

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use majit_ir::{OpRef, Type};
 
-use crate::constant_pool::ConstantPool;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 use crate::recorder::SnapshotTagged;
@@ -535,19 +534,19 @@ impl MIFrame {
     /// `.liveness_info`) — pyre passes them explicitly so this method
     /// does not depend on `MetaInterpStaticData` structurally.
     ///
-    /// `pool` carries the trace's `ConstantPool` so the in_a_call
-    /// branch can mint `history.CONST_FALSE` / `CONST_NULL` /
-    /// `history.CONST_FZERO` OpRefs and write them into the cleared
-    /// register slot exactly as pyjitpl.py:188-192 does.  Tests that
-    /// only care about the snapshot output may pass `None` — the
-    /// fallback path then substitutes `Box::Const*(0)` directly into
+    /// `clear_result_register` selects the in_a_call clear strategy.
+    /// When `true` the branch mints `history.CONST_FALSE` / `CONST_NULL`
+    /// / `history.CONST_FZERO` inline-Const OpRefs and writes them into
+    /// the cleared register slot exactly as pyjitpl.py:188-192 does.
+    /// Tests that only care about the snapshot output may pass `false` —
+    /// the fallback path then substitutes `Box::Const*(0)` directly into
     /// the snapshot array (byte-identical to the structural path) but
     /// leaves the register slot untouched.
     pub fn get_list_of_active_boxes(
         &mut self,
         in_a_call: bool,
         trace: &mut TraceRecordBuffer,
-        pool: Option<&mut ConstantPool>,
+        clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
@@ -562,20 +561,19 @@ impl MIFrame {
         // CONST_NULL / history.CONST_FZERO) so the snapshot captures a
         // well-defined placeholder instead of pre-call stale data.
         //
-        // When `pool` is provided we mirror RPython exactly: mint the
-        // zero constant, write it into the register slot (and the
-        // parallel `*_values` mirror), and let the bank loop below
+        // When `clear_result_register` is set we mirror RPython exactly:
+        // mint the zero constant, write it into the register slot (and
+        // the parallel `*_values` mirror), and let the bank loop below
         // emit it through the normal register → OpBox path.  This makes
         // a subsequent `get_list_of_active_boxes` (e.g. a re-snapshot
         // of the same in-flight call before `make_result_of_lastop`)
         // see the cleared slot rather than the pre-call stale contents.
         //
-        // When `pool` is `None` (test fixtures that do not wire a
-        // ConstantPool) we fall back to substituting the cleared box
-        // directly into the snapshot array via `clear_*_idx`.  The
-        // snapshot bytes are identical, but the register slot retains
-        // its pre-call contents — acceptable for tests that only check
-        // snapshot bytes.
+        // When it is clear (test fixtures that only check snapshot
+        // bytes) we fall back to substituting the cleared box directly
+        // into the snapshot array via `clear_*_idx`.  The snapshot bytes
+        // are identical, but the register slot retains its pre-call
+        // contents.
         let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
             let argcode = self._result_argcode;
             let index = self
@@ -584,23 +582,23 @@ impl MIFrame {
                 .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
             // pyjitpl.py:193 `self._result_argcode = '?'` — mark cleared.
             self._result_argcode = b'?';
-            if let Some(pool) = pool {
-                // pyjitpl.py:184-192 register clearing via ConstantPool.
+            if clear_result_register {
+                // pyjitpl.py:184-192 register clearing via inline-Const.
                 match argcode {
                     b'i' => {
-                        let opref = OpRef::const_int_inline(0);
+                        let opref = OpRef::const_int(0);
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'r' => {
-                        let opref = OpRef::const_ptr_inline(majit_ir::GcRef::NULL);
+                        let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'f' => {
-                        let opref = OpRef::const_float_inline(0.0);
+                        let opref = OpRef::const_float(0.0);
                         self.float_regs[index] = Some(opref);
                         self.float_values[index] = Some(0);
                         (None, None, None)
@@ -745,7 +743,7 @@ impl MIFrame {
     pub fn get_list_of_active_snapshot_boxes(
         &mut self,
         in_a_call: bool,
-        pool: Option<&mut ConstantPool>,
+        clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
@@ -760,20 +758,20 @@ impl MIFrame {
                 .take()
                 .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
             self._result_argcode = b'?';
-            if pool.is_some() {
+            if clear_result_register {
                 match argcode {
                     b'i' => {
-                        let opref = OpRef::const_int_inline(0);
+                        let opref = OpRef::const_int(0);
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                     }
                     b'r' => {
-                        let opref = OpRef::const_ptr_inline(majit_ir::GcRef::NULL);
+                        let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                     }
                     b'f' => {
-                        let opref = OpRef::const_float_inline(0.0);
+                        let opref = OpRef::const_float(0.0);
                         self.float_regs[index] = Some(opref);
                         self.float_values[index] = Some(0);
                     }
@@ -1094,7 +1092,7 @@ mod tests {
         frame.int_regs[0] = Some(OpRef::int_op(5));
         frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
-        frame.ref_regs[0] = Some(OpRef::const_ptr_inline(majit_ir::GcRef(0xdead_beef)));
+        frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xdead_beef)));
         frame.ref_values[0] = Some(0xdead_beef);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1102,7 +1100,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ false,
             &mut trace,
-            /* pool */ None,
+            /* clear_result_register */ false,
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
@@ -1183,7 +1181,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
-            /* pool */ None,
+            /* clear_result_register */ false,
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
@@ -1204,14 +1202,13 @@ mod tests {
         assert_eq!(tag0, 0, "cleared slot must encode as ConstInt(0)");
     }
 
-    /// pyjitpl.py:184-192 — when a `ConstantPool` is provided, the
+    /// pyjitpl.py:184-192 — when `clear_result_register` is set, the
     /// in_a_call branch mutates the register slot itself to the
-    /// pool's zero constant.  A second snapshot of the same in-flight
+    /// zero inline-Const.  A second snapshot of the same in-flight
     /// call (after `_result_argcode` flips to `b'?'`) therefore also
     /// sees the cleared register, instead of the pre-call stale box.
     #[test]
-    fn get_list_of_active_boxes_in_a_call_with_pool_mutates_register() {
-        use crate::constant_pool::ConstantPool;
+    fn get_list_of_active_boxes_in_a_call_clear_flag_mutates_register() {
         use crate::opencoder::TraceRecordBuffer;
         use std::sync::Arc;
 
@@ -1235,20 +1232,18 @@ mod tests {
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(1, sd);
-        let mut pool = ConstantPool::new();
 
         let _ = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
-            Some(&mut pool),
+            /* clear_result_register */ true,
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
         );
 
-        // Register slot now holds the pool's zero ConstInt OpRef
-        // (constants live in the namespace whose OpRef has the high
-        // const bit set), and the parallel value mirror is 0.
+        // Register slot now holds the zero ConstInt inline-Const OpRef,
+        // and the parallel value mirror is 0.
         let cleared = frame.int_regs[0].expect("register cleared, not unset");
         assert!(
             cleared.is_constant(),
@@ -1295,7 +1290,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
-            /* pool */ None,
+            /* clear_result_register */ false,
             OP_LIVE,
             &all_liveness,
             false,
@@ -1355,7 +1350,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ false,
             &mut trace,
-            /* pool */ None,
+            /* clear_result_register */ false,
             OP_LIVE,
             &all_liveness,
             false,
@@ -1580,7 +1575,7 @@ mod tests {
             vec![("g0", Type::Int), ("g1", Type::Int)],
             vec![("r0", Type::Int)],
         );
-        let greens = vec![OpRef::const_int_inline(0), OpRef::const_int_inline(1)];
+        let greens = vec![OpRef::const_int(0), OpRef::const_int(1)];
         // Must not panic — both opref are Const-tagged and length matches.
         MIFrame::verify_green_args(&jd, &greens);
     }
@@ -1594,7 +1589,7 @@ mod tests {
             vec![],
         );
         // Only one green provided — must fail count check.
-        MIFrame::verify_green_args(&jd, &[OpRef::const_int_inline(0)]);
+        MIFrame::verify_green_args(&jd, &[OpRef::const_int(0)]);
     }
 
     #[test]

@@ -6114,7 +6114,7 @@ mod tests {
         let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c1 = OpRef::const_int_inline(1);
+        let c1 = OpRef::const_int(1);
 
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
@@ -6164,7 +6164,7 @@ mod tests {
         // i0 is the typed Ref inputarg slot 0; the regalloc keys boxes
         // by typed `OpRef::input_arg_ref` (variant-aware Eq).
         let i0 = OpRef::input_arg_ref(0);
-        let c0 = OpRef::const_int_inline(0);
+        let c0 = OpRef::const_int(0);
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
 
         let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
@@ -6300,8 +6300,8 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c0 = OpRef::const_int_inline(0);
-        let c8 = OpRef::const_int_inline(8);
+        let c0 = OpRef::const_int(0);
+        let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
             InputArg::from_type(Type::Ref, i0.raw()),
@@ -6348,8 +6348,8 @@ mod tests {
         let i0 = OpRef::input_arg_ref(0);
         let i1 = OpRef::input_arg_ref(1);
         let i2 = OpRef::input_arg_int(2);
-        let c0 = OpRef::const_int_inline(0);
-        let c8 = OpRef::const_int_inline(8);
+        let c0 = OpRef::const_int(0);
+        let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
             InputArg::from_type(Type::Ref, i0.raw()),

@@ -60,8 +60,8 @@ fn test_int_add_loop() {
         InputArg::from_type(Type::Int, 1), // sum
     ];
 
-    let const_1 = OpRef::const_int_inline(1);
-    let const_100 = OpRef::const_int_inline(100);
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
@@ -166,7 +166,7 @@ fn test_float_ops() {
 fn test_call_generates_import() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
-    let func_ptr = OpRef::const_int_inline(42); // fake func_ptr
+    let func_ptr = OpRef::const_int(42); // fake func_ptr
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
@@ -302,7 +302,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
         make_guard(
             OpCode::GuardGcType,
-            &[OpRef::input_arg_int(0), OpRef::const_int_inline(0x42)],
+            &[OpRef::input_arg_int(0), OpRef::const_int(0x42)],
             &[OpRef::input_arg_int(0)],
         ),
         Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
@@ -393,7 +393,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     // the emitted guard-class operand is the vtable address carried as a raw
     // integer (read with `op.getarg(1).getint()`, rewrite.py:247). Use the
     // inline ConstInt factory so the variant tag matches the backend reader.
-    let class_constant = OpRef::const_int_inline(0xCAFE);
+    let class_constant = OpRef::const_int(0xCAFE);
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![

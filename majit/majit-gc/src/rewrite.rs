@@ -474,20 +474,16 @@ impl RewriteState {
     /// directly; legacy pool-indexed variants look up via the snapshot.
     fn resolve_constant(&self, opref: majit_ir::OpRef) -> Option<i64> {
         // rewrite.py:548/590/1013 gate these reads on `isinstance(arg,
-        // ConstInt)` → `getint()`. ConstFloat/ConstPtr have no `getint`
-        // (history.py:268/314), so every Float/Ptr constant — inline or
-        // legacy pool-indexed — is rejected outright. ConstIntInline
-        // carries its value; the legacy pool-indexed `ConstInt(idx)` and
-        // the test harness's non-constant placeholder OpRefs (paired with
-        // a `constants[opref.raw()]` entry) resolve by raw key. Production
+        // ConstInt)` → `getint()`. ConstFloat/ConstPtr have
+        // no `getint` (history.py:268/314), so a Float/Ptr constant is
+        // rejected outright. ConstInt carries its value; the test
+        // harness's non-constant placeholder OpRefs (paired with a
+        // `constants[opref.raw()]` entry) resolve by raw key. Production
         // pools are keyed in the constant namespace (CONST_BIT set), so a
         // genuine box position never collides and stays unresolved.
         match opref {
-            OpRef::ConstIntInline(v) => Some(v),
-            OpRef::ConstFloatInline(_)
-            | OpRef::ConstPtrInline(_)
-            | OpRef::ConstFloat(_)
-            | OpRef::ConstPtr(_) => None,
+            OpRef::ConstInt(v) => Some(v),
+            OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => None,
             _ => self.constants.get(&opref.raw()).copied(),
         }
     }
@@ -497,10 +493,10 @@ impl RewriteState {
     /// rewrite.py:149/671/682 parity: RPython constructs a new
     /// `ConstInt(value)` at each call site. history.py:227
     /// `ConstInt.value` is inline on the Box; pyre mints
-    /// `OpRef::ConstIntInline(value)` with the value carried inline
+    /// `OpRef::ConstInt(value)` with the value carried inline
     /// per history.py:220 `ConstInt.type = 'i'`.
     fn const_int(&mut self, value: i64) -> OpRef {
-        OpRef::const_int_inline(value)
+        OpRef::const_int(value)
     }
 
     /// Emit an op. Void ops do not consume a result id.
@@ -3497,7 +3493,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
-        let val = OpRef::const_ptr_inline(majit_ir::GcRef(0x1234));
+        let val = OpRef::const_ptr(majit_ir::GcRef(0x1234));
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
             Op::with_descr(

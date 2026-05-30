@@ -80,11 +80,10 @@ pub struct ShortPreamble {
     /// The exported virtual state at the loop header (from the preamble's exit).
     /// Used to check bridge compatibility and generate additional guards.
     pub exported_state: Option<VirtualState>,
-    /// Legacy constant snapshot for pre-inline idx-Const short preambles.
-    /// Production short preamble ops now embed inline `Const*` OpRefs
+    /// Constant snapshot retained only for legacy test fixtures.
+    /// Production short preamble ops embed inline `Const*` OpRefs
     /// directly, matching RPython where `_map_args` passes Const boxes
-    /// through unchanged. This map is therefore empty on production paths
-    /// and remains only as a compatibility field for legacy fixtures.
+    /// through unchanged. This map is therefore empty on production paths.
     pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
@@ -128,7 +127,7 @@ impl ShortPreamble {
 
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+            if let Some(slot) = opref.as_const_ptr_mut() {
                 visitor(slot);
             }
         }
@@ -592,24 +591,6 @@ impl ShortBoxes {
         // (slice β routes minting through `ctx.alloc_op_position_typed`),
         // so there is no `next_synthetic_pos` to bump past constant raws.
         self.known_constants.insert(opref);
-    }
-
-    pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
-        // RPython shortpreamble.py only exposes real `Const` objects here.
-        // In majit those live in the constant namespace as typed Const*
-        // OpRefs, preserving history.py:220/261/307 `box.type`.
-        // Ordinary OpRefs that happen to be known-constant for the current
-        // iteration must stay trace-local boxes, or short-preamble import can
-        // leak one iteration's guard knowledge into the next.
-        for (const_idx, value) in ctx.const_pool.iter() {
-            let tp = match value {
-                majit_ir::Value::Int(_) => majit_ir::Type::Int,
-                majit_ir::Value::Float(_) => majit_ir::Type::Float,
-                majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
-                majit_ir::Value::Void => panic!("short preamble cannot import a ConstVoid"),
-            };
-            self.note_known_constant(OpRef::const_typed(const_idx, tp));
-        }
     }
 
     fn add_op(&mut self, result: OpRef, pop: PotentialShortOp) {
@@ -1171,11 +1152,11 @@ fn imported_const_opref(
     // history.py:227/268/314 Const{Int,Float,Ptr}.value inline — fresh
     // imported short-preamble constant lands inline in `op.args` rather
     // than indexing the legacy pool. Slice 7b op-graph walker covers
-    // ConstPtrInline slots across minor collection.
+    // ConstPtr slots across minor collection.
     let opref = match value {
-        majit_ir::Value::Int(v) => OpRef::const_int_inline(*v),
-        majit_ir::Value::Float(v) => OpRef::const_float_inline(*v),
-        majit_ir::Value::Ref(v) => OpRef::const_ptr_inline(*v),
+        majit_ir::Value::Int(v) => OpRef::const_int(*v),
+        majit_ir::Value::Float(v) => OpRef::const_float(*v),
+        majit_ir::Value::Ref(v) => OpRef::const_ptr(*v),
         majit_ir::Value::Void => panic!("imported_const_opref: ConstVoid is not a value type"),
     };
     ctx.seed_constant(opref, value.clone());
@@ -1917,8 +1898,7 @@ fn build_short_preamble_struct_from_ops(
     // `op.args` and need no parallel side table. The captured `constants`
     // map is empty along every production path; readers (`is_constant()`
     // short-circuits at every callsite) treat it as a guaranteed-empty
-    // fallback for the legacy idx-Const shape that no production producer
-    // mints today.
+    // compatibility fallback retained only for legacy fixtures.
     //
     // RPython parity: `shortpreamble.py` keeps no `loop_constants` side
     // table — `arg` IS the `Const` box, so `_map_args(mapping, args)`
@@ -2179,7 +2159,7 @@ pub struct ExtendedShortPreambleBuilder {
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(slot) = opref.as_const_ptr_inline_mut() {
+            if let Some(slot) = opref.as_const_ptr_mut() {
                 visitor(slot);
             }
         }
@@ -2868,9 +2848,8 @@ pub fn build_short_preamble_from_produced_boxes(
     // history.py:227/268/314 — inline-Const variants carry the value on
     // the OpRef; `is_constant()` returns true intrinsically and the
     // `is_reachable` / `add_heap_op` checks short-circuit before
-    // consulting `known_constants`. Production no longer mints legacy
-    // idx-Const variants (Slice 6 retirement), so there are no entries
-    // to seed into `known_constants` and the legacy `loop_constants`
+    // consulting `known_constants`. There are no constant pool entries
+    // to seed into `known_constants` and the `loop_constants`
     // parameter has been retired.
     for (result, _) in produced {
         let _ = builder.add_op_to_short(*result);

@@ -2692,7 +2692,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every
-    /// inline `OpRef::ConstPtrInline(GcRef)` slot in the stashed
+    /// inline `OpRef::ConstPtr(GcRef)` slot in the stashed
     /// `partial_trace.ops` op-graph (history.py:314 `ConstPtr.value`).
     /// See `MetaInterp::walk_partial_trace_refs`.
     pub fn walk_partial_trace_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
@@ -2706,7 +2706,7 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_active_trace_refs(visitor);
     }
 
-    /// GC walker for ConstPtrInline GcRefs in snapshot maps that are
+    /// GC walker for ConstPtr GcRefs in snapshot maps that are
     /// live during compilation. See `MetaInterp::walk_compile_snapshot_refs`.
     pub fn walk_compile_snapshot_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_compile_snapshot_refs(visitor);

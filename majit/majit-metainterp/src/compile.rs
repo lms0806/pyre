@@ -2069,7 +2069,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         for index in 0..array_len {
             // compile.py:453 — ConstInt(index) for the array subscript.
             // history.py:227 ConstInt.value inline.
-            let const_opref = OpRef::const_int_inline(index as i64);
+            let const_opref = OpRef::const_int(index as i64);
 
             let old_opref =
                 OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
@@ -2445,16 +2445,16 @@ pub fn compile_tmp_callback(
     // variant (history.py:227/268/314 `Const{Int,Float,Ptr}.value`).
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)) — `ConstInt.value`
     // inline, carried directly on the OpRef variant.
-    let funcbox_ref = OpRef::const_int_inline(jitdriver_sd.portal_runner_adr);
+    let funcbox_ref = OpRef::const_int(jitdriver_sd.portal_runner_adr);
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
     for gb in greenboxes.iter() {
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
         let g_ref = match *gb {
-            Value::Int(v) => OpRef::const_int_inline(v),
-            Value::Ref(r) => OpRef::const_ptr_inline(r),
-            Value::Float(f) => OpRef::const_float_inline(f),
+            Value::Int(v) => OpRef::const_int(v),
+            Value::Ref(r) => OpRef::const_ptr(r),
+            Value::Float(f) => OpRef::const_float(f),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
         callargs.push(g_ref);
@@ -2576,10 +2576,10 @@ mod tests {
         let snapshot = Snapshot {
             vable_array: vec![
                 OpRef::input_arg_ref(0).into(),
-                OpRef::const_int_inline(8).into(),
-                OpRef::const_int_inline(777).into(), // code object payload
-                OpRef::const_int_inline(2).into(),
-                OpRef::const_int_inline(999).into(), // namespace payload
+                OpRef::const_int(8).into(),
+                OpRef::const_int(777).into(), // code object payload
+                OpRef::const_int(2).into(),
+                OpRef::const_int(999).into(), // namespace payload
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {

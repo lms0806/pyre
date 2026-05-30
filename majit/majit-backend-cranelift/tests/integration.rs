@@ -82,7 +82,7 @@ fn test_simple_arithmetic() {
     let mut rec = Trace::new();
     let i0 = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int_inline(1);
+    let const_one = OpRef::const_int(1);
     let result = rec.record_op(OpCode::IntAdd, &[i0, const_one]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
@@ -114,8 +114,8 @@ fn test_sum_loop() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int_inline(1);
-    let const_zero = OpRef::const_int_inline(0);
+    let const_one = OpRef::const_int(1);
+    let const_zero = OpRef::const_int(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -189,8 +189,8 @@ fn test_guard_failure_path() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_zero = OpRef::const_int_inline(0);
-    let const_two = OpRef::const_int_inline(2);
+    let const_zero = OpRef::const_int(0);
+    let const_two = OpRef::const_int(2);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x, const_zero]);
     rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
@@ -248,8 +248,8 @@ fn test_bridge_end_to_end() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int_inline(1);
-    let const_zero = OpRef::const_int_inline(0);
+    let const_one = OpRef::const_int(1);
+    let const_zero = OpRef::const_int(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -305,7 +305,7 @@ fn test_bridge_end_to_end() {
     let bsum = bridge_rec.record_input_arg(Type::Int);
     let _ = bi; // bridge ignores i
 
-    let bridge_const_two = OpRef::const_int_inline(2);
+    let bridge_const_two = OpRef::const_int(2);
     let result = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
@@ -385,9 +385,9 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_k = OpRef::const_int_inline(k as i64);
-    let const_i = OpRef::const_int_inline(i as i64);
-    let const_63 = OpRef::const_int_inline(63);
+    let const_k = OpRef::const_int(k as i64);
+    let const_i = OpRef::const_int(i as i64);
+    let const_63 = OpRef::const_int(63);
 
     // t = x >> 63
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -419,10 +419,10 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_k = OpRef::const_int_inline(k as i64);
-    let const_i = OpRef::const_int_inline(i as i64);
-    let const_63 = OpRef::const_int_inline(63);
-    let const_m = OpRef::const_int_inline(m);
+    let const_k = OpRef::const_int(k as i64);
+    let const_i = OpRef::const_int(i as i64);
+    let const_63 = OpRef::const_int(63);
+    let const_m = OpRef::const_int(m);
 
     // Division: floor_div(x, m)
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -459,9 +459,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_63 = OpRef::const_int_inline(63);
-    let const_mask = OpRef::const_int_inline(divisor - 1);
-    let const_shift = OpRef::const_int_inline(shift as i64);
+    let const_63 = OpRef::const_int(63);
+    let const_mask = OpRef::const_int(divisor - 1);
+    let const_shift = OpRef::const_int(shift as i64);
 
     let sign = rec.record_op(OpCode::IntRshift, &[x, const_63]);
     let correction = rec.record_op(OpCode::IntAnd, &[sign, const_mask]);
@@ -644,9 +644,9 @@ fn test_vec_int_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -701,9 +701,9 @@ fn test_vec_int_sub_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -745,9 +745,9 @@ fn test_vec_int_mul_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -795,9 +795,9 @@ fn test_vec_expand_add_simd() {
     let b = rec.record_input_arg(Type::Int);
     let s = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -846,9 +846,9 @@ fn test_vec_float_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     // Pack f64 bit patterns into I64X2 vectors
     let vec0 = rec.record_op(OpCode::VecI, &[]);
@@ -916,9 +916,9 @@ fn test_vec_chained_add_mul_simd() {
     let e = rec.record_input_arg(Type::Int);
     let f = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef::const_int_inline(0);
-    let const_1 = OpRef::const_int_inline(1);
-    let const_2 = OpRef::const_int_inline(2);
+    let const_0 = OpRef::const_int(0);
+    let const_1 = OpRef::const_int(1);
+    let const_2 = OpRef::const_int(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec_a = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -1230,7 +1230,7 @@ fn test_threadlocalref_get_basic() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int); // need at least one input
 
-    let const_offset = OpRef::const_int_inline(0); // offset = 0 bytes
+    let const_offset = OpRef::const_int(0); // offset = 0 bytes
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
@@ -1275,8 +1275,8 @@ fn test_threadlocalref_get_multiple_slots() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_off0 = OpRef::const_int_inline(0);
-    let const_off8 = OpRef::const_int_inline(8);
+    let const_off0 = OpRef::const_int(0);
+    let const_off8 = OpRef::const_int(8);
 
     let r0 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off0]);
     let r1 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off8]);
@@ -1315,7 +1315,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_offset = OpRef::const_int_inline(16); // offset 16 -> slot index 2
+    let const_offset = OpRef::const_int(16); // offset 16 -> slot index 2
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
@@ -1440,8 +1440,8 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
-    let saveerr = OpRef::const_int_inline(0);
-    let fn_ptr = OpRef::const_int_inline(ffi_add as *const () as usize as i64);
+    let saveerr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int(ffi_add as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, a, b], cd);
     rec.record_guard_with_fail_args(
@@ -1485,8 +1485,8 @@ fn test_call_release_gil_i_no_args() {
 
     let mut rec = Trace::new();
     let dummy = rec.record_input_arg(Type::Int); // need at least one input
-    let saveerr = OpRef::const_int_inline(0);
-    let fn_ptr = OpRef::const_int_inline(ffi_constant as *const () as usize as i64);
+    let saveerr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int(ffi_constant as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr], cd);
     rec.record_guard_with_fail_args(
@@ -1528,8 +1528,8 @@ fn test_call_release_gil_n_void_return() {
 
     let mut rec = Trace::new();
     let input = rec.record_input_arg(Type::Int);
-    let saveerr = OpRef::const_int_inline(0);
-    let fn_ptr = OpRef::const_int_inline(ffi_sink as *const () as usize as i64);
+    let saveerr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int(ffi_sink as *const () as usize as i64);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[saveerr, fn_ptr, input], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[input]);
@@ -1562,10 +1562,10 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
-    let saveerr = OpRef::const_int_inline(0);
-    let fn_ptr = OpRef::const_int_inline(ffi_add as *const () as usize as i64);
-    let const_10 = OpRef::const_int_inline(10);
-    let const_5 = OpRef::const_int_inline(5);
+    let saveerr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int(ffi_add as *const () as usize as i64);
+    let const_10 = OpRef::const_int(10);
+    let const_5 = OpRef::const_int(5);
 
     let tmp =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, x, const_10], cd);
@@ -1673,7 +1673,7 @@ fn raw_descr_float() -> DescrRef {
 #[test]
 fn test_raw_store_load_int_roundtrip() {
     let ad = raw_descr_int(8);
-    let const_offset = OpRef::const_int_inline(0); // offset 0
+    let const_offset = OpRef::const_int(0); // offset 0
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1712,7 +1712,7 @@ fn test_raw_store_load_int_roundtrip() {
 #[test]
 fn test_raw_store_load_float_roundtrip() {
     let ad = raw_descr_float();
-    let const_offset = OpRef::const_int_inline(0);
+    let const_offset = OpRef::const_int(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1750,8 +1750,8 @@ fn test_raw_store_load_float_roundtrip() {
 #[test]
 fn test_raw_ops_different_offsets_no_interference() {
     let ad = raw_descr_int(8);
-    let off0 = OpRef::const_int_inline(0);
-    let off8 = OpRef::const_int_inline(8);
+    let off0 = OpRef::const_int(0);
+    let off8 = OpRef::const_int(8);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1804,7 +1804,7 @@ fn test_raw_load_unsigned_byte() {
         item_type: Type::Int,
         signed: false,
     });
-    let const_offset = OpRef::const_int_inline(0);
+    let const_offset = OpRef::const_int(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1902,7 +1902,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
 
     // fn_ptr is stored as a constant
-    let fn_ptr = OpRef::const_int_inline(ffi_add_no_force as *const () as usize as i64);
+    let fn_ptr = OpRef::const_int(ffi_add_no_force as *const () as usize as i64);
 
     // CallMayForceI: arg(0)=fn_ptr, rest=[force_token, x]
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
@@ -1962,7 +1962,7 @@ fn test_call_may_force_with_forcing_semantics() {
     let flag = rec.record_input_arg(Type::Int);
 
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
-    let fn_ptr = OpRef::const_int_inline(ffi_maybe_force as *const () as usize as i64);
+    let fn_ptr = OpRef::const_int(ffi_maybe_force as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
@@ -2027,8 +2027,8 @@ fn test_ffi_call_exception_propagation() {
     let mut rec = Trace::new();
     let val = rec.record_input_arg(Type::Int);
 
-    let saveerr = OpRef::const_int_inline(0);
-    let fn_ptr = OpRef::const_int_inline(ffi_raise_exception as *const () as usize as i64);
+    let saveerr = OpRef::const_int(0);
+    let fn_ptr = OpRef::const_int(ffi_raise_exception as *const () as usize as i64);
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
@@ -2097,8 +2097,8 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_5 = OpRef::const_int_inline(5);
-    let const_100 = OpRef::const_int_inline(100);
+    let const_5 = OpRef::const_int(5);
+    let const_100 = OpRef::const_int(100);
 
     let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
     let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
@@ -2155,8 +2155,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef::const_int_inline(1);
-    let const_zero = OpRef::const_int_inline(0);
+    let const_one = OpRef::const_int(1);
+    let const_zero = OpRef::const_int(0);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -2216,8 +2216,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let _bi = bridge_rec.record_input_arg(Type::Int);
     let bsum = bridge_rec.record_input_arg(Type::Int);
 
-    let bridge_const_zero = OpRef::const_int_inline(0);
-    let bridge_const_two = OpRef::const_int_inline(2);
+    let bridge_const_zero = OpRef::const_int(0);
+    let bridge_const_two = OpRef::const_int(2);
 
     let bcmp = bridge_rec.record_op(OpCode::IntGt, &[bsum, bridge_const_zero]);
     bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], Some(make_descr(10)));
@@ -2290,7 +2290,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
         Op::new(
             OpCode::IntGt,
-            &[OpRef::input_arg_int(0), OpRef::const_int_inline(10)],
+            &[OpRef::input_arg_int(0), OpRef::const_int(10)],
         ),
         Op::with_descr(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
         Op::with_descr(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
@@ -2342,7 +2342,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let x_int = rec.record_input_arg(Type::Int);
     let x_float = rec.record_input_arg(Type::Float);
 
-    let const_0 = OpRef::const_int_inline(0);
+    let const_0 = OpRef::const_int(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
     rec.record_guard_with_fail_args(
@@ -2434,10 +2434,10 @@ fn test_ffi_exchange_buffer_pattern() {
     let cd = call_descr_release_gil_i(80, vec![Type::Ref]);
 
     // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
-    let off_arg = OpRef::const_int_inline(16); // offset 16
-    let off_result = OpRef::const_int_inline(32); // offset 32
-    let saveerr = OpRef::const_int_inline(0); // CALL_RELEASE_GIL saveerr flag
-    let fn_ptr = OpRef::const_int_inline(ffi_exchange_buffer_fn as *const () as usize as i64);
+    let off_arg = OpRef::const_int(16); // offset 16
+    let off_result = OpRef::const_int(32); // offset 32
+    let saveerr = OpRef::const_int(0); // CALL_RELEASE_GIL saveerr flag
+    let fn_ptr = OpRef::const_int(ffi_exchange_buffer_fn as *const () as usize as i64);
 
     let mut rec = Trace::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value

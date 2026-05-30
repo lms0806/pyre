@@ -336,20 +336,12 @@ fn build_function(
                     // gcremovetypeptr fallback (assembler.py:1893-1901):
                     //   on x86_64 the typeid is a 32-bit value at offset 0.
                     let class_arg = op.arg(1);
-                    let classptr = class_arg
-                        .const_int_value()
-                        .or_else(|| {
-                            if matches!(class_arg, OpRef::ConstInt(_)) {
-                                constants.get(&class_arg.raw()).copied()
-                            } else {
-                                None
-                            }
-                        })
-                        .expect(
-                            "_cmp_guard_class: gcremovetypeptr requires \
+                    // history.py:227 — inline-Const carries its class pointer directly.
+                    let classptr = class_arg.const_int_value().expect(
+                        "_cmp_guard_class: gcremovetypeptr requires \
                              loc_classptr to be a ConstInt immediate \
                              (aarch64/regalloc.py:829 op.getarg(1).getint())",
-                        );
+                    );
                     let expected_typeid =
                         lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize).expect(
                             "GuardClass: vtable_offset is None but the wasm \
@@ -932,23 +924,15 @@ fn build_function(
                 //   .getint(): the bounds are resolved at codegen time,
                 //   so arg1 must be an immediate class pointer.
                 let class_arg = op.arg(1);
-                let loc_check_against_class = class_arg
-                    .const_int_value()
-                    .or_else(|| {
-                        if matches!(class_arg, OpRef::ConstInt(_)) {
-                            constants.get(&class_arg.raw()).copied()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "x86/assembler.py:1971 vtable_ptr = \
+                // history.py:227 — inline-Const carries its class pointer directly.
+                let loc_check_against_class = class_arg.const_int_value().unwrap_or_else(|| {
+                    panic!(
+                        "x86/assembler.py:1971 vtable_ptr = \
                              loc_check_against_class.getint(): \
                              GUARD_SUBCLASS requires arg1 to be a \
                              ConstInt immediate class pointer"
-                        )
-                    });
+                    )
+                });
                 // assembler.py:1973-1974: vtable_ptr.subclassrange_{min,max}
                 let (check_min, check_max) = guard_gc_type_info
                     .subclass_ranges

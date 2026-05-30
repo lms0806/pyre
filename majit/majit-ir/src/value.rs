@@ -249,17 +249,19 @@ impl Const {
 /// Mirrors rpython/jit/metainterp/resoperation.py AbstractInputArg
 /// (`InputArgInt` / `InputArgFloat` / `InputArgRef` at lines 719/727/739).
 ///
-/// The `_forwarded` slot (`resoperation.py:235`) lives on `BoxRef`
-/// (`majit-metainterp/src/box.rs`), which is pyre's mirror of RPython's
-/// `AbstractValue` object identity.
+/// The `_forwarded` slot (`resoperation.py:235`) is the `forwarded`
+/// field below — the canonical per-identity forwarding host. A bound
+/// `BoxRef` routes `set_forwarded_*` / `get_forwarded` to this field;
+/// there is no Box-side mirror.
 #[derive(Debug)]
 pub struct InputArg {
     pub tp: Type,
     /// Index in the inputargs list.
     pub index: u32,
-    /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot.
-    /// Empty (`Forwarded::None`) until dual-writes wire
-    /// `BoxRef::set_forwarded_*` to this field.
+    /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot —
+    /// the canonical forwarding host for a bound InputArg box.
+    /// `Forwarded::None` until a writer sets it; `BoxRef::set_forwarded_*`
+    /// on a bound box routes here.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 }
 

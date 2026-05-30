@@ -1216,11 +1216,7 @@ impl DynasmBackend {
     /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
     /// the resolver as a VecAssoc up front.
-    fn collect_classptr_typeid_table(
-        &self,
-        ops: &[Op],
-        constants: &majit_ir::VecAssoc<u32, i64>,
-    ) -> majit_ir::VecAssoc<i64, u32> {
+    fn collect_classptr_typeid_table(&self, ops: &[Op]) -> majit_ir::VecAssoc<i64, u32> {
         let mut table = majit_ir::VecAssoc::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             // vtable_offset path doesn't need typeid lookups; without a
@@ -1234,13 +1230,8 @@ impl DynasmBackend {
             ) && op.num_args() >= 2
             {
                 let class_arg = op.arg(1);
-                let classptr = class_arg.const_int_value().or_else(|| {
-                    if matches!(class_arg, majit_ir::OpRef::ConstInt(_)) {
-                        constants.get(&class_arg.raw()).copied()
-                    } else {
-                        None
-                    }
-                });
+                // history.py:227 — inline-Const carries its class pointer directly.
+                let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
@@ -1261,7 +1252,6 @@ impl DynasmBackend {
     fn collect_classptr_subclass_range_table(
         &self,
         ops: &[Op],
-        constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> majit_ir::VecAssoc<i64, (i64, i64)> {
         let mut table = majit_ir::VecAssoc::new();
         if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
@@ -1270,13 +1260,8 @@ impl DynasmBackend {
         for op in ops {
             if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
                 let class_arg = op.arg(1);
-                let classptr = class_arg.const_int_value().or_else(|| {
-                    if matches!(class_arg, majit_ir::OpRef::ConstInt(_)) {
-                        constants.get(&class_arg.raw()).copied()
-                    } else {
-                        None
-                    }
-                });
+                // history.py:227 — inline-Const carries its class pointer directly.
+                let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr {
                     if let Some(range) =
                         with_dynasm_active_gc(|gc| gc.subclass_range(classptr as usize)).flatten()
@@ -1709,10 +1694,9 @@ impl Backend for DynasmBackend {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
-        let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
+        let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
@@ -1942,10 +1926,9 @@ impl Backend for DynasmBackend {
                 majit_ir::format_trace(&prepared_ops, &constants)
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
-        let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
+        let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what

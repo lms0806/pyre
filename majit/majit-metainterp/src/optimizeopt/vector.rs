@@ -590,8 +590,8 @@ impl VectorizingOptimizer {
 
             // VEC_PACK_I args are [vector, scalar, index, count]; index/count
             // are inline ConstInt (history.py:227), not pool indices.
-            let zero_const = OpRef::const_int_inline(0);
-            let one_const = OpRef::const_int_inline(1);
+            let zero_const = OpRef::const_int(0);
+            let one_const = OpRef::const_int(1);
             let pack_op = sched_state.create_vec_op(
                 OpCode::VecPackI,
                 &[zeroed_vec, seed, zero_const, one_const],
@@ -1097,8 +1097,8 @@ impl VectorizingOptimizer {
             sched_state.invariant_oplist.push(xor_op);
 
             // vector.py:866-869: pack the seed scalar into position 0
-            let zero_const = OpRef::const_int_inline(0);
-            let one_const = OpRef::const_int_inline(1);
+            let zero_const = OpRef::const_int(0);
+            let one_const = OpRef::const_int(1);
             let pack_op = sched_state.create_vec_op(
                 OpCode::VecPackI,
                 &[zeroed_vec, seed, zero_const, one_const],

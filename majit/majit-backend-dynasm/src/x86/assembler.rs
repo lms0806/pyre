@@ -7289,7 +7289,7 @@ impl<'a> Assembler386<'a> {
         // inline; the variant tag IS the box type, subsuming the
         // legacy constant_types side table.
         if let Some(val) = value.inline_const_bits() {
-            if !matches!(value, OpRef::ConstPtrInline(_)) {
+            if !matches!(value, OpRef::ConstPtr(_)) {
                 return false;
             }
             return val != 0;

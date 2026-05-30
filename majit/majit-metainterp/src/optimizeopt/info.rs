@@ -418,9 +418,9 @@ impl PtrInfoExt for PtrInfo {
         let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
             // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
             let pos = match value {
-                Value::Int(v) => OpRef::const_int_inline(v),
-                Value::Float(v) => OpRef::const_float_inline(v),
-                Value::Ref(v) => OpRef::const_ptr_inline(v),
+                Value::Int(v) => OpRef::const_int(v),
+                Value::Float(v) => OpRef::const_float(v),
+                Value::Ref(v) => OpRef::const_ptr(v),
                 Value::Void => panic!("alloc_const: ConstVoid not allowed"),
             };
             ctx.seed_constant(pos, value);
@@ -1706,7 +1706,7 @@ mod tests {
 
         let mut replay = Op::new(
             OpCode::GetarrayitemGcI,
-            &[OpRef::int_op(10), OpRef::const_int_inline(0)],
+            &[OpRef::int_op(10), OpRef::const_int(0)],
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {

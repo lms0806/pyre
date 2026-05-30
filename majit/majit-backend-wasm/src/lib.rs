@@ -221,16 +221,9 @@ impl WasmBackend {
     /// `ConstInt(ptr2int(obj.typeptr))`, `virtualstate.py:748` builds
     /// `ConstInt(descr.get_vtable())`, and backends read
     /// `op.getarg(1).getint()` (aarch64/regalloc.py:829). Inline ConstInt
-    /// carries the value directly; legacy pool-indexed ConstInt falls back
-    /// to the `constants` table.
+    /// carries the value directly (history.py:227 `ConstInt.value`).
     fn const_class_vtable(&self, arg: majit_ir::OpRef) -> Option<i64> {
-        if let Some(v) = arg.const_int_value() {
-            return Some(v);
-        }
-        if matches!(arg, majit_ir::OpRef::ConstInt(_)) {
-            return self.constants.get(&arg.raw()).copied();
-        }
-        None
+        arg.const_int_value()
     }
 
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
@@ -311,8 +304,8 @@ impl WasmBackend {
 
     /// Validate that every constant OpRef appearing as an arg is resolvable.
     ///
-    /// Inline-Const variants (`ConstIntInline`/`ConstFloatInline`/
-    /// `ConstPtrInline`) carry `.value` on the OpRef itself (history.py:
+    /// Inline-Const variants (`ConstInt`/`ConstFloat`/
+    /// `ConstPtr`) carry `.value` on the OpRef itself (history.py:
     /// 227/268/314), so they need no `self.constants` side-table entry and
     /// are skipped. A legacy idx-keyed `ConstInt(u32)` / `ConstFloat(u32)` /
     /// `ConstPtr(u32)` must have been seeded by `set_constants_pool`; one that

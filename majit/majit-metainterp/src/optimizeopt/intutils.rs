@@ -81,9 +81,9 @@ impl IntBoundMakeGuards for IntBound {
             // IntBound guards mint Int values only, so the match is total
             // on the variant tag.
             let pos = match value {
-                Value::Int(v) => majit_ir::OpRef::const_int_inline(v),
-                Value::Float(v) => majit_ir::OpRef::const_float_inline(v),
-                Value::Ref(v) => majit_ir::OpRef::const_ptr_inline(v),
+                Value::Int(v) => majit_ir::OpRef::const_int(v),
+                Value::Float(v) => majit_ir::OpRef::const_float(v),
+                Value::Ref(v) => majit_ir::OpRef::const_ptr(v),
                 Value::Void => panic!("alloc_const: ConstVoid not allowed"),
             };
             ctx.seed_constant(pos, value);
