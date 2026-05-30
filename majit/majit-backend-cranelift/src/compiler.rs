@@ -5748,7 +5748,6 @@ fn emit_attached_bridge_dispatch(
     jf_ptr: CValue,
     bridge_cache_addrs: (usize, usize),
     ptr_type: cranelift_codegen::ir::Type,
-    call_conv: cranelift_codegen::isa::CallConv,
 ) {
     // dynasm/x86 patches the failing guard's jump to the attached bridge.
     // Cranelift cannot patch finalized code, so guard exits do the
@@ -5764,51 +5763,64 @@ fn emit_attached_bridge_dispatch(
     // read here — the bridge prologue (compiler.rs:7585) bakes the
     // expected size as an iconst at compile time.
     //
-    // Bridge code_ptr cell lives on the descr as
-    // `Box<AtomicUsize>`.  Box gives it a heap-pinned address that
-    // survives the descr being moved into `Arc::new(...)`, so the
-    // address is stable for the descr's lifetime and safe to bake
-    // into machine code as an immediate.  The caller
-    // pre-computes the address pair via `fail_descr_bridge_cache_addrs`
-    // and passes it directly, since `jf_descr` now embeds the meta
-    // Arc rather than the backend wrapper that owns the cells.
-    let (bridge_code_cache_addr, _bridge_frame_depth_cache_addr) = bridge_cache_addrs;
-    let bridge_code_cache_ptr = builder
+    // Bridge cache cells live on the descr as `Box<AtomicUsize>`.  Box
+    // gives them heap-pinned addresses that survive the descr being moved
+    // into `Arc::new(...)`, so they are stable for the descr's lifetime and
+    // safe to bake into machine code as immediates.  The caller pre-computes
+    // the address pair via `fail_descr_bridge_cache_addrs`: `.0` is the
+    // host-ABI wrapper (`code_ptr`, for host-loop dispatch), `.1` is the
+    // bridge's `CallConv::Tail` body entry (`body_ptr`, for this in-code
+    // tail-call).
+    let (_bridge_code_cache_addr, bridge_body_cache_addr) = bridge_cache_addrs;
+    // Gate the dispatch on the same pointer we will tail-call through.
+    // `store_bridge_caches` releases `body_ptr` before `code_ptr`, and a
+    // non-null `code_ptr` was previously used as a readiness flag with a
+    // following plain-load of `body_ptr`.  On weakly-ordered targets
+    // (aarch64, where closing_jump is enabled by this PR) plain loads can
+    // be reordered, so a thread could observe `code_ptr != 0` while still
+    // seeing a stale `body_ptr == 0` and tail-call through `0`.  Using
+    // `atomic_load` on `body_ptr` synchronizes against the
+    // `store_bridge_caches` releases (resume_guard_descr.rs:701-706) and
+    // collapses readiness + target into a single atomic check.
+    let bridge_body_cache_ptr = builder
         .ins()
-        .iconst(ptr_type, bridge_code_cache_addr as i64);
-    let bridge_code = builder
-        .ins()
-        .load(ptr_type, MemFlags::trusted(), bridge_code_cache_ptr, 0);
+        .iconst(ptr_type, bridge_body_cache_addr as i64);
+    let bridge_body =
+        builder
+            .ins()
+            .atomic_load(ptr_type, MemFlags::trusted(), bridge_body_cache_ptr);
     let null_ptr = builder.ins().iconst(ptr_type, 0);
-    let has_bridge = builder.ins().icmp(IntCC::NotEqual, bridge_code, null_ptr);
+    let has_bridge = builder.ins().icmp(IntCC::NotEqual, bridge_body, null_ptr);
     let bridge_block = builder.create_block();
-    builder.append_block_param(bridge_block, ptr_type);
     let miss_block = builder.create_block();
-    builder.ins().brif(
-        has_bridge,
-        bridge_block,
-        &[BlockArg::from(bridge_code)],
-        miss_block,
-        &[],
-    );
+    builder
+        .ins()
+        .brif(has_bridge, bridge_block, &[], miss_block, &[]);
 
     builder.switch_to_block(bridge_block);
     builder.seal_block(bridge_block);
-    let bridge_code_ptr = builder.block_params(bridge_block)[0];
+    // assembler.py:987 `patch_jump_for_descr`: the failing guard's JMP is
+    // rewritten to jump straight into the bridge — a tail transfer, not a
+    // call.  The cranelift analogue is `return_call_indirect` into the
+    // bridge's `CallConv::Tail` body: the parent trace's frame is torn down
+    // and replaced by the bridge's, so no return frame is stranded on the
+    // machine stack when the bridge later tail-calls forward (closing_jump).
+    // A nested call+return here would leak one return frame per bridge
+    // dispatch under closing_jump, growing the stack until the JIT prologue
+    // stack check raises RecursionError.  The host-ABI wrapper in the
+    // code_ptr cell is unusable here — its call conv is not tail-callable.
     // Dynasm patches the guard branch into a jump to the bridge, so the
     // parent trace no longer contributes a separate shadowstack entry while
-    // the bridge runs.  Pop before the call; the bridge prologue pushes the
-    // same jitframe for its own execution and pops it on return.
+    // the bridge runs.  Pop before the transfer; the bridge prologue pushes
+    // the same jitframe for its own execution and pops it on exit.
     emit_call_footer_shadowstack(builder, ptr_type);
-    let mut bridge_sig = Signature::new(call_conv);
+    let mut bridge_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     bridge_sig.params.push(AbiParam::new(ptr_type));
     bridge_sig.returns.push(AbiParam::new(ptr_type));
     let bridge_sig_ref = builder.import_signature(bridge_sig);
-    let bridge_call = builder
+    builder
         .ins()
-        .call_indirect(bridge_sig_ref, bridge_code_ptr, &[jf_ptr]);
-    let bridge_result_jf = builder.inst_results(bridge_call)[0];
-    builder.ins().return_(&[bridge_result_jf]);
+        .return_call_indirect(bridge_sig_ref, bridge_body, &[jf_ptr]);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -5837,12 +5849,22 @@ fn emit_attached_loop_dispatch(
     jf_ptr: CValue,
     ll_loop_code_addr: usize,
     label_block_id_addr: usize,
+    target_frame_depth_addr: usize,
     ptr_type: cranelift_codegen::ir::Type,
 ) {
+    // `LoopTargetDescr::set_dispatch_target` (descr.rs:1308-1318)
+    // releases `target_frame_depth` and `label_block_id` BEFORE
+    // `ll_loop_code`; an `atomic_load` on `ll_loop_code` synchronizes
+    // against those releases so the subsequent plain loads observe
+    // matching companion values.  Without the acquire ordering, on
+    // weakly-ordered targets (aarch64) the CPU could reorder the
+    // companion loads ahead of the readiness check and tail-call
+    // through a non-null `ll_loop_code` while still seeing stale
+    // `label_block_id == 0` or `target_frame_depth == 0`.
     let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
     let entry = builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), cell_ptr, 0);
+        .atomic_load(ptr_type, MemFlags::trusted(), cell_ptr);
     let null = builder.ins().iconst(ptr_type, 0);
     let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
     let check_block_id = builder.create_block();
@@ -5876,10 +5898,52 @@ fn emit_attached_loop_dispatch(
         .load(cl_types::I32, MemFlags::trusted(), lbid_ptr, 0);
     let zero_i32 = builder.ins().iconst(cl_types::I32, 0);
     let is_first_label = builder.ins().icmp(IntCC::Equal, lbid, zero_i32);
+    let check_depth_block = builder.create_block();
+    builder.append_block_param(check_depth_block, ptr_type);
+    builder.ins().brif(
+        is_first_label,
+        check_depth_block,
+        &[BlockArg::from(target_code_ptr)],
+        miss_block,
+        &[],
+    );
+
+    builder.switch_to_block(check_depth_block);
+    builder.seal_block(check_depth_block);
+    let target_code_ptr = builder.block_params(check_depth_block)[0];
+    // `assembler.py:927 _check_frame_depth_bridge` parity, deferred for
+    // closing-jump: bridges insert this check in their own prologue
+    // (compiler.rs:8060), but loops reached via closing-jump skip the
+    // bridge prologue entirely.  `run_compiled_code_inner` only sized
+    // the JITFRAME for the originally entered loop, so a tail-call
+    // into a target whose `max_output_slots + num_ref_roots` exceeds
+    // the current frame's length would overrun the allocation when
+    // the target writes guard outputs or ref roots.  Read the target
+    // depth from the descr's `target_frame_depth` cell (published with
+    // Release ordering before `ll_loop_code` — see
+    // `LoopTargetDescr::set_dispatch_target`) and compare against the
+    // current frame's `JF_FRAME_LENGTH` word; fall back to the
+    // deadframe exit when the frame is too small so the host loop can
+    // re-enter via `execute_token`, which reallocates for the target.
+    let depth_cell_ptr = builder
+        .ins()
+        .iconst(ptr_type, target_frame_depth_addr as i64);
+    let target_depth = builder
+        .ins()
+        .load(cl_types::I64, MemFlags::trusted(), depth_cell_ptr, 0);
+    let frame_len = builder.ins().load(
+        cl_types::I64,
+        MemFlags::trusted(),
+        jf_ptr,
+        JF_FRAME_LENGTH_OFS,
+    );
+    let frame_fits = builder
+        .ins()
+        .icmp(IntCC::SignedGreaterThanOrEqual, frame_len, target_depth);
     let take_block = builder.create_block();
     builder.append_block_param(take_block, ptr_type);
     builder.ins().brif(
-        is_first_label,
+        frame_fits,
         take_block,
         &[BlockArg::from(target_code_ptr)],
         miss_block,
@@ -5889,19 +5953,14 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
-    // 2026-05-18 hypothesis tests (all reverted, none affect nbody_50k
-    // corruption -0.03513214049650899 vs. dynasm -0.035132020348426815):
-    //   - probe 1: per-LABEL `label_block_id == 0` gate
-    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc
-    //   - probe 3: zero source body's ref_root area
-    //   - probe 4: always-on frame-realloc check at main-loop prologue
-    //   - probe 5: wholesale zero of entire jf_frame tail beyond inputs
-    // The corruption is NOT in jf_frame heap state.  Both
-    // `return_call_indirect` and `call_indirect + return` transit
-    // cranelift's aarch64 Tail-conv function entry/exit lowering and
-    // both corrupt, pointing at the documented ~12.5 bytes/take SP
-    // leak in `emit_return_call_common_sequence` as the same root
-    // cause.  Pyre-side workarounds are exhausted.
+    // The earlier nbody_50k corruption (-0.03513214049650899 vs. the
+    // reference -0.035132020348426815) and the per-dispatch SP growth were
+    // both consequences of `emit_attached_bridge_dispatch` doing a nested
+    // call+return into the bridge, not a cranelift Tail-conv defect: under
+    // closing_jump the bridge tail-calls forward and never returns, so each
+    // dispatch stranded a return frame.  With the bridge dispatch itself
+    // now a tail-call, this loop dispatch is balanced on both x86_64 and
+    // aarch64 (tail_sp_leak.rs: zero drift over 5M tail-calls).
     emit_call_footer_shadowstack(builder, ptr_type);
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
@@ -6007,45 +6066,47 @@ fn emit_guard_exit(
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
 
-    // `assembler.py:2456-2462 closing_jump` parity is wired through
-    // `emit_attached_loop_dispatch` but the call site stays gated.
-    // Enabling it has two independent failure modes on cranelift
-    // 0.130 *and* 0.131 aarch64 (re-verified after 0.131 upgrade
-    // attempt 2026-05-18):
+    // `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
+    // tail-call straight into the target loop body via
+    // `emit_attached_loop_dispatch` (`return_call_indirect`), the
+    // cranelift analogue of PyPy's raw `JMP imm(target._ll_loop_code)`.
+    // This avoids a host-loop round-trip per loop edge and is the main
+    // steady-state speedup over the legacy deadframe→`run_compiled_code`
+    // dispatch.
     //
-    //   - `nbody` produces `-0.03513214049650899` instead of the
-    //     dynasm-reference `-0.035132020348426815` (8th-decimal
-    //     divergence — meaningful, not ULP).  Hypothesis per
-    //     `project_cranelift_wrapper_body_tail_leak.md`: target
-    //     body's prologue reads jf_frame slots (ref-root area,
-    //     force-token slots, gcmap) that source `emit_guard_exit`
-    //     doesn't refresh at the in-code tail call.  Surfaced
-    //     before the orthodox argloc remap (task #114 option (ii))
-    //     lands; bench-only since lib/integration tests don't
-    //     exercise long enough traces to expose the slot mismatch.
+    // Enabled by default on x86_64 and aarch64.  The cranelift Tail-conv
+    // lowering (`return_call_indirect`) is balanced — verified on both
+    // arches by `tests/tail_sp_leak.rs`, which tail-calls 5M times with
+    // zero SP drift.  The historical "gate off" note blamed a
+    // ~12.5 bytes/take SP leak in `emit_return_call_common_sequence`; that
+    // diagnosis was wrong.  The real stack growth came from
+    // `emit_attached_bridge_dispatch` doing a nested call+return into the
+    // bridge: under closing_jump the bridge tail-calls forward and never
+    // returns, stranding one return frame per dispatch until the prologue
+    // stack check raised RecursionError.  Fixed by making the bridge
+    // dispatch a tail-call too (see `emit_attached_bridge_dispatch`); with
+    // that, nbody/spectral/fannkuch match dynasm exactly on both arches.
     //
-    //   - raise_catch_loop / fannkuch crash or time out via the
-    //     ~12.5 bytes/take stack leak inside cranelift's
-    //     `emit_return_call_common_sequence` (Tail conv aarch64) —
-    //     unchanged between 0.130.2 and 0.131.1.
-    //
-    // Gate stays off — 5 hypotheses tested + ruled out:
-    //   - probe 1: per-LABEL `label_block_id == 0` gate
-    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc
-    //   - probe 3: zero source body's ref_root area
-    //   - probe 4: always-on frame-realloc check at main-loop prologue
-    //   - probe 5: wholesale zero of entire jf_frame tail beyond inputs
-    // None affect the deterministic nbody_50k corruption
-    // (-0.03513214049650899 vs. dynasm -0.035132020348426815),
-    // confirming the corruption is NOT in jf_frame heap state.
-    // Empirical conclusion: source is the cranelift aarch64 Tail-conv
-    // lowering itself (consistent with the documented ~12.5 bytes/take
-    // SP leak in `emit_return_call_common_sequence`).  Both
-    // `return_call_indirect` and `call_indirect + return` shapes
-    // corrupt because both transit cranelift's aarch64 Tail-conv
-    // function entry/exit lowering.  Pyre-side workarounds cannot
-    // address upstream stack-frame accounting defects.
-    let _ = info.external_jump_ll_loop_code_addr;
+    // aarch64 re-verified post-fix (cranelift 0.132): tail_sp_leak.rs has
+    // zero drift, nbody_50k matches the reference exactly, and the full
+    // bench suite is correct.  `PYRE_CL_NO_CLOSING_JUMP` is an opt-out
+    // hatch for A/B and rollback.
+    if let Some((ll_loop_code_addr, label_block_id_addr, target_frame_depth_addr)) =
+        info.external_jump_ll_loop_code_addr
+    {
+        let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+            && std::env::var_os("PYRE_CL_NO_CLOSING_JUMP").is_none();
+        if enabled {
+            emit_attached_loop_dispatch(
+                builder,
+                jf_ptr,
+                ll_loop_code_addr,
+                label_block_id_addr,
+                target_frame_depth_addr,
+                ptr_type,
+            );
+        }
+    }
 
     if info.can_have_bridge && !info.must_save_exception {
         // RPython/dynasm patched guards enter the bridge before failure
@@ -6058,7 +6119,6 @@ fn emit_guard_exit(
             info.bridge_cache_addrs
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
             ptr_type,
-            call_conv,
         );
     }
 
@@ -6122,7 +6182,6 @@ fn emit_guard_exit(
             info.bridge_cache_addrs
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
             ptr_type,
-            call_conv,
         );
     }
     builder
@@ -6148,6 +6207,10 @@ struct CompiledLoop {
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     _func_id: FuncId,
     code_ptr: *const u8,
+    /// `CallConv::Tail` body entry (the wrapper-bypassing in-code target).
+    /// `ll_loop_code` for loops; the tail-call target when this trace is a
+    /// bridge dispatched from a parent guard.
+    body_ptr: *const u8,
     code_size: usize,
     fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
@@ -6304,11 +6367,7 @@ pub(crate) fn fail_descr_bridge_ref(fd: &dyn FailDescr) -> Option<Arc<BridgeData
 /// test-scaffold path via the synthesis at compiler.rs:12884.
 pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
     let code_ptr = bridge.code_ptr as usize;
-    let frame_depth = bridge
-        .max_output_slots
-        .max(bridge.num_inputs)
-        .max(1)
-        .saturating_add(bridge.num_ref_roots);
+    let body_ptr = bridge.body_ptr as usize;
     // assembler.py:987 patch_jump_for_descr ordering parity: publish the
     // dispatch cache BEFORE the BridgeData Arc swap so any JIT execution
     // observing a non-null `bridge_dispatch` cell also sees a populated
@@ -6316,7 +6375,11 @@ pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
     // loop bridge fallback at compiler.rs:7287 fires with a freshly
     // published Arc but a still-null cache, which the in-code dispatch
     // (`emit_attached_bridge_dispatch`) cannot reach.
-    fd.store_bridge_caches(code_ptr, frame_depth);
+    //
+    // `store_bridge_caches` writes the body_ptr cell first, then the
+    // code_ptr cell (Release), so a dispatch that observes a non-null
+    // code_ptr is guaranteed to also see the body_ptr it tail-calls.
+    fd.store_bridge_caches(code_ptr, body_ptr);
     let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut ();
     let old_ptr = fd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
     if !old_ptr.is_null() {
@@ -6935,7 +6998,7 @@ struct GuardInfo {
     /// per-LABEL `JMP imm(target._ll_loop_code)`).  Anything else falls
     /// through to the standard deadframe exit so the host loop can
     /// dispatch via `execute_token` to the right wrapper.
-    external_jump_ll_loop_code_addr: Option<(usize, usize)>,
+    external_jump_ll_loop_code_addr: Option<(usize, usize, usize)>,
 }
 
 fn identity_recovery_layout(
@@ -7279,6 +7342,7 @@ impl CraneliftBackend {
                                             source_guard: b.source_guard,
                                             caller_prefix_layout: b.caller_prefix_layout.clone(),
                                             code_ptr: b.code_ptr,
+                                            body_ptr: b.body_ptr,
                                             fail_descrs: b.fail_descrs.clone(),
                                             fail_descr_cells: b.fail_descr_cells.clone(),
                                             num_inputs: b.num_inputs,
@@ -7303,6 +7367,15 @@ impl CraneliftBackend {
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
+        // cranelift 0.132 x86_64 `emit_return_call_common_sequence` panics
+        // when `preserve_frame_pointers=false`:
+        //   "frame pointers aren't fundamentally required for tail calls,
+        //    but the current implementation relies on them being present"
+        // We need frame pointers for the in-code `closing_jump` dispatch
+        // (`emit_attached_loop_dispatch`) regardless of whether the env
+        // var enables it at the call site — bridges/wrappers still get
+        // compiled with these flags.
+        flag_builder.set("preserve_frame_pointers", "true").unwrap();
 
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder
@@ -13257,6 +13330,17 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
         };
+        // Publish target_frame_depth alongside the dispatch pointer so
+        // an external JUMP's closing-jump dispatcher can verify the
+        // source loop's already-allocated JITFRAME has enough capacity
+        // for THIS target before tail-calling into it.  Without the
+        // companion publish, a source loop with a smaller
+        // `max_output_slots + num_ref_roots` than this target could
+        // closing-jump in and overrun the frame writing guard outputs
+        // / ref roots past the allocation (assembler.py:927 bridge
+        // `_check_frame_depth` only fires for bridges, not for loop
+        // bodies entered via tail-call).
+        let target_frame_depth = max_output_slots + ref_root_slots.len();
         let mut label_block_id: u32 = 0;
         for op in ops.iter() {
             if op.opcode != OpCode::Label {
@@ -13264,7 +13348,11 @@ impl CraneliftBackend {
             }
             if let Some(descr_ref) = op.getdescr() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
-                    target.set_dispatch_target(body_ptr as usize, label_block_id);
+                    target.set_dispatch_target(
+                        body_ptr as usize,
+                        label_block_id,
+                        target_frame_depth,
+                    );
                 }
                 register_loop_target(&descr_ref, entry.clone());
             }
@@ -13278,6 +13366,7 @@ impl CraneliftBackend {
             caller_prefix_layout: caller_layout.cloned(),
             _func_id: func_id,
             code_ptr,
+            body_ptr,
             code_size: 0,
             fail_descrs,
             fail_descr_cells,
@@ -14117,6 +14206,7 @@ fn collect_guards(
                     (
                         ltd.ll_loop_code_ptr() as usize,
                         ltd.label_block_id_ptr() as usize,
+                        ltd.target_frame_depth_ptr() as usize,
                     )
                 })
         } else {
@@ -14560,6 +14650,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
                     caller_prefix_layout: compiled.caller_prefix_layout.clone(),
                     code_ptr: compiled.code_ptr,
+                    body_ptr: compiled.body_ptr,
                     fail_descrs: compiled.fail_descrs,
                     fail_descr_cells: compiled.fail_descr_cells,
                     terminal_exit_layouts: compiled.terminal_exit_layouts,
@@ -14600,6 +14691,7 @@ impl majit_backend::Backend for CraneliftBackend {
                                         source_guard: b.source_guard,
                                         caller_prefix_layout: b.caller_prefix_layout.clone(),
                                         code_ptr: b.code_ptr,
+                                        body_ptr: b.body_ptr,
                                         fail_descrs: b.fail_descrs.clone(),
                                         fail_descr_cells: b.fail_descr_cells.clone(),
                                         num_inputs: b.num_inputs,
@@ -14737,6 +14829,7 @@ impl majit_backend::Backend for CraneliftBackend {
                             source_guard: b.source_guard,
                             caller_prefix_layout: b.caller_prefix_layout.clone(),
                             code_ptr: b.code_ptr,
+                            body_ptr: b.body_ptr,
                             fail_descrs: b.fail_descrs.clone(),
                             fail_descr_cells: b.fail_descr_cells.clone(),
                             num_inputs: b.num_inputs,
@@ -14807,12 +14900,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // surface (resume-trace builder via `[`crate::pyre`]`) needs the
         // exit-slot bytes BEFORE virtual reconstruction.
         //
-        // External JUMP fallback: cranelift's
-        // in-code `closing_jump` dispatch (`emit_attached_loop_dispatch`)
-        // stays gated off pending the aarch64 Tail-conv defect fix
-        // (`project_cranelift_wrapper_body_tail_leak.md`).  Until then a
-        // guard exit may legitimately surface an `is_external_jump` descr
-        // here, and the host loop re-enters the target trace exactly as
+        // External JUMP fallback: the in-code `closing_jump` dispatch
+        // (`emit_attached_loop_dispatch`) is on by default for x86_64 and
+        // aarch64, but stays off on other arches and whenever
+        // `PYRE_CL_NO_CLOSING_JUMP` is set.  In those cases a guard exit may
+        // legitimately surface an `is_external_jump` descr here, and the
+        // host loop re-enters the target trace exactly as
         // `execute_with_inputs` (compiler.rs:7357) does.  This block
         // mirrors that dispatch loop with one additional raw-output
         // termination per `execute_token_ints_raw`'s contract.
@@ -14918,10 +15011,10 @@ impl majit_backend::Backend for CraneliftBackend {
             // llgraph/runner.py:1130-1140 cross-loop JUMP: switch to the
             // target trace identified by the TargetToken stored on the
             // fail descriptor and continue dispatch, mirroring
-            // `execute_with_inputs`.  Required until in-code `closing_jump`
-            // lands — see
-            // `project_cranelift_wrapper_body_tail_leak.md` for the
-            // upstream cranelift aarch64 Tail-conv blocker.
+            // `execute_with_inputs`.  Reached when in-code `closing_jump` is
+            // disabled (non-x86_64/non-aarch64 arch, or
+            // `PYRE_CL_NO_CLOSING_JUMP`); otherwise the JUMP transfers
+            // entirely inside generated code.
             if fail_descr_fd.is_external_jump() {
                 slice_x2_probe::record_execute_with_inputs_hit();
                 let target_entry = fail_descr_fd
@@ -21117,7 +21210,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "dispatch site gated off: enabling `emit_attached_loop_dispatch` triggers cranelift 0.130/0.131 aarch64 Tail-conv leak + jf_frame-slot corruption (project_cranelift_wrapper_body_tail_leak.md). Test passes the moment the gate at compiler.rs `emit_guard_exit` flips on."]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1500_260);
