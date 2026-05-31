@@ -198,17 +198,33 @@ impl BoxRef {
         }))
     }
 
-    /// Transient `AbstractResOp` Box wrapping an already-bound
-    /// `OpRc`. Used by the chain walker to materialize a `BoxRef`
-    /// terminal from a `Forwarded::Op(Weak<Op>)` payload; the new box's
-    /// `bound_op` immediately answers with the same `Rc<Op>` and its
-    /// `_forwarded` slot reads via the bound op per `get_forwarded`.
-    /// Type and position are mirrored from `op.pos.get()`.
+    /// `AbstractResOp` Box wrapping an already-bound `OpRc`. Used by the
+    /// chain walker to materialize a `BoxRef` terminal from a
+    /// `Forwarded::Op(Weak<Op>)` payload and by `resolve_to_boxref`; its
+    /// `bound_op` answers with the same `Rc<Op>` and its `_forwarded`
+    /// slot reads via the bound op per `get_forwarded`.
+    ///
+    /// The wrapper is MEMOIZED on the op (`Op::box_cache`): the op object
+    /// IS its own `AbstractValue`, so every call for the same `Rc<Op>`
+    /// returns the SAME `Rc<Box>`, giving stable pointer identity
+    /// (`Rc::ptr_eq` == `self is other`). The cached box's `position`
+    /// (`BoxKind::ResOp`) is refreshed from the current `op.pos` on every
+    /// call, since `op.pos` is mutable (recorder `op.pos.set`, unroll
+    /// resume-retarget, const-pool compaction). `type_` is not refreshed —
+    /// `Op.type_` is immutable and `op.pos`'s variant kind never changes
+    /// type for a given op.
     pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
+        {
+            let cache = op.box_cache.borrow();
+            if let Some(cached) = cache.as_ref() {
+                cached.set_position(op.pos.get().raw());
+                return cached.clone();
+            }
+        }
         let opref = op.pos.get();
         let type_ = opref.ty().unwrap_or(Type::Void);
         let position = opref.raw();
-        Self(Rc::new(Box {
+        let boxref = Self(Rc::new(Box {
             type_,
             kind: BoxKind::ResOp {
                 position: std::cell::Cell::new(position),
@@ -216,22 +232,36 @@ impl BoxRef {
             value: Cell::new(None),
             op_handle: RefCell::new(Some(Rc::downgrade(op))),
             inputarg_handle: RefCell::new(None),
-        }))
+        }));
+        *op.box_cache.borrow_mut() = Some(boxref.clone());
+        boxref
     }
 
-    /// Transient `AbstractInputArg` Box wrapping an already-bound
-    /// `InputArgRc`. Mirror of `from_bound_op` for the chain walker's
-    /// `Forwarded::InputArg` terminal materialization.
+    /// `AbstractInputArg` Box wrapping an already-bound `InputArgRc`.
+    /// Mirror of `from_bound_op` for the chain walker's
+    /// `Forwarded::InputArg` terminal materialization and for
+    /// `resolve_to_boxref`. MEMOIZED on the input arg
+    /// (`InputArg::box_cache`) so every call for the same `Rc<InputArg>`
+    /// returns the SAME `Rc<Box>`. No position refresh: `InputArg.index`
+    /// is immutable (`resoperation.py:699 AbstractInputArg.position`).
     pub fn from_bound_inputarg(ia: &crate::value::InputArgRc) -> Self {
+        {
+            let cache = ia.box_cache.borrow();
+            if let Some(cached) = cache.as_ref() {
+                return cached.clone();
+            }
+        }
         let type_ = ia.tp;
         let position = ia.index;
-        Self(Rc::new(Box {
+        let boxref = Self(Rc::new(Box {
             type_,
             kind: BoxKind::InputArg { position },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
             inputarg_handle: RefCell::new(Some(Rc::downgrade(ia))),
-        }))
+        }));
+        *ia.box_cache.borrow_mut() = Some(boxref.clone());
+        boxref
     }
 
     /// New `AbstractInputArg` Box.
@@ -412,33 +442,22 @@ impl BoxRef {
         }
     }
 
-    /// resoperation.py:38 `AbstractResOpOrInputArg.same_box`: `self is other`
-    /// history.py:211 `Const.same_box`: delegates to `same_constant` (value comparison)
+    /// `resoperation.py:38 AbstractResOpOrInputArg.same_box`: `self is other`
+    /// for ResOp / InputArg; `history.py:211 Const.same_box` delegates to
+    /// `same_constant` (value comparison, `history.py:251/292/338`).
     ///
-    /// The (kind, type, position) triple is a faithful 1:1 encoding of
-    /// upstream object identity: every box has exactly one such triple, so
-    /// triple-equality holds iff the two terminals are the same box —
-    /// matching `self is other` for non-Const and `same_constant` for Const
-    /// (history.py:251/292/338). `Rc::ptr_eq` cannot be used directly
-    /// because `get_box_replacement`'s chain walk reconstructs a fresh
-    /// `Rc<Box>` at each step from the OpRef variant tag, so independently
-    /// walked terminals never share an `Rc` even when they are the same box.
-    /// Convergence path: once OpRef indexing is retired and the trace yields
-    /// a single shared `BoxRef` per box (optimizer.py's
-    /// `trace.next() -> Box`), the reconstruction disappears and this body
-    /// collapses to `Rc::ptr_eq` for non-Const + `same_constant` for Const.
+    /// `from_bound_op` / `from_bound_inputarg` memoize exactly one `BoxRef`
+    /// wrapper per op / inputarg (`Op::box_cache` / `InputArg::box_cache`),
+    /// so every resolution of the same ResOp / InputArg shares one `Rc<Box>`
+    /// and the `Rc::ptr_eq` of `==` is a faithful `self is other` probe.
+    /// Const boxes are minted fresh per resolution (no op to memoize on), so
+    /// their identity is compared by value via the `same_constant` arm.
     pub fn same_box(&self, other: &BoxRef) -> bool {
         if self == other {
             return true;
         }
-        match (self.position(), other.position()) {
-            (Some(a), Some(b)) => {
-                a == b && self.is_inputarg() == other.is_inputarg() && self.type_() == other.type_()
-            }
-            (None, None) => match (self.const_value(), other.const_value()) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            },
+        match (self.const_value(), other.const_value()) {
+            (Some(a), Some(b)) => a == b,
             _ => false,
         }
     }
@@ -1029,6 +1048,88 @@ mod tests {
         let other = BoxRef::new_resop(Type::Int, 1);
         assert_eq!(a, cloned);
         assert_ne!(a, other);
+    }
+
+    /// Goal D identity stabilization: `from_bound_op` memoizes the box
+    /// wrapper on the op (`Op::box_cache`), so two resolutions of the SAME
+    /// `Rc<Op>` yield the SAME `Rc<Box>` (`Rc::ptr_eq` == `self is other`),
+    /// while a distinct (cloned) op gets its own. The cached box's position
+    /// is refreshed from the (mutable) `op.pos` on every call.
+    #[test]
+    fn from_bound_op_memoizes_identity_per_op() {
+        let op = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        op.pos.set(OpRef::op_typed(3, Type::Int));
+
+        let a = BoxRef::from_bound_op(&op);
+        let b = BoxRef::from_bound_op(&op);
+        // Same op -> same wrapper identity (pointer equality).
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(a, b);
+
+        // A fresh-identity clone (box_cache reset to None) gets its own wrapper.
+        let op2 = std::rc::Rc::new((*op).clone());
+        let c = BoxRef::from_bound_op(&op2);
+        assert_ne!(a.as_ptr(), c.as_ptr());
+        assert_ne!(a, c);
+
+        // Position refresh: mutating op.pos is reflected on the next resolve,
+        // and through the already-held reference (shared Rc<Box>).
+        op.pos.set(OpRef::op_typed(9, Type::Int));
+        let d = BoxRef::from_bound_op(&op);
+        assert_eq!(a.as_ptr(), d.as_ptr());
+        assert_eq!(d.position(), Some(9));
+        assert_eq!(a.position(), Some(9));
+    }
+
+    /// `from_bound_inputarg` memoizes identically on `InputArg::box_cache`
+    /// (no position refresh — `InputArg.index` is immutable).
+    #[test]
+    fn from_bound_inputarg_memoizes_identity_per_inputarg() {
+        let ia = std::rc::Rc::new(InputArg::from_type(Type::Ref, 2));
+        let a = BoxRef::from_bound_inputarg(&ia);
+        let b = BoxRef::from_bound_inputarg(&ia);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(a, b);
+
+        // A distinct InputArg (even with equal tp/index) gets its own wrapper.
+        let ia2 = std::rc::Rc::new(InputArg::from_type(Type::Ref, 2));
+        let c = BoxRef::from_bound_inputarg(&ia2);
+        assert_ne!(a.as_ptr(), c.as_ptr());
+        assert_ne!(a, c);
+    }
+
+    /// After identity memoization (slice 1), `BoxRef::same_box` is object
+    /// identity (`Rc::ptr_eq`) for ResOp / InputArg plus `same_constant`
+    /// (value comparison) for Const — resoperation.py:38 / history.py:211.
+    /// Two memoized resolutions of the same op/inputarg are `same_box`;
+    /// DISTINCT op/inputarg identities are NOT (even at the same position —
+    /// distinct objects are distinct boxes); equal-valued Const boxes are
+    /// `same_box` by value; Const vs non-Const is not.
+    #[test]
+    fn same_box_identity_and_same_constant() {
+        let op = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        op.pos.set(OpRef::op_typed(4, Type::Int));
+        let a = BoxRef::from_bound_op(&op);
+        let b = BoxRef::from_bound_op(&op);
+        assert!(a.same_box(&b)); // same op -> shared Rc
+
+        // A distinct op even at the SAME position/type is NOT same_box.
+        let op2 = std::rc::Rc::new((*op).clone());
+        let c = BoxRef::from_bound_op(&op2);
+        assert!(!a.same_box(&c));
+
+        let ia = std::rc::Rc::new(InputArg::from_type(Type::Ref, 1));
+        let ja = BoxRef::from_bound_inputarg(&ia);
+        let jb = BoxRef::from_bound_inputarg(&ia);
+        assert!(ja.same_box(&jb)); // same inputarg -> shared Rc
+        let ia2 = std::rc::Rc::new(InputArg::from_type(Type::Ref, 1));
+        assert!(!ja.same_box(&BoxRef::from_bound_inputarg(&ia2)));
+
+        let k7a = BoxRef::new_const(Value::Int(7));
+        let k7b = BoxRef::new_const(Value::Int(7));
+        assert!(k7a.same_box(&k7b)); // same_constant by value
+        assert!(!k7a.same_box(&BoxRef::new_const(Value::Int(8))));
+        assert!(!k7a.same_box(&a)); // Const vs ResOp
     }
 
     #[test]

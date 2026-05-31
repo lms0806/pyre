@@ -1315,6 +1315,17 @@ pub struct Op {
     /// `set_opref_concrete`); residual calls / guards keep it `None`
     /// until blackhole runs them.
     pub value: std::cell::Cell<Option<crate::value::Value>>,
+
+    /// Canonical `AbstractResOp` box wrapper for this op (`resoperation.py`:
+    /// the op object IS its own `AbstractValue`, so there is exactly one
+    /// identity per op). Lazily minted by [`BoxRef::from_bound_op`] and
+    /// memoized here so every resolution of this op yields the SAME
+    /// `Rc<Box>` — making `Rc::ptr_eq` a faithful `self is other` probe.
+    /// `None` until first bound resolution; reset to `None` for every
+    /// fresh-identity `Op` (`clone` / `copy_and_change`). Holds a strong
+    /// `Rc<Box>`; the `Box` holds only a `Weak<Op>` back-reference, so no
+    /// reference cycle forms.
+    pub box_cache: std::cell::RefCell<Option<crate::box_ref::BoxRef>>,
 }
 
 impl Clone for Op {
@@ -1339,6 +1350,9 @@ impl Clone for Op {
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
             value: std::cell::Cell::new(None),
+            // Fresh identity gets a fresh (empty) box wrapper, mirroring the
+            // `forwarded` reset above.
+            box_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1467,6 +1481,7 @@ impl Op {
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
             value: std::cell::Cell::new(None),
+            box_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1483,6 +1498,7 @@ impl Op {
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
             value: std::cell::Cell::new(None),
+            box_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1553,6 +1569,9 @@ impl Op {
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
             value: std::cell::Cell::new(None),
+            // copy_and_change yields a fresh-identity op, so it gets a fresh
+            // (empty) box wrapper rather than aliasing self's.
+            box_cache: std::cell::RefCell::new(None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3628,6 +3647,7 @@ mod tests {
                 type_: Type::Void,
                 forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
                 value: std::cell::Cell::new(None),
+                box_cache: std::cell::RefCell::new(None),
             };
             __op.type_ = __op.opcode.result_type();
             __op

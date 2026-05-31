@@ -740,6 +740,9 @@ pub struct _struct {
     pub _identity: usize,
     pub TYPE: StructType,
     pub _fields: Arc<Mutex<Vec<(String, LowLevelValue)>>>,
+    /// Shared `_parentable` state — `_storage`/`_wrparent`/… on the
+    /// container object (lltype.py:1654-1666).
+    _parentable: Arc<Parentable>,
 }
 
 /// `_array.items` is wrapped in `Arc<Mutex<...>>` for the same shared-
@@ -750,6 +753,8 @@ pub struct _array {
     pub _identity: usize,
     pub TYPE: ArrayContainer,
     pub items: Arc<Mutex<Vec<LowLevelValue>>>,
+    /// Shared `_parentable` state (lltype.py:1654-1666).
+    _parentable: Arc<Parentable>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -783,6 +788,16 @@ pub struct _opaque {
     /// helper pointers directly on the RTTI opaque (`lltype.py:405-415`).
     pub query_funcptr: Option<Box<_ptr>>,
     pub destructor_funcptr: Option<Box<_ptr>>,
+    /// `cast_opaque_ptr(..., 'hidden', container=..., ORIGTYPE=...,
+    /// solid=...)` stores the original container and its pointer type on
+    /// the opaque so a later opaque→concrete cast can rebuild the real
+    /// pointer (`lltype.py:996-1015`). `None` on every other opaque.
+    pub container: Option<Box<_ptr_obj>>,
+    pub ORIGTYPE: Option<LowLevelType>,
+    pub solid: bool,
+    /// Shared `_parentable` state (lltype.py:1654-1666); `_opaque` is a
+    /// `_parentable` (lltype.py:2142).
+    _parentable: Arc<Parentable>,
 }
 
 #[derive(Clone, Debug)]
@@ -887,6 +902,200 @@ fn fresh_low_level_pointer_identity() -> u64 {
     NEXT_LOW_LEVEL_POINTER_ID.fetch_add(1, Ordering::Relaxed) as u64
 }
 
+/// Shared, clone-aliased `_parentable` state — upstream
+/// `class _parentable(_container)` slots `_storage`, `_wrparent`,
+/// `_parent_type`, `_parent_index` (lltype.py:1654-1666). Held behind an
+/// `Arc` so every value-clone of a container observes `_free` and the
+/// parent link, exactly the way Python's reference objects share one
+/// `__dict__`. `_struct`/`_array`/`_opaque` each embed one — they are the
+/// three `_parentable` subclasses (`_func`/`_wref` are plain
+/// `_container`s, lltype.py:1648, and carry no `Parentable`).
+#[derive(Debug)]
+pub struct Parentable {
+    /// `_storage` (lltype.py:1663): `true` = live (upstream "use default
+    /// storage"), `false` = freed (upstream `None`). The ctypes-object
+    /// variant is not modeled (ll2ctypes is dead in pyre). `AtomicBool`
+    /// keeps the hot `_check`/`_was_freed` read off a mutex.
+    storage_live: std::sync::atomic::AtomicBool,
+    /// `_wrparent`/`_parent_type`/`_parent_index` (lltype.py:1693-1696),
+    /// installed by `_setparentstructure`. Upstream `_wrparent` is a
+    /// `weakref.ref(parent)`; the translator never collects containers, so
+    /// a strong `Arc<Parentable>` to the parent's shared state is held
+    /// instead (the weak/strong distinction and `_keepparent` exist only to
+    /// cooperate with Python's GC).
+    parent: Mutex<Option<ParentLink>>,
+}
+
+/// `_parentable._wrparent` + `_parent_type` + `_parent_index`
+/// (lltype.py:1693-1696).
+#[derive(Debug)]
+struct ParentLink {
+    /// `_wrparent()` — the parent container's shared `_parentable` state.
+    ///
+    /// Upstream `_wrparent` weakly references the parent *container object*
+    /// (`_struct`/`_array`/`_opaque`), so `_parentstructure()`
+    /// (lltype.py:1704-1714) can hand the parent back and `_normalizedcontainer`
+    /// (lltype.py:1721-1735) / `_cast_to` up-casts can read its first inlined
+    /// field. Here only the parent's `Parentable` (liveness chain) is reachable,
+    /// not the owning container value, because the value-model has no
+    /// `_identity`→container map. This is exactly what blocks the
+    /// object-returning `_parentstructure()` walk; the liveness predicates
+    /// (`_was_freed`/`_check`) need only the chain and are fully ported.
+    parent: Arc<Parentable>,
+    /// `_parent_type` (lltype.py:1695) — `typeOf(parent)`. Stored to mirror
+    /// the upstream slot; read by the deferred object-returning
+    /// `_parentstructure()` / `_normalizedcontainer` / `_cast_to` up-cast,
+    /// which need an identity→container map pyre does not have yet.
+    #[allow(dead_code)]
+    parent_type: LowLevelType,
+    /// `_parent_index` (lltype.py:1696) — the field name or item index that
+    /// holds this sub-container inside the parent. Same deferred readers as
+    /// `parent_type`.
+    #[allow(dead_code)]
+    parent_index: ParentIndex,
+}
+
+/// `_parent_index` (lltype.py:1696): a struct field name or an array item
+/// index. Inner values are read by the deferred `_parentstructure()` walk
+/// (see [`ParentLink::parent_index`]).
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum ParentIndex {
+    Field(String),
+    Item(usize),
+}
+
+impl Parentable {
+    /// `_parentable.__init__` (lltype.py:1660-1666) — fresh container,
+    /// live storage, no parent.
+    fn new() -> Arc<Self> {
+        Arc::new(Parentable {
+            storage_live: std::sync::atomic::AtomicBool::new(true),
+            parent: Mutex::new(None),
+        })
+    }
+
+    /// `_parentable._was_freed` (lltype.py:1681-1691): freed iff this
+    /// container's own storage was freed, or — walking `_wrparent` — its
+    /// parent structure is freed. Upstream raises if a `_wrparent` weakref
+    /// was garbage collected; the translator holds the parent strongly, so
+    /// the walk simply recurses.
+    fn was_freed(&self) -> bool {
+        if !self.storage_live.load(Ordering::Relaxed) {
+            return true;
+        }
+        match &*self.parent.lock().unwrap() {
+            None => false,
+            Some(link) => link.parent.was_freed(),
+        }
+    }
+
+    /// `_parentable._check` (lltype.py:1716-1719): accessing freed storage
+    /// is an error. Upstream checks `self._storage is None` then recurses
+    /// through `_parentstructure()` (which calls `parent._check()`); the
+    /// net condition is "freed anywhere in the chain", i.e. `_was_freed()`.
+    fn check(&self) {
+        if self.was_freed() {
+            panic!("accessing freed container");
+        }
+    }
+
+    /// `_parentable._free` (lltype.py:1668-1670): `self._check()` (no
+    /// double-frees) then `self._storage = None`.
+    ///
+    /// `_protect`/`_unprotect` (lltype.py:1672-1679) are intentionally not
+    /// ported — their sole consumer is `ll2ctypes` (dead in pyre) and the
+    /// freed-bit model carries no `_storage` object to round-trip.
+    fn free(&self) {
+        self.check();
+        self.storage_live.store(false, Ordering::Relaxed);
+    }
+
+    /// `_parentable._setparentstructure(parent, parentindex)`
+    /// (lltype.py:1693-1696). `_keepparent` (lltype.py:1697-1702) is moot
+    /// without Python-GC cooperation and is omitted.
+    fn set_parent_structure(
+        &self,
+        parent: Arc<Parentable>,
+        parent_type: LowLevelType,
+        parent_index: ParentIndex,
+    ) {
+        *self.parent.lock().unwrap() = Some(ParentLink {
+            parent,
+            parent_type,
+            parent_index,
+        });
+    }
+}
+
+/// The shared `_parentable` state of a `LowLevelValue` that is itself an
+/// inlined container (`_struct`/`_array`/`_opaque`), or `None` for a
+/// primitive / pointer field. Used to wire `_setparentstructure` at
+/// materialization (`_struct`/`_array.__init__` pass `parent=self`).
+fn parentable_of(value: &LowLevelValue) -> Option<Arc<Parentable>> {
+    match value {
+        LowLevelValue::Struct(s) => Some(s._parentable.clone()),
+        LowLevelValue::Array(a) => Some(a._parentable.clone()),
+        LowLevelValue::Opaque(o) => Some(o._parentable.clone()),
+        _ => None,
+    }
+}
+
+/// `_struct.__init__` (lltype.py:1767-1781) — build a `_struct` whose
+/// inlined sub-container fields link back to it as their `_wrparent`
+/// (`parent=self, parentindex=fld`). Single construction path so both
+/// `_container_example` and `malloc` wire parent links identically.
+fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _struct {
+    let _parentable = Parentable::new();
+    let parent_type = LowLevelType::Struct(Box::new(type_.clone()));
+    for (name, value) in &fields {
+        if let Some(child) = parentable_of(value) {
+            child.set_parent_structure(
+                _parentable.clone(),
+                parent_type.clone(),
+                ParentIndex::Field(name.clone()),
+            );
+        }
+    }
+    _struct {
+        _identity: fresh_low_level_container_identity(),
+        TYPE: type_,
+        _fields: Arc::new(Mutex::new(fields)),
+        _parentable,
+    }
+}
+
+/// `_array.__init__` (lltype.py:1864-1876) and `_fixedsizearray.__init__`
+/// (lltype.py:1817-1827) — build an `_array` whose inlined item slots link
+/// back to it as their `_wrparent`. A plain `_array` passes the integer
+/// item index as `parentindex` (`parent=self, parentindex=j`,
+/// lltype.py:1872); a `_fixedsizearray` passes the synthesized field name
+/// `"item%d" % j` (`parentindex=fld`, lltype.py:1825).
+fn build_array(type_: ArrayContainer, items: Vec<LowLevelValue>) -> _array {
+    let _parentable = Parentable::new();
+    let parent_type = match &type_ {
+        ArrayContainer::Array(a) => LowLevelType::Array(Box::new(a.clone())),
+        ArrayContainer::FixedSizeArray(a) => LowLevelType::FixedSizeArray(Box::new(a.clone())),
+    };
+    let fixedsize = matches!(&type_, ArrayContainer::FixedSizeArray(_));
+    for (j, item) in items.iter().enumerate() {
+        if let Some(child) = parentable_of(item) {
+            let parent_index = if fixedsize {
+                ParentIndex::Field(format!("item{j}"))
+            } else {
+                ParentIndex::Item(j)
+            };
+            child.set_parent_structure(_parentable.clone(), parent_type.clone(), parent_index);
+        }
+    }
+    _array {
+        _identity: fresh_low_level_container_identity(),
+        TYPE: type_,
+        items: Arc::new(Mutex::new(items)),
+        _parentable,
+    }
+}
+
 impl PartialEq for _struct {
     fn eq(&self, other: &Self) -> bool {
         self._identity == other._identity
@@ -916,16 +1125,57 @@ impl Hash for _array {
 }
 
 impl PartialEq for _opaque {
+    /// `_opaque.__eq__` (lltype.py:2156-2164). A `'hidden'` opaque carries
+    /// a `container`; two such opaques are equal iff their normalized
+    /// containers are equal (so two casts of the same allocation match),
+    /// regardless of `_identity`. Any other opaque compares by identity
+    /// (`self is other`).
     fn eq(&self, other: &Self) -> bool {
-        self._identity == other._identity
+        match (&self.container, &other.container) {
+            (Some(_), Some(_)) => self._normalizedcontainer() == other._normalizedcontainer(),
+            _ => self._identity == other._identity,
+        }
     }
 }
 
 impl Eq for _opaque {}
 
 impl Hash for _opaque {
+    /// `_opaque.__hash__` (lltype.py:2171-2176) — hash by the normalized
+    /// container when present, else by identity (`_parentable.__hash__`).
+    /// Consistent with [`PartialEq`].
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self._identity.hash(state);
+        match &self.container {
+            Some(c) => c._normalizedcontainer().hash(state),
+            None => self._identity.hash(state),
+        }
+    }
+}
+
+impl _opaque {
+    /// `_parentable._free` (lltype.py:1668) — `_opaque` is a `_parentable`;
+    /// delegates to the shared `_parentable` state.
+    pub fn _free(&self) {
+        self._parentable.free();
+    }
+
+    /// `_parentable._was_freed` (lltype.py:1681-1691) — delegates to the
+    /// shared `_parentable`, which walks the `_wrparent` chain.
+    pub fn _was_freed(&self) -> bool {
+        self._parentable.was_freed()
+    }
+
+    /// `_opaque._normalizedcontainer` (lltype.py:2178-2189): a `'hidden'`
+    /// opaque normalizes to its stowed container's normal form (the int /
+    /// `_carry_around_for_tests` short-circuits are not modeled in pyre).
+    /// A container-less opaque would fall to `_parentable._normalizedcontainer`
+    /// (the first-inlined-field walk), which needs the deferred
+    /// object-returning `_parentstructure()`; it is already normal here.
+    fn _normalizedcontainer(&self) -> _ptr_obj {
+        match &self.container {
+            Some(c) => c._normalizedcontainer(),
+            None => _ptr_obj::Opaque(self.clone()),
+        }
     }
 }
 
@@ -935,10 +1185,22 @@ impl Hash for _opaque {
 ///
 /// Upstream stores `weakref.ref(normalizeptr(ptarget)._obj)` (or
 /// `lambda: None` for a dead wref) and `_dereference` returns
-/// `obj._as_ptr()` while the referent is alive. This port holds the
-/// referent pointer directly: the translation model never frees objects
-/// (`obj._was_freed()` is always false), so a live `_wref` keeps the
-/// target `_ptr` and `_dereference` clones it; `None` is the dead wref.
+/// `obj._as_ptr()` unless `obj is None or obj._was_freed()`. This port
+/// holds the referent pointer strongly instead.
+///
+/// PRE-EXISTING-ADAPTATION (blocker: value-based container model). A true
+/// `weakref.ref` needs the referent container to be a reference-counted
+/// object a `std::rc::Weak` can observe, and `_was_freed()` needs an arena
+/// that nulls `_storage` on free (`_parentable._was_freed`, lltype.py:1681).
+/// pyre's containers (`_struct`/`_array`/`_opaque`) are value types keyed
+/// by a `_identity` counter, cloned freely, with no arena and no `_free`
+/// path — so `_was_freed()` is always false and a weak ref would resolve
+/// alive exactly as the strong ref does. The behaviour is therefore
+/// identical; only the storage mechanism differs. Convergence path: move
+/// containers behind an `Rc`/arena registry (a cross-cutting epic on the
+/// whole lltype container layer), then store `rc::Weak` here and port
+/// `_free`/`_was_freed`. Until that lands the strong ref is observationally
+/// exact.
 #[derive(Clone, Debug)]
 pub struct _wref {
     pub _identity: usize,
@@ -968,10 +1230,26 @@ impl _wref {
         }
     }
 
-    /// llmemory.py:872-879 `_wref._dereference(self)`. Returns the referent
-    /// (always alive in the translation model) or `None` for a dead wref.
+    /// llmemory.py:872-879 `_wref._dereference(self)`:
+    ///
+    /// ```python
+    /// def _dereference(self):
+    ///     obj = self._obref()
+    ///     if obj is None or obj._was_freed():
+    ///         return None
+    ///     else:
+    ///         return obj._as_ptr()
+    /// ```
+    ///
+    /// `None` for a dead wref; otherwise the referent unless its container
+    /// reports `_was_freed()` (always false until a `_free` caller lands —
+    /// Epic G slice 4 / llinterp).
     pub fn _dereference(&self) -> Option<_ptr> {
-        self._obref.as_ref().map(|p| (**p).clone())
+        match &self._obref {
+            None => None,
+            Some(p) if p._was_freed() => None,
+            Some(p) => Some((**p).clone()),
+        }
     }
 
     /// `_container._as_ptr(self)` — `_ptr(Ptr(self._TYPE), self, solid=True)`
@@ -988,6 +1266,18 @@ impl _wref {
 }
 
 impl _struct {
+    /// `_parentable._free` (lltype.py:1668) — delegates to the shared
+    /// `_parentable` state.
+    pub fn _free(&self) {
+        self._parentable.free();
+    }
+
+    /// `_parentable._was_freed` (lltype.py:1681-1691) — delegates to the
+    /// shared `_parentable`, which walks the `_wrparent` chain.
+    pub fn _was_freed(&self) -> bool {
+        self._parentable.was_freed()
+    }
+
     /// `_struct._fields` is an `Arc<Mutex<...>>`-shared cell so the
     /// returned value must be cloned out of the lock guard. Cheap for
     /// the primitive variants of `LowLevelValue`; `Struct`/`Array`
@@ -1041,6 +1331,18 @@ impl _struct {
 }
 
 impl _array {
+    /// `_parentable._free` (lltype.py:1668) — delegates to the shared
+    /// `_parentable` state.
+    pub fn _free(&self) {
+        self._parentable.free();
+    }
+
+    /// `_parentable._was_freed` (lltype.py:1681-1691) — delegates to the
+    /// shared `_parentable`, which walks the `_wrparent` chain.
+    pub fn _was_freed(&self) -> bool {
+        self._parentable.was_freed()
+    }
+
     pub fn getlength(&self) -> usize {
         self.items.lock().unwrap().len()
     }
@@ -1226,35 +1528,71 @@ impl _ptr {
         });
     }
 
-    /// RPython `_abstract_ptr._getobj` (`lltype.py:1226-1240`). Returns
-    /// the underlying container (non-null required by callers that
-    /// dereference); delayed pointers surface as `Err(DelayedPointer)`.
-    /// Null pointers panic at the dereference site — upstream raises
-    /// `AttributeError` on `self._obj.getattr(...)` implicitly, so
-    /// either outcome is a programmer error.
-    pub fn _obj(&self) -> Result<_ptr_obj, DelayedPointer> {
+    /// RPython `_abstract_ptr._getobj(self, check=True)`
+    /// (`lltype.py:1226-1240`). Resolves `_obj0`, running `obj._check()`
+    /// (which raises on access to freed storage) when `check`. A null
+    /// pointer is `Ok(None)`; a delayed pointer is `Err(DelayedPointer)`.
+    /// The `_obj` property is `_getobj(check=True)`.
+    fn _getobj(&self, check: bool) -> Result<Option<_ptr_obj>, DelayedPointer> {
         let resolved = self._resolved_ptr();
         match resolved._obj0 {
-            Ok(Some(obj)) => Ok(obj),
-            Ok(None) => panic!("null low-level pointer has no underlying object"),
+            Ok(Some(obj)) => {
+                if check {
+                    obj._check();
+                }
+                Ok(Some(obj))
+            }
+            Ok(None) => Ok(None),
             Err(_) => Err(DelayedPointer),
         }
     }
 
-    /// RPython `_abstract_ptr._same_obj` (`lltype.py:1200-1201`).
-    /// Compares `_obj` values directly (handles null-null equality)
-    /// and surfaces `DelayedPointer` for either-side delayed.
-    pub fn _same_obj(&self, other: &_ptr) -> Result<bool, DelayedPointer> {
-        let self_resolved = self._resolved_ptr();
-        let other_resolved = other._resolved_ptr();
-        match (&self_resolved._obj0, &other_resolved._obj0) {
-            (Ok(a), Ok(b)) => Ok(a == b),
-            _ => Err(DelayedPointer),
+    /// The `_obj` property (`_getobj(check=True)`, lltype.py:1240). Returns
+    /// the underlying container; null pointers panic at the dereference
+    /// site (upstream raises `AttributeError` on `self._obj.getattr(...)`
+    /// implicitly, so either outcome is a programmer error).
+    pub fn _obj(&self) -> Result<_ptr_obj, DelayedPointer> {
+        match self._getobj(true)? {
+            Some(obj) => Ok(obj),
+            None => panic!("null low-level pointer has no underlying object"),
         }
     }
 
+    /// RPython `_ptr._was_freed` (lltype.py:1242):
+    ///
+    /// ```python
+    /// def _was_freed(self):
+    ///     return (type(self._obj0) not in (type(None), int) and
+    ///             self._getobj(check=False)._was_freed())
+    /// ```
+    ///
+    /// A null pointer (`_obj0 == None`) and a tagged int are never freed;
+    /// a real container delegates to its own `_was_freed`. A delayed
+    /// pointer cannot be inspected, so it reports not-freed. Uses
+    /// `check=False` to avoid recursing into `_check`.
+    pub fn _was_freed(&self) -> bool {
+        match self._getobj(false) {
+            Ok(Some(obj)) => obj._was_freed(),
+            _ => false,
+        }
+    }
+
+    /// RPython `_abstract_ptr._same_obj` (`lltype.py:1200-1201`):
+    /// `self._obj == other._obj`. Both sides go through `_getobj(check=True)`
+    /// so a freed pointer raises; null-null compares equal; a delayed
+    /// pointer on either side surfaces as `Err(DelayedPointer)` (the caller
+    /// `__eq__` falls back to `self is other`).
+    pub fn _same_obj(&self, other: &_ptr) -> Result<bool, DelayedPointer> {
+        let a = self._getobj(true)?;
+        let b = other._getobj(true)?;
+        Ok(a == b)
+    }
+
+    /// RPython `_abstract_ptr.__nonzero__` (`lltype.py:1206-1210`):
+    /// `self._obj is not None`, i.e. `_getobj(check=True)` — a freed pointer
+    /// raises; a delayed pointer is assumed non-null.
     pub fn nonzero(&self) -> bool {
-        match &self._resolved_ptr()._obj0 {
+        match self._getobj(true) {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(DelayedPointer) => true,
@@ -2241,11 +2579,7 @@ impl StructType {
                 (name.clone(), typ._defl())
             })
             .collect();
-        _struct {
-            _identity: fresh_low_level_container_identity(),
-            TYPE: self.clone(),
-            _fields: Arc::new(Mutex::new(fields)),
-        }
+        build_struct(self.clone(), fields)
     }
 
     pub fn getattr_field_type(&self, field_name: &str) -> Option<ConcretetypePlaceholder> {
@@ -2330,11 +2664,7 @@ impl ArrayType {
     }
 
     pub fn _container_example(&self) -> _array {
-        _array {
-            _identity: fresh_low_level_container_identity(),
-            TYPE: ArrayContainer::Array(self.clone()),
-            items: Arc::new(Mutex::new(vec![self.OF._defl()])),
-        }
+        build_array(ArrayContainer::Array(self.clone()), vec![self.OF._defl()])
     }
 
     /// RPython `Array._is_atomic` (`lltype.py:450-451`) — an array is
@@ -2421,11 +2751,7 @@ impl FixedSizeArrayType {
 
     pub fn _container_example(&self) -> _array {
         let items: Vec<LowLevelValue> = (0..self.length).map(|_| self.OF._defl()).collect();
-        _array {
-            _identity: fresh_low_level_container_identity(),
-            TYPE: ArrayContainer::FixedSizeArray(self.clone()),
-            items: Arc::new(Mutex::new(items)),
-        }
+        build_array(ArrayContainer::FixedSizeArray(self.clone()), items)
     }
 
     /// RPython `FixedSizeArray._short_name` (`lltype.py:532-536`).
@@ -2464,6 +2790,10 @@ impl OpaqueType {
             about: None,
             query_funcptr: None,
             destructor_funcptr: None,
+            container: None,
+            ORIGTYPE: None,
+            solid: false,
+            _parentable: Parentable::new(),
         }
     }
 
@@ -2516,7 +2846,41 @@ fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType
         about,
         query_funcptr: None,
         destructor_funcptr: None,
+        container: None,
+        ORIGTYPE: None,
+        solid: false,
+        _parentable: Parentable::new(),
     }
+}
+
+/// `opaqueptr(PTRTYPE.TO, 'hidden', container=container, ORIGTYPE=...,
+/// solid=...)` — a `'hidden'` opaque produced by `cast_opaque_ptr` that
+/// stows the original container so the inverse cast can recover it
+/// (`lltype.py:1003-1009`).
+fn opaqueptr_hidden(
+    TYPE: OpaqueType,
+    container: _ptr_obj,
+    origtype: Option<LowLevelType>,
+    solid: bool,
+) -> Result<_ptr, String> {
+    let obj = _opaque {
+        _identity: fresh_low_level_container_identity(),
+        TYPE: TYPE.clone(),
+        _name: Some("hidden".to_string()),
+        about: None,
+        query_funcptr: None,
+        destructor_funcptr: None,
+        container: Some(Box::new(container)),
+        ORIGTYPE: origtype,
+        solid,
+        _parentable: Parentable::new(),
+    };
+    let ptr_t = Ptr::from_container_type(LowLevelType::Opaque(Box::new(TYPE)))?;
+    Ok(_ptr::new_with_solid(
+        ptr_t,
+        Ok(Some(_ptr_obj::Opaque(obj))),
+        solid,
+    ))
 }
 
 fn expect_rtti_struct(T: &LowLevelType) -> Result<&StructType, String> {
@@ -3044,6 +3408,154 @@ pub fn cast_pointer(ptrtype: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     ptr._cast_to(ptrtype)
 }
 
+impl _ptr_obj {
+    /// `lltype.typeOf(container)` — the container's `LowLevelType`.
+    fn _container_type(&self) -> LowLevelType {
+        match self {
+            _ptr_obj::Func(f) => LowLevelType::Func(Box::new(f.TYPE.clone())),
+            _ptr_obj::Struct(s) => LowLevelType::Struct(Box::new(s.TYPE.clone())),
+            _ptr_obj::Array(a) => match &a.TYPE {
+                ArrayContainer::Array(t) => LowLevelType::Array(Box::new(t.clone())),
+                ArrayContainer::FixedSizeArray(t) => {
+                    LowLevelType::FixedSizeArray(Box::new(t.clone()))
+                }
+            },
+            _ptr_obj::Opaque(o) => LowLevelType::Opaque(Box::new(o.TYPE.clone())),
+            _ptr_obj::Wref(_) => WEAKREF.clone(),
+        }
+    }
+
+    /// The container's `_was_freed()`. `_struct`/`_array`/`_opaque` are
+    /// `_parentable` and consult their shared `_parentable` state;
+    /// `_func`/`_wref` are plain `_container`s whose `_was_freed` is always
+    /// `False` (lltype.py:1648).
+    fn _was_freed(&self) -> bool {
+        match self {
+            _ptr_obj::Struct(s) => s._was_freed(),
+            _ptr_obj::Array(a) => a._was_freed(),
+            _ptr_obj::Opaque(o) => o._was_freed(),
+            _ptr_obj::Func(_) | _ptr_obj::Wref(_) => false,
+        }
+    }
+
+    /// `_container._check()` dispatched per variant. The three `_parentable`
+    /// containers raise on access to freed storage (lltype.py:1716-1719);
+    /// `_func`/`_wref` are plain `_container`s whose `_check` is a no-op
+    /// (lltype.py:1638). Called by `_ptr._getobj(check=True)`.
+    fn _check(&self) {
+        match self {
+            _ptr_obj::Struct(s) => s._parentable.check(),
+            _ptr_obj::Array(a) => a._parentable.check(),
+            _ptr_obj::Opaque(o) => o._parentable.check(),
+            _ptr_obj::Func(_) | _ptr_obj::Wref(_) => {}
+        }
+    }
+
+    /// `_container._normalizedcontainer()` — only `_opaque` rewrites itself
+    /// (lltype.py:2178). `_parentable._normalizedcontainer`
+    /// (lltype.py:1721-1735) walks `_struct`/`_array` up to the enclosing
+    /// struct when this is its first inlined field; that walk needs the
+    /// deferred object-returning `_parentstructure()`. A hidden opaque's
+    /// container is a top-level allocation (no parent), so it is already in
+    /// normal form here.
+    fn _normalizedcontainer(&self) -> _ptr_obj {
+        match self {
+            _ptr_obj::Opaque(o) => o._normalizedcontainer(),
+            _ => self.clone(),
+        }
+    }
+}
+
+/// RPython `cast_opaque_ptr(PTRTYPE, ptr)` (`lltype.py:978-1015`) — casts
+/// between an `OpaqueType` pointer and a concrete container pointer (or
+/// between two opaque pointers), keeping the gc kind. A concrete→opaque
+/// cast mints a `'hidden'` opaque that stows the original container so the
+/// inverse cast can rebuild the real pointer.
+///
+/// The `_cast_to_ptr` / `_cast_to_opaque` container hooks and the
+/// tagged-int container case that upstream guards with `hasattr` are not
+/// modelled: no pyre container defines those hooks, so those branches are
+/// dead exactly as the `hasattr` checks make them dead upstream.
+pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
+    let curtype = ptr._TYPE.clone();
+    if curtype == *PTRTYPE {
+        return Ok(ptr.clone());
+    }
+    if curtype._gckind() != PTRTYPE._gckind() {
+        return Err(format!(
+            "cast_opaque_ptr() cannot change the gc status: {} to {}",
+            LowLevelType::Ptr(Box::new(curtype)).short_name(),
+            LowLevelType::Ptr(Box::new(PTRTYPE.clone())).short_name(),
+        ));
+    }
+    let cur_opaque = matches!(curtype.TO, PtrTarget::Opaque(_));
+    let exp_opaque = matches!(PTRTYPE.TO, PtrTarget::Opaque(_));
+    let expected_to = || LowLevelType::from(PTRTYPE.TO.clone());
+
+    if cur_opaque && !exp_opaque {
+        // opaque -> concrete
+        if !ptr.nonzero() {
+            return nullptr(expected_to());
+        }
+        let _ptr_obj::Opaque(opaque) = obj_of(ptr)? else {
+            return Err(format!("{ptr:?} does not come from a container"));
+        };
+        let container = opaque
+            .container
+            .ok_or_else(|| format!("{ptr:?} does not come from a container"))?;
+        let p = _ptr::new_with_solid(
+            Ptr::from_container_type(container._container_type())?,
+            Ok(Some(*container)),
+            opaque.solid,
+        );
+        cast_pointer(PTRTYPE, &p)
+    } else if !cur_opaque && exp_opaque {
+        // concrete -> opaque
+        let PtrTarget::Opaque(opaque_t) = &PTRTYPE.TO else {
+            unreachable!()
+        };
+        if !ptr.nonzero() {
+            return nullptr(expected_to());
+        }
+        let container = obj_of(ptr)?;
+        opaqueptr_hidden(
+            opaque_t.clone(),
+            container,
+            Some(LowLevelType::Ptr(Box::new(curtype))),
+            ptr._solid,
+        )
+    } else if cur_opaque && exp_opaque {
+        // opaque -> opaque
+        let PtrTarget::Opaque(opaque_t) = &PTRTYPE.TO else {
+            unreachable!()
+        };
+        if !ptr.nonzero() {
+            return nullptr(expected_to());
+        }
+        let _ptr_obj::Opaque(opaque) = obj_of(ptr)? else {
+            return Err(format!("{ptr:?} does not come from a container"));
+        };
+        let container = opaque
+            .container
+            .ok_or_else(|| format!("{ptr:?} does not come from a container"))?;
+        opaqueptr_hidden(opaque_t.clone(), *container, None, opaque.solid)
+    } else {
+        Err(format!(
+            "invalid cast_opaque_ptr(): {} -> {}",
+            LowLevelType::Ptr(Box::new(curtype)).short_name(),
+            LowLevelType::Ptr(Box::new(PTRTYPE.clone())).short_name(),
+        ))
+    }
+}
+
+/// `ptr._obj` for a cast — surfaces a delayed pointer as an error rather
+/// than panicking, matching the `try/except AttributeError` upstream uses
+/// to detect a container-less pointer.
+fn obj_of(ptr: &_ptr) -> Result<_ptr_obj, String> {
+    ptr._obj()
+        .map_err(|_| format!("{ptr:?} is a delayed pointer"))
+}
+
 /// RPython `getRuntimeTypeInfo(GCSTRUCT)` (`lltype.py:2391-2397`):
 ///
 /// ```python
@@ -3240,22 +3752,17 @@ pub fn malloc(
                             };
                             let inner_items: Vec<LowLevelValue> =
                                 (0..n).map(|_| array_t.OF._defl()).collect();
-                            let arr = _array {
-                                _identity: fresh_low_level_container_identity(),
-                                TYPE: ArrayContainer::Array((**array_t).clone()),
-                                items: Arc::new(Mutex::new(inner_items)),
-                            };
+                            let arr = build_array(
+                                ArrayContainer::Array((**array_t).clone()),
+                                inner_items,
+                            );
                             (name.clone(), LowLevelValue::Array(Box::new(arr)))
                         } else {
                             (name.clone(), typ._defl())
                         }
                     })
                     .collect();
-                _ptr_obj::Struct(_struct {
-                    _identity: fresh_low_level_container_identity(),
-                    TYPE: (**struct_t).clone(),
-                    _fields: Arc::new(Mutex::new(fields)),
-                })
+                _ptr_obj::Struct(build_struct((**struct_t).clone(), fields))
             } else {
                 if n.is_some() {
                     return Err(format!(
@@ -3271,11 +3778,10 @@ pub fn malloc(
                 Some(n) => (0..n).map(|_| array_t.OF._defl()).collect(),
                 None => array_t._container_example().items.lock().unwrap().clone(),
             };
-            _ptr_obj::Array(_array {
-                _identity: fresh_low_level_container_identity(),
-                TYPE: ArrayContainer::Array((**array_t).clone()),
-                items: Arc::new(Mutex::new(items)),
-            })
+            _ptr_obj::Array(build_array(
+                ArrayContainer::Array((**array_t).clone()),
+                items,
+            ))
         }
         LowLevelType::Opaque(opaque_t) => {
             if n.is_some() {
@@ -5325,5 +5831,172 @@ mod tests {
         let interior =
             gc_parent_ptr._interior_ptr_type_with_index(&LowLevelType::Struct(Box::new(to_struct)));
         assert_eq!(interior._adtmeths, FrozenDict::new(adtmeths));
+    }
+
+    #[test]
+    fn freed_container_reports_was_freed_and_kills_wref_deref() {
+        // Epic G slice 1: `_free` flips the container's shared `_parentable`
+        // storage; `_was_freed` (lltype.py:1681) and `_wref._dereference`
+        // (llmemory.py:872-879) observe it. Before `_free` the referent is
+        // live; after, the weakref dereferences to `None`.
+        let s = StructType::_build(
+            "gcthing",
+            vec![("x".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let target = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let wref = _wref::new(Some(&target));
+
+        assert!(!target._was_freed());
+        assert!(wref._dereference().is_some());
+
+        let _ptr_obj::Struct(container) = target._obj().unwrap() else {
+            panic!("gc struct ptr must hold a Struct container");
+        };
+        container._free();
+
+        assert!(target._was_freed());
+        assert!(wref._dereference().is_none());
+    }
+
+    #[test]
+    fn inlined_sub_container_is_freed_when_parent_is_freed() {
+        // Epic G slice 2: `_struct.__init__` wires `_setparentstructure`
+        // on each inlined sub-container (lltype.py:1774-1783); `_was_freed`
+        // walks the `_wrparent` chain (lltype.py:1681-1691), so freeing the
+        // parent makes the inlined sub-struct report freed too.
+        let inner = StructType::new("inner", vec![("x".into(), LowLevelType::Signed)]);
+        let outer = StructType::_build(
+            "outer",
+            vec![("sub".into(), LowLevelType::Struct(Box::new(inner)))],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let parent = malloc(
+            LowLevelType::Struct(Box::new(outer)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+
+        let _ptr_obj::Struct(parent_container) = parent._obj().unwrap() else {
+            panic!("gc struct ptr must hold a Struct container");
+        };
+        let Some(LowLevelValue::Struct(sub)) = parent_container._getattr("sub") else {
+            panic!("inlined sub field must hold a Struct container");
+        };
+
+        assert!(!sub._was_freed());
+        parent_container._free();
+        // The sub-container's own storage was never freed; it reports freed
+        // only by walking `_wrparent` to the freed parent.
+        assert!(sub._was_freed());
+    }
+
+    #[test]
+    #[should_panic(expected = "accessing freed container")]
+    fn double_free_panics() {
+        // Epic G slice 3: `_free` calls `_check` first, so a second `_free`
+        // on the same container raises (lltype.py:1668-1669).
+        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        let _ptr_obj::Struct(container) = p._obj().unwrap() else {
+            panic!("struct ptr must hold a Struct container");
+        };
+        container._free();
+        container._free();
+    }
+
+    #[test]
+    #[should_panic(expected = "accessing freed container")]
+    fn nonzero_on_freed_pointer_raises() {
+        // `__nonzero__` is `_getobj(check=True)` (lltype.py:1206-1210), so a
+        // freed pointer raises on truthiness like every other dereference,
+        // rather than silently testing not-null.
+        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        let _ptr_obj::Struct(container) = p._obj().unwrap() else {
+            panic!("struct ptr must hold a Struct container");
+        };
+        container._free();
+        let _ = p.nonzero();
+    }
+
+    #[test]
+    fn hidden_opaque_eq_hash_by_normalized_container() {
+        // lltype.py:2156-2176 — two `'hidden'` opaques wrapping the same
+        // allocation compare equal and hash equal despite distinct opaque
+        // `_identity`; a different allocation is unequal.
+        use std::collections::hash_map::DefaultHasher;
+        let opaque_hash = |o: &_opaque| {
+            let mut h = DefaultHasher::new();
+            o.hash(&mut h);
+            h.finish()
+        };
+        let s = StructType::_build(
+            "gcs",
+            vec![("x".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let LowLevelType::Ptr(opaque_ptr_t) = WEAKREF_PTR.clone() else {
+            panic!("WEAKREF_PTR must be a Ptr");
+        };
+        let make_hidden = |ty: &LowLevelType| {
+            let p = malloc(ty.clone(), None, MallocFlavor::Gc, true).unwrap();
+            let op = cast_opaque_ptr(&opaque_ptr_t, &p).unwrap();
+            let _ptr_obj::Opaque(o) = op._obj().unwrap() else {
+                panic!("cast_opaque_ptr must yield an opaque container");
+            };
+            o
+        };
+
+        let struct_ty = LowLevelType::Struct(Box::new(s));
+        let p = malloc(struct_ty.clone(), None, MallocFlavor::Gc, true).unwrap();
+        let o1 = {
+            let _ptr_obj::Opaque(o) = cast_opaque_ptr(&opaque_ptr_t, &p).unwrap()._obj().unwrap()
+            else {
+                panic!("opaque");
+            };
+            o
+        };
+        let o2 = {
+            let _ptr_obj::Opaque(o) = cast_opaque_ptr(&opaque_ptr_t, &p).unwrap()._obj().unwrap()
+            else {
+                panic!("opaque");
+            };
+            o
+        };
+        // Distinct opaque objects, same underlying allocation.
+        assert_ne!(o1._identity, o2._identity);
+        assert_eq!(o1, o2);
+        assert_eq!(opaque_hash(&o1), opaque_hash(&o2));
+
+        // A separate allocation normalizes to a different container.
+        let o3 = make_hidden(&struct_ty);
+        assert_ne!(o1, o3);
     }
 }

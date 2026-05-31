@@ -69,11 +69,10 @@ use crate::translator::rtyper::rtyper::{
 /// `getfield` / dereferences will lower through generic `_ptr.getattr`
 /// against the resolved Struct.
 pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
-    // `Array(Char, hints={'immutable': True, 'extra_item_after_alloc': 1})`
-    // (rstr.py:1226-1228). `immutable` marks the chars array read-only;
-    // `extra_item_after_alloc=1` is the trailing NUL slot that
-    // `llmemory.sizeof(STR, n)` adds to `n` (llmemory.py:422) and that the
-    // GC rewriter's STR `basesize` token already bakes in.
+    // `Array(Char, hints={'immutable': True, 'extra_item_after_alloc':
+    // 1})` (rstr.py:1227-1228). `extra_item_after_alloc` reserves the
+    // trailing NUL slot that `sizeof` / `get_array_token` add on top of
+    // the requested length; `immutable` marks the char array read-only.
     let chars = ArrayType::with_hints(
         LowLevelType::Char,
         vec![
@@ -126,15 +125,11 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 /// Mirror of [`STR`] with the `chars` element type swapped from
 /// `Char` to `UniChar`. The `extra_item_after_alloc` hint that STR
 /// carries (for the trailing NUL slot) is omitted upstream for
-/// UNICODE — only `immutable` is set on the array (rstr.py:1238-1240).
+/// UNICODE — only `immutable` is set on the array. The Rust port
+/// elides both today (see [`STR`] docstring); structural shape is
+/// what the eventual `UnicodeRepr` port consumes.
 pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let chars = ArrayType::with_hints(
-        LowLevelType::UniChar,
-        vec![(
-            "immutable".into(),
-            crate::flowspace::model::ConstValue::Bool(true),
-        )],
-    );
+    let chars = ArrayType::new(LowLevelType::UniChar);
     let body = StructType::gc_with_hints(
         "rpy_unicode",
         vec![

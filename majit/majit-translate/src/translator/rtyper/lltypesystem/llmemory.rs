@@ -2,12 +2,13 @@
 //! low-level memory addresses.
 #![allow(non_snake_case)]
 
-use std::cell::RefCell;
+use std::sync::LazyLock;
 
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, _wref, ArrayType, GcKind, LowLevelType, cast_pointer, nullptr,
+    _ptr, _ptr_obj, _wref, GcKind, LowLevelType, Ptr, PtrTarget, WEAKREF_PTR, cast_opaque_ptr,
+    cast_pointer, nullptr,
 };
 
 /// `class SomeAddress(SomeObject)` (llmemory.py:573-590).
@@ -122,10 +123,16 @@ impl SomeObjectTrait for SomeTypedAddressAccess {
 /// / `raw_memcopy` methods operate on the `fakeaddress` simulator, which
 /// pyre does not model; what flows through the annotator and rtyper is
 /// the rtyping-level structure — variant identity, `known_nonneg`,
-/// symbolic arithmetic, and `lltype() == Signed`. `GCHeaderOffset` /
-/// `GCHeaderAntiOffset` (llmemory.py:341-386) carry a `gcheaderbuilder`,
-/// which belongs to the GC transform pyre does not run, so they are
-/// omitted here.
+/// symbolic arithmetic, and `lltype() == Signed`.
+///
+/// `GCHeaderOffset` / `GCHeaderAntiOffset` (llmemory.py:341-386) are
+/// omitted (blocker: GC transform not run). They carry a `gcheaderbuilder`
+/// and are minted only by the GC transformer (`gctransform/`), which pyre
+/// does not run; no annotator/rtyper path constructs one, so adding the
+/// variants now would be unreachable dead code. Convergence path: port
+/// them alongside the GC transform when/if pyre grows one — at that point
+/// the `gcheaderbuilder` (`header_of_object` / `object_from_header`)
+/// becomes the real dependency to port first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AddressOffset {
     /// llmemory.py:58 `class ItemOffset(AddressOffset)`.
@@ -256,20 +263,7 @@ impl AddressOffset {
     pub fn byte_size(&self, layout: &dyn OffsetLayout) -> Result<i64, String> {
         match self {
             AddressOffset::ItemOffset { TYPE, repeat } => {
-                let item = match primitive_byte_size(TYPE) {
-                    Ok(sz) => sz,
-                    // Non-primitive item (e.g. a struct array element) —
-                    // `symbolic.get_size(TYPE)`.
-                    Err(_) => match TYPE {
-                        LowLevelType::Struct(st) => {
-                            layout.struct_size(&st._name).ok_or_else(|| {
-                                format!("no struct layout for {} (get_size)", st._name)
-                            })?
-                        }
-                        other => return Err(format!("no byte size for item type {other:?}")),
-                    },
-                };
-                Ok(item * repeat)
+                Ok(item_byte_size(TYPE, layout)? * repeat)
             }
             // `symbolic.get_field_token(STRUCT, fldname)[0]`.
             AddressOffset::FieldOffset { TYPE, fldname } => {
@@ -290,10 +284,17 @@ impl AddressOffset {
                 }
                 Ok(total)
             }
-            // `symbolic.get_array_token` for a standard length-prefixed
-            // array: the length field sits at offset 0 and the items start
-            // one word later.
-            AddressOffset::ArrayItemsOffset(_) => Ok(WORD),
+            // `symbolic.get_array_token` basesize: the items start one word
+            // after the length field for a standard length-prefixed array,
+            // or at offset 0 for a `nolength` array (symbolic.py:39-42,
+            // which sets `ofs_length = -1` and the items at the base).
+            AddressOffset::ArrayItemsOffset(arr_ty) => {
+                if array_is_nolength(arr_ty) {
+                    Ok(0)
+                } else {
+                    Ok(WORD)
+                }
+            }
             AddressOffset::ArrayLengthOffset(_) => Ok(0),
         }
     }
@@ -327,13 +328,59 @@ fn primitive_byte_size(ty: &LowLevelType) -> Result<i64, String> {
     }
 }
 
+/// `symbolic.get_size(TYPE)` for an `ItemOffset` element type — a
+/// primitive width, a struct size from `layout`, or a `FixedSizeArray`
+/// laid out as `length` inlined items of `OF`.
+fn item_byte_size(ty: &LowLevelType, layout: &dyn OffsetLayout) -> Result<i64, String> {
+    if let Ok(sz) = primitive_byte_size(ty) {
+        return Ok(sz);
+    }
+    match ty {
+        LowLevelType::Struct(st) => layout
+            .struct_size(&st._name)
+            .ok_or_else(|| format!("no struct layout for {} (get_size)", st._name)),
+        LowLevelType::FixedSizeArray(fa) => Ok(item_byte_size(&fa.OF, layout)? * fa.length as i64),
+        other => Err(format!("no byte size for item type {other:?}")),
+    }
+}
+
+/// True when `array_ty` is an `Array` carrying the `'nolength'` hint —
+/// the items begin at the container base with no length prefix
+/// (symbolic.py:39-42).
+fn array_is_nolength(array_ty: &LowLevelType) -> bool {
+    matches!(
+        array_ty,
+        LowLevelType::Array(arr)
+            if matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true)))
+    )
+}
+
+/// `llmemory.extra_item_after_alloc(ARRAY)` (llmemory.py:407-409) — the
+/// `'extra_item_after_alloc'` array hint, `0` when absent.
+fn extra_item_after_alloc(array_ty: &LowLevelType) -> i64 {
+    match array_ty {
+        LowLevelType::Array(arr) => match arr._hints.get("extra_item_after_alloc") {
+            Some(ConstValue::Int(n)) => *n,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// `TYPE.OF` for an `Array` (llmemory.py:439 `ItemOffset(TYPE.OF)`).
+fn array_of(array_ty: &LowLevelType) -> Result<LowLevelType, String> {
+    match array_ty {
+        LowLevelType::Array(arr) => Ok(arr.OF.clone()),
+        other => Err(format!("itemoffsetof: {other:?} is not an Array")),
+    }
+}
+
 /// `llmemory._sizeof_none(TYPE)` (llmemory.py:391-393) — `ItemOffset(TYPE)`,
-/// asserting the type is not varsize.
+/// asserting `not TYPE._is_varsize()` (so an `Array` or a varsize `Struct`
+/// must be sized with an explicit `n`).
 fn sizeof_none(ty: &LowLevelType) -> Result<AddressOffset, String> {
-    if let LowLevelType::Struct(st) = ty
-        && st._is_varsize()
-    {
-        return Err(format!("sizeof: {} is varsize, pass n", st._name));
+    if ty._is_varsize() {
+        return Err(format!("sizeof: {ty:?} is varsize, pass n"));
     }
     Ok(AddressOffset::ItemOffset {
         TYPE: ty.clone(),
@@ -358,17 +405,26 @@ pub fn offsetof(struct_ty: &LowLevelType, fldname: &str) -> Result<AddressOffset
 
 /// `llmemory.itemoffsetof(TYPE, n=0)` (llmemory.py:438-442) —
 /// `ArrayItemsOffset(TYPE)`, plus `ItemOffset(TYPE.OF) * n` when `n != 0`.
-fn itemoffsetof(array_ty: &LowLevelType, of: &LowLevelType, n: i64) -> AddressOffset {
+pub fn itemoffsetof(array_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String> {
     let result = AddressOffset::ArrayItemsOffset(array_ty.clone());
     if n != 0 {
+        let of = array_of(array_ty)?;
         let item = AddressOffset::ItemOffset {
-            TYPE: of.clone(),
-            repeat: n,
-        };
-        result.add(item)
+            TYPE: of,
+            repeat: 1,
+        }
+        .mul(n)
+        .expect("ItemOffset.mul is always Some");
+        Ok(result.add(item))
     } else {
-        result
+        Ok(result)
     }
+}
+
+/// `llmemory.arraylengthoffset(TYPE)` (llmemory.py:445-447) —
+/// `ArrayLengthOffset(TYPE)`.
+pub fn arraylengthoffset(array_ty: &LowLevelType) -> AddressOffset {
+    AddressOffset::ArrayLengthOffset(array_ty.clone())
 }
 
 /// `llmemory._sizeof_int(TYPE, n)` (llmemory.py:400-405) — for a varsize
@@ -389,32 +445,24 @@ fn sizeof_int(struct_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String>
     Ok(offsetof(struct_ty, &fldname)?.add(sizeof_offset(&array_ty, Some(n))?))
 }
 
-/// `llmemory.extra_item_after_alloc(ARRAY)` (llmemory.py:407-409) —
-/// `ARRAY._hints.get('extra_item_after_alloc', 0)`. STR's chars array sets it
-/// to 1 for the trailing NUL slot (rstr.py:1226-1228).
-fn extra_item_after_alloc(arr: &ArrayType) -> i64 {
-    match arr._hints.get("extra_item_after_alloc") {
-        Some(ConstValue::Int(n)) => *n,
-        _ => 0,
-    }
-}
-
 /// `llmemory.sizeof(TYPE, n=None)` (llmemory.py:411-426). `n=None` sizes a
 /// fixed (non-varsize) type; an `Array` is sized as
-/// `itemoffsetof(TYPE) + sizeof(TYPE.OF) * (n + extra_item_after_alloc(TYPE))`;
+/// `itemoffsetof(TYPE) + _sizeof_none(TYPE.OF) * (n + extra_item_after_alloc)`;
 /// a varsize `Struct` defers to [`sizeof_int`].
 fn sizeof_offset(ty: &LowLevelType, n: Option<i64>) -> Result<AddressOffset, String> {
     match n {
         None => sizeof_none(ty),
         Some(n) => match ty {
-            LowLevelType::Array(arr) => {
-                // llmemory.py:422 `n += extra_item_after_alloc(TYPE)`.
-                let n = n + extra_item_after_alloc(arr);
-                let item = AddressOffset::ItemOffset {
-                    TYPE: arr.OF.clone(),
-                    repeat: n,
-                };
-                Ok(itemoffsetof(ty, &arr.OF, 0).add(item))
+            LowLevelType::Array(_) => {
+                // `n += extra_item_after_alloc(TYPE)`
+                let n = n + extra_item_after_alloc(ty);
+                let of = array_of(ty)?;
+                // `_sizeof_none(TYPE.OF) * n` — `_sizeof_none` asserts the
+                // element type is not itself varsize.
+                let item = sizeof_none(&of)?
+                    .mul(n)
+                    .expect("_sizeof_none yields an ItemOffset, mul is Some");
+                Ok(itemoffsetof(ty, 0)?.add(item))
             }
             _ => sizeof_int(ty, n),
         },
@@ -428,23 +476,17 @@ pub fn sizeof(ty: &LowLevelType, n: Option<i64>) -> Result<ConstValue, String> {
     Ok(ConstValue::AddressOffset(sizeof_offset(ty, n)?))
 }
 
-/// `llmemory.dead_wref` (llmemory.py:887) — `_wref(None)._as_ptr()`, a
+/// `llmemory.dead_wref` (llmemory.py:887) — `_wref(None)._as_ptr()`, the
 /// single prebuilt pointer to a dead low-level weakref.
 ///
-/// `_ptr` equality respects container identity (lltype.py:1185-1201), so
-/// the value is cached thread-locally to keep every reference to
-/// `dead_wref` comparing equal. Thread-local matches the single-threaded
-/// translation model (`_ptr` is not `Sync`).
+/// A process-wide singleton, matching upstream's module-level `dead_wref`
+/// variable: `_ptr` equality respects container identity
+/// (lltype.py:1185-1201), so every reference resolves to the same `_wref`
+/// container and compares equal. `_ptr` is `Send + Sync`, so the value
+/// lives in a `LazyLock` rather than a per-thread cell.
 pub fn dead_wref() -> _ptr {
-    thread_local! {
-        static DEAD_WREF: RefCell<Option<_ptr>> = const { RefCell::new(None) };
-    }
-    DEAD_WREF.with(|cell| {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(_wref::new(None)._as_ptr());
-        }
-        cell.borrow().as_ref().unwrap().clone()
-    })
+    static DEAD_WREF: LazyLock<_ptr> = LazyLock::new(|| _wref::new(None)._as_ptr());
+    (*DEAD_WREF).clone()
 }
 
 /// `llmemory.weakref_create(ptarget)` (llmemory.py:818-824).
@@ -488,10 +530,10 @@ pub fn weakref_create(ptarget: &_ptr) -> Result<_ptr, String> {
 ///         return cast_any_ptr(PTRTYPE, p)
 /// ```
 ///
-/// The referents this port produces are concrete gc-struct pointers whose
-/// `typeOf` already equals `PTRTYPE`, so `cast_any_ptr` reduces to the
-/// identity branch; a mismatch falls through to [`cast_pointer`]
-/// (`cast_opaque_ptr` is not reached for these referents).
+/// `p = pwref._obj._dereference()` recovers the referent; a dead wref
+/// yields `nullptr(PTRTYPE.TO)`, otherwise [`cast_any_ptr`] adapts the
+/// concrete referent to the requested `PTRTYPE` (identity, opaque, or a
+/// plain pointer cast).
 pub fn weakref_deref(PTRTYPE: &LowLevelType, pwref: &_ptr) -> Result<_ptr, String> {
     let LowLevelType::Ptr(ptr_t) = PTRTYPE else {
         return Err(format!(
@@ -511,14 +553,54 @@ pub fn weakref_deref(PTRTYPE: &LowLevelType, pwref: &_ptr) -> Result<_ptr, Strin
     };
     match wref._dereference() {
         None => nullptr(LowLevelType::from((**ptr_t).TO.clone())),
-        Some(p) => {
-            if LowLevelType::Ptr(Box::new(p._TYPE.clone())) == *PTRTYPE {
-                Ok(p)
-            } else {
-                cast_pointer(ptr_t, &p)
-            }
-        }
+        Some(p) => cast_any_ptr(ptr_t, &p),
     }
+}
+
+/// RPython `cast_any_ptr(EXPECTED_TYPE, ptr)` (llmemory.py:1037-1052) — a
+/// generalisation of the `cast_xxx_ptr` family that dispatches on whether
+/// either side is `WeakRefPtr` or an `OpaqueType`:
+///
+/// ```python
+/// def cast_any_ptr(EXPECTED_TYPE, ptr):
+///     PTRTYPE = lltype.typeOf(ptr)
+///     if PTRTYPE == EXPECTED_TYPE:                       return ptr
+///     elif EXPECTED_TYPE == WeakRefPtr:                  return cast_ptr_to_weakrefptr(ptr)
+///     elif PTRTYPE == WeakRefPtr:
+///         ptr = cast_weakrefptr_to_ptr(None, ptr);       return cast_any_ptr(EXPECTED_TYPE, ptr)
+///     elif (isinstance(EXPECTED_TYPE.TO, OpaqueType) or
+///           isinstance(PTRTYPE.TO, OpaqueType)):         return cast_opaque_ptr(EXPECTED_TYPE, ptr)
+///     else:                                              return cast_pointer(EXPECTED_TYPE, ptr)
+/// ```
+///
+/// The two `WeakRefPtr` branches call `cast_ptr_to_weakrefptr` /
+/// `cast_weakrefptr_to_ptr`, which upstream notes "exist only after the GC
+/// transformation" (llmemory.py:893-895) via `_gctransformed_wref`. pyre
+/// does not run the GC transformer, so a `WeakRefPtr` operand never reaches
+/// here; the branches fail loud rather than fabricate a transformed
+/// weakref.
+pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
+    let ptrtype = &ptr._TYPE;
+    if ptrtype == expected {
+        return Ok(ptr.clone());
+    }
+    let is_weakref_ptr = |p: &Ptr| LowLevelType::Ptr(Box::new(p.clone())) == *WEAKREF_PTR;
+    if is_weakref_ptr(expected) {
+        return Err(
+            "cast_ptr_to_weakrefptr requires the GC transformer, which pyre does not run"
+                .to_string(),
+        );
+    }
+    if is_weakref_ptr(ptrtype) {
+        return Err(
+            "cast_weakrefptr_to_ptr requires the GC transformer, which pyre does not run"
+                .to_string(),
+        );
+    }
+    if matches!(expected.TO, PtrTarget::Opaque(_)) || matches!(ptrtype.TO, PtrTarget::Opaque(_)) {
+        return cast_opaque_ptr(expected, ptr);
+    }
+    cast_pointer(expected, ptr)
 }
 
 #[cfg(test)]
@@ -816,26 +898,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sizeof_array_adds_extra_item_after_alloc() {
-        use crate::translator::rtyper::lltypesystem::lltype::ArrayType;
-        // llmemory.py:422 `n += extra_item_after_alloc(TYPE)` — an array with
-        // `extra_item_after_alloc=1` (e.g. `rstr.STR.chars`) sizes to n+1
-        // items so the trailing NUL slot is reserved (rstr.py:1226-1228).
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::with_hints(
-            LowLevelType::Char,
-            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
-        )));
-        let expected = AddressOffset::CompositeOffset(vec![
-            AddressOffset::ArrayItemsOffset(array_ty.clone()),
-            item(LowLevelType::Char, 4), // 3 requested + 1 extra
-        ]);
-        assert_eq!(
-            sizeof(&array_ty, Some(3)),
-            Ok(ConstValue::AddressOffset(expected))
-        );
-    }
-
     fn gc_opaque(name: &str) -> _ptr {
         use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, opaqueptr};
         opaqueptr(LowLevelType::Opaque(Box::new(OpaqueType::gc(name))), "t").unwrap()
@@ -882,5 +944,82 @@ mod tests {
         let ptrtype = LowLevelType::Ptr(Box::new(gc_opaque("GcThing")._TYPE.clone()));
         let got = weakref_deref(&ptrtype, &dead_wref()).unwrap();
         assert!(!got.nonzero());
+    }
+
+    fn array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
+        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, FrozenDict, GcKind};
+        LowLevelType::Array(Box::new(ArrayType {
+            OF: of,
+            _hints: FrozenDict::from(hints),
+            _gckind: GcKind::Gc,
+        }))
+    }
+
+    #[test]
+    fn sizeof_none_rejects_varsize_array() {
+        // llmemory.py:391-393 `_sizeof_none` asserts `not TYPE._is_varsize()`,
+        // so an Array (always varsize) must be sized with an explicit n.
+        assert!(sizeof(&array(LowLevelType::Signed, Vec::new()), None).is_err());
+    }
+
+    #[test]
+    fn sizeof_array_adds_extra_item_after_alloc() {
+        // llmemory.py:418-420 `n += extra_item_after_alloc(TYPE)` — a STR-like
+        // char array with the `extra_item_after_alloc=1` hint sizes n+1 items.
+        let chars = array(
+            LowLevelType::Char,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
+        );
+        let expected = AddressOffset::CompositeOffset(vec![
+            AddressOffset::ArrayItemsOffset(chars.clone()),
+            item(LowLevelType::Char, 4),
+        ]);
+        assert_eq!(
+            sizeof(&chars, Some(3)),
+            Ok(ConstValue::AddressOffset(expected))
+        );
+    }
+
+    #[test]
+    fn array_items_offset_is_zero_for_nolength_array() {
+        // symbolic.py:39-42 — a `nolength` array has no length prefix, so the
+        // items begin at offset 0 instead of one word in.
+        let nolength = array(
+            LowLevelType::Signed,
+            vec![("nolength".into(), ConstValue::Bool(true))],
+        );
+        assert_eq!(
+            AddressOffset::ArrayItemsOffset(nolength).byte_size(&NoLayout),
+            Ok(0)
+        );
+        let plain = array(LowLevelType::Signed, Vec::new());
+        assert_eq!(
+            AddressOffset::ArrayItemsOffset(plain).byte_size(&NoLayout),
+            Ok(WORD)
+        );
+    }
+
+    #[test]
+    fn cast_any_ptr_concrete_to_opaque_hides_the_container() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            MallocFlavor, OpaqueType, Ptr, StructType, malloc,
+        };
+        // llmemory.py:1048 — a concrete gc referent cast to a gc opaque
+        // (GCREF-style) PTRTYPE takes the `cast_opaque_ptr` concrete→opaque
+        // branch and yields a non-null opaque pointer of the requested type.
+        let st = LowLevelType::Struct(Box::new(StructType::gc_with_hints(
+            "GcThing",
+            vec![("x".into(), LowLevelType::Signed)],
+            vec![],
+        )));
+        let target = malloc(st, None, MallocFlavor::Gc, false).unwrap();
+        let wref = weakref_create(&target).unwrap();
+        let gcref = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(LowLevelType::Opaque(Box::new(OpaqueType::gc("GCREF"))))
+                .unwrap(),
+        ));
+        let got = weakref_deref(&gcref, &wref).unwrap();
+        assert!(got.nonzero());
+        assert_eq!(LowLevelType::Ptr(Box::new(got._TYPE.clone())), gcref);
     }
 }
