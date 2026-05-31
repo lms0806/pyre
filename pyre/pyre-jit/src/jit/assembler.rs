@@ -780,14 +780,24 @@ fn dispatch_op(
             };
             state.builder.loop_header(jdindex);
         }
+        // `flatten.py:130-146 make_return` / `:382-384 getcolor` pass a
+        // `Constant` operand through unchanged; the const arm encodes it
+        // into the ref constant window (`assembler.py:80-138 emit_const`).
         "ref_return" => {
-            let src = expect_result_or_first_reg(args, result, Kind::Ref);
-            state.builder.ref_return(src);
+            if let Some(Operand::ConstRef(value)) = args.first() {
+                state.builder.ref_return_const(*value);
+            } else {
+                let src = expect_result_or_first_reg(args, result, Kind::Ref);
+                state.builder.ref_return(src);
+            }
         }
-        "raise" => {
-            let src = expect_reg(&args[0], Kind::Ref);
-            state.builder.emit_raise(src);
-        }
+        "raise" => match &args[0] {
+            Operand::ConstRef(value) => state.builder.emit_raise_const(*value),
+            _ => {
+                let src = expect_reg(&args[0], Kind::Ref);
+                state.builder.emit_raise(src);
+            }
+        },
         "reraise" => state.builder.emit_reraise(),
         "last_exception" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
@@ -2247,6 +2257,78 @@ mod tests {
                 majit_metainterp::blackhole::BhDescr::VableField { index: 3 }
             )
         ));
+    }
+
+    #[test]
+    fn assemble_ref_return_accepts_const_ref() {
+        let mut ssarepr = SSARepr::new("ref_return_const");
+        ssarepr
+            .insns
+            .push(Insn::op("ref_return", vec![Operand::ConstRef(42)]));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 2,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("ref_return/r")
+            .expect("ref_return must be registered in wellknown insns");
+        // The constant routes into the ref constant pool; the operand byte
+        // resolves to `num_regs_r + pool_idx` (2 + 0) in the const window.
+        assert_eq!(jitcode.code, vec![opcode, 2]);
+        assert_eq!(jitcode.constants_r, vec![42]);
+    }
+
+    #[test]
+    fn assemble_ref_return_preserves_result_form() {
+        let mut ssarepr = SSARepr::new("ref_return_result_form");
+        ssarepr.insns.push(Insn::op_with_result(
+            "ref_return",
+            vec![],
+            Register::new(Kind::Ref, 0),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("ref_return/r")
+            .expect("ref_return must be registered in wellknown insns");
+        assert_eq!(jitcode.code, vec![opcode, 0]);
+    }
+
+    #[test]
+    fn assemble_raise_accepts_const_ref() {
+        let mut ssarepr = SSARepr::new("raise_const");
+        ssarepr
+            .insns
+            .push(Insn::op("raise", vec![Operand::ConstRef(7)]));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 2,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("raise/r")
+            .expect("raise must be registered in wellknown insns");
+        assert_eq!(jitcode.code, vec![opcode, 2]);
+        assert_eq!(jitcode.constants_r, vec![7]);
     }
 
     #[test]
