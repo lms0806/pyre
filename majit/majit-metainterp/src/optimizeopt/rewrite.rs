@@ -5171,12 +5171,7 @@ mod tests {
         constants.insert(200u32, majit_ir::Value::Int(0));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::GuardFalse),
@@ -5197,12 +5192,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(-1));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::IntNeg),
@@ -5228,12 +5218,7 @@ mod tests {
         // Float constant as Value::Float
         constants.insert(200u32, majit_ir::Value::Float(-1.0));
         // Need float constant support in ctx — skip for now, just test no crash
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(!result.is_empty());
     }
 
@@ -5252,12 +5237,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
             "COND_CALL_N(0, ...) should be removed"
@@ -5279,12 +5259,7 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),
             "COND_CALL_N(1, ...) should become CALL_N"

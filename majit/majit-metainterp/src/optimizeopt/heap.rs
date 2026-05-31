@@ -3974,12 +3974,7 @@ mod tests {
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-            crate::r#box::BoxPool::new(),
-        )
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -4312,7 +4307,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         let arr_box = ctx
-            .get_box_replacement_box(OpRef::int_op(100))
+            .get_box_replacement_box(OpRef::ref_op(100))
             .expect("array box");
         assert_eq!(
             ctx.peek_ptr_info(&arr_box)
@@ -6082,12 +6077,8 @@ mod tests {
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-            crate::r#box::BoxPool::new(),
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)
@@ -6220,11 +6211,11 @@ mod tests {
         op1.pos.set(pos1);
         // Pretend the result is known >= 0.
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        // `reserve_pos_typed` skips extending box_pool when the pool is
-        // empty (test baseline), so lazy-allocate here.
+        // `reserve_pos_typed` does not pre-mint a canonical host; `ensure_box`
+        // materializes the BoxRef for the reserved position here.
         let pos1_box = ctx
             .ensure_box(pos1)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+            .expect("body-namespace OpRef must resolve to a BoxRef");
         ctx.setintbound(
             &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),

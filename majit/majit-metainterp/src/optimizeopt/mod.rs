@@ -724,10 +724,9 @@ pub struct OptContext {
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
-    /// Strong `InputArgRc` ownership for the BoxRefs seeded by
+    /// Strong `InputArgRc` ownership for the inputargs seeded by
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
-    /// via `TreeLoop.inputargs` and re-bind the optimizer's `box_pool`
-    /// via `BoxPool::bind_inputargs`; the test-and-fallback helper
+    /// via `TreeLoop.inputargs`; the test-and-fallback helper
     /// `with_inputarg_types` has no upstream `TreeLoop`, so it stashes
     /// fresh `InputArgRc`s here to keep the `Weak<InputArg>` stored
     /// inside each `BoxRef.inputarg_handle` upgradable. `make_equal_to`
@@ -749,6 +748,17 @@ pub struct OptContext {
     /// upgrades (e.g. in already-installed `Forwarded::Op` chains)
     /// stay valid.
     pub(crate) resop_refs: Vec<Option<majit_ir::resoperation::OpRc>>,
+    /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
+    /// products) that have NOT been superseded by an `emit` at their
+    /// position. The end-of-Phase-1 orphan-binding pass drains this into
+    /// `phase1_emit_ops` so retrace's `Weak<Op>` upgrades stay valid; an
+    /// `emit` that rebinds a position's box off its synthetic removes the
+    /// synthetic here (it stays strongly held by `resop_refs` for lookup,
+    /// but is no longer an orphan needing carry). Tracking liveness
+    /// incrementally by `OpRc` identity sidesteps the flat-OpRef raw/type
+    /// collision that makes the final `resop_refs` / `new_operations` state
+    /// ambiguous about which type-tagged value won a shared raw slot.
+    pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -760,19 +770,16 @@ pub struct OptContext {
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<majit_ir::OpRc>,
-    /// Per-position BoxRef pool for the input ops being
-    /// optimized. `box_pool[i]` mirrors the `AbstractValue` for the
-    /// trace position whose `OpRef::raw() == i` (recorder issuance order:
-    /// inputargs first, then ops). Empty when the optimizer is invoked
-    /// without an upstream recorder pool (tests, retrace helpers).
-    ///
-    /// RPython parity: PyPy's `_forwarded` slot lives on the `Box`
-    /// object itself, so the optimizer just calls
-    /// `box.set_forwarded(target)` directly. The Rust pool gives the
-    /// optimizer the same per-position object access that RPython gets
-    /// for free from object identity. PtrInfo / IntBound / forwarding
-    /// state is carried by the BoxRef `_forwarded` slot.
-    pub(crate) box_pool: crate::r#box::BoxPool,
+    /// Recorder trace ops that carry the input operands' producer `Op`
+    /// (e.g. the `IntLt`/`GetfieldGcPureI` operands of a recorded loop),
+    /// shared by `Rc` with the canonical stores but absent from
+    /// `new_operations` / `phase1_emit_ops` / `resop_refs`. Seeded at
+    /// optimizer setup from the recorder's `Rc<Op>` slice (`TreeLoop.ops`
+    /// at the loop-finish / simple-loop sites, or the Phase-2 threaded
+    /// `explicit_input_ops_seed`). `find_producer_op` consults this as the
+    /// lowest-priority store so a later emission at the same position always
+    /// wins.
+    pub(crate) input_ops: Vec<majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -1575,10 +1582,11 @@ impl OptContext {
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
             resop_refs: Vec::new(),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: crate::r#box::BoxPool::new(),
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
@@ -1602,14 +1610,13 @@ impl OptContext {
         Self::with_inputarg_types(estimated_ops, &[])
     }
 
-    /// Construct an `OptContext` and seed `box_pool` with one
-    /// `BoxRef::new_inputarg(tp, i)` per entry of `inputarg_types`.
+    /// Construct an `OptContext` and seed `inputarg_refs` with one canonical
+    /// `InputArg::from_type(tp, i)` per entry of `inputarg_types`.
     ///
     /// Mirrors `TraceIterator::new` (`opencoder.rs:373-426`, parity with
     /// `opencoder.py:259-262` `inputarg_from_tp(arg.type)`). Test fixtures
     /// that construct via this helper exercise the optimizer's BoxRef-direct
-    /// routing — the production path — instead of the legacy empty-pool
-    /// Vec fallback.
+    /// routing — the production path.
     ///
     /// `inputarg_types` carries the type tags needed to round-trip
     /// `OpRef::input_arg_typed(i, tp)` on read; `with_num_inputs` is the
@@ -1618,93 +1625,96 @@ impl OptContext {
         let num_inputs = inputarg_types.len();
         let mut ctx =
             Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32);
-        let mut seed = crate::r#box::BoxPool::with_capacity(inputarg_types.len());
-        let mut refs: Vec<majit_ir::InputArgRc> = Vec::with_capacity(inputarg_types.len());
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            let b = crate::r#box::BoxRef::new_inputarg(tp, i as u32);
-            // Bind each seeded BoxRef to a fresh `InputArgRc` so the
-            // optimizer's `make_equal_to` routes a chain step that
-            // targets one of these BoxRefs through
-            // `Forwarded::InputArg(_)`, matching the production
-            // recorder→TreeLoop handoff invariant
-            // (`BoxPool::bind_inputargs`). The strong `InputArgRc`s
-            // are stashed in `ctx.inputarg_refs` so the bound
-            // `Weak<InputArg>` stays upgradable for the OptContext's
-            // lifetime.
-            let ia = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32));
-            b.bind_inputarg(&ia);
-            seed.push(b);
-            refs.push(ia);
-        }
-        ctx.box_pool = seed;
-        ctx.inputarg_refs = refs;
-        // Mirror the production wiring at `setup_optimizations`
-        // (optimizer.rs `ctx.inputargs = self.trace_inputargs.clone()`):
-        // seed `ctx.inputargs` in lockstep with the `box_pool` so the
-        // typed-Box parity contract holds — strict accessors like
-        // `inputarg_type_at_strict` (and `inputarg_type_at`) return
-        // `Some(tp)` matching `box.type` for slot i. Test fixtures that
-        // call `with_inputarg_types` no longer need to set `inputargs`
-        // separately. Each entry is `OpRef::input_arg_typed(i, tp)` so
-        // the variant tag IS the type (resoperation.py:719/727/739).
+        // Seed a fresh canonical `InputArgRc` per slot so the optimizer's
+        // `make_equal_to` routes an InputArg-targeted chain step through
+        // `Forwarded::InputArg(_)` (`optimizer.py:394 op.set_forwarded(newop)`).
+        // The strong `InputArgRc`s are stashed in `ctx.inputarg_refs` so the
+        // `Weak<InputArg>` each bound box later carries stays upgradable for
+        // the OptContext's lifetime. Production traces own these via
+        // `TreeLoop.inputargs`; this test-and-fallback helper has no upstream
+        // `TreeLoop`.
+        ctx.inputarg_refs = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)))
+            .collect();
+        // Seed `ctx.inputargs` so strict accessors like
+        // `inputarg_type_at_strict` return `Some(tp)` matching slot i. Each
+        // entry is `OpRef::input_arg_typed(i, tp)` so the variant tag IS the
+        // type (resoperation.py:719/727/739).
         ctx.inputargs = majit_ir::OpRef::inputarg_refs(inputarg_types);
         ctx
     }
 
-    /// Walk every materialized `box_pool` slot and bind any InputArg BoxRef
-    /// whose `bound_inputarg()` is None to a fresh `InputArgRc` carrying
-    /// the BoxRef's intrinsic type. Strong refs are stashed in
-    /// `inputarg_refs` so the bound `Weak<InputArg>` stays upgradable for
-    /// the OptContext's lifetime.
+    /// Mirror every InputArg position into `inputarg_refs[pos]`: an
+    /// already-bound slot keeps the `InputArgRc` it binds; an unbound slot
+    /// gets a fresh one (bound here) carrying the position's type. Stashing
+    /// the strong ref in `inputarg_refs` keeps each bound `Weak<InputArg>`
+    /// upgradable for the OptContext's lifetime AND gives the canonical-host
+    /// readers (`resolve_to_boxref` / `read_forwarded` / `clear_forwarded`)
+    /// a live `InputArg.forwarded` host to resolve to.
     ///
-    /// `TraceIterator::new` (opencoder.rs) builds the per-iter pool by
-    /// pushing fresh `BoxRef::new_inputarg(tp, _fresh)` for each inputarg
-    /// without calling `bind_inputarg`; the TreeLoop-owned strong
-    /// `InputArgRc`s never reach this freshly-built pool. Phase 2 inherits
-    /// Phase 1's box_pool snapshot via `iter.box_pool.clone()`, so Phase 1
-    /// inputarg slots reappear at Phase 2 entry with their earlier
-    /// `Weak<InputArg>` dangling (the previous OptContext's
-    /// `inputarg_refs` strong owners were dropped). Re-binding here
-    /// restores `Forwarded::InputArg(_)` reachability for every
-    /// InputArg BoxRef the optimizer will hand to `make_equal_to`
-    /// (`optimizer.py:394 op.set_forwarded(newop)`, unroll.py:497).
-    /// Idempotent — already-bound entries skip.
+    /// Phase 2 enters with a fresh per-iteration inputarg set whose earlier
+    /// `Weak<InputArg>` owners (the previous OptContext's `inputarg_refs`)
+    /// were dropped, leaving them dangling. Re-binding here restores
+    /// `Forwarded::InputArg(_)` reachability for every InputArg BoxRef the
+    /// optimizer will hand to `make_equal_to` (`optimizer.py:394
+    /// op.set_forwarded(newop)`, unroll.py:497). Idempotent — re-running
+    /// re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
-        if self.box_pool.is_empty() {
-            return;
-        }
-        // Walk every materialized slot; any InputArg BoxRef whose
-        // `bound_inputarg()` is None gets a fresh `InputArgRc` and bind.
-        // Cross-phase: Phase 2 inherits Phase 1's box_pool snapshot, so
-        // Phase 1 inputarg slots reappear at Phase 2 entry with their
-        // earlier `Weak<InputArg>` dangling (the previous OptContext's
-        // `inputarg_refs` strong owners were dropped). Re-binding here
-        // restores `Forwarded::InputArg(_)` reachability across phases.
-        let needs: Vec<(usize, majit_ir::Type)> = self
-            .box_pool
-            .iter_indexed()
-            .filter_map(|(pos, b)| {
-                if !b.is_inputarg() || b.bound_inputarg().is_some() {
-                    return None;
+        // Derive the materialized InputArg positions from `ctx` state.
+        // The InputArg positions are exactly the
+        // canonical/inherited set (`self.inputargs` = `optimizer.py:34
+        // self.inputargs`, positions `[0, num_inputs)` carried across Phase 1 →
+        // Phase 2 by `opt_p2.trace_inputargs = self.trace_inputargs`) UNION the
+        // fresh per-iteration label set at `[inputarg_base, inputarg_base +
+        // num_inputs)` (`TraceIterator` allocates these; their types match
+        // `self.inputargs` because Phase 2 walks the body half with the same
+        // per-arg types). Pre-populating `inputarg_refs` for both subsets makes
+        // every InputArg OpRef resolve through `inputarg_refs` (read path:
+        // `resolve_to_boxref` / `read_forwarded`; write path: `ensure_box`'s
+        // InputArg branch). `ensure_box` type-repairs any position this derive
+        // misses. Both loops no-op when `self.inputargs` is empty
+        // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
+        // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
+        // encoding (resoperation.py:719/727/739), so a Void sentinel in
+        // `inputargs` is not a real input-arg host (mirrors the retired
+        // box_pool scan's `!b.is_inputarg()` skip).
+        for op in self.inputargs.clone() {
+            match op.ty() {
+                Some(tp) if tp != majit_ir::Type::Void => {
+                    self.bind_canonical_inputarg(op.raw() as usize, tp);
                 }
-                Some((pos, b.type_()))
-            })
-            .collect();
-        for (pos, tp) in needs {
-            let ia = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
-            if let Some(b) = self.box_pool.get_at_position(pos) {
-                b.bind_inputarg(&ia);
+                _ => {}
             }
-            // `inputarg_refs` is keyed by raw OpRef position so
-            // `ensure_box(InputArg{Int,Ref,Float}(idx))` finds the
-            // canonical `InputArgRc` at `inputarg_refs[idx]`. Pushing
-            // would scramble the position→Rc mapping (bridges/Phase 2
-            // see scattered inputarg positions, not a dense 0..N range).
-            if pos >= self.inputarg_refs.len() {
-                self.inputarg_refs
-                    .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+        }
+        let base = self.inputarg_base as usize;
+        for i in 0..self.num_inputs as usize {
+            match self.inputargs.get(i).and_then(|op| op.ty()) {
+                Some(tp) if tp != majit_ir::Type::Void => {
+                    self.bind_canonical_inputarg(base + i, tp);
+                }
+                _ => {}
             }
-            self.inputarg_refs[pos] = ia;
+        }
+    }
+
+    /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
+    /// `tp` (the `_forwarded` host that `resolve_to_boxref` / `read_forwarded`
+    /// / `clear_forwarded` / `ensure_box` route the matching InputArg OpRef
+    /// through). Idempotent: keeps an existing same-shape host (preserving any
+    /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
+    /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
+    /// the `ensure_box` InputArg arm).
+    fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
+        if pos >= self.inputarg_refs.len() {
+            self.inputarg_refs
+                .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+            self.inputarg_refs[pos] =
+                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+        } else if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
+            self.inputarg_refs[pos] =
+                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
         }
     }
 
@@ -1732,9 +1742,23 @@ impl OptContext {
         {
             return Some(op.clone());
         }
-        self.resop_refs
+        if let Some(op) = self
+            .resop_refs
             .get(opref.raw() as usize)
-            .and_then(|slot| slot.clone())
+            .and_then(|slot| slot.as_ref())
+            .filter(|op| op.pos.get() == opref)
+            .cloned()
+        {
+            return Some(op);
+        }
+        // Lowest-priority store: the recorder's input ops (seeded at setup
+        // from the recorder's `Rc<Op>` slice). Full-OpRef match (collision-safe)
+        // so a type-tagged value never aliases a different one at the same raw.
+        // Consulted last so any live emission / synthetic above wins.
+        self.input_ops
+            .iter()
+            .rfind(|op| op.pos.get() == opref)
+            .cloned()
     }
 
     /// S-8.A.1: mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
@@ -1764,12 +1788,13 @@ impl OptContext {
             self.resop_refs.resize_with(idx + 1, || None);
         }
         self.resop_refs[idx] = Some(synthetic.clone());
+        self.live_synthetics.push(synthetic.clone());
         synthetic
     }
 
     /// S-8.A: read `_forwarded` for `opref` directly off the canonical
-    /// host (`op.forwarded` / `inputarg.forwarded`) without going
-    /// through `box_pool`. Mirrors `BoxRef::get_forwarded` semantics
+    /// host (`op.forwarded` / `inputarg.forwarded`). Mirrors
+    /// `BoxRef::get_forwarded` semantics
     /// but bypasses the wrapper allocation. Returns `Forwarded::None`
     /// for constants (`resoperation.py:50` `Const._forwarded` is
     /// permanently `None`), `None` for sentinel `OpRef::none()` and
@@ -1807,14 +1832,9 @@ impl OptContext {
     /// `None` for sentinel `OpRef::none()` and for ResOp positions
     /// without a producer in any canonical store.
     ///
-    /// Transitional fallback: synthetic test fixtures (`ctx.box_pool =
-    /// vec![...]`) bypass the production canonical-store population
-    /// path. While `BoxPool` survives (until S-9), consult it after
-    /// the canonical stores so those fixtures continue resolving to
-    /// the same bound `BoxRef`. Production paths populate `inputarg_refs`
-    /// via S-1's `bind_input_resops` plus emit-time `bind_op`, so the
-    /// fallback is dead outside synthetic fixtures and disappears with
-    /// `BoxPool` in S-9.
+    /// Production paths populate `inputarg_refs` via S-1's
+    /// `bind_input_resops` plus emit-time `bind_op`, so every
+    /// chain-walker-reachable position resolves to its bound `BoxRef`.
     pub(crate) fn resolve_to_boxref(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
         if opref.is_none() {
             return None;
@@ -1833,23 +1853,30 @@ impl OptContext {
         if let Some(op) = self.find_producer_op(opref) {
             return Some(crate::r#box::BoxRef::from_bound_op(&op));
         }
-        // Match `ensure_box`'s resolution order exactly so the write host
-        // (a `set_forwarded_*` through `ensure_box`'s BoxRef) and the read
-        // host (this resolver, behind `get_box_replacement_box`) coincide:
-        // consult the authoritative `box_pool` slot before the
-        // `inputarg_refs` mirror. `ensure_box` returns the `box_pool` slot
-        // for an existing entry and only falls to `inputarg_refs` when it
-        // must lazy-allocate; without this ordering an InputArg whose
-        // `box_pool` slot is bound to a different `InputArgRc` than
-        // `inputarg_refs[idx]` would read its forwarded state from the wrong
-        // host. Both are transitional and retire with `BoxPool` in S-9.
         let idx = opref.raw() as usize;
-        if let Some(b) = self.box_pool.get(opref) {
-            return Some(b.clone());
+        // InputArg variants resolve through the canonical `inputarg_refs`
+        // store — symmetric with the `clear_forwarded` write path
+        // (`inputarg_refs[idx].forwarded`). `ensure_inputarg_bindings`
+        // populates `inputarg_refs[idx]` with the canonical `InputArgRc`, so
+        // this returns the `InputArg.forwarded` host every other reader and
+        // writer observes.
+        match opref {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                if let Some(ia) = self.inputarg_refs.get(idx) {
+                    return Some(crate::r#box::BoxRef::from_bound_inputarg(ia));
+                }
+            }
+            _ => {}
         }
-        self.inputarg_refs
-            .get(idx)
-            .map(crate::r#box::BoxRef::from_bound_inputarg)
+        // A ResOp position with no producer in any canonical store resolves
+        // to `None`: the caller's `ensure_box` mints a `SameAs*` synthetic
+        // into `resop_refs[idx]` and binds it, so the next `find_producer_op`
+        // (and hence the next `resolve_to_boxref` / `make_constant` chain)
+        // reaches that same `_forwarded` host. Routing a ResOp OpRef to
+        // `inputarg_refs[idx]` here would re-introduce the raw-position
+        // collapse (`int_op(p)` aliasing `input_arg_int(p)`) the
+        // `find_producer_op` / `inputarg_refs` split exists to eliminate.
+        None
     }
 
     /// S-8.A: write `Forwarded::None` to the canonical host for
@@ -1876,46 +1903,90 @@ impl OptContext {
         }
     }
 
-    /// S-1: bind every input op's resop `BoxRef` in `box_pool` to a
-    /// fresh `OpRc` of the input op so any `Forwarded::Op(_)` chain
-    /// step targeting the slot has an upgradable `Weak<Op>` from the
-    /// start of the optimization run. `TraceIterator::next()`
-    /// (opencoder.rs:500) plants unbound `BoxRef::new_resop` slots for
-    /// every visited op; absent this pre-pass, `getintbound_box` →
-    /// `get_box_replacement_box` (a `&self` reader) can land on the
+    /// Test-only: seed the canonical producer stores (`resop_refs` /
+    /// `inputarg_refs`) from a list of already-bound `BoxRef`s, mirroring
+    /// what the production recorder→optimizer handoff populates. Each box
+    /// is distributed by its bound identity: InputArg boxes land in
+    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos.raw()]`. This
+    /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
+    /// `resolve_to_boxref` / `ensure_box` / `find_producer_op` resolve each
+    /// OpRef through the same canonical hosts production uses, returning a
+    /// fresh `BoxRef` bound to the seeded `Op` / `InputArg`.
+    #[cfg(test)]
+    pub(crate) fn seed_boxes_canonical(&mut self, boxes: &[crate::r#box::BoxRef]) {
+        for b in boxes {
+            if let Some(ia) = b.bound_inputarg() {
+                let idx = ia.index as usize;
+                if idx >= self.inputarg_refs.len() {
+                    self.inputarg_refs
+                        .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                }
+                self.inputarg_refs[idx] = ia;
+            } else if let Some(op) = b.bound_op() {
+                let idx = op.pos.get().raw() as usize;
+                if idx >= self.resop_refs.len() {
+                    self.resop_refs.resize_with(idx + 1, || None);
+                }
+                self.resop_refs[idx] = Some(op);
+            }
+        }
+    }
+
+    /// S-1: record every input op's resop producer `OpRc` into
+    /// `resop_refs` so any `Forwarded::Op(_)` chain step targeting the
+    /// slot has an upgradable `Weak<Op>` from the start of the
+    /// optimization run. Absent this pre-pass, `getintbound_box` →
+    /// `get_box_replacement_box` (a `&self` reader) can land on an
     /// unbound terminal and a subsequent `set_forwarded_info` write
     /// trips `BoxRef::write_forwarded`'s bound-precondition assert.
     ///
-    /// The bound `OpRc` is stashed in `resop_refs[pos]` so `emit()`'s
+    /// The producer `OpRc` is stashed in `resop_refs[pos]` so `emit()`'s
     /// `bound_is_synthetic` check (`mod.rs::emit` rebind path) later
     /// upgrades the binding to the emitted post-pass producer `OpRc`
     /// via `bind_op`'s carry-over (forwarded state preserved).
     ///
-    /// Inherited Phase 1 slots (already bound by Phase 1's end-of-pass
-    /// orphan binding at `optimizer.rs:2431-2460`) skip — the
-    /// `bound_op().is_some()` guard preserves their phase-1 identity.
-    pub(crate) fn bind_input_resops(&mut self, ops: &[Op]) {
-        if self.box_pool.is_empty() {
-            return;
-        }
+    /// InputArg slots are skipped (handled by `ensure_inputarg_bindings`);
+    /// only resop positions land here. Each phase's input `ops` carry that
+    /// phase's own positions (Phase 2 body ops sit above the Phase 1 emit
+    /// namespace, so they never collide with an inherited bound slot), and
+    /// the `resop_refs[idx]` dedup covers intra-`ops` repeats.
+    pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
+        // The loop over the caller-threaded `ops` self-guards (no-op on an
+        // empty slice) and records each resop producer into `resop_refs` /
+        // `live_synthetics` — the collision-safe stores `find_producer_op`
+        // consults.
         for op in ops {
             let pos = op.pos.get();
             if pos.is_none() || pos.is_constant() {
                 continue;
             }
-            let Some(b) = self.box_pool.get(pos) else {
-                continue;
-            };
-            if !b.is_resop() || b.bound_op().is_some() {
+            // InputArg slots are handled by `ensure_inputarg_bindings`; only
+            // resop positions land in `resop_refs`.
+            if matches!(
+                pos,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            ) {
                 continue;
             }
-            let op_rc = std::rc::Rc::new(op.clone());
-            b.bind_op(&op_rc);
             let idx = pos.raw() as usize;
+            // Dedup: a producer for this exact pos is already recorded.
+            if self
+                .resop_refs
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|o| o.pos.get() == pos)
+            {
+                continue;
+            }
+            // Record the caller-threaded `OpRc` so the iterated input op,
+            // `resop_refs`, and `live_synthetics` share one `Op` identity
+            // (no second private copy).
+            let op_rc = op.clone();
             if idx >= self.resop_refs.len() {
                 self.resop_refs.resize_with(idx + 1, || None);
             }
-            self.resop_refs[idx] = Some(op_rc);
+            self.resop_refs[idx] = Some(op_rc.clone());
+            self.live_synthetics.push(op_rc);
         }
     }
 
@@ -1985,10 +2056,11 @@ impl OptContext {
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
             resop_refs: Vec::new(),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: crate::r#box::BoxPool::new(),
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
@@ -2240,30 +2312,16 @@ impl OptContext {
     /// so typed positions never grow `value_types`.
     pub(crate) fn reserve_pos_typed(&mut self, tp: majit_ir::Type) -> OpRef {
         let raw = self.allocate_next_pos_raw();
-        // H-3.4 prerequisite (round-6 audit TODO B): eagerly materialize a
-        // typed BoxRef at `box_pool[idx]` so fresh OpRefs from `emit` /
-        // `alloc_op_position_typed` / `reserve_pos_typed` carry a Box.
-        // Without this, `get_box_replacement_box` returns None for these
-        // positions and `make_equal_to` mirror skips when the target is fresh
-        // (mod.rs:2927), leaving the BoxRef forwarded chain incomplete.
-        //
-        // Empty `box_pool` (test / retrace baselines) stays empty — only
-        // extend when the pool is plumbed by the recorder (production
-        // paths post H-2.1/H-3.0b).
-        //
-        // Gaps between `box_pool.len()` and `idx` (raw positions skipped by
-        // `allocate_next_pos_raw` advancing past slots claimed by the
-        // `constants` table) stay as `None` tombstones — PyPy/RPython has
-        // no Box for positions that no `ResOperation()` / `InputArg()` call
-        // produced (`resoperation.py:233-248`), so the sparse `BoxPool`
-        // model is the literal upstream shape. `ensure_box` writes the
-        // single requested slot via `BoxPool::set(idx, ...)` and leaves
-        // the holes untouched.
-        let opref = OpRef::op_typed(raw, tp);
-        if !self.box_pool.is_empty() {
-            self.ensure_box(opref);
-        }
-        opref
+        // The position's canonical host is materialized lazily on first
+        // access (`ensure_box` / `resolve_to_boxref` mint a `SameAs*`
+        // synthetic into `resop_refs[raw]` keyed by the full OpRef). No eager
+        // pre-mint here: an eager synthetic for a position that is reserved
+        // but never emitted (label / jump positions on an empty trace) would
+        // leak into `phase1_emit_ops` via `live_synthetics`; the emitted op,
+        // when it arrives, supersedes the lazily-minted synthetic the same way.
+        // PyPy/RPython has no Box for positions that no `ResOperation()` /
+        // `InputArg()` call produced (`resoperation.py:233-248`).
+        OpRef::op_typed(raw, tp)
     }
 
     /// opencoder.py:271 `_index` parity: floor at the iteration's inputarg
@@ -2275,15 +2333,14 @@ impl OptContext {
         self.next_pos = self
             .next_pos
             .max(self.inputarg_base + self.num_inputs + self.new_operations.len() as u32);
-        // Skip positions already claimed by a constant BoxRef forwarding
-        // (`make_constant`/`seed_constant`'s
-        // `box._forwarded = Box(constbox)` write) — those slots' BoxRef is
-        // already a constant identity and cannot be reused for a fresh op.
-        while self
-            .box_pool
-            .get_at_position(self.next_pos as usize)
-            .is_some_and(|b| matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_)))
-        {
+        // Skip positions already claimed by a constant forwarding
+        // (`make_constant`/`seed_constant`'s `set_forwarded_const` write) —
+        // those positions' canonical host is already a constant identity and
+        // cannot be reused for a fresh op. Reads the canonical `_forwarded`
+        // host for the position (`resop_refs[pos]` / `inputarg_refs[pos]`):
+        // `make_constant` writes `Forwarded::Const` to that host
+        // (resoperation.py:233).
+        while self.position_is_const_forwarded(self.next_pos) {
             self.next_pos += 1;
         }
         debug_assert!(
@@ -2294,6 +2351,26 @@ impl OptContext {
         let raw = self.next_pos;
         self.next_pos += 1;
         raw
+    }
+
+    /// Whether the canonical `_forwarded` host for raw position `raw`
+    /// (`resop_refs[raw]` for a ResOp slot, `inputarg_refs[raw]` for an
+    /// InputArg slot) carries `Forwarded::Const`. The position-keyed
+    /// replacement for the retired `box_pool.get_at_position(raw)` const
+    /// probe in `allocate_next_pos_raw`.
+    fn position_is_const_forwarded(&self, raw: u32) -> bool {
+        use crate::r#box::Forwarded;
+        let idx = raw as usize;
+        let resop_const = self
+            .resop_refs
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
+        let inputarg_const = self
+            .inputarg_refs
+            .get(idx)
+            .is_some_and(|ia| matches!(*ia.forwarded.borrow(), Forwarded::Const(_)));
+        resop_const || inputarg_const
     }
 
     /// RPython `box.type` invariant (history.py:220
@@ -2460,24 +2537,22 @@ impl OptContext {
         // object; late binding establishes that connection so
         // subsequent `box.set_forwarded` reaches `op.forwarded`.
         //
-        // Re-bind unconditionally when a ResOp BoxRef is already bound
-        // to a synthetic stand-in (`OptContext::resop_refs[op_pos]`):
-        // `BoxRef::bind_op`'s carry-over reads the current
-        // `get_forwarded()` (via the stand-in's slot) and writes it
-        // into `op_rc.forwarded` before re-pointing the handle, so
-        // forwarded state migrates to the real producer Op.
-        if let Some(b) = self.box_pool.get(op_pos) {
-            if b.is_resop() {
-                let bound_is_synthetic = b.bound_op().is_some_and(|bound| {
-                    self.resop_refs
-                        .get(op_pos.raw() as usize)
-                        .and_then(|slot| slot.as_ref())
-                        .is_some_and(|synth| std::rc::Rc::ptr_eq(&bound, synth))
-                });
-                if b.bound_op().is_none() || bound_is_synthetic {
-                    b.bind_op(&op_rc);
-                }
-            }
+        // The synthetic stand-in registered for `op_pos` by `ensure_box` /
+        // `bind_input_resops` is the `live_synthetics` entry at this position.
+        // Migrate its `_forwarded` onto the real producer (resoperation.py:233
+        // `_forwarded` lives on the op) and drop it from `live_synthetics` so
+        // the superseded stand-in is not drained into `phase1_emit_ops`. Each
+        // `op_pos` has at most one live stand-in, so the position match is
+        // unambiguous. This is the sole carry-over path: the synthetic is the
+        // `_forwarded` host every `find_producer_op` reaches before this emit
+        // supersedes it.
+        if let Some(i) = self
+            .live_synthetics
+            .iter()
+            .position(|s| s.pos.get() == op_pos)
+        {
+            let synth = self.live_synthetics.swap_remove(i);
+            *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
         }
         self.new_operations.push(op_rc);
         pos_ref
@@ -3726,15 +3801,17 @@ impl OptContext {
         if op.is_constant() {
             return;
         }
+        // optimizer.py:391 op = get_box_replacement(op)
+        let op = op.get_box_replacement(false);
         // optimizer.py:387 Box.type invariant: cross-type forwards would
-        // silently retype the chain head.
-        debug_assert_eq!(
-            op.get_box_replacement(false).type_(),
+        // silently retype the chain head. Always-on (not `debug_assert_eq!`)
+        // for parity with the Const-invariant `assert!`s in `set_forwarded_*`;
+        // asserted on the already-chain-walked `op` so it costs no extra walk.
+        assert_eq!(
+            op.type_(),
             newop.type_(),
             "make_equal_to: cross-type forward (Box.type invariant)",
         );
-        // optimizer.py:391 op = get_box_replacement(op)
-        let op = op.get_box_replacement(false);
         // optimizer.py:392 if op is newop: return
         if &op == newop {
             return;
@@ -3963,10 +4040,10 @@ impl OptContext {
     /// `BoxRef._forwarded` (`box.rs`) is the authoritative storage; both
     /// readers walk the same chain and agree by construction.
     ///
-    /// Returns `None` when `opref` is sentinel/None or has no entry in
-    /// `box_pool` / `const_pool` (the test / retrace baseline that runs
-    /// without an upstream pool). Callers in that case fall back to the
-    /// `OpRef`-returning walker.
+    /// Returns `None` when `opref` is sentinel/None or has no resolvable
+    /// producer / inputarg / const entry (the test / retrace baseline that
+    /// runs without an upstream binding). Callers in that case fall back to
+    /// the `OpRef`-returning walker.
     pub fn get_box_replacement_box(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
         // S-8.A.4: resolve the chain root through `resolve_to_boxref`, the
         // variant-aware canonical-host resolver (producer `Op` for ResOp
@@ -3985,8 +4062,8 @@ impl OptContext {
     /// RPython "Box always exists" invariant materializer
     /// (`resoperation.py:233-248 AbstractResOpOrInputArg._forwarded`).
     ///
-    /// Returns a `BoxRef` for `opref`, lazy-allocating a `box_pool`
-    /// placeholder for non-const OpRefs if absent. Mirrors PyPy's model
+    /// Returns a `BoxRef` for `opref`, materializing the canonical
+    /// `Op`/`InputArg` host for non-const OpRefs if absent. Mirrors PyPy's model
     /// where every operand in a trace has a backing `AbstractValue`; write
     /// paths (`setintbound`, `set_ptr_info`, `with_intbound_mut`,
     /// `with_ptr_info_mut`, `make_constant_class`, …) MUST use this helper
@@ -4026,14 +4103,51 @@ impl OptContext {
         // variants, resolve to the producing `Op`'s canonical `_forwarded`
         // host first. `find_producer_op` distinguishes the ResOp namespace
         // from the InputArg namespace by full `OpRef` (`op.pos == opref`),
-        // so a `Box.value`-style position-collapse — where this raw slot
-        // also holds an InputArg box (`box_pool[idx]`) — no longer routes a
-        // ResOp write to `inputarg_refs[idx].forwarded` while the matching
-        // read routes to `op.forwarded`. Returns `None` for InputArg / input
-        // positions (no producing op), falling through to the InputArg /
-        // box_pool / lazy-alloc paths below unchanged.
+        // so a raw-slot position-collapse — where one slot index served
+        // both a ResOp and an InputArg — no longer routes a ResOp write to
+        // `inputarg_refs[idx].forwarded` while the matching read routes to
+        // `op.forwarded`. Returns `None` for InputArg / input positions
+        // (no producing op), falling through to the InputArg / lazy-alloc
+        // paths below unchanged.
         if let Some(op_rc) = self.find_producer_op(opref) {
             return Some(crate::r#box::BoxRef::from_bound_op(&op_rc));
+        }
+        // InputArg write path: route through the canonical `inputarg_refs`
+        // host (symmetric with `resolve_to_boxref`'s InputArg branch and the
+        // `read_forwarded` / `clear_forwarded` writers). The returned BoxRef is
+        // bound to `inputarg_refs[idx]`, so a `set_forwarded_*` write lands the
+        // same `InputArg.forwarded` slot a later `resolve_to_boxref` read
+        // observes — without returning a position-collapsed InputArg slot
+        // whose write would silently vanish in a release build where the
+        // `BoxRef::write_forwarded` bound-precondition assert is off.
+        // Materialize / repair the slot's canonical `InputArgRc` by the
+        // canonical `inputargs` slot type, mirroring the lazy-alloc path below.
+        #[cfg(not(test))]
+        if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = opref {
+            let idx = opref.raw() as usize;
+            // Type the slot from the canonical `inputargs` slot type, falling
+            // back to the OpRef variant tag only when no canonical type is
+            // recorded — `opref.ty()` can disagree across a phase boundary (a
+            // Phase-2 OpRef referencing a Phase-1 low slot), so it is not the
+            // authoritative source (mirrors the lazy-alloc arm's `inputarg_type`
+            // sourcing below).
+            let tp = self
+                .inputarg_type(opref)
+                .unwrap_or_else(|| opref.ty().unwrap_or(majit_ir::Type::Void));
+            if idx >= self.inputarg_refs.len() {
+                self.inputarg_refs
+                    .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                self.inputarg_refs[idx] =
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
+            } else if self.inputarg_refs[idx].tp != tp
+                || self.inputarg_refs[idx].index != idx as u32
+            {
+                self.inputarg_refs[idx] =
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
+            }
+            return Some(crate::r#box::BoxRef::from_bound_inputarg(
+                &self.inputarg_refs[idx],
+            ));
         }
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
@@ -4046,35 +4160,14 @@ impl OptContext {
         // synthesize a body-namespace `new_resop` shape and `boxref_to_opref`
         // would round-trip to `op_at(pos)` (None) instead of
         // `inputargs[i]`.
-        if let Some(existing) = self.box_pool.get(opref) {
-            let cloned = existing.clone();
-            // Phase 1's per-iter BoxPool plants unbound `BoxRef::new_resop`
-            // slots in `TraceIterator::next()` (opencoder.rs:500) without a
-            // producer OpRc to bind to. When Phase 2 (or a retrace) sees
-            // those slots via `p1_full_prefix` carry-over and the
-            // corresponding producer arrives via `phase1_emit_ops` or
-            // `new_operations`, late-bind here so the chain-walk reads
-            // through to `op.forwarded` (resoperation.py:233 `_forwarded`
-            // host) and `make_equal_to`'s strict bound-target invariant
-            // holds.
-            if cloned.is_resop() && cloned.bound_op().is_none() {
-                if let Some(op_rc) = self.find_producer_op(opref) {
-                    cloned.bind_op(&op_rc);
-                } else {
-                    // Producer not yet emitted: bind to a synthetic
-                    // stand-in. `emit()` swaps the binding to the
-                    // real producer when it arrives, with `bind_op`'s
-                    // carry-over migrating the forwarded state.
-                    // Required so every BoxRef returned from
-                    // `ensure_box` is bound to an `Op` whose
-                    // `forwarded` slot is the canonical `_forwarded`
-                    // host (resoperation.py:233).
-                    let synthetic = self.mint_synthetic_resop(opref, cloned.type_());
-                    cloned.bind_op(&synthetic);
-                }
-            }
-            return Some(cloned);
-        }
+        // A resop reaching here has no producer in any `find_producer_op`
+        // store (else it returned above), so it falls through to the
+        // lazy-alloc arm below, which mints a `SameAs*` synthetic into
+        // `resop_refs[idx]` and binds a BoxRef to it. A subsequent
+        // `ensure_box` / `find_producer_op` for the same OpRef re-resolves to
+        // that synthetic (`resop_refs[idx].pos == opref`), so the synthetic is
+        // the stable `_forwarded` host across calls; no memoization side-table
+        // is needed.
         let idx = opref.raw() as usize;
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
         let placeholder = match opref {
@@ -4139,14 +4232,19 @@ impl OptContext {
                 p
             }
         };
-        Some(self.box_pool.set(opref, placeholder))
+        // The placeholder is bound to its producer / freshly-minted
+        // `resop_refs` synthetic (resops) or `inputarg_refs` host (the
+        // InputArg arm, only reachable in `#[cfg(test)]` since production
+        // InputArgs resolve through the `inputarg_refs` branch above), so it
+        // carries the canonical `_forwarded` host.
+        Some(placeholder)
     }
 
     /// `optimizer.py:1009 getptrinfo + info.is_virtual()` BoxRef-routing
     /// helper. Returns whether the box at `opref` (after chain walk)
     /// carries a `PtrInfo` whose `is_virtual()` is true. Reads via
-    /// `BoxRef::ptr_info()` on the chain-walked terminal box; an absent
-    /// `box_pool` slot (synthetic test paths) returns `false`.
+    /// `BoxRef::ptr_info()` on the chain-walked terminal box; an
+    /// unresolvable opref (synthetic test paths) returns `false`.
     /// `optimizer.py:884-886 is_virtual(op)`:
     /// ```python
     /// def is_virtual(self, op):
@@ -4291,9 +4389,9 @@ impl OptContext {
     ///
     /// `Const.get_forwarded()` returns `None` in RPython
     /// (`resoperation.py:1162`); short-circuit on the const-namespace
-    /// `OpRef` so the caller doesn't index `box_pool` with a CONST_BIT
-    /// `raw()` — which would either return None (large-index miss) or
-    /// alias an unrelated slot if the pool happens to be that long.
+    /// `OpRef` so the caller doesn't index a raw-keyed store with a
+    /// CONST_BIT `raw()` — which would either miss (large-index) or
+    /// alias an unrelated slot.
     pub fn has_forwarding(&self, op: &crate::r#box::BoxRef) -> bool {
         // `resoperation.py:1162 Const.get_forwarded()` returns None;
         // Const boxes carry no `_forwarded` slot upstream.
@@ -4315,8 +4413,8 @@ impl OptContext {
     ///
     /// `Const.get_forwarded()` returns `None` upstream
     /// (`resoperation.py:1162`); short-circuit on the const-namespace
-    /// `OpRef` so the caller doesn't index `box_pool` with a CONST_BIT
-    /// `raw()`.
+    /// `OpRef` so the caller doesn't index a raw-keyed store with a
+    /// CONST_BIT `raw()`.
     pub fn has_op_forwarding(&self, op: &crate::r#box::BoxRef) -> bool {
         if op.is_constant() {
             return false;
@@ -4516,11 +4614,10 @@ impl OptContext {
         // optimizer.py:116: assert op.type == 'i' — structural assert,
         // matches RPython's release-build invariant. Type::Void boxes are
         // pyre-only phantom placeholders surfaced by `ensure_box` when the
-        // recorder has not yet typed `box_pool[idx]`;
-        // accept them as the pyre equivalent of RPython's "the trace
-        // typing hasn't reached this OpRef yet" tolerance (PRE-EXISTING-
-        // ADAPTATION on the placeholder mechanism — convergence path is
-        // D-3 box_pool retirement, which removes phantoms entirely).
+        // recorder has not yet typed the position; accept them as the pyre
+        // equivalent of RPython's "the trace typing hasn't reached this
+        // OpRef yet" tolerance (PRE-EXISTING-ADAPTATION on the placeholder
+        // mechanism).
         assert!(
             matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
             "setintbound: expected 'i'-typed BoxRef, got {:?}",
@@ -4867,15 +4964,6 @@ impl OptContext {
             .and_then(|b| b.const_value())
     }
 
-    /// Register a concrete runtime value for an OpRef by writing it to
-    /// the corresponding `BoxRef`'s per-type mixin slot (RPython
-    /// `IntOp._resint` / `RefOp._resref` / `FloatOp._resfloat`).
-    pub fn register_runtime_value(&mut self, opref: OpRef, value: Value) {
-        if let Some(box_ref) = self.box_pool.get_at_position(opref.raw() as usize) {
-            box_ref.set_value(value);
-        }
-    }
-
     /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
     /// — extract the concrete runtime value carried by an OpRef.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
@@ -4903,8 +4991,8 @@ impl OptContext {
     /// box, so `==` holds iff the operands are the same box.
     /// Use this where RPython writes `arg0 is arg1`; use `same_box` where
     /// RPython writes `arg0.same_box(arg1)`.
-    /// Convergence path: once Goal D retires `box_pool` / OpRef indexing and
-    /// the trace yields a shared `BoxRef` per box, this collapses to
+    /// Convergence path: once OpRef indexing is retired and the trace yields
+    /// a shared `BoxRef` per box, this collapses to
     /// `Rc::ptr_eq(&get_box_replacement(a), &get_box_replacement(b))`.
     pub fn box_is(&self, a: OpRef, b: OpRef) -> bool {
         self.get_box_replacement(a) == self.get_box_replacement(b)
@@ -4915,8 +5003,8 @@ impl OptContext {
     /// `same_constant`). Resolves both operands through
     /// `get_box_replacement` then delegates to `BoxRef::same_box`. Falls
     /// back to resolved-`OpRef` identity plus constant-value comparison
-    /// when either box is absent (test fixtures without a populated
-    /// `box_pool`).
+    /// when either box is absent (test fixtures without populated canonical
+    /// stores).
     pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
         match (
             self.get_box_replacement_box(query),
@@ -6258,10 +6346,9 @@ impl OptContext {
     /// ```
     /// The Int arm delegates to `getrawptrinfo` per `info.py:881-882`.
     /// The Float arm short-circuits to `None`. The Void arm panics —
-    /// `info.py:885 assert op.type == 'r'` rejects Void boxes
-    /// outright, and the sparse `BoxPool` (`Vec<Option<BoxRef>>`) no
-    /// longer produces synthetic Void filler boxes that would smuggle
-    /// a typed-erased pointer through this helper.
+    /// `info.py:885 assert op.type == 'r'` rejects Void boxes outright;
+    /// no synthetic Void filler box exists that would smuggle a
+    /// type-erased pointer through this helper.
     pub fn getptrinfo(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfo> {
         self.getptrinfo_handle(op).map(|h| h.snapshot())
     }
@@ -6812,7 +6899,7 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // Use ensure_box (non-walking, &mut self) so the original
-        // box_pool[idx] is materialized — getptrinfo's internal chain
+        // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
@@ -6843,7 +6930,7 @@ impl OptContext {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
         // Use ensure_box (non-walking, &mut self) so the original
-        // box_pool[idx] is materialized — getptrinfo's internal chain
+        // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
@@ -6901,7 +6988,7 @@ impl OptContext {
         // info.py:729: ref = self._const.getref_base() — same dispatch as
         // _get_info; route through getptrinfo for the op.type contract.
         // Use ensure_box (non-walking, &mut self) so the original
-        // box_pool[idx] is materialized — getptrinfo's internal chain
+        // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
@@ -7634,7 +7721,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (b0, ia0) = bound_inputarg_box(Type::Int, 0);
         let (b1, ia1) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![b0.clone(), b1.clone()].into();
+        ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         (ctx, b0, b1, vec![ia0, ia1])
     }
 
@@ -7728,7 +7815,7 @@ mod boxref_forwarding_tests {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
         match &b.get_forwarded() {
@@ -7747,7 +7834,7 @@ mod boxref_forwarding_tests {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
@@ -7786,7 +7873,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
         let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![b0, b1.clone()].into();
+        ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.ensure_box(const_opref).expect("const box");
@@ -7811,7 +7898,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_make_constant_mirrors_box_info_constant() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
-        ctx.make_constant(OpRef::int_op(0), Value::Int(42));
+        ctx.make_constant(OpRef::input_arg_typed(0, Type::Int), Value::Int(42));
         match &b0.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Int(v)) => {
                 assert_eq!(*v, 42);
@@ -7871,25 +7958,31 @@ mod boxref_forwarding_tests {
             .expect("inline-Const carries the value on the Box");
         ctx.make_equal_to(&b0, &b_const);
 
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(0)), const_opref);
         assert_eq!(
-            ctx.get_box_replacement_not_const(OpRef::int_op(0)),
-            OpRef::int_op(0)
+            ctx.get_box_replacement(OpRef::input_arg_typed(0, Type::Int)),
+            const_opref
+        );
+        assert_eq!(
+            ctx.get_box_replacement_not_const(OpRef::input_arg_typed(0, Type::Int)),
+            OpRef::input_arg_typed(0, Type::Int)
         );
 
         ctx.make_equal_to(&b1, &b0);
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(1)), const_opref);
         assert_eq!(
-            ctx.get_box_replacement_not_const(OpRef::int_op(1)),
+            ctx.get_box_replacement(OpRef::input_arg_typed(1, Type::Int)),
+            const_opref
+        );
+        assert_eq!(
+            ctx.get_box_replacement_not_const(OpRef::input_arg_typed(1, Type::Int)),
             OpRef::input_arg_typed(0, Type::Int)
         );
     }
 
-    /// H-3.4 slice 77b follow-up: Phase 2's `box_pool` carries placeholder
-    /// `BoxRef::new_resop(Type::Void)` at indices `[0..phase2_inputarg_base)`
-    /// (the Phase 1 emit-position region; Phase 1 emit ops do NOT appear in
-    /// Phase 2's trace iteration, so Phase 2's iter has no `cls()` allocation
-    /// for them). Replicates the import_state pattern at unroll.rs:3105:
+    /// H-3.4 slice 77b follow-up: Phase 2's emit-position region
+    /// `[0..phase2_inputarg_base)` carries placeholder resop hosts (Phase 1
+    /// emit ops do NOT appear in Phase 2's trace iteration, so Phase 2's iter
+    /// has no `cls()` allocation for them). Replicates the import_state
+    /// pattern at unroll.rs:3105:
     ///
     ///   1. `make_equal_to(source_p2, target_p1)` writes
     ///      `source._forwarded = Box(placeholder_at_target_p1.raw)`.
@@ -7914,13 +8007,12 @@ mod boxref_forwarding_tests {
         let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
         let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
         let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
-        ctx.box_pool = vec![
+        ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
-            placeholder_other,
+            placeholder_other.clone(),
             source_box.clone(),
-            other_box,
-        ]
-        .into();
+            other_box.clone(),
+        ]);
 
         // BoxRef-first chain walker reconstructs the variant tag from
         // `box.type_()`; placeholders and source are both Ref, so use the
@@ -7939,7 +8031,7 @@ mod boxref_forwarding_tests {
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         let target_p1_box = ctx
             .ensure_box(target_p1)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+            .expect("body-namespace OpRef must resolve to a BoxRef");
         ctx.set_ptr_info(&target_p1_box, info.clone());
 
         // Read via BoxRef-routing path: walk source's chain to placeholder.
@@ -7988,13 +8080,12 @@ mod boxref_forwarding_tests {
         let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
         let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
         let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
-        ctx.box_pool = vec![
+        ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
-            placeholder_other,
+            placeholder_other.clone(),
             source_box.clone(),
-            other_box,
-        ]
-        .into();
+            other_box.clone(),
+        ]);
 
         let target_p1 = OpRef::ref_op(0);
         let source_p2 = OpRef::input_arg_ref(2);
@@ -8021,17 +8112,22 @@ mod boxref_forwarding_tests {
         ));
     }
 
-    /// H-3.2b: with a populated `box_pool` and no forwarding, the
-    /// BoxRef-returning reader returns the pool entry unchanged.
+    /// H-3.2b: with the canonical slot seeded and no forwarding, the
+    /// BoxRef-returning reader resolves the slot's bound InputArg.
     /// `resoperation.py:57-68` walker terminates on `None` immediately.
     #[test]
     fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
-        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, _b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         let got = ctx
-            .get_box_replacement_box(OpRef::int_op(0))
-            .expect("pool entry exists");
-        // Pointer identity: same `Rc` allocation as `b0`.
-        assert_eq!(got, b0);
+            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .expect("canonical store resolves the slot");
+        // No forwarding: the resolver materialises a fresh terminal BoxRef
+        // bound to the same `InputArgRc` as the seeded slot.
+        assert!(std::rc::Rc::ptr_eq(
+            &got.bound_inputarg()
+                .expect("resolved terminal carries bound InputArg"),
+            &ia_holder[0],
+        ));
     }
 
     /// H-3.2b: with a forwarding chain installed via `make_equal_to`, the
@@ -8046,8 +8142,8 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
         let got = ctx
-            .get_box_replacement_box(OpRef::int_op(0))
-            .expect("pool entry exists");
+            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .expect("bound box resolves");
         assert!(std::rc::Rc::ptr_eq(
             &got.bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
@@ -8057,13 +8153,13 @@ mod boxref_forwarding_tests {
         assert_ne!(got, b0);
     }
 
-    /// H-3.2b: empty `box_pool` (test/retrace baseline) makes the
-    /// BoxRef-returning reader return `None`; the OpRef-returning walker
-    /// cannot resolve a Box identity without a pool entry either.
+    /// H-3.2b: with no seeded canonical stores (test/retrace baseline) the
+    /// BoxRef-returning reader returns `None`; the OpRef-returning walker
+    /// cannot resolve a Box identity without a bound producer either.
     #[test]
     fn h3_2b_get_box_replacement_box_returns_none_when_pool_empty() {
         let ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        // box_pool empty: no Box identity to resolve.
+        // No seeded producer: no Box identity to resolve.
         assert!(ctx.get_box_replacement_box(OpRef::int_op(0)).is_none());
     }
 
@@ -8082,13 +8178,18 @@ mod boxref_forwarding_tests {
     /// PyPy `resoperation.py:60 isinstance(next, AbstractInfo)`.
     #[test]
     fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
-        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
-            .get_box_replacement_box(OpRef::int_op(0))
-            .expect("pool entry exists");
-        // Walker terminates at b0 (its `_forwarded` is Info, not Box).
-        assert_eq!(got, b0);
+            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .expect("canonical store resolves the slot");
+        // Walker terminates at the slot (its `_forwarded` is Info, not a
+        // chain step); the resolved BoxRef shares b0's bound InputArg.
+        assert!(std::rc::Rc::ptr_eq(
+            &got.bound_inputarg()
+                .expect("resolved terminal carries bound InputArg"),
+            &ia_holder[0],
+        ));
     }
 
     // BoxRef-routing helpers `is_virtual` / `is_nonnull` read the same
@@ -8097,7 +8198,7 @@ mod boxref_forwarding_tests {
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
         // `b.inputarg_handle` upgrades across the test body.
         ctx.inputarg_refs = vec![ia];
@@ -8466,7 +8567,7 @@ mod boxref_forwarding_tests {
         let (a, _ia_a) = bound_inputarg_box(Type::Ref, 0);
         let (b, _ia_b) = bound_inputarg_box(Type::Ref, 1);
         let (c, _ia_c) = bound_inputarg_box(Type::Ref, 2);
-        ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
+        ctx.seed_boxes_canonical(&[a.clone(), b.clone(), c.clone()]);
         ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
         ctx.make_equal_to(&a, &b);
@@ -8497,7 +8598,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
@@ -8534,7 +8635,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
@@ -8569,7 +8670,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
@@ -8593,7 +8694,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
@@ -8616,7 +8717,7 @@ mod boxref_forwarding_tests {
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (old_box, ia) = bound_inputarg_box(Type::Int, 0);
-        ctx.box_pool = vec![old_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone()]);
         ctx.inputarg_refs = vec![ia];
         ctx.setintbound(
             &old_box,
@@ -8788,10 +8889,10 @@ mod constant_ptr_info_tests {
 
         let parent_box = ctx
             .get_box_replacement_box(parent)
-            .expect("set_ptr_info populated box_pool");
+            .expect("set_ptr_info bound a BoxRef");
         let slice_box = ctx
             .get_box_replacement_box(slice)
-            .expect("set_ptr_info populated box_pool");
+            .expect("set_ptr_info bound a BoxRef");
         assert!(ctx.is_raw_ptr(&parent_box));
         assert!(ctx.is_raw_ptr(&slice_box));
     }
@@ -9465,15 +9566,23 @@ mod opt_box_env_tests {
         assert_eq!(materialised.position(), Some(0));
         assert_eq!(materialised.type_(), majit_ir::Type::Int);
 
-        // Re-entering must keep the same identity (no second lazy
-        // mint): `BoxRef` `PartialEq` is `Rc::ptr_eq` matching
-        // PyPy's `_forwarded` identity.
+        // Re-entering must resolve to the same canonical `_forwarded`
+        // host (`resoperation.py:700 AbstractInputArg._forwarded`). The
+        // `BoxRef` wrapper carries no state post-S-0.C, so two
+        // `ensure_box` calls return distinct wrappers bound to the same
+        // `InputArgRc`; identity lives on that bound host, not the
+        // wrapper `Rc`.
         let second = ctx
             .ensure_box(arg)
             .expect("InputArg OpRef must continue to resolve");
-        assert_eq!(
-            materialised, second,
-            "second ensure_box must return the same Box identity",
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &materialised
+                    .bound_inputarg()
+                    .expect("materialised bound to InputArg"),
+                &second.bound_inputarg().expect("second bound to InputArg"),
+            ),
+            "second ensure_box must resolve to the same InputArg host",
         );
     }
 

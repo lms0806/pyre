@@ -523,12 +523,6 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    /// Per-iter `BoxRef` pool from the bridge `TraceIterator`, mirroring
-    /// `opencoder.py:259-262`'s fresh `inputarg_from_tp` / `cls()` allocation
-    /// for the bridge's disjoint Box identity set. The optimizer consumes it
-    /// via the `box_pool` parameter on `optimize_bridge` so BoxRef-routing
-    /// readers see the bridge's own boxes, not the parent loop's.
-    box_pool: crate::r#box::BoxPool,
 }
 
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
@@ -602,7 +596,6 @@ fn prepare_bridge_trace_for_optimizer(
         None,
         &bridge_inputarg_types,
         bridge_inputarg_base,
-        None, // p1_full_prefix — bridge has no prior unroll phase
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
     while let Some(op) = iter.next() {
@@ -614,7 +607,6 @@ fn prepare_bridge_trace_for_optimizer(
         .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.raw()))
         .collect();
     let cache = iter._cache;
-    let box_pool = iter.box_pool;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
     let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
@@ -635,7 +627,6 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_vref_boxes,
         snapshot_frame_pcs,
         pending_bridge_rd,
-        box_pool,
     }
 }
 
@@ -1309,7 +1300,7 @@ pub struct JitHooks {
 /// stores it inline on `OpRef::ConstPtr(GcRef)` so each `&mut
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
-fn walk_op_const_ptr_refs(op: &mut Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args.borrow_mut().iter_mut() {
         if let Some(slot) = arg.as_const_ptr_mut() {
             visitor(slot);
@@ -1440,7 +1431,7 @@ impl<M: Clone> MetaInterp<M> {
         let Some(trace_ctx) = self.tracing.as_mut() else {
             return;
         };
-        for op in trace_ctx.recorder.ops_mut() {
+        for op in trace_ctx.recorder.ops() {
             walk_op_const_ptr_refs(op, &mut visitor);
         }
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
@@ -4631,11 +4622,6 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
-        // Recorder BoxRefs carry values stamped by `set_opref_concrete`
-        // during tracing. TraceIterator copies those intrinsic values to
-        // the fresh per-iteration boxes it mints for the optimizer.
-        let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
-
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -4738,7 +4724,18 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.source_box_pool = Some(close_loop_box_pool);
+        // Seed the phase optimizers' `input_ops`. Non-cut: `close_loop` only
+        // appends, so `preamble_data.base.operations()`'s loop-body `Rc<Op>`
+        // are the recorder objects carrying the authoritative Phase-1
+        // `_forwarded`. Cut: `cut_trace_from` remaps ops into a fresh
+        // namespace, so no seed can resolve cut-op lookups anyway; an explicit
+        // empty seed states that (producer lookup runs off new_operations /
+        // phase1_emit_ops / resop_refs).
+        unroll_opt.phase2_input_ops_seed = Some(if cross_loop_cut.is_none() {
+            preamble_data.base.operations().to_vec()
+        } else {
+            Vec::new()
+        });
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
@@ -4830,14 +4827,18 @@ impl<M: Clone> MetaInterp<M> {
                         // Forward the recorder's BoxRef pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
                         // the original trace.
-                        let retry_box_pool = trace.box_pool.clone();
+                        //
+                        // Seed the retry optimizer's `input_ops` from
+                        // `preamble_data.base.operations()` (the canonical
+                        // `Rc<Op>`), so producer lookup resolves identity.
+                        simple_opt.explicit_input_ops_seed =
+                            Some(preamble_data.base.operations().to_vec());
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
                                     &trace_ops_snapshot,
                                     &mut retry_constants,
                                     num_trace_inputargs,
-                                    retry_box_pool,
                                 )
                             }));
                         match retry_result {
@@ -5469,7 +5470,9 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
-        let bridge_ops = ctx.ops().to_vec();
+        // `ctx.ops()` yields `&[OpRc]`; the bridge compile helpers consume
+        // `&[Op]`, so materialize an owned value copy here.
+        let bridge_ops: Vec<majit_ir::Op> = ctx.ops().iter().map(|op| (**op).clone()).collect();
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputarg_types()
@@ -5701,7 +5704,7 @@ impl<M: Clone> MetaInterp<M> {
             mut constants,
             trace,
             call_pure_results,
-            close_loop_box_pool,
+            phase2_input_ops_seed,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -5723,7 +5726,6 @@ impl<M: Clone> MetaInterp<M> {
             let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
-            let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -5744,6 +5746,16 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 trace
             };
+            // Seed the retrace optimizer's `input_ops` directly. Retrace runs
+            // no Phase 1, so the recorder ops carry no `_forwarded`, and
+            // `trace.ops` (non-cut) are the recorder `Rc<Op>` themselves. Cut
+            // remaps ops into a fresh namespace, so an empty seed states that
+            // no producer lookup can resolve cut ops anyway.
+            let phase2_input_ops_seed = Some(if retrace_cut.is_none() {
+                trace.ops.clone()
+            } else {
+                Vec::new()
+            });
             (
                 green_key,
                 driver_descriptor,
@@ -5752,7 +5764,7 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 trace,
                 call_pure_results,
-                close_loop_box_pool,
+                phase2_input_ops_seed,
             )
         };
 
@@ -5799,7 +5811,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.source_box_pool = Some(close_loop_box_pool);
+        unroll_opt.phase2_input_ops_seed = phase2_input_ops_seed;
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             mut retrace_snapshot_boxes,
@@ -6344,20 +6356,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // Hand the recorder's BoxRef pool to the optimizer so writes reach
-        // the same `Rc<Box>` allocations. RPython parity: PyPy's
-        // `AbstractValue` objects from tracing flow unchanged into
-        // optimization.
-        let trace_box_pool = trace.box_pool.clone();
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs(
-                &trace_ops,
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+                // seeds identity directly from them.
+                &trace.ops,
                 &mut constants,
                 trace.inputargs.len(),
-                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -6763,16 +6771,13 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // Simple-loop path — same recorder BoxRef pool plumb as the
-        // unrolled loop entry above.
-        let trace_box_pool = trace.box_pool.clone();
 
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs(
-                &trace_ops,
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
+                &trace.ops,
                 &mut constants,
                 num_trace_inputargs,
-                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -8707,12 +8712,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        // Per-iter bridge `BoxRef` pool from `prepare_bridge_trace_for_optimizer`'s
-        // `TraceIterator::new` (`opencoder.py:259-262` parity). The bridge
-        // optimizer reads through `BoxRef::_forwarded` for `getptrinfo` /
-        // `getintbound` callsites; the pool must be plumbed through for
-        // those readers to hit non-empty BoxRefs.
-        let bridge_box_pool = prepared.box_pool;
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -8761,10 +8760,9 @@ impl<M: Clone> MetaInterp<M> {
             );
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
                 let value = heap_value_for(ia.tp, raw);
-                let box_ref = bridge_box_pool
-                    .get(ia.opref())
-                    .expect("fresh bridge inputarg BoxRef must exist");
-                box_ref.set_value(value);
+                // Stamp the concrete value on the canonical bridge `InputArg`
+                // identity (`history.py:803 *FrontendOp(pos, value)`).
+                ia.set_value(value);
             }
         }
 
@@ -8787,7 +8785,6 @@ impl<M: Clone> MetaInterp<M> {
                     None,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
-                    bridge_box_pool,
                 )
             }))
         };
@@ -9274,13 +9271,9 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        // Per-iter bridge `BoxRef` pool — see the sibling compile_bridge entry
-        // earlier for the rationale. Both bridge entries (descriptor=None and
-        // descriptor=Some) need the plumb so BoxRef readers stay primary.
-        let bridge_box_pool = prepared.box_pool;
         if let Some(prd) = pending_bridge_rd.as_ref() {
             // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
-            // The concrete values belong on the fresh bridge InputArg boxes
+            // The concrete values belong on the fresh bridge InputArg objects
             // themselves, mirroring `FrontendOp(pos, value)` rather than a
             // side table keyed by OpRef.
             assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
@@ -9291,10 +9284,9 @@ impl<M: Clone> MetaInterp<M> {
                 if tp == Type::Void {
                     continue;
                 }
-                let box_ref = bridge_box_pool
-                    .get(livebox)
-                    .expect("fresh descriptor bridge livebox BoxRef must exist");
-                box_ref.set_value(heap_value_for(tp, raw));
+                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
+                    ia.set_value(heap_value_for(tp, raw));
+                }
             }
         }
         // history.py:220 box.type parity: promote the legacy `i64` pool
@@ -9356,7 +9348,6 @@ impl<M: Clone> MetaInterp<M> {
                     pending_bridge_rd,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
-                    bridge_box_pool,
                 )
             }))
         };

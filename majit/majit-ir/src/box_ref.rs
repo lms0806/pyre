@@ -10,8 +10,6 @@
 //! `_forwarded` slot lives on `Op` / `InputArg` themselves
 //! (`resoperation.py:233` / `:700`); `BoxRef` is a thin wrapper that
 //! routes `get_forwarded` / `set_forwarded_*` through the bound handle.
-//! The `BoxPool` side-table that addresses these objects by `OpRef`
-//! index stays in metainterp.
 //!
 //! # Design decisions
 //!
@@ -35,21 +33,7 @@ use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
-use crate::{GcRef, OpRef, Type, Value};
-
-/// Per-type mixin class-attribute default — `IntOp._resint = 0`
-/// (resoperation.py:566), `RefOp._resref = nullptr` (resoperation.py:613),
-/// `FloatOp._resfloat = 0.0` (resoperation.py:582).  `Type::Void` has no
-/// mixin (void ops carry no result) so we use `Value::Void` as the inert
-/// placeholder.
-fn default_value_for(type_: Type) -> Value {
-    match type_ {
-        Type::Int => Value::Int(0),
-        Type::Ref => Value::Ref(GcRef::NULL),
-        Type::Float => Value::Float(0.0),
-        Type::Void => Value::Void,
-    }
-}
+use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
 /// op/inputarg/const objects.
@@ -78,12 +62,12 @@ pub struct Box {
     /// `Weak` to avoid an `Rc` cycle (`Op.forwarded` may carry a
     /// `BoxRef` holding an `Rc<Box>` whose `op_handle` could
     /// otherwise loop back through the trace). Empty for
-    /// `BoxKind::InputArg` / `Const`; filled by `BoxRef::bind_op` at
-    /// the recorder→TreeLoop handoff (`history.rs::with_box_pool`)
-    /// and during emit's `bound_is_synthetic` rebind path
-    /// (`mod.rs::emit`). `BoxRef::get_forwarded` /
-    /// `set_forwarded_*` route through this handle exclusively for
-    /// ResOp boxes — there is no `Box`-side mirror to consult.
+    /// `BoxKind::InputArg` / `Const`; filled at construction
+    /// (`BoxRef::from_bound_op`) or by `BoxRef::bind_op` during emit's
+    /// `bound_is_synthetic` rebind path (`mod.rs::emit`).
+    /// `BoxRef::get_forwarded` / `set_forwarded_*` route through this
+    /// handle exclusively for ResOp boxes — there is no `Box`-side mirror
+    /// to consult.
     pub op_handle: RefCell<Option<Weak<Op>>>,
 
     /// Canonical `_forwarded` host backref for `BoxKind::InputArg`
@@ -216,12 +200,10 @@ impl BoxRef {
 
     /// Transient `AbstractResOp` Box wrapping an already-bound
     /// `OpRc`. Used by the chain walker to materialize a `BoxRef`
-    /// terminal from a `Forwarded::Op(Weak<Op>)` payload without
-    /// going through the pool; the new box does not live in
-    /// `BoxPool`, but its `bound_op` immediately answers with the
-    /// same `Rc<Op>` and its `_forwarded` slot reads via the bound op
-    /// per `get_forwarded`. Type and position are mirrored from
-    /// `op.pos.get()`.
+    /// terminal from a `Forwarded::Op(Weak<Op>)` payload; the new box's
+    /// `bound_op` immediately answers with the same `Rc<Op>` and its
+    /// `_forwarded` slot reads via the bound op per `get_forwarded`.
+    /// Type and position are mirrored from `op.pos.get()`.
     pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
         let opref = op.pos.get();
         let type_ = opref.ty().unwrap_or(Type::Void);
@@ -278,28 +260,31 @@ impl BoxRef {
     /// Bind this Box to its corresponding `Op` so subsequent
     /// `set_forwarded_*` / `clear_forwarded` calls write through to
     /// `op.forwarded` (the canonical host; there is no Box-side mirror).
-    /// Stores a `Weak<Op>` to avoid an Rc cycle. Called by
-    /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
-    /// if called on a non-ResOp Box.
+    /// Stores a `Weak<Op>` to avoid an Rc cycle. Called when re-binding a
+    /// box to its producer (`ensure_box`'s synthetic-mint path, test
+    /// fixtures). Panics if called on a non-ResOp Box.
     ///
-    /// Late-binding carry-over: at bind time the box's effective forwarded
-    /// state (`self.get_forwarded()`) becomes the source of truth for the
-    /// bound `Op`. Copy it into `op.forwarded` unconditionally — including
-    /// when it is `Forwarded::None` — so any stale forwarding the `OpRc`
-    /// happened to carry (e.g. from a clone path) is overwritten and
-    /// post-bind `get_forwarded` reads exactly what the writer set.
+    /// Late-binding carry-over: when the box is *already bound* (a rebind:
+    /// `bind → set_forwarded → rebind`, e.g. `emit()` re-pointing a
+    /// synthetic placeholder at its real producer), its effective forwarded
+    /// state (`self.get_forwarded()`) is transferred into the new `Op` host.
+    /// A freshly minted, still-unbound box has no forwarded state of its own
+    /// — S-0.C removed the Box-side mirror, so `get_forwarded()` on an
+    /// unbound box is always `Forwarded::None`. Carrying that `None` would
+    /// *clobber* an already-populated canonical host's authoritative
+    /// `_forwarded` (the bug that `box_pool` memoization used to mask by
+    /// returning the same bound box on a repeat `ensure_box`). So the
+    /// carry-over fires only when `self` is bound; binding a fresh box leaves
+    /// the host's `_forwarded` intact.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
             "BoxRef::bind_op only valid for ResOp boxes"
         );
-        // Read the canonical effective forwarded slot, not the in-Box
-        // mirror. `get_forwarded` consults the bound op/inputarg first,
-        // so a `bind → set_forwarded → rebind` sequence carries the
-        // freshest state across the rebind even if a writer ever bypasses
-        // `BoxRef::set_forwarded_*` and updates `op.forwarded` directly.
-        let carry = self.get_forwarded();
-        *op.forwarded.borrow_mut() = carry;
+        if self.bound_op().is_some() {
+            let carry = self.get_forwarded();
+            *op.forwarded.borrow_mut() = carry;
+        }
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
@@ -316,19 +301,20 @@ impl BoxRef {
     /// `Weak<InputArg>` so subsequent `set_forwarded_*` / `clear_forwarded`
     /// route through `inputarg.forwarded` (`resoperation.py:700
     /// AbstractInputArg._forwarded`). Panics if called on a non-InputArg
-    /// box. Late-binding carry-over: the effective forwarded state
-    /// (`self.get_forwarded()`) is copied into `inputarg.forwarded`
-    /// unconditionally so any forwarding written before bind survives the
-    /// handoff and post-bind readers see what was set.
+    /// box. Late-binding carry-over follows the same rule as `bind_op`: it
+    /// fires only when `self` is already bound (a rebind that carries real
+    /// state), never when binding a freshly minted box — carrying an unbound
+    /// box's `Forwarded::None` would clobber the canonical host's
+    /// authoritative `_forwarded`.
     pub fn bind_inputarg(&self, ia: &crate::value::InputArgRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::InputArg { .. }),
             "BoxRef::bind_inputarg only valid for InputArg boxes"
         );
-        // Same canonical-slot rule as `bind_op`: `get_forwarded` reads via
-        // the bound handle first so the rebind sees the freshest state.
-        let carry = self.get_forwarded();
-        *ia.forwarded.borrow_mut() = carry;
+        if self.bound_inputarg().is_some() {
+            let carry = self.get_forwarded();
+            *ia.forwarded.borrow_mut() = carry;
+        }
         *self.0.inputarg_handle.borrow_mut() = Some(Rc::downgrade(ia));
     }
 
@@ -437,8 +423,8 @@ impl BoxRef {
     /// because `get_box_replacement`'s chain walk reconstructs a fresh
     /// `Rc<Box>` at each step from the OpRef variant tag, so independently
     /// walked terminals never share an `Rc` even when they are the same box.
-    /// Convergence path: once Goal D retires `box_pool` / OpRef indexing and
-    /// the trace yields a single shared `BoxRef` per box (optimizer.py's
+    /// Convergence path: once OpRef indexing is retired and the trace yields
+    /// a single shared `BoxRef` per box (optimizer.py's
     /// `trace.next() -> Box`), the reconstruction disappears and this body
     /// collapses to `Rc::ptr_eq` for non-Const + `same_constant` for Const.
     pub fn same_box(&self, other: &BoxRef) -> bool {
@@ -596,24 +582,6 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
-    /// Per-type mixin slot read — `_resint` / `_resref` / `_resfloat`
-    /// (resoperation.py:566/612/582).  Returns the cached runtime value
-    /// for `ResOp` / `InputArg` boxes; the variant default for `Const`
-    /// (which is what `Const.getvalue()` returns upstream).
-    /// For ResOp/InputArg, reads the stamped mixin slot; falls back
-    /// to the type-default when unstamped (RPython mixin class-attr
-    /// defaults: `_resint = 0`, `_resref = nullptr`, `_resfloat = 0.0`).
-    pub fn value(&self) -> Value {
-        match &self.0.kind {
-            BoxKind::Const { value, .. } => *value,
-            _ => self
-                .0
-                .value
-                .get()
-                .unwrap_or_else(|| default_value_for(self.type_())),
-        }
-    }
-
     /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
     /// per-Box intrinsic value carrier.  `None` when the mixin slot
     /// has not been stamped (Pyre allocates BoxRefs before the tracer
@@ -623,33 +591,24 @@ impl BoxRef {
     pub fn get_value(&self) -> Option<Value> {
         match &self.0.kind {
             BoxKind::Const { value, .. } => Some(*value),
-            _ => self.0.value.get(),
+            _ => {
+                // The concrete value's canonical host is the bound
+                // `Op`/`InputArg` (`resoperation.py:566 IntOp._resint`).
+                // Prefer it; fall back to the transitional `Box.value`
+                // slot only for boxes not yet bound to their object
+                // (recorder pool entries).
+                if let Some(op) = self.bound_op() {
+                    if let Some(v) = op.get_value() {
+                        return Some(v);
+                    }
+                } else if let Some(ia) = self.bound_inputarg() {
+                    if let Some(v) = ia.get_value() {
+                        return Some(v);
+                    }
+                }
+                self.0.value.get()
+            }
         }
-    }
-
-    /// `IntOp.setint` (resoperation.py:576) — typed mixin slot write.
-    /// Rust adaptation of RPython's class-level typing: `setint` only
-    /// exists on `IntOp` subclasses, so calling it on a non-Int box is
-    /// structurally impossible in RPython. The assert mirrors that.
-    pub fn setint(&self, v: i64) {
-        assert_eq!(self.type_(), Type::Int, "setint on non-Int box");
-        self.0.value.set(Some(Value::Int(v)));
-    }
-
-    /// `RefOp.setref_base` (resoperation.py:630) — typed mixin slot write.
-    pub fn setref_base(&self, v: GcRef) {
-        assert_eq!(self.type_(), Type::Ref, "setref_base on non-Ref box");
-        self.0.value.set(Some(Value::Ref(v)));
-    }
-
-    /// `FloatOp.setfloatstorage` (resoperation.py:601) — typed mixin slot write.
-    pub fn setfloatstorage(&self, v: f64) {
-        assert_eq!(
-            self.type_(),
-            Type::Float,
-            "setfloatstorage on non-Float box"
-        );
-        self.0.value.set(Some(Value::Float(v)));
     }
 
     /// Generic mixin slot write.  Asserts type consistency as the Rust
@@ -671,6 +630,15 @@ impl BoxRef {
                     self.type_(),
                     v.get_type()
                 );
+                // Stamp the concrete value on the canonical host (the bound
+                // `Op`/`InputArg`, `resoperation.py:566 IntOp._resint`).
+                // Dual-write the transitional `Box.value` slot so boxes not
+                // yet bound to their object keep working.
+                if let Some(op) = self.bound_op() {
+                    op.set_value(v);
+                } else if let Some(ia) = self.bound_inputarg() {
+                    ia.set_value(v);
+                }
                 self.0.value.set(Some(v));
             }
         }
@@ -697,9 +665,7 @@ impl BoxRef {
     /// unbound or dropped-target write would silently lose data
     /// since there is no `Box`-side mirror to catch it. Production
     /// pre-binds every chain-walker-reachable slot via
-    /// `OptContext::ensure_inputarg_bindings` and
-    /// `bind_input_resops`; recorder→TreeLoop handoff binds via
-    /// `BoxPool::bind_inputargs` / `bind_ops`.
+    /// `OptContext::ensure_inputarg_bindings` and `bind_input_resops`.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(op) = self.bound_op() {
             *op.forwarded.borrow_mut() = value;

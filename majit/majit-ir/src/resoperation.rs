@@ -1230,10 +1230,9 @@ pub trait BoxEnv {
 /// the same `Rc<Op>` and reads/writes `forwarded`/`descr`/...  through
 /// the interior-mutable slots.
 ///
-/// This alias is the migration target for `Vec<Op>` storage sites
-/// (BoxPool removal plan).  Sites already migrated traffic in
-/// `OpRc`; the remaining `Vec<Op>` sites keep the legacy clone-on-copy
-/// shape until they are migrated and `BoxPool` retires.
+/// This alias is the shared-identity handle for trace `Op` storage.
+/// Most sites traffic in `OpRc`; the remaining `Vec<Op>` sites keep the
+/// legacy clone-on-copy shape until they are migrated.
 pub type OpRc = std::rc::Rc<Op>;
 
 /// A single IR operation.
@@ -1249,13 +1248,13 @@ pub struct Op {
     pub opcode: OpCode,
     /// `resoperation.py:281 AbstractResOp` operand list. `RefCell` so
     /// `setarg` / `initarglist` can mutate through a shared `Op` reached
-    /// via `Rc<Op>` (BoxPool removal prep) — RPython writes
+    /// via `Rc<Op>` — RPython writes
     /// `op._args[i] = ...` on the same Python object the trace list,
     /// optimizer state, and backend input lists all observe.
     pub args: std::cell::RefCell<SmallVec<[OpRef; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached
-    /// through `Rc<Op>` (BoxPool removal prep): RPython's
+    /// through `Rc<Op>`: RPython's
     /// `op.setdescr(...)` writes through the same slot every observer
     /// sees.
     pub descr: std::cell::RefCell<Option<DescrRef>>,
@@ -1273,14 +1272,14 @@ pub struct Op {
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.  `RefCell` so
     /// the optimizer can rewrite fail_args on a shared `Op` reached
-    /// through `Rc<Op>` (BoxPool removal prep): RPython writes
+    /// through `Rc<Op>`: RPython writes
     /// `op._fail_args = [...]` on the same Python object the trace list,
     /// optimizer state, and backend input list all see.
     pub fail_args: std::cell::RefCell<Option<SmallVec<[OpRef; 3]>>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     /// `RefCell` so the optimizer can stamp types onto a shared `Op`
-    /// reached through `Rc<Op>` (BoxPool removal prep): RPython
+    /// reached through `Rc<Op>`: RPython
     /// writes `op.fail_arg_types = [...]` on the same Python object the
     /// trace/backend/short preamble all observe.
     pub fail_arg_types: std::cell::RefCell<Option<Vec<Type>>>,
@@ -1306,6 +1305,16 @@ pub struct Op {
     /// `Forwarded::None` until a writer sets it; `BoxRef::set_forwarded_*`
     /// on a bound box routes here, and `get_forwarded` reads it back.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+
+    /// `resoperation.py:566 IntOp._resint` / `:582 FloatOp._resfloat` /
+    /// `:612 RefOp._resref` parity (`history.py:803-807 *FrontendOp(pos,
+    /// value)`) — the concrete runtime value stamped onto this op
+    /// identity at execute-time. The canonical per-identity concrete
+    /// carrier for a bound ResOp box; `BoxRef::get_value`/`set_value`
+    /// route here. `None` until a writer stamps it (trace-time
+    /// `set_opref_concrete`); residual calls / guards keep it `None`
+    /// until blackhole runs them.
+    pub value: std::cell::Cell<Option<crate::value::Value>>,
 }
 
 impl Clone for Op {
@@ -1329,6 +1338,7 @@ impl Clone for Op {
             // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 }
@@ -1456,6 +1466,7 @@ impl Op {
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -1471,6 +1482,7 @@ impl Op {
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -1484,6 +1496,19 @@ impl Op {
 
     pub fn result_type(&self) -> Type {
         self.type_
+    }
+
+    /// Read the concrete runtime value stamped on this op identity
+    /// (`history.py:680 *FrontendOp.getint()` for the `_resint`/
+    /// `_resfloat`/`_resref` slot). `None` until a writer stamps it.
+    pub fn get_value(&self) -> Option<crate::value::Value> {
+        self.value.get()
+    }
+
+    /// Stamp the concrete runtime value on this op identity
+    /// (`history.py:803 *FrontendOp(pos, value)`).
+    pub fn set_value(&self, v: crate::value::Value) {
+        self.value.set(Some(v));
     }
 
     /// resoperation.py:323-334 AbstractResOp.copy_and_change +
@@ -1527,6 +1552,7 @@ impl Op {
             // `self.vecinfo` as `None`, so the clone is a no-op for them.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3601,6 +3627,7 @@ mod tests {
                 $($field)*
                 type_: Type::Void,
                 forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+                value: std::cell::Cell::new(None),
             };
             __op.type_ = __op.opcode.result_type();
             __op
