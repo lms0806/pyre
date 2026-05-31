@@ -1083,7 +1083,7 @@ pub enum BhDescr {
         is_item_signed: bool,
         /// `effectinfo.py:465 compute_bitstrings` ei_index carried from
         /// the producer-side `SimpleArrayDescr.get_ei_index()`. Passed
-        /// to `make_descr_from_bh` so the runtime `PyreArrayDescr` it
+        /// to `make_descr_from_bh` so the runtime `SimpleArrayDescr` it
         /// reconstructs publishes the same ei_index — without this
         /// field the bridge breaks across the BhDescr boundary.
         /// `u32::MAX` is the unset sentinel.

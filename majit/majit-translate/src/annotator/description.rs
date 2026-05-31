@@ -1056,6 +1056,29 @@ impl FunctionDesc {
         builder: Option<GraphBuilder<'_>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         if let Some(existing) = self.cache.borrow().get(&key) {
+            // Restore the `buildflowgraph` append invariant
+            // (translator.py:61 `self.graphs.append(graph)`) for
+            // lazy-lifted graphs. Upstream reaches a `cachedgraph` hit only
+            // for a graph that `buildgraph` -> `buildflowgraph` already
+            // appended to `translator.graphs`; pyre prefills the cache via
+            // the Rust-source adapter (`cutover::lift_callee_to_pygraph` ->
+            // `prefill_default_cache`), which bypasses `buildflowgraph`, so
+            // the lifted `FunctionGraph` never entered `translator.graphs`.
+            // Append it here so the flowspace effect analyzers
+            // (`canraise::RaiseAnalyzer` et al.) can resolve `funcobj.graph`
+            // through `translator.graphs` (graphanalyze.rs) instead of
+            // falling to `top_result()`. Identity-checked against
+            // double-append exactly like `buildflowgraph`'s walker-hit
+            // guard. `try_annotator` is `None` only for a bare `Bookkeeper`
+            // with no attached session (the leaf-lift registry and test
+            // fixtures), so the prod lift at `codewriter.rs` is a no-op here
+            // and the append fires once a session is attached.
+            if let Some(annotator) = self.base.bookkeeper.try_annotator() {
+                let mut graphs = annotator.translator.graphs.borrow_mut();
+                if !graphs.iter().any(|g| Rc::ptr_eq(g, &existing.graph)) {
+                    graphs.push(existing.graph.clone());
+                }
+            }
             return Ok(existing.clone());
         }
         if let Some(lift_err) = self.pyre_lift_error_message() {

@@ -4471,12 +4471,12 @@ fn materialize_virtual_from_rd(
     if let Some(cached) = virtuals_cache.get(&vidx) {
         return cached.clone();
     }
-    let Some(virtuals) = rd_virtuals else {
-        return Value::Ref(majit_ir::GcRef::NULL);
-    };
-    let Some(entry) = virtuals.get(vidx) else {
-        return Value::Ref(majit_ir::GcRef::NULL);
-    };
+    // resume.py:953: assert self.rd_virtuals is not None
+    let virtuals = rd_virtuals.expect("resume.py:953 getvirtual_ptr: rd_virtuals is not None");
+    // resume.py:954: v = self.rd_virtuals[index].allocate(self, index) — direct
+    // index; a corrupt resume stream (out-of-range vidx) raises IndexError here
+    // rather than being swallowed as a NULL ref.
+    let entry = &virtuals[vidx];
     // resume.py:1552-1588 decode_* parity.
     fn decode_tagged_fieldnum(
         tagged: i16,
@@ -4492,26 +4492,28 @@ fn materialize_virtual_from_rd(
         let (val, tagbits) = majit_metainterp::resume::untag(tagged);
         Some(match tagbits {
             majit_ir::resumedata::TAGBOX => {
-                // resume.py:1556-1564: negative index → num + count
+                // resume.py:1562-1564: if num < 0: num += self.count; then
+                // cpu.get_*_value(self.deadframe, num) — direct deadframe
+                // access, so a corrupt stream (out-of-range num) raises here
+                // rather than being papered over with a 0.
                 let idx = if val < 0 {
                     (val + num_failargs) as usize
                 } else {
                     val as usize
                 };
-                dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame[idx].clone()
             }
             majit_ir::resumedata::TAGINT => Value::Int(val as i64),
             majit_ir::resumedata::TAGCONST => {
-                // resume.py:1552-1564: type-aware constant decode
+                // resume.py:1568-1570 decode_ref: if tagged_eq(tagged, NULLREF):
+                //   return ConstPtr.value
                 if tagged == majit_ir::resumedata::NULLREF {
                     return Some(Value::Ref(majit_ir::GcRef::NULL));
                 }
+                // resume.py:1554/1571/1582: self.consts[num - TAG_CONST_OFFSET]
+                // — direct index; a corrupt stream raises IndexError here.
                 let ci = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                rd_consts
-                    .get(ci)
-                    .copied()
-                    .unwrap_or(majit_ir::Const::Int(0))
-                    .to_value()
+                rd_consts[ci].to_value()
             }
             majit_ir::resumedata::TAGVIRTUAL => {
                 return Some(materialize_virtual_from_rd(
@@ -4523,7 +4525,10 @@ fn materialize_virtual_from_rd(
                     virtuals_cache,
                 ));
             }
-            _ => Value::Int(0),
+            // untag masks to 2 bits (TAGMASK), so tagbits is exhaustively one
+            // of TAGCONST/TAGINT/TAGBOX/TAGVIRTUAL above. resume.py's decode_*
+            // encode this with `assert tag == TAGBOX` in the final else.
+            _ => unreachable!("untag yields a 2-bit tag; all four are handled"),
         })
     }
     /// resume.py:1549 decode_int(fieldnum)
@@ -4689,9 +4694,10 @@ fn materialize_virtual_from_rd(
             let mut p = 0;
             for i in 0..*size {
                 for j in 0..num_fields {
-                    if p >= fieldnums.len() {
-                        break;
-                    }
+                    // resume.py:755: num = self.fieldnums[p] — direct index; a
+                    // short stream raises IndexError here (encoder bug), a
+                    // longer one leaves its tail unread once p exhausts
+                    // size * len(fielddescrs).
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -4727,21 +4733,38 @@ fn materialize_virtual_from_rd(
             descrs,
             fieldnums,
         } => {
-            assert_eq!(offsets.len(), descrs.len());
-            assert_eq!(offsets.len(), fieldnums.len());
             // resume.py:701-703: buffer = decoder.allocate_raw_buffer(func, size)
             let (driver, _) = driver_pair();
-            let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
-                "i".into(),
-                'i',
-                majit_ir::descr::EffectInfo::MOST_GENERAL,
-            );
+            // resume.py:1453-1455 allocate_raw_buffer:
+            //   cic = self.callinfocollection
+            //   calldescr, _ = cic.callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
+            // The calldescr comes from the shared callinfocollection, not a
+            // freshly minted MOST_GENERAL descr.  func is NOT read from the
+            // callinfo (resume.py:1453 discards it as `_`; several malloc
+            // variants share the oopspec) — it stays the VRawBufferInfo.func.
+            let cic = driver
+                .meta_interp()
+                .callinfocollection()
+                .expect(
+                    "materialize_virtual_from_rd: MetaInterp.callinfocollection \
+                     required for VRawBufferInfo recovery (resume.py:1453)",
+                )
+                .clone();
+            let (calldescr, _) =
+                cic.callinfo_for_oopspec(majit_ir::effectinfo::OopSpecIndex::RawMallocVarsizeChar);
+            let calldescr =
+                calldescr.expect("callinfo_for_oopspec missing OS_RAW_MALLOC_VARSIZE_CHAR");
+            let cd = calldescr
+                .as_call_descr()
+                .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
+            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            // resume.py:1456: self.cpu.bh_call_i(func, [size], None, None, calldescr)
             let buffer = driver.meta_interp().backend().bh_call_i(
                 *func,
                 Some(&[*size as i64]),
                 None,
                 None,
-                &calldescr,
+                &bh_calldescr,
             );
             // resume.py:704: cache BEFORE filling fields.
             let result = Value::Int(buffer);
@@ -4749,8 +4772,12 @@ fn materialize_virtual_from_rd(
             let backend = driver.meta_interp().backend();
             // resume.py:705-708: for i in range(len(self.offsets)):
             //     offset = self.offsets[i]; descr = self.descrs[i]
-            //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
-            for (i, &fnum) in fieldnums.iter().enumerate() {
+            //     decoder.setrawbuffer_item(buffer, self.fieldnums[i], offset, descr)
+            // Drive by len(self.offsets) (not fieldnums): indexing
+            // descrs[i]/fieldnums[i] makes a short list an out-of-bounds error
+            // (IndexError parity), a longer one leaves its tail unread.
+            for i in 0..offsets.len() {
+                let fnum = fieldnums[i];
                 let di = &descrs[i];
                 let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
                 // resume.py:1544: assert not descr.is_array_of_pointers()
@@ -4789,23 +4816,26 @@ fn materialize_virtual_from_rd(
             return result;
         }
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
-            // resume.py:723-727: base_buffer + offset
-            if let Some(fnum) = fieldnums.first() {
-                if let Some(Value::Int(base)) = decode_tagged_fieldnum(
-                    *fnum,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                ) {
-                    let result = Value::Int(base + *offset as i64);
-                    // resume.py:727: virtuals_cache.set_int(index, buffer)
-                    virtuals_cache.insert(vidx, result.clone());
-                    return result;
-                }
-            }
-            return Value::Int(0);
+            // resume.py:724: assert len(self.fieldnums) == 1 — a slice carries
+            // exactly its base buffer; any other count is an encoder bug.
+            assert!(
+                fieldnums.len() == 1,
+                "resume.py:724 VRawSliceInfo.allocate_int: len(self.fieldnums) == 1"
+            );
+            // resume.py:725: base_buffer = decoder.decode_int(self.fieldnums[0])
+            let base = decode_tagged_fieldnum_int(
+                fieldnums[0],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            // resume.py:726: buffer = decoder.int_add_const(base_buffer, self.offset)
+            let result = Value::Int(base + *offset as i64);
+            // resume.py:727: decoder.virtuals_cache.set_int(index, buffer)
+            virtuals_cache.insert(vidx, result.clone());
+            return result;
         }
         majit_ir::RdVirtualInfo::Empty => {
             panic!("[jit] materialize_virtual: rd_virtuals[{vidx}] is Empty");
@@ -4904,9 +4934,9 @@ fn materialize_virtual_from_rd(
                      required for VStr/VUni Concat recovery (resume.py:1143)",
                 )
                 .clone();
-            let (calldescr, func) = cic
-                .callinfo_for_oopspec(oopspec)
-                .expect("callinfo_for_oopspec missing OS_STR_CONCAT / OS_UNI_CONCAT");
+            let (calldescr, func) = cic.callinfo_for_oopspec(oopspec);
+            let calldescr =
+                calldescr.expect("callinfo_for_oopspec missing OS_STR_CONCAT / OS_UNI_CONCAT");
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Concat calldescr must downcast to CallDescr");
@@ -4915,7 +4945,7 @@ fn materialize_virtual_from_rd(
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
             let backend = driver.meta_interp().backend();
             let result = backend.bh_call_r(
-                *func as i64,
+                func as i64,
                 None,
                 Some(&[left_val, right_val]),
                 None,
@@ -4979,9 +5009,9 @@ fn materialize_virtual_from_rd(
                      required for VStr/VUni Slice recovery (resume.py:1143)",
                 )
                 .clone();
-            let (calldescr, func) = cic
-                .callinfo_for_oopspec(oopspec)
-                .expect("callinfo_for_oopspec missing OS_STR_SLICE / OS_UNI_SLICE");
+            let (calldescr, func) = cic.callinfo_for_oopspec(oopspec);
+            let calldescr =
+                calldescr.expect("callinfo_for_oopspec missing OS_STR_SLICE / OS_UNI_SLICE");
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Slice calldescr must downcast to CallDescr");
@@ -4990,7 +5020,7 @@ fn materialize_virtual_from_rd(
             // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
             let backend = driver.meta_interp().backend();
             let result = backend.bh_call_r(
-                *func as i64,
+                func as i64,
                 Some(&[start_val, stop_val]),
                 Some(&[str_val]),
                 None,
@@ -6711,15 +6741,32 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     /// Concrete reader: cpu.bh_call_i(func, [size], None, None, calldescr)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let (driver, _) = driver_pair();
-        let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
-            "i".into(),
-            'i',
-            majit_ir::descr::EffectInfo::MOST_GENERAL,
-        );
-        driver
+        // resume.py:1453-1455: calldescr, _ = cic.callinfo_for_oopspec(
+        //   OS_RAW_MALLOC_VARSIZE_CHAR). The calldescr comes from the shared
+        // callinfocollection, not a freshly minted MOST_GENERAL descr; func is
+        // the caller's argument (resume.py discards the callinfo's func as `_`).
+        let cic = driver
             .meta_interp()
-            .backend()
-            .bh_call_i(func, Some(&[size as i64]), None, None, &calldescr)
+            .callinfocollection()
+            .expect(
+                "allocate_raw_buffer: MetaInterp.callinfocollection required \
+                 (resume.py:1453)",
+            )
+            .clone();
+        let (calldescr, _) =
+            cic.callinfo_for_oopspec(majit_ir::effectinfo::OopSpecIndex::RawMallocVarsizeChar);
+        let calldescr = calldescr.expect("callinfo_for_oopspec missing OS_RAW_MALLOC_VARSIZE_CHAR");
+        let cd = calldescr
+            .as_call_descr()
+            .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
+        let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+        driver.meta_interp().backend().bh_call_i(
+            func,
+            Some(&[size as i64]),
+            None,
+            None,
+            &bh_calldescr,
+        )
     }
 
     /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr).

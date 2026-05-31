@@ -2941,7 +2941,7 @@ fn arraydescrof(
             is_item_signed: array_descr.is_item_signed(),
             // descr.py:465 compute_bitstrings — carry the SimpleArrayDescr's
             // ei_index across the BhDescr boundary so make_descr_from_bh
-            // republishes it on the runtime PyreArrayDescr.
+            // republishes it on the runtime SimpleArrayDescr.
             ei_index: descr.get_ei_index(),
             // descr.py:348-360 cache identity — carry the codewriter
             // `array_type_id` across the BhDescr boundary so the

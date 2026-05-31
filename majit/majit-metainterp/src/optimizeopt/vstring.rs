@@ -1186,7 +1186,12 @@ impl OptString {
     ) -> Option<OptimizationResult> {
         // Clone Arc to avoid borrow conflict with ctx
         let cic = ctx.callinfocollection.clone()?;
-        let &(ref calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec)?;
+        // vstring.py:852: calldescr, func = cic.callinfo_for_oopspec(oopspecindex)
+        // — a missing oopspec yields (None, 0). PyPy then builds CALL_I with
+        // descr=calldescr (possibly None); pyre's Op descr is non-optional, so a
+        // missing calldescr cannot be encoded as a None-descr op — bail instead.
+        let (calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec);
+        let calldescr = calldescr?;
         let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];

@@ -824,10 +824,13 @@ impl CallInfoCollection {
     }
 
     /// effectinfo.py:439-447: callinfo_for_oopspec(oopspecindex)
-    /// Returns (calldescr, func_as_int) for the oopspec, or `None` on miss.
-    /// (RPython returns `(None, 0)` on miss; Rust uses `Option`.)
-    pub fn callinfo_for_oopspec(&self, oopspec: OopSpecIndex) -> Option<&(DescrRef, u64)> {
-        self.entries.get(&oopspec)
+    /// Returns (calldescr, func_as_int) for the oopspec, or `(None, 0)` on a
+    /// miss (KeyError) — the calldescr is optional, the func defaults to 0.
+    pub fn callinfo_for_oopspec(&self, oopspec: OopSpecIndex) -> (Option<&DescrRef>, u64) {
+        match self.entries.get(&oopspec) {
+            Some((calldescr, func)) => (Some(calldescr), *func),
+            None => (None, 0),
+        }
     }
 
     /// effectinfo.py:436-437: all_function_addresses_as_int()

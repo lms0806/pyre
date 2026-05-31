@@ -1348,10 +1348,9 @@ impl CallControl {
                 // `descr.py:348-378 get_array_descr` cache-or-mint:
                 // `LLType::Array(path_hash(atid))` cache hit returns the
                 // runtime `__majit_register_descrs`-or-prior-analyzer-
-                // minted Arc (`SimpleArrayDescr` or `PyreArrayDescr`);
-                // a miss mints a fresh `Arc<SimpleArrayDescr>` and
-                // caches it.  Both sides converge on one Arc per
-                // ARRAY identity.
+                // minted `Arc<SimpleArrayDescr>`; a miss mints a fresh
+                // `Arc<SimpleArrayDescr>` and caches it.  Both sides
+                // converge on one Arc per ARRAY identity.
                 //
                 // No `set_type_id` stamp here.  PyPy `gc.py:544-549
                 // init_array_descr` stamps `descr.tid` from
@@ -1361,7 +1360,7 @@ impl CallControl {
                 // session epic); analyzer-side `SimpleArrayDescr.type_id`
                 // stays at 0 (the `get_array_descr` cache-miss-mint
                 // default at `descr.rs:515`).  Runtime-registered
-                // `PyreArrayDescr` carries a real GC tid stamped at
+                // `SimpleArrayDescr` carries a real GC tid stamped at
                 // module init (`LIST_TYPE_ID`, `DICT_TYPE_ID`, …) and
                 // wins the cache slot when both paths race.  The
                 // structural identity used for `_cache_array` lookups
@@ -1812,9 +1811,9 @@ impl CallControl {
         // `LLType::Array(path_hash(atid))` cache key.  `try_downcast_arc`
         // recovers `Arc<SimpleArrayDescr>` from the cache's
         // `Arc<dyn Descr>` (the `Descr::as_any` override on
-        // `SimpleArrayDescr` / `PyreArrayDescr` makes the cast sound),
-        // then cast `as Arc<dyn ArrayDescr>` matches the trait-object
-        // field type on `SimpleInteriorFieldDescr.array_descr`.
+        // `SimpleArrayDescr` makes the cast sound), then cast
+        // `as Arc<dyn ArrayDescr>` matches the trait-object field type
+        // on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
         let base_size = self.array_header_size;
         let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
@@ -1833,11 +1832,9 @@ impl CallControl {
             )
         };
         // `descr.py:348-378 get_array_descr` cache hit returns the
-        // existing Arc — whichever concrete `ArrayDescr` impl is in
-        // the slot.  Plugin-registry upcast (`SimpleArrayDescr` built-in
-        // + pyre's `PyreArrayDescr` registered at module-init) keeps
-        // identity across runtime / analyzer paths per PyPy
-        // `cpu.arraydescrof(ARRAY)`.
+        // existing `Arc<SimpleArrayDescr>` in the slot, upcast to the
+        // `ArrayDescr` trait object, keeping identity across runtime /
+        // analyzer paths per PyPy `cpu.arraydescrof(ARRAY)`.
         let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
             majit_ir::descr::descr_arc_as_array_descr(cached)
                 .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
@@ -7370,6 +7367,182 @@ mod tests {
 
         let mut seen = HashSet::new();
         assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
+    }
+
+    /// Graph-model unification (Slice 1, test-only): prove the orthodox
+    /// flowspace `RaiseAnalyzer` (backendopt/canraise.rs) reproduces the
+    /// SAME tri-state verdict as the flat `CallControl::_canraise` on
+    /// well-formed lltype-vocabulary graphs. This locks the equivalence
+    /// contract that is the precondition for deleting
+    /// `analyze_can_raise_impl` once the flowspace analyzers are wired
+    /// into `getcalldescr` (the whole-program flowspace-registration
+    /// keystone + consumer slice).
+    ///
+    /// Tri-state coverage, parametrized by startblock op + CFG shape:
+    /// - `int_add`, no exception edge → `No` (the op cannot raise and the
+    ///   graph never reaches the exceptblock).
+    /// - `int_add` (`canraise=[]`), `LastException` edge re-raising the
+    ///   caught exception into the exceptblock → `MemoryErrorOnly` (the
+    ///   default analyzer reaches the exceptblock → raises; the
+    ///   `ignore_memory_error` analyzer suppresses it via
+    ///   `exceptblock_is_reraise_of_caught_exception`). Exercises the
+    ///   reraise-of-caught suppression in BOTH paths.
+    /// - `int_add_ovf` (`canraise=[OverflowError]`) → `Yes` in both modes
+    ///   (the op raises a non-MemoryError, short-circuiting the
+    ///   exceptblock).
+    ///
+    /// `int_add`/`int_add_ovf` are lltype-vocabulary opnames present in
+    /// `ll_operations()`; a non-lltype opname (e.g. `add`) would be
+    /// UNKNOWN to the flowspace table and conservatively classified
+    /// raising — an op-vocabulary difference, not an exceptblock
+    /// divergence (the flowspace analyzer targets post-rtype graphs).
+    #[test]
+    fn well_formed_raise_flowspace_raiseanalyzer_matches_flat_canraise() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::backendopt::canraise::RaiseAnalyzer;
+        use crate::translator::backendopt::graphanalyze::GraphAnalyzer;
+        use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        use crate::translator::translator::TranslationContext;
+        use std::rc::Rc;
+
+        // Entry computes slot 3 = OP(slot 1, slot 2). When `raises` is
+        // set the block exits on `LastException`: the normal edge carries
+        // slot 3 to the returnblock and the exception edge carries the
+        // caught (last_exception, last_exc_value) = (slot 10, slot 11)
+        // into the exceptblock inputargs via `.extravars` — a
+        // reraise-of-caught shape. When `raises` is clear the block has a
+        // single unconditional exit to the returnblock (no exceptblock
+        // reach), so the only raise source is the op itself.
+        fn build(name: &str, opname: &str, raises: bool) -> FunctionGraph {
+            let mut g = FunctionGraph::new(name);
+            g.set_next_value(12);
+            let op = crate::model::SpaceOperation {
+                result: Some(g.must_variable_at(3)),
+                kind: crate::model::OpKind::BinOp {
+                    op: opname.to_string(),
+                    lhs: g.must_variable_at(1),
+                    rhs: g.must_variable_at(2),
+                    result_ty: crate::model::ValueType::Int,
+                },
+            };
+            let (exitswitch, exits) = if raises {
+                (
+                    Some(ExitSwitch::LastException),
+                    vec![
+                        Link::new_mixed(
+                            vec![LinkArg::Value(g.must_variable_at(3))],
+                            g.returnblock,
+                            None,
+                        ),
+                        Link::new_mixed(
+                            vec![
+                                LinkArg::Value(g.must_variable_at(10)),
+                                LinkArg::Value(g.must_variable_at(11)),
+                            ],
+                            g.exceptblock,
+                            Some(exception_exitcase()),
+                        )
+                        .extravars(
+                            Some(LinkArg::Value(g.must_variable_at(10))),
+                            Some(LinkArg::Value(g.must_variable_at(11))),
+                        ),
+                    ],
+                )
+            } else {
+                (
+                    None,
+                    vec![Link::new_mixed(
+                        vec![LinkArg::Value(g.must_variable_at(3))],
+                        g.returnblock,
+                        None,
+                    )],
+                )
+            };
+            let startblock = crate::model::Block {
+                id: g.startblock,
+                inputargs: vec![g.must_variable_at(1), g.must_variable_at(2)],
+                operations: vec![op],
+                exitswitch,
+                exits,
+                dead: false,
+                framestate: None,
+            };
+            let returnblock = crate::model::Block {
+                id: g.returnblock,
+                inputargs: vec![g.must_variable_at(4)],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                dead: false,
+                framestate: None,
+            };
+            let mut blocks = vec![startblock, returnblock];
+            if raises {
+                blocks.push(crate::model::Block {
+                    id: g.exceptblock,
+                    inputargs: vec![g.must_variable_at(10), g.must_variable_at(11)],
+                    operations: vec![],
+                    exitswitch: None,
+                    exits: vec![],
+                    dead: false,
+                    framestate: None,
+                });
+            }
+            g.blocks = blocks;
+            g
+        }
+
+        // (label, opname, reaches-exceptblock, expected flat tri-state)
+        let cases: [(&str, &str, bool, CanRaise); 3] = [
+            ("no", "int_add", false, CanRaise::No),
+            ("mem", "int_add", true, CanRaise::MemoryErrorOnly),
+            ("yes", "int_add_ovf", true, CanRaise::Yes),
+        ];
+        for (label, opname, raises, expected) in cases {
+            // -- flat path: CallControl tri-state --
+            let mut cc = CallControl::new();
+            cc.register_function_graph(
+                CallPath::from_segments(["wf_raise"]),
+                build("wf_raise", opname, raises),
+            );
+            let flat = cc._canraise(
+                &CallTarget::function_path(["wf_raise"]),
+                &mut AnalysisCache::default(),
+            );
+            assert_eq!(
+                flat, expected,
+                "flat _canraise verdict for {label}/{opname}"
+            );
+
+            // -- flowspace path: adapter converts; RaiseAnalyzer reproduces
+            //    the flat tri-state from the (default, ignore-MemoryError)
+            //    boolean pair (default ↔ ignore=false; do_ignore_memory_error
+            //    ↔ ignore=true) --
+            let reg = PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
+            let out = function_graph_to_flowspace(&build("wf_raise", opname, raises), &reg)
+                .expect("well-formed graph converts to flowspace");
+            let translator = TranslationContext::new();
+            translator.graphs.borrow_mut().push(out.graph.clone());
+
+            let mut ra = RaiseAnalyzer::new(&translator);
+            let fs_default = ra.analyze_direct_call(&out.graph, None);
+
+            let mut ra_ignore = RaiseAnalyzer::new(&translator);
+            ra_ignore.do_ignore_memory_error();
+            let fs_ignore = ra_ignore.analyze_direct_call(&out.graph, None);
+
+            let fs_tristate = match (fs_default, fs_ignore) {
+                (false, _) => CanRaise::No,
+                (true, true) => CanRaise::Yes,
+                (true, false) => CanRaise::MemoryErrorOnly,
+            };
+            assert_eq!(
+                fs_tristate, flat,
+                "{label}/{opname}: flowspace RaiseAnalyzer (default={fs_default}, \
+                 ignore_mem={fs_ignore}) must reproduce the flat _canraise tri-state {flat:?}"
+            );
+        }
     }
 
     #[test]

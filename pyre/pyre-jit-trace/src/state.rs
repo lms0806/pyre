@@ -4174,10 +4174,9 @@ fn emit_stroruni_oopspec_call(
              (resume.py:1143-1188)",
         )
         .clone();
-    let (calldescr, func) = cic
-        .callinfo_for_oopspec(oopspec)
-        .expect("callinfo_for_oopspec missing entry for VStr/VUni oopspec");
-    let func_const = ctx.const_int(*func as i64);
+    let (calldescr, func) = cic.callinfo_for_oopspec(oopspec);
+    let calldescr = calldescr.expect("callinfo_for_oopspec missing entry for VStr/VUni oopspec");
+    let func_const = ctx.const_int(func as i64);
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(func_const);
     call_args.extend_from_slice(args);
@@ -4665,14 +4664,14 @@ fn bh_call_r_for_oopspec(
         "TraceCtx.callinfocollection missing — concrete VStr/VUni materialization \
          requires resume.py DirectReader funcptr_for_oopspec parity",
     );
-    let (calldescr, func) = cic
-        .callinfo_for_oopspec(oopspec)
+    let (calldescr, func) = cic.callinfo_for_oopspec(oopspec);
+    let calldescr = calldescr
         .expect("callinfo_for_oopspec missing entry for concrete VStr/VUni materialization");
     let cd = calldescr
         .as_call_descr()
         .expect("VStr/VUni oopspec calldescr must be CallDescr");
     let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
-    backend.bh_call_r(*func as i64, args_i, args_r, None, &bh_calldescr)
+    backend.bh_call_r(func as i64, args_i, args_r, None, &bh_calldescr)
 }
 
 /// resume.py:945-956 getvirtual_ptr concrete parity.
@@ -4887,17 +4886,10 @@ fn materialize_concrete_virtual_ptr(
             //                   self.fielddescrs[j])
             //           p += 1
             let num_fields = fielddescrs.len();
-            // resume.py:752-759 iterates exactly size × len(fielddescrs)
-            // entries with no bounds guard; a short stream is an encoder
-            // bug, surfaced here instead of silently truncated.
-            assert_eq!(
-                fieldnums.len(),
-                *size * num_fields,
-                "VArrayStructInfo fieldnums len {} != size {} * fielddescrs {}",
-                fieldnums.len(),
-                size,
-                num_fields,
-            );
+            // resume.py:752-759 reads exactly size × len(fielddescrs) entries
+            // via self.fieldnums[p] with no length-equality check: a short
+            // fieldnums is an out-of-bounds error here (IndexError parity), a
+            // longer one leaves its tail unread.
             let mut p = 0;
             for i in 0..*size {
                 for j in 0..num_fields {
@@ -5142,26 +5134,33 @@ fn materialize_concrete_virtual_int(
             // bug, surfaced fail-loud rather than papered over with a synthetic
             // calldescr.
             let cic = callinfocollection.expect("allocate_raw_buffer: callinfocollection is None");
-            let (descr_ref, _) = cic
-                .callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar)
-                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) not registered");
+            // resume.py:1455: calldescr, _ = cic.callinfo_for_oopspec(
+            //   OS_RAW_MALLOC_VARSIZE_CHAR). callinfo_for_oopspec returns
+            // (None, 0) on a missing entry (effectinfo.py:444-447) — no
+            // lookup-time check; the calldescr is used directly.
+            let (calldescr, _) =
+                cic.callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar);
+            // resume.py:1456: self.cpu.bh_call_i(func, [size], None, None,
+            //   calldescr). A missing entry surfaces here, as the calldescr is
+            // consumed by the backend call, not as a separate lookup assertion.
+            let descr_ref =
+                calldescr.expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr (callinfocollection)");
             let cd = descr_ref
                 .as_call_descr()
-                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR): not a CallDescr");
-            let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+                .expect("OS_RAW_MALLOC_VARSIZE_CHAR: not a CallDescr");
+            let bh = majit_translate::jitcode::BhCallDescr::from_arg_classes(
                 cd.arg_classes(),
                 cd.result_class(),
                 cd.get_extra_info().clone(),
             );
-            let buffer = backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &calldescr);
+            let buffer = backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &bh);
+            // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_concrete_int(vidx, buffer);
-            // resume.py:705-708 iterate by len(self.offsets), indexing
-            // self.descrs[i] and self.fieldnums[i] by the same i — a short
-            // descrs/fieldnums raises IndexError here (encoder bug), a longer
-            // one is ignored. No len-equality assert (VRawBufferInfo has none).
-            if buffer == 0 {
-                return 0;
-            }
+            // resume.py:705-708 iterate by len(self.offsets) unconditionally
+            // (no buffer == 0 guard), indexing self.descrs[i] and
+            // self.fieldnums[i] by the same i — a short descrs/fieldnums raises
+            // IndexError here (encoder bug), a longer one is ignored. No
+            // len-equality assert (VRawBufferInfo has none).
             for i in 0..offsets.len() {
                 let off = offsets[i];
                 let fnum = fieldnums[i];
@@ -5574,17 +5573,10 @@ fn materialize_bridge_virtual(
             //               decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
             //           p += 1
             let num_fields = fielddescrs.len();
-            // resume.py:752-759 iterates exactly size × len(fielddescrs)
-            // entries of self.fieldnums with no bounds guard; a short stream
-            // is an encoder bug, surfaced here instead of silently truncated.
-            assert_eq!(
-                fieldnums.len(),
-                *size * num_fields,
-                "VArrayStructInfo fieldnums len {} != size {} * fielddescrs {}",
-                fieldnums.len(),
-                size,
-                num_fields,
-            );
+            // resume.py:752-759 reads exactly size × len(fielddescrs) entries
+            // via self.fieldnums[p] with no length-equality check: a short
+            // fieldnums is an out-of-bounds error here (IndexError parity), a
+            // longer one leaves its tail unread.
             let mut p = 0;
             for i in 0..*size {
                 for j in 0..num_fields {
@@ -5642,11 +5634,23 @@ fn materialize_bridge_virtual(
                      it (resume.py:1124-1126)",
                 )
                 .clone();
-            let (calldescr, _) = cic
-                .callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar)
-                .expect("callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) not registered");
-            let buffer =
-                ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr.clone());
+            // resume.py:1126: calldescr, _ = cic.callinfo_for_oopspec(
+            //   OS_RAW_MALLOC_VARSIZE_CHAR). callinfo_for_oopspec returns
+            // (None, 0) on a missing entry (effectinfo.py:444-447) — no
+            // lookup-time check; the calldescr is used directly.
+            let (calldescr, _) =
+                cic.callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar);
+            // resume.py:1131-1132: execute_and_record_varargs(CALL_I,
+            //   [func, size], calldescr). A missing entry surfaces here, as the
+            // calldescr is consumed by the CALL_I op, not as a separate lookup
+            // assertion.
+            let buffer = ctx.record_op_with_descr(
+                OpCode::CallI,
+                &[func_ref, size_ref],
+                calldescr
+                    .cloned()
+                    .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr (callinfocollection)"),
+            );
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
             // resume.py:705-708 iterate by len(self.offsets), indexing
@@ -7438,29 +7442,52 @@ fn materialize_virtual_raw_buffer(
     values: &[majit_metainterp::resume::MaterializedValue],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
-    assert_eq!(offsets.len(), descrs.len());
-    assert_eq!(offsets.len(), values.len());
-
-    // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
+    // resume.py:700-709 VRawBufferInfo.allocate_int iterates len(self.offsets)
+    // unconditionally, indexing self.descrs[i]/self.fieldnums[i] by the same i.
+    // No len-equality assert (VRawBufferInfo has none); a short descrs/values
+    // raises IndexError here (encoder bug), a longer one leaves its tail unread.
     let (driver, _) = crate::driver::driver_pair();
-    let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
-        "i".into(),
-        'i',
-        majit_ir::descr::EffectInfo::MOST_GENERAL,
+    // resume.py:1452-1456 allocate_raw_buffer:
+    //   cic = self.callinfocollection
+    //   calldescr, _ = cic.callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
+    //   return self.cpu.bh_call_i(func, [size], None, None, calldescr)
+    // The calldescr comes from the shared callinfocollection, not a freshly
+    // minted MOST_GENERAL descr.  func stays the VRawBufferInfo.func (resume.py
+    // discards the callinfo's func as `_`).
+    let cic = driver
+        .meta_interp()
+        .callinfocollection()
+        .expect(
+            "materialize_virtual_raw_buffer: MetaInterp.callinfocollection \
+             required for VRawBufferInfo recovery (resume.py:1453)",
+        )
+        .clone();
+    // resume.py:1455: calldescr, _ = cic.callinfo_for_oopspec(...).
+    // callinfo_for_oopspec returns (None, 0) on a miss (effectinfo.py:444-447)
+    // — no lookup-time guard; the calldescr is consumed directly below.
+    let (calldescr, _) =
+        cic.callinfo_for_oopspec(majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar);
+    let descr_ref = calldescr.expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr (callinfocollection)");
+    let cd = descr_ref
+        .as_call_descr()
+        .expect("OS_RAW_MALLOC_VARSIZE_CHAR: not a CallDescr");
+    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+        cd.arg_classes(),
+        cd.result_class(),
+        cd.get_extra_info().clone(),
     );
+    // resume.py:703: buffer = self.cpu.bh_call_i(func, [size], None, None, calldescr)
     let buffer = driver.meta_interp().backend().bh_call_i(
         func,
         Some(&[size as i64]),
         None,
         None,
-        &calldescr,
+        &bh_calldescr,
     );
-    if buffer == 0 {
-        return None;
-    }
 
     let backend = driver.meta_interp().backend();
-    // resume.py:705-708: per-item bh_raw_store_i/f
+    // resume.py:705-708: per-item bh_raw_store_i/f, run unconditionally (no
+    // buffer == 0 guard).
     for i in 0..offsets.len() {
         let concrete = values[i].resolve_with_refs(materialized_refs)?;
         let di = &descrs[i];
@@ -8992,11 +9019,10 @@ mod tests {
     }
 
     // Needs a real raw-buffer allocator (`func` passed as a valid function
-    // pointer into `bh_call_i`). The current test supplies `func: 0`, so
-    // `materialize_virtual_raw_buffer` bails out at the `buffer == 0`
-    // guard. Previously the test tripped on an uninitialised
-    // `CallJitCallbacks` before ever reaching that guard; wiring up the
-    // backend allocator is a follow-up.
+    // pointer into `bh_call_i`) and a callinfocollection carrying
+    // OS_RAW_MALLOC_VARSIZE_CHAR. The current test supplies `func: 0` with no
+    // registered calldescr, so `materialize_virtual_raw_buffer` cannot run the
+    // resume.py:1456 bh_call_i; wiring up the backend allocator is a follow-up.
     #[ignore]
     #[test]
     fn test_materialize_virtual_ref_reconstructs_list_from_raw_buffer_ref() {

@@ -1108,12 +1108,10 @@ fn arc_in_vec(haystack: &[DescrRef], needle: &DescrRef) -> bool {
 /// sound.
 ///
 /// PyPy parity: `gc_cache._cache_array[ARRAY_OR_STRUCT]` is typed
-/// `ArrayDescr` in Python.  Pyre's lift stores `Arc<dyn Descr>` to
-/// admit both `SimpleArrayDescr` (analyzer mint) and
-/// `PyreArrayDescr` (runtime mint); this helper restores the
-/// per-concrete-type Arc identity at the consumer boundary so
-/// `SimpleInteriorFieldDescr::new` can wrap the cached Arc directly
-/// without a fresh allocation.
+/// `ArrayDescr` in Python.  Pyre's lift stores `Arc<dyn Descr>`; this
+/// helper restores the concrete-type Arc identity at the consumer
+/// boundary so `SimpleInteriorFieldDescr::new` can wrap the cached Arc
+/// directly without a fresh allocation.
 pub fn try_downcast_arc<T: 'static>(arc: DescrRef) -> Result<Arc<T>, DescrRef> {
     if arc.as_any().is_some_and(|a| a.is::<T>()) {
         // SAFETY: as_any returned a ref typed as T, so the underlying
@@ -1126,58 +1124,21 @@ pub fn try_downcast_arc<T: 'static>(arc: DescrRef) -> Result<Arc<T>, DescrRef> {
     }
 }
 
-/// Cross-trait Arc upcast from `Arc<dyn Descr>` → `Arc<dyn ArrayDescr>`.
+/// Convert `Arc<dyn Descr>` → `Arc<dyn ArrayDescr>` if the underlying
+/// concrete type is `SimpleArrayDescr`.
 ///
 /// Rust does not provide direct subtrait downcast on trait objects
 /// (`dyn Descr` is the supertrait of `dyn ArrayDescr`).  This helper
-/// walks a registry of `(TypeId → upcaster fn)` to recover the
-/// `Arc<dyn ArrayDescr>` view of the held concrete type — PyPy
+/// downcasts to the sole concrete `ArrayDescr` impl and upcasts the
+/// resulting `Arc` to the trait-object view — PyPy
 /// `cpu.arraydescrof(ARRAY)` per-tuple Arc identity for callers that
 /// hold a type-erased `DescrRef` and need the `ArrayDescr` trait
 /// surface (e.g. `SimpleInteriorFieldDescr.array_descr`).
-///
-/// `SimpleArrayDescr` is the built-in upcaster registered statically.
-/// External `ArrayDescr` impls (e.g. pyre's `PyreArrayDescr`) register
-/// their own upcasters at module-init via [`register_array_descr_upcaster`].
-type ArrayDescrUpcaster = fn(DescrRef) -> Result<Arc<dyn ArrayDescr>, DescrRef>;
-
-fn upcast_simple_array_descr(arc: DescrRef) -> Result<Arc<dyn ArrayDescr>, DescrRef> {
-    match try_downcast_arc::<SimpleArrayDescr>(arc) {
-        Ok(simple) => Ok(simple),
-        Err(arc) => Err(arc),
-    }
-}
-
-static ARRAY_DESCR_UPCASTERS: std::sync::OnceLock<std::sync::Mutex<Vec<ArrayDescrUpcaster>>> =
-    std::sync::OnceLock::new();
-
-fn upcasters() -> &'static std::sync::Mutex<Vec<ArrayDescrUpcaster>> {
-    ARRAY_DESCR_UPCASTERS.get_or_init(|| std::sync::Mutex::new(vec![upcast_simple_array_descr]))
-}
-
-/// Register an external `ArrayDescr` upcaster at module-init.
-///
-/// Pyre's `PyreArrayDescr` (in `pyre-jit-trace`) registers its own
-/// upcaster so `descr_arc_as_array_descr` recovers
-/// `Arc<dyn ArrayDescr>` for cache slots holding `PyreArrayDescr`
-/// instead of falling through to None.
-pub fn register_array_descr_upcaster(f: ArrayDescrUpcaster) {
-    upcasters().lock().unwrap().push(f);
-}
-
-/// Convert `Arc<dyn Descr>` → `Arc<dyn ArrayDescr>` if the underlying
-/// concrete type implements `ArrayDescr`.  Tries each registered
-/// upcaster in order; first match wins.
 pub fn descr_arc_as_array_descr(arc: DescrRef) -> Option<Arc<dyn ArrayDescr>> {
-    let list = upcasters().lock().unwrap();
-    let mut current = arc;
-    for f in list.iter() {
-        match f(current) {
-            Ok(a) => return Some(a),
-            Err(c) => current = c,
-        }
+    match try_downcast_arc::<SimpleArrayDescr>(arc) {
+        Ok(simple) => Some(simple),
+        Err(_) => None,
     }
-    None
 }
 
 /// Process-global `GcCache` slot — pyre's lift of PyPy's per-CPU
@@ -4098,9 +4059,9 @@ pub struct SimpleInteriorFieldDescr {
     /// `descr.py:388 InteriorFieldDescr.__init__` carries the
     /// containing `ArrayDescr` object. PyPy duck-types this — any
     /// `ArrayDescr` instance suffices.  Pyre stores `Arc<dyn ArrayDescr>`
-    /// to admit cached `Arc<SimpleArrayDescr>` (analyzer mint) and
-    /// `Arc<PyreArrayDescr>` (runtime mint) interchangeably; both
-    /// downcasted via `try_downcast_arc` at the analyzer wrap site.
+    /// over the sole concrete `Arc<SimpleArrayDescr>` (analyzer and
+    /// runtime mint), downcasted via `try_downcast_arc` at the analyzer
+    /// wrap site.
     array_descr: std::sync::Arc<dyn ArrayDescr>,
     /// `descr.py:388 InteriorFieldDescr.__init__` field descr —
     /// concrete `FieldDescr` in PyPy.

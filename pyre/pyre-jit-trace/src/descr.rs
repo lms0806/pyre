@@ -11,9 +11,7 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type,
-};
+use majit_ir::{Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type};
 
 // TODO: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs
@@ -73,47 +71,9 @@ pub struct PyreFieldDescr {
     ei_index: AtomicU32,
 }
 
-/// Concrete array descriptor for pointer-backed runtime arrays.
-#[derive(Debug)]
-pub struct PyreArrayDescr {
-    base_size: usize,
-    item_size: usize,
-    type_id: u32,
-    item_type: Type,
-    signed: bool,
-    /// `descr.py:359-362 ArrayDescr.lendescr` parity. `None` for the
-    /// `nolength=True` shape (ints/floats backing arrays where items
-    /// start at offset 0); `Some` for length-prefixed `Ptr(GcArray(T))`
-    /// shapes whose `gen_initialize_len` (`rewrite.py:565,572`) writes
-    /// the runtime length so `ArraylenGc` / `bhimpl_arraylen_vable`
-    /// can read it back.
-    len_descr: Option<DescrRef>,
-    /// Sequential identity bound at construction. Mirrors PyPy's
-    /// per-lltype cache slot identity (`descr.py:350-351`
-    /// `cache[ARRAY_OR_STRUCT]`): every distinct `(base_size, item_size,
-    /// type_id, item_type, signed, len_offset)` tuple receives one slot,
-    /// every repeat lookup returns the same `Arc`. Replaces the
-    /// previous bit-packed structural hash so `descr.index()` is 1:1
-    /// with the registry slot rather than a lossy compression of the
-    /// fields.
-    descr_id: u32,
-    /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
-    /// the codewriter publishes its `array_index` onto this descr —
-    /// `Descr::get_ei_index()` readers fall back to `descr.index()`
-    /// while the bridge is unset.
-    ei_index: AtomicU32,
-    /// `gc_cache._cache_array[LLType::Array(cache_key)]` keyed identity
-    /// surrogate — `path_hash(array_type_id)` for the runtime mint sites
-    /// that carry an identity carrier; 0 for legacy no-identity mints.
-    /// Mirrors `SimpleArrayDescr.cache_key` so the cross-impl
-    /// `ArrayDescr::cache_key()` accessor reports a stable identity slot
-    /// regardless of which concrete impl is in the cache.
-    cache_key: u64,
-}
-
 /// Structural key for `ARRAY_DESCR_REGISTRY`. Combination of all fields
 /// that PyPy treats as part of `ArrayDescr` identity (`descr.py:273-279
-/// + lendescr`). Two PyreArrayDescrs sharing this tuple share the same
+/// + lendescr`). Two array descrs sharing this tuple share the same
 /// `descr_id`.
 ///
 /// `array_type_id` carries the codewriter lltype-identity proxy
@@ -155,30 +115,26 @@ fn alloc_array_descr_id() -> u32 {
     let id = NEXT_ARRAY_DESCR_ID.fetch_add(1, Ordering::Relaxed);
     assert!(
         id < ARRAY_DESCR_ID_MAX,
-        "PyreArrayDescr registry exhausted (>2^28 instances) — index() bit 28 belongs to FIELD_DESCR_TAG"
+        "array descr registry exhausted (>2^28 instances) — index() bit 28 belongs to FIELD_DESCR_TAG"
     );
     id
 }
 
-/// `descr_arc_as_array_descr` plugin: recover `Arc<dyn ArrayDescr>`
-/// from an `Arc<dyn Descr>` whose underlying concrete type is
-/// `PyreArrayDescr`.  Registered process-wide on first PyreArrayDescr
-/// mint so analyzer-side consumers (in majit-translate) can upcast
-/// `_cache_array` slot hits without knowing the concrete type.
-fn upcast_pyre_array_descr(
-    arc: majit_ir::DescrRef,
-) -> Result<Arc<dyn majit_ir::descr::ArrayDescr>, majit_ir::DescrRef> {
-    match majit_ir::descr::try_downcast_arc::<PyreArrayDescr>(arc) {
-        Ok(pyre) => Ok(pyre),
-        Err(c) => Err(c),
+/// `descr.py:241-254 get_type_flag(ARRAY.OF)` — element classification
+/// for the runtime array mint.  Preserves the predicates the dropped
+/// `PyreArrayDescr` reported: `is_item_signed` (Signed vs Unsigned for
+/// ints), `is_array_of_pointers` (Pointer), `is_array_of_floats`
+/// (Float).  Non-struct only — struct arrays are minted as
+/// `SimpleArrayDescr(FLAG_STRUCT)` in `make_descr_from_bh`.
+fn runtime_array_flag(item_type: Type, signed: bool) -> majit_ir::descr::ArrayFlag {
+    use majit_ir::descr::ArrayFlag;
+    match item_type {
+        Type::Ref => ArrayFlag::Pointer,
+        Type::Float => ArrayFlag::Float,
+        Type::Int if signed => ArrayFlag::Signed,
+        Type::Int => ArrayFlag::Unsigned,
+        Type::Void => ArrayFlag::Void,
     }
-}
-
-fn ensure_pyre_array_descr_upcaster_registered() {
-    static REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    REGISTERED.get_or_init(|| {
-        majit_ir::descr::register_array_descr_upcaster(upcast_pyre_array_descr);
-    });
 }
 
 fn get_or_create_array_descr(
@@ -224,7 +180,7 @@ fn get_or_create_array_descr_with_full_id(
     // is the authoritative cache slot — consult it FIRST so a prior
     // analyzer-side `gc_cache.get_array_descr` mint
     // (`SimpleArrayDescr`) is reused instead of layered under a fresh
-    // `PyreArrayDescr`.  Matches PyPy `cpu.arraydescrof(ARRAY)`
+    // runtime `SimpleArrayDescr`.  Matches PyPy `cpu.arraydescrof(ARRAY)`
     // per-ARRAY object identity — both analyzer and pyre runtime
     // consumers share one Arc per `LLType::Array(path_hash(atid))`.
     if let Some(ref atid) = key.array_type_id {
@@ -244,7 +200,6 @@ fn get_or_create_array_descr_with_full_id(
             return existing;
         }
     }
-    ensure_pyre_array_descr_upcaster_registered();
     let descr_id = alloc_array_descr_id();
     // `array_type_id` Some → `LLType::Array(path_hash(atid))` cache
     // slot (analyzer ↔ runtime convergence path).
@@ -264,19 +219,27 @@ fn get_or_create_array_descr_with_full_id(
         None if type_id != 0 => type_id as u64,
         None => 0,
     };
-    let arc: DescrRef = Arc::new(PyreArrayDescr {
+    // `descr.py:273-279` ArrayDescr — a single flag-bearing descriptor.
+    // The runtime mint produces the same `SimpleArrayDescr` the
+    // analyzer / `make_descr_from_bh` path mints, stamping the
+    // content-addressed `ARRAY_DESCR_TAG | descr_id` index so `index()`
+    // keeps the value the retired `PyreArrayDescr::index()` returned
+    // (`ARRAY_DESCR_REGISTRY` still returns one Arc per structural key,
+    // preserving `Arc::as_ptr` identity).
+    let index = ARRAY_DESCR_TAG | (descr_id & 0x0FFF_FFFF);
+    let mut array_descr = majit_ir::descr::SimpleArrayDescr::with_flag(
+        index,
         base_size,
         item_size,
         type_id,
         item_type,
-        signed,
-        len_descr: maybe_array_lendescr_at_offset(len_offset),
-        descr_id,
-        ei_index: AtomicU32::new(u32::MAX),
-        cache_key,
-    });
+        runtime_array_flag(item_type, signed),
+    );
+    array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
+    array_descr.set_cache_key(cache_key);
+    let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
-    // Publish the freshly-minted PyreArrayDescr into
+    // Publish the freshly-minted SimpleArrayDescr into
     // `gc_cache._cache_array` keyed on `LLType::Array(path_hash(atid))`
     // so later analyzer-side `gc_cache.get_array_descr` cache-hit
     // returns this exact Arc.  Without an `array_type_id` (legacy
@@ -322,48 +285,6 @@ impl Descr for PyreFieldDescr {
     }
 }
 
-impl Descr for PyreArrayDescr {
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-    fn index(&self) -> u32 {
-        // Registry-bound identity (`descr.py:350-351 cache[ARRAY_OR_STRUCT]`):
-        // bits 0-27 carry the sequential `descr_id` allocated at
-        // construction, bits 28-31 carry `ARRAY_DESCR_TAG`. Two ArrayDescrs
-        // built from the same structural tuple share the slot and report
-        // the same index; distinct tuples allocate fresh ids and never
-        // collide within the 2^28 budget.
-        //
-        // TODO: this index lives in a different
-        // namespace from the codewriter `CallControl::array_index`
-        // (`majit-translate/src/jit_codewriter/call.rs:762`), which
-        // mints `effectinfo.py:307-311` indices for the EffectInfo
-        // `read_descrs_arrays` / `write_descrs_arrays` raw sets. The
-        // PyPy-orthodox bridge between the two namespaces is
-        // `effectinfo.py:465 compute_bitstrings` plus a
-        // `Descr::get_ei_index()` accessor that publishes the
-        // codewriter-side index onto the runtime descr; until that
-        // infrastructure lands here, `force_from_effectinfo`
-        // (`heap.py:537-571`) reads the bitstring against the same
-        // codewriter index it was written with, but cannot map a
-        // runtime DescrRef back to the bitstring slot through this
-        // function alone.
-        ARRAY_DESCR_TAG | (self.descr_id & 0x0FFF_FFFF)
-    }
-
-    fn get_ei_index(&self) -> u32 {
-        self.ei_index.load(Ordering::Relaxed)
-    }
-
-    fn set_ei_index(&self, ei_index: u32) {
-        self.ei_index.store(ei_index, Ordering::Relaxed);
-    }
-
-    fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
-        Some(self)
-    }
-}
-
 impl FieldDescr for PyreFieldDescr {
     fn offset(&self) -> usize {
         self.offset
@@ -387,36 +308,6 @@ impl FieldDescr for PyreFieldDescr {
         self.parent_descr
             .as_ref()
             .and_then(|parent| parent.upgrade())
-    }
-}
-
-impl ArrayDescr for PyreArrayDescr {
-    fn base_size(&self) -> usize {
-        self.base_size
-    }
-
-    fn item_size(&self) -> usize {
-        self.item_size
-    }
-
-    fn type_id(&self) -> u32 {
-        self.type_id
-    }
-
-    fn cache_key(&self) -> u64 {
-        self.cache_key
-    }
-
-    fn item_type(&self) -> Type {
-        self.item_type
-    }
-
-    fn is_item_signed(&self) -> bool {
-        self.signed
-    }
-
-    fn len_descr(&self) -> Option<&dyn FieldDescr> {
-        self.len_descr.as_ref().and_then(|d| d.as_field_descr())
     }
 }
 
@@ -1558,8 +1449,8 @@ pub fn make_size_descr_with_type_and_vtable(
 /// `descr.py:264 FieldDescr("len", ofs, WORD, FLAG_SIGNED)`. Lives at
 /// offset 0 of the `Ptr(GcArray(T))` block (FixedObjectArray /
 /// pyobject_gcarray layout): items start at `base_size`, so the word
-/// before items is the length header. Returned from
-/// `PyreArrayDescr::len_descr()` so `gen_initialize_len`
+/// before items is the length header. Stored as
+/// `SimpleArrayDescr.lendescr` so `gen_initialize_len`
 /// (`rewrite.py:565,572`) emits the runtime length store after
 /// `CallMallocNurseryVarsize`.
 fn array_lendescr_at_offset(offset: usize) -> DescrRef {
@@ -1599,7 +1490,7 @@ fn maybe_array_lendescr_at_offset(len_offset: Option<usize>) -> Option<DescrRef>
 /// (this function: `array_type_id = None`, `type_id = 0`) cannot
 /// participate in the keyed cache because they have no ARRAY-object
 /// surrogate to hash; the orthodox behaviour is therefore "each call
-/// is a distinct ARRAY" — mint fresh `PyreArrayDescr` per call so
+/// is a distinct ARRAY" — mint fresh `SimpleArrayDescr` per call so
 /// shape-coincident-but-logically-distinct ARRAYs receive distinct
 /// `descr_id` slots.  Callers that need singleton semantics
 /// (`int_array_descr`, `float_array_descr`, `pyobject_array_descr`,
@@ -1613,21 +1504,21 @@ pub fn make_array_descr(
     item_type: Type,
     signed: bool,
 ) -> DescrRef {
-    ensure_pyre_array_descr_upcaster_registered();
     let descr_id = alloc_array_descr_id();
-    Arc::new(PyreArrayDescr {
+    // No identity carrier — fresh mint per call (cache_key = 0 means "no
+    // cache slot").  Single flag-bearing `SimpleArrayDescr` (descr.py:273-279);
+    // index carries the content-addressed `ARRAY_DESCR_TAG | descr_id`.
+    let index = ARRAY_DESCR_TAG | (descr_id & 0x0FFF_FFFF);
+    let mut array_descr = majit_ir::descr::SimpleArrayDescr::with_flag(
+        index,
         base_size,
         item_size,
-        type_id: 0,
+        0,
         item_type,
-        signed,
-        len_descr: maybe_array_lendescr_at_offset(len_offset),
-        descr_id,
-        ei_index: AtomicU32::new(u32::MAX),
-        // No identity carrier — fresh mint per call (cache_key = 0
-        // means "no cache slot").
-        cache_key: 0,
-    })
+        runtime_array_flag(item_type, signed),
+    );
+    array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
+    Arc::new(array_descr)
 }
 
 pub fn make_array_descr_with_type(
@@ -2598,9 +2489,9 @@ pub fn make_struct_array_descr_full_keyed(
     use majit_ir::descr::{ArrayFlag, LLType, SimpleArrayDescr, gc_cache, try_downcast_arc};
     // `descr.py:348-378 get_array_descr(gccache, ARRAY)` cache-or-mint:
     // an `LLType::Array(cache_key)` cache hit returns the existing Arc
-    // (whichever concrete type lives in the slot — `SimpleArrayDescr`
-    // from a prior analyzer call or `PyreArrayDescr` from
-    // `make_array_descr_with_full_id`); only a miss mints a fresh
+    // (the `SimpleArrayDescr` in the slot — from a prior analyzer call
+    // or from a runtime mint via `make_array_descr_with_full_id`); only
+    // a miss mints a fresh
     // descr.  Matches PyPy `cpu.arraydescrof(ARRAY)` per-ARRAY object
     // identity — both pyre runtime mint sites and analyzer share a
     // single Arc per cache key.  `cache_key == 0` is the no-identity
@@ -2632,8 +2523,9 @@ pub fn make_struct_array_descr_full_keyed(
         // `get_array_descr` cache-miss-mint stamp at descr.rs:526-528
         // — structural identity (`cache_key`) is decoupled from GC tid
         // (`type_id`) per the trait doc at descr.rs:2120-2131.  Runtime
-        // registrations (`PyreArrayDescr`) carry their real GC tid
-        // immutably at mint and win the cache slot.
+        // registrations (`SimpleArrayDescr` from the runtime mint
+        // factories) carry their real GC tid at mint and win the cache
+        // slot.
         cached.set_index(descr_index);
         cached
     } else {
@@ -2660,33 +2552,12 @@ pub fn make_struct_array_descr_full_keyed(
 
     // Upcast the cached array descr to `Arc<dyn ArrayDescr>` for
     // `SimpleInteriorFieldDescr.array_descr` storage.  The cache slot
-    // can hold either concrete `SimpleArrayDescr` (analyzer mint or
-    // gc_cache internal mint) or `PyreArrayDescr` (legacy runtime mint
-    // from `make_array_descr_with_full_id`).  Both implement
-    // `ArrayDescr`; downcast to the appropriate Arc type, then upcast.
+    // always holds a concrete `SimpleArrayDescr` (analyzer mint,
+    // gc_cache internal mint, or runtime mint); downcast to the
+    // concrete Arc type, then upcast.
     let array_descr_for_interior: Arc<dyn majit_ir::descr::ArrayDescr> =
-        match try_downcast_arc::<SimpleArrayDescr>(array_descr_dyn.clone()) {
-            Ok(simple) => simple,
-            Err(orig) => match try_downcast_arc::<PyreArrayDescr>(orig) {
-                Ok(pyre) => pyre,
-                Err(_) => {
-                    // Cache slot held an Arc we cannot downcast to either
-                    // known concrete ArrayDescr type — this should not
-                    // happen in production paths.  Fall back to a fresh
-                    // SimpleArrayDescr so the interior loop has a stable
-                    // `array_descr` anchor (will not share identity with
-                    // the cache, but better than panicking).
-                    Arc::new(SimpleArrayDescr::with_flag(
-                        descr_index,
-                        base_size,
-                        item_size,
-                        type_id,
-                        item_type,
-                        ArrayFlag::Struct,
-                    ))
-                }
-            },
-        };
+        try_downcast_arc::<SimpleArrayDescr>(array_descr_dyn.clone())
+            .expect("array descriptor cache must hold SimpleArrayDescr for struct arrays");
 
     let mut descrs: Vec<DescrRef> = Vec::new();
     for interior in interior_fields {
@@ -2767,7 +2638,7 @@ pub fn make_struct_array_descr_full_keyed(
 /// [`make_descr_from_bh`] (each `BhDescr::JitCode` wraps in this
 /// struct so the walker's `as_jitcode_descr() -> Some(&self)` cast
 /// succeeds; Field/Array/Size become `PyreFieldDescr` /
-/// `PyreArrayDescr` / `PyreSizeDescr`; `Call` becomes a
+/// `SimpleArrayDescr` / `PyreSizeDescr`; `Call` becomes a
 /// `MetaCallDescr` carrying the codewriter's `EffectInfo`).
 ///
 /// Tests in `jitcode_dispatch.rs` previously used a `TestJitCodeDescr`
@@ -3130,40 +3001,54 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                         "BhDescr::InteriorField array slot must be BhDescr::Array, got {other:?}"
                     ),
                 };
-            // `descr.py:389` asserts `arraydescr.flag == FLAG_STRUCT`, so a
-            // round-tripped array-of-structs descr must carry FLAG_STRUCT and
-            // `descr.py:372-375` `all_interiorfielddescrs`.  Route struct
-            // arrays through the full factory (cache_key=0, local mint, no
-            // aliasing) so the rebuilt descr re-attaches the interior list the
-            // producer (`from_interior_field_descr`) serialized; a plain
-            // element array keeps the bare mint (descr.py only attaches the
-            // list when `ARRAY.OF` is a Struct).
-            let array_descr: Arc<dyn majit_ir::descr::ArrayDescr> = if array.is_array_of_structs() {
-                let dyn_descr = make_struct_array_descr_full_keyed(
-                    u32::MAX,
-                    base_size,
-                    itemsize,
-                    len_offset,
-                    type_id as u32,
-                    0,
-                    item_type,
-                    interior_fields,
-                );
-                majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleArrayDescr>(dyn_descr)
-                    .expect(
-                        "make_struct_array_descr_full_keyed(cache_key=0) mints SimpleArrayDescr",
-                    )
-            } else {
-                let array_flag = majit_ir::descr::ArrayFlag::from_item_type(item_type, false);
-                Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
-                    u32::MAX,
-                    base_size,
-                    itemsize,
-                    type_id as u32,
-                    item_type,
-                    array_flag,
-                ))
-            };
+            // `descr.py:430` `get_interiorfield_descr` builds the interior
+            // descr from `get_array_descr(gc_ll_descr, ARRAY)` — the SAME
+            // cached arraydescr the `BhDescr::Array` arm restores.  Route the
+            // outer struct array through the identical keyed factory so the
+            // rebuilt `InteriorFieldDescr.arraydescr` shares the
+            // `gc_cache._cache_array[LLType::Array(cache_key)]` identity rather
+            // than a fresh local mint, and re-attaches `all_interiorfielddescrs`
+            // (`descr.py:372-375`).  `type_id` is the producer-side cache key
+            // (`ArrayDescr.cache_key` = `path_hash(array_type_id)`); the u32
+            // gc-tid slot is ignored on the cache path (`init_array_descr`
+            // stamps the real tid), keeping ARRAY identity cache key separate
+            // from GC layout tid.  On a cache MISS the factory requests
+            // `ArrayFlag::Struct`, so the minted arraydescr is FLAG_STRUCT; on a
+            // cache HIT the existing slot is reused verbatim, so the resolved
+            // arraydescr is re-checked against `descr.py:389`'s
+            // `assert arraydescr.flag == FLAG_STRUCT` below.
+            let array_dyn = make_struct_array_descr_full_keyed(
+                u32::MAX,
+                base_size,
+                itemsize,
+                len_offset,
+                type_id as u32,
+                type_id,
+                item_type,
+                interior_fields,
+            );
+            // The cache slot always holds a concrete `SimpleArrayDescr`
+            // (analyzer / gc_cache / runtime mint).
+            let array_descr: Arc<dyn majit_ir::descr::ArrayDescr> =
+                match majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleArrayDescr>(
+                    array_dyn,
+                ) {
+                    Ok(simple) => simple,
+                    Err(other) => panic!(
+                        "BhDescr::InteriorField array resolved to an unknown ArrayDescr type: {other:?}"
+                    ),
+                };
+            // `descr.py:389 InteriorFieldDescr.__init__`:
+            //   assert arraydescr.flag == FLAG_STRUCT
+            // The factory requests `ArrayFlag::Struct` on a cache MISS, but a
+            // cache HIT returns the existing `LLType::Array(cache_key)` slot
+            // verbatim — which may be a non-struct array (a contaminated cache
+            // key).  Reject those here rather than silently rebuilding the
+            // InteriorFieldDescr around a non-struct array.
+            assert!(
+                array_descr.is_array_of_structs(),
+                "BhDescr::InteriorField arraydescr must be FLAG_STRUCT (descr.py:389)"
+            );
             let (offset, field_size, field_type, field_flag, index_in_parent, name) =
                 match field.as_ref() {
                     BhDescr::Field {
@@ -3186,6 +3071,13 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                         "BhDescr::InteriorField field slot must be BhDescr::Field, got {other:?}"
                     ),
                 };
+            // Bare interior field name (`descr.py:221 cache[STRUCT][fieldname]`
+            // shape) — the `get_interiorfield_descr` cache key the
+            // `make_struct_array_descr_full_keyed` interior loop used.
+            let bare_name = name
+                .rsplit_once('.')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| name.clone());
             // `descr.py:393` `InteriorFieldDescr.get_index()` delegates to
             // `fielddescr.get_index()` (= `index_in_parent`), read back by
             // `info.py:573-594` getinteriorfield/setinteriorfield_virtual.
@@ -3201,18 +3093,35 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 )
                 .with_index_in_parent(index_in_parent),
             );
-            // The first arg is the per-trace analyzer descr-slot (`Descr::index()`),
-            // defaulted here to the `u32::MAX` "no setup_descrs index assigned"
-            // sentinel — matching the canonical `get_interiorfield_descr` mint
-            // (descr.rs:814) and the array-of-structs restore sibling
-            // (descr.rs:2734). It is NOT `get_index()`: descr.py:393
-            // `InteriorFieldDescr.get_index()` delegates to `fielddescr.get_index()`
-            // (= `index_in_parent`), already round-tripped on `field_descr` above.
-            Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
-                u32::MAX,
-                array_descr,
-                field_descr,
-            ))
+            // `descr.py:423-438 get_interiorfield_descr` cache-or-mint keyed on
+            // the outer ARRAY identity, so the analyzer's
+            // `cc.interiorfielddescrof`, the array's `all_interiorfielddescrs`,
+            // and this restore share one `Arc` per `(ARRAY, name)` tuple — the
+            // `make_struct_array_descr_full_keyed` interior loop above already
+            // populated `_cache_interiorfield` (with the per-trace
+            // `Descr::index()`) for `cache_key != 0`, so this hits and returns
+            // that same descr.  `cache_key == 0` is the legacy no-identity
+            // sentinel — local mint a fresh `SimpleInteriorFieldDescr` (the
+            // `u32::MAX` slot is the "no setup_descrs index assigned" default;
+            // `get_index()` comes from `field_descr.index_in_parent` above).
+            if type_id != 0 {
+                majit_ir::descr::gc_cache()
+                    .lock()
+                    .unwrap()
+                    .get_interiorfield_descr(
+                        majit_ir::descr::LLType::Array(type_id),
+                        bare_name,
+                        String::new(),
+                        array_descr,
+                        field_descr,
+                    )
+            } else {
+                Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                    u32::MAX,
+                    array_descr,
+                    field_descr,
+                ))
+            }
         }
         BhDescr::Call { calldescr } => make_call_descr_from_bh(calldescr),
         BhDescr::JitCode { jitcode_index, .. } => make_jitcode_descr(*jitcode_index),
