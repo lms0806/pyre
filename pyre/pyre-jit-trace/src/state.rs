@@ -632,6 +632,27 @@ pub fn install_jitcode_for(
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, Some(payload)) as *const ())
 }
 
+/// `framework.py root_walker.walk_roots` parity for the persistent
+/// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
+/// `self.metainterp_sd.jitcodes = jitcodes`).  Each `JitCode.code`
+/// (state.rs:40) is a W_CodeObject pointer.
+///
+/// Intentionally not yet registered as a root walker: W_CodeObject is
+/// host-allocated via `Box::into_raw` (pycode.rs), not in the GC heap, so
+/// the moving collector never sweeps or relocates it and there is nothing
+/// to root.  When code objects become GC-managed this gets wired into
+/// `majit_gc::register_extra_root_walker`, at which point `JitCode.code`
+/// becomes a `GcRef` slot and `visit` lets a moving collector rewrite it
+/// in place.
+#[allow(dead_code)]
+pub fn walk_jitcode_code_roots(mut visit: impl FnMut(&mut *const ())) {
+    METAINTERP_SD.with(|r| {
+        for jc in r.borrow_mut().jitcodes.iter_mut() {
+            visit(&mut jc.code);
+        }
+    });
+}
+
 /// Install the complete `CodeWriter.make_jitcodes()` result into
 /// `MetaInterpStaticData.jitcodes`. Setup-time bulk publish only.
 ///
@@ -2599,15 +2620,6 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
 /// Read through w_globals_obj → dict_storage_proxy to reach the raw
 /// DictStorage* for slot-based namespace reads (celldict quasiimmut
 /// path).  Only valid when globals is a W_ModuleDictObject.
-pub(crate) fn frame_get_namespace(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    let globals_obj = frame_get_globals_obj(ctx, frame);
-    ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[globals_obj],
-        crate::descr::module_dict_storage_proxy_descr(),
-    )
-}
-
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
@@ -2681,49 +2693,21 @@ pub(crate) fn callee_layout_for_call_assembler(
     (nlocals, nlocals + stack_only)
 }
 
-/// Derive the legacy `*mut DictStorage` from a dict object (W_DictObject
-/// or W_ModuleDictObject) via the `dict_storage_proxy` back-pointer.
-pub(crate) fn concrete_dict_storage(obj: PyObjectRef) -> *mut DictStorage {
-    if obj.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe {
-        if pyre_object::dictmultiobject::is_module_dict(obj) {
-            (*(obj as *const pyre_object::dictmultiobject::W_ModuleDictObject)).dict_storage_proxy
-                as *mut DictStorage
-        } else {
-            (*(obj as *const pyre_object::dictmultiobject::W_DictObject)).dict_storage_proxy
-                as *mut DictStorage
-        }
-    }
+/// `celldict.py:42-50 getdictvalue_no_unwrapping` slot lookup against the
+/// module dict's `ModuleDictStorage` (the cell store), bypassing the
+/// `DictStorage` shadow.  `None` for non-module dicts and after
+/// `switch_to_object_strategy`.  Used by the cell fast path to derive the
+/// elidable lookup key.
+pub(crate) fn module_dict_cell_slot_direct(obj: PyObjectRef, name: &str) -> Option<usize> {
+    unsafe { pyre_object::dictmultiobject::module_dict_cell_slot_of(obj, name) }
 }
 
-/// `celldict.py:317` — the slot-based quasi-immutable global cache is
-/// only valid for `W_ModuleDictObject` globals.  The slot path emits IR
-/// (`frame_get_namespace`) that chases the `W_ModuleDictObject`
-/// `dict_storage_proxy` offset, so plain `W_DictObject` globals
-/// (`exec`/`eval` with a bare dict) must NOT take the slot path.
-/// Returns the module dict's DictStorage proxy when `obj` is a module
-/// dict, else null so callers fall back to the name-based path.
-pub(crate) fn module_dict_slot_storage(obj: PyObjectRef) -> *mut DictStorage {
-    if obj.is_null() || unsafe { pyre_object::dictmultiobject::is_module_dict(obj) } == false {
-        return std::ptr::null_mut();
-    }
-    concrete_dict_storage(obj)
-}
-
-pub(crate) fn dict_storage_slot_direct(ns: *mut DictStorage, name: &str) -> Option<usize> {
-    if ns.is_null() {
-        return None;
-    }
-    unsafe { &*ns }.slot_of(name)
-}
-
-pub(crate) fn dict_storage_value_direct(ns: *mut DictStorage, idx: usize) -> Option<PyObjectRef> {
-    if ns.is_null() {
-        return None;
-    }
-    unsafe { &*ns }.get_slot(idx)
+/// `celldict.py:53-54 _getdictvalue_no_unwrapping_pure` — the raw stored
+/// value-or-cell at `slot` (not unwrapped), read at trace time to
+/// classify the cell (`ObjectMutableCell` → live `GetfieldGcR`, raw value
+/// → const fold, `IntMutableCell` → name-based fallback).
+pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Option<PyObjectRef> {
+    unsafe { pyre_object::dictmultiobject::module_dict_cell_at(obj, slot) }
 }
 
 /// virtualizable.py:44 + interp_jit.py:25-31 —
@@ -3787,23 +3771,25 @@ impl PyreJitState {
         self.frame_array_mut(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
-    fn namespace_ptr(&self) -> Option<*mut DictStorage> {
-        let frame_ptr = self.frame_ptr()?;
+    fn namespace_len(&self) -> usize {
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         let w_globals_obj = unsafe {
             *(frame_ptr.add(PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const pyre_object::PyObjectRef)
         };
         if w_globals_obj.is_null() {
-            return None;
-        }
-        let ds = concrete_dict_storage(w_globals_obj);
-        (!ds.is_null()).then_some(ds)
-    }
-
-    fn namespace_len(&self) -> usize {
-        let Some(namespace_ptr) = self.namespace_ptr() else {
             return 0;
-        };
-        unsafe { (*namespace_ptr).len() }
+        }
+        // `dictmultiobject.py:107-109 W_DictMultiObject.length`. The common
+        // module-dict case reads `ModuleDictStorage` directly (O(1), no
+        // `dict_storage_proxy` reconciliation) — this guard is on the
+        // per-portal-entry path. Plain dict globals (exec/eval) fall back to
+        // the polymorphic strategy length.
+        unsafe {
+            pyre_object::dictmultiobject::module_dict_storage_len(w_globals_obj)
+                .unwrap_or_else(|| pyre_object::dictmultiobject::w_dict_len(w_globals_obj))
+        }
     }
 
     fn restore_single_frame(&mut self, meta: &PyreMeta, values: &[i64]) {

@@ -431,26 +431,26 @@ fn call_user_function_with_eval(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
             w_globals_obj,
             frame.execution_context,
             closure,
-        );
+        )?;
         gen_frame.fix_array_ptrs();
         return gen_frame.run();
     }
 
-    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         &final_args,
         globals,
         w_globals_obj,
         frame.execution_context,
         closure,
-    );
+    )?;
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -482,28 +482,28 @@ pub fn call_user_function_resolved(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             args,
             globals,
             w_globals_obj,
             frame.execution_context,
             closure,
-        );
+        )?;
         gen_frame.fix_array_ptrs();
         return gen_frame.run();
     }
 
     let eval_fn = get_eval_fn();
 
-    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         args,
         globals,
         w_globals_obj,
         frame.execution_context,
         closure,
-    );
+    )?;
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -642,26 +642,26 @@ pub fn call_user_function_plain_with_ctx(
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
             w_globals_obj,
             execution_context,
             closure,
-        );
+        )?;
         gen_frame.fix_array_ptrs();
         return gen_frame.run();
     }
 
-    let mut func_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         &final_args,
         globals,
         w_globals_obj,
         execution_context,
         closure,
-    );
+    )?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -1084,11 +1084,23 @@ pub fn call_with_kwargs(
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
         //
-        // PyPy keeps keyword_names_w / keywords_w on the live Arguments object
-        // and gateway builtins parse that object.  Pyre's builtin ABI is still
-        // the older flat slice, so the dict tail is a structural adaptation.
-        // Keep the __pyre_kw__ marker here, in the one builtin kwargs packing
-        // site, so CALL_KW and CALL_FUNCTION_EX have the same shape.
+        // PRE-EXISTING-ADAPTATION (builtin kwargs ABI). PyPy gives every
+        // builtin a real Signature (`gateway.py:740 BuiltinCode`, `:804
+        // self.sig = app_sig.signature()`) and `funcrun_obj` (`gateway.py:871`)
+        // resolves keywords by name through `args.parse_obj` →
+        // `_match_signature` (`argument.py:173`), exactly like a user function;
+        // there is no marker dict. Pyre's builtin ABI is a flat
+        // `&[PyObjectRef]` slice (`BuiltinCodeFn`), so kwargs are smuggled as a
+        // trailing dict tagged with the `__pyre_kw__` sentinel and each
+        // kwarg-aware builtin reads it manually (`builtins::split_builtin_kwargs`).
+        // CONVERGENCE PATH: port the gateway Signature/unwrap_spec surface for
+        // builtins, then route builtin kwargs through `Arguments::_match_signature`
+        // into named parameter slots and delete `__pyre_kw__`. Deferred: that is
+        // a standalone multi-slice epic (no builtin-Signature machinery exists
+        // yet) and the JIT inline-call path consumes the same flat tail
+        // (`pyre-jit/src/eval.rs:2319`), so it cannot land in one ≤12-file slice.
+        // Keep the marker here, in the one builtin kwargs packing site, so
+        // CALL_KW and CALL_FUNCTION_EX have the same shape.
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
@@ -1343,14 +1355,15 @@ pub fn call_with_kwargs(
             let globals = unsafe { function_get_globals(callable) };
             let w_globals_obj = unsafe { function_get_globals_obj(callable) };
             let closure = unsafe { function_get_closure(callable) };
-            let mut func_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-                w_code,
-                &final_args,
-                globals,
-                w_globals_obj,
-                frame.execution_context,
-                closure,
-            );
+            let mut func_frame =
+                crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                    w_code,
+                    &final_args,
+                    globals,
+                    w_globals_obj,
+                    frame.execution_context,
+                    closure,
+                )?;
             func_frame.fix_array_ptrs();
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
@@ -1722,14 +1735,20 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         .flags
         .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
-        let mut gen_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut gen_frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
             w_globals_obj,
             exec_ctx,
             closure,
-        );
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        };
         gen_frame.fix_array_ptrs();
         return match gen_frame.run() {
             Ok(v) => v,
@@ -1740,14 +1759,20 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         };
     }
 
-    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         &final_args,
         globals,
         w_globals_obj,
         exec_ctx,
         closure,
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     match frame.execute_frame(None, None) {
         Ok(v) => v,
@@ -2088,14 +2113,14 @@ fn build_class_inner(
         }
     }
 
-    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         &[],
         globals,
         w_globals_obj,
         exec_ctx,
         closure,
-    );
+    )?;
     frame.setdictscope(class_ns_ptr)?;
 
     frame.execute_frame(None, None)?;

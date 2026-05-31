@@ -208,10 +208,10 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     // module's `w_dict` shares one identity with `globals()` /
     // `function.__globals__` (PyPy `module.py:77 Module.getdict()`
     // parity).
-    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(frame.w_globals);
+    let canonical = frame.get_w_globals_obj();
     let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
         "__main__",
-        frame.w_globals as *mut u8,
+        unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
         canonical,
     );
     importing::set_sys_module("__main__", main_module);

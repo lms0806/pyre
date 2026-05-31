@@ -724,15 +724,21 @@ impl MiniMarkGC {
             self.invalidate_young_weakrefs();
         }
 
-        // incminimark.py:1871-1884: clear the shadow map now that all
+        // incminimark.py:1876-1882: clear the shadow map now that all
         // nursery objects have been forwarded (or died).  Without pinned
         // objects every nursery object was dragged out (into its shadow
-        // if any), so the whole map is dropped.  But pinned objects stay
-        // in the nursery, so a shadow handed out by `id_or_identityhash`
-        // is their stable identity address and MUST survive the clear —
-        // otherwise the next `id_or_identityhash` re-allocates a fresh
-        // shadow and the identity hash changes across collections
-        // (`record_pinned_object_with_shadow`).
+        // if any), so the whole map is dropped.  With pinned objects,
+        // upstream rebuilds a fresh `AddressDict` from
+        // `surviving_pinned_objects` via `record_pinned_object_with_shadow`
+        // (incminimark.py:1738); pyre pins explicitly through `pin`/`unpin`
+        // (a liveness contract that keeps the object in the nursery until
+        // released, never reclaimed by a collection), so `pinned_objects`
+        // IS the surviving-pinned set and an in-place `retain` keeping those
+        // entries yields the same map contents as the upstream rebuild —
+        // every non-pinned shadow was already consumed by the copy above.
+        // A pinned object's shadow is its stable identity address and MUST
+        // survive the clear, else the next `id_or_identityhash`
+        // re-allocates a fresh shadow and the identity hash changes.
         if !self.nursery_objects_shadows.is_empty() {
             if self.pinned_objects.is_empty() {
                 self.nursery_objects_shadows.clear();
@@ -743,7 +749,7 @@ impl MiniMarkGC {
                     .retain(|obj_addr, shadow_addr| {
                         let keep = pinned.contains(obj_addr);
                         if keep && marking {
-                            // incminimark.py:1745-1752
+                            // incminimark.py:1738-1752
                             // record_pinned_object_with_shadow: during the
                             // marking phase keep the retained shadow black so
                             // the in-progress sweep does not reclaim the
@@ -873,9 +879,16 @@ impl MiniMarkGC {
     fn find_shadow(&mut self, obj_addr: usize) -> usize {
         let hdr = unsafe { *((obj_addr - GcHeader::SIZE) as *const GcHeader) };
         if hdr.has_flag(flags::HAS_SHADOW) {
-            if let Some(&shadow) = self.nursery_objects_shadows.get(&obj_addr) {
-                return shadow;
-            }
+            // incminimark.py:2855-2857 `ll_assert(shadow != NULL,
+            // "GCFLAG_HAS_SHADOW but no shadow found")`.  HAS_SHADOW
+            // guarantees the map holds the shadow; a missing entry is a GC
+            // invariant violation, not a cue to silently allocate a second
+            // shadow (which would hand out an unstable identity address).
+            return self
+                .nursery_objects_shadows
+                .get(&obj_addr)
+                .copied()
+                .expect("GCFLAG_HAS_SHADOW but no shadow found");
         }
         self.allocate_shadow(obj_addr)
     }
@@ -944,21 +957,31 @@ impl MiniMarkGC {
         // of a fresh allocation.
         let header_ptr = obj_addr - GcHeader::SIZE;
         let new_header_ptr = if unsafe { (*hdr_ptr).has_flag(flags::HAS_SHADOW) } {
-            if let Some(&shadow_obj) = self.nursery_objects_shadows.get(&obj_addr) {
-                let shadow_hdr = (shadow_obj - GcHeader::SIZE) as *mut u8;
-                // minimark.py:1518-1520: clear HAS_SHADOW before copy so the
-                // flag does not propagate to the shadow object itself.
-                unsafe { (*hdr_ptr).clear_flag(flags::HAS_SHADOW) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
-                }
-                shadow_hdr
-            } else {
-                unsafe {
-                    self.oldgen
-                        .alloc_and_copy(header_ptr as *const u8, total_size)
-                }
+            // incminimark.py:2213-2214 `ll_assert(newobj != NULL,
+            // "GCFLAG_HAS_SHADOW but no shadow found")` — HAS_SHADOW
+            // guarantees the shadow map entry exists.
+            let shadow_obj = *self
+                .nursery_objects_shadows
+                .get(&obj_addr)
+                .expect("GCFLAG_HAS_SHADOW but no shadow found");
+            let shadow_hdr = (shadow_obj - GcHeader::SIZE) as *mut u8;
+            // incminimark.py:2215-2221: if the shadow is already black
+            // (VISITED), the memcpy below overwrites its flags with the
+            // nursery object's (white) flags, so a sweep running during this
+            // incremental cycle could reclaim it (see test_pin_id_bug).
+            // Remember VISITED and re-apply it after the copy.
+            let shadow_was_visited =
+                unsafe { (*(shadow_hdr as *const GcHeader)).has_flag(flags::VISITED) };
+            // minimark.py:1518-1520: clear HAS_SHADOW before copy so the
+            // flag does not propagate to the shadow object itself.
+            unsafe { (*hdr_ptr).clear_flag(flags::HAS_SHADOW) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
             }
+            if shadow_was_visited {
+                unsafe { (*(shadow_hdr as *mut GcHeader)).set_flag(flags::VISITED) };
+            }
+            shadow_hdr
         } else {
             unsafe {
                 self.oldgen

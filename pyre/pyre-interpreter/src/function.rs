@@ -2031,14 +2031,20 @@ fn _flat_pycall(
     let closure = unsafe { function_get_closure(func) };
 
     // function.py:208-209 — createframe(code, w_func_globals, self)
-    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut new_frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         code,
         &[], // locals filled below directly from stack
         globals,
         w_globals_obj,
         frame.execution_context,
         closure,
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
 
     // function.py:210-211 — copy from stack into locals directly
     // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
@@ -2093,14 +2099,20 @@ fn _flat_pycall_defaults(
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
-    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+    let mut new_frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         code,
         &[], // locals filled below
         globals,
         w_globals_obj,
         frame.execution_context,
         closure,
-    );
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
 
     // function.py:221-222 — copy positional args from stack
     for i in 0..nargs {

@@ -467,6 +467,14 @@ pub struct ModuleDictStrategy {
     pub version: VersionTag,
     pub caches:
         Option<std::collections::HashMap<String, std::rc::Rc<std::cell::RefCell<GlobalCache>>>>,
+    /// JIT loop-invalidation flags watching the `version?` quasi-immutable
+    /// field.  Each compiled loop whose trace promoted `self.version`
+    /// (and folded a module-global lookup keyed on it) registers its
+    /// `JitCellToken` invalidation flag here.  `mutated()` reassigns
+    /// `version`, which under `_immutable_fields_ = ["version?"]` must
+    /// invalidate every such loop, so it flips all live flags.  Weak refs
+    /// so a dead loop token drops out without keeping the flag alive.
+    version_watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for ModuleDictStrategy {
@@ -481,7 +489,39 @@ impl ModuleDictStrategy {
         Self {
             version: VersionTag::fresh(),
             caches: None,
+            version_watchers: Vec::new(),
         }
+    }
+
+    /// Register a JIT loop's invalidation flag against the `version?`
+    /// quasi-immutable field.  The compile-time glue
+    /// (`register_quasi_immutable_deps` analogue) calls this once per
+    /// version-keyed module-global dependency, passing the
+    /// `JitCellToken.invalidation_flag()`.  Mirrors
+    /// `DictStorage::register_slot_watcher` but keyed on the strategy
+    /// version rather than a per-slot index.
+    pub fn register_version_watcher(
+        &mut self,
+        flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.version_watchers.push(std::sync::Arc::downgrade(flag));
+    }
+
+    /// Invalidate every loop watching `version`.  Sets each live flag to
+    /// `true` (the polarity `GuardNotInvalidated` tests) and drops dead
+    /// weak refs.  Mirrors `DictStorage::notify_slot_watchers`.
+    fn notify_version_watchers(&mut self) {
+        if self.version_watchers.is_empty() {
+            return;
+        }
+        self.version_watchers.retain(|w| {
+            if let Some(flag) = w.upgrade() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// `celldict.py:214-240 get_global_cache`:
@@ -585,9 +625,15 @@ impl ModuleDictStrategy {
     /// def mutated(self):
     ///     self.version = VersionTag()
     /// ```
+    ///
+    /// Reassigning the `version?` quasi-immutable field is what
+    /// invalidates the JIT.  In RPython the `?` machinery does this
+    /// automatically on the field write; pyre flips the registered loop
+    /// flags explicitly here (the single `version` write site).
     #[inline]
     pub fn mutated(&mut self) {
         self.version = VersionTag::fresh();
+        self.notify_version_watchers();
     }
 
     /// `celldict.py:47-55 getdictvalue_no_unwrapping`:
@@ -990,6 +1036,34 @@ mod tests {
         let a = VersionTag::fresh();
         let b = VersionTag::fresh();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mutated_flips_registered_version_watchers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut strategy = ModuleDictStrategy::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        strategy.register_version_watcher(&flag);
+        // Before a structural change the watching loop is still valid.
+        assert_eq!(flag.load(Ordering::Acquire), false);
+        // `mutated()` reassigns `version` and must invalidate the loop.
+        strategy.mutated();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dead_version_watchers_drop_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut strategy = ModuleDictStrategy::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        strategy.register_version_watcher(&flag);
+        // Drop the only strong ref: the weak watcher can no longer upgrade.
+        drop(flag);
+        // notify (via mutated) must not panic and must purge the dead weak.
+        strategy.mutated();
+        assert!(strategy.version_watchers.is_empty());
     }
 
     #[test]

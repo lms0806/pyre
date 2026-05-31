@@ -134,16 +134,21 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     )
 }
 
-pub(crate) extern "C" fn jit_namespace_slot_lookup(namespace_ptr: i64, slot: i64) -> i64 {
+/// `celldict.py:42-54 getdictvalue_no_unwrapping` residual: returns the
+/// raw stored value-or-cell at `slot` of the module dict `namespace_ptr`
+/// (the object, not its storage), _not_ unwrapped.  The elidable form of
+/// this — keyed on `version?` via `QuasiimmutField` — folds to a constant
+/// cell pointer; the live `cell.w_value` read is emitted separately as a
+/// `GetfieldGcR`.  Null on a non-module dict, missing slot, or after
+/// `switch_to_object_strategy`.
+pub(crate) extern "C" fn jit_namespace_cell_lookup(namespace_ptr: i64, slot: i64) -> i64 {
     let w_globals_obj = namespace_ptr as pyre_object::PyObjectRef;
     if w_globals_obj.is_null() || slot < 0 {
         return PY_NULL as i64;
     }
-    let ds = crate::state::concrete_dict_storage(w_globals_obj);
-    if ds.is_null() {
-        return PY_NULL as i64;
-    }
-    unsafe { (&*ds).get_slot(slot as usize).unwrap_or(PY_NULL) as i64 }
+    let cell =
+        unsafe { pyre_object::dictmultiobject::module_dict_cell_at(w_globals_obj, slot as usize) };
+    cell.unwrap_or(PY_NULL) as i64
 }
 
 pub(crate) fn namespace_slot_lookup_values(

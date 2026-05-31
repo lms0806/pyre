@@ -841,13 +841,21 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
-/// (`call.rs:727-744`) appends for builtin callees and return the
-/// positional slice paired with a keyword lookup helper.
+/// (`call.rs`) appends for builtin callees and return the positional
+/// slice paired with a keyword lookup helper.
 ///
-/// PyPy's gateway parses `Arguments.keyword_names_w` directly through
-/// the `unwrap_spec` machinery; pyre's flat `BuiltinCodeFn` ABI lacks
-/// that surface, so each kwarg-aware builtin reaches into the trailing
-/// dict via this shared helper.
+/// PRE-EXISTING-ADAPTATION (builtin kwargs ABI, consumer side). PyPy's
+/// gateway gives each builtin a `Signature` (`gateway.py:740 BuiltinCode`,
+/// `:804`) and resolves keywords by name through `args.parse_obj` →
+/// `_match_signature` (`argument.py:173`) before the interp-level function
+/// runs; the builtin never sees a marker dict. Pyre's flat `BuiltinCodeFn`
+/// ABI lacks that Signature surface, so each kwarg-aware builtin reaches into
+/// the `__pyre_kw__`-tagged trailing dict via this shared helper. CONVERGENCE
+/// PATH (same epic as the producer note in `call.rs`): port the builtin
+/// Signature/unwrap_spec gateway, route builtin kwargs through
+/// `Arguments::_match_signature` into named slots, then delete this helper and
+/// the `__pyre_kw__` marker. Deferred — a standalone multi-slice epic that also
+/// touches the JIT inline-call flat tail (`pyre-jit/src/eval.rs`).
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if let Some(&last) = args.last() {
         if unsafe {

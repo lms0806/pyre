@@ -481,6 +481,92 @@ pub unsafe fn w_dict_set_strategy(
     dict.dstrategy = strategy;
 }
 
+/// `celldict.py:42-50 getdictvalue_no_unwrapping` slot lookup for the JIT
+/// global cell fast path.  Returns the insertion-order index of `name`
+/// inside the module dict's `ModuleDictStorage`, or `None` when `obj` is
+/// not a `W_ModuleDictObject` in `ModuleDictStrategy` mode (after
+/// `switch_to_object_strategy` the `object_storage` is authoritative and
+/// the version-keyed cell path is permanently invalid).  The index is
+/// stable across in-place cell mutation and value overwrite (`IndexMap`
+/// keeps the slot position), so it serves as the elidable lookup key.
+///
+/// # Safety
+/// `obj` must be null or a valid PyObjectRef.
+pub unsafe fn module_dict_cell_slot_of(obj: PyObjectRef, name: &str) -> Option<usize> {
+    if obj.is_null() || !is_module_dict(obj) {
+        return None;
+    }
+    let md = &*(obj as *const W_ModuleDictObject);
+    if !md.object_storage.is_null() || md.dstorage.is_null() {
+        return None;
+    }
+    (*md.dstorage).entries.get_index_of(name)
+}
+
+/// `celldict.py:53-54 _getdictvalue_no_unwrapping_pure` — the raw stored
+/// value-or-cell at `slot` (the result of `getdictvalue_no_unwrapping`,
+/// _not_ unwrapped).  `None` when `obj` is not a module dict in
+/// `ModuleDictStrategy` mode or `slot` is out of range.
+///
+/// # Safety
+/// `obj` must be null or a valid PyObjectRef.
+pub unsafe fn module_dict_cell_at(obj: PyObjectRef, slot: usize) -> Option<PyObjectRef> {
+    if obj.is_null() || !is_module_dict(obj) {
+        return None;
+    }
+    let md = &*(obj as *const W_ModuleDictObject);
+    if !md.object_storage.is_null() || md.dstorage.is_null() {
+        return None;
+    }
+    (*md.dstorage).entries.get_index(slot).map(|(_, v)| *v)
+}
+
+/// Direct O(1) entry count of a module dict's `ModuleDictStorage`
+/// (`dictmultiobject.py:107-109 length` for the `ModuleDictStrategy`
+/// case), bypassing both the strategy vtable and the
+/// `dict_storage_proxy` reconciliation that `w_module_dict_length`
+/// performs.  `None` when `obj` is not a `W_ModuleDictObject` in
+/// `ModuleDictStrategy` mode.  Used by the JIT frame-shape guard, which
+/// is on the per-portal-entry hot path and cannot afford the proxy
+/// `maybe_items_dict_storage` materialization.
+///
+/// # Safety
+/// `obj` must be null or a valid PyObjectRef.
+pub unsafe fn module_dict_storage_len(obj: PyObjectRef) -> Option<usize> {
+    if obj.is_null() || !is_module_dict(obj) {
+        return None;
+    }
+    let md = &*(obj as *const W_ModuleDictObject);
+    if !md.object_storage.is_null() || md.dstorage.is_null() {
+        return None;
+    }
+    Some((*md.dstorage).len())
+}
+
+/// Register a compiled loop's invalidation `flag` against the module
+/// dict's `ModuleDictStrategy.version?` quasi-immutable field
+/// (`celldict.py:34 _immutable_fields_ = ["version?"]`).  The compile-time
+/// glue calls this once per version-keyed module-global dependency so a
+/// later `mutated()` (new key, `del`, or `switch_to_object_strategy`)
+/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.  No-op
+/// when `obj` is not a `W_ModuleDictObject`.
+///
+/// # Safety
+/// `obj` must be null or a valid PyObjectRef.
+pub unsafe fn module_dict_register_version_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() || !is_module_dict(obj) {
+        return;
+    }
+    let md = &*(obj as *const W_ModuleDictObject);
+    if md.mstrategy.is_null() {
+        return;
+    }
+    (*md.mstrategy).register_version_watcher(flag);
+}
+
 /// Allocate a new empty dict per `dictmultiobject.py:67-69
 /// allocate_and_init_instance`:
 ///

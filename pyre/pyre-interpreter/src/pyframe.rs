@@ -84,8 +84,6 @@ pub struct PyFrame {
     /// pyframe.py:86 lastblock — head of the FrameBlock linked list.
     /// Virtualizable static field (interp_jit.py:29).
     pub lastblock: *mut FrameBlock,
-    /// pyframe.py:49 / interp_jit.py:31 w_globals.
-    pub w_globals: *mut DictStorage,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
@@ -113,26 +111,14 @@ pub struct PyFrame {
     pub w_builtin: PyObjectRef,
     /// `pypy/interpreter/pyframe.py:49 self.w_globals = w_globals`
     /// — the canonical W_DictObject paired with this frame's globals.
-    /// PyPy's frame carries only this slot; pyre keeps an adjacent
-    /// raw `*mut DictStorage` (`self.w_globals` above) because the
-    /// JIT vable layout reads STORE/LOAD_GLOBAL through a fixed byte
-    /// offset (`PYFRAME_W_GLOBALS_OFFSET`).
     ///
-    /// **Population**: eagerly resolved at frame construction (per
-    /// `new_with_namespace` + `new_jit_test`) by calling
-    /// `dict_storage_to_dict(w_globals)`.  `pyframe.py:98 __init__`'s
-    /// `self.w_globals = w_globals` identity invariant — every reader
-    /// after construction observes the same W_DictObject across the
-    /// frame's lifetime.  `get_w_globals_obj()`'s null-check arm
-    /// remains as a safety net for synthetic test stubs that hand-build
-    /// PyFrame without going through the canonical constructors.
-    ///
-    /// **Convergence (Phase C-1)**: once every JIT consumer of
-    /// `PYFRAME_W_GLOBALS_OFFSET` (state.rs:3581 etc.) migrates to
-    /// reading PyObjectRef + chasing the W_ModuleDictObject's
-    /// `dict_storage_proxy` for STORE/LOAD_GLOBAL slot indexing, the
-    /// `w_globals` field above can be retired and this slot renamed
-    /// `w_globals` to fully match PyPy's `pyframe.py:49` shape.
+    /// **Population**: eagerly resolved at frame construction by calling
+    /// `dict_storage_to_dict(w_globals)` on the raw storage handed to the
+    /// constructor, so every reader after construction observes the same
+    /// W_DictObject across the frame's lifetime.  `get_w_globals_obj()`'s
+    /// null-check arm remains as a safety net for synthetic test stubs
+    /// that hand-build PyFrame without going through the canonical
+    /// constructors.
     pub w_globals_obj: PyObjectRef,
 }
 
@@ -490,9 +476,6 @@ pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugd
 /// Byte offset of `lastblock` in `PyFrame`.
 pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
-/// Byte offset of `w_globals` in `PyFrame`.
-pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
-
 /// Byte offset of `f_generator_nowref` in `PyFrame`.
 /// `PyObjectRef` slot — points into the GC heap (possibly nursery).
 pub const PYFRAME_F_GENERATOR_NOWREF_OFFSET: usize =
@@ -692,7 +675,6 @@ impl PyFrame {
         self.pycode = code;
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
-        self.w_globals = w_globals;
         unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
         self.locals_cells_stack_w = unsafe {
             alloc_fixed_array_with_header(
@@ -714,11 +696,20 @@ impl PyFrame {
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
             self.getorcreate_debug_data(-1).w_globals = w_globals;
         }
-        // pyframe.py:119 — final step of __init__.  PyFrame::__init__ has
-        // no in-tree callers (rebuilt frames go through createframe); on the
-        // unlikely path of an uncaught freevar/closure mismatch surface it
-        // as a panic so the caller can be added in the same change rather
-        // than silently corrupting state.
+        // `pyframe.py:114-115` — `self.builtin = space.builtin.pick_builtin(
+        // w_globals)`.  pyre keeps the picked builtin and the canonical
+        // `w_globals` W_DictObject (the `get_w_globals` resolution of
+        // `pyframe.py:128-132`) in the adjacent `w_builtin` / `w_globals_obj`
+        // slots, resolved eagerly here exactly as `new_minimal` does, so a
+        // frame built through this hook is left in the same state as one
+        // built by `createframe`.
+        self.w_builtin = crate::baseobjspace::pick_builtin(w_globals, self.execution_context);
+        self.w_globals_obj = if w_globals.is_null() {
+            PY_NULL
+        } else {
+            crate::baseobjspace::dict_storage_to_dict(w_globals)
+        };
+        // pyframe.py:118 — final step of __init__.
         self.initialize_frame_scopes(outer_func, code).expect(
             "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
         );
@@ -958,7 +949,6 @@ impl PyFrame {
             escaped: false,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
-            w_globals,
             vable_token: 0,
             frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
@@ -1074,7 +1064,6 @@ impl PyFrame {
             escaped: false,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
-            w_globals,
             vable_token: 0,
             frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
@@ -1111,7 +1100,6 @@ impl PyFrame {
             escaped: self.escaped,
             debugdata: unsafe { clone_debugdata_ptr(self.debugdata) },
             lastblock: unsafe { clone_block_chain(self.lastblock) },
-            w_globals: self.get_w_globals(),
             vable_token: self.vable_token,
             frame_finished_execution: self.frame_finished_execution,
             f_generator_nowref: self.f_generator_nowref,
@@ -2059,6 +2047,16 @@ impl PyFrame {
         Self::new_for_call_with_closure(code, args, globals, execution_context, PY_NULL)
     }
 
+    /// JIT warm-entry frame builder. The only callers are the `call_jit.rs`
+    /// residual-frame helpers (`create_callee_frame_impl*`,
+    /// `jit_create_self_recursive_callee_frame_1`, `jit_force_callee_frame`),
+    /// which run from compiled code through an `i64`-pointer ABI with no error
+    /// channel, so this stays infallible. PRE-EXISTING-ADAPTATION: a compiled
+    /// trace sets the virtualizable frame fields directly (pyjitpl frame
+    /// setup) instead of re-running `__init__` as a residual call, so there is
+    /// no fallible `createframe` residual to mirror and `pick_builtin` cannot
+    /// newly raise here — `globals` carries an `__builtins__` already validated
+    /// when the interpreter first built the frame.
     pub fn new_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -2099,10 +2097,45 @@ impl PyFrame {
         )
     }
 
+    /// pyframe.py:114 `Frame.__init__` resolves `self.builtin` through
+    /// `pick_builtin(w_globals)`, which raises a non-KeyError
+    /// `OperationError` straight out of `__init__`.  Fallible frame builder
+    /// mirroring that path.
+    pub fn try_new_for_call_with_closure_and_globals_obj(
+        code: *const (),
+        args: &[PyObjectRef],
+        globals: *mut DictStorage,
+        w_globals_obj: PyObjectRef,
+        execution_context: *const PyExecutionContext,
+        closure: PyObjectRef,
+    ) -> Result<Self, crate::PyError> {
+        let w_builtin = if w_globals_obj.is_null() {
+            crate::baseobjspace::pick_builtin(globals, execution_context)
+        } else {
+            crate::baseobjspace::pick_builtin_obj_checked(w_globals_obj, execution_context)?
+        };
+        Ok(Self::finish_for_call_with_globals_obj(
+            code,
+            args,
+            globals,
+            w_globals_obj,
+            execution_context,
+            closure,
+            w_builtin,
+        ))
+    }
+
     /// PyPy `space.createframe(code, function.w_func_globals, function)`.
     /// The semantic globals carrier is the dict object.  `globals` is kept
     /// only as pyre's legacy raw-storage side channel for code paths that
     /// have not yet migrated off `PyFrame.w_globals`.
+    ///
+    /// Infallible sibling of `try_new_for_call_with_closure_and_globals_obj`.
+    /// All interpreter and tracer entry points use the `try_` variant; this
+    /// one survives only for the JIT warm-entry path via
+    /// `new_for_call_with_globals_obj` (see that method for why fallibility has
+    /// no upstream counterpart there). `pick_builtin_obj` drops a non-KeyError
+    /// `__builtins__` lookup, which is unreachable on that path.
     pub fn new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -2110,6 +2143,36 @@ impl PyFrame {
         w_globals_obj: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
+    ) -> Self {
+        let w_builtin = if w_globals_obj.is_null() {
+            crate::baseobjspace::pick_builtin(globals, execution_context)
+        } else {
+            crate::baseobjspace::pick_builtin_obj(w_globals_obj, execution_context)
+        };
+        Self::finish_for_call_with_globals_obj(
+            code,
+            args,
+            globals,
+            w_globals_obj,
+            execution_context,
+            closure,
+            w_builtin,
+        )
+    }
+
+    /// Common tail of the frame builders: everything in `Frame.__init__`
+    /// except the `pick_builtin` resolution, which is lifted to the callers
+    /// so the fallible variant can propagate.  Transitional split for the
+    /// R3.4 frame-build fallibility migration; folds back into a single
+    /// builder once the infallible variant is retired.
+    fn finish_for_call_with_globals_obj(
+        code: *const (),
+        args: &[PyObjectRef],
+        globals: *mut DictStorage,
+        w_globals_obj: PyObjectRef,
+        execution_context: *const PyExecutionContext,
+        closure: PyObjectRef,
+        w_builtin: PyObjectRef,
     ) -> Self {
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
@@ -2154,11 +2217,6 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
 
-        let w_builtin = if w_globals_obj.is_null() {
-            crate::baseobjspace::pick_builtin(globals, execution_context)
-        } else {
-            crate::baseobjspace::pick_builtin_obj(w_globals_obj, execution_context)
-        };
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -2168,7 +2226,6 @@ impl PyFrame {
             escaped: false,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
-            w_globals: globals,
             vable_token: 0,
             frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
@@ -2453,7 +2510,6 @@ pub fn createframe(
         escaped: false,
         debugdata: std::ptr::null_mut(),
         lastblock: std::ptr::null_mut(),
-        w_globals,
         vable_token: 0,
         frame_finished_execution: false,
         f_generator_nowref: PY_NULL,

@@ -341,9 +341,9 @@ fn concrete_list_strategy_id(concrete: PyObjectRef) -> Option<i64> {
 }
 
 use crate::descr::{
-    dict_storage_values_len_descr, dict_storage_values_ptr_descr, float_floatval_descr,
-    int_intval_descr, list_strategy_descr, ob_type_descr, slice_w_start_descr, slice_w_step_descr,
-    slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
+    float_floatval_descr, int_intval_descr, list_strategy_descr, ob_type_descr,
+    slice_w_start_descr, slice_w_step_descr, slice_w_stop_descr, w_float_size_descr,
+    w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
@@ -2215,71 +2215,6 @@ impl MIFrame {
                 }
             }
         }
-        Ok(())
-    }
-
-    pub(crate) fn load_namespace_value(
-        &mut self,
-        ctx: &mut TraceCtx,
-        idx: usize,
-    ) -> Result<OpRef, PyError> {
-        // pyjitpl.py:1075-1089: quasi-immutable field pattern.
-        // Module globals are effectively quasi-immutable — they rarely change
-        // during hot loops. Emit GUARD_NOT_INVALIDATED on first global access
-        // so compiled code is invalidated if globals mutate.
-        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-            self.generate_guard(ctx, OpCode::GuardNotInvalidated, &[]);
-        }
-        let frame = self.sym().frame;
-        let namespace = frame_get_namespace(ctx, frame);
-        let len = ctx.record_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[namespace],
-            dict_storage_values_len_descr(),
-        );
-        self.guard_len_gt_index(ctx, len, idx);
-        // Post-L1: `dict_storage_values_ptr_descr()` now points at
-        // `*mut ItemsBlock` (not the legacy fat-pointer items base).
-        // Add `ITEMS_BLOCK_ITEMS_OFFSET` to recover the raw items-base
-        // pointer that `trace_raw_array_getitem_value` expects.
-        let block = ctx.record_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[namespace],
-            dict_storage_values_ptr_descr(),
-        );
-        let offset = ctx.const_int(pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET as i64);
-        let values = ctx.record_op(OpCode::IntAdd, &[block, offset]);
-        let idx_const = ctx.const_int(idx as i64);
-        Ok(trace_raw_array_getitem_value(ctx, values, idx_const))
-    }
-
-    pub(crate) fn store_namespace_value(
-        &mut self,
-        ctx: &mut TraceCtx,
-        idx: usize,
-        value: OpRef,
-    ) -> Result<(), PyError> {
-        let frame = self.sym().frame;
-        let namespace = frame_get_namespace(ctx, frame);
-        let len = ctx.record_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[namespace],
-            dict_storage_values_len_descr(),
-        );
-        self.guard_len_gt_index(ctx, len, idx);
-        // Post-L1: `dict_storage_values_ptr_descr()` now returns a
-        // `*mut ItemsBlock`. Recover the items-base pointer via
-        // `+ ITEMS_BLOCK_ITEMS_OFFSET` before emitting the raw
-        // setitem.
-        let block = ctx.record_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[namespace],
-            dict_storage_values_ptr_descr(),
-        );
-        let offset = ctx.const_int(pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET as i64);
-        let values = ctx.record_op(OpCode::IntAdd, &[block, offset]);
-        let idx_const = ctx.const_int(idx as i64);
-        trace_raw_array_setitem_value(ctx, values, idx_const, value);
         Ok(())
     }
 
@@ -6077,14 +6012,14 @@ impl MIFrame {
             passed_concrete_args,
         );
         let concrete_args = concrete_args.as_ref();
-        let mut callee_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        let mut callee_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             concrete_args,
             globals,
             callee_globals_obj,
             caller_exec_ctx,
             closure,
-        );
+        )?;
         callee_frame.fix_array_ptrs();
 
         let callee_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(&callee_frame) };

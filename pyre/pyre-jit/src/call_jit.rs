@@ -402,25 +402,23 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     // warmspot.py:1021 assembler_call_helper parity: the callee frame
     // (deadframe) may be a nursery-allocated JitFrame-like block. We
     // reconstruct a proper interpreter frame from its raw fields.
-    let (code, namespace, w_globals_obj, exec_ctx) = unsafe {
+    let (code, w_globals_obj, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
         let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
-        let ns = *(p.add(std::mem::offset_of!(PyFrame, w_globals))
-            as *const *mut pyre_interpreter::DictStorage);
         let w_globals_obj =
             *(p.add(PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const pyre_object::PyObjectRef);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
             as *const *const pyre_interpreter::PyExecutionContext);
-        (code, ns, w_globals_obj, ec)
+        (code, w_globals_obj, ec)
     };
-    let namespace = if namespace.is_null() && !w_globals_obj.is_null() {
+    let namespace = if !w_globals_obj.is_null() {
         unsafe {
             pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_obj)
                 as *mut pyre_interpreter::DictStorage
         }
     } else {
-        namespace
+        std::ptr::null_mut()
     };
 
     let mut func_frame =
@@ -2788,7 +2786,6 @@ fn create_callee_frame_impl_1_boxed(
         if was_init {
             let f = unsafe { &mut *ptr };
             if f.pycode == w_code
-                && f.w_globals == globals
                 && f.w_globals_obj == w_globals_obj
                 && f.execution_context == caller.execution_context
             {
@@ -2848,8 +2845,11 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
-    let globals = caller.w_globals;
     let w_globals_obj = caller.w_globals_obj;
+    let globals = unsafe {
+        pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj)
+            as *mut pyre_interpreter::DictStorage
+    };
     let execution_context = caller.execution_context;
 
     let arena = arena_ref();
@@ -2857,7 +2857,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
         if was_init {
             let f = unsafe { &mut *ptr };
             if f.pycode == func_code
-                && f.w_globals == globals
                 && f.w_globals_obj == w_globals_obj
                 && f.execution_context == execution_context
             {
@@ -2942,7 +2941,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             // are stable for self-recursion (same function, same module).
             let f = unsafe { &mut *ptr };
             if f.pycode == w_code
-                && f.w_globals == globals
                 && f.w_globals_obj == w_globals_obj
                 && f.execution_context == caller.execution_context
             {
@@ -3041,8 +3039,11 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
-    let globals = caller.w_globals;
     let w_globals_obj = caller.w_globals_obj;
+    let globals = unsafe {
+        pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj)
+            as *mut pyre_interpreter::DictStorage
+    };
     let execution_context = caller.execution_context;
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -3052,7 +3053,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         let f = unsafe { &mut *ptr };
         if was_init
             && f.pycode == func_code
-            && f.w_globals == globals
             && f.w_globals_obj == w_globals_obj
             && f.execution_context == execution_context
         {

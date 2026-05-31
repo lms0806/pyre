@@ -14,9 +14,6 @@ pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
     std::mem::offset_of!(PyFrame, locals_cells_stack_w);
 
-/// Byte offset of `w_globals` in `PyFrame`.
-pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
-
 /// Byte offset of `pycode` in `PyFrame`.
 pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 
@@ -82,7 +79,6 @@ const _: () = {
     );
     assert!(PYFRAME_DEBUGDATA_OFFSET == pyre_interpreter::pyframe::PYFRAME_DEBUGDATA_OFFSET);
     assert!(PYFRAME_LASTBLOCK_OFFSET == pyre_interpreter::pyframe::PYFRAME_LASTBLOCK_OFFSET);
-    assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
     assert!(
         PYFRAME_F_GENERATOR_NOWREF_OFFSET
             == pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET

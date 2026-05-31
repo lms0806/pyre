@@ -245,6 +245,17 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 let f_back_slot = &mut (*(frame)).f_backref as *mut *mut PyFrame;
                 visitor(&mut *(f_back_slot as *mut majit_ir::GcRef));
 
+                // pyframe.py:102 `self.pycode` — the running code object.
+                // Visited as a root so a code object reachable only via
+                // `frame.pycode` (e.g. `exec`'d code with no owning
+                // Function) stays alive once code objects become
+                // GC-managed.  While code objects remain Box-immortal the
+                // visitor's `is_nursery_object_start` /
+                // `is_managed_heap_object` guard short-circuits, so this is
+                // inert today.
+                let pycode_slot = &mut (*(frame)).pycode as *mut *const ();
+                visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
+
                 // PyFrame is normally a GC object in PyPy, so its GCREF
                 // fields are traced before consumers dereference them.
                 // pyre also has stdalloc-backed frames, so the frame root
@@ -276,31 +287,30 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
                 }
-                if !(*frame).w_globals.is_null() {
-                    let globals_ptr = (*frame).w_globals;
-                    let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
-                        .values_mut()
-                        .iter_mut()
-                        .map(|value| value as *mut PyObjectRef)
-                        .collect();
-                    for value in value_slots {
-                        visitor(&mut *(value as *mut majit_ir::GcRef));
-                        walk_raw_function_roots(*value, visitor);
-                    }
-                    // `pyframe.py:50 self.w_globals = pycode.w_globals`
-                    // stores the W_DictObject identity directly.  Pyre
-                    // mirrors that on the eager `frame.w_globals_obj`
-                    // slot (per `pyframe.rs PYFRAME_W_GLOBALS_OBJ_OFFSET`);
-                    // tracing that slot keeps the W_DictObject (and
-                    // through `W_ModuleDictObject`'s own custom trace,
-                    // its strategy + storage chain) reachable across
-                    // minor collections.  `set_mirror_target` write-back
-                    // is no longer required because the slot lives on
-                    // the frame itself.
-                    let w_globals_obj_slot = &mut (*frame).w_globals_obj as *mut PyObjectRef;
-                    visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
-                    let live_obj = (*frame).w_globals_obj;
-                    if !live_obj.is_null() {
+                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Visit
+                // the canonical `w_globals_obj` slot first so the visitor
+                // forwards it (and resolves any forwarding marker a sibling
+                // frame sharing the same module globals already left); only
+                // then is the object's `dict_storage_proxy` safe to chase for
+                // the backing storage.  Reading the proxy off a not-yet-
+                // forwarded object would dereference a stale nursery address.
+                let w_globals_obj_slot = &mut (*frame).w_globals_obj as *mut PyObjectRef;
+                visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
+                let live_obj = (*frame).w_globals_obj;
+                if !live_obj.is_null() {
+                    let globals_ptr =
+                        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(live_obj)
+                            as *mut crate::DictStorage;
+                    if !globals_ptr.is_null() {
+                        let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
+                            .values_mut()
+                            .iter_mut()
+                            .map(|value| value as *mut PyObjectRef)
+                            .collect();
+                        for value in value_slots {
+                            visitor(&mut *(value as *mut majit_ir::GcRef));
+                            walk_raw_function_roots(*value, visitor);
+                        }
                         (&mut *globals_ptr).set_mirror_target(live_obj);
                     }
                 }

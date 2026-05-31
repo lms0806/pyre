@@ -214,6 +214,29 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     }
 }
 
+/// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
+///
+/// The suspended frame is held behind an opaque `frame_ptr`
+/// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so its
+/// `pycode` is not reachable from `walk_pyframe_roots`.  Visit it here so
+/// a code object whose only live reference is a suspended generator's
+/// frame stays a GC root once code objects become GC-managed (a generator
+/// can outlive its defining `Function`, the other code-object root).
+/// Inert while code objects remain Box-immortal — the visitor's
+/// `is_nursery_object_start` / `is_managed_heap_object` guard skips the
+/// non-managed pointer.  (The suspended frame's other PyObjectRef slots
+/// remain a separate pre-existing tracing gap; only `pycode` is needed
+/// for the code-object migration.)
+unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let gen_obj =
+        unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::W_GeneratorObject) };
+    if !gen_obj.frame_ptr.is_null() {
+        let frame = gen_obj.frame_ptr as *mut PyFrame;
+        let pycode_slot = unsafe { &mut (*frame).pycode as *mut *const () };
+        f(pycode_slot as *mut majit_ir::GcRef);
+    }
+}
+
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
     // the storage layout, so each strategy walks its own native shape
@@ -1052,12 +1075,16 @@ thread_local! {
         }
         // W_GeneratorObject carries `frame_ptr: *mut u8` (opaque
         // PyFrame pointer, owned by the generator) plus three bools.
-        // No direct `PyObjectRef` fields; the suspended frame's
-        // PyObjectRefs are reachable through the generator only via
-        // the PyFrame indirection (pre-existing limitation).
-        let w_generator_tid = gc.register_type(TypeInfo::object_subclass(
+        // The suspended frame is held behind an opaque `frame_ptr`; a
+        // custom trace visits the frame's `pycode` so a code object
+        // reachable only via a suspended generator stays a GC root once
+        // code objects are GC-managed.  The frame's other PyObjectRefs
+        // remain reachable only through the PyFrame indirection
+        // (pre-existing limitation).
+        let w_generator_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::generatorobject::W_GeneratorObject>(),
             object_tid,
+            generator_object_custom_trace,
         ));
         debug_assert_eq!(w_generator_tid, W_GENERATOR_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1279,6 +1306,36 @@ thread_local! {
             Vec::new(),
         ));
         debug_assert_eq!(gc_float_array_tid, GC_FLOAT_ARRAY_GC_TYPE_ID);
+        // `pypy/interpreter/pycode.py:52 class PyCode(W_Root)` — code
+        // objects are normal GC heap objects in PyPy.  Pre-register
+        // `W_CodeObject` here, immediately after the GcArray tids and
+        // before the foreign-pytype loop, so it takes tid 43 and the
+        // loop skips `CODE_TYPE` via the `pytype_to_tid.contains_key`
+        // guard below.  This keeps the net register-call count up to
+        // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
+        // registration here, one fewer from the loop), so no downstream
+        // hardcoded tid shifts.  `W_CodeObject` carries only raw /
+        // non-GC pointers today (`code_ptr`, `w_globals`,
+        // `globals_caches`), so it registers with empty gc_ptr offsets;
+        // a `w_globals_obj` PyObjectRef slot is added in a later slice.
+        // Allocation still routes through `Box::into_raw`
+        // (`w_code_new` → `malloc_typed`), so this registration is inert
+        // — the collector never reaches a code object until `w_code_new`
+        // is switched to `try_gc_alloc_stable`.
+        let w_code_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_interpreter::pycode::W_CodeObject>(),
+            object_tid,
+        ));
+        debug_assert_eq!(w_code_tid, pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
+            w_code_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
+            w_code_tid,
+        );
         // W_InstanceObject is intentionally NOT pre-registered: its
         // PyType (`INSTANCE_TYPE`) is the `object` root, already
         // covered by `object_tid` (`OBJECT_GC_TYPE_ID = 0`). Adding
@@ -1295,9 +1352,10 @@ thread_local! {
         // `int_between(cls.min, subcls.min, cls.max)` (rclass.py:1133).
         // `pyre_object::pyobject::all_foreign_pytypes()` covers object
         // module PyTypes; `pyre_interpreter::all_foreign_pytypes()`
-        // covers interpreter-level PyTypes (CODE_TYPE / FUNCTION_TYPE
-        // / BUILTIN_CODE_TYPE) that flow through tracing as constant
-        // callable/code pointers.
+        // covers interpreter-level PyTypes (PYTRACEBACK_TYPE /
+        // FUNCTION_TYPE / BUILTIN_CODE_TYPE) that flow through tracing as
+        // constant callable/code pointers.  `CODE_TYPE` is pre-registered
+        // above (tid 43) and so skipped here by the `contains_key` guard.
         for (pytype, parent) in pyre_object::pyobject::all_foreign_pytypes()
             .iter()
             .chain(pyre_interpreter::all_foreign_pytypes().iter())
@@ -2519,9 +2577,20 @@ fn register_quasi_immutable_deps(green_key: u64) {
         return;
     };
     let flag = token.invalidation_flag();
-    for (ns_ptr, slot) in deps {
-        let ns = unsafe { &mut *(ns_ptr as *mut pyre_interpreter::DictStorage) };
-        ns.register_slot_watcher(slot as usize, &flag);
+    // `celldict.py:34 _immutable_fields_ = ["version?"]`: the global cell
+    // fast path's `QUASIIMMUT_FIELD(ns, slot)` is keyed on the module
+    // dict's `ModuleDictStrategy.version`, not a per-slot index, so every
+    // recorded dep registers the loop flag against that single version
+    // watcher.  `mutated()` (new key, `del`, `switch_to_object_strategy`)
+    // then flips the flag; a same-key value reassign mutates the cell in
+    // place without bumping the version and is observed by the live
+    // `cell.w_value` read instead.  `ns_ptr` is the `const_ref`-folded
+    // `w_globals` object pointer; `slot` is unused for version keying.
+    for (ns_ptr, _slot) in deps {
+        let obj = ns_ptr as pyre_object::PyObjectRef;
+        unsafe {
+            pyre_object::dictmultiobject::module_dict_register_version_watcher(obj, &flag);
+        }
     }
 }
 
@@ -2703,10 +2772,11 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
 
 fn log_named_global_result(frame: &PyFrame, label: &str) {
     unsafe {
-        if frame.w_globals.is_null() {
+        let ns = frame.get_w_globals();
+        if ns.is_null() {
             return;
         }
-        let Some(&value) = (*frame.w_globals).get("result") else {
+        let Some(&value) = (*ns).get("result") else {
             return;
         };
         if value.is_null() {
@@ -3527,7 +3597,7 @@ fn resume_in_blackhole_from_exit_layout(
     let saved_ni = frame.next_instr();
     let saved_code = frame.pycode;
     let saved_vsd = frame.valuestackdepth;
-    let saved_ns = frame.w_globals;
+    let saved_ns = frame.w_globals_obj;
     let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_w().as_slice().to_vec();
 
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
@@ -3544,7 +3614,7 @@ fn resume_in_blackhole_from_exit_layout(
         frame.set_last_instr_from_next_instr(saved_ni);
         frame.pycode = saved_code;
         frame.valuestackdepth = saved_vsd;
-        frame.w_globals = saved_ns;
+        frame.w_globals_obj = saved_ns;
         let dest = frame.locals_w_mut().as_mut_slice();
         let n = dest.len().min(saved_array.len());
         dest[..n].copy_from_slice(&saved_array[..n]);
@@ -6080,7 +6150,7 @@ fn build_resumed_frames(
                     f.next_instr(),
                     f.valuestackdepth,
                     f.pycode,
-                    f.w_globals,
+                    f.w_globals_obj,
                     f.debugdata,
                     f.lastblock,
                     f.vable_token,
@@ -6162,7 +6232,7 @@ fn build_resumed_frames(
             if !vable_ns.is_null() {
                 vable_ns
             } else if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).w_globals as *const () }
+                unsafe { (*vable_frame_ptr).w_globals_obj as *const () }
             } else {
                 std::ptr::null()
             }
@@ -6809,6 +6879,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame's globals `DictStorage`, resolved through the canonical
+    /// `w_globals_obj`'s `dict_storage_proxy`.
+    unsafe fn frame_globals_storage(frame: &PyFrame) -> *const pyre_interpreter::DictStorage {
+        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(frame.w_globals_obj)
+            as *const pyre_interpreter::DictStorage
+    }
 
     struct TestJitParamsGuard;
 
@@ -8352,7 +8429,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let x = *(*frame.w_globals).get("x").unwrap();
+            let x = *(*frame_globals_storage(&frame)).get("x").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(x), 3);
         }
     }
@@ -8370,7 +8447,7 @@ while i < 20:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 190);
         }
     }
@@ -8434,13 +8511,14 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut keys: Vec<_> = unsafe { (*frame.w_globals).keys().cloned().collect() };
+            let mut keys: Vec<_> =
+                unsafe { (*frame_globals_storage(&frame)).keys().cloned().collect() };
             keys.sort();
             eprintln!("module result: {:?}", result);
             eprintln!("module namespace keys: {:?}", keys);
         }
         unsafe {
-            let r = *(*frame.w_globals).get("r").unwrap();
+            let r = *(*frame_globals_storage(&frame)).get("r").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 6);
         }
     }
@@ -8468,7 +8546,7 @@ result = fib(12)
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let result = *(*frame.w_globals).get("result").unwrap();
+            let result = *(*frame_globals_storage(&frame)).get("result").unwrap();
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(result),
                 144,
@@ -8504,8 +8582,8 @@ second = g(9)";
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let first = *(*frame.w_globals).get("first").unwrap();
-            let second = *(*frame.w_globals).get("second").unwrap();
+            let first = *(*frame_globals_storage(&frame)).get("first").unwrap();
+            let second = *(*frame_globals_storage(&frame)).get("second").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(first), 88);
             assert_eq!(pyre_object::intobject::w_int_get_value(second), 176);
         }
@@ -8530,7 +8608,7 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 3_900);
         }
     }
@@ -8560,7 +8638,7 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
+            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 21_320);
         }
     }
@@ -8686,8 +8764,8 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.w_globals).get("s").unwrap();
-            let q = *(*frame.w_globals).get("q").unwrap();
+            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let q = *(*frame_globals_storage(&frame)).get("q").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 220);
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(

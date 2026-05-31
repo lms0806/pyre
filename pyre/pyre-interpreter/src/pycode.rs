@@ -74,6 +74,30 @@ pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
 /// Field offset of `w_globals` within `W_CodeObject`.
 pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_CodeObject, w_globals);
 
+/// GC type id assigned to `W_CodeObject`.
+///
+/// `PyCode` is a normal `W_Root` subclass in PyPy (`pycode.py:52 class
+/// PyCode(W_Root)`), so it lives in the GC heap.  This tid is pinned by
+/// a `debug_assert_eq!` in the pyre-jit type-registration sequence: the
+/// `W_CodeObject` `TypeInfo` is registered explicitly just before the
+/// foreign-pytype loop, taking the slot directly after
+/// `GC_FLOAT_ARRAY_GC_TYPE_ID = 42`.  Pre-registering it there (and
+/// inserting `CODE_TYPE` into `pytype_to_tid`) makes the foreign loop
+/// skip `CODE_TYPE`, so the net register-call count up to
+/// `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged and no downstream tid
+/// shifts.  The numeric value coincides with the dormant
+/// `pytraceback::PYTRACEBACK_GC_TYPE_ID` constant, but `W_PyTraceback`
+/// is still host-allocated and is never GC-registered, so tid 43 only
+/// ever tags a `W_CodeObject` at runtime and the two do not collide.
+pub const W_CODE_GC_TYPE_ID: u32 = 43;
+
+impl pyre_object::lltype::GcType for W_CodeObject {
+    fn type_id() -> u32 {
+        W_CODE_GC_TYPE_ID
+    }
+    const SIZE: usize = std::mem::size_of::<W_CodeObject>();
+}
+
 /// Compatibility helper for unpacking a tuple of strings.
 pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<String> {
     let _ = (_space, w_str_tuple);

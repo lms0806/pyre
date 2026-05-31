@@ -4884,51 +4884,60 @@ pub fn pick_builtin(
 /// Object-based `pick_builtin` for call frames whose globals came from
 /// `Function.w_func_globals` as a W_DictObject, matching PyPy's
 /// `pyframe.py:115 self.builtin = space.builtin.pick_builtin(w_globals)`.
-pub fn pick_builtin_obj(
+///
+/// Propagates a non-KeyError from the `__builtins__` lookup per
+/// `moduledef.py:97-98 if not e.match(space, space.w_KeyError): raise`
+/// (a dict-subclass globals whose `__getitem__` raises). `finditem_str`
+/// already maps KeyError to `None`, so an `Err` here is always a
+/// non-KeyError to propagate.
+pub fn pick_builtin_obj_checked(
     w_globals: PyObjectRef,
     exec_ctx: *const crate::PyExecutionContext,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, PyError> {
     if !w_globals.is_null() {
         match finditem_str(w_globals, "__builtins__") {
             Ok(Some(w_builtin)) if !w_builtin.is_null() => {
                 if !exec_ctx.is_null() {
                     let space_builtin = unsafe { (*exec_ctx).get_builtin() };
                     if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
-                        return w_builtin;
+                        return Ok(w_builtin);
                     }
                 }
                 if unsafe { pyre_object::is_module(w_builtin) } {
-                    return w_builtin;
+                    return Ok(w_builtin);
                 }
                 let backing = crate::type_methods::resolve_dict_backing(w_builtin);
                 if !backing.is_null() {
-                    return pyre_object::w_module_new_aliasing_dict(
+                    return Ok(pyre_object::w_module_new_aliasing_dict(
                         "",
                         std::ptr::null_mut(),
                         w_builtin,
-                    );
+                    ));
                 }
             }
             // `__builtins__` absent — moduledef.py:106-108 default Module.
             Ok(_) => {}
-            // moduledef.py:97-98 `if not e.match(space, space.w_KeyError): raise`
-            // — a non-KeyError from the `__builtins__` lookup (a dict-subclass
-            // globals whose `__getitem__` raises) should propagate.  It cannot
-            // here: `pick_builtin_obj` returns `PyObjectRef` because every
-            // caller is an infallible frame builder (`pyframe.rs
-            // new_for_call_*`, JIT `call_jit.rs new_for_call_with_globals_obj`,
-            // `trace_opcode.rs`).  Propagating requires making frame creation
-            // fallible — the R3.4 `PyFrame.w_globals` retirement, which
-            // cascades a `Result` return across ~28 frame-build sites including
-            // the JIT hot path.  Until then the non-KeyError is dropped; the
-            // case is unreachable for a real module-dict `__globals__` and
-            // only arises for a dict-subclass globals with a raising
-            // `__getitem__`.  CONVERGENCE: thread `Result` once frame builders
-            // become fallible (R3.4).
-            Err(_) => {}
+            // moduledef.py:97-98 — non-KeyError propagates.
+            Err(e) => return Err(e),
         }
     }
-    build_default_pick_builtin_module()
+    Ok(build_default_pick_builtin_module())
+}
+
+/// Infallible adapter over [`pick_builtin_obj_checked`] for the frame
+/// builders that have not yet been made fallible (`pyframe.rs
+/// new_for_call_*`, JIT `call_jit.rs`, `trace_opcode.rs`).  A non-KeyError
+/// `__builtins__` lookup is dropped here, reproducing the pre-existing
+/// behavior; the case only arises for a dict-subclass globals with a
+/// raising `__getitem__` and is unreachable for a real module-dict
+/// `__globals__`.  CONVERGENCE (R3.4 frame-build fallibility): migrate
+/// callers to `pick_builtin_obj_checked` and retire this wrapper.
+pub fn pick_builtin_obj(
+    w_globals: PyObjectRef,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    pick_builtin_obj_checked(w_globals, exec_ctx)
+        .unwrap_or_else(|_| build_default_pick_builtin_module())
 }
 
 /// Allocate the `moduledef.py:106-108` default Module — empty backing
@@ -6712,6 +6721,19 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
     compare(a, b, CompareOp::Eq)
         .map(|r| is_true(r))
         .unwrap_or(false)
+}
+
+/// `baseobjspace.py:933 ObjSpace._side_effects_ok`.
+///
+/// Reverse debugging is not ported (`reverse_debugging` is set from
+/// `config.translation.reverse_debugger` at `baseobjspace.py:441`), so the
+/// `if self.reverse_debugging: return self._revdb_standard_code()` branch is
+/// unreachable and this always returns `True`, matching the non-revdb path.
+/// The JIT does not trace this cache write because the cache lookup lives in
+/// the `@jit.dont_look_inside` `find_map_attr_cache` and the JIT calls
+/// `compute_find_map_attr` directly (`mapdict.py:100-103`).
+pub fn side_effects_ok() -> bool {
+    true
 }
 
 /// Delete item: `del obj[index]`

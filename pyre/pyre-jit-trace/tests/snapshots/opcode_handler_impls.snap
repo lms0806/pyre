@@ -641,14 +641,29 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let w_globals_obj = self.sym().concrete_namespace;
-        // `celldict.py:287-322 _LOAD_GLOBAL_cached`: under the JIT the
-        // cell/slot fast path is gated on `isinstance(w_globals,
-        // W_ModuleDictObject)`; plain dict globals fall through to
-        // `_load_global` (`space.finditem_str`).  `module_dict_slot_storage`
-        // returns null for non-module dicts so they take the name-based
-        // path whose emitted IR is layout-agnostic.
-        let ns = crate::state::module_dict_slot_storage(w_globals_obj);
-        let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
+        // `celldict.py:285-322 _LOAD_GLOBAL_cached` + `:42-54
+        // getdictvalue_no_unwrapping`: the JIT global fast path promotes
+        // the module dict's `version?` quasi-immutable, folds the stored
+        // value-or-cell for `name`, then reads `cell.w_value` LIVE.  The
+        // cell path applies only to a `W_ModuleDictObject` still in
+        // `ModuleDictStrategy` mode whose slot holds a raw value or an
+        // `ObjectMutableCell`; plain dict globals, post-
+        // `switch_to_object_strategy` module dicts, absent/null keys, and
+        // `IntMutableCell` slots (which need `w_int_new` boxing of
+        // `intvalue`) fall through to the layout-agnostic name-based path
+        // (`_load_global` -> `space.finditem_str`).
+        let cell_path = crate::state::module_dict_cell_slot_direct(w_globals_obj, name).and_then(
+            |slot| {
+                let stored = crate::state::module_dict_cell_value_direct(w_globals_obj, slot)?;
+                if stored.is_null()
+                    || unsafe { pyre_object::celldict::is_int_mutable_cell(stored) }
+                {
+                    return None;
+                }
+                Some((slot, stored))
+            },
+        );
+        let Some((slot, stored)) = cell_path else {
             let frame = self.trace_frame();
             let globals = self.trace_globals_ptr();
             let opref = self.with_trace_ctx(|ctx| {
@@ -672,56 +687,60 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
             let result_concrete = crate::state::ConcreteValue::from_pyobj(obj);
             return Ok(crate::state::FrontendOp::new(opref, result_concrete));
         };
-        let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
-        let result_concrete = concrete_cv
-            .map(crate::state::ConcreteValue::from_pyobj)
-            .unwrap_or(crate::state::ConcreteValue::Null);
-        if let Some(concrete_value) = concrete_cv {
-            if !concrete_value.is_null() {
-                // celldict.py @elidable_promote + quasiimmut.py parity:
-                // 1. QUASIIMMUT_FIELD(ns, slot) — collected as quasi_immutable_deps
-                //    + GUARD_NOT_INVALIDATED.
-                // 2. RECORD_KNOWN_RESULT(result, helper, ns, slot) — cache
-                //    trace-time lookup result (call_pure_results).
-                // 3. CALL_PURE_R(helper, ns, slot) — elidable lookup;
-                //    record_result_of_call_pure folds via OptPure lookup_known_result.
-                let opref = self.with_ctx(|_this, ctx| {
-                    let ns_const = ctx.const_ref(w_globals_obj as i64);
-                    let slot_const = ctx.const_int(slot as i64);
-                    ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
-                    let lookup_fn = crate::helpers::jit_namespace_slot_lookup as *const ();
-                    let lookup_args = [ns_const, slot_const];
-                    let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];
-                    ctx.record_known_result_typed(
-                        concrete_value as i64,
-                        lookup_fn,
-                        &lookup_args,
-                        &lookup_arg_types,
-                        majit_ir::Type::Ref,
-                        majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
-                    );
-                    let concrete_args = crate::helpers::namespace_slot_lookup_values(
-                        lookup_fn,
-                        w_globals_obj,
-                        slot,
-                    );
-                    let concrete_result =
-                        crate::helpers::namespace_slot_lookup_result(concrete_value);
-                    let call_result = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
-                        ctx,
-                        lookup_fn,
-                        &lookup_args,
-                        &lookup_arg_types,
-                        &concrete_args,
-                        concrete_result,
-                    );
-                    Ok::<_, pyre_interpreter::PyError>(call_result)
-                })?;
-                return Ok(crate::state::FrontendOp::new(opref, result_concrete));
-            }
-        }
-        let opref = self
-            .with_ctx(|this, ctx| crate::state::MIFrame::load_namespace_value(this, ctx, slot))?;
+        // `typeobject.py:48-51 unwrap_cell`: the concrete LOAD result is
+        // the unwrapped value (identity for a raw stored value).
+        let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
+        let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
+        let result_concrete = crate::state::ConcreteValue::from_pyobj(result_obj);
+        let opref = self.with_ctx(|_this, ctx| {
+            let ns_const = ctx.const_ref(w_globals_obj as i64);
+            let slot_const = ctx.const_int(slot as i64);
+            // `quasiimmut.py` + `celldict.py:34 _immutable_fields_=["version?"]`:
+            // 1. QUASIIMMUT_FIELD(ns, slot) — recorded as a version dep +
+            //    GUARD_NOT_INVALIDATED; the compile-time glue registers the
+            //    loop's invalidation flag on the strategy's version watchers.
+            // 2. RECORD_KNOWN_RESULT(cell, helper, ns, slot) — seed the
+            //    trace-time cell fold into call_pure_results.
+            // 3. CALL_PURE_R(helper, ns, slot) — elidable cell lookup folds
+            //    to the constant cell (or raw value) pointer.
+            ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+            let lookup_fn = crate::helpers::jit_namespace_cell_lookup as *const ();
+            let lookup_args = [ns_const, slot_const];
+            let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];
+            ctx.record_known_result_typed(
+                stored as i64,
+                lookup_fn,
+                &lookup_args,
+                &lookup_arg_types,
+                majit_ir::Type::Ref,
+                majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
+            );
+            let concrete_args =
+                crate::helpers::namespace_slot_lookup_values(lookup_fn, w_globals_obj, slot);
+            let concrete_cell = crate::helpers::namespace_slot_lookup_result(stored);
+            let cell_opref = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
+                ctx,
+                lookup_fn,
+                &lookup_args,
+                &lookup_arg_types,
+                &concrete_args,
+                concrete_cell,
+            );
+            // When the fold produced an `ObjectMutableCell`, read
+            // `cell.w_value` LIVE so a same-key reassign (in-place
+            // `write_cell`, no version bump) is observed each iteration; a
+            // raw stored value needs no indirection.
+            let opref = if is_obj_cell {
+                crate::state::opimpl_getfield_gc_r(
+                    ctx,
+                    cell_opref,
+                    crate::descr::object_mutable_cell_value_descr(),
+                )
+            } else {
+                cell_opref
+            };
+            Ok::<_, pyre_interpreter::PyError>(opref)
+        })?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 
@@ -733,21 +752,17 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
     ) -> Result<(), pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         // `celldict.py:328-333 STORE_GLOBAL_cached`: under the JIT the
-        // cell/slot path is bypassed for plain dict globals;
-        // `module_dict_slot_storage` returns null for non-module dicts so
-        // they take the name-based store (`space.setitem_str`) whose IR
-        // is layout-agnostic.  The slot store IR (`store_namespace_value`)
-        // reads the W_ModuleDictObject proxy offset, valid only here.
-        let ns = crate::state::module_dict_slot_storage(self.sym().concrete_namespace);
-        let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
-            let globals = self.trace_globals_ptr();
-            return self.with_trace_ctx(|ctx| {
-                crate::helpers::emit_trace_store_name_to_namespace(ctx, globals, name, value.opref);
-                Ok(())
-            });
-        };
-        self.with_ctx(|this, ctx| {
-            crate::state::MIFrame::store_namespace_value(this, ctx, slot, value.opref)
+        // cell/slot path is bypassed entirely —
+        // `self.space.setitem_str(self.get_w_globals(), varname, w_newvalue)`.
+        // The emitted IR is layout-agnostic: `w_dict_setitem_str` on the
+        // globals dict object runs the full ModuleDictStrategy.setitem_str
+        // (write_cell + version mutated()) and mirrors the str-keyed write
+        // into the paired DictStorage, so the LOAD fast path still observes
+        // it.
+        let globals = self.trace_globals_ptr();
+        self.with_trace_ctx(|ctx| {
+            crate::helpers::emit_trace_store_name_to_namespace(ctx, globals, name, value.opref);
+            Ok(())
         })
     }
 

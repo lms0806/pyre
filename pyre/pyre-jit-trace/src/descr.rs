@@ -899,6 +899,36 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `pypy/objspace/std/typeobject.py:26-34 ObjectMutableCell`. The single
+/// `w_value` field is read LIVE on the module-global cell fast path: a
+/// frequently-rewritten global mutates the cell payload in place without
+/// bumping `mstrategy.version` (`typeobject.py:55-71 write_cell`), so the
+/// JIT cell read must observe the current value and stays MUTABLE (not
+/// immutable / quasi-immutable). Cell identity is what the `version?`
+/// quasi-immutable guard protects.
+static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::celldict::{
+        OBJECT_MUTABLE_CELL_TYPE, W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS,
+        W_OBJECT_MUTABLE_CELL_GC_TYPE_ID, W_OBJECT_MUTABLE_CELL_OBJECT_SIZE,
+    };
+    build_object_descr_group_with_def_path(
+        W_OBJECT_MUTABLE_CELL_OBJECT_SIZE,
+        W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
+        &OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
+        &[(
+            "W_ObjectMutableCell.w_value",
+            W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS[0],
+            8,
+            Type::Ref,
+            false,
+            false,
+            false,
+        )],
+        "W_ObjectMutableCell",
+        "celldict::W_ObjectMutableCell",
+    )
+});
+
 static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
     //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
@@ -1628,6 +1658,16 @@ pub fn method_w_function_descr() -> DescrRef {
 /// `_Method._immutable_fields_`.
 pub fn method_w_self_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 1)
+}
+
+/// `typeobject.py:26-34 ObjectMutableCell.w_value` — the boxed payload of
+/// a module-global cell, read LIVE on the cell fast path. The value is
+/// rewritten in place when a hot global is reassigned without bumping the
+/// strategy version, so this descriptor is mutable (not immutable /
+/// quasi-immutable); the `version?` guard protects cell identity, not the
+/// payload.
+pub fn object_mutable_cell_value_descr() -> DescrRef {
+    field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
