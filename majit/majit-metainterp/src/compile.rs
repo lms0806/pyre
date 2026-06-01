@@ -82,28 +82,16 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 
 /// Resolve the type of an OpRef in guard fail_args.
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
-/// RPython resume.py:389-452 parity: guard metadata sees only the
-/// Box.type values available at the guard's numbering point, not later
-/// operations in the same trace. `value_types` is the incremental
-/// guard-point map maintained by `build_guard_metadata`, stored as a
-/// `vecset::VecMap<u32, Type>` keyed by `OpRef::raw()` (no-HashMap rule;
-/// sparse OpRef keys made a dense `Vec<Option<Type>>` allocate and zero
-/// the full [0..max_opref) range per call — triggered macOS large-malloc
-/// mmap on every guard emission. VecMap allocates proportional to live
-/// entries only — see task #149 fannkuch sys-time).
-fn fail_arg_type(opref: &OpRef, value_types: &vecset::VecMap<u32, Type>) -> Type {
+/// history.py:220/261/307 — the type is intrinsic on the Box itself
+/// (`Const{Int,Float,Ptr}.type`, `InputArg{Int,Float,Ref}.type`, and the
+/// `{Int,Float,Ref}Op` mixins), read off the OpRef variant tag (`ty()`,
+/// resoperation.rs:233). A fail_arg carries its own type regardless of
+/// trace position, so no position-keyed side table is needed.
+fn fail_arg_type(opref: &OpRef) -> Type {
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
-    // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is intrinsic on
-    // the Box itself. Variant tag dispatch is the single source of truth
-    // for Const operands; the side `value_types` map is only consulted for
-    // body OpRefs whose type was captured at guard-emission time.
-    // Inline-Const variants panic on `.raw()`, so dispatch via `ty()` first.
-    if opref.is_constant() {
-        return opref.ty().unwrap_or(Type::Int);
-    }
-    value_types.get(&opref.raw()).copied().unwrap_or(Type::Ref)
+    opref.ty().unwrap_or(Type::Ref)
 }
 
 /// Derive slot_types from ExitValueSourceLayout + exit_types.
@@ -380,14 +368,10 @@ impl<'a> UnrolledLoopData<'a> {
 /// The backend numbers every guard and finish in a single exit table, so this
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
-/// resume.py ResumeDataLoopMemo parity: `constant_types` maps OpRef.0 → Type.
-/// Used by `getconst` to encode virtual field constants as TAGINT/TAGCONST
-/// instead of TAGBOX.
 pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-    constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> (
     crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
     crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
@@ -400,39 +384,10 @@ pub(crate) fn build_guard_metadata(
         crate::optimizeopt::vec_assoc::VecAssoc::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
-    // RPython box.type parity: type lookup is `inputarg.tp` /
-    // `constant.type` / `op.type_` direct attribute access — pyre
-    // gathers these into OpTypeIndex since OpRef carries no type.
-    //
-    // RPython resume.py:389-520 captures each guard's livebox types at
-    // numbering time, so a guard at trace position K only sees ops
-    // that have already been emitted (positions <= K). pyre's flat
-    // `OpRef(u32)` namespace can re-use the same numeric position
-    // across phases (Phase 2 `shift_back` remaps fresh OpRefs onto
-    // Phase 1's inputarg slots), so a global `type_index.opref_type`
-    // would let later op result types leak back into earlier guards.
-    // Mirror main's incremental walk: maintain `value_types` seeded
-    // from inputargs + constants, then insert each op's result type
-    // before consulting it.
-    // `vecset::VecMap<u32, Type>` keyed by `OpRef::raw()` (no-HashMap rule).
-    // Sparse OpRef keys would make a dense `Vec<Option<Type>>` allocate
-    // and zero the full [0..max_opref) range per call (large traces hit
-    // macOS large-malloc mmap path — see task #149 fannkuch sys-time).
-    let mut value_types: vecset::VecMap<u32, Type> = vecset::VecMap::new();
-    for arg in inputargs.iter() {
-        value_types.insert(arg.index, arg.tp);
-    }
-    for (&idx, c) in constants.iter() {
-        if value_types.get(&idx).is_none() {
-            value_types.insert(idx, c.get_type());
-        }
-    }
-
+    // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
+    // (the OpRef variant tag, `ty()`); a fail_arg carries its own type
+    // regardless of trace position, so no position-keyed side table is needed.
     for (op_idx, op) in ops.iter().enumerate() {
-        if !op.pos.get().is_none() && op.result_type() != Type::Void {
-            value_types.insert(op.pos.get().raw(), op.result_type());
-        }
-
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         if !is_guard && !is_finish {
@@ -481,7 +436,7 @@ pub(crate) fn build_guard_metadata(
         // minted by `store_final_boxes_in_guard` carrying the
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
-        // and finally the incremental guard-point `value_types` map.
+        // and finally the failarg's own variant tag (`opref.ty()`).
         let descr_types = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec());
         let exit_types: Vec<Type> = if is_finish {
             // FINISH ops are always emitted with one of the
@@ -492,25 +447,17 @@ pub(crate) fn build_guard_metadata(
             // typing — it matches RPython where `handle_fail` reads
             // `cpu.get_*_value(deadframe, 0)` keyed by the descr
             // class, not by per-arg inference.
-            // history.py:220/261/307 — Const operands carry `.type`
-            // intrinsically; route via `opref.ty()` before consulting the
-            // body-OpRef-keyed `value_types` side table (which uses
-            // `.raw()` that panics on inline-Const variants).
-            let finish_arg_type = |opref: &OpRef| -> Type {
-                if opref.is_constant() {
-                    opref.ty().unwrap_or(Type::Int)
-                } else {
-                    value_types.get(&opref.raw()).copied().unwrap_or(Type::Int)
-                }
-            };
+            // history.py:220/261/307 — type is intrinsic on the Box; read it
+            // off the OpRef variant tag (`ty()`).
+            let finish_arg_type = |opref: &OpRef| -> Type { opref.ty().unwrap_or(Type::Int) };
             if let Some(types) = descr_types {
                 if types.len() == op.num_args() {
                     types.to_vec()
                 } else {
                     // Arity mismatch (synthetic test ops without a
                     // type-shaped descr): reconstruct per-arg from the
-                    // incremental `value_types`. Production FINISH always
-                    // matches the descr arity.
+                    // failarg variant tag (`opref.ty()`). Production FINISH
+                    // always matches the descr arity.
                     op.getarglist().iter().map(finish_arg_type).collect()
                 }
             } else {
@@ -523,18 +470,15 @@ pub(crate) fn build_guard_metadata(
             // fail_arg_types (single source of truth, matches RPython
             // `ResumeGuardDescr.fail_arg_types`); fall back to op-level
             // `fail_arg_types` on sharing-path (no descr); fall back to
-            // per-arg reconstruction via guard-point `value_types` when arity
-            // mismatches.
+            // per-arg reconstruction via the failarg variant tag
+            // (`opref.ty()`) when arity mismatches.
             let fa_types = op.get_fail_arg_types();
             if let Some(types) = descr_types {
                 if types.len() == fail_args.len() {
                     types.to_vec()
                 } else {
-                    // history.py:220/261/307 — `fail_arg_type` routes Const
-                    // operands via `opref.ty()` (intrinsic on Const Boxes)
-                    // and only consults the `value_types` side table for
-                    // body OpRefs. Inline-Const operands panic on `.raw()`,
-                    // so the redundant inline lookup is collapsed away.
+                    // history.py:220/261/307 — `fail_arg_type` reads the type
+                    // off the failarg's own variant tag (`opref.ty()`).
                     fail_args
                         .iter()
                         .enumerate()
@@ -547,7 +491,7 @@ pub(crate) fn build_guard_metadata(
                                     return tp;
                                 }
                             }
-                            fail_arg_type(opref, &value_types)
+                            fail_arg_type(opref)
                         })
                         .collect()
                 }
@@ -562,15 +506,12 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            fail_arg_type(opref, &value_types)
+                            fail_arg_type(opref)
                         })
                         .collect()
                 }
             } else {
-                fail_args
-                    .iter()
-                    .map(|opref| fail_arg_type(opref, &value_types))
-                    .collect()
+                fail_args.iter().map(fail_arg_type).collect()
             }
         } else if let Some(dt) = descr_types {
             dt.to_vec()
@@ -2610,12 +2551,7 @@ mod tests {
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(
-            &inputargs,
-            &[guard],
-            8,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-        );
+        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 8);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2665,12 +2601,7 @@ mod tests {
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(
-            &inputargs,
-            &[guard],
-            0,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-        );
+        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 0);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(

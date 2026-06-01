@@ -5186,12 +5186,8 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                    &inputargs,
-                    &compiled_ops,
-                    green_key,
-                    &compiled_constants_typed,
-                );
+                let (mut resume_data, mut exit_layouts) =
+                    compile::build_guard_metadata(&inputargs, &compiled_ops, green_key);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
@@ -6046,12 +6042,8 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                    &inputargs,
-                    &combined_ops,
-                    green_key,
-                    &compiled_constants_typed,
-                );
+                let (mut resume_data, mut exit_layouts) =
+                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) =
@@ -6553,12 +6545,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &mut optimized_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                    &inputargs,
-                    &optimized_ops,
-                    green_key,
-                    &compiled_constants_typed,
-                );
+                let (mut resume_data, mut exit_layouts) =
+                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
@@ -6917,12 +6905,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &mut compiled_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                    &inputargs,
-                    &compiled_ops,
-                    green_key,
-                    &compiled_constants_typed,
-                );
+                let (mut resume_data, mut exit_layouts) =
+                    compile::build_guard_metadata(&inputargs, &compiled_ops, green_key);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
@@ -8932,7 +8916,6 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_inputargs,
                     &optimized_ops,
                     original_green_key,
-                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -9573,12 +9556,8 @@ impl<M: Clone> MetaInterp<M> {
                     // starts at 1).  No `0 → root_trace_id` sentinel;
                     // RPython resolves the source via descr identity.
                     let source_trace_id = fail_descr.trace_id();
-                    let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                        bridge_inputargs,
-                        &optimized_ops,
-                        green_key,
-                        &compiled_constants_typed,
-                    );
+                    let (mut resume_data, mut exit_layouts) =
+                        compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
@@ -18313,12 +18292,8 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops_rc, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-            inputargs,
-            &ops,
-            green_key,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-        );
+        let (mut resume_data, mut exit_layouts) =
+            compile::build_guard_metadata(inputargs, &ops, green_key);
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);

@@ -753,6 +753,13 @@ pub struct Assembler386<'a> {
     /// machine-code buffer* (i.e. pre-`rawstart`); `patch_stack_checks`
     /// adds `rawstart` to obtain the absolute address.
     frame_depth_to_patch: Vec<usize>,
+    /// assembler.py:1003-1008 `_assemble`: the frame depth of a cross-loop
+    /// JUMP target (its `target_frame_depth`), or 0 when the trace has no
+    /// external JUMP.  The closing `JMP` enters the target loop's body,
+    /// which may use deeper frame slots than this trace; `_assemble` grows
+    /// `frame_depth` to fit so a bridge's prologue `_check_frame_depth`
+    /// reallocs the in-flight JITFRAME large enough before the `JMP`.
+    jump_target_frame_depth: usize,
     /// `x86/assembler.py:63` `self.malloc_slowpath` parity — entry
     /// pointer of the per-CPU malloc slowpath trampoline used by both
     /// `CallMallocNursery` and `CallMallocNurseryVarsizeFrame` (PyPy
@@ -899,6 +906,7 @@ impl<'a> Assembler386<'a> {
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
+            jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
         }
     }
@@ -998,8 +1006,15 @@ impl<'a> Assembler386<'a> {
                  Const always carries a value (history.py:227/268/314)"
             );
         }
-        // Unmapped OpRef — treat as 0.
-        ResolvedArg::Const(0)
+        // regalloc.py:102 `FrameManager.loc(must_exist=True)` raises KeyError
+        // for a non-constant box that is neither register- nor frame-resident:
+        // a used box is always slot-mapped or constant. Silently materializing
+        // an unmapped box as `#0` would hide a wrong value — the same hazard
+        // that moved genop_call_assembler onto regalloc arglocs. Fail loud.
+        panic!(
+            "resolve_opref: unmapped non-constant OpRef {opref:?} — every used \
+             box must be slot-mapped or constant (regalloc.py:102 loc must_exist)"
+        );
     }
 
     /// Allocate a frame slot for an OpRef and return the slot index.
@@ -2378,6 +2393,23 @@ impl<'a> Assembler386<'a> {
 
         for descr in &self.compiled_target_tokens {
             if let Some(loop_descr) = descr.as_loop_target_descr() {
+                // assembler.py:1003-1008 reads the target loop's
+                // `frame_info.jfi_frame_depth` at a cross-loop JUMP; publish
+                // this loop's full frame depth so a later trace's JUMP can
+                // size its frame for this target.  Carries the depth grown by
+                // `_assemble` for this loop's own onward JUMP.
+                //
+                // Store the companion `target_frame_depth` BEFORE the
+                // `ll_loop_code` gate (both Release stores): a reader
+                // Acquire-loads `ll_loop_code` and only reads
+                // `target_frame_depth` once the gate is non-zero, so the depth
+                // must become visible first — otherwise the reader pairs the
+                // new code pointer with a stale 0 depth and bypasses the
+                // frame-capacity check (descr.rs set_dispatch_target ordering
+                // contract).  Dynasm ignores `label_block_id` (descr.rs:1236 —
+                // it bakes the LABEL address straight into `ll_loop_code`), so
+                // that companion is not published here.
+                loop_descr.set_target_frame_depth(self.frame_depth);
                 loop_descr.set_ll_loop_code(loop_descr.ll_loop_code() + rawstart);
             }
         }
@@ -2715,6 +2747,15 @@ impl<'a> Assembler386<'a> {
                 fail_index
             );
         }
+
+        // assembler.py:1003-1008 `_assemble`: grow the frame to fit a
+        // cross-loop JUMP target.  The closing `JMP` jumps into the target
+        // loop's body, which can use deeper frame slots than this trace; for
+        // a bridge the prologue `_check_frame_depth` then reallocs the live
+        // JITFRAME to this grown depth on entry.  `target_frame_depth` is
+        // full-width (includes JITFRAME_FIXED_SIZE), matching `frame_depth`,
+        // so no adjustment is needed.  Zero (no external JUMP) is a no-op.
+        self.frame_depth = self.frame_depth.max(self.jump_target_frame_depth);
 
         Ok(())
     }
@@ -3824,6 +3865,12 @@ impl<'a> Assembler386<'a> {
                     // iteration's GuardClass(RAX) then misreads RAX as
                     // a Ref and SEGVs when it dereferences trace + 0x1B3
                     // expecting a class pointer.
+                    // assembler.py:1003-1008 `_assemble`: record the target
+                    // loop's frame depth so this trace's frame grows to fit it.
+                    if let Some(descr) = jump_descr {
+                        self.jump_target_frame_depth =
+                            self.jump_target_frame_depth.max(descr.target_frame_depth());
+                    }
                     let addr = target as i64;
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
@@ -5835,6 +5882,12 @@ impl<'a> Assembler386<'a> {
             // stages the 64-bit target through `X86_64_SCRATCH_REG`
             // (r11), never RAX — using RAX here would clobber the
             // loop-carried Ref the regalloc bound to it.
+            // assembler.py:1003-1008 `_assemble`: record the target loop's
+            // frame depth so this trace's frame grows to fit it.
+            if let Some(descr) = jump_descr {
+                self.jump_target_frame_depth =
+                    self.jump_target_frame_depth.max(descr.target_frame_depth());
+            }
             let addr = target as i64;
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             dynasm!(self.mc ; .arch x64
