@@ -2509,35 +2509,54 @@ fn alloc_var_id() -> u64 {
 /// annotator correctness — see `test_variable_identity_diagnostic.rs`
 /// and plan `~/.claude/plans/annotator-monomorphization-tier1-abstract-
 /// lake.md` "Feasibility probe findings".
+/// Backing storage for [`Variable`] — the single heap object that all
+/// references to one logical Variable share. Mutable attributes use
+/// plain `Cell`/`RefCell` interior mutability; no per-field `Rc` is
+/// needed because the whole struct is shared through the one outer
+/// `Rc` in [`Variable`], so a write through any reference is observed
+/// by all of them (upstream Python's attribute-on-object semantics).
 #[derive(Debug)]
-pub struct Variable {
-    /// Identity key. See `NEXT_VAR_ID` — RPython uses object
-    /// identity; Rust approximates with a process-wide increment.
+pub struct VariableInner {
+    /// Identity key. See `NEXT_VAR_ID` — RPython uses object identity;
+    /// Rust approximates with a process-wide increment, used only as a
+    /// hash/equality key (Python hashes objects by identity too), never
+    /// as an index into a value table.
     id: u64,
-    /// Prefix name (upstream `Variable._name`). Wrapped in
-    /// `Rc<RefCell<…>>` so that `rename`/`set_name` on one clone is
-    /// observable through every clone with the same identity — upstream
-    /// Python is a single object, so a post-clone rename (e.g. the
-    /// `mergeblock` generalize loop renaming a block's inputargs) must
-    /// propagate to all references. `copy()` mints a fresh cell.
-    _name: Rc<std::cell::RefCell<String>>,
-    /// Lazy numbering counter (upstream `Variable._nr`). Shared
-    /// across clones so `name()` is stable per identity.
-    _nr: Rc<std::cell::Cell<i64>>,
-    /// RPython `Variable.annotation` (set by the annotator). Holds a
-    /// shared [`SomeValue`] handle once the annotator binds the
-    /// variable — upstream Python uses reference semantics so one
-    /// lattice instance can back many `Variable`s. The
-    /// `Rc<RefCell<...>>` wrapper makes `setbinding(v1)` observable
-    /// via every clone `v2` with the same identity.
-    pub annotation: Rc<std::cell::RefCell<Option<Rc<SomeValue>>>>,
+    /// Prefix name (upstream `Variable._name`). `copy()` mints a fresh
+    /// `VariableInner` holding this prefix value; `rename`/`set_name`
+    /// through any reference is observed by all since they share the
+    /// one object.
+    _name: std::cell::RefCell<String>,
+    /// Lazy numbering counter (upstream `Variable._nr`).
+    _nr: std::cell::Cell<i64>,
+    /// RPython `Variable.annotation` (set by the annotator). The inner
+    /// `Rc<SomeValue>` is the shared lattice handle (one instance backs
+    /// many `Variable`s); the cell itself is per-object.
+    pub annotation: std::cell::RefCell<Option<Rc<SomeValue>>>,
     /// RPython `Variable.concretetype` (set by the rtyper).
-    ///
-    /// Reference-semantic like `annotation` so that a write on one clone
-    /// (e.g. `rtyper.setconcretetype(v)`) is observable through every
-    /// other clone with the same identity — matching upstream Python's
-    /// `v.concretetype = X` mutation semantics via object references.
-    pub concretetype: Rc<std::cell::RefCell<Option<ConcretetypePlaceholder>>>,
+    pub concretetype: std::cell::RefCell<Option<ConcretetypePlaceholder>>,
+}
+
+/// RPython `flowspace/model.py:279` — `class Variable`.
+///
+/// `__slots__ = ["_name", "_nr", "annotation", "concretetype"]`.
+///
+/// A `Variable` IS a Python object: one heap allocation, many
+/// references. The Rust port models that directly as a newtype over
+/// `Rc<VariableInner>` — `clone()` aliases the same object (a reference
+/// copy; identity preserved) while [`Variable::copy`] mints a new
+/// object with the same name prefix (RPython `Variable.copy`).
+/// Equality and hashing are object identity. `Deref` exposes the
+/// shared [`VariableInner`] so existing `v.annotation` /
+/// `v.concretetype` reads keep working.
+#[derive(Debug, Clone)]
+pub struct Variable(Rc<VariableInner>);
+
+impl std::ops::Deref for Variable {
+    type Target = VariableInner;
+    fn deref(&self) -> &VariableInner {
+        &self.0
+    }
 }
 
 // `Variable` is intentionally !Send / !Sync — matching RPython's
@@ -2552,24 +2571,12 @@ pub struct Variable {
 // confine that consumer to a thread-local (matching RPython's GIL
 // model), not to widen the unsafe surface area.
 
-impl Clone for Variable {
-    // RPython has no `clone` at the language level, but downstream
-    // code that stores a `Variable` in a Vec and later reuses the
-    // "same" Variable relies on identity being preserved. `clone`
-    // in Rust therefore aliases the identity; use `copy()` for
-    // RPython `Variable.copy` semantics (new identity). The
-    // `_nr` / `annotation` / `concretetype` cells Rc-share across
-    // clones so they act as if attached to the upstream Python object.
-    fn clone(&self) -> Self {
-        Variable {
-            id: self.id,
-            _name: Rc::clone(&self._name),
-            _nr: Rc::clone(&self._nr),
-            annotation: Rc::clone(&self.annotation),
-            concretetype: Rc::clone(&self.concretetype),
-        }
-    }
-}
+// `Clone` is derived: a newtype over `Rc<VariableInner>` clones via
+// `Rc::clone`, which aliases the one shared object — RPython has no
+// language-level clone, and downstream code that stores a `Variable`
+// and later reuses the "same" one relies on identity being preserved.
+// Use [`Variable::copy`] for RPython `Variable.copy` semantics (a new
+// object with the same prefix).
 
 impl PartialEq for Variable {
     // RPython relies on Python object identity for Variable
@@ -2591,13 +2598,13 @@ impl Variable {
     /// RPython `Variable.__init__(name=None)`.
     pub fn new() -> Self {
         // `_name = self.dummyname; _nr = -1; annotation = None`.
-        Variable {
+        Variable(Rc::new(VariableInner {
             id: alloc_var_id(),
-            _name: Rc::new(std::cell::RefCell::new(DUMMYNAME.to_owned())),
-            _nr: Rc::new(std::cell::Cell::new(-1)),
-            annotation: Rc::new(std::cell::RefCell::new(None)),
-            concretetype: Rc::new(std::cell::RefCell::new(None)),
-        }
+            _name: std::cell::RefCell::new(DUMMYNAME.to_owned()),
+            _nr: std::cell::Cell::new(-1),
+            annotation: std::cell::RefCell::new(None),
+            concretetype: std::cell::RefCell::new(None),
+        }))
     }
 
     /// RPython `Variable.__init__(name)` with a non-None argument.

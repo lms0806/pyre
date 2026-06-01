@@ -4251,6 +4251,17 @@ impl FunctionGraph {
     /// lands.
     pub fn value_name_at(&self, idx: usize) -> Option<String> {
         let var = self.variable_at(idx)?;
+        self.value_name_for(var)
+    }
+
+    /// Identity-based counterpart of [`Self::value_name_at`]: the source
+    /// name of `var` if it entered SSA through an `OpKind::Input` op,
+    /// resolved by Variable identity directly — no graph-slot round
+    /// trip. Orthodox reader for callers that already hold the
+    /// `Variable` (e.g. `signature_for_graph` walking
+    /// `startblock.inputargs`); RPython reads the source name off the
+    /// Variable / `co_varnames`, never via an integer value index.
+    pub fn value_name_for(&self, var: &crate::flowspace::model::Variable) -> Option<String> {
         // Unnamed values (arithmetic temporaries, constants) carry no
         // source name; `Variable.renamed` is the O(1) gate that keeps
         // the `Input`-op lookup off the hot path for the common case.

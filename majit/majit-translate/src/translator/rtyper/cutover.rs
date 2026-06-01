@@ -891,8 +891,7 @@ fn signature_for_graph(graph: &LegacyGraph) -> Signature {
         .enumerate()
         .map(|(idx, var)| {
             graph
-                .slot_of(var)
-                .and_then(|slot| graph.value_name_at(slot))
+                .value_name_for(var)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
         .collect();
@@ -1192,8 +1191,7 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
         .enumerate()
         .map(|(idx, var)| {
             graph
-                .slot_of(var)
-                .and_then(|slot| graph.value_name_at(slot))
+                .value_name_for(var)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
         .collect();
