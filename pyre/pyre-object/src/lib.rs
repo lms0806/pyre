@@ -11,6 +11,7 @@ pub use pyre_macros::pyre_class;
 pub mod boolobject;
 pub mod bytearrayobject;
 pub mod bytesobject;
+pub mod callableiteratorobject;
 pub mod celldict;
 pub mod cellobject;
 pub mod dict_eq_hook;

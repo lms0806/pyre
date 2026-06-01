@@ -9,6 +9,240 @@ use crate::{
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
+/// Read a memoryview stub's `(data copy, itemsize, backing buffer)`.
+unsafe fn memoryview_data(
+    mv: PyObjectRef,
+) -> Result<(Vec<u8>, usize, PyObjectRef), crate::PyError> {
+    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+    let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+    let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
+    let data = if pyre_object::bytesobject::is_bytes_like(buf) {
+        pyre_object::bytesobject::bytes_like_data(buf).to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok((data, itemsize, buf))
+}
+
+/// Little-endian unpack of one `itemsize`-wide element at element index `i`.
+fn memoryview_unpack(data: &[u8], itemsize: usize, i: usize) -> i64 {
+    let base = i * itemsize;
+    let mut val: i64 = 0;
+    for j in 0..itemsize {
+        val |= (data[base + j] as i64) << (8 * j);
+    }
+    val
+}
+
+/// `memoryview.__getitem__` — integer index returns the unpacked element;
+/// a slice returns a fresh memoryview over the copied sub-buffer.
+fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let index = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let count = (data.len() / itemsize) as i64;
+        if pyre_object::is_int(index) {
+            let mut i = pyre_object::w_int_get_value(index);
+            if i < 0 {
+                i += count;
+            }
+            if i < 0 || i >= count {
+                return Err(crate::PyError::index_error("index out of bounds"));
+            }
+            return Ok(w_int_new(memoryview_unpack(&data, itemsize, i as usize)));
+        }
+        if pyre_object::is_slice(index) {
+            let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            let mut out: Vec<u8> = Vec::new();
+            let mut k = start;
+            while (step > 0 && k < stop) || (step < 0 && k > stop) {
+                let base = k as usize * itemsize;
+                out.extend_from_slice(&data[base..base + itemsize]);
+                k += step;
+            }
+            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
+            let inst = pyre_object::w_instance_new(cls);
+            let fmt = crate::baseobjspace::getattr(mv, "__pyre_fmt__")?;
+            crate::baseobjspace::setattr(
+                inst,
+                "__pyre_buf__",
+                pyre_object::bytesobject::w_bytes_from_bytes(&out),
+            )?;
+            crate::baseobjspace::setattr(inst, "__pyre_fmt__", fmt)?;
+            crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(itemsize as i64))?;
+            return Ok(inst);
+        }
+        Err(crate::PyError::type_error(
+            "memoryview: invalid slice key, must be int or slice",
+        ))
+    }
+}
+
+/// `memoryview.__setitem__` — integer assignment into a mutable, byte-wide
+/// view; read-only or wider-format views raise as in CPython.
+fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let index = args.get(1).copied().unwrap_or(w_none());
+    let value = args.get(2).copied().unwrap_or(w_none());
+    unsafe {
+        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+        let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+        let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
+        if !pyre_object::bytearrayobject::is_bytearray(buf) {
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        }
+        if itemsize != 1 {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid type for format 'B'",
+            ));
+        }
+        if !pyre_object::is_int(index) {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid slice key, must be int",
+            ));
+        }
+        let count = pyre_object::bytesobject::bytes_like_len(buf) as i64;
+        let mut i = pyre_object::w_int_get_value(index);
+        if i < 0 {
+            i += count;
+        }
+        if i < 0 || i >= count {
+            return Err(crate::PyError::index_error("index out of bounds"));
+        }
+        if !pyre_object::is_int(value) {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid type for format 'B'",
+            ));
+        }
+        let v = pyre_object::w_int_get_value(value);
+        if !(0..=255).contains(&v) {
+            return Err(crate::PyError::value_error(
+                "memoryview: invalid value for format 'B'",
+            ));
+        }
+        pyre_object::bytearrayobject::w_bytearray_setitem(buf, i as usize, v as u8);
+        Ok(w_none())
+    }
+}
+
+/// `memoryview.tobytes` — copy the backing buffer to a `bytes`.
+fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, _, _) = memoryview_data(mv)?;
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+    }
+}
+
+/// `memoryview.__iter__` — yield the unpacked elements in order.
+fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let n = data.len() / itemsize;
+        let items: Vec<PyObjectRef> = (0..n)
+            .map(|i| w_int_new(memoryview_unpack(&data, itemsize, i)))
+            .collect();
+        crate::baseobjspace::iter(w_list_new(items))
+    }
+}
+
+/// `memoryview.__contains__` — membership over the unpacked elements.
+fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let needle = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        if !pyre_object::is_int(needle) {
+            return Ok(w_bool_from(false));
+        }
+        let target = pyre_object::w_int_get_value(needle);
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let n = data.len() / itemsize;
+        let found = (0..n).any(|i| memoryview_unpack(&data, itemsize, i) == target);
+        Ok(w_bool_from(found))
+    }
+}
+
+/// `memoryview.readonly` — false only for a mutable (bytearray) backing.
+fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+        Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(
+            buf,
+        )))
+    }
+}
+
+/// `memoryview.nbytes` — total byte length of the backing buffer.
+fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, _, _) = memoryview_data(mv)?;
+        Ok(w_int_new(data.len() as i64))
+    }
+}
+
+/// `memoryview.format` — the stored struct format string.
+fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    crate::baseobjspace::getattr(mv, "__pyre_fmt__")
+}
+
+/// `memoryview.ndim` — the stub models only 1-D views.
+fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_int_new(1))
+}
+
+/// Unpack a memoryview-or-bytes-like operand to its element value list,
+/// or `None` when it is neither (so `__eq__` can return NotImplemented).
+unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
+    if let Some(t) = crate::typedef::r#type(obj) {
+        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
+            let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
+            let n = data.len() / itemsize;
+            return Some(
+                (0..n)
+                    .map(|i| memoryview_unpack(&data, itemsize, i))
+                    .collect(),
+            );
+        }
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
+        return Some(data.iter().map(|&b| b as i64).collect());
+    }
+    None
+}
+
+/// `memoryview.__eq__` — equal element values against another memoryview
+/// or bytes-like; NotImplemented for any other operand.
+fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let other = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let a = memoryview_operand_values(mv).unwrap_or_default();
+        match memoryview_operand_values(other) {
+            Some(b) => Ok(w_bool_from(a == b)),
+            None => Ok(pyre_object::w_not_implemented()),
+        }
+    }
+}
+
+/// `memoryview.__ne__` — negation of `__eq__` over comparable operands.
+fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let other = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let a = memoryview_operand_values(mv).unwrap_or_default();
+        match memoryview_operand_values(other) {
+            Some(b) => Ok(w_bool_from(a != b)),
+            None => Ok(pyre_object::w_not_implemented()),
+        }
+    }
+}
+
 pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("print", || {
         make_module_builtin_function("print", builtin_print)
@@ -266,6 +500,59 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     pyre_object::PY_NULL,
                 ),
             );
+            // Buffer-protocol accessors over the stored backing buffer.
+            crate::dict_storage_store(
+                ns,
+                "__getitem__",
+                make_builtin_function_with_arity("__getitem__", memoryview_getitem, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__setitem__",
+                make_builtin_function_with_arity("__setitem__", memoryview_setitem, 3),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__iter__",
+                make_builtin_function_with_arity("__iter__", memoryview_iter, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__contains__",
+                make_builtin_function_with_arity("__contains__", memoryview_contains, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "tobytes",
+                make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__eq__",
+                make_builtin_function_with_arity("__eq__", memoryview_eq, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__ne__",
+                make_builtin_function_with_arity("__ne__", memoryview_ne, 2),
+            );
+            type MvGetter = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
+            for (attr, getter) in [
+                ("readonly", memoryview_readonly as MvGetter),
+                ("nbytes", memoryview_nbytes),
+                ("format", memoryview_format),
+                ("ndim", memoryview_ndim),
+            ] {
+                crate::dict_storage_store(
+                    ns,
+                    attr,
+                    pyre_object::w_property_new(
+                        make_builtin_function_with_arity(attr, getter, 1),
+                        pyre_object::PY_NULL,
+                        pyre_object::PY_NULL,
+                    ),
+                );
+            }
         });
         // Store per-instance __pyre_buf__/__pyre_fmt__/__pyre_itemsize__ slots.
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -756,7 +1043,8 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 
 /// `range(stop)` or `range(start, stop)` or `range(start, stop, step)`.
 ///
-/// Returns a range iterator directly (simplified: no separate range object).
+/// Returns a `W_Range` sequence object; `iter()` produces a fresh
+/// `W_RangeIterator` cursor.
 fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     match args.len() {
         0 => Err(crate::PyError::type_error(
@@ -764,12 +1052,12 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )),
         1 => {
             let stop = unsafe { range_arg_to_i64(args[0]) }?;
-            Ok(w_range_iter_new(0, stop, 1))
+            Ok(pyre_object::w_range_new(0, stop, 1))
         }
         2 => {
             let start = unsafe { range_arg_to_i64(args[0]) }?;
             let stop = unsafe { range_arg_to_i64(args[1]) }?;
-            Ok(w_range_iter_new(start, stop, 1))
+            Ok(pyre_object::w_range_new(start, stop, 1))
         }
         3 => {
             let start = unsafe { range_arg_to_i64(args[0]) }?;
@@ -780,7 +1068,7 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     "step argument must not be zero",
                 ));
             }
-            Ok(w_range_iter_new(start, stop, step))
+            Ok(pyre_object::w_range_new(start, stop, step))
         }
         _ => Err(crate::PyError::type_error(format!(
             "range expected at most 3 arguments, got {}",
@@ -906,6 +1194,22 @@ pub(crate) fn kwarg_reject_unknown(
                 "{fn_name}() got an unexpected keyword argument '{key}'"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject `f(x, name=...)` when `name` already arrived positionally.
+/// The flat builtin ABI leaves this validation to each kw-aware method.
+pub(crate) fn kwarg_reject_duplicate(
+    kwargs: Option<PyObjectRef>,
+    fn_name: &str,
+    name: &str,
+    positional_present: bool,
+) -> Result<(), crate::PyError> {
+    if positional_present && kwarg_get(kwargs, name).is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() got multiple values for argument '{name}'"
+        )));
     }
     Ok(())
 }
@@ -1076,36 +1380,44 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     //   [metatype, obj] — 2 args (type(obj))
     // Find the (name, bases, dict) triple by scanning for the first str arg.
     // Also extract the metatype (first type arg before the name str).
+    // The class-definition keywords arrive as a trailing `__pyre_kw__`
+    // dict (the builtin kwargs ABI); strip it before the arity scan and
+    // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
+    let (pos, kwargs) = split_builtin_kwargs(args);
     let mut w_metaclass = pyre_object::PY_NULL;
-    for i in 0..args.len() {
-        if unsafe { pyre_object::is_str(args[i]) } && i + 2 < args.len() {
+    for i in 0..pos.len() {
+        if unsafe { pyre_object::is_str(pos[i]) } && i + 2 < pos.len() {
             // Extract metatype from preceding args
             for j in 0..i {
-                if unsafe { pyre_object::is_type(args[j]) } {
-                    w_metaclass = args[j];
+                if unsafe { pyre_object::is_type(pos[j]) } {
+                    w_metaclass = pos[j];
                 }
             }
-            return type_descr_new_with_metaclass(&args[i..], w_metaclass);
+            return type_descr_new_with_metaclass(&pos[i..], w_metaclass, kwargs);
         }
     }
-    if args.len() == 1 && unsafe { pyre_object::is_type(args[0]) } {
+    if pos.len() == 1 && unsafe { pyre_object::is_type(pos[0]) } {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
     }
-    if args.len() == 1 {
-        return type_descr_new_without_metaclass(args);
+    if pos.len() == 1 {
+        return type_descr_new_without_metaclass(pos, kwargs);
     }
-    if args.len() == 2 {
-        return type_descr_new_without_metaclass(&args[1..]);
+    if pos.len() == 2 {
+        return type_descr_new_without_metaclass(&pos[1..], kwargs);
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
-fn type_descr_new_without_metaclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    type_descr_new_with_metaclass(args, pyre_object::PY_NULL)
+fn type_descr_new_without_metaclass(
+    args: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    type_descr_new_with_metaclass(args, pyre_object::PY_NULL, kwargs)
 }
 
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
+    kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 && args.len() != 3 {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
@@ -1236,6 +1548,24 @@ fn type_descr_new_with_metaclass(
                 }
             }
         }
+
+        // type_new_init_subclass — fire __init_subclass__ with the
+        // keywords that reached type.__new__ (the stripped `__pyre_kw__`
+        // dict).  This is the single site for the metaclass path; the
+        // default-metaclass `__build_class__` shortcut fires it itself
+        // because it bypasses type.__new__.
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match kwargs {
+            Some(kw) => unsafe {
+                pyre_object::w_dict_items(kw)
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        is_str(*k) && pyre_object::w_str_get_value(*k) != "__pyre_kw__"
+                    })
+                    .collect()
+            },
+            None => Vec::new(),
+        };
+        crate::call::call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
 
         return Ok(w_type);
     }
@@ -2564,14 +2894,24 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     })
 }
 
-/// `iter(obj)` — PyPy: baseobjspace.py iter
+/// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
+/// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
+    match args.len() {
+        0 => Err(crate::PyError::type_error(
             "iter() requires at least one argument",
-        ));
+        )),
+        1 => crate::baseobjspace::iter(args[0]),
+        2 => {
+            if !crate::baseobjspace::callable_w(args[0]) {
+                return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
+            }
+            Ok(pyre_object::callableiteratorobject::w_callable_iterator_new(args[0], args[1]))
+        }
+        n => Err(crate::PyError::type_error(format!(
+            "iter expected at most 2 arguments, got {n}"
+        ))),
     }
-    crate::baseobjspace::iter(args[0])
 }
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
@@ -4247,8 +4587,19 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let t = pyre_object::w_tuple_new(items);
             return Ok(pyre_object::w_seq_iter_new(t, n));
         }
-        // range_iterator: `range()` returns the iterator directly, so
-        // `reversed(range(n))` lands here. rangeobject.py
+        // range: rangeobject.py W_RangeObject.descr_reversed — reflect
+        // the span and hand back a fresh reverse-walking iterator.
+        if pyre_object::is_w_range(obj) {
+            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let len = pyre_object::w_range_len(obj);
+            if len == 0 {
+                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
+            }
+            let last = start + (len - 1) * step;
+            return Ok(pyre_object::w_range_iter_new(last, start - step, -step));
+        }
+        // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
+        // can also be reversed. rangeobject.py
         // `W_AbstractRangeObject.descr_reversed` walks the span in
         // reverse; mirror it by reflecting `(current, stop, step)` —
         // start from the last element, negate the step, and stop one

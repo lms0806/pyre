@@ -251,7 +251,7 @@ fn fill_user_function_args(
 
     // argument.py:235-236 — too_many_args when no *vararg to absorb.
     if nargs > nparams && !has_varargs {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         let ndefaults = if !defaults.is_null() {
             let defaults = crate::baseobjspace::unwrap_cell(defaults);
             if unsafe { pyre_object::is_tuple(defaults) } {
@@ -342,9 +342,9 @@ fn fill_user_function_args(
         }
     }
     if !missing_positional.is_empty() {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_positional,
             true,
         )));
@@ -358,9 +358,9 @@ fn fill_user_function_args(
         }
     }
     if !missing_kwonly.is_empty() {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_kwonly,
             false,
         )));
@@ -427,10 +427,7 @@ fn call_user_function_with_eval(
     // Generator function: create generator object instead of executing.
     // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
     // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -478,10 +475,7 @@ pub fn call_user_function_resolved(
     let code_ref = unsafe { &*func_code };
 
     // Generator function
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             args,
@@ -638,10 +632,7 @@ pub fn call_user_function_plain_with_ctx(
     let code_ref = unsafe { &*func_code };
     let final_args = fill_user_function_args(callable, code_ref, args)?;
 
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -801,7 +792,7 @@ pub(crate) fn resolve_kwargs(
     let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
     let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
     let posonlyarg_count = code.posonlyarg_count as usize;
-    let fname = unsafe { crate::function_get_name(target_func) };
+    let fname = unsafe { crate::function_get_qualname(target_func) };
 
     // `argument.py:235-236` — too-many positional args with no *vararg.
     // The kwargs path counts only positional args (`n_pos`); kwargs are
@@ -1007,7 +998,7 @@ pub(crate) fn resolve_kwargs(
     }
     if !missing_positional.is_empty() {
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_positional,
             true,
         )));
@@ -1022,7 +1013,7 @@ pub(crate) fn resolve_kwargs(
     }
     if !missing_kwonly.is_empty() {
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_kwonly,
             false,
         )));
@@ -1170,7 +1161,7 @@ pub fn call_with_kwargs(
             let n_pos_params = code.arg_count as usize;
             let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
             let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
-            let fname = unsafe { crate::function_get_name(callable) };
+            let fname = unsafe { crate::function_get_qualname(callable) };
 
             // `argument.py:235-236` — too-many positional args with no *vararg.
             if pos_args.len() > n_pos_params && !has_varargs {
@@ -1311,7 +1302,7 @@ pub fn call_with_kwargs(
             }
             if !missing_positional.is_empty() {
                 return Err(crate::PyError::type_error(format_missing_err(
-                    fname,
+                    &fname,
                     &missing_positional,
                     true,
                 )));
@@ -1325,7 +1316,7 @@ pub fn call_with_kwargs(
             }
             if !missing_kwonly.is_empty() {
                 return Err(crate::PyError::type_error(format_missing_err(
-                    fname,
+                    &fname,
                     &missing_kwonly,
                     false,
                 )));
@@ -1423,11 +1414,12 @@ pub fn call_with_kwargs(
                 let mut init_args = Vec::with_capacity(1 + pos_args.len());
                 init_args.push(instance);
                 init_args.extend_from_slice(pos_args);
-                if unsafe { crate::is_function(init_fn) } && !kwargs.is_empty() {
-                    call_with_kwargs(frame, init_fn, &init_args, kwargs)?;
+                let init_result = if unsafe { crate::is_function(init_fn) } && !kwargs.is_empty() {
+                    call_with_kwargs(frame, init_fn, &init_args, kwargs)?
                 } else {
-                    call_callable(frame, init_fn, &init_args)?;
-                }
+                    call_callable(frame, init_fn, &init_args)?
+                };
+                check_init_returned_none(init_result)?;
             }
         }
         return Ok(instance);
@@ -1680,11 +1672,40 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            let _ = call_function_impl(init_fn, &init_args);
+            let res = call_function_impl(init_fn, &init_args);
+            if res.is_null() {
+                // `__init__` raised — error already stashed; propagate it.
+                return PY_NULL;
+            }
+            if let Err(e) = check_init_returned_none(res) {
+                set_call_error(e);
+                return PY_NULL;
+            }
         }
     }
 
     instance
+}
+
+/// `typeobject.py descr_call` — `__init__` must return None.  A non-null,
+/// non-None result raises `TypeError: __init__() should return None, not
+/// 'X'`.
+///
+/// A null `result` means `__init__` already raised.  Callers are
+/// responsible for detecting that (via `result.is_null()` or a
+/// `?`-propagating call) and forwarding the stashed error themselves;
+/// this function returns `Ok(())` for null purely as a defensive guard so
+/// it never overwrites the original error with a spurious `TypeError`.
+fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
+    if result.is_null() || unsafe { pyre_object::is_none(result) } {
+        return Ok(());
+    }
+    let tname = crate::typedef::r#type(result)
+        .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+        .unwrap_or("object");
+    Err(PyError::type_error(format!(
+        "__init__() should return None, not '{tname}'"
+    )))
 }
 
 fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
@@ -1731,10 +1752,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     };
 
     // Generator function: wrap frame in generator object
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -1814,10 +1832,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
         closure,
     );
     frame.fix_array_ptrs();
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame.run() {
             Ok(v) => v,
             Err(e) => {
@@ -1846,14 +1861,23 @@ fn call_metaclass_with_kwargs(
     w_namespace_dict: PyObjectRef,
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
-    // Find the metaclass __new__ method
-    let new_fn = if unsafe { pyre_object::is_type(w_metaclass) } {
-        unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
+    if unsafe { !pyre_object::is_type(w_metaclass) } {
+        return crate::call_function(w_metaclass, &[name, bases, w_namespace_dict]);
+    }
+    let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
+        unsafe {
+            pyre_object::w_dict_items(kwargs)
+                .into_iter()
+                .filter(|(k, _)| pyre_object::is_str(*k))
+                .collect()
+        }
     } else {
-        None
+        Vec::new()
     };
+    // Find the metaclass __new__ method
+    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") };
 
-    if let Some(new_fn) = new_fn {
+    let instance = if let Some(new_fn) = new_fn {
         // Resolve only against a user-defined __new__ with a real code
         // object; the builtin type.__new__ has none, so fall through.
         let is_user_fn = unsafe { crate::is_function(new_fn) }
@@ -1867,25 +1891,93 @@ fn call_metaclass_with_kwargs(
             // the remainder into a `**kwds` parameter when present.
             let mut call_args = vec![w_metaclass, name, bases, w_namespace_dict];
             let mut names = Vec::new();
-            for (k, v) in unsafe { pyre_object::w_dict_items(kwargs) } {
-                if unsafe { pyre_object::is_str(k) } {
-                    call_args.push(v);
-                    names.push(k);
-                }
+            for (k, v) in &kw_items {
+                call_args.push(*v);
+                names.push(*k);
             }
             let kwarg_names = pyre_object::w_tuple_new(names);
-            return match resolve_kwargs(new_fn, &call_args, kwarg_names) {
+            match resolve_kwargs(new_fn, &call_args, kwarg_names) {
                 Ok(resolved) => call_user_function_resolved_frameless(new_fn, &resolved),
                 Err(e) => {
                     set_call_error(e);
                     PY_NULL
                 }
+            }
+        } else {
+            // Builtin type.__new__ (the metaclass defines no __new__): pass
+            // the class-definition keywords through the `__pyre_kw__`
+            // trailing-dict ABI so type.__new__ fires __init_subclass__
+            // with them, matching the default-metaclass path.
+            let mut new_args = vec![w_metaclass, name, bases, w_namespace_dict];
+            if !kw_items.is_empty() {
+                new_args.push(pack_pyre_kwargs(&kw_items));
+            }
+            match call_function_impl_result(new_fn, &new_args) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    set_call_error(e);
+                    PY_NULL
+                }
+            }
+        }
+    } else {
+        pyre_object::w_instance_new(w_metaclass)
+    };
+
+    if instance.is_null() {
+        return PY_NULL;
+    }
+
+    if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)
+        && let Some(init_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+    {
+        let is_user_fn = unsafe { crate::is_function(init_fn) }
+            && unsafe {
+                !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
             };
+        if is_user_fn && !kw_items.is_empty() {
+            let mut call_args = vec![instance, name, bases, w_namespace_dict];
+            let mut names = Vec::with_capacity(kw_items.len());
+            for (k, v) in &kw_items {
+                call_args.push(*v);
+                names.push(*k);
+            }
+            let kwarg_names = pyre_object::w_tuple_new(names);
+            match resolve_kwargs(init_fn, &call_args, kwarg_names) {
+                Ok(resolved) => {
+                    let res = call_user_function_resolved_frameless(init_fn, &resolved);
+                    if res.is_null() {
+                        return PY_NULL;
+                    }
+                    if let Err(e) = check_init_returned_none(res) {
+                        set_call_error(e);
+                        return PY_NULL;
+                    }
+                }
+                Err(e) => {
+                    set_call_error(e);
+                    return PY_NULL;
+                }
+            }
+        } else {
+            // Builtin __init__ (e.g. type.__init__) ignores the
+            // class-definition keywords during 3-arg class creation, and a
+            // user __init__ with no kwargs takes only the positional triple.
+            // Either way call positionally; the class-definition kwargs flow
+            // to the __init_subclass__ forwarding path instead of being
+            // rejected here (typeobject.py descr_call passes __args__ to a
+            // builtin __init__, which tolerates them).
+            if let Err(e) =
+                call_function_impl_result(init_fn, &[instance, name, bases, w_namespace_dict])
+            {
+                set_call_error(e);
+                return PY_NULL;
+            }
         }
     }
 
-    // Fallback: call without kwargs
-    crate::call_function(w_metaclass, &[name, bases, w_namespace_dict])
+    instance
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
@@ -2260,77 +2352,115 @@ fn build_class_inner(
         }
     }
 
-    // Call __init_subclass__ on each base class
-    // PyPy: typeobject.py type.__init__ → call __init_subclass__
-    //
-    // type.__new__ calls super().__init_subclass__(cls, **kwds) with the
-    // class-definition keyword arguments (`class C(Base, x=1)` → `x=1`).
-    // The kwds left after metaclass extraction live in `extra_kwargs`;
-    // forward them to a user-defined __init_subclass__ resolved against
-    // its signature so `def __init_subclass__(cls, **kw)` and
-    // `def __init_subclass__(cls, *, x=None)` both receive them.
-    let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match extra_kwargs {
-        Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
-            pyre_object::w_dict_items(kw)
-                .into_iter()
-                .filter(|(k, _)| pyre_object::is_str(*k))
-                .collect()
-        },
-        _ => Vec::new(),
-    };
-    if !w_effective_bases.is_null() && unsafe { pyre_object::is_tuple(w_effective_bases) } {
-        let n = unsafe { pyre_object::w_tuple_len(w_effective_bases) };
-        for i in 0..n {
-            if let Some(base) = unsafe { pyre_object::w_tuple_getitem(w_effective_bases, i as i64) }
-            {
-                if unsafe { pyre_object::is_type(base) } {
-                    if let Some(init_sub) =
-                        unsafe { crate::baseobjspace::lookup_in_type(base, "__init_subclass__") }
-                    {
-                        // Forward kwargs only to a user-defined
-                        // __init_subclass__ with a real Python code object;
-                        // object's builtin default has no code object, so
-                        // resolve_kwargs would deref a bogus code pointer.
-                        let is_user_fn = unsafe { crate::is_function(init_sub) }
-                            && unsafe {
-                                !crate::is_builtin_code(
-                                    crate::getcode(init_sub) as pyre_object::PyObjectRef
-                                )
-                            };
-                        if !init_subclass_kwargs.is_empty() && is_user_fn {
-                            let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
-                            call_args.push(w_type);
-                            let mut names = Vec::with_capacity(init_subclass_kwargs.len());
-                            for (k, v) in &init_subclass_kwargs {
-                                call_args.push(*v);
-                                names.push(*k);
-                            }
-                            let kwarg_names = pyre_object::w_tuple_new(names);
-                            let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
-                            clear_call_error();
-                            let res = call_user_function_resolved_frameless(init_sub, &resolved);
-                            if res.is_null() {
-                                if let Some(err) = take_call_error() {
-                                    return Err(err);
-                                }
-                            }
-                        } else if init_subclass_kwargs.is_empty() {
-                            let _ = crate::call_function(init_sub, &[w_type]);
-                        } else {
-                            // The default __init_subclass__ consumes no
-                            // keywords; leftover class-definition keywords
-                            // are an error rather than silently dropped.
-                            return Err(crate::PyError::type_error(
-                                "__init_subclass__() takes no keyword arguments",
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+    // type_new_init_subclass (typeobject.c) — fire __init_subclass__ on
+    // the bases with the keywords that reached `type.__new__`.  Only the
+    // default-metaclass path builds the class here via `w_type_new`,
+    // bypassing `type.__new__`; for it the class-definition keywords are
+    // exactly the keywords `type.__new__` would have seen.  The metaclass
+    // path routes through `type.__new__` (builtins.rs `type_descr_new`),
+    // which fires __init_subclass__ with the subset of keywords the
+    // metaclass actually forwarded — so it must NOT be re-fired here.
+    if w_metaclass.is_none() {
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match extra_kwargs {
+            Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
+                pyre_object::w_dict_items(kw)
+                    .into_iter()
+                    .filter(|(k, _)| pyre_object::is_str(*k))
+                    .collect()
+            },
+            _ => Vec::new(),
+        };
+        call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
     }
 
     Ok(w_type)
+}
+
+/// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
+/// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
+/// consumes.  Mirrors the producer in `call_with_kwargs`.
+fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
+    let kw_dict = pyre_object::w_dict_new();
+    unsafe {
+        pyre_object::w_dict_store(
+            kw_dict,
+            pyre_object::w_str_new("__pyre_kw__"),
+            pyre_object::w_bool_from(true),
+        );
+        for (k, v) in kw_items {
+            pyre_object::w_dict_store(kw_dict, *k, *v);
+        }
+    }
+    kw_dict
+}
+
+/// `typeobject.c type_new_init_subclass` — after a class is created, call
+/// `__init_subclass__` on each base that defines it, forwarding the
+/// keyword arguments that reached `type.__new__`.  `init_subclass_kwargs`
+/// must already exclude the `__pyre_kw__` marker and the `metaclass` key.
+pub(crate) fn call_init_subclass_on_bases(
+    w_type: PyObjectRef,
+    w_effective_bases: PyObjectRef,
+    init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
+) -> Result<(), crate::PyError> {
+    if w_effective_bases.is_null() || unsafe { !pyre_object::is_tuple(w_effective_bases) } {
+        return Ok(());
+    }
+    let n = unsafe { pyre_object::w_tuple_len(w_effective_bases) };
+    for i in 0..n {
+        let Some(base) = (unsafe { pyre_object::w_tuple_getitem(w_effective_bases, i as i64) })
+        else {
+            continue;
+        };
+        if unsafe { !pyre_object::is_type(base) } {
+            continue;
+        }
+        let Some(init_sub) =
+            (unsafe { crate::baseobjspace::lookup_in_type(base, "__init_subclass__") })
+        else {
+            continue;
+        };
+        // Forward kwargs only to a user-defined __init_subclass__ with a
+        // real Python code object; object's builtin default has no code
+        // object, so resolve_kwargs would deref a bogus code pointer.
+        let is_user_fn = unsafe { crate::is_function(init_sub) }
+            && unsafe {
+                !crate::is_builtin_code(crate::getcode(init_sub) as pyre_object::PyObjectRef)
+            };
+        if !init_subclass_kwargs.is_empty() && is_user_fn {
+            let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
+            call_args.push(w_type);
+            let mut names = Vec::with_capacity(init_subclass_kwargs.len());
+            for (k, v) in init_subclass_kwargs {
+                call_args.push(*v);
+                names.push(*k);
+            }
+            let kwarg_names = pyre_object::w_tuple_new(names);
+            let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
+            clear_call_error();
+            let res = call_user_function_resolved_frameless(init_sub, &resolved);
+            if res.is_null() {
+                if let Some(err) = take_call_error() {
+                    return Err(err);
+                }
+            }
+        } else if init_subclass_kwargs.is_empty() {
+            clear_call_error();
+            let res = crate::call_function(init_sub, &[w_type]);
+            if res.is_null() {
+                if let Some(err) = take_call_error() {
+                    return Err(err);
+                }
+            }
+        } else {
+            // The default __init_subclass__ consumes no keywords; leftover
+            // keywords are an error rather than silently dropped.
+            return Err(crate::PyError::type_error(
+                "__init_subclass__() takes no keyword arguments",
+            ));
+        }
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -2373,7 +2503,8 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            let _ = call_callable(frame, init_fn, &init_args)?;
+            let init_result = call_callable(frame, init_fn, &init_args)?;
+            check_init_returned_none(init_result)?;
         }
     }
 

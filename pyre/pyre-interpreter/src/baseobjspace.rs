@@ -634,6 +634,9 @@ pub fn is_true(obj: PyObjectRef) -> bool {
         if pyre_object::is_set_or_frozenset(obj) {
             return pyre_object::w_set_len(obj) > 0;
         }
+        if pyre_object::is_w_range(obj) {
+            return pyre_object::w_range_len(obj) > 0;
+        }
         if is_none(obj) {
             return false;
         }
@@ -826,6 +829,9 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             return getitem_instance(obj, index);
         }
+        if pyre_object::is_w_range(obj) {
+            return getitem_range(obj, index);
+        }
         if is_range_iter(obj) {
             return getitem_range_iter(obj, index);
         }
@@ -834,6 +840,22 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             (*(*obj).ob_type).name,
         )))
     }
+}
+
+/// `pypy/interpreter/baseobjspace.py:1574 getindex_w` — the `TypeError`
+/// raised when a sequence subscript is neither an integer nor a slice:
+/// `"<descr> indices must be integers or slices, not <type>"`.
+fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
+    let tp = unsafe {
+        if index.is_null() {
+            "NULL"
+        } else {
+            (*(*index).ob_type).name
+        }
+    };
+    PyError::type_error(format!(
+        "{descr} indices must be integers or slices, not {tp}"
+    ))
 }
 
 #[inline(never)]
@@ -852,9 +874,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return Ok(w_list_new(items));
     }
     if !is_int(index) {
-        return Err(PyError::type_error(
-            "list indices must be integers or slices",
-        ));
+        return Err(index_type_error("list", index));
     }
     let idx = w_int_get_value(index);
     match w_list_getitem(obj, idx) {
@@ -883,7 +903,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return Ok(w_tuple_new(items));
     }
     if !is_int(index) {
-        return Err(PyError::type_error("tuple indices must be integers"));
+        return Err(index_type_error("tuple", index));
     }
     let idx = w_int_get_value(index);
     match w_tuple_getitem(obj, idx) {
@@ -932,7 +952,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             "string index out of range",
         ));
     }
-    Err(PyError::type_error("string indices must be integers"))
+    Err(index_type_error("string", index))
 }
 
 #[inline(never)]
@@ -979,10 +999,8 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
         });
     }
-    let name = if is_bytes { "bytes" } else { "bytearray" };
-    Err(PyError::type_error(format!(
-        "{name} indices must be integers"
-    )))
+    let descr = if is_bytes { "byte" } else { "bytearray" };
+    Err(index_type_error(descr, index))
 }
 
 #[inline(never)]
@@ -1015,6 +1033,83 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 }
 
 #[inline(never)]
+/// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
+/// the member `start + i*step` (negative folded, bounds-checked); a slice
+/// returns a NEW `range` object, not a list.
+unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
+    let len = pyre_object::w_range_len(obj);
+    if is_int(index) {
+        return match pyre_object::w_range_getitem(obj, w_int_get_value(index)) {
+            Some(v) => Ok(w_int_new(v)),
+            None => Err(PyError::new(
+                PyErrorKind::IndexError,
+                "range object index out of range",
+            )),
+        };
+    }
+    if is_slice(index) {
+        let (sstart, sstop, sstep) = normalize_slice(index, len)?;
+        let new_start = rstart + sstart * rstep;
+        let new_stop = rstart + sstop * rstep;
+        let new_step = rstep * sstep;
+        return Ok(pyre_object::w_range_new(new_start, new_stop, new_step));
+    }
+    Err(index_type_error("range", index))
+}
+
+/// `range.count(value)` — `rangeobject.py W_RangeObject.descr_count`.
+fn range_count_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = args[0];
+    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
+}
+
+/// `range.index(value)` — `rangeobject.py W_RangeObject.descr_index`.
+fn range_index_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = args[0];
+    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    unsafe {
+        let (start, _stop, step) = pyre_object::w_range_fields(obj);
+        let len = pyre_object::w_range_len(obj);
+        if is_int(needle) {
+            let v = w_int_get_value(needle);
+            if pyre_object::w_range_contains_int(obj, v) {
+                return Ok(w_int_new((v - start) / step));
+            }
+            return Err(PyError::value_error(
+                "range.index(x): x not in range".to_string(),
+            ));
+        }
+        for i in 0..len {
+            if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
+                return Ok(w_int_new(i));
+            }
+        }
+    }
+    Err(PyError::value_error(
+        "sequence.index(x): x not in sequence".to_string(),
+    ))
+}
+
+/// `range.__iter__()` — fresh `W_RangeIterator` cursor.
+fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
+    iter(args[0])
+}
+
+/// `range.__reversed__()` — `rangeobject.py W_RangeObject.descr_reversed`.
+fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let (start, _stop, step) = pyre_object::w_range_fields(args[0]);
+        let len = pyre_object::w_range_len(args[0]);
+        if len == 0 {
+            return Ok(pyre_object::w_range_iter_new(0, 0, 1));
+        }
+        let last = start + (len - 1) * step;
+        Ok(pyre_object::w_range_iter_new(last, start - step, -step))
+    }
+}
+
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
     let len = if r.step > 0 {
@@ -1047,9 +1142,7 @@ unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         return Ok(w_list_new(items));
     }
-    Err(PyError::type_error(
-        "range indices must be integers or slices",
-    ))
+    Err(index_type_error("range", index))
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
@@ -1110,14 +1203,7 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
         return setitem_list_slice(obj, index, value);
     }
     if !is_int(index) {
-        let tp = if index.is_null() {
-            "NULL"
-        } else {
-            (*(*index).ob_type).name
-        };
-        return Err(PyError::type_error(format!(
-            "list indices must be integers, not {tp}"
-        )));
+        return Err(index_type_error("list", index));
     }
     let idx = w_int_get_value(index);
     if w_list_setitem(obj, idx, value) {
@@ -1361,20 +1447,13 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
+        } else if pyre_object::is_w_range(obj) {
+            // `rangeobject.py W_RangeObject.descr_len → self.w_length`.
+            Ok(w_int_new(pyre_object::w_range_len(obj)))
         } else if is_range_iter(obj) {
-            // TODO: pyre conflates `range` and
-            // `range_iterator` into a single `W_RangeIterator` (see
-            // `builtin_range` in `builtins.rs`). PyPy keeps them
-            // separate: `pypy/module/__builtin__/functional.py:444
-            // W_Range` carries `w_length` and exposes
-            // `descr_len → self.w_length` (line 485-486), while the
-            // iterator (`pypy/objspace/std/iterobject.py
-            // W_AbstractSeqIterObject:47 descr_length_hint`) exposes
-            // only `__length_hint__`.  The convergence path is to
-            // split pyre's `W_RangeIterator` into `W_Range` +
-            // `W_RangeIterator`. Until then, derive the remaining
-            // count from `(stop - current) / step` so `len(range(N))`
-            // matches CPython's `range.__len__` semantics.
+            // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
+            // — the iterator reports its REMAINING count, derived from
+            // `(stop - current) / step`.
             let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
             let count = if r.step > 0 {
                 ((r.stop - r.current).max(0) + r.step - 1) / r.step
@@ -1686,10 +1765,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // built-in subclasses (W_ExceptionObject, etc.) resolve their
             // class through the same path that powers `type(obj)` —
             // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
-            let w_obj_type = if is_instance(bound_obj) {
-                w_instance_get_type(bound_obj)
-            } else if is_type(bound_obj) {
+            // superobject.py:103-110 _supercheck: `su_obj` is itself a
+            // subtype of `su_type` only in the classmethod / class-level
+            // case (return `su_obj`).  A class whose metaclass is
+            // `su_type` is an *instance* of `su_type`, not a subtype, so
+            // it must resolve through `type(su_obj)` — otherwise its MRO
+            // never reaches `su_type` and the lookup fails.
+            let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
                 bound_obj
+            } else if is_instance(bound_obj) {
+                w_instance_get_type(bound_obj)
             } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
                 cls
             } else {
@@ -1719,13 +1804,18 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                         if let Some(attr) = found {
                             // superobject.py super_getattro:
                             // Invoke descriptor __get__ protocol.
-                            // function.__get__(obj, type) → bound method
-                            // __new__ is implicitly static — never bind.
-                            if name != "__new__"
-                                && crate::is_function(attr)
-                                && !pyre_object::is_staticmethod(attr)
-                                && !pyre_object::is_classmethod(attr)
-                            {
+                            // classmethod.__get__(obj, type) binds the class
+                            // (`w_obj_type`); staticmethod.__get__ unwraps to
+                            // the plain function; a plain function binds `obj`.
+                            // `__new__` is implicitly static — never bind.
+                            if pyre_object::is_classmethod(attr) {
+                                let func = pyre_object::w_classmethod_get_func(attr);
+                                return Ok(pyre_object::w_method_new(func, w_obj_type, w_obj_type));
+                            }
+                            if pyre_object::is_staticmethod(attr) {
+                                return Ok(pyre_object::w_staticmethod_get_func(attr));
+                            }
+                            if name != "__new__" && crate::is_function(attr) {
                                 return Ok(pyre_object::w_method_new(attr, bound_obj, w_obj_type));
                             }
                             return Ok(attr);
@@ -1792,6 +1882,41 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // range attributes/methods — rangeobject.py W_RangeObject.
+    // `.start`/`.stop`/`.step` read-only ints; count/index/__iter__/
+    // __reversed__ exposed as bound methods.
+    unsafe {
+        if pyre_object::is_w_range(obj) {
+            match name {
+                "start" | "stop" | "step" => {
+                    let (start, stop, step) = pyre_object::w_range_fields(obj);
+                    let v = match name {
+                        "start" => start,
+                        "stop" => stop,
+                        _ => step,
+                    };
+                    return Ok(w_int_new(v));
+                }
+                _ => {}
+            }
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
+                "count" => Some((range_count_method, "count", 2)),
+                "index" => Some((range_index_method, "index", 2)),
+                "__iter__" => Some((range_iter_method, "__iter__", 1)),
+                "__reversed__" => Some((range_reversed_method, "__reversed__", 1)),
+                _ => None,
+            };
+            if let Some((func, sname, arity)) = entry {
+                let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
+            }
+        }
+    }
+
     // Native iterator methods — `iter(x)` products: list/tuple/str/set/
     // bytes/zip/map/reversed share the seq-iter type; range, the dict
     // views and enumerate are distinct.  `next(it)` and `for` already
@@ -1802,6 +1927,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             || is_range_iter(obj)
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
+            || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -5509,6 +5635,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let key_list = pyre_object::w_list_new(items);
             return Ok(pyre_object::w_seq_iter_new(key_list, len));
         }
+        // `range` sequence → fresh `W_RangeIterator` cursor.
+        if pyre_object::is_w_range(obj) {
+            let (start, stop, step) = pyre_object::w_range_fields(obj);
+            return Ok(pyre_object::w_range_iter_new(start, stop, step));
+        }
         // Already an iterator
         if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
         {
@@ -5524,6 +5655,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `pypy/module/__builtin__/functional.py:277-278
         // W_Enumerate.descr___iter__` — `return self`.
         if pyre_object::enumerateobject::is_enumerate(obj) {
+            return Ok(obj);
+        }
+        // `iter(callable, sentinel)` product — its own iterator.
+        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             return Ok(obj);
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
@@ -5813,6 +5948,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_item is None:
         //             w_item = space.next(self.w_iter_or_list)
         //         return space.newtuple2(w_index, w_item)
+        // `iter(callable, sentinel)` product (`Objects/iterobject.c`
+        // `calliter_iternext`): invoke the zero-arg callable; stop when
+        // the result equals the sentinel.  Once exhausted, `callable` is
+        // latched to `PY_NULL` so further `next()` keeps raising.
+        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
+            use pyre_object::callableiteratorobject as ci;
+            let callable = ci::w_callable_iterator_get_callable(obj);
+            if callable.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let result = crate::call::call_function_impl_result(callable, &[])?;
+            let sentinel = ci::w_callable_iterator_get_sentinel(obj);
+            if is_true(compare(result, sentinel, CompareOp::Eq)?) {
+                ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+                return Err(PyError::stop_iteration());
+            }
+            return Ok(result);
+        }
         if pyre_object::enumerateobject::is_enumerate(obj) {
             use pyre_object::enumerateobject as eo;
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
@@ -6571,6 +6724,26 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
                     return Ok(false);
                 }
             }
+        }
+    }
+    // `rangeobject.py W_RangeObject.descr_contains` — O(1) membership for
+    // an int needle; any other type falls back to an elementwise scan.
+    unsafe {
+        if pyre_object::is_w_range(haystack) {
+            if is_int(needle) {
+                return Ok(pyre_object::w_range_contains_int(
+                    haystack,
+                    w_int_get_value(needle),
+                ));
+            }
+            let (start, _stop, step) = pyre_object::w_range_fields(haystack);
+            let len = pyre_object::w_range_len(haystack);
+            for i in 0..len {
+                if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
     }
     unsafe {

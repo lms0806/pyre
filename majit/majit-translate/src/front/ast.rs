@@ -310,13 +310,37 @@ pub struct SemanticProgram {
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_with_options(parsed, &AstGraphOptions::default())
+    build_semantic_program_with_options(
+        parsed,
+        &AstGraphOptions::default(),
+        crate::HostStaticAddrs::default(),
+    )
 }
 
 pub fn build_semantic_program_from_parsed_files(
     parsed_files: &[ParsedInterpreter],
 ) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_from_parsed_files_with_options(parsed_files, &AstGraphOptions::default())
+    build_semantic_program_from_parsed_files_with_options(
+        parsed_files,
+        &AstGraphOptions::default(),
+        crate::HostStaticAddrs::default(),
+    )
+}
+
+/// Like [`build_semantic_program_from_parsed_files`] but with
+/// host-supplied object-space singleton addresses threaded through to
+/// the `KnownStaticsCatalogue` (`HostStaticAddrs`).  The production
+/// driver (`pyre-jit-trace/build.rs`) uses this; test / legacy callers
+/// keep the no-statics wrapper above.
+pub fn build_semantic_program_from_parsed_files_with_statics(
+    parsed_files: &[ParsedInterpreter],
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<SemanticProgram, FlowingError> {
+    build_semantic_program_from_parsed_files_with_options(
+        parsed_files,
+        &AstGraphOptions::default(),
+        static_addrs,
+    )
 }
 
 /// Pre-walk metadata produced by `collect_program_metadata_pub` —
@@ -1507,6 +1531,7 @@ fn build_graphs_from_items(
 pub fn build_semantic_program_with_options(
     parsed: &ParsedInterpreter,
     options: &AstGraphOptions,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<SemanticProgram, FlowingError> {
     let mut functions = Vec::new();
     let mut known_struct_names = std::collections::HashSet::new();
@@ -1556,7 +1581,8 @@ pub fn build_semantic_program_with_options(
         let module = qualify_module_path(&parsed.module_path, nested);
         module_statics.insert((module, name.clone()), decl.clone());
     }
-    let known_statics = KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed));
+    let known_statics =
+        KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed), static_addrs);
     let start_len = functions.len();
     let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     build_graphs_from_items(
@@ -1604,6 +1630,7 @@ pub fn build_semantic_program_with_options(
 pub fn build_semantic_program_from_parsed_files_with_options(
     parsed_files: &[ParsedInterpreter],
     options: &AstGraphOptions,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<SemanticProgram, FlowingError> {
     // RPython: annotator/rtyper provides whole-program type info before
     // the codewriter runs. We emulate this with a 2-pass approach:
@@ -1656,7 +1683,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             module_statics.insert((module, name.clone()), decl.clone());
         }
     }
-    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files);
+    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files, static_addrs);
     // Glob expansion: each parsed file's `use <path>::*` resolves to
     // explicit (alias → full_path) entries in `use_imports` here,
     // mirroring Python's import-resolution step which binds glob-
@@ -3998,7 +4025,10 @@ impl KnownStaticsCatalogue {
     /// macro statics via `extract_static_decls`, then registers the
     /// hand-coded stdlib enum variants pyre source carries through
     /// the flowgraph as opaque constants.
-    pub fn from_parsed_files(parsed_files: &[crate::parse::ParsedInterpreter]) -> Self {
+    pub fn from_parsed_files(
+        parsed_files: &[crate::parse::ParsedInterpreter],
+        static_addrs: crate::HostStaticAddrs<'_>,
+    ) -> Self {
         let mut entries = indexmap::IndexMap::new();
         for parsed in parsed_files {
             for (segments, ty, value) in
@@ -4013,7 +4043,7 @@ impl KnownStaticsCatalogue {
                 entries.insert(segments.join("::"), (ty, value));
             }
         }
-        register_stdlib_known_statics(&mut entries);
+        register_stdlib_known_statics(&mut entries, static_addrs);
         Self { entries }
     }
 
@@ -4068,8 +4098,39 @@ impl KnownStaticsCatalogue {
 /// directly.
 fn register_stdlib_known_statics(
     m: &mut indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) {
     use crate::flowspace::model::ConstValue;
+    // Prebuilt static `PyType` pointers, host-supplied across the
+    // translation boundary (`HostStaticAddrs`).  Recorded as
+    // `ValueType::Int` so the `lower_expr` `Expr::Path` arm emits a
+    // `ConstInt` directly.  Empty for fixtures that do not reference
+    // these singletons.
+    for (path, addr) in static_addrs.pytypes {
+        m.insert(
+            (*path).to_string(),
+            (ValueType::Int, Some(ConstValue::Int(*addr))),
+        );
+    }
+    // `PY_NULL` is a null sentinel, not an object-space address, so it
+    // stays native here instead of arriving through `static_addrs`.
+    m.insert(
+        "pyobject::PY_NULL".to_string(),
+        (
+            ValueType::Ref(None),
+            Some(ConstValue::LLAddress(
+                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+            )),
+        ),
+    );
+    // Prebuilt dict-strategy singletons, host-supplied refs.
+    for (path, addr) in static_addrs.refs {
+        m.insert(
+            (*path).to_string(),
+            (ValueType::Ref(None), Some(ConstValue::Int(*addr))),
+        );
+    }
+
     let ordering_variants: &[(&str, i64)] = &[
         ("Ordering::Relaxed", 0),
         ("Ordering::Acquire", 1),
@@ -6167,10 +6228,11 @@ fn lower_expr_inner(
             // [`KnownStaticsCatalogue::from_parsed_files`]; a path
             // identifier that matches a registered crate-level
             // `static` / `const` decl (or a `thread_local!` static)
-            // emits `OpKind::LoadStatic` (translated by
-            // `flowspace_adapter::translate_op` to a
-            // `same_as(Constant(UniStr(segments)))`) instead of the
-            // body-`OpKind::Input` fallthrough.
+            // emits `OpKind::LoadStatic` instead of the body-
+            // `OpKind::Input` fallthrough.  The flowspace adapter only
+            // accepts entries that carry a folded `ConstValue`; unresolved
+            // statics must gain a real host-evaluator lowering before
+            // they can reach JitCode.
             //
             // Qualified-only lookup: single-segment reads must be
             // qualified through `use_imports` (alias → fully
@@ -6252,6 +6314,17 @@ fn lower_expr_inner(
                     (ValueType::Int, Some(ConstValue::Int(i))) => Some(OpKind::ConstInt(*i)),
                     (ValueType::Float, Some(ConstValue::Float(bits))) => {
                         Some(OpKind::ConstFloat(*bits))
+                    }
+                    (ValueType::Ref(_), Some(ConstValue::LLAddress(addr)))
+                        if matches!(
+                            addr,
+                            crate::translator::rtyper::lltypesystem::lltype::_address::Null
+                        ) =>
+                    {
+                        Some(OpKind::ConstRefNull)
+                    }
+                    (ValueType::Ref(_), Some(ConstValue::Int(addr))) => {
+                        Some(OpKind::ConstRefAddr(*addr))
                     }
                     _ => None,
                 };
@@ -10259,6 +10332,9 @@ fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
         }
         OpKind::ConstFloat(_) => Some(ValueType::Float),
         OpKind::ConstBool(_) => Some(ValueType::Bool),
+        OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => {
+            Some(ValueType::Ref(None))
+        }
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. } => {
