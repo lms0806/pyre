@@ -1188,15 +1188,18 @@ impl OptString {
         let cic = ctx.callinfocollection.clone()?;
         // vstring.py:852: calldescr, func = cic.callinfo_for_oopspec(oopspecindex)
         // — a missing oopspec yields (None, 0). PyPy then builds CALL_I with
-        // descr=calldescr (possibly None); pyre's Op descr is non-optional, so a
-        // missing calldescr cannot be encoded as a None-descr op — bail instead.
+        // descr=calldescr (possibly None). Op.descr is `Option<DescrRef>`, so
+        // encode the None-descr CALL directly instead of bailing.
         let (calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec);
-        let calldescr = calldescr?;
         let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
-        let mut call_op = Op::with_descr(OpCode::CallI, &call_args, calldescr.clone());
+        // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
+        let mut call_op = match calldescr {
+            Some(d) => Op::with_descr(OpCode::CallI, &call_args, d.clone()),
+            None => Op::new(OpCode::CallI, &call_args),
+        };
         call_op.pos.set(result_op.pos.get());
         Some(OptimizationResult::Emit(call_op))
     }

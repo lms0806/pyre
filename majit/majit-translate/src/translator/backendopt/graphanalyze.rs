@@ -155,16 +155,84 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     fn analyze_simple_operation(&mut self, op: &SpaceOperation, graphinfo: &I) -> R;
 
     /// `analyze_external_call(funcobj, seen)`
-    /// (`graphanalyze.py:60-69`). Pyre's lltype runtime does not
-    /// surface `funcobj._callbacks.callbacks`, so the default
-    /// returns `bottom_result()` and concrete subclasses (e.g.
-    /// GilAnalyzer at `gilanalysis.py:23-24`) keep the same default.
+    /// (`graphanalyze.py:60-69`):
+    ///
+    /// ```python
+    /// def analyze_external_call(self, funcobj, seen=None):
+    ///     result = self.bottom_result()
+    ///     if hasattr(funcobj, '_callbacks'):
+    ///         bk = self.translator.annotator.bookkeeper
+    ///         for function in funcobj._callbacks.callbacks:
+    ///             desc = bk.getdesc(function)
+    ///             for graph in desc.getgraphs():
+    ///                 result = self.join_two_results(
+    ///                     result, self.analyze_direct_call(graph, seen))
+    ///     return result
+    /// ```
+    ///
+    /// Pyre surfaces every `**attrs`-set funcobj member through
+    /// `_func.attrs` (the same mirror that carries `external`,
+    /// `canraise`, `random_effects_on_gcobjs`). `_callbacks` is exposed
+    /// there as a `ConstValue::Graphs` graph-key list — upstream's
+    /// `function -> bk.getdesc(function).getgraphs()` indirection
+    /// collapses to the resolved callback graphs, resolved through
+    /// `TranslationContext.graphs` exactly like the `indirect_call` arm.
+    /// When the key is absent (no callback-bearing external modelled
+    /// yet) the loop runs zero times and the result is `bottom_result()`,
+    /// matching upstream's `hasattr(funcobj, '_callbacks') == False` path.
     fn analyze_external_call(
         &mut self,
-        _op: &SpaceOperation,
-        _seen: Option<&mut DependencyTracker<R>>,
+        op: &SpaceOperation,
+        seen: Option<&mut DependencyTracker<R>>,
     ) -> R {
-        R::bottom_result()
+        // `result = self.bottom_result()`.
+        let mut result = R::bottom_result();
+        // `funcobj` upstream is `op.args[0].value._obj`.
+        let Some(Hlvalue::Constant(c)) = op.args.first() else {
+            return result;
+        };
+        let ConstValue::LLPtr(f) = &c.value else {
+            return result;
+        };
+        let Ok(lltype::_ptr_obj::Func(funcobj)) = f._obj() else {
+            return result;
+        };
+        // `if hasattr(funcobj, '_callbacks'):` — the callback graph keys.
+        let Some(ConstValue::Graphs(keys)) = funcobj.attrs.get("_callbacks") else {
+            return result;
+        };
+        // Resolve all callback graphs up front so the `translator()`
+        // borrow is dropped before the recursive `analyze_direct_call`
+        // (which re-borrows `self`). Upstream obtains every callback
+        // graph from `bk.getdesc(function).getgraphs()`, so resolution
+        // never drops a callback; an unresolved key here is a
+        // registration bug, surfaced as `top_result()` exactly like the
+        // `indirect_call` arm's unknown-graph path (`:117-126`).
+        let graphs: Vec<GraphRef> = {
+            let trans_graphs = self.translator().graphs.borrow();
+            let mut graphs = Vec::with_capacity(keys.len());
+            for key in keys {
+                let Some(graph) = trans_graphs
+                    .iter()
+                    .find(|g| GraphKey::of(g).as_usize() == *key)
+                    .cloned()
+                else {
+                    return R::top_result();
+                };
+                graphs.push(graph);
+            }
+            graphs
+        };
+        // `seen` is threaded into each callee walk; default an owned
+        // tracker when the caller passed `None`, as the framework does.
+        let mut owned_tracker = DependencyTracker::new();
+        let seen = seen.unwrap_or(&mut owned_tracker);
+        // `for ... for graph in desc.getgraphs(): result =
+        //  self.join_two_results(result, self.analyze_direct_call(...))`.
+        for graph in &graphs {
+            result = R::join_two_results(result, self.analyze_direct_call(graph, Some(seen)));
+        }
+        result
     }
 
     /// `analyze_exceptblock(block, seen)`

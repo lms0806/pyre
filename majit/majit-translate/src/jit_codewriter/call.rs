@@ -1344,19 +1344,28 @@ impl CallControl {
         // descr.py:354 — itemsize from symbolic.get_array_token().
         // descr.py:365 — ArrayDescr(basesize, itemsize, ..., flag).
         // Even for struct(struct), itemsize is correct from symbolic.
-        let (flag, item_size) = if is_struct {
+        let (flag, item_size, item_type) = if is_struct {
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 elem_ref.map(|n| compute_struct_size(self, n)).unwrap_or(8),
+                majit_ir::value::Type::Ref,
             )
         } else if let Some(elem) = elem_ref {
-            let (f, _, s) = get_type_flag(elem);
-            (f, s)
+            let (f, t, s) = get_type_flag(elem);
+            (f, s, t)
         } else {
             (
                 majit_ir::descr::ArrayFlag::from_item_type(ir_type, false),
                 8,
+                ir_type,
             )
+        };
+        // descr.py:366-370 — `concrete_type='f'` when the element OF is
+        // Float/SingleFloat (pyre has a single Float); otherwise `'\x00'`.
+        let concrete_type = if item_type == majit_ir::value::Type::Float {
+            'f'
+        } else {
+            '\x00'
         };
         // descr.py:359-362 + symbolic.get_array_token — basesize follows
         // the lltype's nolength flag:
@@ -1427,7 +1436,7 @@ impl CallControl {
                         nolength,
                         length_offset,
                         is_pure,
-                        '\x00', // concrete_type (descr.py:366-370 Float-only marker)
+                        concrete_type, // descr.py:366-370 Float-only marker
                     );
                 let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
                     majit_ir::descr::descr_arc_as_array_descr(cached)
@@ -1482,7 +1491,7 @@ impl CallControl {
                 );
                 ad.lendescr = lendescr;
                 ad.is_pure = false;
-                ad.concrete_type = '\x00';
+                ad.concrete_type = concrete_type;
                 let arc: std::sync::Arc<majit_ir::descr::SimpleArrayDescr> =
                     std::sync::Arc::new(ad);
                 majit_ir::descr_registry::register_array(arc.clone() as majit_ir::descr::DescrRef);

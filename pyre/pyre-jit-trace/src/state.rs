@@ -5261,9 +5261,12 @@ fn materialize_bridge_virtual(
         resume_data: &majit_metainterp::ResumeDataResult,
         cache: &mut BridgeVirtualCache,
     ) -> OpRef {
-        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
-            return OpRef::NONE;
-        }
+        // resume.py:1245 `decode_box` dispatches purely on the tag bits;
+        // it has no UNINITIALIZED case. The UNINITIALIZED skip lives in
+        // the callers (e.g. VArrayStructInfo.allocate, resume.py:629),
+        // so this decoder mirrors `decode_box` exactly — an UNINITIALIZED
+        // tag reaching here falls into the TAGCONST arm and fails loud on
+        // the out-of-range const index, matching upstream's IndexError.
         let (val, tagbits) = untag(tagged);
         match tagbits {
             TAGBOX => {
@@ -5646,14 +5649,14 @@ fn materialize_bridge_virtual(
             for i in 0..offsets.len() {
                 let off = offsets[i];
                 let fnum = fieldnums[i];
-                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
-                    continue;
-                }
-                // resume.py:1232: itembox = self.decode_box(fieldnum, kind)
+                // resume.py:701-708 VRawBufferStateInfo.allocate_int passes
+                // fieldnums[i] straight to setrawbuffer_item with no
+                // UNINITIALIZED skip (unlike VArrayStructInfo) — a raw buffer
+                // is fully written by the encoder.
+                // resume.py:1232: itembox = self.decode_box(fieldnum, kind).
+                // `decode_box` always returns a box (no UNINITIALIZED case),
+                // so the store is unconditional, matching setrawbuffer_item.
                 let item = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
-                if item.is_none() {
-                    continue;
-                }
                 // resume.py:1225-1234: setrawbuffer_item (direct reader).
                 // Dispatches pointer/float/int via arraydescr — all types allowed.
                 let di = &descrs[i];

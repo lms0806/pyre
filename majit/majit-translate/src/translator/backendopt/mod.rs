@@ -19,3 +19,4 @@ pub mod ssa;
 pub mod stat;
 pub mod storesink;
 pub mod support;
+pub mod writeanalyze;

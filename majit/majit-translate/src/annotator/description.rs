@@ -1056,23 +1056,29 @@ impl FunctionDesc {
         builder: Option<GraphBuilder<'_>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         if let Some(existing) = self.cache.borrow().get(&key) {
-            // Restore the `buildflowgraph` append invariant
-            // (translator.py:61 `self.graphs.append(graph)`) for
-            // lazy-lifted graphs. Upstream reaches a `cachedgraph` hit only
-            // for a graph that `buildgraph` -> `buildflowgraph` already
-            // appended to `translator.graphs`; pyre prefills the cache via
-            // the Rust-source adapter (`cutover::lift_callee_to_pygraph` ->
-            // `prefill_default_cache`), which bypasses `buildflowgraph`, so
-            // the lifted `FunctionGraph` never entered `translator.graphs`.
-            // Append it here so the flowspace effect analyzers
-            // (`canraise::RaiseAnalyzer` et al.) can resolve `funcobj.graph`
-            // through `translator.graphs` (graphanalyze.rs) instead of
-            // falling to `top_result()`. Identity-checked against
-            // double-append exactly like `buildflowgraph`'s walker-hit
-            // guard. `try_annotator` is `None` only for a bare `Bookkeeper`
-            // with no attached session (the leaf-lift registry and test
-            // fixtures), so the prod lift at `codewriter.rs` is a no-op here
-            // and the append fires once a session is attached.
+            // Append the lifted callee graph to `translator.graphs`,
+            // mirroring `buildflowgraph`'s build-time append
+            // (translator.py:61 `self.graphs.append(graph)`). This is NOT
+            // a second append site: the MISS path below routes through
+            // `buildgraph` -> `buildflowgraph` (description.rs:1248,
+            // translator.rs:537), which already appends exactly like
+            // upstream. Only graphs prefilled by the Rust-source adapter
+            // (`cutover::lift_callee_to_pygraph` -> `prefill_default_cache`)
+            // reach a HIT without ever passing through `buildflowgraph`, so
+            // those never entered `translator.graphs`. The first HIT is the
+            // demand point at which upstream's MISS -> build -> append would
+            // have fired for a non-prefilled callee (pyre moved the build
+            // eager into the prefill), so appending on first HIT is the
+            // faithful compensation; the `Rc::ptr_eq` guard makes it fire
+            // once (upstream's `_cache` build-once), matching
+            // `buildflowgraph`'s walker-hit guard. The flowspace effect
+            // analyzers (`canraise::RaiseAnalyzer` et al.) then resolve
+            // `funcobj.graph` through `translator.graphs` (graphanalyze.rs)
+            // instead of falling to `top_result()`. `try_annotator` is
+            // `None` only for a bare `Bookkeeper` with no attached session
+            // (the leaf-lift registry and test fixtures), so the prod lift
+            // at `codewriter.rs` is a no-op here and the append fires once a
+            // session is attached.
             if let Some(annotator) = self.base.bookkeeper.try_annotator() {
                 let mut graphs = annotator.translator.graphs.borrow_mut();
                 if !graphs.iter().any(|g| Rc::ptr_eq(g, &existing.graph)) {
