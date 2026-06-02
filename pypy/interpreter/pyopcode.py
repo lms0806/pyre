@@ -15,6 +15,7 @@ from rpython.tool.sourcetools import func_with_new_name
 from pypy.interpreter import (
     gateway, function, eval, pyframe, pytraceback, pycode
 )
+from pypy.interpreter.executioncontext import TICK_COUNTER_STEP
 from pypy.interpreter.baseobjspace import W_Root
 from pypy.interpreter.error import OperationError, oefmt, oefmt_name_error, raise_import_error
 from pypy.interpreter.nestedscope import Cell
@@ -198,10 +199,21 @@ class __extend__(pyframe.PyFrame):
             assert next_instr & 1 == 0
             self.last_instr = intmask(next_instr)
             if jit.we_are_jitted():
-                ec.bytecode_only_trace(self)
+                _d = self.debugdata
+                if ec.space.reverse_debugging or (
+                        _d is not None and _d.w_f_trace is not None):
+                    ec.bytecode_only_trace(self)
+                    next_instr = r_uint(self.last_instr)
             else:
-                ec.bytecode_trace(self)
-            next_instr = r_uint(self.last_instr)
+                _d = self.debugdata
+                if ec.space.reverse_debugging or (
+                        _d is not None and _d.w_f_trace is not None):
+                    ec.bytecode_only_trace(self)
+                    next_instr = r_uint(self.last_instr)
+                actionflag = ec.space.actionflag
+                if actionflag.decrement_ticker(TICK_COUNTER_STEP) < 0:
+                    actionflag.action_dispatcher(ec, self)
+                    next_instr = r_uint(self.last_instr)
             assert next_instr & 1 == 0
             opcode = ord(co_code[next_instr])
             oparg = ord(co_code[next_instr + 1])
