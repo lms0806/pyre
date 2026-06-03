@@ -179,9 +179,9 @@ class MsvcPlatform(Platform):
     if _find_executable('jom.exe'):
         make = 'jom.exe'
 
-    cflags = ('/MD', '/O2', '/FS', '/Zi')
+    cflags = ('/MD', '/O2')
     # allow >2GB address space, set stack to 3MB (1MB is too small)
-    link_flags = ('/nologo', '/debug','/LARGEADDRESSAWARE',
+    link_flags = ('/nologo', '/LARGEADDRESSAWARE',
                   '/STACK:3145728', '/MANIFEST:EMBED')
     standalone_only = ()
     shared_only = ()
