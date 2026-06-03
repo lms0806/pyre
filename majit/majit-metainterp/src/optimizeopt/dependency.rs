@@ -8,6 +8,7 @@ use std::collections::BinaryHeap;
 
 use majit_ir::vec_set::VecSet;
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -70,14 +71,18 @@ fn side_effect_arguments(
         if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
             if obj_idx < op.num_args() {
                 if cell_idx >= 0 && (cell_idx as usize) < op.num_args() {
-                    result.push((op.arg(obj_idx), Some(op.arg(cell_idx as usize)), true));
+                    result.push((
+                        op.arg(obj_idx).to_opref(),
+                        Some(op.arg(cell_idx as usize).to_opref()),
+                        true,
+                    ));
                     for j in (cell_idx as usize + 1)..op.num_args() {
-                        result.push((op.arg(j), None, false));
+                        result.push((op.arg(j).to_opref(), None, false));
                     }
                 } else {
-                    result.push((op.arg(obj_idx), None, true));
+                    result.push((op.arg(obj_idx).to_opref(), None, true));
                     for j in (obj_idx + 1)..op.num_args() {
-                        result.push((op.arg(j), None, false));
+                        result.push((op.arg(j).to_opref(), None, false));
                     }
                 }
             }
@@ -86,10 +91,10 @@ fn side_effect_arguments(
         // dependency.py:232-240: generic side effect
         for arg in op.getarglist().iter() {
             // dependency.py:237: arg.is_constant() or arg.type == 'f' → not destroyed
-            if arg.is_constant() || arg_type_of(*arg) == majit_ir::Type::Float {
-                result.push((*arg, None, false));
+            if arg.is_constant() || arg_type_of(arg.to_opref()) == majit_ir::Type::Float {
+                result.push((arg.to_opref(), None, false));
             } else {
-                result.push((*arg, None, true));
+                result.push((arg.to_opref(), None, true));
             }
         }
     }
@@ -265,7 +270,7 @@ impl DependencyGraph {
             // dependency.py:626-644: build edges based on op type
             if op.opcode.is_always_pure() || op.opcode.is_final() {
                 // dependency.py:628-629: pure/final — depend on all args
-                let args: Vec<OpRef> = op.getarglist().to_vec();
+                let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
                 for arg in &args {
                     Self::depends_on_arg_static(&tracker, *arg, i, &mut self.nodes);
                 }
@@ -312,7 +317,7 @@ impl DependencyGraph {
         }
         // dependency.py:714-715: true dependencies on args
         for arg in op.getarglist().iter() {
-            Self::depends_on_arg_static(tracker, *arg, guard_idx, &mut self.nodes);
+            Self::depends_on_arg_static(tracker, arg.to_opref(), guard_idx, &mut self.nodes);
         }
         // dependency.py:717: guard_argument_protection
         self.guard_argument_protection(guard_idx, tracker);
@@ -327,14 +332,20 @@ impl DependencyGraph {
                 if arg.is_none() {
                     continue;
                 }
-                if !tracker.is_defined(*arg) {
+                if !tracker.is_defined(arg.to_opref()) {
                     continue;
                 }
                 // dependency.py:730-733: for at in tracker.redefinitions(arg)
-                let redefs = tracker.redefinitions(*arg);
+                let redefs = tracker.redefinitions(arg.to_opref());
                 for at_idx in redefs {
                     if self.nodes[at_idx].is_before(guard_idx) {
-                        Self::add_edge(&mut self.nodes, at_idx, guard_idx, Some(*arg), true);
+                        Self::add_edge(
+                            &mut self.nodes,
+                            at_idx,
+                            guard_idx,
+                            Some(arg.to_opref()),
+                            true,
+                        );
                     }
                 }
             }
@@ -352,11 +363,11 @@ impl DependencyGraph {
             // dependency.py:658: arg.type not in ('i','f')
             // Look up the defining op's result type to determine arg type.
             let arg_type = tracker
-                .definition(*arg)
+                .definition(arg.to_opref())
                 .map(|def_idx| self.nodes[def_idx].op.opcode.result_type())
                 .unwrap_or(majit_ir::Type::Ref); // unknown → assume ref (conservative)
             if arg_type != majit_ir::Type::Int && arg_type != majit_ir::Type::Float {
-                tracker.define(*arg, guard_idx);
+                tracker.define(arg.to_opref(), guard_idx);
             }
         }
         // dependency.py:665-698: special guard priorities
@@ -406,10 +417,10 @@ impl DependencyGraph {
             // (opnum, complex_obj_arg_idx, index_arg_idx)
             let (cobj_idx, index_idx) = load_complex_obj_args(op.opcode);
             if cobj_idx < op.num_args() {
-                let cobj = op.arg(cobj_idx);
+                let cobj = op.arg(cobj_idx).to_opref();
                 if index_idx >= 0 && (index_idx as usize) < op.num_args() {
                     // dependency.py:747-748: argcell-aware depends_on
-                    let index_var = op.arg(index_idx as usize);
+                    let index_var = op.arg(index_idx as usize).to_opref();
                     Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
                     Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
                 } else {
@@ -811,7 +822,10 @@ impl IndexVar {
         if self.coefficient_mul != 1 {
             // dependency.py:1069: args = [var, ConstInt(self.coefficient_mul)]
             let c = next_const(self.coefficient_mul);
-            let op = Op::new(OpCode::IntMul, &[var, c]);
+            let op = Op::new(
+                OpCode::IntMul,
+                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+            );
             var = op.pos.get();
             tolist.push(op);
         }
@@ -823,14 +837,20 @@ impl IndexVar {
         if self.constant > 0 {
             // dependency.py:1076: args = [var, ConstInt(self.constant)]
             let c = next_const(self.constant);
-            let op = Op::new(OpCode::IntAdd, &[var, c]);
+            let op = Op::new(
+                OpCode::IntAdd,
+                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+            );
             var = op.pos.get();
             tolist.push(op);
         }
         if self.constant < 0 {
             // dependency.py:1080-1081: var = ResOperation(INT_SUB, [var, ConstInt(-self.constant)])
             let c = next_const(-self.constant);
-            let op = Op::new(OpCode::IntSub, &[var, c]);
+            let op = Op::new(
+                OpCode::IntSub,
+                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+            );
             #[allow(unused_assignments)]
             {
                 var = op.pos.get();
@@ -1131,8 +1151,8 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
         let result = op.pos.get();
-        let a0 = op.arg(0);
-        let a1 = op.arg(1);
+        let a0 = op.arg(0).to_opref();
+        let a1 = op.arg(1).to_opref();
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1171,8 +1191,8 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
         let result = op.pos.get();
-        let a0 = op.arg(0);
-        let a1 = op.arg(1);
+        let a0 = op.arg(0).to_opref();
+        let a1 = op.arg(1).to_opref();
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1204,8 +1224,8 @@ impl<'a> IntegralForwardModification<'a> {
         if op.num_args() < 2 {
             return;
         }
-        let array = op.arg(0);
-        let index = op.arg(1);
+        let array = op.arg(0).to_opref();
+        let index = op.arg(1).to_opref();
         let idx_var = self.get_or_create(index);
         if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()

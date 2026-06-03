@@ -1229,7 +1229,7 @@ impl DynasmBackend {
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.num_args() >= 2
             {
-                let class_arg = op.arg(1);
+                let class_arg = op.arg(1).to_opref();
                 // history.py:227 — inline-Const carries its class pointer directly.
                 let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr {
@@ -1259,7 +1259,7 @@ impl DynasmBackend {
         }
         for op in ops {
             if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
-                let class_arg = op.arg(1);
+                let class_arg = op.arg(1).to_opref();
                 // history.py:227 — inline-Const carries its class pointer directly.
                 let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr {
@@ -3260,6 +3260,7 @@ mod tests {
     use majit_gc::collector::{GcConfig, MiniMarkGC};
     use majit_gc::header::header_of;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{
         CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, OpCode, Type, Value,
     };
@@ -3365,7 +3366,8 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let op = Op::new(opcode, args);
+        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let op = Op::new(opcode, &bx);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(op)
     }
@@ -3937,7 +3939,7 @@ mod tests {
         // referenced via `OpRef::input_arg_int(0)`. Variant-aware Eq/Hash
         // treats `IntOp(0)` and `InputArgInt(0)` as disjoint Box classes.
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(vec![OpRef::input_arg_int(0)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_int(0))].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4024,7 +4026,13 @@ mod tests {
         let mut token = JitCellToken::new(1603);
         backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)].into());
+        guard.setfailargs(
+            vec![
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            ]
+            .into(),
+        );
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4124,7 +4132,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4309,7 +4317,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4418,7 +4426,7 @@ mod tests {
         entry_getfield.setdescr(field_descr.clone());
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
         let mut call1 = mk_op(
             OpCode::CallAssemblerI,
             &[OpRef::input_arg_ref(0), OpRef::int_op(4)],
@@ -4538,7 +4546,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             guard,
@@ -4628,7 +4636,13 @@ mod tests {
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)].into());
+        guard.setfailargs(
+            vec![
+                BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            ]
+            .into(),
+        );
         let ops = vec![
             mk_op(
                 OpCode::Label,

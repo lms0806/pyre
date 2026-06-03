@@ -425,7 +425,7 @@ pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> Life
 
         // regalloc.py:1190-1201 process arguments
         for j in 0..op.num_args() {
-            let arg = op.arg(j);
+            let arg = op.arg(j).to_opref();
             if arg.is_constant() {
                 continue;
             }
@@ -445,11 +445,12 @@ pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> Life
         // regalloc.py:1202-1208 guard failargs
         if opnum.is_guard() {
             if let Some(fail_args) = op.getfailargs() {
-                for &arg in fail_args.iter() {
+                for arg in fail_args.iter() {
                     if arg.is_none() {
                         continue; // hole
                     }
                     debug_assert!(!arg.is_constant());
+                    let arg = arg.to_opref();
                     if !longevity.contains(arg) {
                         longevity.set(arg, Lifetime::new(UNDEF_POS, i));
                     }
@@ -1848,7 +1849,8 @@ impl<'a> RegAlloc<'a> {
             return;
         }
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args = descr_id.map(|id| (id, op.getarglist().to_vec()));
+        self.final_jump_args =
+            descr_id.map(|id| (id, op.getarglist().iter().map(|a| a.to_opref()).collect()));
         self.final_jump_op_position = (operations.len() - 1) as i32;
         let Some(descr) = op.getdescr() else {
             return;
@@ -2024,8 +2026,9 @@ impl<'a> RegAlloc<'a> {
     /// docstring + `majit-ir/src/op_type_index.rs:144-164` for the
     /// shared cranelift caller seeding gap rationale.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
             if !arg.is_constant() && !arg.is_none() {
+                let arg = arg.to_opref();
                 let tp = self.opref_type(arg).unwrap_or(Type::Int);
                 self.possibly_free_var(arg, tp);
             }
@@ -2325,6 +2328,7 @@ impl<'a> RegAlloc<'a> {
             Some(fa) => fa,
             None => return Vec::new(),
         };
+        let fail_args: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
         self.locs_for_fail_args(&fail_args)
     }
 
@@ -2412,15 +2416,17 @@ impl<'a> RegAlloc<'a> {
 
     /// Free args and result of an op (x86/regalloc.py:308).
     fn _free_op_vars(&mut self, op: &Op) {
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
             if !arg.is_constant() && !arg.is_none() {
+                let arg = arg.to_opref();
                 let tp = self.tp(arg);
                 self.possibly_free_var(arg, tp);
             }
         }
         if let Some(fail_args) = op.getfailargs() {
-            for &arg in fail_args.iter() {
+            for arg in fail_args.iter() {
                 if !arg.is_constant() && !arg.is_none() {
+                    let arg = arg.to_opref();
                     let tp = self.tp(arg);
                     self.possibly_free_var(arg, tp);
                 }
@@ -3340,9 +3346,10 @@ impl<'a> RegAlloc<'a> {
             }
             // aarch64/regalloc.py:947 prepare_op_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+                let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
                 let mut arglocs = Vec::new();
-                for (idx, &arg) in op.getarglist().iter().enumerate() {
+                for (idx, arg) in op.getarglist().iter().enumerate() {
+                    let arg = arg.to_opref();
                     let tp = if idx == 0 { Type::Ref } else { Type::Int };
                     arglocs.push(self.make_sure_var_in_reg(arg, tp, &args, None, false));
                 }
@@ -3405,8 +3412,8 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:527 _consider_binop_part
     fn _consider_binop_part(&mut self, op: &Op, symm: bool) -> (Loc, Loc) {
-        let mut x = op.arg(0);
-        let mut y = op.arg(1);
+        let mut x = op.arg(0).to_opref();
+        let mut y = op.arg(1).to_opref();
         let xloc = self.loc(x, self.tp(x));
         let mut argloc = self.loc(y, self.tp(y));
 
@@ -3428,7 +3435,7 @@ impl<'a> RegAlloc<'a> {
         }
 
         let tp = self.tp(x);
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let loc = self.rm.force_result_in_reg(
             op.pos.get(),
             x,
@@ -3456,18 +3463,19 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:556 _consider_lea
     fn _consider_lea(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let x = op.arg(0);
+        let x = op.arg(0).to_opref();
         let loc = self.make_sure_var_in_reg(x, self.tp(x), &[], None, false);
         // make it possible to have argloc be == loc if x dies
         self.possibly_free_var(x, self.tp(x));
-        let argloc = self.loc(op.arg(1), self.tp(op.arg(1)));
+        let y = op.arg(1).to_opref();
+        let argloc = self.loc(y, self.tp(y));
         let resloc = Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
         self.perform(i, vec![loc, argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py:566 consider_int_add — LEA when const fits 32 bits.
     fn consider_int_add(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let y = op.arg(1);
+        let y = op.arg(1).to_opref();
         if y.is_constant() {
             let val = self.const_value(y);
             if fits_in_32bits(val) {
@@ -3479,7 +3487,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:575 consider_int_sub
     fn consider_int_sub(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let y = op.arg(1);
+        let y = op.arg(1).to_opref();
         if y.is_constant() {
             let val = self.const_value(y);
             if fits_in_32bits(-val) {
@@ -3499,16 +3507,16 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let y = op.arg(1);
+            let y = op.arg(1).to_opref();
             let loc2 = if y.is_constant() {
                 self.rm.convert_to_imm(y, &self.constants)
             } else {
                 self.make_sure_var_in_reg(y, Type::Int, &[], Some(ECX), false)
             };
-            let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+            let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
             let loc1 = self.rm.force_result_in_reg(
                 op.pos.get(),
-                op.arg(0),
+                op.arg(0).to_opref(),
                 Type::Int,
                 &args,
                 &mut self.longevity,
@@ -3522,10 +3530,10 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py int_neg / int_invert / int_is_true / int_is_zero / int_signext
     fn consider_unary_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let loc = self.rm.force_result_in_reg(
             op.pos.get(),
-            op.arg(0),
+            op.arg(0).to_opref(),
             Type::Int,
             &args,
             &mut self.longevity,
@@ -3545,8 +3553,8 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let mut arg1 = op.arg(0);
-            let mut arg2 = op.arg(1);
+            let mut arg1 = op.arg(0).to_opref();
+            let mut arg2 = op.arg(1).to_opref();
             // x86/regalloc.py:594 — optimized for (box, const)
             if arg1.is_constant() {
                 std::mem::swap(&mut arg1, &mut arg2);
@@ -3586,8 +3594,8 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:618 consider_int_signext
     fn consider_int_signext(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let argloc = self.loc(op.arg(0), Type::Int);
-        let numbytesloc = self.loc(op.arg(1), Type::Int);
+        let argloc = self.loc(op.arg(0).to_opref(), Type::Int);
+        let numbytesloc = self.loc(op.arg(1).to_opref(), Type::Int);
         let resloc = Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
         self.perform(i, vec![argloc, numbytesloc], Some(resloc), output);
     }
@@ -3628,7 +3636,7 @@ impl<'a> RegAlloc<'a> {
         if next_op.num_args() == 0
             || next_op.arg(0).is_constant()
             || result.is_constant()
-            || next_op.arg(0).raw() != result.raw()
+            || next_op.arg(0).to_opref().raw() != result.raw()
         {
             return false;
         }
@@ -3646,11 +3654,16 @@ impl<'a> RegAlloc<'a> {
         // body op result.
         if opnum != OpCode::CondCallN {
             if let Some(fail_args) = next_op.getfailargs() {
-                if fail_args.iter().any(|a| *a == result) {
+                if fail_args.iter().any(|a| a.to_opref() == result) {
                     return false;
                 }
             }
-        } else if next_op.getarglist().iter().skip(1).any(|a| *a == result) {
+        } else if next_op
+            .getarglist()
+            .iter()
+            .skip(1)
+            .any(|a| a.to_opref() == result)
+        {
             return false;
         }
         true
@@ -3682,8 +3695,8 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:636 _consider_compop
     fn consider_compop(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let vx = op.arg(0);
-        let vy = op.arg(1);
+        let vx = op.arg(0).to_opref();
+        let vy = op.arg(1).to_opref();
         let mut arglocs = vec![self.loc(vx, self.tp(vx)), self.loc(vy, self.tp(vy))];
         // x86/regalloc.py:640-644
         let vx_in_reg = self.rm.reg_bindings_contains(vx, &self.longevity);
@@ -3855,33 +3868,35 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:435 _consider_guard_cc
     fn consider_guard_cc(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let arg = op.arg(0);
+        let arg = op.arg(0).to_opref();
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
         self.perform_guard(op, i, vec![loc], None, output);
     }
 
     /// x86/regalloc.py:496 consider_guard_value
     fn consider_guard_value(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let x = self.make_sure_var_in_reg(op.arg(0), self.tp(op.arg(0)), &[], None, false);
-        let y = self.loc(op.arg(1), self.tp(op.arg(1)));
+        let arg0 = op.arg(0).to_opref();
+        let arg1 = op.arg(1).to_opref();
+        let x = self.make_sure_var_in_reg(arg0, self.tp(arg0), &[], None, false);
+        let y = self.loc(arg1, self.tp(arg1));
         self.perform_guard(op, i, vec![x, y], None, output);
     }
 
     /// x86/regalloc.py:503 consider_guard_class
     fn consider_guard_class(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let x = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &[], None, false);
-        let y = self.loc(op.arg(1), Type::Int);
+        let x = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
+        let y = self.loc(op.arg(1).to_opref(), Type::Int);
         self.perform_guard(op, i, vec![x, y], None, output);
     }
 
     /// x86/regalloc.py:468 consider_guard_exception
     fn consider_guard_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &[], None, false);
+        let loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         // x86/regalloc.py:470 box = TempVar()
         let tmp = self.fresh_temp_var();
         self.longevity
             .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let loc1 = Loc::Reg(self.rm.force_allocate_reg(
             tmp,
             &args,
@@ -3912,9 +3927,9 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:486 consider_restore_exception
     fn consider_restore_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
-        let loc0 = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
-        let loc1 = self.make_sure_var_in_reg(op.arg(1), Type::Ref, &args, None, false);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
+        let loc1 = self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Ref, &args, None, false);
         self.perform_discard(i, vec![loc0, loc1], output);
     }
 
@@ -3941,8 +3956,9 @@ impl<'a> RegAlloc<'a> {
     /// (assembler.py:1630-1641 `genop_discard_check_memory_error` /
     /// opassembler.py:258 `emit_op_check_memory_error`).
     fn consider_check_memory_error(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let tp = self.tp(op.arg(0));
-        let loc = self.make_sure_var_in_reg(op.arg(0), tp, &[], None, false);
+        let arg0 = op.arg(0).to_opref();
+        let tp = self.tp(arg0);
+        let loc = self.make_sure_var_in_reg(arg0, tp, &[], None, false);
         self.perform(i, vec![loc], None, output);
     }
 
@@ -3963,8 +3979,9 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:445 consider_finish
     fn consider_finish(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let locs = if op.num_args() != 0 {
-            let tp = self.tp(op.arg(0));
-            vec![self.make_sure_var_in_reg(op.arg(0), tp, &[], None, false)]
+            let arg0 = op.arg(0).to_opref();
+            let tp = self.tp(arg0);
+            vec![self.make_sure_var_in_reg(arg0, tp, &[], None, false)]
         } else {
             vec![]
         };
@@ -3989,8 +4006,8 @@ impl<'a> RegAlloc<'a> {
     ///          resloc = force_allocate_reg(op)
     fn consider_same_as(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
-        let arg = op.arg(0);
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let arg = op.arg(0).to_opref();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // aarch64/regalloc.py:880-884
         let argloc = if arg.is_constant() {
             self.rm.convert_to_imm(arg, &self.constants)
@@ -4033,17 +4050,17 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:661 _consider_float_op
     fn consider_float_op(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc1 = self.xrm.loc(
-            op.arg(1),
+            op.arg(1).to_opref(),
             Type::Float,
             false,
             &mut self.longevity,
             &mut self.fm,
             &self.constants,
         );
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let loc0 = self.xrm.force_result_in_reg(
             op.pos.get(),
-            op.arg(0),
+            op.arg(0).to_opref(),
             Type::Float,
             &args,
             &mut self.longevity,
@@ -4086,10 +4103,10 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py float_neg / float_abs
     fn consider_float_unary(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let loc = self.xrm.force_result_in_reg(
             op.pos.get(),
-            op.arg(0),
+            op.arg(0).to_opref(),
             Type::Float,
             &args,
             &mut self.longevity,
@@ -4123,8 +4140,8 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:672 _consider_float_cmp
     fn consider_float_cmp(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let vx = op.arg(0);
-        let vy = op.arg(1);
+        let vx = op.arg(0).to_opref();
+        let vy = op.arg(1).to_opref();
         let mut arglocs = vec![self.loc(vx, Type::Float), self.loc(vy, Type::Float)];
         let vx_in_reg = self.xrm.reg_bindings_contains(vx, &self.longevity);
         let vy_in_reg = self.xrm.reg_bindings_contains(vy, &self.longevity);
@@ -4156,7 +4173,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py cast_int_to_float
     fn consider_cast_int_to_float(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let loc0 = self.make_sure_var_in_reg(op.arg(0), Type::Int, &[], None, false);
+        let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Int, &[], None, false);
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Float, &[], None, false));
         self.perform(i, vec![loc0], Some(result_loc), output);
@@ -4176,7 +4193,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py cast_float_to_int
     fn consider_cast_float_to_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let loc0 = self.make_sure_var_in_reg(op.arg(0), Type::Float, &[], None, false);
+        let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Float, &[], None, false);
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
         self.perform(i, vec![loc0], Some(result_loc), output);
@@ -4196,7 +4213,7 @@ impl<'a> RegAlloc<'a> {
 
     /// Memory load: getfield pattern (1 arg → result)
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &[], None, false);
+        let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
         self.perform(i, vec![base_loc], Some(result_loc), output);
@@ -4218,9 +4235,11 @@ impl<'a> RegAlloc<'a> {
 
     /// Memory load: getarrayitem pattern (2 args → result)
     fn consider_getarrayitem(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
-        let index_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
+        let index_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
@@ -4245,9 +4264,11 @@ impl<'a> RegAlloc<'a> {
 
     /// Memory load: getinteriorfield (3 args → result)
     fn consider_getinteriorfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
-        let index_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
+        let index_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
@@ -4402,9 +4423,9 @@ impl<'a> RegAlloc<'a> {
     /// Returns [base_loc, ofs_loc, res_loc, imm(nsize)].
     fn consider_gc_load(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // aarch64/regalloc.py:537
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &[], None, false);
+        let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         // aarch64/regalloc.py:535-543: ofs = op.getarg(1).getint(); check_imm_arg
-        let ofs = self.const_value(op.arg(1));
+        let ofs = self.const_value(op.arg(1).to_opref());
         let ofs_loc = if check_imm_arg(ofs) {
             Loc::Immed(ImmedLoc::new(ofs))
         } else {
@@ -4414,7 +4435,7 @@ impl<'a> RegAlloc<'a> {
         };
         // aarch64/regalloc.py:536: nsize = op.getarg(2).getint()
         let nsize = if op.num_args() > 2 {
-            self.const_value(op.arg(2))
+            self.const_value(op.arg(2).to_opref())
         } else {
             op.getdescr()
                 .and_then(|d| {
@@ -4449,28 +4470,30 @@ impl<'a> RegAlloc<'a> {
     /// Returns [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)].
     #[cfg(target_arch = "aarch64")]
     fn consider_gc_load_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // aarch64/regalloc.py:564
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
         // aarch64/regalloc.py:565
-        let index_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let index_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         // aarch64/regalloc.py:566 `assert boxes[2].getint() == 1` — aarch64 load
         // has no scaled addressing form, so the rewriter must have already
         // pre-scaled the index (load_supported_factors = (1,) per
         // `gc_store_supported_factors()` in runner.rs).
-        let scale = self.const_value(op.arg(2));
+        let scale = self.const_value(op.arg(2).to_opref());
         assert_eq!(
             scale, 1,
             "aarch64 GcLoadIndexed requires factor == 1 (got {scale})"
         );
         // aarch64/regalloc.py:567-568: ofs/nsize getint
         let ofs = if op.num_args() > 3 {
-            self.const_value(op.arg(3))
+            self.const_value(op.arg(3).to_opref())
         } else {
             0
         };
         let nsize = if op.num_args() > 4 {
-            self.const_value(op.arg(4))
+            self.const_value(op.arg(4).to_opref())
         } else {
             8
         };
@@ -4497,11 +4520,13 @@ impl<'a> RegAlloc<'a> {
     /// + result_loc.
     #[cfg(target_arch = "x86_64")]
     fn consider_gc_load_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // x86/regalloc.py:1175
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
         // x86/regalloc.py:1176
-        let ofs_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let ofs_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         // x86/regalloc.py:1177
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
@@ -4515,10 +4540,10 @@ impl<'a> RegAlloc<'a> {
             5,
             "GC_LOAD_INDEXED must have 5 operands (ptr, idx, scale, offset, size)"
         );
-        let scale = self.const_value(op.arg(2));
-        let offset = self.const_value(op.arg(3));
+        let scale = self.const_value(op.arg(2).to_opref());
+        let offset = self.const_value(op.arg(3).to_opref());
         // x86/regalloc.py:1186 `nsize = size_box.value  # negative for "signed"`
-        let nsize = self.const_value(op.arg(4));
+        let nsize = self.const_value(op.arg(4).to_opref());
         // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
         let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
         // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
@@ -4541,10 +4566,11 @@ impl<'a> RegAlloc<'a> {
 
     /// Memory store: setfield pattern (2 args: base, value)
     fn consider_setfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
-        let tp_val = self.tp(op.arg(1));
-        let val_loc = self.make_sure_var_in_reg(op.arg(1), tp_val, &args, None, false);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
+        let tp_val = self.tp(op.arg(1).to_opref());
+        let val_loc = self.make_sure_var_in_reg(op.arg(1).to_opref(), tp_val, &args, None, false);
         self.perform_discard(i, vec![base_loc, val_loc], output);
     }
 
@@ -4564,11 +4590,13 @@ impl<'a> RegAlloc<'a> {
 
     /// Memory store: setarrayitem pattern (3 args: base, index, value)
     fn consider_setarrayitem(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
-        let index_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
-        let tp_val = self.tp(op.arg(2));
-        let val_loc = self.make_sure_var_in_reg(op.arg(2), tp_val, &args, None, false);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
+        let index_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
+        let tp_val = self.tp(op.arg(2).to_opref());
+        let val_loc = self.make_sure_var_in_reg(op.arg(2).to_opref(), tp_val, &args, None, false);
         self.perform_discard(i, vec![base_loc, index_loc, val_loc], output);
     }
 
@@ -4701,17 +4729,18 @@ impl<'a> RegAlloc<'a> {
     /// aarch64/regalloc.py:520 prepare_op_gc_store parity.
     /// Returns [value_loc, base_loc, ofs_loc, imm(size)].
     fn consider_gc_store(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // aarch64/regalloc.py:522
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
         // aarch64/regalloc.py:523: ofs = boxes[1].getint()
-        let ofs = self.const_value(op.arg(1));
+        let ofs = self.const_value(op.arg(1).to_opref());
         // aarch64/regalloc.py:524
-        let tp_val = self.tp(op.arg(2));
-        let value_loc = self.make_sure_var_in_reg(op.arg(2), tp_val, &args, None, false);
+        let tp_val = self.tp(op.arg(2).to_opref());
+        let value_loc = self.make_sure_var_in_reg(op.arg(2).to_opref(), tp_val, &args, None, false);
         // aarch64/regalloc.py:525: size = boxes[3].getint()
         let size = if op.num_args() > 3 {
-            self.const_value(op.arg(3))
+            self.const_value(op.arg(3).to_opref())
         } else {
             8
         };
@@ -4741,30 +4770,32 @@ impl<'a> RegAlloc<'a> {
     /// Returns [value_loc, base_loc, index_loc, imm(size), imm(ofs)].
     #[cfg(target_arch = "aarch64")]
     fn consider_gc_store_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // aarch64/regalloc.py:554
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
         // aarch64/regalloc.py:555
-        let tp_val = self.tp(op.arg(2));
-        let value_loc = self.make_sure_var_in_reg(op.arg(2), tp_val, &args, None, false);
+        let tp_val = self.tp(op.arg(2).to_opref());
+        let value_loc = self.make_sure_var_in_reg(op.arg(2).to_opref(), tp_val, &args, None, false);
         // aarch64/regalloc.py:556
-        let index_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let index_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         // aarch64/regalloc.py:557 `assert boxes[3].getint() == 1` — the
         // aarch64 store has no scaled addressing form so the rewriter must
         // have pre-scaled the index (load_supported_factors = (1,)).
-        let scale = self.const_value(op.arg(3));
+        let scale = self.const_value(op.arg(3).to_opref());
         assert_eq!(
             scale, 1,
             "aarch64 GcStoreIndexed requires factor == 1 (got {scale})"
         );
         // aarch64/regalloc.py:558-559: ofs/size getint
         let ofs = if op.num_args() > 4 {
-            self.const_value(op.arg(4))
+            self.const_value(op.arg(4).to_opref())
         } else {
             0
         };
         let size = if op.num_args() > 5 {
-            self.const_value(op.arg(5))
+            self.const_value(op.arg(5).to_opref())
         } else {
             8
         };
@@ -4786,22 +4817,23 @@ impl<'a> RegAlloc<'a> {
     /// Returns [base_loc, ofs_loc, value_loc, imm(factor), imm(offset), imm(size)].
     #[cfg(target_arch = "x86_64")]
     fn consider_gc_store_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         // x86/regalloc.py:1129
-        let base_loc = self.make_sure_var_in_reg(op.arg(0), Type::Ref, &args, None, false);
+        let base_loc =
+            self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &args, None, false);
         // x86/regalloc.py:1130-1138: scale/offset/size are ConstInt
         let factor = if op.num_args() > 3 {
-            self.const_value(op.arg(3))
+            self.const_value(op.arg(3).to_opref())
         } else {
             1
         };
         let offset = if op.num_args() > 4 {
-            self.const_value(op.arg(4))
+            self.const_value(op.arg(4).to_opref())
         } else {
             0
         };
         let size = if op.num_args() > 5 {
-            self.const_value(op.arg(5))
+            self.const_value(op.arg(5).to_opref())
         } else {
             8
         };
@@ -4815,10 +4847,12 @@ impl<'a> RegAlloc<'a> {
         );
         let need_lower_byte = size == 1;
         // x86/regalloc.py:1144-1145
-        let tp_val = self.tp(op.arg(2));
-        let value_loc = self.make_sure_var_in_reg(op.arg(2), tp_val, &args, None, need_lower_byte);
+        let tp_val = self.tp(op.arg(2).to_opref());
+        let value_loc =
+            self.make_sure_var_in_reg(op.arg(2).to_opref(), tp_val, &args, None, need_lower_byte);
         // x86/regalloc.py:1146
-        let ofs_loc = self.make_sure_var_in_reg(op.arg(1), Type::Int, &args, None, false);
+        let ofs_loc =
+            self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         // x86/regalloc.py:1147-1148
         self.perform_discard(
             i,
@@ -4867,7 +4901,8 @@ impl<'a> RegAlloc<'a> {
         } else {
             0
         })));
-        for (arg_index, &arg) in op.getarglist().iter().enumerate() {
+        for (arg_index, arg) in op.getarglist().iter().enumerate() {
+            let arg = arg.to_opref();
             let tp = if arg_index >= first_arg_index {
                 calldescr.arg_types()[arg_index - first_arg_index]
             } else {
@@ -5048,10 +5083,11 @@ impl<'a> RegAlloc<'a> {
     fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // llsupport/regalloc.py:897: self.rm._sync_var_to_stack(op.getarg(k))
         // Force all register-held args to frame before before_call.
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
             if arg.is_constant() {
                 continue;
             }
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             if tp == Type::Float {
                 self.xrm
@@ -5087,7 +5123,8 @@ impl<'a> RegAlloc<'a> {
 
         // After before_call, all args are in Frame or Const — safe for calloc.
         let mut arglocs: Vec<Loc> = Vec::new();
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             arglocs.push(self.loc_must_exist(arg, tp));
         }
@@ -5205,7 +5242,8 @@ impl<'a> RegAlloc<'a> {
         );
 
         let mut arglocs = Vec::new();
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             arglocs.push(self.loc(arg, tp));
         }
@@ -5330,7 +5368,7 @@ impl<'a> RegAlloc<'a> {
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py:968: sizeloc = size_box.getint()
-        let size_val = self.const_value(op.arg(0));
+        let size_val = self.const_value(op.arg(0).to_opref());
         let arglocs = vec![Loc::Immed(ImmedLoc::new(size_val))];
         self.perform_with_gcmap(i, arglocs, Some(Loc::Reg(result_reg)), output);
     }
@@ -5397,7 +5435,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         // aarch64/regalloc.py:984: sizeloc = make_sure_var_in_reg(size_box)
-        let size_box = op.arg(0);
+        let size_box = op.arg(0).to_opref();
         let sizeloc = self.make_sure_var_in_reg(size_box, Type::Int, &[], None, false);
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -5536,11 +5574,11 @@ impl<'a> RegAlloc<'a> {
             &mut self.fm,
         );
         // aarch64/regalloc.py:1027: lengthloc = self.rm.loc(length_box)
-        let lengthloc = self.loc(op.arg(2), Type::Int);
+        let lengthloc = self.loc(op.arg(2).to_opref(), Type::Int);
         // aarch64/regalloc.py:1030: itemsize = op.getarg(1).getint()
-        let itemsize = self.const_value(op.arg(1));
+        let itemsize = self.const_value(op.arg(1).to_opref());
         // aarch64/regalloc.py:1033: kind = op.getarg(0).getint()
-        let kind = self.const_value(op.arg(0));
+        let kind = self.const_value(op.arg(0).to_opref());
         self.perform_with_gcmap(
             i,
             vec![
@@ -5605,10 +5643,12 @@ impl<'a> RegAlloc<'a> {
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args = descr_id.map(|id| (id, op.getarglist().to_vec()));
+        self.final_jump_args =
+            descr_id.map(|id| (id, op.getarglist().iter().map(|a| a.to_opref()).collect()));
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             locs.push(self.loc_must_exist(arg, tp));
         }
@@ -5636,7 +5676,8 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:1360 consider_label
     fn consider_label(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let position = self.rm.position;
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             if self
                 .longevity
@@ -5648,7 +5689,8 @@ impl<'a> RegAlloc<'a> {
         }
 
         let mut locs = Vec::new();
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
             match loc {
@@ -5791,8 +5833,8 @@ impl<'a> RegAlloc<'a> {
     /// load_effective_address: all args in regs
     fn consider_load_effective_address(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
-        for &arg in op.getarglist().iter() {
-            locs.push(self.loc(arg, Type::Int));
+        for arg in op.getarglist().iter() {
+            locs.push(self.loc(arg.to_opref(), Type::Int));
         }
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
@@ -5835,7 +5877,7 @@ impl<'a> RegAlloc<'a> {
 
     /// Discard op with 3 args (zero_array, strsetitem, etc.)
     fn consider_discard_3args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let args: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let mut locs = Vec::new();
         for &arg in &args {
             let tp = self.tp(arg);
@@ -5861,7 +5903,8 @@ impl<'a> RegAlloc<'a> {
     /// Generic discard with N args
     fn consider_discard_nargs(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
-        for &arg in op.getarglist().iter() {
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
             let tp = self.tp(arg);
             locs.push(self.loc(arg, tp));
         }
@@ -5951,17 +5994,19 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 mod tests {
     use super::*;
     use majit_ir::VecAssoc;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
-        let mut op = Op::new(opcode, args);
+        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let mut op = Op::new(opcode, &bx);
         op.pos.set(OpRef::int_op(pos));
         op
     }
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {
         let mut op = make_op(opcode, pos, args);
-        op.setfailargs(fail_args.iter().copied().collect());
+        op.setfailargs(fail_args.iter().map(|a| BoxRef::from_opref(*a)).collect());
         op
     }
 
@@ -6118,13 +6163,16 @@ mod tests {
 
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
-        let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[BoxRef::from_opref(i0), BoxRef::from_opref(c1)],
+        );
         add.pos.set(i1);
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[i1]);
+        let mut is_true = Op::new(OpCode::IntIsTrue, &[BoxRef::from_opref(i1)]);
         is_true.pos.set(i2);
-        let mut guard = Op::new(OpCode::GuardTrue, &[i2]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(i2)]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![i1].into());
+        guard.setfailargs(vec![BoxRef::from_opref(i1)].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());
@@ -6167,7 +6215,14 @@ mod tests {
         let c0 = OpRef::const_int(0);
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
 
-        let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
+        let store = Op::new(
+            OpCode::GcStore,
+            &[
+                BoxRef::from_opref(i0),
+                BoxRef::from_opref(c0),
+                BoxRef::from_opref(i0),
+            ],
+        );
         let ops = vec![store];
 
         let mut ra = RegAlloc::new(
@@ -6217,9 +6272,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::IntIsTrue, &[i0]);
+        let mut raw = Op::new(OpCode::IntIsTrue, &[BoxRef::from_opref(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6266,10 +6321,10 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::GuardTrue, &[i0]);
+        let mut raw = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(i0)]);
         raw.pos.set(OpRef::int_op(2));
         raw.setfailargs(vec![].into());
-        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6308,9 +6363,16 @@ mod tests {
             InputArg::from_type(Type::Ref, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::GcLoadI, &[i0, c0, c8]);
+        let mut raw = Op::new(
+            OpCode::GcLoadI,
+            &[
+                BoxRef::from_opref(i0),
+                BoxRef::from_opref(c0),
+                BoxRef::from_opref(c8),
+            ],
+        );
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6357,8 +6419,16 @@ mod tests {
             InputArg::from_type(Type::Int, i2.raw()),
         ];
 
-        let raw = Op::new(OpCode::GcStore, &[i0, c0, i2, c8]);
-        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        let raw = Op::new(
+            OpCode::GcStore,
+            &[
+                BoxRef::from_opref(i0),
+                BoxRef::from_opref(c0),
+                BoxRef::from_opref(i2),
+                BoxRef::from_opref(c8),
+            ],
+        );
+        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6399,9 +6469,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::SameAsI, &[i0]);
+        let mut raw = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 

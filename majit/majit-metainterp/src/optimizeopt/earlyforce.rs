@@ -71,9 +71,9 @@ impl Optimization for OptEarlyForce {
             // which uses ctx.current_pass_idx (== earlyforce_idx) for
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
-                let arg = ctx.get_box_replacement(op.arg(i));
+                let arg = ctx.get_box_replacement(op.arg(i).to_opref());
                 let arg_is_virtual = ctx
-                    .get_box_replacement_box(op.arg(i))
+                    .get_box_replacement_box(op.arg(i).to_opref())
                     .as_ref()
                     .map_or(false, |b| ctx.is_virtual(b));
                 if arg_is_virtual {
@@ -109,6 +109,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
+    use majit_ir::box_ref::BoxRef;
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -121,7 +122,10 @@ mod tests {
     fn test_earlyforce_resolves_call_may_force_args() {
         let mut ops = vec![Op::new(
             OpCode::CallMayForceN,
-            &[OpRef::input_arg_ref(100), OpRef::input_arg_ref(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_ref(100)),
+                BoxRef::from_opref(OpRef::input_arg_ref(101)),
+            ],
         )];
         assign_positions(&mut ops);
 
@@ -138,7 +142,10 @@ mod tests {
     fn test_earlyforce_passthrough_non_call() {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
         assign_positions(&mut ops);
 
@@ -155,7 +162,7 @@ mod tests {
     fn test_earlyforce_call_assembler_handled() {
         let mut ops = vec![Op::new(
             OpCode::CallAssemblerI,
-            &[OpRef::input_arg_ref(100)],
+            &[BoxRef::from_opref(OpRef::input_arg_ref(100))],
         )];
         assign_positions(&mut ops);
 
@@ -196,7 +203,10 @@ mod tests {
             OpCode::CallMayForceF,
             OpCode::CallMayForceN,
         ] {
-            let mut ops = vec![Op::new(opcode, &[OpRef::input_arg_ref(100)])];
+            let mut ops = vec![Op::new(
+                opcode,
+                &[BoxRef::from_opref(OpRef::input_arg_ref(100))],
+            )];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();
@@ -212,7 +222,10 @@ mod tests {
         // SETFIELD_GC should NOT force args (earlyforce.py:18)
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
-            &[OpRef::input_arg_ref(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_ref(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
         assign_positions(&mut ops);
 

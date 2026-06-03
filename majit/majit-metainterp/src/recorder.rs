@@ -11,7 +11,8 @@
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::box_ref::BoxRef;
+use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 
 /// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
 /// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
@@ -114,7 +115,11 @@ pub struct Trace {
     /// optimizer (`AbstractValue` object identity).
     ops: Vec<OpRc>,
     /// Input arguments to the trace (live variables at the loop header).
-    inputargs: Vec<InputArg>,
+    /// Stored as `InputArgRc` so the recorder's `box_args` bridge can mint a
+    /// canonical, identity-stable `BoxRef` per input arg (`from_bound_inputarg`
+    /// memoizes on `InputArg::box_cache`), and the same `Rc<InputArg>` flows
+    /// through `into_parts` / `from_oprc` into `TreeLoop.inputargs` unchanged.
+    inputargs: Vec<InputArgRc>,
     /// Next OpRef index to assign.
     op_count: u32,
     /// opencoder.py parity: count of box-yielding positions
@@ -168,7 +173,7 @@ impl Trace {
             "input args must be registered before any operations"
         );
         let index = self.inputargs.len() as u32;
-        self.inputargs.push(InputArg::from_type(tp, index));
+        self.inputargs.push(InputArg::from_type_rc(tp, index));
         let opref = match tp {
             Type::Int => OpRef::input_arg_int(self.op_count),
             Type::Float => OpRef::input_arg_float(self.op_count),
@@ -180,6 +185,50 @@ impl Trace {
         opref
     }
 
+    /// Bridge the recorder's OpRef-operand API to the BoxRef-carrying
+    /// `Op.args` / `Op.fail_args` storage. Each operand resolves to its
+    /// *canonical* producer `BoxRef` so the stored args share one `Rc<Box>`
+    /// per producer (`AbstractValue` object identity): `from_bound_op` /
+    /// `from_bound_inputarg` memoize on `Op::box_cache` / `InputArg::box_cache`.
+    /// Frame registers and the public `record_*` API stay OpRef; the optimizer
+    /// bridges back with `BoxRef::to_opref`, which round-trips to the same
+    /// `OpRef` the frozen `from_opref` view produced.
+    fn box_args(&self, args: &[OpRef]) -> smallvec::SmallVec<[BoxRef; 3]> {
+        args.iter().map(|&a| self.box_for_operand(a)).collect()
+    }
+
+    /// Resolve one operand `OpRef` to its canonical `BoxRef`. Const operands
+    /// carry their `Value` inline on the `OpRef` (history.py:227/268/314) and
+    /// are minted via `from_opref`; InputArg / ResOp operands resolve to the
+    /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`.
+    /// Falls back to the position-only `from_opref` view for any operand that
+    /// does not resolve to a recorded producer (preserving the prior behavior
+    /// rather than introducing a new index panic).
+    fn box_for_operand(&self, r: OpRef) -> BoxRef {
+        if r.is_none() || r.is_constant() {
+            return BoxRef::from_opref(r);
+        }
+        if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = r {
+            if let Some(ia) = self.inputargs.get(r.raw() as usize) {
+                return BoxRef::from_bound_inputarg(ia);
+            }
+            return BoxRef::from_opref(r);
+        }
+        // ResOp operand: positions are dense in op_count order — inputargs
+        // occupy `[0, n)`, recorded ops occupy `[n, ..)` — so the producing op
+        // sits at `self.ops[r.raw() - n]`. Confirm `op.pos` matches before
+        // binding, falling back to `from_opref` on any mismatch.
+        let n = self.inputargs.len();
+        if let Some(idx) = (r.raw() as usize).checked_sub(n) {
+            if let Some(op) = self.ops.get(idx) {
+                if op.pos.get().raw() == r.raw() {
+                    return BoxRef::from_bound_op(op);
+                }
+            }
+        }
+        BoxRef::from_opref(r)
+    }
+
     /// Record a regular (non-guard) operation.
     /// Returns the OpRef for this operation's result.
     ///
@@ -189,7 +238,7 @@ impl Trace {
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let op = Op::new(opcode, args);
+        let op = Op::new(opcode, &self.box_args(args));
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
@@ -209,7 +258,7 @@ impl Trace {
     ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let op = Op::with_descr(opcode, args, descr);
+        let op = Op::with_descr(opcode, &self.box_args(args), descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
@@ -235,8 +284,8 @@ impl Trace {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let op = match descr {
-            Some(d) => Op::with_descr(opcode, args, d),
-            None => Op::new(opcode, args),
+            Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
+            None => Op::new(opcode, &self.box_args(args)),
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
@@ -260,11 +309,11 @@ impl Trace {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let op = match descr {
-            Some(d) => Op::with_descr(opcode, args, d),
-            None => Op::new(opcode, args),
+            Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
+            None => Op::new(opcode, &self.box_args(args)),
         };
         op.pos.set(opref);
-        op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
+        op.setfailargs(self.box_args(fail_args));
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
@@ -298,7 +347,7 @@ impl Trace {
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
-        op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
+        op.setfailargs(self.box_args(fail_args));
     }
 
     /// Set `fail_arg_types` on the last recorded op. Used by
@@ -328,8 +377,8 @@ impl Trace {
         // peeling) bridges the gap by creating a Label with the extended count.
         let opref = OpRef::op_typed(self.op_count, OpCode::Jump.result_type());
         let op = match descr {
-            Some(descr) => Op::with_descr(OpCode::Jump, jump_args, descr),
-            None => Op::new(OpCode::Jump, jump_args),
+            Some(descr) => Op::with_descr(OpCode::Jump, &self.box_args(jump_args), descr),
+            None => Op::new(OpCode::Jump, &self.box_args(jump_args)),
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
@@ -343,7 +392,7 @@ impl Trace {
     /// `finish_args` are the values returned from the trace.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
         let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
-        let op = Op::with_descr(OpCode::Finish, finish_args, descr);
+        let op = Op::with_descr(OpCode::Finish, &self.box_args(finish_args), descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
@@ -357,7 +406,7 @@ impl Trace {
     /// history.py parity: the recording phase ends and the trace is handed
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
-    pub fn into_parts(self) -> (Vec<InputArg>, Vec<OpRc>) {
+    pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
         (self.inputargs, self.ops)
     }
 
@@ -435,7 +484,7 @@ impl Trace {
     }
 
     /// Access the recorded input arguments.
-    pub fn inputargs(&self) -> &[InputArg] {
+    pub fn inputargs(&self) -> &[InputArgRc] {
         &self.inputargs
     }
 
@@ -584,7 +633,7 @@ mod tests {
         assert_eq!(trace.num_ops(), 2); // IntAdd + Jump
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[1].opcode, OpCode::Jump);
-        assert_eq!(trace.ops[1].arg(0), i1);
+        assert_eq!(trace.ops[1].arg(0).to_opref(), i1);
     }
 
     #[test]
@@ -753,12 +802,12 @@ mod tests {
         assert_eq!(trace.ops[2].opcode, OpCode::Jump);
 
         // First add uses input args i0, i1.
-        assert_eq!(trace.ops[0].arg(0), i0);
-        assert_eq!(trace.ops[0].arg(1), i1);
+        assert_eq!(trace.ops[0].arg(0).to_opref(), i0);
+        assert_eq!(trace.ops[0].arg(1).to_opref(), i1);
 
         // Second add references the result of first add and i0.
-        assert_eq!(trace.ops[1].arg(0), add0);
-        assert_eq!(trace.ops[1].arg(1), i0);
+        assert_eq!(trace.ops[1].arg(0).to_opref(), add0);
+        assert_eq!(trace.ops[1].arg(1).to_opref(), i0);
     }
 
     #[test]
@@ -795,8 +844,8 @@ mod tests {
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[0].pos.get(), iop(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
-        assert_eq!(trace.ops[1].arg(0), add); // references the add result
-        assert_eq!(trace.ops[1].arg(1), i0); // references the input arg
+        assert_eq!(trace.ops[1].arg(0).to_opref(), add); // references the add result
+        assert_eq!(trace.ops[1].arg(1).to_opref(), i0); // references the input arg
     }
 
     #[test]
@@ -821,9 +870,9 @@ mod tests {
         assert!(guard_op.opcode.is_guard());
         let fail_args = guard_op.getfailargs().unwrap();
         assert_eq!(fail_args.len(), 3);
-        assert_eq!(fail_args[0], i0);
-        assert_eq!(fail_args[1], i1);
-        assert_eq!(fail_args[2], add);
+        assert_eq!(fail_args[0].to_opref(), i0);
+        assert_eq!(fail_args[1].to_opref(), i1);
+        assert_eq!(fail_args[2].to_opref(), add);
     }
 
     #[test]
@@ -853,14 +902,14 @@ mod tests {
         // First guard's fail_args
         let fa0 = guards[0].getfailargs().unwrap();
         assert_eq!(fa0.len(), 2);
-        assert_eq!(fa0[0], i0);
-        assert_eq!(fa0[1], i1);
+        assert_eq!(fa0[0].to_opref(), i0);
+        assert_eq!(fa0[1].to_opref(), i1);
 
         // Second guard's fail_args
         let fa1 = guards[1].getfailargs().unwrap();
         assert_eq!(fa1.len(), 2);
-        assert_eq!(fa1[0], i0);
-        assert_eq!(fa1[1], add);
+        assert_eq!(fa1[0].to_opref(), i0);
+        assert_eq!(fa1[1].to_opref(), add);
     }
 
     #[test]
@@ -877,8 +926,8 @@ mod tests {
         let jump = trace.ops.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(jump.num_args(), trace.num_inputargs());
-        assert_eq!(jump.arg(0), add);
-        assert_eq!(jump.arg(1), i1);
+        assert_eq!(jump.arg(0).to_opref(), add);
+        assert_eq!(jump.arg(1).to_opref(), i1);
     }
 
     #[test]
@@ -898,7 +947,7 @@ mod tests {
         let finish_op = trace.ops.last().unwrap();
         assert_eq!(finish_op.opcode, OpCode::Finish);
         assert_eq!(finish_op.num_args(), 1);
-        assert_eq!(finish_op.arg(0), add);
+        assert_eq!(finish_op.arg(0).to_opref(), add);
         assert!(finish_op.has_descr());
     }
 
@@ -1055,7 +1104,7 @@ mod tests {
         rec.close_loop(&[add]);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].arg(1), const_ref);
+        assert_eq!(trace.ops[0].arg(1).to_opref(), const_ref);
         assert!(trace.ops[0].arg(1).is_constant());
     }
 
@@ -1073,8 +1122,11 @@ mod tests {
         let trace = rec.get_trace();
 
         // Both ops reference the same constant
-        assert_eq!(trace.ops[0].arg(1), trace.ops[1].arg(1));
-        assert_eq!(trace.ops[0].arg(1), const_ref);
+        assert_eq!(
+            trace.ops[0].arg(1).to_opref(),
+            trace.ops[1].arg(1).to_opref()
+        );
+        assert_eq!(trace.ops[0].arg(1).to_opref(), const_ref);
     }
 
     #[test]
@@ -1121,7 +1173,7 @@ mod tests {
             assert_eq!(op.opcode, OpCode::IntAdd);
             if i > 0 {
                 // The previous IntAdd produced BoxInt(i) (offset by inputarg).
-                assert_eq!(op.arg(0), iop(i as u32));
+                assert_eq!(op.arg(0).to_opref(), iop(i as u32));
             }
         }
     }
@@ -1181,7 +1233,7 @@ mod tests {
 
         // Verify all fail_args match what we specified
         for (i, &expected) in fail_args.iter().enumerate() {
-            assert_eq!(fa[i], expected);
+            assert_eq!(fa[i].to_opref(), expected);
         }
     }
 
@@ -1269,8 +1321,8 @@ mod tests {
 
         assert_eq!(trace.num_ops(), 1); // Only Jump
         assert_eq!(trace.ops[0].opcode, OpCode::Jump);
-        assert_eq!(trace.ops[0].arg(0), i0);
-        assert_eq!(trace.ops[0].arg(1), i1);
+        assert_eq!(trace.ops[0].arg(0).to_opref(), i0);
+        assert_eq!(trace.ops[0].arg(1).to_opref(), i1);
     }
 
     #[test]

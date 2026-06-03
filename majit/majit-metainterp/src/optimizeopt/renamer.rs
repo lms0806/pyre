@@ -5,6 +5,7 @@
 
 use majit_ir::{Op, OpRef};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::vec_assoc::VecAssoc;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
@@ -46,8 +47,8 @@ impl Renamer {
         //       op.setarg(i, arg)
         for i in 0..op.num_args() {
             let arg = op.arg(i);
-            if let Some(&renamed) = self.rename_map.get(&arg) {
-                op.setarg(i, renamed);
+            if let Some(&renamed) = self.rename_map.get(&arg.to_opref()) {
+                op.setarg(i, BoxRef::from_opref(renamed));
             }
         }
 
@@ -57,10 +58,13 @@ impl Renamer {
             if let Some(fail_args) = op.fail_args_mut() {
                 let cloned: Vec<OpRef> = fail_args
                     .iter()
-                    .map(|arg| self.lookup(*arg).unwrap_or(*arg))
+                    .map(|arg| {
+                        let opref = arg.to_opref();
+                        self.lookup(opref).unwrap_or(opref)
+                    })
                     .collect();
                 fail_args.clear();
-                fail_args.extend(cloned);
+                fail_args.extend(cloned.into_iter().map(BoxRef::from_opref));
             }
         }
 

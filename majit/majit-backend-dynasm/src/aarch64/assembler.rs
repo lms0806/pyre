@@ -2810,7 +2810,7 @@ impl<'a> AssemblerARM64<'a> {
                     let arg_tp = op
                         .getarglist()
                         .get(i)
-                        .and_then(|arg| self.opref_type_at(*arg, Some(op_index)))
+                        .and_then(|arg| self.opref_type_at(arg.to_opref(), Some(op_index)))
                         .unwrap_or(Type::Int);
                     if arg_tp == Type::Float {
                         src_locations2.push(*src_loc);
@@ -3988,8 +3988,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_ADD: result = arg0 + arg1
     fn genop_int_add(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; add x0, x0, x1
         );
@@ -3998,8 +3998,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_SUB: result = arg0 - arg1
     fn genop_int_sub(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; sub x0, x0, x1
         );
@@ -4008,8 +4008,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_MUL: result = arg0 * arg1
     fn genop_int_mul(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; mul x0, x0, x1
         );
@@ -4018,8 +4018,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_AND: result = arg0 & arg1
     fn genop_int_and(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; and x0, x0, x1
         );
@@ -4028,8 +4028,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_OR: result = arg0 | arg1
     fn genop_int_or(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; orr x0, x0, x1
         );
@@ -4038,8 +4038,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_XOR: result = arg0 ^ arg1
     fn genop_int_xor(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; eor x0, x0, x1
         );
@@ -4048,7 +4048,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_NEG: result = -arg0
     fn genop_int_neg(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; neg x0, x0
         );
@@ -4057,7 +4057,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_INVERT: result = ~arg0
     fn genop_int_invert(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; mvn x0, x0
         );
@@ -4066,8 +4066,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_LSHIFT: result = arg0 << arg1
     fn genop_int_lshift(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; lsl x0, x0, x1
         );
@@ -4076,8 +4076,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
     fn genop_int_rshift(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; asr x0, x0, x1
         );
@@ -4086,8 +4086,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
     fn genop_uint_rshift(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; lsr x0, x0, x1
         );
@@ -4101,8 +4101,8 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
     fn genop_int_add_ovf(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
         self.store_rax_to_result(op.pos.get());
         self.guard_success_cc = Some(CC_NO);
@@ -4110,8 +4110,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:1860 genop_int_sub_ovf.
     fn genop_int_sub_ovf(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
         self.store_rax_to_result(op.pos.get());
         self.guard_success_cc = Some(CC_NO);
@@ -4123,8 +4123,8 @@ impl<'a> AssemblerARM64<'a> {
         // compares the high word against the sign-extension of the low
         // word. regalloc.py's prepare_op_guard_no_overflow then uses
         // EQ for INT_MUL_OVF specifically.
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; mul x2, x0, x1
             ; smulh x3, x0, x1
@@ -4146,8 +4146,8 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_int_cmp(&mut self, op: &Op) {
         let cc = Self::opcode_to_cc(op.opcode);
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; cmp x0, x1
         );
@@ -4187,7 +4187,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_IS_TRUE: result = (arg0 != 0)
     fn genop_int_is_true(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; cmp x0, 0
         );
@@ -4199,7 +4199,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_IS_ZERO: result = (arg0 == 0)
     fn genop_int_is_zero(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; cmp x0, 0
         );
@@ -4312,14 +4312,15 @@ impl<'a> AssemblerARM64<'a> {
                 op.getarglist()
                     .iter()
                     .map(|opref| {
-                        self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
-                            panic!(
-                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                        self.opref_type_at(opref.to_opref(), op_index)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "infer_fail_arg_types: opref_type_at({:?}) returned None at \
                                  op_index={:?} (Finish/Jump arg): RPython box.type is fixed at \
                                  construction (resoperation.py:719/727/739)",
-                                opref, op_index
-                            )
-                        })
+                                    opref, op_index
+                                )
+                            })
                     })
                     .collect()
             } else if let Some(fa) = op.getfailargs() {
@@ -4339,7 +4340,7 @@ impl<'a> AssemblerARM64<'a> {
                             // `gc_ref_slots` and the shadow stack.
                             Type::Void
                         } else {
-                            self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
+                            self.opref_type_at(opref.to_opref(), op_index).unwrap_or_else(|| {
                                 panic!(
                                     "infer_fail_arg_types: opref_type_at({:?}) returned None at \
                                      op_index={:?} (fail_arg): RPython box.type is fixed at \
@@ -4361,14 +4362,15 @@ impl<'a> AssemblerARM64<'a> {
                         // Type::Void is the "hole" sentinel.
                         Type::Void
                     } else {
-                        self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
-                            panic!(
-                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                        self.opref_type_at(opref.to_opref(), op_index)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "infer_fail_arg_types: opref_type_at({:?}) returned None at \
                                  op_index={:?} (fail_arg): RPython box.type is fixed at \
                                  construction (resoperation.py:719/727/739)",
-                                opref, op_index
-                            )
-                        })
+                                    opref, op_index
+                                )
+                            })
                     }
                 })
                 .collect()
@@ -4477,7 +4479,7 @@ impl<'a> AssemblerARM64<'a> {
         let n_label = op.num_args();
         // Pass 1: push source values
         for i in 0..n_label {
-            let arg_ref = op.arg(i);
+            let arg_ref = op.arg(i).to_opref();
             if arg_ref.is_none() {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
@@ -4515,9 +4517,9 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         // Remap: Label's arg[i] → canonical slot i
-        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
+        for (i, arg_ref) in op.getarglist().iter().enumerate() {
             if !arg_ref.is_none() {
-                self.opref_to_slot.insert(arg_ref, i);
+                self.opref_to_slot.insert(arg_ref.to_opref(), i);
             }
         }
         self.next_slot = self.next_slot.max(op.num_args());
@@ -4544,9 +4546,9 @@ impl<'a> AssemblerARM64<'a> {
         // Each entry: (src_offset_or_const, dst_offset, is_const, const_val)
         let n = op.num_args();
         let mut moves: Vec<(i32, i32, bool, i64)> = Vec::with_capacity(n);
-        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
+        for (i, arg_ref) in op.getarglist().iter().enumerate() {
             let dst = Self::slot_offset(i);
-            match self.resolve_opref(arg_ref) {
+            match self.resolve_opref(arg_ref.to_opref()) {
                 ResolvedArg::Slot(src) => moves.push((src, dst, false, 0)),
                 ResolvedArg::Const(val) => moves.push((0, dst, true, val)),
             }
@@ -4659,7 +4661,7 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
+        let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
                 explicit.to_vec()
@@ -4696,7 +4698,7 @@ impl<'a> AssemblerARM64<'a> {
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
         if op.num_args() > 0 {
-            let arg0 = op.arg(0);
+            let arg0 = op.arg(0).to_opref();
             let slot0_offset = Self::slot_offset(0);
             if result_type == Type::Float {
                 // Float: load to xmm0, store via MOVSD
@@ -4750,7 +4752,7 @@ impl<'a> AssemblerARM64<'a> {
     /// SAME_AS: result = arg0 (identity).
     /// regalloc.py parity: no code emitted — just alias the slot.
     fn genop_same_as(&mut self, op: &Op) {
-        let arg = op.arg(0);
+        let arg = op.arg(0).to_opref();
         if let Some(&slot) = self.opref_to_slot.get(&arg) {
             self.opref_to_slot.insert(op.pos.get(), slot);
         } else {
@@ -4816,8 +4818,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// FLOAT_ADD: result = arg0 + arg1
     fn genop_float_add(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
-        self.load_float_arg_to_d1(op.arg(1));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
+        self.load_float_arg_to_d1(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fadd d0, d0, d1
         );
@@ -4826,8 +4828,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// FLOAT_SUB: result = arg0 - arg1
     fn genop_float_sub(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
-        self.load_float_arg_to_d1(op.arg(1));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
+        self.load_float_arg_to_d1(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fsub d0, d0, d1
         );
@@ -4836,8 +4838,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// FLOAT_MUL: result = arg0 * arg1
     fn genop_float_mul(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
-        self.load_float_arg_to_d1(op.arg(1));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
+        self.load_float_arg_to_d1(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fmul d0, d0, d1
         );
@@ -4846,8 +4848,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
     fn genop_float_truediv(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
-        self.load_float_arg_to_d1(op.arg(1));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
+        self.load_float_arg_to_d1(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fdiv d0, d0, d1
         );
@@ -4858,7 +4860,7 @@ impl<'a> AssemblerARM64<'a> {
     /// x64: XOR with sign-bit mask (0x8000000000000000).
     /// aarch64: FNEG d0, d0.
     fn genop_float_neg(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fneg d0, d0
         );
@@ -4867,7 +4869,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
     fn genop_cast_int_to_float(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; scvtf d0, x0
         );
@@ -4876,7 +4878,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
     fn genop_cast_float_to_int(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fcvtzs x0, d0
         );
@@ -4907,7 +4909,7 @@ impl<'a> AssemblerARM64<'a> {
         let size = Self::field_size_from_descr(op);
 
         // Load the object pointer from arg0.
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
 
         // Load the field value at [rax + offset] into rax/x0.
 
@@ -4935,8 +4937,8 @@ impl<'a> AssemblerARM64<'a> {
         let size = Self::field_size_from_descr(op);
 
         // Load object pointer into rax/x0 and value into rcx/x1.
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
 
         match size {
             1 => dynasm!(self.mc ; .arch aarch64
@@ -4963,8 +4965,8 @@ impl<'a> AssemblerARM64<'a> {
             .unwrap_or((8, 8));
 
         // Load array pointer and index.
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
 
         // Compute address: rax = rax + base_size + rcx * item_size
 
@@ -5009,9 +5011,9 @@ impl<'a> AssemblerARM64<'a> {
             .unwrap_or((8, 8));
 
         // Load array pointer.
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         // Load index.
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rcx(op.arg(1).to_opref());
 
         // Compute element address: rax = rax + base_size + rcx * item_size
         if item_size != 1 {
@@ -5038,7 +5040,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x2, x0
         );
-        self.load_arg_to_rcx(op.arg(2)); // loads into x1
+        self.load_arg_to_rcx(op.arg(2).to_opref()); // loads into x1
         match item_size {
             1 => dynasm!(self.mc ; .arch aarch64
                 ; strb w1, [x2]
@@ -5064,7 +5066,7 @@ impl<'a> AssemblerARM64<'a> {
             .unwrap_or(0); // Default: length at offset 0 in array header
 
         // Load array pointer.
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
 
         // Load length from [array + len_offset].
         dynasm!(self.mc ; .arch aarch64
@@ -5094,7 +5096,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
 
         for i in (func_arg + 1)..arg_count.min(func_arg + 7) {
-            let arg = op.arg(i);
+            let arg = op.arg(i).to_opref();
             let abi_idx = i - func_arg - 1;
             match self.resolve_opref(arg) {
                 ResolvedArg::Slot(offset) => {
@@ -5110,7 +5112,7 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
-        match self.resolve_opref(op.arg(func_arg)) {
+        match self.resolve_opref(op.arg(func_arg).to_opref()) {
             ResolvedArg::Slot(offset) => {
                 dynasm!(self.mc ; .arch aarch64
                     ; ldr x8, [x29, offset as u32]
@@ -5982,7 +5984,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Inline nursery bump allocation. total_size (from op.arg(0))
     /// includes GcHeader. Result in x0 = object pointer (after header).
     fn genop_call_malloc_nursery(&mut self, op: &Op) {
-        let size_ref = op.arg(0);
+        let size_ref = op.arg(0).to_opref();
         // history.py:227 ConstInt.value carried inline — prefer the inline
         // payload before falling through to the legacy pool / raw u32.
         let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
@@ -6179,7 +6181,7 @@ impl<'a> AssemblerARM64<'a> {
             .with_array_descr(|ad| ad.len_descr().map(|ld| ld.offset() as i32))
             .flatten()
             .unwrap_or_else(|| Self::field_offset_from_descr(op));
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
 
         dynasm!(self.mc ; .arch aarch64
             ; ldr x0, [x0, offset as u32]
@@ -6202,8 +6204,8 @@ impl<'a> AssemblerARM64<'a> {
             base_size -= 1; // rewrite.py:299 — skip the extra null character
         }
 
-        self.load_arg_to_rax(op.arg(0)); // string pointer
-        self.load_arg_to_rcx(op.arg(1)); // index
+        self.load_arg_to_rax(op.arg(0).to_opref()); // string pointer
+        self.load_arg_to_rcx(op.arg(1).to_opref()); // index
 
         if item_size != 1 {
             self.emit_mov_imm64(2, item_size as i64);
@@ -6263,8 +6265,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_FLOORDIV: result = arg0 / arg1 (signed)
     fn genop_int_floordiv(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; sdiv x0, x0, x1
         );
@@ -6273,8 +6275,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_MOD: result = arg0 % arg1 (signed)
     fn genop_int_mod(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; sdiv x2, x0, x1
             ; msub x0, x2, x1, x0
@@ -6284,8 +6286,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
     fn genop_uint_mul_high(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
@@ -6294,8 +6296,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
     fn genop_int_signext(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        let num_bytes = match self.resolve_opref(op.arg(1)) {
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        let num_bytes = match self.resolve_opref(op.arg(1).to_opref()) {
             ResolvedArg::Const(v) => v,
             _ => 8,
         };
@@ -6316,7 +6318,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// FLOAT_ABS: result = |arg0|
     fn genop_float_abs(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
         );
@@ -6328,11 +6330,11 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_float_cmp(&mut self, op: &Op) {
         let swap = matches!(op.opcode, OpCode::FloatLt | OpCode::FloatLe);
         if swap {
-            self.load_float_arg_to_d0(op.arg(1));
-            self.load_float_arg_to_d1(op.arg(0));
+            self.load_float_arg_to_d0(op.arg(1).to_opref());
+            self.load_float_arg_to_d1(op.arg(0).to_opref());
         } else {
-            self.load_float_arg_to_d0(op.arg(0));
-            self.load_float_arg_to_d1(op.arg(1));
+            self.load_float_arg_to_d0(op.arg(0).to_opref());
+            self.load_float_arg_to_d1(op.arg(1).to_opref());
         }
 
         dynasm!(self.mc ; .arch aarch64 ; fcmp d0, d1);
@@ -6362,7 +6364,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
     fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0));
+        self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fcvt s0, d0
             ; fmov w0, s0
@@ -6372,7 +6374,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
     fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fmov s0, w0
             ; fcvt d0, s0
@@ -6421,11 +6423,11 @@ impl<'a> AssemblerARM64<'a> {
     /// GC_LOAD_I/R/F: load from base + offset with given itemsize.
     /// arg(0) = base, arg(1) = offset, arg(2) = itemsize.
     fn genop_gc_load(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
 
-        let itemsize = self.resolve_const_or(op.arg(2), 8) as i32;
+        let itemsize = self.resolve_const_or(op.arg(2).to_opref(), 8) as i32;
         self.emit_load_from_rax_sized(itemsize);
         self.store_rax_to_result(op.pos.get());
     }
@@ -6433,12 +6435,12 @@ impl<'a> AssemblerARM64<'a> {
     /// GC_LOAD_INDEXED_I/R/F: load from base + base_offset + index * scale.
     /// arg(0)=base, arg(1)=index, arg(2)=scale, arg(3)=base_offset, arg(4)=itemsize.
     fn genop_gc_load_indexed(&mut self, op: &Op) {
-        let scale = self.resolve_const_or(op.arg(2), 1) as i32;
-        let base_offset = self.resolve_const_or(op.arg(3), 0) as i32;
-        let itemsize = self.resolve_const_or(op.arg(4), 8) as i32;
+        let scale = self.resolve_const_or(op.arg(2).to_opref(), 1) as i32;
+        let base_offset = self.resolve_const_or(op.arg(3).to_opref(), 0) as i32;
+        let itemsize = self.resolve_const_or(op.arg(4).to_opref(), 8) as i32;
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
 
         if scale != 1 {
             self.emit_mov_imm64(2, scale as i64);
@@ -6459,13 +6461,15 @@ impl<'a> AssemblerARM64<'a> {
         if op.num_args() < 4 {
             return; // 3-arg GC rewrite form — skip for now
         }
-        let itemsize = self.resolve_const_or(op.arg(3), 8).unsigned_abs() as usize;
+        let itemsize = self
+            .resolve_const_or(op.arg(3).to_opref(), 8)
+            .unsigned_abs() as usize;
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
         dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
         self.emit_store_to_rax_sized(itemsize);
     }
@@ -6474,12 +6478,14 @@ impl<'a> AssemblerARM64<'a> {
     /// arg(0)=base, arg(1)=index, arg(2)=value, arg(3)=scale,
     /// arg(4)=base_offset, arg(5)=itemsize.
     fn genop_discard_gc_store_indexed(&mut self, op: &Op) {
-        let scale = self.resolve_const_or(op.arg(3), 1) as i32;
-        let base_offset = self.resolve_const_or(op.arg(4), 0) as i32;
-        let itemsize = self.resolve_const_or(op.arg(5), 8).unsigned_abs() as usize;
+        let scale = self.resolve_const_or(op.arg(3).to_opref(), 1) as i32;
+        let base_offset = self.resolve_const_or(op.arg(4).to_opref(), 0) as i32;
+        let itemsize = self
+            .resolve_const_or(op.arg(5).to_opref(), 8)
+            .unsigned_abs() as usize;
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         if scale != 1 {
             self.emit_mov_imm64(2, scale as i64);
             dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
@@ -6489,7 +6495,7 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
         }
         dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
         self.emit_store_to_rax_sized(itemsize);
     }
@@ -6499,8 +6505,8 @@ impl<'a> AssemblerARM64<'a> {
         let offset = Self::field_offset_from_descr(op);
         let size = Self::field_size_from_descr(op);
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
 
         self.emit_load_from_rax_sized(size as i32);
@@ -6512,11 +6518,11 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_discard_raw_store(&mut self, op: &Op) {
         let size = Self::field_size_from_descr(op);
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
         dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
         self.emit_store_to_rax_sized(size);
     }
@@ -6540,8 +6546,8 @@ impl<'a> AssemblerARM64<'a> {
             })
             .unwrap_or((8, 8, 0, 8));
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         let total_offset = base_size + field_offset;
 
         if item_size != 1 {
@@ -6572,8 +6578,8 @@ impl<'a> AssemblerARM64<'a> {
             })
             .unwrap_or((8, 8, 0, 8));
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
         let total_offset = base_size + field_offset;
 
         if item_size != 1 {
@@ -6585,7 +6591,7 @@ impl<'a> AssemblerARM64<'a> {
         }
         dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
         dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
 
         self.emit_store_to_rax_sized(field_size);
@@ -6597,7 +6603,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
     fn genop_discard_cond_call(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbz x0, =>skip_label);
 
@@ -6608,7 +6614,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
     fn genop_cond_call_value(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
@@ -6638,8 +6644,8 @@ impl<'a> AssemblerARM64<'a> {
             base_size -= 1; // rewrite.py:311 — skip the extra null character
         }
 
-        self.load_arg_to_rax(op.arg(0)); // string
-        self.load_arg_to_rcx(op.arg(1)); // index
+        self.load_arg_to_rax(op.arg(0).to_opref()); // string
+        self.load_arg_to_rcx(op.arg(1).to_opref()); // index
         if item_size != 1 {
             self.emit_mov_imm64(2, item_size as i64);
             dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
@@ -6649,7 +6655,7 @@ impl<'a> AssemblerARM64<'a> {
             ; add x0, x0, x1
         );
         dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
         self.emit_store_to_rax_sized(item_size as usize);
     }
@@ -6679,15 +6685,15 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         // Compute byte_count = length * item_size
-        self.load_arg_to_rax(op.arg(4));
+        self.load_arg_to_rax(op.arg(4).to_opref());
         if item_size != 1 {
             self.emit_mov_imm64(1, item_size);
             dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
         }
         dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!); // byte_count
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(2));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(2).to_opref());
         if item_size != 1 {
             self.emit_mov_imm64(2, item_size);
             dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
@@ -6698,8 +6704,8 @@ impl<'a> AssemblerARM64<'a> {
             ; str x0, [sp, #-16]!  // src_addr
         );
 
-        self.load_arg_to_rax(op.arg(1));
-        self.load_arg_to_rcx(op.arg(3));
+        self.load_arg_to_rax(op.arg(1).to_opref());
+        self.load_arg_to_rcx(op.arg(3).to_opref());
         if item_size != 1 {
             self.emit_mov_imm64(2, item_size);
             dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
@@ -6753,7 +6759,7 @@ impl<'a> AssemblerARM64<'a> {
     /// and writes length to the header.
     fn genop_alloc_varsize(&mut self, op: &Op, base_size: i64, item_size: i64) {
         // arg(0) = length
-        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rax(op.arg(0).to_opref());
         let malloc_ptr = libc::malloc as *const () as i64;
         let memset_ptr = libc::memset as *const () as i64;
 
@@ -6799,14 +6805,14 @@ impl<'a> AssemblerARM64<'a> {
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
-        let scale_start = self.resolve_const_or(op.arg(3), 1);
-        let scale_size = self.resolve_const_or(op.arg(4), 1);
+        let scale_start = self.resolve_const_or(op.arg(3).to_opref(), 1);
+        let scale_size = self.resolve_const_or(op.arg(4).to_opref(), 1);
         let memset_ptr = libc::memset as *const () as i64;
 
         // byte_offset = base_size + start * scale_start
         // byte_length = size * scale_size
-        self.load_arg_to_rax(op.arg(0)); // base
-        self.load_arg_to_rcx(op.arg(1)); // start
+        self.load_arg_to_rax(op.arg(0).to_opref()); // base
+        self.load_arg_to_rcx(op.arg(1).to_opref()); // start
 
         if scale_start != 1 {
             self.emit_mov_imm64(2, scale_start);
@@ -6817,7 +6823,7 @@ impl<'a> AssemblerARM64<'a> {
             ; add x0, x0, x1
             ; str x0, [sp, #-16]!               // save dest
         );
-        self.load_arg_to_rax(op.arg(2));
+        self.load_arg_to_rax(op.arg(2).to_opref());
         if scale_size != 1 {
             self.emit_mov_imm64(1, scale_size);
             dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
@@ -6843,11 +6849,11 @@ impl<'a> AssemblerARM64<'a> {
     /// resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs, c_shift]`.
     /// arg(0)=base, arg(1)=index, arg(2)=baseofs, arg(3)=shift.
     fn genop_load_effective_address(&mut self, op: &Op) {
-        let baseofs = self.resolve_const_or(op.arg(2), 0) as i32;
-        let shift = self.resolve_const_or(op.arg(3), 0) as i32;
+        let baseofs = self.resolve_const_or(op.arg(2).to_opref(), 0) as i32;
+        let shift = self.resolve_const_or(op.arg(3).to_opref(), 0) as i32;
 
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.load_arg_to_rcx(op.arg(1).to_opref());
 
         if shift != 0 {
             // add x0, x0, x1, lsl #shift fuses << and + in one insn;

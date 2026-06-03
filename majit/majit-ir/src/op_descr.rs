@@ -168,11 +168,11 @@ impl Op {
 
     /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`
     /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
-    /// None for non-guard ops.  Clone is cheap because OpRef is `Copy` and
+    /// None for non-guard ops.  Clone is cheap because BoxRef is an `Rc` bump and
     /// fail_args almost always fits inline (≤3 entries).  Owned return
     /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
     /// `.into_iter().flatten()` or `.iter()` patterns.
-    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
+    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
         self.fail_args.borrow().clone()
     }
 
@@ -183,7 +183,7 @@ impl Op {
     /// `None`.  Mirror that fail-loud behaviour here so a missing-
     /// fail-args bug surfaces at the call site rather than returning
     /// a silently-empty vector.
-    pub fn getfailargs_copy(&self) -> Vec<crate::resoperation::OpRef> {
+    pub fn getfailargs_copy(&self) -> Vec<crate::box_ref::BoxRef> {
         let borrow = self.fail_args.borrow();
         let fa = borrow.as_ref().unwrap_or_else(|| {
             panic!(
@@ -192,14 +192,14 @@ impl Op {
                  fail-loud shape (resoperation.py:492)"
             )
         });
-        fa.iter().copied().collect()
+        fa.iter().cloned().collect()
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
     /// the fail_args slot.  Takes `&self` (interior mutability) so the
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
-    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
+    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
         *self.fail_args.borrow_mut() = Some(fail_args);
     }
 
@@ -211,7 +211,7 @@ impl Op {
     /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(
         &mut self,
-    ) -> Option<&mut smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
+    ) -> Option<&mut smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
         self.fail_args.get_mut().as_mut()
     }
 
@@ -270,14 +270,14 @@ impl Op {
     /// via `Rc<Op>` (RPython writes `op._args[i] = ...` on the same
     /// Python object the trace list, optimizer state, and backend
     /// observe).
-    pub fn getarglist(&self) -> std::cell::Ref<'_, [crate::resoperation::OpRef]> {
+    pub fn getarglist(&self) -> std::cell::Ref<'_, [crate::box_ref::BoxRef]> {
         std::cell::Ref::map(self.args.borrow(), |a| a.as_slice())
     }
 
     /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` clone for the same effect.
-    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::resoperation::OpRef; 3]> {
+    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::box_ref::BoxRef; 3]> {
         self.args.borrow().clone()
     }
 
@@ -291,14 +291,14 @@ impl Op {
     ///  sb.used_boxes)` extends the LABEL arg list when finishing the
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
-    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
+    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
         *self.args.borrow_mut() = args;
     }
 
     /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
     /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
     /// or `_args[i]`; pyre indexes the SmallVec directly.
-    pub fn setarg(&self, i: usize, box_: crate::resoperation::OpRef) {
+    pub fn setarg(&self, i: usize, box_: crate::box_ref::BoxRef) {
         self.args.borrow_mut()[i] = box_;
     }
 }

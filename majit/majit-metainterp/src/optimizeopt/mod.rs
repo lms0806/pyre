@@ -437,7 +437,11 @@ impl ImportedShortPureOp {
                 ImportedShortPureArg::Const(_, src) => *src,
             })
             .collect();
-        let mut replay = majit_ir::Op::new(opcode, &replay_args);
+        let replay_arg_boxes: Vec<crate::r#box::BoxRef> = replay_args
+            .iter()
+            .map(|a| crate::r#box::BoxRef::from_opref(*a))
+            .collect();
+        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
         // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -2056,7 +2060,10 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Int);
-        let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
+        let mut op = Op::new(
+            OpCode::SameAsI,
+            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+        );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Int(value));
@@ -2067,7 +2074,10 @@ impl OptContext {
     /// return the resulting OpRef.
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Ref);
-        let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
+        let mut op = Op::new(
+            OpCode::SameAsR,
+            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+        );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Ref(value));
@@ -2078,7 +2088,10 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Float);
-        let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
+        let mut op = Op::new(
+            OpCode::SameAsF,
+            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+        );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Float(value));
@@ -2172,7 +2185,10 @@ impl OptContext {
         } else {
             majit_ir::OpCode::Strlen
         };
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[op_resolved]);
+        let strlen_op = majit_ir::Op::new(
+            strlen_opcode,
+            &[crate::r#box::BoxRef::from_opref(op_resolved)],
+        );
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
@@ -2744,17 +2760,24 @@ impl OptContext {
             match produced_op.kind {
                 PreambleOpKind::Pure => {
                     let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
-                    for &arg in produced_op.preamble_op.getarglist().iter() {
-                        let Some(resolved) =
-                            resolve_arg(arg, self, &produced_results, &mut imported_constants)
-                        else {
+                    for arg in produced_op.preamble_op.getarglist().iter() {
+                        let Some(resolved) = resolve_arg(
+                            arg.to_opref(),
+                            self,
+                            &produced_results,
+                            &mut imported_constants,
+                        ) else {
                             return false;
                         };
                         resolved_args.push(resolved);
                     }
+                    let resolved_arg_boxes: Vec<crate::r#box::BoxRef> = resolved_args
+                        .iter()
+                        .map(|a| crate::r#box::BoxRef::from_opref(*a))
+                        .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
-                        &resolved_args,
+                        &resolved_arg_boxes,
                     );
                     op.pos.set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
@@ -2779,9 +2802,12 @@ impl OptContext {
                         None => continue,
                     };
                     let object_arg = produced_op.preamble_op.arg(0);
-                    let Some(obj) =
-                        resolve_arg(object_arg, self, &produced_results, &mut imported_constants)
-                    else {
+                    let Some(obj) = resolve_arg(
+                        object_arg.to_opref(),
+                        self,
+                        &produced_results,
+                        &mut imported_constants,
+                    ) else {
                         return false;
                     };
                     let new_pop = match produced_op.preamble_op.opcode {
@@ -2792,7 +2818,7 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            let mut op = Op::new(opcode, &[obj]);
+                            let mut op = Op::new(opcode, &[crate::r#box::BoxRef::from_opref(obj)]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             ProducedShortOp {
@@ -2820,7 +2846,7 @@ impl OptContext {
                             // not the constant integer value.
                             let index_arg = produced_op.preamble_op.arg(1);
                             let index_opref = match resolve_arg(
-                                index_arg,
+                                index_arg.to_opref(),
                                 self,
                                 &produced_results,
                                 imported_constants,
@@ -2828,7 +2854,13 @@ impl OptContext {
                                 Some(r) => r,
                                 None => return false,
                             };
-                            let mut op = Op::new(opcode, &[obj, index_opref]);
+                            let mut op = Op::new(
+                                opcode,
+                                &[
+                                    crate::r#box::BoxRef::from_opref(obj),
+                                    crate::r#box::BoxRef::from_opref(index_opref),
+                                ],
+                            );
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             ProducedShortOp {
@@ -2849,7 +2881,7 @@ impl OptContext {
                 PreambleOpKind::LoopInvariant => {
                     let result_type = produced_op.preamble_op.result_type();
                     let Some(func_opref) = resolve_arg(
-                        produced_op.preamble_op.arg(0),
+                        produced_op.preamble_op.arg(0).to_opref(),
                         self,
                         &produced_results,
                         imported_constants,
@@ -2863,7 +2895,10 @@ impl OptContext {
                     {
                         return false;
                     }
-                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
+                    let mut op = Op::new(
+                        loop_invariant_opcode(result_type),
+                        &[crate::r#box::BoxRef::from_opref(func_opref)],
+                    );
                     op.pos.set(replay_pos(*source, produced_op));
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
@@ -3096,7 +3131,8 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for &arg in preamble_op.getarglist().iter() {
+        for arg in preamble_op.getarglist().iter() {
+            let arg = arg.to_opref();
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
                 continue;
@@ -3144,7 +3180,13 @@ impl OptContext {
                 Value::Void => panic!("emit_const_guard: ConstVoid not allowed"),
             };
             ctx.seed_constant(c, value.clone());
-            guards.push(Op::new(OpCode::GuardValue, &[arg, c]));
+            guards.push(Op::new(
+                OpCode::GuardValue,
+                &[
+                    crate::r#box::BoxRef::from_opref(arg),
+                    crate::r#box::BoxRef::from_opref(c),
+                ],
+            ));
         };
         for entry in &arg_entries {
             match &entry.info {
@@ -3685,7 +3727,7 @@ impl OptContext {
                     .iter()
                     .map(|op| ImportedShortAlias {
                         result: op.pos.get(),
-                        same_as_source: op.arg(0),
+                        same_as_source: op.arg(0).to_opref(),
                         same_as_opcode: op.opcode,
                     })
                     .collect()
@@ -5171,7 +5213,7 @@ impl OptContext {
             });
             // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
             match self.new_operations[idx].getfailargs() {
-                Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+                Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
                 None => op.clearfailargs(),
             }
             // bridgeopt.py parity: fail_arg_types carry the types the
@@ -5202,7 +5244,7 @@ impl OptContext {
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
             if let Some(fa) = op.getfailargs() {
-                let fargs: Vec<OpRef> = fa.iter().copied().collect();
+                let fargs: Vec<OpRef> = fa.iter().map(|b| b.to_opref()).collect();
                 for farg in fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.
@@ -5236,7 +5278,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.get_box_replacement(arg0);
+        let arg0_resolved = self.get_box_replacement(arg0.to_opref());
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -5252,7 +5294,7 @@ impl OptContext {
         }
         let arg1 = op.arg(1);
         let Some(constvalue) = self
-            .get_box_replacement_box(arg1)
+            .get_box_replacement_box(arg1.to_opref())
             .and_then(|cb| cb.const_int())
         else {
             return;
@@ -5545,7 +5587,11 @@ impl OptContext {
             })
             .collect();
 
-        op.store_final_boxes(liveboxes);
+        let liveboxes_b: Vec<crate::r#box::BoxRef> = liveboxes
+            .iter()
+            .map(|a| crate::r#box::BoxRef::from_opref(*a))
+            .collect();
+        op.store_final_boxes(liveboxes_b);
         op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
@@ -5807,7 +5853,7 @@ impl OptContext {
         self.protect_speculative_operation(op);
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
-            let b = self.get_box_replacement_box(op.arg(i)).expect(
+            let b = self.get_box_replacement_box(op.arg(i).to_opref()).expect(
                 "constant_fold: arg BoxRef must be registered (pure.rs:993-1006 pre-check)",
             );
             argboxes.push(
@@ -5877,7 +5923,7 @@ impl OptContext {
         if opnum.is_getfield() {
             // optimizer.py:829-832 pure-getfield branch.
             let arg0 = self
-                .get_box_replacement_box(op.arg(0))
+                .get_box_replacement_box(op.arg(0).to_opref())
                 .expect("protect_speculative_operation: arg0 BoxRef must be registered");
             let gcref = match self
                 .get_constant_box(&arg0)
@@ -5908,7 +5954,7 @@ impl OptContext {
         ) {
             // optimizer.py:834-841 array branch.
             let arg0 = self
-                .get_box_replacement_box(op.arg(0))
+                .get_box_replacement_box(op.arg(0).to_opref())
                 .expect("protect_speculative_operation: array arg0 BoxRef must be registered");
             let array = match self
                 .get_constant_box(&arg0)
@@ -5937,7 +5983,7 @@ impl OptContext {
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
             let arg0 = self
-                .get_box_replacement_box(op.arg(0))
+                .get_box_replacement_box(op.arg(0).to_opref())
                 .expect("protect_speculative_operation: string arg0 BoxRef must be registered");
             let string = match self
                 .get_constant_box(&arg0)
@@ -5959,7 +6005,7 @@ impl OptContext {
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
             let arg0 = self
-                .get_box_replacement_box(op.arg(0))
+                .get_box_replacement_box(op.arg(0).to_opref())
                 .expect("protect_speculative_operation: unicode arg0 BoxRef must be registered");
             let unicode = match self
                 .get_constant_box(&arg0)
@@ -5990,7 +6036,7 @@ impl OptContext {
         //   index = self.get_constant_box(op.getarg(1)).getint()
         //   if not (0 <= index < arraylength): raise SpeculativeError
         let arg1 = self
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(op.arg(1).to_opref())
             .expect("protect_speculative_operation: arg1 BoxRef must be registered");
         let index = match self
             .get_constant_box(&arg1)
@@ -7036,7 +7082,7 @@ impl OptContext {
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
-        let arg0 = self.get_box_replacement(op.arg(0));
+        let arg0 = self.get_box_replacement(op.arg(0).to_opref());
         if arg0.is_constant()
             || self
                 .get_box_replacement_box(arg0)
@@ -7065,7 +7111,7 @@ impl OptContext {
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let arg0 = self.get_box_replacement(op.arg(0));
+        let arg0 = self.get_box_replacement(op.arg(0).to_opref());
         if arg0.is_constant()
             || self
                 .get_box_replacement_box(arg0)
@@ -7181,7 +7227,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.get_box_replacement(op.arg(0));
+        let arg0 = self.get_box_replacement(op.arg(0).to_opref());
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
@@ -7253,7 +7299,7 @@ impl OptContext {
         // BoxRef-routing read. Owned PtrInfo from `peek_ptr_info` is
         // consumed by `matches!` so no borrow is held when the mutable
         // re-borrow of the BoxRef slot runs below for the early return.
-        let arg0_box = self.get_box_replacement_box(op.arg(0));
+        let arg0_box = self.get_box_replacement_box(op.arg(0).to_opref());
         if matches!(
             arg0_box.as_ref().and_then(|b| self.peek_ptr_info(b)),
             Some(
@@ -9066,7 +9112,11 @@ mod ensure_ptr_info_arg0_tests {
         // history.py:182 GetfieldGc receiver is a Ref box; arg0 must
         // carry the Ref variant tag (resoperation.py:615 RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], descr);
+        let mut op = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            descr,
+        );
         op.pos.set(OpRef::int_op(1));
         op
     }
@@ -9077,7 +9127,11 @@ mod ensure_ptr_info_arg0_tests {
             index: 7,
             is_object: false,
         });
-        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], descr);
+        let mut op = Op::with_descr(
+            OpCode::ArraylenGc,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            descr,
+        );
         op.pos.set(OpRef::int_op(1));
         op
     }
@@ -9138,7 +9192,11 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
+            let mut op = Op::with_descr(
+                OpCode::Strlen,
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                descr,
+            );
             op.pos.set(OpRef::int_op(1));
             op
         };
@@ -9167,7 +9225,11 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
+            let mut op = Op::with_descr(
+                OpCode::Strlen,
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                descr,
+            );
             op.pos.set(OpRef::int_op(1));
             op
         };
@@ -9483,7 +9545,13 @@ mod imported_short_preamble_fallback_tests {
             &[],
         );
 
-        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(7), OpRef::int_op(8)]);
+        let mut replay_op = Op::new(
+            OpCode::IntAdd,
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(7)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(8)),
+            ],
+        );
         replay_op.pos.set(OpRef::int_op(14));
         // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
@@ -9503,8 +9571,13 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops.len(), 1);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(
-            &*sp.ops[0].op.getarglist(),
-            &[OpRef::int_op(7), OpRef::int_op(8)]
+            sp.ops[0]
+                .op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::int_op(7), OpRef::int_op(8)]
         );
         assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));
     }

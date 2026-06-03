@@ -17,6 +17,7 @@ pub use frame::{MIFrame, MIFrameStack};
 
 use std::sync::Arc;
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(feature = "cranelift")]
@@ -813,11 +814,11 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
         .map(|op| {
             let mut hw = opref_high_water(op.pos.get());
             for a in op.getarglist().iter() {
-                hw = hw.max(opref_high_water(*a));
+                hw = hw.max(opref_high_water(a.to_opref()));
             }
             if let Some(fa) = op.getfailargs() {
                 for a in fa {
-                    hw = hw.max(opref_high_water(a));
+                    hw = hw.max(opref_high_water(a.to_opref()));
                 }
             }
             hw
@@ -1303,16 +1304,12 @@ pub struct JitHooks {
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
 fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
-    for arg in op.args.borrow_mut().iter_mut() {
-        if let Some(slot) = arg.as_const_ptr_mut() {
-            visitor(slot);
-        }
+    for arg in op.args.borrow().iter() {
+        arg.walk_const_ptr_refs(visitor);
     }
-    if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
-        for arg in fail_args.iter_mut() {
-            if let Some(slot) = arg.as_const_ptr_mut() {
-                visitor(slot);
-            }
+    if let Some(fail_args) = op.fail_args.borrow().as_ref() {
+        for arg in fail_args.iter() {
+            arg.walk_const_ptr_refs(visitor);
         }
     }
 }
@@ -4939,7 +4936,7 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::OpCode::Label,
                 &root_inputargs
                     .iter()
-                    .map(|ia| ia.opref())
+                    .map(|ia| BoxRef::from_opref(ia.opref()))
                     .collect::<Vec<_>>(),
             );
             label_op.pos.set(majit_ir::OpRef::NONE);
@@ -4983,7 +4980,7 @@ impl<M: Clone> MetaInterp<M> {
                     if let Some(fa) = op.getfailargs() {
                         let raw: Vec<String> = fa
                             .iter()
-                            .map(|a| format!("OpRef::from_raw({})", a.raw()))
+                            .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
                             .collect();
                         crate::debug::debug_print(&format!(
                             "FINAL GuardNotInv fail_args=[{}]",
@@ -5048,7 +5045,10 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 let mut label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
-                    &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
+                    &inputargs
+                        .iter()
+                        .map(|ia| BoxRef::from_opref(ia.opref()))
+                        .collect::<Vec<_>>(),
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
                 label_op.setdescr(target_token.as_jump_target_descr());
@@ -6854,7 +6854,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
+            &inputargs
+                .iter()
+                .map(|ia| BoxRef::from_opref(ia.opref()))
+                .collect::<Vec<_>>(),
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
         label_op.setdescr(target_token.as_jump_target_descr());
@@ -7849,7 +7852,7 @@ impl<M: Clone> MetaInterp<M> {
                         .iter()
                         .map(|arg| {
                             type_index
-                                .opref_type_at(*arg, label_index)
+                                .opref_type_at(arg.to_opref(), label_index)
                                 .unwrap_or(Type::Ref)
                         })
                         .collect(),
@@ -8681,7 +8684,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().to_vec())
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
             .unwrap_or_default();
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
@@ -9207,7 +9210,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().to_vec())
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
             .unwrap_or_default();
         let bridge_trace_data = TreeLoop::with_snapshots(
             bridge_inputargs
@@ -16298,9 +16301,9 @@ mod metainterp_static_data_tests {
             .expect("CallI must be recorded");
         assert_eq!(op.pos.get(), opref);
         assert_eq!(op.num_args(), 3);
-        assert_eq!(op.arg(0), funcbox_ref);
-        assert_eq!(op.arg(1), OpRef::int_op(1));
-        assert_eq!(op.arg(2), OpRef::int_op(2));
+        assert_eq!(op.arg(0).to_opref(), funcbox_ref);
+        assert_eq!(op.arg(1).to_opref(), OpRef::int_op(1));
+        assert_eq!(op.arg(2).to_opref(), OpRef::int_op(2));
     }
 
     #[test]
@@ -16473,7 +16476,7 @@ mod metainterp_static_data_tests {
             let op = matches.next().expect("GuardException must be recorded");
             assert_eq!(op.num_args(), 1);
             let typeptr = ctx
-                .constants_get_value(op.arg(0))
+                .constants_get_value(op.arg(0).to_opref())
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
             op.pos.get()
@@ -16758,7 +16761,7 @@ mod metainterp_static_data_tests {
             .find(|op| op.opcode == OpCode::GuardException)
             .expect("GuardException must be recorded");
         let typeptr = ctx
-            .constants_get_value(op.arg(0))
+            .constants_get_value(op.arg(0).to_opref())
             .expect("typeptr constant");
         assert_eq!(typeptr, majit_ir::Value::Int(0xcafef00d));
     }
@@ -16917,9 +16920,11 @@ mod metainterp_static_data_tests {
         let op = matches.next().expect("EnterPortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
         assert_eq!(op.num_args(), 2);
-        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
+        let jd_no = ctx
+            .constants_get_value(op.arg(0).to_opref())
+            .expect("jd_no constant");
         let unique_id = ctx
-            .constants_get_value(op.arg(1))
+            .constants_get_value(op.arg(1).to_opref())
             .expect("unique_id constant");
         assert_eq!(jd_no, majit_ir::Value::Int(3));
         assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
@@ -16945,7 +16950,9 @@ mod metainterp_static_data_tests {
         let op = matches.next().expect("LeavePortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
         assert_eq!(op.num_args(), 1);
-        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
+        let jd_no = ctx
+            .constants_get_value(op.arg(0).to_opref())
+            .expect("jd_no constant");
         assert_eq!(jd_no, majit_ir::Value::Int(7));
     }
 
@@ -16984,15 +16991,15 @@ mod metainterp_static_data_tests {
             .expect("LeavePortalFrame must be recorded");
 
         assert_eq!(
-            ctx.constants_get_value(enter.arg(0)),
+            ctx.constants_get_value(enter.arg(0).to_opref()),
             Some(majit_ir::Value::Int(5))
         );
         assert_eq!(
-            ctx.constants_get_value(enter.arg(1)),
+            ctx.constants_get_value(enter.arg(1).to_opref()),
             Some(majit_ir::Value::Int(0xfeed))
         );
         assert_eq!(
-            ctx.constants_get_value(leave.arg(0)),
+            ctx.constants_get_value(leave.arg(0).to_opref()),
             Some(majit_ir::Value::Int(5))
         );
     }
@@ -17416,7 +17423,8 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let op = Op::new(opcode, args);
+        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let op = Op::new(opcode, &args);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
@@ -17426,7 +17434,8 @@ mod tests {
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let op = Op::with_descr(opcode, args, descr);
+        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
@@ -17493,8 +17502,8 @@ mod tests {
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
-        assert_eq!(ops[0].arg(0).as_const_ptr(), Some(GcRef(0x5000)));
-        assert_eq!(ops[0].arg(1).as_const_ptr(), Some(GcRef(0x6000)));
+        assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0x5000)));
+        assert_eq!(ops[0].arg(1).to_opref().as_const_ptr(), Some(GcRef(0x6000)));
     }
 
     #[test]
@@ -17506,8 +17515,8 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 11);
         guard.setfailargs(smallvec::smallvec![
-            OpRef::const_ptr(GcRef(0x7000)),
-            OpRef::const_int(123),
+            BoxRef::from_opref(OpRef::const_ptr(GcRef(0x7000))),
+            BoxRef::from_opref(OpRef::const_int(123)),
         ]);
         meta.partial_trace = Some(PartialTrace {
             ops: vec![guard],
@@ -17522,9 +17531,9 @@ mod tests {
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
         let fail_args = ops[0].getfailargs().expect("guard has fail_args");
-        assert_eq!(fail_args[0].as_const_ptr(), Some(GcRef(0x8000)));
+        assert_eq!(fail_args[0].to_opref().as_const_ptr(), Some(GcRef(0x8000)));
         // Non-Ref inline-Const slots untouched.
-        assert_eq!(fail_args[1], OpRef::const_int(123));
+        assert_eq!(fail_args[1].to_opref(), OpRef::const_int(123));
     }
 
     #[test]
@@ -17549,7 +17558,7 @@ mod tests {
         });
 
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
-        assert_eq!(ops[0].arg(0).as_const_ptr(), Some(GcRef(0xB000)));
+        assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0xB000)));
     }
 
     #[test]
@@ -17680,16 +17689,28 @@ mod tests {
         );
         assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
         assert_eq!(
-            prepared.ops[0].getarglist().to_vec(),
+            prepared.ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(11)]
         );
         assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
         assert_eq!(
-            prepared.ops[1].getarglist().to_vec(),
+            prepared.ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_int(10)]
         );
         assert_eq!(
-            prepared.ops[2].getarglist().to_vec(),
+            prepared.ops[2]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
         assert_eq!(
@@ -18134,7 +18155,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18377,7 +18400,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18455,7 +18480,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18553,7 +18580,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18645,10 +18674,10 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::int_op(1),
-            OpRef::int_op(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::int_op(1)),
+            BoxRef::from_opref(OpRef::int_op(0)),
+        ]);
         // pyre cranelift test-fixture quirk (NOT RPython parity): the bare
         // OpRef::int_op(100) literal is paired with `constants.insert(100, ...)` below
         // because `backend.set_constants` keys the function-pointer literal by
@@ -19683,10 +19712,10 @@ mod tests {
         let _const_one = OpRef::int_op(100);
         let const_zero = OpRef::int_op(101);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -19701,10 +19730,10 @@ mod tests {
             mk_op(OpCode::IntGt, &[OpRef::int_op(2), const_zero], 3),
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
-                g.setfailargs(smallvec::SmallVec::from_slice(&[
-                    OpRef::input_arg_int(0),
-                    OpRef::input_arg_int(1),
-                ]));
+                g.setfailargs(smallvec::smallvec![
+                    BoxRef::from_opref(OpRef::input_arg_int(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(1)),
+                ]);
                 g
             },
             mk_op(

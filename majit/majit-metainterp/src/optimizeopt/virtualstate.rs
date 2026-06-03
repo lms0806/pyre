@@ -28,6 +28,8 @@ use majit_ir::vec_set::VecSet;
 use majit_ir::descr::descr_identity;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
+use crate::r#box::BoxRef;
+
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
 #[derive(Clone, Debug)]
@@ -2459,7 +2461,10 @@ impl GuardRequirement {
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
+                let mut op = Op::new(
+                    OpCode::GuardClass,
+                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2480,7 +2485,10 @@ impl GuardRequirement {
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
+                let mut op = Op::new(
+                    OpCode::GuardNonnullClass,
+                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2496,7 +2504,7 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
+                let mut op = Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(arg)]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2525,7 +2533,10 @@ impl GuardRequirement {
                     Value::Ref(r) => ctx.make_constant_ref(*r),
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
-                let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
+                let mut op = Op::new(
+                    OpCode::GuardValue,
+                    &[BoxRef::from_opref(arg), BoxRef::from_opref(val_const)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -3116,7 +3127,7 @@ mod tests {
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
         assert_eq!(
-            ctx.get_box_replacement_box(guard.arg(1))
+            ctx.get_box_replacement_box(guard.arg(1).to_opref())
                 .and_then(|cb| cb.const_value()),
             Some(Value::Ref(expected))
         );

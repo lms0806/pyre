@@ -3977,8 +3977,8 @@ fn resolve_binop(
     constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
 ) -> (CValue, CValue) {
-    let a = resolve_opref(builder, constants, op.arg(0));
-    let b = resolve_opref(builder, constants, op.arg(1));
+    let a = resolve_opref(builder, constants, op.arg(0).to_opref());
+    let b = resolve_opref(builder, constants, op.arg(1).to_opref());
     (a, b)
 }
 
@@ -4186,9 +4186,9 @@ fn validate_oprefs_for_compile(
             // LABEL params are introduced at the label block.
             // Const operands (history.py:189-220) are not body-namespace
             // OpRefs and are never label-bound.
-            for &arg in op.getarglist().iter() {
+            for arg in op.getarglist().iter() {
                 if !arg.is_none() && !arg.is_constant() {
-                    seen.insert(arg.raw());
+                    seen.insert(arg.to_opref().raw());
                 }
             }
             // The label op result itself (if any) is bound after the
@@ -4200,24 +4200,24 @@ fn validate_oprefs_for_compile(
             // always "bound" by the value carried inline.
             let bound = arg.is_none()
                 || arg.is_constant()
-                || arg.inline_const_bits().is_some()
-                || constants.contains_key(&arg.raw())
+                || arg.to_opref().inline_const_bits().is_some()
+                || constants.contains_key(&arg.to_opref().raw())
                 || is_rewriter_immediate_arg(op.opcode, 0)
-                || seen.contains(&arg.raw());
+                || seen.contains(&arg.to_opref().raw());
             if !bound {
                 if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
                         "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef::int_op({}) — InvalidLoop",
                         op_idx,
                         op.opcode,
-                        arg.raw()
+                        arg.to_opref().raw()
                     );
                 }
                 return Err(BackendError::CompilationFailed(format!(
                     "InvalidLoop: op[{}] {:?} dereferences undefined OpRef::int_op({})",
                     op_idx,
                     op.opcode,
-                    arg.raw()
+                    arg.to_opref().raw()
                 )));
             }
         }
@@ -4603,11 +4603,11 @@ fn build_type_overrides(
         };
         let label_op = &ops[label_idx];
         let jump_op = &ops[*jump_idx];
-        for (i, &label_arg) in label_op.getarglist().iter().enumerate() {
+        for (i, label_arg) in label_op.getarglist().iter().enumerate() {
             if label_arg.is_none() {
                 continue;
             }
-            let Some(&jump_arg) = jump_op.getarglist().get(i) else {
+            let Some(jump_arg) = jump_op.getarglist().get(i).map(|a| a.to_opref()) else {
                 continue;
             };
             if jump_arg.is_none() {
@@ -4619,10 +4619,10 @@ fn build_type_overrides(
                 continue;
             }
             let jump_type = lookup(jump_arg, *jump_idx, Type::Int, &overrides);
-            let label_type = lookup(label_arg, label_idx, Type::Ref, &overrides);
+            let label_type = lookup(label_arg.to_opref(), label_idx, Type::Ref, &overrides);
             if jump_type != label_type {
-                overrides.insert(label_arg.raw(), jump_type);
-                op_def_positions.insert(label_arg.raw(), label_idx);
+                overrides.insert(label_arg.to_opref().raw(), jump_type);
+                op_def_positions.insert(label_arg.to_opref().raw(), label_idx);
             }
         }
     }
@@ -4683,7 +4683,7 @@ fn build_ref_root_slots(
         .rfind(|(_, op)| op.opcode == OpCode::Jump && op.num_args() == inputargs.len())
     {
         let num_inputs = inputargs.len();
-        for (i, &arg) in jump.getarglist().iter().enumerate() {
+        for (i, arg) in jump.getarglist().iter().enumerate() {
             if i >= num_inputs {
                 break;
             }
@@ -4699,11 +4699,12 @@ fn build_ref_root_slots(
             if !arg.is_constant()
                 && inputargs
                     .iter()
-                    .any(|ia| ia.index == arg.raw() && ia.tp == Type::Ref)
+                    .any(|ia| ia.index == arg.to_opref().raw() && ia.tp == Type::Ref)
             {
                 continue; // inputarg reference — always safe
             }
-            if let Some(actual_tp) = lookup_type_at(type_index, overrides, arg, jump_idx) {
+            if let Some(actual_tp) = lookup_type_at(type_index, overrides, arg.to_opref(), jump_idx)
+            {
                 if actual_tp != Type::Ref {
                     non_ref_at_backedge.insert(inputargs[i].index);
                     if actual_tp == Type::Float {
@@ -4727,7 +4728,7 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: VecSet<u32> = VecSet::new();
     for op in ops.iter() {
-        for &arg in op.getarglist().iter().chain(
+        for arg in op.getarglist().iter().chain(
             op.getfailargs()
                 .into_iter()
                 .flatten()
@@ -4736,8 +4737,8 @@ fn build_ref_root_slots(
         ) {
             // Const operands (history.py:189-220) are not InputArgs; skip
             // the body-namespace `.raw()` membership check.
-            if !arg.is_constant() && inputarg_oprefs.contains(&arg.raw()) {
-                used_inputargs.insert(arg.raw());
+            if !arg.is_constant() && inputarg_oprefs.contains(&arg.to_opref().raw()) {
+                used_inputargs.insert(arg.to_opref().raw());
             }
         }
     }
@@ -5390,7 +5391,7 @@ fn ref_root_slots_with_future_regular_uses(
                     })
                     // Const operands carry value inline (history.py:227/268/314)
                     // — not a body-namespace var_idx match.
-                    .any(|arg| !arg.is_constant() && arg.raw() == *var_idx)
+                    .any(|arg| !arg.is_constant() && arg.to_opref().raw() == *var_idx)
         })
         .copied()
         .collect()
@@ -8080,7 +8081,7 @@ impl CraneliftBackend {
         let longevity: VecAssoc<u32, usize> = {
             let mut m: VecAssoc<u32, usize> = VecAssoc::new();
             for (i, op) in ops.iter().enumerate() {
-                for &arg in op.getarglist().iter().chain(
+                for arg in op.getarglist().iter().chain(
                     op.getfailargs()
                         .into_iter()
                         .flatten()
@@ -8094,7 +8095,7 @@ impl CraneliftBackend {
                     if arg.is_constant() {
                         continue;
                     }
-                    let idx = arg.raw();
+                    let idx = arg.to_opref().raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
                         // iteration order is monotonic in `i`, so a later
                         // visit always supersedes any earlier `last_usage`.
@@ -8343,7 +8344,7 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for &arg in op.getarglist().iter().chain(
+            for arg in op.getarglist().iter().chain(
                 op.getfailargs()
                     .into_iter()
                     .flatten()
@@ -8356,18 +8357,18 @@ impl CraneliftBackend {
                     continue;
                 }
                 if !arg.is_none()
-                    && !declared_vars.contains(&arg.raw())
-                    && !constants.contains_key(&arg.raw())
+                    && !declared_vars.contains(&arg.to_opref().raw())
+                    && !constants.contains_key(&arg.to_opref().raw())
                 {
-                    declared_vars.insert(arg.raw());
+                    declared_vars.insert(arg.to_opref().raw());
                     if debug_declares {
                         eprintln!(
                             "[jit][declare] ref-arg var{} owner={:?}",
-                            arg.raw(),
+                            arg.to_opref().raw(),
                             op.opcode
                         );
                     }
-                    var_types.insert(arg.raw(), cl_type_for_opref(arg));
+                    var_types.insert(arg.to_opref().raw(), cl_type_for_opref(arg.to_opref()));
                 }
             }
         }
@@ -8379,18 +8380,21 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            for &arg in op.getarglist().iter() {
+            for arg in op.getarglist().iter() {
                 // Const label args carry value inline (history.py:227/268/314)
                 // — no Cranelift variable to declare.
-                if arg.is_none() || arg.is_constant() || declared_vars.contains(&arg.raw()) {
+                if arg.is_none()
+                    || arg.is_constant()
+                    || declared_vars.contains(&arg.to_opref().raw())
+                {
                     continue;
                 }
-                declared_vars.insert(arg.raw());
+                declared_vars.insert(arg.to_opref().raw());
                 if debug_declares {
                     // Independent debug toggle — not gated by MAJIT_LOG.
-                    eprintln!("[jit][declare] label-arg var{}", arg.raw());
+                    eprintln!("[jit][declare] label-arg var{}", arg.to_opref().raw());
                 }
-                var_types.insert(arg.raw(), cl_type_for_opref(arg));
+                var_types.insert(arg.to_opref().raw(), cl_type_for_opref(arg.to_opref()));
             }
         }
 
@@ -8539,11 +8543,11 @@ impl CraneliftBackend {
             // (var_types), so the LABEL-block `def_var(param)` never mismatches.
             // Float vars are F64, keeping a loop-carried float in an FP register
             // across the back-edge; the matching JUMP coerces incoming values.
-            for &arg in ops[label_idx].getarglist().iter() {
+            for arg in ops[label_idx].getarglist().iter() {
                 let ty = var_types
-                    .get(&arg.raw())
+                    .get(&arg.to_opref().raw())
                     .copied()
-                    .unwrap_or_else(|| cl_type_for_opref(arg));
+                    .unwrap_or_else(|| cl_type_for_opref(arg.to_opref()));
                 builder.append_block_param(block, ty);
             }
             if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
@@ -8622,16 +8626,16 @@ impl CraneliftBackend {
 
                 // Continue with preamble label block for var binding
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
+                for (i, arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
-                        builder.def_var(var(arg_ref.raw()), param);
+                        builder.def_var(var(arg_ref.to_opref().raw()), param);
                         let cur_jf = builder.use_var(jf_ptr_var);
                         sync_ref_root_var(
                             &mut builder,
                             cur_jf,
                             &ref_root_slots,
-                            arg_ref.raw(),
+                            arg_ref.to_opref().raw(),
                             param,
                             ref_root_base_ofs,
                             &mut synced_ref_vars,
@@ -8644,16 +8648,16 @@ impl CraneliftBackend {
                 let args = block_args_to(&mut builder, entry_label_block, &vals);
                 builder.ins().jump(entry_label_block, &args);
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
+                for (i, arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
-                        builder.def_var(var(arg_ref.raw()), param);
+                        builder.def_var(var(arg_ref.to_opref().raw()), param);
                         let cur_jf = builder.use_var(jf_ptr_var);
                         sync_ref_root_var(
                             &mut builder,
                             cur_jf,
                             &ref_root_slots,
-                            arg_ref.raw(),
+                            arg_ref.to_opref().raw(),
                             param,
                             ref_root_base_ofs,
                             &mut synced_ref_vars,
@@ -8716,28 +8720,28 @@ impl CraneliftBackend {
                         let vals: Vec<CValue> = ops[op_idx]
                             .getarglist()
                             .iter()
-                            .map(|&r| resolve_opref(&mut builder, &constants, r))
+                            .map(|r| resolve_opref(&mut builder, &constants, r.to_opref()))
                             .collect();
                         let args = block_args_to(&mut builder, *label_block, &vals);
                         builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
-                    for (i, &arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
+                    for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
                         let param = builder.block_params(*label_block)[i];
                         // Inline-Const (history.py:227/268/314) and legacy
                         // idx-Const args carry value, not a body-namespace
                         // slot — skip def_var/sync.
                         if !arg_ref.is_none()
                             && !arg_ref.is_constant()
-                            && !constants.contains_key(&arg_ref.raw())
+                            && !constants.contains_key(&arg_ref.to_opref().raw())
                         {
-                            builder.def_var(var(arg_ref.raw()), param);
+                            builder.def_var(var(arg_ref.to_opref().raw()), param);
                             let cur_jf = builder.use_var(jf_ptr_var);
                             sync_ref_root_var(
                                 &mut builder,
                                 cur_jf,
                                 &ref_root_slots,
-                                arg_ref.raw(),
+                                arg_ref.to_opref().raw(),
                                 param,
                                 ref_root_base_ofs,
                                 &mut synced_ref_vars,
@@ -8860,31 +8864,31 @@ impl CraneliftBackend {
 
                 // ── Unary integer ──
                 OpCode::IntNeg => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let r = builder.ins().ineg(a);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::IntInvert => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let r = builder.ins().bnot(a);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::IntIsZero => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::Equal, a, zero);
                     let r = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::IntIsTrue => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let r = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::IntForceGeZero => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, zero);
                     let r = builder.ins().select(cmp, zero, a);
@@ -8892,9 +8896,9 @@ impl CraneliftBackend {
                 }
                 OpCode::IntBetween => {
                     // int_between(a, b, c) => a <= b < c
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
-                    let c = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
+                    let c = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
                     let cmp1 = builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
                     let cmp2 = builder.ins().icmp(IntCC::SignedLessThan, b, c);
                     let both = builder.ins().band(cmp1, cmp2);
@@ -8973,7 +8977,7 @@ impl CraneliftBackend {
                 // ── Identity / cast ──
                 OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF | OpCode::CastOpaquePtr => {
                     let a = if op.num_args() > 0 {
-                        resolve_opref(&mut builder, &constants, op.arg(0))
+                        resolve_opref(&mut builder, &constants, op.arg(0).to_opref())
                     } else if let Some(&c) = constants.get(&vi) {
                         builder.ins().iconst(cl_types::I64, c)
                     } else {
@@ -9011,7 +9015,7 @@ impl CraneliftBackend {
                 // ptr(-17) -> cast_ptr_to_int == -17` expects strict
                 // identity through the compiled trace.
                 OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), a);
                 }
 
@@ -9023,7 +9027,7 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
@@ -9112,7 +9116,7 @@ impl CraneliftBackend {
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
                     // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
                     // — pre-fetch the classptr immediate from the constant pool.
-                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1));
+                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
@@ -9155,7 +9159,7 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
-                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1));
+                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
@@ -9259,7 +9263,8 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let expected_type = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let expected_type =
+                        resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // Inline: load pos_exception (exc type)
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     let exc_type =
@@ -9541,7 +9546,7 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -9604,8 +9609,9 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let obj_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let expected_tid = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let obj_ptr = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let expected_tid =
+                        resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
 
                     // Load header word from obj_ptr - GcHeader::SIZE
                     let hdr_addr = builder.ins().iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
@@ -9682,7 +9688,7 @@ impl CraneliftBackend {
                          installed a TYPE_INFO layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
                     // majit's GC header sits at `obj - GcHeader::SIZE`
                     // (see the GuardGcType arm above); the typeid occupies
@@ -9795,14 +9801,14 @@ impl CraneliftBackend {
                          installed a TYPE_INFO / rclass.CLASSTYPE layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
                     //   so arg1 must be an immediate class pointer. Inline-Const
                     //   carries the value on the OpRef (history.py:227); fall
                     //   through to the legacy pool snapshot for idx-Const.
-                    let loc_check_against_class = lookup_const_i64(&constants, op.arg(1))
-                        .unwrap_or_else(|| {
+                    let loc_check_against_class =
+                        lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or_else(|| {
                             panic!(
                                 "x86/assembler.py:1971 vtable_ptr = \
                                  loc_check_against_class.getint(): \
@@ -9953,8 +9959,8 @@ impl CraneliftBackend {
                     // x86/assembler.py:1845-1850 _restore_exception:
                     //   MOV [pos_exc_value], excvalloc
                     //   MOV [pos_exception], exctploc
-                    let exc_type = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let value = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let exc_type = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let value = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     builder
@@ -9969,7 +9975,7 @@ impl CraneliftBackend {
                     // — emit `is_null?` branch into the propagate path (a tail
                     // that mirrors `_build_propagate_exception_path`,
                     // x86/assembler.py:328-345 / aarch64/assembler.py:559-577).
-                    let ptr_val = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let ptr_val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
                     let propagate_block = builder.create_block();
@@ -10059,8 +10065,11 @@ impl CraneliftBackend {
                     let call_result = emit_indirect_call_from_parts(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        &op.getarglist()[1..],
+                        op.arg(0).to_opref(),
+                        &op.getarglist()[1..]
+                            .iter()
+                            .map(|a| a.to_opref())
+                            .collect::<Vec<_>>(),
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -10149,106 +10158,111 @@ impl CraneliftBackend {
                     // Allocate callee jitframe from nursery (heap), not stack.
                     // The callee's prologue pushes jf_ptr onto shadow stack,
                     // so GC tracks it during callee execution. After return,
-                    let (args_ptr, args_data_ptr) = if let Some(expansion) =
-                        call_descr.vable_expansion()
-                    {
-                        let callee_depth = resolved_target
-                            .as_ref()
-                            .map_or(16, |t| (t.max_output_slots + t.num_ref_roots).max(1));
-                        let num_expanded_items =
-                            1 + expansion.scalar_fields.len() + expansion.num_array_items;
-                        let jf_depth = num_expanded_items.max(callee_depth).max(1);
-                        let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
-                        let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            jf_bytes,
-                            3,
-                        ));
-                        let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                        let frame_val = resolve_opref(&mut builder, &constants, op.arg(0));
-                        builder.ins().store(
-                            MemFlags::trusted(),
-                            frame_val,
-                            args_ptr,
-                            JF_FRAME_ITEM0_OFS,
-                        );
-                        for (i, &(offset, _tp)) in expansion.scalar_fields.iter().enumerate() {
-                            let slot = i + 1;
-                            let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-                            if let Some(&(_, cval)) =
-                                expansion.const_overrides.iter().find(|(s, _)| *s == slot)
-                            {
-                                let cv = builder.ins().iconst(cl_types::I64, cval);
-                                builder.ins().stack_store(cv, args_slot, ofs);
-                            } else {
-                                let val = builder.ins().load(
-                                    cl_types::I64,
-                                    MemFlags::trusted(),
-                                    frame_val,
-                                    offset as i32,
-                                );
-                                builder.ins().stack_store(val, args_slot, ofs);
-                            }
-                        }
-                        let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
-                        // Only load array data pointer if at least one item
-                        // needs to be read from the frame (not covered by
-                        // const_overrides or arg_overrides).
-                        let needs_array_load = (0..expansion.num_array_items).any(|i| {
-                            let slot = num_scalars_with_frame + i;
-                            !expansion.const_overrides.iter().any(|(s, _)| *s == slot)
-                                && !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
-                        });
-                        let arr_data_ptr_val = if needs_array_load {
-                            let arr_struct_addr = builder
-                                .ins()
-                                .iadd_imm(frame_val, expansion.array_struct_offset as i64);
-                            builder.ins().load(
-                                ptr_type,
+                    let (args_ptr, args_data_ptr) =
+                        if let Some(expansion) = call_descr.vable_expansion() {
+                            let callee_depth = resolved_target
+                                .as_ref()
+                                .map_or(16, |t| (t.max_output_slots + t.num_ref_roots).max(1));
+                            let num_expanded_items =
+                                1 + expansion.scalar_fields.len() + expansion.num_array_items;
+                            let jf_depth = num_expanded_items.max(callee_depth).max(1);
+                            let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
+                            let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                jf_bytes,
+                                3,
+                            ));
+                            let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
+                            let frame_val =
+                                resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                            builder.ins().store(
                                 MemFlags::trusted(),
-                                arr_struct_addr,
-                                expansion.array_ptr_offset as i32,
-                            )
-                        } else {
-                            builder.ins().iconst(ptr_type, 0)
-                        };
-                        for i in 0..expansion.num_array_items {
-                            let slot = num_scalars_with_frame + i;
-                            let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-                            // Match dynasm x86 assembler.rs:4544 / aarch64
-                            // assembler.rs:4673: const_overrides take precedence
-                            // for any slot, including array items.
-                            if let Some(&(_, cval)) =
-                                expansion.const_overrides.iter().find(|(s, _)| *s == slot)
-                            {
-                                let cv = builder.ins().iconst(cl_types::I64, cval);
-                                builder.ins().stack_store(cv, args_slot, ofs);
-                            } else if let Some(&(_, arg_idx)) =
-                                expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
-                            {
-                                let val = resolve_opref(&mut builder, &constants, op.arg(arg_idx));
-                                builder.ins().stack_store(val, args_slot, ofs);
-                            } else {
-                                let val = builder.ins().load(
-                                    cl_types::I64,
-                                    MemFlags::trusted(),
-                                    arr_data_ptr_val,
-                                    (i * 8) as i32,
-                                );
-                                builder.ins().stack_store(val, args_slot, ofs);
+                                frame_val,
+                                args_ptr,
+                                JF_FRAME_ITEM0_OFS,
+                            );
+                            for (i, &(offset, _tp)) in expansion.scalar_fields.iter().enumerate() {
+                                let slot = i + 1;
+                                let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+                                if let Some(&(_, cval)) =
+                                    expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                                {
+                                    let cv = builder.ins().iconst(cl_types::I64, cval);
+                                    builder.ins().stack_store(cv, args_slot, ofs);
+                                } else {
+                                    let val = builder.ins().load(
+                                        cl_types::I64,
+                                        MemFlags::trusted(),
+                                        frame_val,
+                                        offset as i32,
+                                    );
+                                    builder.ins().stack_store(val, args_slot, ofs);
+                                }
                             }
-                        }
-                        let args_data_ptr =
-                            builder
-                                .ins()
-                                .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
-                        (args_ptr, args_data_ptr)
-                    } else {
-                        let args_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
-                        let args_data_ptr =
-                            builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
-                        (args_ptr, args_data_ptr)
-                    };
+                            let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
+                            // Only load array data pointer if at least one item
+                            // needs to be read from the frame (not covered by
+                            // const_overrides or arg_overrides).
+                            let needs_array_load = (0..expansion.num_array_items).any(|i| {
+                                let slot = num_scalars_with_frame + i;
+                                !expansion.const_overrides.iter().any(|(s, _)| *s == slot)
+                                    && !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
+                            });
+                            let arr_data_ptr_val = if needs_array_load {
+                                let arr_struct_addr = builder
+                                    .ins()
+                                    .iadd_imm(frame_val, expansion.array_struct_offset as i64);
+                                builder.ins().load(
+                                    ptr_type,
+                                    MemFlags::trusted(),
+                                    arr_struct_addr,
+                                    expansion.array_ptr_offset as i32,
+                                )
+                            } else {
+                                builder.ins().iconst(ptr_type, 0)
+                            };
+                            for i in 0..expansion.num_array_items {
+                                let slot = num_scalars_with_frame + i;
+                                let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+                                // Match dynasm x86 assembler.rs:4544 / aarch64
+                                // assembler.rs:4673: const_overrides take precedence
+                                // for any slot, including array items.
+                                if let Some(&(_, cval)) =
+                                    expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                                {
+                                    let cv = builder.ins().iconst(cl_types::I64, cval);
+                                    builder.ins().stack_store(cv, args_slot, ofs);
+                                } else if let Some(&(_, arg_idx)) =
+                                    expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
+                                {
+                                    let val = resolve_opref(
+                                        &mut builder,
+                                        &constants,
+                                        op.arg(arg_idx).to_opref(),
+                                    );
+                                    builder.ins().stack_store(val, args_slot, ofs);
+                                } else {
+                                    let val = builder.ins().load(
+                                        cl_types::I64,
+                                        MemFlags::trusted(),
+                                        arr_data_ptr_val,
+                                        (i * 8) as i32,
+                                    );
+                                    builder.ins().stack_store(val, args_slot, ofs);
+                                }
+                            }
+                            let args_data_ptr =
+                                builder
+                                    .ins()
+                                    .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
+                            (args_ptr, args_data_ptr)
+                        } else {
+                            let args_ptr =
+                                resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                            let args_data_ptr =
+                                builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
+                            (args_ptr, args_data_ptr)
+                        };
                     let target_token = builder.ins().iconst(
                         cl_types::I64,
                         call_descr.call_target_token().unwrap() as i64,
@@ -10688,8 +10702,11 @@ impl CraneliftBackend {
                     if let Some(result) = emit_indirect_call_from_parts(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        &op.getarglist()[1..],
+                        op.arg(0).to_opref(),
+                        &op.getarglist()[1..]
+                            .iter()
+                            .map(|a| a.to_opref())
+                            .collect::<Vec<_>>(),
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -10811,7 +10828,8 @@ impl CraneliftBackend {
                     // `op.arg(0)` is still consumed as a const_int
                     // operand at trace replay rather than threaded
                     // into the backend hook signature.
-                    let func_ptr_raw = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let func_ptr_raw =
+                        resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let func_ptr_val = if ptr_type != cl_types::I64 {
                         builder.ins().ireduce(ptr_type, func_ptr_raw)
                     } else {
@@ -10819,8 +10837,8 @@ impl CraneliftBackend {
                     };
 
                     let mut args: Vec<CValue> = Vec::with_capacity(op.num_args() - 2);
-                    for (i, &arg_ref) in op.getarglist()[2..].iter().enumerate() {
-                        let raw = resolve_opref(&mut builder, &constants, arg_ref);
+                    for (i, arg_ref) in op.getarglist()[2..].iter().enumerate() {
+                        let raw = resolve_opref(&mut builder, &constants, arg_ref.to_opref());
                         if i < arg_types.len() && arg_types[i] == Type::Float {
                             args.push(coerce_ty(&mut builder, raw, cl_types::F64));
                         } else {
@@ -10866,7 +10884,7 @@ impl CraneliftBackend {
                 // args[0] = condition, args[1] = func_ptr, args[2..] = call args
                 // If condition != 0, perform the call.
                 OpCode::CondCallN => {
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let call_block = builder.create_block();
                     let cont_block = builder.create_block();
                     if preamble_phase {
@@ -10887,8 +10905,11 @@ impl CraneliftBackend {
                             let _ = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
-                                op.arg(1),
-                                &op.getarglist()[2..],
+                                op.arg(1).to_opref(),
+                                &op.getarglist()[2..]
+                                    .iter()
+                                    .map(|a| a.to_opref())
+                                    .collect::<Vec<_>>(),
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -10915,7 +10936,7 @@ impl CraneliftBackend {
                 // If condition != 0: result = call(func_ptr, args...)
                 // Else: result = condition (0)
                 OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let call_block = builder.create_block();
                     let cont_block = builder.create_block();
                     if preamble_phase {
@@ -10942,8 +10963,11 @@ impl CraneliftBackend {
                             if let Some(result) = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
-                                op.arg(1),
-                                &op.getarglist()[2..],
+                                op.arg(1).to_opref(),
+                                &op.getarglist()[2..]
+                                    .iter()
+                                    .map(|a| a.to_opref())
+                                    .collect::<Vec<_>>(),
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -11010,12 +11034,13 @@ impl CraneliftBackend {
                         // history.py:227 ConstInt.value inline — read directly
                         // from `OpRef::ConstInt(v)`, fall through to the
                         // legacy pool for `OpRef::ConstInt(idx)` arms.
-                        let size_val = op.arg(0).inline_const_bits().unwrap_or_else(|| {
-                            constants
-                                .get(&op.arg(0).raw())
-                                .copied()
-                                .unwrap_or(op.arg(0).raw() as i64)
-                        });
+                        let size_val =
+                            op.arg(0).to_opref().inline_const_bits().unwrap_or_else(|| {
+                                constants
+                                    .get(&op.arg(0).to_opref().raw())
+                                    .copied()
+                                    .unwrap_or(op.arg(0).to_opref().raw() as i64)
+                            });
                         let size_total = builder.ins().iconst(cl_types::I64, size_val);
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
@@ -11138,8 +11163,12 @@ impl CraneliftBackend {
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
-                    let length =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(2));
+                    let length = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(2).to_opref(),
+                    );
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
@@ -11168,8 +11197,12 @@ impl CraneliftBackend {
                     let (nf_addr, nt_addr) =
                         gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let flags = MemFlags::trusted();
-                    let size_total =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let size_total = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(0).to_opref(),
+                    );
 
                     let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                     let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
@@ -11276,7 +11309,7 @@ impl CraneliftBackend {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
                     }
-                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let obj = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
@@ -11371,7 +11404,7 @@ impl CraneliftBackend {
                         // opassembler.py:994-1015: inline card bit setting.
                         builder.switch_to_block(card_mark_block);
                         builder.seal_block(card_mark_block);
-                        let index = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let index = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let shift_plus_3 = (wb_card_shift + 3) as i64;
                         let shifted = builder.ins().ushr_imm(index, shift_plus_3);
                         let byteofs_val = builder.ins().bnot(shifted);
@@ -11418,7 +11451,7 @@ impl CraneliftBackend {
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(2),
+                        op.arg(2).to_opref(),
                         "GC_LOAD itemsize",
                     )?;
                     let value_type = match op.opcode {
@@ -11437,8 +11470,8 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         &known_values,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                     );
                     let result = emit_load_from_addr(
                         &mut builder,
@@ -11467,21 +11500,21 @@ impl CraneliftBackend {
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(2),
+                        op.arg(2).to_opref(),
                         "GC_LOAD_INDEXED scale",
                     )?;
                     let base_offset = resolve_constant_i64(
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(3),
+                        op.arg(3).to_opref(),
                         "GC_LOAD_INDEXED base offset",
                     )?;
                     let item_size = resolve_constant_i64(
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(4),
+                        op.arg(4).to_opref(),
                         "GC_LOAD_INDEXED itemsize",
                     )?;
                     let value_type = match op.opcode {
@@ -11499,8 +11532,8 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         scale,
                         base_offset,
                     );
@@ -11535,8 +11568,8 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         &known_values,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                     );
                     let value_type = match op.opcode {
                         OpCode::RawLoadI => Type::Int,
@@ -11564,18 +11597,18 @@ impl CraneliftBackend {
                             &constants,
                             &known_values,
                             op.opcode,
-                            op.arg(3),
+                            op.arg(3).to_opref(),
                             "GC_STORE itemsize",
                         )?;
                         if std::env::var_os("MAJIT_CL_GCSTORE_LOG").is_some() {
-                            let offset_dbg = lookup_const_i64(&constants, op.arg(1));
+                            let offset_dbg = lookup_const_i64(&constants, op.arg(1).to_opref());
                             eprintln!(
                                 "[cl-gcstore] op_idx={} base={:?} offset_arg={:?} offset={:?} value_arg={:?} size={}",
                                 op_idx,
-                                op.arg(0),
-                                op.arg(1),
+                                op.arg(0).to_opref(),
+                                op.arg(1).to_opref(),
                                 offset_dbg,
-                                op.arg(2),
+                                op.arg(2).to_opref(),
                                 item_size
                             );
                         }
@@ -11584,7 +11617,7 @@ impl CraneliftBackend {
                             &type_overrides,
                             &known_values,
                             op.opcode,
-                            op.arg(2),
+                            op.arg(2).to_opref(),
                             op_idx,
                             "GC_STORE value",
                         )?;
@@ -11592,14 +11625,14 @@ impl CraneliftBackend {
                             &mut builder,
                             &constants,
                             &known_values,
-                            op.arg(0),
-                            op.arg(1),
+                            op.arg(0).to_opref(),
+                            op.arg(1).to_opref(),
                         );
                         let value = resolve_opref_or_imm(
                             &mut builder,
                             &constants,
                             &known_values,
-                            op.arg(2),
+                            op.arg(2).to_opref(),
                         );
                         emit_store_to_addr(
                             &mut builder,
@@ -11621,21 +11654,21 @@ impl CraneliftBackend {
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(3),
+                        op.arg(3).to_opref(),
                         "GC_STORE_INDEXED scale",
                     )?;
                     let base_offset = resolve_constant_i64(
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(4),
+                        op.arg(4).to_opref(),
                         "GC_STORE_INDEXED base offset",
                     )?;
                     let item_size = resolve_constant_i64(
                         &constants,
                         &known_values,
                         op.opcode,
-                        op.arg(5),
+                        op.arg(5).to_opref(),
                         "GC_STORE_INDEXED itemsize",
                     )?;
                     let value_type = type_for_opref(
@@ -11643,20 +11676,24 @@ impl CraneliftBackend {
                         &type_overrides,
                         &known_values,
                         op.opcode,
-                        op.arg(2),
+                        op.arg(2).to_opref(),
                         op_idx,
                         "GC_STORE_INDEXED value",
                     )?;
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         scale,
                         base_offset,
                     );
-                    let value =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(2));
+                    let value = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(2).to_opref(),
+                    );
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -11685,7 +11722,7 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("getfield descriptor must be a FieldDescr");
 
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
                     let r = emit_load_from_addr(
                         &mut builder,
@@ -11706,8 +11743,8 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("setfield descriptor must be a FieldDescr");
 
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let val = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let val = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
                     emit_store_to_addr(
                         &mut builder,
@@ -11740,8 +11777,8 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         ad.item_size() as i64,
                         ad.base_size() as i64,
                     );
@@ -11767,12 +11804,12 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("setarrayitem descriptor must be an ArrayDescr");
 
-                    let val = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         ad.item_size() as i64,
                         ad.base_size() as i64,
                     );
@@ -11802,8 +11839,8 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         ad.item_size() as i64,
                         base_offset,
                     );
@@ -11831,12 +11868,12 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         ad.item_size() as i64,
                         base_offset,
                     );
-                    let val = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -11856,10 +11893,10 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         &known_values,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                     );
-                    let val = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -11879,7 +11916,7 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("arraylen descriptor must be an ArrayDescr");
 
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
                         let addr = builder.ins().iadd_imm(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
@@ -11908,7 +11945,7 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("strlen/unicodelen descriptor must be an ArrayDescr");
 
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
                         let addr = builder.ins().iadd_imm(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
@@ -11938,7 +11975,7 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("strhash/unicodehash descriptor must be a FieldDescr");
                     assert_eq!(fd.field_size(), std::mem::size_of::<usize>());
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
                     let hash = emit_load_from_addr(
                         &mut builder,
@@ -11976,8 +12013,8 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         itemsize,
                         basesize,
                     );
@@ -12009,12 +12046,12 @@ impl CraneliftBackend {
                         ad.base_size() as i64
                     };
 
-                    let val = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(1),
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
                         itemsize,
                         basesize,
                     );
@@ -12048,21 +12085,25 @@ impl CraneliftBackend {
                     let src_addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(0),
-                        op.arg(2),
+                        op.arg(0).to_opref(),
+                        op.arg(2).to_opref(),
                         itemsize,
                         basesize,
                     );
                     let dst_addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
-                        op.arg(1),
-                        op.arg(3),
+                        op.arg(1).to_opref(),
+                        op.arg(3).to_opref(),
                         itemsize,
                         basesize,
                     );
-                    let length =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(4));
+                    let length = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(4).to_opref(),
+                    );
                     let byte_length = if ad.item_size() == 1 {
                         length
                     } else {
@@ -12093,16 +12134,16 @@ impl CraneliftBackend {
                     let scale_start = resolve_rewriter_immediate_i64(
                         &constants,
                         op.opcode,
-                        op.arg(3),
+                        op.arg(3).to_opref(),
                         "ZERO_ARRAY scale_start",
                     )?;
                     let scale_size = resolve_rewriter_immediate_i64(
                         &constants,
                         op.opcode,
-                        op.arg(4),
+                        op.arg(4).to_opref(),
                         "ZERO_ARRAY scale_size",
                     )?;
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // regalloc.py:1450-1453 `consider_zero_array`: startindex
                     // (arg 1) and length (arg 2) flow through
                     // `make_sure_var_in_reg` — they may be runtime boxes, not
@@ -12110,8 +12151,8 @@ impl CraneliftBackend {
                     // asserted `ConstInt` by the rewriter. Resolve start/size
                     // as boxes-or-consts; baking them as immediates would
                     // miscompile a register operand.
-                    let start = resolve_opref(&mut builder, &constants, op.arg(1));
-                    let size = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let start = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
+                    let size = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
 
                     let start_bytes = match scale_start {
                         0 => builder.ins().iconst(cl_types::I64, 0),
@@ -12144,8 +12185,8 @@ impl CraneliftBackend {
                 // ── Nursery pointer increment ──
                 // args[0] = base ptr, args[1] = byte offset
                 OpCode::NurseryPtrIncrement => {
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let offset = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let offset = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let r = builder.ins().iadd(base, offset);
                     builder.def_var(var(vi), r);
                 }
@@ -12155,7 +12196,7 @@ impl CraneliftBackend {
                     let vals: Vec<CValue> = op
                         .getarglist()
                         .iter()
-                        .map(|&r| resolve_opref(&mut builder, &constants, r))
+                        .map(|r| resolve_opref(&mut builder, &constants, r.to_opref()))
                         .collect();
                     // Resolve target: try descr-based lookup first, then
                     // fall back to loop_block (Jump without descr targets
@@ -12273,7 +12314,7 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatNeg => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fneg(fa);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
@@ -12281,7 +12322,7 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatAbs => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fabs(fa);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
@@ -12291,13 +12332,13 @@ impl CraneliftBackend {
 
                 // ── Casts ──
                 OpCode::CastFloatToInt => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let r = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::CastIntToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fr = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let r = coerce_ty(&mut builder, fr, want);
@@ -12307,7 +12348,7 @@ impl CraneliftBackend {
                     // Bit reinterpretation: float<->longlong shares storage, so
                     // coerce the operand to the result variable's carrier type
                     // (an actual `bitcast` when one side is F64 and the other I64).
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let r = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(vi), r);
@@ -12345,7 +12386,7 @@ impl CraneliftBackend {
                 // materializes it by returning the underlying object reference.
                 // args[0] = the real object, args[1] = vref_id
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
-                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let obj = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), obj);
                     if op.opcode == OpCode::VirtualRefR {
                         let cur_jf = builder.use_var(jf_ptr_var);
@@ -12365,7 +12406,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardTrue => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -12397,7 +12438,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardFalse => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
@@ -12442,14 +12483,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(1),
+                            op.arg(1).to_opref(),
                         );
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
@@ -12462,8 +12503,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
                             OpCode::VecIntSub => builder.ins().isub(a, b),
@@ -12488,14 +12529,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
                         let b = resolve_opref_vec_float(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(1),
+                            op.arg(1).to_opref(),
                         );
                         let result = match op.opcode {
                             OpCode::VecFloatAdd => builder.ins().fadd(a, b),
@@ -12506,8 +12547,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                         let fresult = match op.opcode {
@@ -12531,12 +12572,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
                         let result = builder.ins().fneg(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fneg(fa);
                         let result = builder
@@ -12553,12 +12594,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
                         let result = builder.ins().fabs(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fabs(fa);
                         let result = builder
@@ -12576,14 +12617,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(1),
+                            op.arg(1).to_opref(),
                         );
                         let xored = builder.ins().bxor(a, b);
                         // Result is declared as F64X2, bitcast from I64X2
@@ -12592,8 +12633,8 @@ impl CraneliftBackend {
                             .bitcast(cl_types::F64X2, MemFlags::new(), xored);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let result = builder.ins().bxor(a, b);
                         builder.def_var(var(vi), result);
                     }
@@ -12602,8 +12643,8 @@ impl CraneliftBackend {
                 // ── Vector comparison/test operations ──
                 // These always produce scalar results (I64), not vectors.
                 OpCode::VecFloatEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::Equal, fa, fb);
@@ -12612,8 +12653,8 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecFloatNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::NotEqual, fa, fb);
@@ -12622,7 +12663,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntIsTrue => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
@@ -12630,16 +12671,16 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let cmp = builder.ins().icmp(IntCC::Equal, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecIntNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
@@ -12647,21 +12688,21 @@ impl CraneliftBackend {
 
                 OpCode::VecIntSignext => {
                     // Sign-extend a narrower integer value to i64
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), a); // already i64
                 }
 
                 // ── Vector cast operations ──
                 // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let result = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecCastIntToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let result = builder
                         .ins()
@@ -12670,7 +12711,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastFloatToSinglefloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
                     let result = builder
@@ -12681,7 +12722,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastSinglefloatToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
                     let f32val = builder
                         .ins()
@@ -12725,14 +12766,15 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
-                        let lane = lookup_const_i64(&constants, op.arg(2)).unwrap_or(0) as u8;
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
+                        let lane =
+                            lookup_const_i64(&constants, op.arg(2).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12746,18 +12788,20 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let scalar_i =
+                            resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let scalar_f =
                             builder
                                 .ins()
                                 .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
-                        let lane = lookup_const_i64(&constants, op.arg(2)).unwrap_or(0) as u8;
+                        let lane =
+                            lookup_const_i64(&constants, op.arg(2).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12770,13 +12814,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
-                        let lane = lookup_const_i64(&constants, op.arg(1)).unwrap_or(0) as u8;
+                        let lane =
+                            lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12789,9 +12834,10 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.arg(0),
+                            op.arg(0).to_opref(),
                         );
-                        let lane = lookup_const_i64(&constants, op.arg(1)).unwrap_or(0) as u8;
+                        let lane =
+                            lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
                         let result =
                             builder
@@ -12799,7 +12845,7 @@ impl CraneliftBackend {
                                 .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12807,11 +12853,11 @@ impl CraneliftBackend {
                 OpCode::VecExpandI => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar to all lanes
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let result = builder.ins().splat(cl_types::I64X2, scalar);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12819,7 +12865,8 @@ impl CraneliftBackend {
                 OpCode::VecExpandF => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar f64 to all lanes
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let scalar_i =
+                            resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let scalar_f =
                             builder
                                 .ins()
@@ -12827,7 +12874,7 @@ impl CraneliftBackend {
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12836,9 +12883,9 @@ impl CraneliftBackend {
                 OpCode::VecLoadI | OpCode::VecLoadF => {
                     if USE_NATIVE_SIMD {
                         // Load 128 bits (2x i64 or 2x f64) from memory
-                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 1 {
-                            resolve_opref(&mut builder, &constants, op.arg(1))
+                            resolve_opref(&mut builder, &constants, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12851,9 +12898,9 @@ impl CraneliftBackend {
                         let result = builder.ins().load(load_type, MemFlags::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 1 {
-                            resolve_opref(&mut builder, &constants, op.arg(1))
+                            resolve_opref(&mut builder, &constants, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12869,29 +12916,32 @@ impl CraneliftBackend {
                 OpCode::VecStore => {
                     if USE_NATIVE_SIMD {
                         // Store 128 bits to memory
-                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 2 {
-                            resolve_opref(&mut builder, &constants, op.arg(1))
+                            resolve_opref(&mut builder, &constants, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
                         let value_ref = op.arg(op.num_args() - 1);
-                        let value = if vec_oprefs.contains(&value_ref.raw()) {
-                            builder.use_var(var(value_ref.raw()))
+                        let value = if vec_oprefs.contains(&value_ref.to_opref().raw()) {
+                            builder.use_var(var(value_ref.to_opref().raw()))
                         } else {
-                            resolve_opref(&mut builder, &constants, value_ref)
+                            resolve_opref(&mut builder, &constants, value_ref.to_opref())
                         };
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 2 {
-                            resolve_opref(&mut builder, &constants, op.arg(1))
+                            resolve_opref(&mut builder, &constants, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
-                        let value =
-                            resolve_opref(&mut builder, &constants, op.arg(op.num_args() - 1));
+                        let value = resolve_opref(
+                            &mut builder,
+                            &constants,
+                            op.arg(op.num_args() - 1).to_opref(),
+                        );
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     }
@@ -13003,8 +13053,12 @@ impl CraneliftBackend {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
                     }
-                    let length =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let length = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(0).to_opref(),
+                    );
                     let __descr_arc = op.getdescr();
                     let (base_size, item_size) =
                         if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
@@ -13049,8 +13103,8 @@ impl CraneliftBackend {
 
                 // ── Integer sign extension ──
                 OpCode::IntSignext => {
-                    let val = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let num_bits = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let num_bits = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
 
                     // Sign extend from `num_bits` to 64 bits
                     // shift left by (64 - num_bits), then arithmetic shift right by same
@@ -13063,15 +13117,15 @@ impl CraneliftBackend {
 
                 // ── Unsigned multiply high ──
                 OpCode::UintMulHigh => {
-                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let result = builder.ins().umulhi(a, b);
                     builder.def_var(var(vi), result);
                 }
 
                 // ── Float ↔ SingleFloat casts ──
                 OpCode::CastFloatToSinglefloat => {
-                    let val = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // f64 → f32 → zero-extend to i64 (singlefloat is Int-typed)
                     let f64_val = coerce_ty(&mut builder, val, cl_types::F64);
                     let f32_val = builder.ins().fdemote(cl_types::F32, f64_val);
@@ -13083,7 +13137,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::CastSinglefloatToFloat => {
-                    let val = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // i64 (lower 32 bits = f32) → f32 → f64 → i64
                     let i32_val = builder.ins().ireduce(cl_types::I32, val);
                     let f32_val = builder
@@ -13097,8 +13151,8 @@ impl CraneliftBackend {
 
                 // ── Raw array item read (ref-typed) ──
                 OpCode::GetarrayitemRawR => {
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let index = resolve_opref(&mut builder, &constants, op.arg(1));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let index = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                     let scale = builder.ins().iconst(cl_types::I64, 8);
                     let offset = builder.ins().imul(index, scale);
                     let addr = builder.ins().iadd(base, offset);
@@ -13121,7 +13175,7 @@ impl CraneliftBackend {
                 OpCode::ThreadlocalrefGet => {
                     // Load from a thread-local slot via runtime callback.
                     // arg(0) = offset (in bytes) into the TLS area.
-                    let offset = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let offset = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let result = emit_host_call(
                         &mut builder,
                         ptr_type,
@@ -13147,7 +13201,7 @@ impl CraneliftBackend {
                 OpCode::LoadFromGcTable => {
                     // Load a constant pointer from the GC table.
                     // arg(0) = index into the gc table
-                    let index = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let index = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), index);
                 }
 
@@ -13155,10 +13209,10 @@ impl CraneliftBackend {
                 // resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs,
                 // c_shift]`, `res = arg0 + (arg1 << arg3) + arg2`.
                 OpCode::LoadEffectiveAddress => {
-                    let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let index = resolve_opref(&mut builder, &constants, op.arg(1));
-                    let baseofs = resolve_opref(&mut builder, &constants, op.arg(2));
-                    let shift = resolve_opref(&mut builder, &constants, op.arg(3));
+                    let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let index = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
+                    let baseofs = resolve_opref(&mut builder, &constants, op.arg(2).to_opref());
+                    let shift = resolve_opref(&mut builder, &constants, op.arg(3).to_opref());
                     let shifted_index = builder.ins().ishl(index, shift);
                     let addr = builder.ins().iadd(base, shifted_index);
                     let result = builder.ins().iadd(addr, baseofs);
@@ -13183,7 +13237,7 @@ impl CraneliftBackend {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
                     }
-                    let len = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let len = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     let result = emit_collecting_gc_call(
@@ -13578,7 +13632,7 @@ fn collect_guards(
         let fail_index = fail_descrs.len() as u32;
 
         let (fail_arg_refs, fail_arg_types) = if is_finish || is_external_jump {
-            let refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
+            let refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
             // Use the descriptor's explicit types for FINISH args — these are
             // set by the tracer and represent the caller's view of the return
             // type, which may differ from the op's inferred type (e.g. New
@@ -13594,7 +13648,7 @@ fn collect_guards(
             };
             (refs, types)
         } else if let Some(fa) = op.getfailargs() {
-            let refs: Vec<OpRef> = fa.iter().copied().collect();
+            let refs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
             let __descr_arc_descr_fd = op.getdescr();
             let descr_fd = __descr_arc_descr_fd
                 .as_ref()
@@ -14110,7 +14164,7 @@ fn collect_guards(
                 // FailDescr.  Synthesize a `ResumeGuardDescr` so the
                 // meta-side slots for `force_token_slots` and
                 // `external_jump_target` are reachable.
-                majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
+                majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             } else if let Some(d) = op.getdescr() {
                 // Preserve `op.descr` identity for every guard that carries
                 // one — including non-Resume FailDescrs (PropagateExceptionDescr
@@ -14135,7 +14189,7 @@ fn collect_guards(
                 // somewhere to land — only the
                 // meta-side slot stores recovery_layout, no backend
                 // cell fallback.
-                majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
+                majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             };
             // Stamp the per-trace fail_index and trace_id onto the
             // metainterp ResumeGuardDescr.  `compile.py:185` gates the
@@ -14147,7 +14201,7 @@ fn collect_guards(
                     fd.set_fail_index_per_trace(fail_index);
                     fd.set_trace_id(trace_id);
                     if fd.fail_arg_types().is_empty() {
-                        fd.set_fail_arg_types(fail_arg_types.clone());
+                        fd.set_fail_arg_types(fail_arg_types.to_vec());
                     }
                 }
             }
@@ -14189,8 +14243,8 @@ fn collect_guards(
         // index + type tag in status (overrides store_hash).
         if op.opcode == majit_ir::OpCode::GuardValue {
             if let Some(fa) = op.getfailargs() {
-                let arg0 = op.arg(0);
-                if let Some(idx) = fa.iter().position(|&r| r == arg0) {
+                let arg0 = op.arg(0).to_opref();
+                if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
                     let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
                         Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
                         Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
@@ -14320,8 +14374,9 @@ fn collect_terminal_exit_layouts(
         let is_jump = op.opcode == OpCode::Jump;
 
         if is_finish || is_jump {
+            let arg_oprefs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
             let exit_types =
-                infer_fail_arg_types(&op.getarglist(), &type_index, &type_overrides, op_index)?;
+                infer_fail_arg_types(&arg_oprefs, &type_index, &type_overrides, op_index)?;
             let force_token_slots: Vec<usize> = op
                 .getarglist()
                 .iter()
@@ -14330,7 +14385,9 @@ fn collect_terminal_exit_layouts(
                     if opref.is_constant() {
                         None
                     } else {
-                        force_tokens.contains(&opref.raw()).then_some(slot)
+                        force_tokens
+                            .contains(&opref.to_opref().raw())
+                            .then_some(slot)
                     }
                 })
                 .collect();
@@ -15965,10 +16022,12 @@ mod tests {
     use majit_gc::flags;
     use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let o = Op::new(opcode, args);
+        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let o = Op::new(opcode, &bx);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
@@ -16000,7 +16059,8 @@ mod tests {
         pos: u32,
         descr: majit_ir::DescrRef,
     ) -> majit_ir::OpRc {
-        let o = Op::with_descr(opcode, args, descr);
+        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let o = Op::with_descr(opcode, &bx, descr);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
@@ -16841,10 +16901,10 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_int(0),
-        ]));
+        guard.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -17046,7 +17106,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -17141,7 +17203,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -17210,7 +17274,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        bridge_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -17280,7 +17346,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        root_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        root_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             root_guard,
@@ -17346,7 +17414,9 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        bridge_guard.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+        bridge_guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
@@ -17865,7 +17935,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17913,7 +17985,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -17954,7 +18028,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18005,7 +18081,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18060,7 +18138,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -18132,7 +18212,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -20107,10 +20189,10 @@ mod tests {
             OpRef::NONE.raw(),
         );
         // Explicit fail_args: save both i0 and i1 plus the computed sum (i0+i1)
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+        ]);
 
         let ops = vec![
             mk_op(
@@ -20202,10 +20284,10 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_float(1),
-            OpRef::input_arg_ref(2),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_float(1)),
+            BoxRef::from_opref(OpRef::input_arg_ref(2)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20252,12 +20334,12 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_float(2),
-            OpRef::input_arg_ref(3),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            BoxRef::from_opref(OpRef::input_arg_float(2)),
+            BoxRef::from_opref(OpRef::input_arg_ref(3)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20448,10 +20530,10 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_int(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20524,10 +20606,10 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_int(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20599,11 +20681,11 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(1),
-            OpRef::int_op(3),
-            OpRef::input_arg_int(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::int_op(3)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20658,11 +20740,11 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(1),
-            OpRef::int_op(3),
-            OpRef::input_arg_int(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::int_op(3)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20729,11 +20811,11 @@ mod tests {
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Float);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(1),
-            OpRef::float_op(3),
-            OpRef::input_arg_int(0),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::float_op(3)),
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20987,7 +21069,7 @@ mod tests {
         backend.set_next_trace_id(1500_247);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
+        guard_op.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -21032,7 +21114,7 @@ mod tests {
             .unwrap();
 
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::ref_op(1)]));
+        guard_op.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::ref_op(1))]);
         let force_token_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::ForceToken, &[], 1),
@@ -21279,7 +21361,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21353,7 +21437,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21430,11 +21516,11 @@ mod tests {
             InputArg::new_ref(2),
         ];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_ref(2),
-        ]));
+        guard.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_ref(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            BoxRef::from_opref(OpRef::input_arg_ref(2)),
+        ]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21531,7 +21617,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -21617,7 +21705,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -22118,9 +22208,9 @@ mod tests {
         let inputargs = vec![];
         let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
-            OpRef::ref_op(0),
-            OpRef::ref_op(1),
-            OpRef::ref_op(2)
+            BoxRef::from_opref(OpRef::ref_op(0)),
+            BoxRef::from_opref(OpRef::ref_op(1)),
+            BoxRef::from_opref(OpRef::ref_op(2))
         ]);
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
@@ -22294,7 +22384,10 @@ mod tests {
         // ref_!(Newstr,...))) — the str pointer references must use the
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
-        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+        let op = |oc, args: &[OpRef]| {
+            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            std::rc::Rc::new(Op::new(oc, &bx))
+        };
         let ops = vec![
             op(OpCode::Newstr, &[OpRef::int_op(100)]),
             op(
@@ -22343,7 +22436,10 @@ mod tests {
         // pointers; both must reference back as Ref-typed OpRefs.
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
-        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+        let op = |oc, args: &[OpRef]| {
+            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            std::rc::Rc::new(Op::new(oc, &bx))
+        };
         let ops = vec![
             op(OpCode::Newstr, &[OpRef::int_op(100)]),
             op(
@@ -22394,7 +22490,10 @@ mod tests {
         // ref_!(...,Newunicode,...))) — references to the unicode
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
-        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+        let op = |oc, args: &[OpRef]| {
+            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            std::rc::Rc::new(Op::new(oc, &bx))
+        };
         let ops = vec![
             op(OpCode::Newunicode, &[OpRef::int_op(100)]),
             op(
@@ -22425,7 +22524,10 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+        let op = |oc, args: &[OpRef]| {
+            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            std::rc::Rc::new(Op::new(oc, &bx))
+        };
         let ops = vec![
             op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
             op(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
@@ -22468,7 +22570,10 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+        let op = |oc, args: &[OpRef]| {
+            let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            std::rc::Rc::new(Op::new(oc, &bx))
+        };
         let ops = vec![
             op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
             op(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
@@ -22727,10 +22832,10 @@ mod tests {
         // Build a guard with explicit fail_args so we can inspect them.
         let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
-        guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-        ]));
+        guard_op.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+        ]);
 
         let ops = vec![
             mk_op(
@@ -22779,7 +22884,7 @@ mod tests {
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
-        guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
+        guard_inv.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -22829,7 +22934,9 @@ mod tests {
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
-        guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
+        guard_inv.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+            OpRef::input_arg_int(0)
+        )]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             std::rc::Rc::new(guard_inv),
@@ -22879,17 +22986,17 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard1.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-        ]));
+        guard1.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1)),
+        ]);
         let int_add = mk_op(
             OpCode::IntAdd,
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
             2,
         );
         let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard2.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(2)]));
+        guard2.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(2))]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22948,11 +23055,11 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_float(2),
-        ]));
+        guard.setfailargs(smallvec::smallvec![
+            BoxRef::from_opref(OpRef::input_arg_int(0)),
+            BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            BoxRef::from_opref(OpRef::input_arg_float(2)),
+        ]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23016,7 +23123,9 @@ mod tests {
             mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-                g.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
+                g.setfailargs(smallvec::smallvec![BoxRef::from_opref(
+                    OpRef::input_arg_int(0)
+                )]);
                 g
             },
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),

@@ -23,6 +23,7 @@ use majit_backend::{
     Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
     OpRef, RdVirtualInfo, Type, Value,
@@ -449,7 +450,7 @@ pub(crate) fn build_guard_metadata(
             // class, not by per-arg inference.
             // history.py:220/261/307 — type is intrinsic on the Box; read it
             // off the OpRef variant tag (`ty()`).
-            let finish_arg_type = |opref: &OpRef| -> Type { opref.ty().unwrap_or(Type::Int) };
+            let finish_arg_type = |b: &BoxRef| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
             if let Some(types) = descr_types {
                 if types.len() == op.num_args() {
                     types.to_vec()
@@ -491,7 +492,7 @@ pub(crate) fn build_guard_metadata(
                                     return tp;
                                 }
                             }
-                            fail_arg_type(opref)
+                            fail_arg_type(&opref.to_opref())
                         })
                         .collect()
                 }
@@ -506,12 +507,15 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            fail_arg_type(opref)
+                            fail_arg_type(&opref.to_opref())
                         })
                         .collect()
                 }
             } else {
-                fail_args.iter().map(fail_arg_type).collect()
+                fail_args
+                    .iter()
+                    .map(|b| fail_arg_type(&b.to_opref()))
+                    .collect()
             }
         } else if let Some(dt) = descr_types {
             dt.to_vec()
@@ -1520,7 +1524,7 @@ pub(crate) fn infer_terminal_exit_layout(
                 return Type::Ref;
             }
             type_index
-                .opref_type_at(*opref, op_index)
+                .opref_type_at(opref.to_opref(), op_index)
                 .unwrap_or(Type::Int)
         })
         .collect();
@@ -1530,7 +1534,7 @@ pub(crate) fn infer_terminal_exit_layout(
         .enumerate()
         .filter_map(|(slot, opref)| {
             type_index
-                .op_at(*opref)
+                .op_at(opref.to_opref())
                 .map(|op| op.opcode)
                 .filter(|opcode| *opcode == OpCode::ForceToken)
                 .map(|_| slot)
@@ -1678,16 +1682,16 @@ pub(crate) fn normalize_closing_jump_args(
         if arg.is_constant() {
             continue;
         }
-        if constants.contains_key(&arg.raw()) {
+        if constants.contains_key(&arg.to_opref().raw()) {
             continue;
         }
-        if (arg.raw() as usize) < num_inputs {
+        if (arg.to_opref().raw() as usize) < num_inputs {
             continue;
         }
-        if defined.contains(&arg) {
+        if defined.contains(&arg.to_opref()) {
             continue;
         }
-        jump.setarg(idx, label_args[idx]);
+        jump.setarg(idx, label_args[idx].clone());
     }
 
     ops
@@ -1818,8 +1822,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
 
         for i in 0..op.num_args() {
             let orig_arg = op.arg(i);
-            let arg = get_local_box_replacement(forwarding, orig_arg);
-            if orig_arg != arg {
+            let arg = get_local_box_replacement(forwarding, orig_arg.to_opref());
+            if orig_arg.to_opref() != arg {
                 if !replaced {
                     emitted = op.copy_and_change(op.opcode, None, None);
                     if op.result_type() != Type::Void && !op.pos.get().is_none() {
@@ -1833,7 +1837,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                     }
                     replaced = true;
                 }
-                emitted.setarg(i, arg);
+                emitted.setarg(i, BoxRef::from_opref(arg));
             }
         }
 
@@ -1843,7 +1847,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             }
             if let Some(fail_args) = emitted.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
-                    *arg = get_local_box_replacement(forwarding, *arg);
+                    *arg =
+                        BoxRef::from_opref(get_local_box_replacement(forwarding, arg.to_opref()));
                 }
             }
         }
@@ -1876,8 +1881,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .iter()
         .flat_map(|op| {
             std::iter::once(op.pos.get())
-                .chain(op.getarglist_copy())
-                .chain(op.getfailargs().into_iter().flatten())
+                .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
+                .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()))
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -1928,7 +1933,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
-        let mut op = Op::new(opcode, &[vable_box]);
+        let mut op = Op::new(opcode, &[BoxRef::from_opref(vable_box)]);
         op.pos.set(new_opref);
         op.setdescr(descr);
         extra_ops.push(op);
@@ -1948,7 +1953,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
-        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box]);
+        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[BoxRef::from_opref(vable_box)]);
         arr_load.pos.set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
         extra_ops.push(arr_load);
@@ -1986,7 +1991,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 // RPython's flat GC-array layout — out of scope.
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
-                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_opref]);
+                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[BoxRef::from_opref(array_opref)]);
                 ptr_load.pos.set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -2019,7 +2024,13 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
             let new_opref = OpRef::op_typed(next_opref, vinfo.array_fields[ai].item_type);
             next_opref += 1;
-            let mut elem_op = Op::new(item_opcode, &[item_base, const_opref]);
+            let mut elem_op = Op::new(
+                item_opcode,
+                &[
+                    BoxRef::from_opref(item_base),
+                    BoxRef::from_opref(const_opref),
+                ],
+            );
             elem_op.pos.set(new_opref);
             elem_op.setdescr(item_descr.clone());
             extra_ops.push(elem_op);
@@ -2431,7 +2442,8 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let mut call_op = Op::with_descr(call_opcode, &callargs, portal_calldescr);
+    let callargs_box: Vec<BoxRef> = callargs.iter().map(|a| BoxRef::from_opref(*a)).collect();
+    let mut call_op = Op::with_descr(call_opcode, &callargs_box, portal_calldescr);
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2457,7 +2469,8 @@ pub fn compile_tmp_callback(
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
-    let finish_op = Op::with_descr(OpCode::Finish, &finishargs, portal_finishtoken);
+    let finishargs_box: Vec<BoxRef> = finishargs.iter().map(|a| BoxRef::from_opref(*a)).collect();
+    let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
     let operations: Vec<majit_ir::OpRc> = vec![call_op, guard_op, finish_op]
         .into_iter()
         .map(std::rc::Rc::new)
@@ -2538,7 +2551,10 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(1)]);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[BoxRef::from_opref(OpRef::input_arg_int(1))],
+        );
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
@@ -2546,8 +2562,8 @@ mod tests {
         }
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_int(1)
+            BoxRef::from_opref(OpRef::input_arg_ref(0)),
+            BoxRef::from_opref(OpRef::input_arg_int(1))
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
@@ -2585,7 +2601,10 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_ref(0)]);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[BoxRef::from_opref(OpRef::input_arg_ref(0))],
+        );
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2594,10 +2613,10 @@ mod tests {
             .set_fail_arg_types(fail_arg_types.clone());
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_ref(1),
-            OpRef::input_arg_ref(2),
-            OpRef::input_arg_ref(3)
+            BoxRef::from_opref(OpRef::input_arg_ref(0)),
+            BoxRef::from_opref(OpRef::input_arg_ref(1)),
+            BoxRef::from_opref(OpRef::input_arg_ref(2)),
+            BoxRef::from_opref(OpRef::input_arg_ref(3))
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
@@ -2618,13 +2637,25 @@ mod tests {
 
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::SameAsR, &[OpRef::input_arg_ref(1)]);
+                let mut op = Op::new(
+                    OpCode::SameAsR,
+                    &[BoxRef::from_opref(OpRef::input_arg_ref(1))],
+                );
                 op.pos.set(OpRef::ref_op(10));
                 op
             },
-            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0), OpRef::ref_op(10)]),
+            Op::new(
+                OpCode::Label,
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    BoxRef::from_opref(OpRef::ref_op(10)),
+                ],
+            ),
             {
-                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)]);
+                let mut op = Op::new(
+                    OpCode::GetfieldGcPureI,
+                    &[BoxRef::from_opref(OpRef::ref_op(10))],
+                );
                 op.pos.set(OpRef::int_op(11));
                 op.setdescr(majit_ir::descr::make_field_descr(
                     16,
@@ -2654,18 +2685,36 @@ mod tests {
         let vable_field = ops[0].pos.get();
 
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
-        assert_eq!(&*ops[1].getarglist(), &[vable_field]);
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![vable_field]
+        );
         let forwarded_same_as = ops[1].pos.get();
         assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
-            &*ops[2].getarglist(),
-            &[OpRef::input_arg_ref(0), forwarded_same_as]
+            ops[2]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), forwarded_same_as]
         );
 
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(&*ops[3].getarglist(), &[forwarded_same_as]);
+        assert_eq!(
+            ops[3]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![forwarded_same_as]
+        );
     }
 
     #[test]
@@ -2685,9 +2734,9 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::Label,
             &[
-                OpRef::input_arg_ref(0),
-                OpRef::input_arg_ref(1),
-                OpRef::input_arg_ref(2),
+                BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                BoxRef::from_opref(OpRef::input_arg_ref(1)),
+                BoxRef::from_opref(OpRef::input_arg_ref(2)),
             ],
         )];
         let mut inputargs = vec![
@@ -2711,15 +2760,26 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
-        assert_eq!(&*ops[1].getarglist(), &[ops[0].pos.get()]);
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![ops[0].pos.get()]
+        );
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[2].arg(0), ops[1].pos.get());
+        assert_eq!(ops[2].arg(0).to_opref(), ops[1].pos.get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[3].arg(0), ops[1].pos.get());
+        assert_eq!(ops[3].arg(0).to_opref(), ops[1].pos.get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
-            &*ops[4].getarglist(),
-            &[OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
+            ops[4]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
         );
     }
 }

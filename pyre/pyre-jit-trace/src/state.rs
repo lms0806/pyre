@@ -8714,7 +8714,7 @@ mod tests {
         let tree_loop = ctx.into_tree_loop();
         let op = tree_loop.ops.last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
-        assert_eq!(op.arg(0), obj);
+        assert_eq!(op.arg(0).to_opref(), obj);
     }
 
     #[test]
@@ -8758,7 +8758,14 @@ mod tests {
             if op.opcode == OpCode::GuardNonnullClass {
                 saw_guard_nonnull_class = true;
             }
-            if op.opcode == OpCode::GetfieldGcPureI && (&*op.getarglist()) == &[int_obj] {
+            if op.opcode == OpCode::GetfieldGcPureI
+                && op
+                    .getarglist()
+                    .iter()
+                    .map(|a| a.to_opref())
+                    .collect::<Vec<_>>()
+                    == vec![int_obj]
+            {
                 saw_pure_payload = true;
             }
         }
@@ -9339,8 +9346,8 @@ mod tests {
                 )
             })
             .expect("call op should be present");
-        assert_ne!(call.arg(0), lhs);
-        assert_ne!(call.arg(1), rhs);
+        assert_ne!(call.arg(0).to_opref(), lhs);
+        assert_ne!(call.arg(1).to_opref(), rhs);
     }
 
     #[test]
@@ -9391,7 +9398,7 @@ mod tests {
                 )
             })
             .expect("call op should be present");
-        assert_ne!(call.getarglist().last().copied(), Some(arg));
+        assert_ne!(call.getarglist().last().map(|a| a.to_opref()), Some(arg));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use majit_ir::vec_set::VecSet;
 
 use majit_ir::{Op, OpCode, OpRef};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -76,7 +77,7 @@ impl VectorLoop {
             "expected Jump, got {:?}",
             jump.opcode
         );
-        let inputargs = label.getarglist().to_vec();
+        let inputargs = label.getarglist().iter().map(|a| a.to_opref()).collect();
         VectorLoop {
             label,
             inputargs,
@@ -445,7 +446,14 @@ impl VectorizingOptimizer {
     /// 8. Re-schedule for cleanup
     pub fn run_optimization(&mut self, loop_: &mut VectorLoop) -> Result<Vec<Op>, VectorizeError> {
         // vector.py:221
-        self.orig_label_args = Some(loop_.label.getarglist().to_vec());
+        self.orig_label_args = Some(
+            loop_
+                .label
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect(),
+        );
 
         // vector.py:222
         self.linear_find_smallest_type(loop_);
@@ -528,10 +536,15 @@ impl VectorizingOptimizer {
         let packset = self.packset.take().unwrap_or_default();
 
         // Populate inputargs/seen from label args
-        for &arg in loop_.label.getarglist().iter() {
-            sched_state.inputargs.insert(arg, ());
+        for arg in loop_.label.getarglist().iter() {
+            sched_state.inputargs.insert(arg.to_opref(), ());
         }
-        let mut seen: VecSet<OpRef> = loop_.label.getarglist().iter().copied().collect();
+        let mut seen: VecSet<OpRef> = loop_
+            .label
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
 
         // accumulate_prepare for accumulation packs
         for pack in &packset.packs {
@@ -544,7 +557,7 @@ impl VectorizingOptimizer {
             }
             let pos = pack.position.max(0) as usize;
             let seed = if pos < first_op.num_args() {
-                first_op.arg(pos)
+                first_op.arg(pos).to_opref()
             } else {
                 OpRef::NONE
             };
@@ -742,8 +755,9 @@ impl VectorizingOptimizer {
         // vector.py:349-350: descr.clone() — already cloned by copy_resop
         // vector.py:351: failargs = renamer.rename_failargs(copied_op, clone=True)
         if let Some(fail_args) = copied_op.getfailargs() {
-            let renamed = renamer.rename_failargs(&fail_args);
-            copied_op.setfailargs(renamed.into());
+            let fail_args_oprefs: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
+            let renamed = renamer.rename_failargs(&fail_args_oprefs);
+            copied_op.setfailargs(renamed.iter().map(|r| BoxRef::from_opref(*r)).collect());
         }
     }
 
@@ -845,7 +859,7 @@ impl VectorizingOptimizer {
                 // args = pack.leftmost().getarglist(); if left not in args: continue
                 let dep_opref = graph.nodes[l_dep].op.pos.get();
                 let left_args = graph.nodes[left_idx].op.getarglist();
-                if !left_args.contains(&dep_opref) {
+                if !left_args.iter().any(|a| a.to_opref() == dep_opref) {
                     continue;
                 }
                 let l_op = &graph.nodes[l_dep].op;
@@ -884,7 +898,12 @@ impl VectorizingOptimizer {
                 // vector.py:451-453: left = pack.leftmost()
                 // args = lnode.getoperation().getarglist()
                 // if left not in args: continue
-                if !graph.nodes[l_user].op.getarglist().contains(&left_opref) {
+                if !graph.nodes[l_user]
+                    .op
+                    .getarglist()
+                    .iter()
+                    .any(|a| a.to_opref() == left_opref)
+                {
                     continue;
                 }
                 let l_op = &graph.nodes[l_user].op;
@@ -1074,7 +1093,7 @@ impl VectorizingOptimizer {
             }
             let pos = pack.position.max(0) as usize;
             let seed = if pos < first_op.num_args() {
-                first_op.arg(pos)
+                first_op.arg(pos).to_opref()
             } else {
                 OpRef::NONE
             };
@@ -1312,8 +1331,8 @@ impl VectorLoop {
         for u in 0..unroll_count {
             // vector.py:296-301: fill rename map: label args → jump args
             for i in 0..label_args.len().min(jump_args.len()) {
-                let la = label_args[i];
-                let ja = renamer.rename_box(jump_args[i]);
+                let la = label_args[i].to_opref();
+                let ja = renamer.rename_box(jump_args[i].to_opref());
                 if la != ja {
                     renamer.start_renaming(la, ja);
                 }
@@ -1337,8 +1356,8 @@ impl VectorLoop {
 
                 // vector.py:312-315: rename args
                 for i in 0..copied_op.num_args() {
-                    let renamed = renamer.rename_box(copied_op.arg(i));
-                    copied_op.setarg(i, renamed);
+                    let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
+                    copied_op.setarg(i, BoxRef::from_opref(renamed));
                 }
 
                 // vector.py:319-320: rename guard fail args
@@ -1359,8 +1378,8 @@ impl VectorLoop {
                     minted.setdescr(descr);
                 }
                 for i in 0..minted.num_args() {
-                    let renamed = renamer.rename_box(minted.arg(i));
-                    minted.setarg(i, renamed);
+                    let renamed = renamer.rename_box(minted.arg(i).to_opref());
+                    minted.setarg(i, BoxRef::from_opref(renamed));
                 }
                 new_label = minted;
             }
@@ -1368,8 +1387,8 @@ impl VectorLoop {
 
         // vector.py:334-337: update jump args with final renaming
         for i in 0..self.jump.num_args() {
-            let renamed = renamer.rename_box(self.jump.arg(i));
-            self.jump.setarg(i, renamed);
+            let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
+            self.jump.setarg(i, BoxRef::from_opref(renamed));
         }
 
         // vector.py:339-344
@@ -1402,24 +1421,24 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
             if arg.is_none() {
                 continue;
             }
-            if let Some(entry) = state.accumulation.get(arg) {
+            if let Some(entry) = state.accumulation.get(&arg.to_opref()) {
                 let location = state
-                    .getvector_of_box(*arg)
+                    .getvector_of_box(arg.to_opref())
                     .map(|(_, vec_ref)| vec_ref)
-                    .unwrap_or(*arg);
+                    .unwrap_or(arg.to_opref());
                 if let Some(descr) = op.getdescr() {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumInfo {
                             prev: None,
                             failargs_pos: fi,
-                            variable: *arg,
+                            variable: arg.to_opref(),
                             location,
                             accum_operation: entry.operator,
                             scalar: OpRef::NONE,
                         });
                     }
                 }
-                *arg = entry.seed;
+                *arg = BoxRef::from_opref(entry.seed);
             }
         }
         op.setfailargs(new_fa);
@@ -1439,7 +1458,7 @@ pub(crate) fn ensure_args_unpacked(
 ) {
     // schedule.py:702-706: unpack immediate-use args
     for j in 0..op.num_args() {
-        let arg = op.arg(j);
+        let arg = op.arg(j).to_opref();
         if arg.is_constant() || seen.contains(&arg) {
             continue;
         }
@@ -1453,24 +1472,24 @@ pub(crate) fn ensure_args_unpacked(
             let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
             state.renamer.start_renaming(arg, unpacked);
             seen.insert(unpacked);
-            op.setarg(j, unpacked);
+            op.setarg(j, BoxRef::from_opref(unpacked));
         }
     }
     // schedule.py:708-716: unpack guard failargs
     if op.opcode.is_guard() {
         if let Some(mut fail_args) = op.getfailargs() {
             for arg in fail_args.iter_mut() {
-                if arg.is_constant() || seen.contains(arg) {
+                if arg.is_constant() || seen.contains(&arg.to_opref()) {
                     continue;
                 }
-                if let Some((pos, vec_ref)) = state.getvector_of_box(*arg) {
-                    if state.accumulation.contains_key(arg) {
+                if let Some((pos, vec_ref)) = state.getvector_of_box(arg.to_opref()) {
+                    if state.accumulation.contains_key(&arg.to_opref()) {
                         continue;
                     }
                     let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
-                    state.renamer.start_renaming(*arg, unpacked);
+                    state.renamer.start_renaming(arg.to_opref(), unpacked);
                     seen.insert(unpacked);
-                    *arg = unpacked;
+                    *arg = BoxRef::from_opref(unpacked);
                 }
             }
             op.setfailargs(fail_args);
@@ -1494,7 +1513,7 @@ impl Optimization for VectorizingOptimizer {
         match op.opcode {
             OpCode::Label => {
                 self.in_loop = true;
-                self.label_args = op.getarglist().to_vec();
+                self.label_args = op.getarglist().iter().map(|a| a.to_opref()).collect();
                 // Hold the LABEL instead of emitting it: post_schedule may need to
                 // place prefix ops (and a prefix_label) BEFORE the loop entry, which
                 // is impossible once the label is in the stream. The held label is
@@ -1622,18 +1641,30 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
-            Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]),
+            Op::new(
+                OpCode::Label,
+                &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+            ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::int_op(2), OpRef::input_arg_int(102)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                ],
             ),
-            Op::new(OpCode::Jump, &[OpRef::int_op(3)]),
+            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(3))]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
@@ -1647,12 +1678,18 @@ mod tests {
 
     #[test]
     fn test_vector_loop_new() {
-        let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
+        let label = Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+        );
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
-        let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
+        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]);
         let vloop = VectorLoop::new(label, ops, jump);
         assert_eq!(vloop.body_len(), 1);
         assert_eq!(vloop.inputargs, vec![OpRef::input_arg_int(100)]);
@@ -1663,12 +1700,18 @@ mod tests {
 
     #[test]
     fn test_vector_loop_finaloplist() {
-        let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
+        let label = Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+        );
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
-        let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
+        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]);
         let vloop = VectorLoop::new(label, ops, jump);
 
         let with_label = vloop.finaloplist(None, true, true);
@@ -1690,16 +1733,25 @@ mod tests {
         // loop: label(i0, i1) { i_add } jump(i0, i1)
         let label = Op::new(
             OpCode::Label,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         let mut body = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         )];
         assign_positions(&mut body, 10);
         let jump = Op::new(
             OpCode::Jump,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         let mut vloop = VectorLoop::new(label, body.clone(), jump);
 
@@ -1733,7 +1785,12 @@ mod tests {
         // (schedule.py:116) moves it into loop_.operations.
         st.oplist = body.clone();
 
-        let mut seen: VecSet<OpRef> = vloop.label.getarglist().iter().copied().collect();
+        let mut seen: VecSet<OpRef> = vloop
+            .label
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
         st.post_schedule(&mut vloop, &mut seen);
 
         // schedule.py:766: prefix == the three invariant ops, in insertion order.
@@ -1751,13 +1808,13 @@ mod tests {
             .getarglist_copy();
         assert_eq!(vloop.prefix_label.as_ref().unwrap().opcode, OpCode::Label);
         assert_eq!(pl_args.len(), 3); // i0, i1, seed_vec
-        assert_eq!(pl_args[2], seed_vec);
+        assert_eq!(pl_args[2].to_opref(), seed_vec);
 
         // schedule.py:779: jump rebuilt with the extra invariant var.
         let j_args = vloop.jump.getarglist_copy();
         assert_eq!(vloop.jump.opcode, OpCode::Jump);
         assert_eq!(j_args.len(), 3);
-        assert_eq!(j_args[2], seed_vec);
+        assert_eq!(j_args[2].to_opref(), seed_vec);
 
         // base post_schedule (schedule.py:116): operations came from oplist.
         assert_eq!(vloop.operations.len(), 1);
@@ -1772,21 +1829,35 @@ mod tests {
 
         let label = Op::new(
             OpCode::Label,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         let body = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         )];
         let jump = Op::new(
             OpCode::Jump,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         let mut vloop = VectorLoop::new(label, body.clone(), jump);
 
         let mut st = VecScheduleState::new(100);
         st.oplist = body.clone();
-        let mut seen: VecSet<OpRef> = vloop.label.getarglist().iter().copied().collect();
+        let mut seen: VecSet<OpRef> = vloop
+            .label
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
         st.post_schedule(&mut vloop, &mut seen);
 
         assert!(vloop.prefix.is_empty());
@@ -1806,25 +1877,43 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(104), OpRef::input_arg_int(105)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(104)),
+                    BoxRef::from_opref(OpRef::input_arg_int(105)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(106), OpRef::input_arg_int(107)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(106)),
+                    BoxRef::from_opref(OpRef::input_arg_int(107)),
+                ],
             ),
-            Op::new(OpCode::Jump, &[OpRef::input_arg_int(100)]),
+            Op::new(
+                OpCode::Jump,
+                &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -1854,12 +1943,18 @@ mod tests {
         use crate::optimizeopt::optimizer::Optimizer;
 
         let mut ops = vec![
-            Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]),
+            Op::new(
+                OpCode::Label,
+                &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+            ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(1)]),
+            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(1))]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -1884,12 +1979,18 @@ mod tests {
 
     #[test]
     fn test_user_loop_bail_fast_path_no_array() {
-        let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
+        let label = Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+        );
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
-        let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
+        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]);
         let vloop = VectorLoop::new(label, ops, jump);
         // vector.py:183 initializes at_least_one_array_access = True and only
         // re-assigns True, so the "no array access" branch is unreachable.
@@ -1904,15 +2005,24 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -1927,7 +2037,10 @@ mod tests {
     fn test_dep_graph_no_self_dep() {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         )];
         assign_positions(&mut ops, 0);
 
@@ -1942,11 +2055,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -1965,11 +2084,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -1984,11 +2109,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2005,15 +2136,24 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::input_arg_int(104), OpRef::input_arg_int(105)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(104)),
+                    BoxRef::from_opref(OpRef::input_arg_int(105)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2114,9 +2254,12 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -2134,17 +2277,32 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
-            Op::new(OpCode::Jump, &[OpRef::int_op(1), OpRef::int_op(2)]),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -2163,15 +2321,24 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::int_op(1), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2192,11 +2359,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2214,19 +2387,31 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::int_op(1), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2245,17 +2430,32 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntMul,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntSub,
-                &[OpRef::int_op(0), OpRef::input_arg_int(102)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                ],
             ),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(2)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -2342,11 +2542,17 @@ mod tests {
     fn test_isomorphic_same_opcode() {
         let a = Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         );
         let b = Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(102)),
+                BoxRef::from_opref(OpRef::input_arg_int(103)),
+            ],
         );
         assert!(isomorphic(&a, &b));
     }
@@ -2355,11 +2561,17 @@ mod tests {
     fn test_isomorphic_different_opcode() {
         let a = Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         );
         let b = Op::new(
             OpCode::IntSub,
-            &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(102)),
+                BoxRef::from_opref(OpRef::input_arg_int(103)),
+            ],
         );
         assert!(!isomorphic(&a, &b));
     }
@@ -2369,11 +2581,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2394,11 +2612,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::int_op(0), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2416,17 +2640,32 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(200), OpRef::int_op(0)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(200)),
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                ],
             ),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -2463,15 +2702,24 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(102)),
+                    BoxRef::from_opref(OpRef::input_arg_int(103)),
+                ],
             ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(104), OpRef::input_arg_int(105)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(104)),
+                    BoxRef::from_opref(OpRef::input_arg_int(105)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 0);
@@ -2506,12 +2754,18 @@ mod tests {
     #[test]
     fn test_guard_analysis_hoistable() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(100)]),
+            Op::new(
+                OpCode::GuardTrue,
+                &[BoxRef::from_opref(OpRef::input_arg_int(100))],
+            ),
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+                &[
+                    BoxRef::from_opref(OpRef::input_arg_int(100)),
+                    BoxRef::from_opref(OpRef::input_arg_int(101)),
+                ],
             ),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]),
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
@@ -2547,15 +2801,27 @@ mod tests {
     fn test_unroll_loop_iterations() {
         let mut label = Op::new(
             OpCode::Label,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         );
         label.pos.set(OpRef::op_typed(0, majit_ir::Type::Void));
         let mut body_op = Op::new(
             OpCode::IntAdd,
-            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(100)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
         );
         body_op.pos.set(OpRef::int_op(1));
-        let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(1), OpRef::input_arg_int(101)]);
+        let mut jump = Op::new(
+            OpCode::Jump,
+            &[
+                BoxRef::from_opref(OpRef::int_op(1)),
+                BoxRef::from_opref(OpRef::input_arg_int(101)),
+            ],
+        );
         jump.pos.set(OpRef::op_typed(2, majit_ir::Type::Void));
 
         let mut vloop = VectorLoop::new(label, vec![body_op], jump);

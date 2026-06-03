@@ -14,6 +14,7 @@ use crate::optimizeopt::{
 };
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
@@ -773,7 +774,7 @@ impl Optimizer {
                 .opref_type(*label_arg)
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-            let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
+            let mut op = majit_ir::Op::new(same_as_op, &[BoxRef::from_opref(*label_arg)]);
             op.pos.set(ctx.reserve_pos_typed(tp));
             let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
@@ -1674,7 +1675,7 @@ impl Optimizer {
             | OpCode::GetarrayitemGcF => {
                 // Check arg(0) is not null constant.
                 if let Some(0) = ctx
-                    .get_box_replacement_box(op.arg(0))
+                    .get_box_replacement_box(op.arg(0).to_opref())
                     .and_then(|b| ctx.get_constant_int_box(&b))
                 {
                     return false; // would deref null
@@ -1978,9 +1979,9 @@ impl Optimizer {
                     if arg.is_constant() {
                         continue;
                     }
-                    let idx = arg.raw() as usize;
+                    let idx = arg.to_opref().raw() as usize;
                     if idx < num_inputs {
-                        match arg.ty() {
+                        match arg.to_opref().ty() {
                             Some(majit_ir::Type::Void) | None => {}
                             Some(tp) => types[idx] = tp,
                         }
@@ -2401,7 +2402,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|&arg| ctx.get_box_replacement(arg))
+                .map(|arg| ctx.get_box_replacement(arg.to_opref()))
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2413,7 +2414,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.get_box_replacement(arg);
+                let resolved = ctx.get_box_replacement(arg.to_opref());
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2422,7 +2423,7 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .get_box_replacement_box(arg)
+                    .get_box_replacement_box(arg.to_opref())
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
@@ -2435,7 +2436,7 @@ impl Optimizer {
                         .is_some()
                 {
                     let arg_is_virtual = ctx
-                        .get_box_replacement_box(arg)
+                        .get_box_replacement_box(arg.to_opref())
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2453,13 +2454,13 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    terminal_op.setarg(i, resolved);
+                    terminal_op.setarg(i, BoxRef::from_opref(resolved));
                 }
             }
             for i in force_needed {
                 let original = terminal_op.arg(i);
-                let forced = self.force_box(original, &mut ctx);
-                terminal_op.setarg(i, ctx.get_box_replacement(forced));
+                let forced = self.force_box(original.to_opref(), &mut ctx);
+                terminal_op.setarg(i, BoxRef::from_opref(ctx.get_box_replacement(forced)));
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
@@ -2561,10 +2562,11 @@ impl Optimizer {
             //   self.optimizer.flush()
             //   virtual_state = self.get_virtual_state(end_args)
             // — VS captured AFTER force + flush.
-            let original_jump_args = pre_jump_resolved_args.clone()
+            let original_jump_args: Vec<OpRef> = pre_jump_resolved_args.clone()
+                .map(|v| v.iter().map(|b| b.to_opref()).collect())
                 .unwrap_or_else(|| {
                     jump.getarglist().iter()
-                        .map(|&a| ctx.get_box_replacement(a))
+                        .map(|a| ctx.get_box_replacement(a.to_opref()))
                         .collect()
                 });
             let mut resolved_args = original_jump_args.clone();
@@ -2631,7 +2633,7 @@ impl Optimizer {
                         .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position_typed(arg_type);
-                    let mut op = Op::new(same_as, &[orig]);
+                    let mut op = Op::new(same_as, &[BoxRef::from_opref(orig)]);
                     op.pos.set(fresh);
                     // unroll.py:146 + compile.py:327 parity: accumulate the
                     // alias op in `extra_same_as` and splice it between the
@@ -2778,11 +2780,16 @@ impl Optimizer {
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
                     for i in 0..preamble_op.num_args() {
-                        preamble_op.setarg(i, ctx.get_box_replacement(preamble_op.arg(i)));
+                        preamble_op.setarg(
+                            i,
+                            BoxRef::from_opref(
+                                ctx.get_box_replacement(preamble_op.arg(i).to_opref()),
+                            ),
+                        );
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
-                            *arg = ctx.get_box_replacement(*arg);
+                            *arg = BoxRef::from_opref(ctx.get_box_replacement(arg.to_opref()));
                         }
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
@@ -2808,7 +2815,10 @@ impl Optimizer {
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.getarglist(), &mut ctx);
+            let jump_arglist_oprefs: Vec<OpRef> =
+                jump.getarglist().iter().map(|a| a.to_opref()).collect();
+            let exported_int_bounds =
+                self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
             // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
             // are the fresh per-iteration boxes from `trace.get_iter()`. They
             // live in this run's iteration namespace, not the original
@@ -2873,6 +2883,7 @@ impl Optimizer {
                 .iter()
                 .flat_map(|op| op.getarglist_copy())
                 .filter(|r| !r.is_none())
+                .map(|r| r.to_opref())
                 .collect();
             for opref in all_refs {
                 let resolved_is_virtual = ctx
@@ -3046,20 +3057,21 @@ impl Optimizer {
             // applies only to body-namespace OpRefs (InputArg* / *Op).
             for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
-                    let arg = op.arg(i);
+                    let arg = op.arg(i).to_opref();
                     if arg.is_constant() {
                         continue;
                     }
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
-                        op.setarg(i, arg.with_raw(new_pos));
+                        op.setarg(i, BoxRef::from_opref(arg.with_raw(new_pos)));
                     }
                 }
                 if let Some(mut fail_args) = op.getfailargs() {
                     let mut changed = false;
                     for arg in fail_args.iter_mut() {
-                        if !arg.is_constant() {
-                            if let Some(&new_pos) = remap.get(&arg.raw()) {
-                                *arg = arg.with_raw(new_pos);
+                        let arg_opref = arg.to_opref();
+                        if !arg_opref.is_constant() {
+                            if let Some(&new_pos) = remap.get(&arg_opref.raw()) {
+                                *arg = BoxRef::from_opref(arg_opref.with_raw(new_pos));
                                 changed = true;
                             }
                         }
@@ -3128,13 +3140,15 @@ impl Optimizer {
                     remap_opref(&mut new_pos);
                     entry.op.pos.set(new_pos);
                     for i in 0..entry.op.num_args() {
-                        let mut arg = entry.op.arg(i);
+                        let mut arg = entry.op.arg(i).to_opref();
                         remap_opref(&mut arg);
-                        entry.op.setarg(i, arg);
+                        entry.op.setarg(i, BoxRef::from_opref(arg));
                     }
                     if let Some(fa) = entry.op.fail_args_mut() {
                         for arg in fa.iter_mut() {
-                            remap_opref(arg);
+                            let mut arg_opref = arg.to_opref();
+                            remap_opref(&mut arg_opref);
+                            *arg = BoxRef::from_opref(arg_opref);
                         }
                     }
                     if let Some(ref mut src) = entry.same_as_source {
@@ -3254,7 +3268,7 @@ impl Optimizer {
         // emitting a fallback jump through send_extra_operation.  RPython's
         // separate `runtime_boxes` argument is threaded below into
         // jump_to_existing_trace for virtual-state guard generation.
-        let pre_opt_jump_args: Vec<OpRef> = ops
+        let pre_opt_jump_args: Vec<crate::r#box::BoxRef> = ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
             .map(|op| op.getarglist().to_vec())
@@ -3310,7 +3324,11 @@ impl Optimizer {
         }
 
         let terminal_jump = terminal_jump.unwrap();
-        let jump_args = terminal_jump.getarglist().to_vec();
+        let jump_args: Vec<OpRef> = terminal_jump
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
 
         // unroll.py:198-200: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
@@ -3635,9 +3653,26 @@ impl Optimizer {
         // post-`make_equal_to(_, const_target)` and de-sync from the
         // numbering snapshot.
         let mut resolved_op = op.clone();
-        // optimizer.py:651-652 force_box loop parity.
+        // optimizer.py:651-652 force_box loop parity: resolve each arg
+        // through its forwarding chain. Store the CANONICAL terminal box
+        // (carrying the live _forwarded chain), not a fresh from_opref box,
+        // so passes can read PtrInfo / IntBound / known-class directly off
+        // op.arg(i) — matching RPython where get_box_replacement returns the
+        // Box object itself. A from_opref box is unbound and drops the chain.
         for i in 0..resolved_op.num_args() {
-            resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
+            let arg = resolved_op.arg(i);
+            let resolved = ctx
+                .get_box_replacement_box(arg.to_opref())
+                .unwrap_or_else(|| arg.clone());
+            // The canonical box's OpRef identity must equal the OpRef-path
+            // bridge result so OpRef-keyed consumers (box_pool, VecAssoc) see
+            // the same key; only the carried _forwarded info is added.
+            debug_assert_eq!(
+                resolved.to_opref(),
+                ctx.get_box_replacement(arg.to_opref()),
+                "resolver canonical box to_opref diverged from OpRef bridge",
+            );
+            resolved_op.setarg(i, resolved);
         }
 
         let mut current_op = resolved_op;
@@ -3649,7 +3684,7 @@ impl Optimizer {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             let old = current_op.pos.get();
-            let new = current_op.arg(0);
+            let new = current_op.arg(0).to_opref();
             let b_old = ctx
                 .ensure_box(old)
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3808,7 +3843,10 @@ impl Optimizer {
 
         // optimizer.py:623-625: force_box on every arg unconditionally.
         for i in 0..op.num_args() {
-            op.setarg(i, self.force_box(op.arg(i), ctx));
+            op.setarg(
+                i,
+                BoxRef::from_opref(self.force_box(op.arg(i).to_opref(), ctx)),
+            );
         }
 
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
@@ -4085,7 +4123,7 @@ impl Optimizer {
                             // (caught at pyjitpl/mod.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.get_box_replacement(pf_op.arg(1));
+                            let boxindex = ctx.get_box_replacement(pf_op.arg(1).to_opref());
                             let idx = match ctx
                                 .get_box_replacement_box(boxindex)
                                 .and_then(|cb| cb.const_int())
@@ -4096,9 +4134,9 @@ impl Optimizer {
                                              must be a non-negative Const i32 (TagOverflow)",
                                 )),
                             };
-                            (pf_op.arg(0), pf_op.arg(2), idx as i32)
+                            (pf_op.arg(0).to_opref(), pf_op.arg(2).to_opref(), idx as i32)
                         } else {
-                            (pf_op.arg(0), pf_op.arg(1), -1i32)
+                            (pf_op.arg(0).to_opref(), pf_op.arg(1).to_opref(), -1i32)
                         };
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
@@ -4134,7 +4172,7 @@ impl Optimizer {
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py:681-683: force_box on each fail_arg for unrolling.
             if let Some(fa) = op.getfailargs() {
-                let fargs: Vec<OpRef> = fa.iter().copied().collect();
+                let fargs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
                 for farg in fargs {
                     if !farg.is_none() {
                         self.force_box(farg, ctx);
@@ -4219,7 +4257,7 @@ impl Optimizer {
         });
         // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
         match last.getfailargs() {
-            Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+            Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
             None => op.clearfailargs(),
         }
         op.rd_resume_position.set(last.rd_resume_position.get());
@@ -4284,7 +4322,8 @@ impl Optimizer {
         if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
-                    fail_args[fa_idx] = ctx.get_box_replacement_not_const(fail_args[fa_idx]);
+                    let resolved = ctx.get_box_replacement_not_const(fail_args[fa_idx].to_opref());
+                    fail_args[fa_idx] = BoxRef::from_opref(resolved);
                 }
             }
         }
@@ -4399,12 +4438,12 @@ impl Optimizer {
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        if ctx.opref_type(arg0) != Some(majit_ir::Type::Int) {
+        if ctx.opref_type(arg0.to_opref()) != Some(majit_ir::Type::Int) {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = ctx
-            .ensure_box(arg0)
+            .ensure_box(arg0.to_opref())
             .map(|b| ctx.getintbound_handle(&b).borrow().clone())
             .expect("getintbound: operand must resolve to a BoxRef");
         if !b.is_bool() {
@@ -4412,7 +4451,7 @@ impl Optimizer {
         }
         // optimizer.py:762: constvalue = op.getarg(1).getint()
         let Some(constvalue) = ctx
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(op.arg(1).to_opref())
             .and_then(|cb| cb.const_int())
         else {
             return op;
@@ -4430,7 +4469,7 @@ impl Optimizer {
             newop.setdescr(d);
         }
         match op.getfailargs() {
-            Some(fa) => newop.setfailargs(fa.iter().copied().collect()),
+            Some(fa) => newop.setfailargs(fa.iter().cloned().collect()),
             None => newop.clearfailargs(),
         }
         match op.get_fail_arg_types() {
@@ -4509,12 +4548,12 @@ mod tests {
             if op.opcode == OpCode::IntAdd {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx
-                    .get_box_replacement_box(op.arg(1))
+                    .get_box_replacement_box(op.arg(1).to_opref())
                     .and_then(|b| ctx.get_constant_int_box(&b))
                 {
                     // Replace with first arg
                     let old = op.pos.get();
-                    let new = op.arg(0);
+                    let new = op.arg(0).to_opref();
                     let b_old = ctx
                         .ensure_box(old)
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -4740,7 +4779,13 @@ mod tests {
                 self.queued = true;
 
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef::int_op(0)]);
+                let mut set = Op::new(
+                    OpCode::SetfieldGc,
+                    &[
+                        BoxRef::from_opref(alloc),
+                        BoxRef::from_opref(OpRef::int_op(0)),
+                    ],
+                );
                 set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
             }
@@ -4812,7 +4857,10 @@ mod tests {
         let mut opt = Optimizer::new();
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
         )];
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
@@ -4831,7 +4879,10 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::IntMul,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
         let result =
@@ -4856,24 +4907,40 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::CallMayForceR,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
                 call_descr_a,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcPureI,
-                &[OpRef::int_op(3)],
+                &[BoxRef::from_opref(OpRef::int_op(3))],
                 field_descr.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceR,
-                &[OpRef::int_op(0), OpRef::int_op(2)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                ],
                 call_descr_b,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
-            Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(6)], field_descr),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::int_op(8)]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(9)]),
+            Op::with_descr(
+                OpCode::GetfieldGcPureI,
+                &[BoxRef::from_opref(OpRef::int_op(6))],
+                field_descr,
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(5)),
+                    BoxRef::from_opref(OpRef::int_op(8)),
+                ],
+            ),
+            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(9))]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
             op.pos
@@ -4931,7 +4998,10 @@ mod tests {
 
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
             call_descr_a,
         );
         let mut guard_a = Op::with_descr(
@@ -4941,30 +5011,33 @@ mod tests {
         );
         guard_a.setfailargs(
             vec![
-                OpRef::int_op(0),
-                OpRef::int_op(2000),
-                OpRef::int_op(2001),
-                OpRef::int_op(3),
-                OpRef::int_op(3000),
-                OpRef::int_op(3001),
-                OpRef::int_op(4),
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(2000)),
+                BoxRef::from_opref(OpRef::int_op(2001)),
+                BoxRef::from_opref(OpRef::int_op(3)),
+                BoxRef::from_opref(OpRef::int_op(3000)),
+                BoxRef::from_opref(OpRef::int_op(3001)),
+                BoxRef::from_opref(OpRef::int_op(4)),
             ]
             .into(),
         );
         guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[OpRef::int_op(3)],
+            &[BoxRef::from_opref(OpRef::int_op(3))],
             field_descr.clone(),
         );
         let get_a_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[OpRef::int_op(3)],
+            &[BoxRef::from_opref(OpRef::int_op(3))],
             field_descr.clone(),
         );
         let mut call_b = Op::with_descr(
             OpCode::CallMayForceR,
-            &[OpRef::int_op(0), OpRef::int_op(2)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(2)),
+            ],
             call_descr_b,
         );
         let mut guard_b = Op::with_descr(
@@ -4974,26 +5047,36 @@ mod tests {
         );
         guard_b.setfailargs(
             vec![
-                OpRef::int_op(0),
-                OpRef::int_op(2002),
-                OpRef::int_op(2003),
-                OpRef::int_op(3),
-                OpRef::int_op(6),
-                OpRef::int_op(3002),
-                OpRef::int_op(3003),
-                OpRef::int_op(7),
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(2002)),
+                BoxRef::from_opref(OpRef::int_op(2003)),
+                BoxRef::from_opref(OpRef::int_op(3)),
+                BoxRef::from_opref(OpRef::int_op(6)),
+                BoxRef::from_opref(OpRef::int_op(3002)),
+                BoxRef::from_opref(OpRef::int_op(3003)),
+                BoxRef::from_opref(OpRef::int_op(7)),
             ]
             .into(),
         );
         guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[OpRef::int_op(6)],
+            &[BoxRef::from_opref(OpRef::int_op(6))],
             field_descr.clone(),
         );
-        let get_b_val = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(6)], field_descr);
-        let add = Op::new(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::int_op(8)]);
-        let finish = Op::new(OpCode::Finish, &[OpRef::int_op(9)]);
+        let get_b_val = Op::with_descr(
+            OpCode::GetfieldGcPureI,
+            &[BoxRef::from_opref(OpRef::int_op(6))],
+            field_descr,
+        );
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[
+                BoxRef::from_opref(OpRef::int_op(5)),
+                BoxRef::from_opref(OpRef::int_op(8)),
+            ],
+        );
+        let finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(9))]);
 
         let mut ops = vec![
             call_a.clone(),
@@ -5056,8 +5139,20 @@ mod tests {
         // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
         // should eliminate the duplicate.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
@@ -5079,10 +5174,25 @@ mod tests {
         opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
 
         let mut ops = vec![
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(4)]),
-            Op::new(OpCode::IntGt, &[OpRef::int_op(5), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(4))],
+            ),
+            Op::new(
+                OpCode::IntGt,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(5)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(3));
         ops[1].pos.set(OpRef::int_op(4));
@@ -5102,8 +5212,8 @@ mod tests {
                 OpRef::int_op(8)
             ]
         );
-        assert_eq!(result[2].arg(0), OpRef::int_op(6));
-        assert_eq!(result[3].arg(0), OpRef::int_op(7));
+        assert_eq!(result[2].arg(0).to_opref(), OpRef::int_op(6));
+        assert_eq!(result[3].arg(0).to_opref(), OpRef::int_op(7));
     }
 
     #[test]
@@ -5116,10 +5226,25 @@ mod tests {
         }));
 
         let mut ops = vec![
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(
+                OpCode::GetfieldRawI,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(
+                OpCode::IntGt,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(3)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(3));
         ops[1].pos.set(OpRef::int_op(4));
@@ -5132,7 +5257,7 @@ mod tests {
         assert_eq!(result[0].pos.get(), OpRef::int_op(5));
         assert_eq!(result[1].pos.get(), OpRef::int_op(6));
         assert_eq!(result[2].pos.get(), OpRef::int_op(7));
-        assert_eq!(result[2].arg(0), OpRef::int_op(5));
+        assert_eq!(result[2].arg(0).to_opref(), OpRef::int_op(5));
         assert_eq!(constants.get(&5), None);
         assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
     }
@@ -5147,7 +5272,10 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::IntGt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5166,7 +5294,10 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::IntGt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5187,8 +5318,14 @@ mod tests {
         opt.skip_flush = true;
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(2))]),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5203,7 +5340,14 @@ mod tests {
             .as_ref()
             .expect("skip_flush should preserve terminal jump");
         assert_eq!(terminal.opcode, OpCode::Jump);
-        assert_eq!(&*terminal.getarglist(), &[OpRef::int_op(2)]);
+        assert_eq!(
+            terminal
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::int_op(2)]
+        );
     }
 
     #[test]
@@ -5217,12 +5361,21 @@ mod tests {
         // the first GuardTrue becomes the sharing donor for the
         // descrless GuardNonnull below — give it a real descr so
         // OptContext::emit_guard_operation finds a valid donor.
-        let mut guard_true = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
+        let mut guard_true = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(100))]);
         guard_true.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
         let mut ops = vec![
             guard_true,
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(100)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(100))],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
@@ -5244,7 +5397,13 @@ mod tests {
         let ops = vec![
             Op::new(OpCode::New, &[]),
             Op::new(OpCode::New, &[]),
-            Op::new(OpCode::GuardValue, &[OpRef::ref_op(0), OpRef::ref_op(1)]),
+            Op::new(
+                OpCode::GuardValue,
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::ref_op(1)),
+                ],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
 
@@ -5289,8 +5448,20 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::unroll::OptUnroll::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5328,12 +5499,24 @@ mod tests {
                 self.queued = true;
 
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef::int_op(0)]);
+                let mut set_a = Op::new(
+                    OpCode::SetfieldGc,
+                    &[
+                        BoxRef::from_opref(alloc_a),
+                        BoxRef::from_opref(OpRef::int_op(0)),
+                    ],
+                );
                 set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef::int_op(1)]);
+                let mut set_b = Op::new(
+                    OpCode::SetfieldGc,
+                    &[
+                        BoxRef::from_opref(alloc_b),
+                        BoxRef::from_opref(OpRef::int_op(1)),
+                    ],
+                );
                 set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
@@ -5355,8 +5538,20 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5368,7 +5563,7 @@ mod tests {
             let alloc_ref = set_op.arg(0);
             let new_idx = result
                 .iter()
-                .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref)
+                .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref.to_opref())
                 .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
             let set_idx = result
                 .iter()
@@ -5403,8 +5598,20 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5434,7 +5641,7 @@ mod tests {
             result
                 .iter()
                 .filter(|op| op.opcode == OpCode::SetfieldGc)
-                .all(|op| new_positions.contains(&op.arg(0).raw())),
+                .all(|op| new_positions.contains(&op.arg(0).to_opref().raw())),
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
         );
@@ -5458,13 +5665,16 @@ mod tests {
         let size_descr = make_size_descr(16);
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(10)]);
-        guard.setfailargs(vec![OpRef::int_op(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(10))]);
+        guard.setfailargs(vec![BoxRef::from_opref(OpRef::int_op(0))].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::int_op(0), OpRef::int_op(11)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(11)),
+                ],
                 field_descr,
             ),
             guard,
@@ -5502,7 +5712,7 @@ mod tests {
             fail_args
         );
         assert!(
-            fail_args.iter().any(|&a| a == OpRef::int_op(11)),
+            fail_args.iter().any(|a| a.to_opref() == OpRef::int_op(11)),
             "virtual's field value (OpRef::int_op(11)) should appear in liveboxes; got {:?}",
             fail_args
         );
@@ -5539,7 +5749,7 @@ mod tests {
         ];
         opt.phase1_emit_ops.push(std::rc::Rc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
-            &[OpRef::int_op(50)],
+            &[BoxRef::from_opref(OpRef::int_op(50))],
         )));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5592,7 +5802,13 @@ mod tests {
 
     #[test]
     fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
-        let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let mut op = Op::new(
+            OpCode::CallPureI,
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
+        );
         op.setdescr(Arc::new(TestCallDescr {
             idx: 400,
             effect: EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
@@ -5606,7 +5822,13 @@ mod tests {
 
     #[test]
     fn test_is_call_pure_pure_canraise_true_for_other_raising_effects() {
-        let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let mut op = Op::new(
+            OpCode::CallPureI,
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
+        );
         op.setdescr(Arc::new(TestCallDescr {
             idx: 401,
             effect: EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
@@ -5621,11 +5843,17 @@ mod tests {
         let ctx = OptContext::new(10);
 
         // Arithmetic ops are always safe
-        let add_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        let add_op = Op::new(
+            OpCode::IntAdd,
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
+        );
         assert!(opt.protect_speculative_operation(&add_op, &ctx));
 
         // Getfield on unknown arg is safe (not constant null)
-        let get_op = Op::new(OpCode::GetfieldGcI, &[OpRef::int_op(0)]);
+        let get_op = Op::new(OpCode::GetfieldGcI, &[BoxRef::from_opref(OpRef::int_op(0))]);
         assert!(opt.protect_speculative_operation(&get_op, &ctx));
     }
 
@@ -5637,7 +5865,10 @@ mod tests {
 
         opt.add_pending_field(Op::new(
             OpCode::SetfieldGc,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(0)),
+                BoxRef::from_opref(OpRef::int_op(1)),
+            ],
         ));
         assert!(opt.has_pending_fields());
         assert_eq!(opt.num_pending_fields(), 1);
@@ -5771,7 +6002,10 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let op = Op::new(OpCode::GuardNonnull, &[OpRef::ref_op(10)]);
+        let op = Op::new(
+            OpCode::GuardNonnull,
+            &[BoxRef::from_opref(OpRef::ref_op(10))],
+        );
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
@@ -5780,16 +6014,16 @@ mod tests {
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
         assert!(ctx.new_operations.iter().any(|op| {
-            op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.has_descr()
+            op.opcode == OpCode::SetfieldGc
+                && op.arg(1).to_opref() == OpRef::int_op(11)
+                && op.has_descr()
         }));
         // info.py:146-151: force_box emits the ORIGINAL box op, so the
         // forced GuardNonnull keeps arg(0) = OpRef::ref_op(10) (matches the virtual's
         // original identity). force_box_impl preserves `new_op.pos = opref`.
-        assert!(
-            ctx.new_operations
-                .iter()
-                .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) == OpRef::ref_op(10))
-        );
+        assert!(ctx.new_operations.iter().any(
+            |op| op.opcode == OpCode::GuardNonnull && op.arg(0).to_opref() == OpRef::ref_op(10)
+        ));
     }
 
     #[test]
@@ -5797,7 +6031,13 @@ mod tests {
         let mut opt = Optimizer::new();
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
-        let mut preamble_op = Op::new(OpCode::IntGe, &[OpRef::int_op(3), OpRef::int_op(10_000)]);
+        let mut preamble_op = Op::new(
+            OpCode::IntGe,
+            &[
+                BoxRef::from_opref(OpRef::int_op(3)),
+                BoxRef::from_opref(OpRef::int_op(10_000)),
+            ],
+        );
         preamble_op.pos.set(OpRef::int_op(14));
         ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
@@ -5817,14 +6057,17 @@ mod tests {
                 op: OpRef::int_op(14),
                 invented_name: false,
                 preamble_op: {
-                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::int_op(14)]);
+                    let mut op = majit_ir::Op::new(
+                        majit_ir::OpCode::SameAsI,
+                        &[BoxRef::from_opref(OpRef::int_op(14))],
+                    );
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
                     op
                 },
             },
         );
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(14))]);
         guard.pos.set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
@@ -5850,11 +6093,23 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&input_types);
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(100))]),
             Op::new(OpCode::Finish, &[]),
         ];
-        ops[1].setfailargs(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
+        ops[1].setfailargs(
+            vec![
+                BoxRef::from_opref(OpRef::int_op(100)),
+                BoxRef::from_opref(OpRef::int_op(101)),
+            ]
+            .into(),
+        );
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));

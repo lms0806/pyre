@@ -7609,7 +7609,7 @@ mod tests {
         let recorder = ctx.into_recorder();
         let op = recorder.ops().last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
-        assert_eq!(op.arg(0), obj);
+        assert_eq!(op.arg(0).to_opref(), obj);
     }
 
     #[test]
@@ -7679,13 +7679,25 @@ mod tests {
         let recorded_ops: Vec<(OpCode, Vec<OpRef>)> = recorder
             .ops()
             .iter()
-            .map(|op| (op.opcode, op.getarglist().to_vec()))
+            .map(|op| {
+                (
+                    op.opcode,
+                    op.getarglist().iter().map(|a| a.to_opref()).collect(),
+                )
+            })
             .collect();
         for op in recorder.ops() {
             if op.opcode == OpCode::GuardNonnullClass {
                 saw_guard_nonnull_class = true;
             }
-            if op.opcode == OpCode::GetfieldGcPureI && (&*op.getarglist()) == &[int_obj] {
+            if op.opcode == OpCode::GetfieldGcPureI
+                && op
+                    .getarglist()
+                    .iter()
+                    .map(|a| a.to_opref())
+                    .collect::<Vec<_>>()
+                    == vec![int_obj]
+            {
                 saw_pure_payload = true;
             }
         }
@@ -8218,10 +8230,14 @@ mod tests {
                 continue;
             };
             match op.opcode {
-                OpCode::GetfieldGcI if op.getarglist().first().copied() == Some(list) => {
+                OpCode::GetfieldGcI
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(list) =>
+                {
                     saw_gc_field = true
                 }
-                OpCode::GetfieldRawI if op.getarglist().first().copied() == Some(list) => {
+                OpCode::GetfieldRawI
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(list) =>
+                {
                     saw_raw_field = true
                 }
                 OpCode::GetarrayitemRawF => saw_raw_array = true,
@@ -8397,16 +8413,24 @@ mod tests {
                 continue;
             };
             match op.opcode {
-                OpCode::GetfieldGcI if op.getarglist().first().copied() == Some(iter) => {
+                OpCode::GetfieldGcI
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
+                {
                     saw_getfield_gc = true
                 }
-                OpCode::SetfieldGc if op.getarglist().first().copied() == Some(iter) => {
+                OpCode::SetfieldGc
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
+                {
                     saw_setfield_gc = true
                 }
-                OpCode::SetfieldRaw if op.getarglist().first().copied() == Some(iter) => {
+                OpCode::SetfieldRaw
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
+                {
                     saw_setfield_raw = true
                 }
-                OpCode::GetfieldRawI if op.getarglist().first().copied() == Some(iter) => {
+                OpCode::GetfieldRawI
+                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
+                {
                     saw_getfield_raw = true
                 }
                 OpCode::New => saw_new = true,

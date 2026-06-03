@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use majit_backend_wasm::codegen;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use smallvec::smallvec;
 
@@ -12,17 +13,19 @@ fn validate_wasm(bytes: &[u8]) {
 }
 
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
-    let mut op = Op::new(opcode, args);
+    let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+    let mut op = Op::new(opcode, &bx);
     op.pos.set(pos);
     op
 }
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
-    let mut op = Op::new(opcode, args);
-    op.setfailargs(smallvec![fail_args[0]; 0]);
-    let mut fa: smallvec::SmallVec<[OpRef; 3]> = smallvec::SmallVec::new();
+    let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+    let mut op = Op::new(opcode, &bx);
+    op.setfailargs(smallvec![BoxRef::from_opref(fail_args[0]); 0]);
+    let mut fa: smallvec::SmallVec<[BoxRef; 3]> = smallvec::SmallVec::new();
     for &a in fail_args {
-        fa.push(a);
+        fa.push(BoxRef::from_opref(a));
     }
     op.setfailargs(fa);
     op
@@ -32,8 +35,11 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
 fn test_empty_trace() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![{
-        let mut op = Op::new(OpCode::Finish, &[OpRef::input_arg_int(0)]);
-        op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
+        let mut op = Op::new(
+            OpCode::Finish,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        );
+        op.setfailargs(smallvec![BoxRef::from_opref(OpRef::input_arg_int(0))]);
         op
     }];
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
@@ -67,7 +73,10 @@ fn test_int_add_loop() {
     let ops = vec![
         Op::new(
             OpCode::Label,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         ),
         make_op(
             OpCode::IntAdd,
@@ -89,7 +98,13 @@ fn test_int_add_loop() {
             &[OpRef::int_op(4)],
             &[OpRef::int_op(3), OpRef::int_op(2)],
         ),
-        Op::new(OpCode::Jump, &[OpRef::int_op(3), OpRef::int_op(2)]),
+        Op::new(
+            OpCode::Jump,
+            &[
+                BoxRef::from_opref(OpRef::int_op(3)),
+                BoxRef::from_opref(OpRef::int_op(2)),
+            ],
+        ),
     ];
 
     let (bytes, guards) = codegen::build_wasm_module(
@@ -142,8 +157,8 @@ fn test_float_ops() {
             OpRef::int_op(8),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef::float_op(7)]);
-            op.setfailargs(smallvec![OpRef::float_op(7)]);
+            let mut op = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::float_op(7))]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::float_op(7))]);
             op
         },
     ];
@@ -176,8 +191,8 @@ fn test_call_generates_import() {
             OpRef::int_op(1),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
-            op.setfailargs(smallvec![OpRef::int_op(1)]);
+            let mut op = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(1))]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::int_op(1))]);
             op
         },
     ];
@@ -221,7 +236,10 @@ fn test_guard_types() {
     let ops = vec![
         Op::new(
             OpCode::Label,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         ),
         // GuardTrue
         make_guard(
@@ -256,18 +274,21 @@ fn test_guard_types() {
         // GuardNoOverflow (0 args)
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::input_arg_int(0))]);
             op
         },
         // GuardNotInvalidated (0 args, always pass)
         {
             let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
-            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::input_arg_int(0))]);
             op
         },
         Op::new(
             OpCode::Jump,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         ),
     ];
 
@@ -299,13 +320,16 @@ fn test_guard_gc_type_uses_immediate_typeid() {
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        ),
         make_guard(
             OpCode::GuardGcType,
             &[OpRef::input_arg_int(0), OpRef::const_int(0x42)],
             &[OpRef::input_arg_int(0)],
         ),
-        Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
+        Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
     ];
 
     let (bytes, guards) = codegen::build_wasm_module(
@@ -356,13 +380,16 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        ),
         make_guard(
             OpCode::GuardIsObject,
             &[OpRef::input_arg_int(0)],
             &[OpRef::input_arg_int(0)],
         ),
-        Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
+        Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
     ];
 
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
@@ -397,13 +424,16 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        ),
         make_guard(
             OpCode::GuardSubclass,
             &[OpRef::input_arg_int(0), class_constant],
             &[OpRef::input_arg_int(0)],
         ),
-        Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
+        Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
     ];
 
     let mut info = enabled_guard_gc_type_info();
@@ -474,8 +504,8 @@ fn test_sameas_and_conversions() {
             OpRef::int_op(9),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(9)]);
-            op.setfailargs(smallvec![OpRef::int_op(9)]);
+            let mut op = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(9))]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::int_op(9))]);
             op
         },
     ];
@@ -508,7 +538,7 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.setfailargs(smallvec![OpRef::int_op(2)]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::int_op(2))]);
             op
         },
         make_op(
@@ -518,12 +548,12 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.setfailargs(smallvec![OpRef::int_op(3)]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::int_op(3))]);
             op
         },
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(2)]);
-            op.setfailargs(smallvec![OpRef::int_op(2)]);
+            let mut op = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(2))]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::int_op(2))]);
             op
         },
     ];

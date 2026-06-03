@@ -5,6 +5,7 @@
 
 use majit_ir::{Op, OpCode, OpRef, Type};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 
 // ── vector.py:670-678: isomorphic ─────────────────────────────────────
@@ -377,7 +378,7 @@ impl PackSet {
                 OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
             ))
             && packed.num_args() >= 2
-            && packed.arg(1) == inquestion.pos.get()
+            && packed.arg(1).to_opref() == inquestion.pos.get()
         {
             return true;
         }
@@ -453,10 +454,10 @@ impl PackSet {
             .pos
             .get();
 
-        if left.getarglist().get(other_index).copied() != Some(origin_left_pos) {
+        if left.getarglist().get(other_index).map(|b| b.to_opref()) != Some(origin_left_pos) {
             return None;
         }
-        if right.getarglist().get(other_index).copied() != Some(origin_right_pos) {
+        if right.getarglist().get(other_index).map(|b| b.to_opref()) != Some(origin_right_pos) {
             return None;
         }
 
@@ -488,8 +489,8 @@ impl PackSet {
     /// is the result of left (the accumulator variable).
     fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
         for (i, arg) in right.getarglist().iter().enumerate() {
-            if *arg == left.pos.get() {
-                return (Some(*arg), i as i32);
+            if arg.to_opref() == left.pos.get() {
+                return (Some(arg.to_opref()), i as i32);
             }
         }
         (None, -1)
@@ -511,11 +512,14 @@ pub fn are_adjacent_memory_refs(
     if op_a.num_args() < 2 || op_b.num_args() < 2 {
         return false;
     }
-    if op_a.arg(0) != op_b.arg(0) {
+    if op_a.arg(0).to_opref() != op_b.arg(0).to_opref() {
         return false;
     }
     // Indices must differ by exactly 1
-    if let (Some(idx_a), Some(idx_b)) = (constant_of(op_a.arg(1)), constant_of(op_b.arg(1))) {
+    if let (Some(idx_a), Some(idx_b)) = (
+        constant_of(op_a.arg(1).to_opref()),
+        constant_of(op_b.arg(1).to_opref()),
+    ) {
         return (idx_b - idx_a).abs() == 1;
     }
     false
@@ -586,7 +590,7 @@ impl GuardAnalysis {
             let all_invariant = op
                 .getarglist()
                 .iter()
-                .all(|arg| !body_results.contains(arg));
+                .all(|arg| !body_results.contains(&arg.to_opref()));
             if all_invariant {
                 hoistable.push(i);
             } else {
@@ -851,7 +855,7 @@ impl VecScheduleState {
         constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> majit_ir::VectorizationInfo {
         if op.num_args() >= 2 {
-            if let Some(bytesize) = constant_of(op.arg(1)) {
+            if let Some(bytesize) = constant_of(op.arg(1).to_opref()) {
                 if (i8::MIN as i64..=i8::MAX as i64).contains(&bytesize) {
                     let mut info = majit_ir::VectorizationInfo::new();
                     info.setinfo('i', bytesize as i8, true);
@@ -1002,7 +1006,7 @@ impl VecScheduleState {
                 arg = op.arg(i);
             }
             if !arg.is_constant() {
-                if let Some(vinfo) = self.get_forwarded_vecinfo(arg) {
+                if let Some(vinfo) = self.get_forwarded_vecinfo(arg.to_opref()) {
                     if vinfo.datatype != '\x00' && vinfo.bytesize != -1 {
                         datatype = vinfo.datatype;
                         tp = match datatype {
@@ -1051,7 +1055,8 @@ impl VecScheduleState {
         signed: bool,
         count: usize,
     ) -> Op {
-        let op = Op::new(opcode, args);
+        let ba: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let op = Op::new(opcode, &ba);
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
@@ -1105,7 +1110,7 @@ impl VecScheduleState {
             if index >= op.num_args() {
                 break;
             }
-            let arg = op.arg(index);
+            let arg = op.arg(index).to_opref();
             // schedule.py:757-760:
             //   vecinfo = forwarded_vecinfo(arg)
             //   if i >= vecinfo.count: break
@@ -1160,7 +1165,11 @@ impl VecScheduleState {
             // vecmap_rs::VecSet), so iterating reproduces RPython's list-append
             // order. RPython's list may hold dups but expand() only appends fresh
             // boxes, so VecSet's de-dup is a no-op here.
-            args.extend(self.invariant_vector_vars.iter().copied());
+            args.extend(
+                self.invariant_vector_vars
+                    .iter()
+                    .map(|r| BoxRef::from_opref(*r)),
+            );
             // schedule.py:770-771: opnum = loop.label.getopnum();
             //   op = loop.label.copy_and_change(opnum, args).
             // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
@@ -1174,7 +1183,11 @@ impl VecScheduleState {
 
             // schedule.py:775-779: jump.
             let mut args = loop_.jump.getarglist_copy();
-            args.extend(self.invariant_vector_vars.iter().copied());
+            args.extend(
+                self.invariant_vector_vars
+                    .iter()
+                    .map(|r| BoxRef::from_opref(*r)),
+            );
             let mut new_jump =
                 loop_
                     .jump
@@ -1349,7 +1362,8 @@ pub fn prepare_fail_arguments(
         return;
     }
     if let Some(fail_args) = first_op.getfailargs() {
-        let mut new_fail_args: smallvec::SmallVec<[OpRef; 3]> = fail_args.iter().copied().collect();
+        let mut new_fail_args: smallvec::SmallVec<[OpRef; 3]> =
+            fail_args.iter().map(|b| b.to_opref()).collect();
         for arg in new_fail_args.iter_mut() {
             // schedule.py:393-394: look up if arg is in a vector box
             let (_pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));
@@ -1359,7 +1373,12 @@ pub fn prepare_fail_arguments(
                 *arg = unpacked;
             }
         }
-        vecop.setfailargs(new_fail_args);
+        vecop.setfailargs(
+            new_fail_args
+                .iter()
+                .map(|r| BoxRef::from_opref(*r))
+                .collect(),
+        );
     }
 }
 
@@ -1409,7 +1428,7 @@ fn assemble_scattered_values(
         .map(|&m| {
             let op = &ops[m];
             if index < op.num_args() {
-                op.arg(index)
+                op.arg(index).to_opref()
             } else {
                 args[index]
             }
@@ -1614,7 +1633,7 @@ fn expand(
     // schedule.py:539-543: check if all pack members have the same arg at `index`
     let all_same = pack.members.iter().all(|&m| {
         let op = &ops[m];
-        index < op.num_args() && op.arg(index) == arg
+        index < op.num_args() && op.arg(index).to_opref() == arg
     });
 
     // datatype is `arg.type` per PyPy `OpHelpers.create_vec_expand`
@@ -1681,7 +1700,7 @@ fn expand(
         .map(|&m| {
             let op = &ops[m];
             if index < op.num_args() {
-                op.arg(index)
+                op.arg(index).to_opref()
             } else {
                 arg
             }
@@ -1758,7 +1777,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     };
 
     // schedule.py:335-336: build args list + prepare_arguments
-    let mut args = first_op.getarglist().to_vec();
+    let mut args: Vec<OpRef> = first_op.getarglist().iter().map(|a| a.to_opref()).collect();
     prepare_arguments(state, pack, &mut args, ops);
 
     // schedule.py:337-338: VecOperation(left.vector, args, left, pack.numops())

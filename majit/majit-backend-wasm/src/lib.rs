@@ -246,7 +246,7 @@ impl WasmBackend {
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.num_args() >= 2
             {
-                if let Some(classptr) = self.const_class_vtable(op.arg(1)) {
+                if let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref()) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -290,7 +290,7 @@ impl WasmBackend {
             // for every constant GuardSubclass arg1.
             for op in ops {
                 if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
-                    if let Some(classptr) = self.const_class_vtable(op.arg(1)) {
+                    if let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref()) {
                         if let Some(range) = gc.subclass_range(classptr as usize) {
                             info.subclass_ranges.insert(classptr, range);
                         }
@@ -312,7 +312,8 @@ impl WasmBackend {
     /// is missing is a producer gap and panics rather than defaulting to 0.
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
-            for &arg in op.getarglist().iter() {
+            for arg in op.getarglist().iter() {
+                let arg = arg.to_opref();
                 if arg.is_constant()
                     && arg.inline_const_bits().is_none()
                     && !self.constants.contains_key(&arg.raw())
@@ -321,7 +322,8 @@ impl WasmBackend {
                 }
             }
             if let Some(fail_args) = op.getfailargs() {
-                for &arg in fail_args.iter() {
+                for arg in fail_args.iter() {
+                    let arg = arg.to_opref();
                     if arg.is_constant()
                         && arg.inline_const_bits().is_none()
                         && !self.constants.contains_key(&arg.raw())

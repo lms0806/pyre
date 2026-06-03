@@ -73,6 +73,7 @@ impl IntBoundMakeGuards for IntBound {
         guards: &mut Vec<crate::optimizeopt::Op>,
         ctx: &mut crate::optimizeopt::OptContext,
     ) {
+        use crate::r#box::BoxRef;
         use crate::optimizeopt::Op;
         use majit_ir::{OpCode, Type, Value};
 
@@ -91,12 +92,18 @@ impl IntBoundMakeGuards for IntBound {
         };
         if self.is_constant() {
             let c = alloc_const(ctx, Value::Int(self.upper));
-            guards.push(Op::new(OpCode::GuardValue, &[box_ref, c]));
+            guards.push(Op::new(
+                OpCode::GuardValue,
+                &[BoxRef::from_opref(box_ref), BoxRef::from_opref(c)],
+            ));
             return;
         }
         if self.lower > i64::MIN {
             let bound = alloc_const(ctx, Value::Int(self.lower));
-            let mut op = Op::new(OpCode::IntGe, &[box_ref, bound]);
+            let mut op = Op::new(
+                OpCode::IntGe,
+                &[BoxRef::from_opref(box_ref), BoxRef::from_opref(bound)],
+            );
             // intutils.py:1275 `op = ResOperation(rop.INT_GE, ...)` then
             // `[op]` — RPython uses the ResOperation object as identity.
             // pyre allocates a fresh Int OpRef into `op.pos` so the next
@@ -105,26 +112,35 @@ impl IntBoundMakeGuards for IntBound {
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);
-            guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
+            guards.push(Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(op_pos)]));
         }
         if self.upper < i64::MAX {
             let bound = alloc_const(ctx, Value::Int(self.upper));
-            let mut op = Op::new(OpCode::IntLe, &[box_ref, bound]);
+            let mut op = Op::new(
+                OpCode::IntLe,
+                &[BoxRef::from_opref(box_ref), BoxRef::from_opref(bound)],
+            );
             // intutils.py:1281 INT_LE producer identity — see comment above.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);
-            guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
+            guards.push(Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(op_pos)]));
         }
         if !self.are_knownbits_implied() {
             let mask = alloc_const(ctx, Value::Int(!self.tmask as i64));
-            let mut op = Op::new(OpCode::IntAnd, &[box_ref, mask]);
+            let mut op = Op::new(
+                OpCode::IntAnd,
+                &[BoxRef::from_opref(box_ref), BoxRef::from_opref(mask)],
+            );
             // intutils.py:1286 INT_AND producer identity — see comment above.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);
             let value = alloc_const(ctx, Value::Int(self.tvalue as i64));
-            guards.push(Op::new(OpCode::GuardValue, &[op_pos, value]));
+            guards.push(Op::new(
+                OpCode::GuardValue,
+                &[BoxRef::from_opref(op_pos), BoxRef::from_opref(value)],
+            ));
         }
     }
 }

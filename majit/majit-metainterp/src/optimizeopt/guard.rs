@@ -47,6 +47,7 @@
 use majit_ir::vec_set::VecSet;
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::IndexVar;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -64,7 +65,7 @@ impl GuardKey {
     fn from_op(op: &Op) -> Self {
         GuardKey {
             opcode: op.opcode,
-            args: op.getarglist().to_vec(),
+            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
         }
     }
 }
@@ -97,13 +98,13 @@ impl Guard {
         cmp_op: Op,
         index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     ) -> Self {
-        let lhs_arg = cmp_op.arg(0);
+        let lhs_arg = cmp_op.arg(0).to_opref();
         let lhs = index_vars
             .get(&lhs_arg)
             .cloned()
             .unwrap_or_else(|| IndexVar::new(lhs_arg));
         let rhs_arg = if cmp_op.num_args() > 1 {
-            cmp_op.arg(1)
+            cmp_op.arg(1).to_opref()
         } else {
             OpRef::NONE
         };
@@ -270,7 +271,7 @@ impl Guard {
         // guard.py:84-85: emit_varops
         let box_rhs = Self::emit_varops(
             &self.rhs,
-            self.cmp_op.arg(1),
+            self.cmp_op.arg(1).to_opref(),
             new_ops,
             renamer,
             next_const_pos,
@@ -278,14 +279,17 @@ impl Guard {
         );
         let other_rhs = Self::emit_varops(
             &other.rhs,
-            other.cmp_op.arg(1),
+            other.cmp_op.arg(1).to_opref(),
             new_ops,
             renamer,
             next_const_pos,
             const_values,
         );
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
-        let compare = Op::new(opnum, &[box_rhs, other_rhs]);
+        let compare = Op::new(
+            opnum,
+            &[BoxRef::from_opref(box_rhs), BoxRef::from_opref(other_rhs)],
+        );
         new_ops.push(compare.clone());
         // guard.py:89-91:
         //   descr = CompileLoopVersionDescr()
@@ -300,10 +304,10 @@ impl Guard {
         // make_compile_loop_version_descr_from reference-shares each
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
-        let mut guard_op = Op::new(self.op.opcode, &[compare.pos.get()]);
+        let mut guard_op = Op::new(self.op.opcode, &[BoxRef::from_opref(compare.pos.get())]);
         guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
-        guard_op.setfailargs(label_args.into());
+        guard_op.setfailargs(label_args.iter().map(|a| BoxRef::from_opref(*a)).collect());
         // copy_all_attributes_from parity: compile.py:861-872 copies
         // rd_consts / rd_pendingfields / rd_virtuals / rd_numb.  In
         // pyre these live on the FailDescr (compile.py:855 `_attrs_`)
@@ -371,7 +375,7 @@ impl Guard {
             .set(other.op.rd_resume_position.get());
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
         match other.op.getfailargs() {
-            Some(fa) => self.op.setfailargs(fa.iter().copied().collect()),
+            Some(fa) => self.op.setfailargs(fa.iter().cloned().collect()),
             None => self.op.clearfailargs(),
         }
         match other.op.get_fail_arg_types() {
@@ -394,7 +398,7 @@ impl Guard {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
             &self.lhs,
-            self.cmp_op.arg(0),
+            self.cmp_op.arg(0).to_opref(),
             new_ops,
             renamer,
             next_const_pos,
@@ -402,23 +406,26 @@ impl Guard {
         );
         let rhs = Self::emit_varops(
             &self.rhs,
-            self.cmp_op.arg(1),
+            self.cmp_op.arg(1).to_opref(),
             new_ops,
             renamer,
             next_const_pos,
             const_values,
         );
         // guard.py:138-140: cmp_op = ResOperation(opnum, [lhs, rhs])
-        let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
+        let cmp_op = Op::new(
+            self.cmp_op.opcode,
+            &[BoxRef::from_opref(lhs), BoxRef::from_opref(rhs)],
+        );
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
-        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos.get()]);
+        let mut guard = Op::new(self.op.opcode, &[BoxRef::from_opref(cmp_op.pos.get())]);
         if let Some(d) = self.op.getdescr() {
             guard.setdescr(d);
         }
         // guard.py:143: guard.setfailargs(self.op.getfailargs()[:])
         match self.op.getfailargs() {
-            Some(fa) => guard.setfailargs(fa.iter().copied().collect()),
+            Some(fa) => guard.setfailargs(fa.iter().cloned().collect()),
             None => guard.clearfailargs(),
         }
         match self.op.get_fail_arg_types() {
@@ -500,7 +507,7 @@ impl GuardStrengthenOpt {
                 continue;
             }
             // guard.py:183: Guard.of(op.getarg(0), operations, i, self.index_vars)
-            let bool_arg = op.arg(0);
+            let bool_arg = op.arg(0).to_opref();
             let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
             if let Some(cmp) = cmp_op {
                 if let Some(guard) = Guard::of(i, op, cmp, &self.index_vars) {
@@ -684,9 +691,9 @@ impl GuardStrengthenOpt {
     /// renamer.py:20-22: rename(op) — apply renamer map to op args.
     fn rename_op(&self, op: &mut Op) {
         for i in 0..op.num_args() {
-            let arg = op.arg(i);
+            let arg = op.arg(i).to_opref();
             if let Some(&replacement) = self.renamer.get(&arg) {
-                op.setarg(i, replacement);
+                op.setarg(i, BoxRef::from_opref(replacement));
             }
         }
     }
@@ -851,10 +858,10 @@ impl OptGuard {
     fn record_implications(&mut self, op: &Op, ctx: &OptContext) {
         match op.opcode {
             OpCode::GuardTrue => {
-                self.truthy_values.insert(op.arg(0));
+                self.truthy_values.insert(op.arg(0).to_opref());
             }
             OpCode::GuardNonnull => {
-                self.truthy_values.insert(op.arg(0));
+                self.truthy_values.insert(op.arg(0).to_opref());
             }
             OpCode::GuardFalse => {
                 // guard.py: guard_false(v) means v is known to be 0/false.
@@ -862,11 +869,8 @@ impl OptGuard {
                 // But we record it so that a later guard_false(v) can be eliminated.
             }
             OpCode::GuardValue => {
-                let val_arg = op.arg(0);
-                if let Some(c) = ctx
-                    .get_box_replacement_box(op.arg(1))
-                    .and_then(|cb| cb.const_int())
-                {
+                let val_arg = op.arg(0).to_opref();
+                if let Some(c) = op.arg(1).get_box_replacement(false).const_int() {
                     // guard.py: record known constant value.
                     self.known_constants.insert(val_arg, c);
                     if c != 0 {
@@ -876,14 +880,11 @@ impl OptGuard {
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
                 // Having a class implies the object is nonnull.
-                self.truthy_values.insert(op.arg(0));
+                self.truthy_values.insert(op.arg(0).to_opref());
                 // guard.py: record the known class for subsumption checks.
                 if op.num_args() >= 2 {
-                    if let Some(class_val) = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|cb| cb.const_int())
-                    {
-                        let key = op.arg(0);
+                    if let Some(class_val) = op.arg(1).get_box_replacement(false).const_int() {
+                        let key = op.arg(0).to_opref();
                         self.known_classes.insert(key, class_val);
                     }
                 }
@@ -900,17 +901,17 @@ impl OptGuard {
         match op.opcode {
             OpCode::GuardTrue => {
                 // guard.py: also subsumed if value is a known nonzero constant.
-                if self.truthy_values.contains(&op.arg(0)) {
+                if self.truthy_values.contains(&op.arg(0).to_opref()) {
                     return true;
                 }
-                if let Some(c) = self.known_constants.get(&op.arg(0)).copied() {
+                if let Some(c) = self.known_constants.get(&op.arg(0).to_opref()).copied() {
                     return c != 0;
                 }
                 false
             }
             OpCode::GuardFalse => {
                 // Subsumed if value is a known zero constant.
-                if let Some(c) = self.known_constants.get(&op.arg(0)).copied() {
+                if let Some(c) = self.known_constants.get(&op.arg(0).to_opref()).copied() {
                     return c == 0;
                 }
                 false
@@ -923,24 +924,17 @@ impl OptGuard {
             // rewrite.py: optimize_GUARD_CLASS — if the class is already
             // known for this value, and it matches, remove the guard.
             OpCode::GuardClass if op.num_args() >= 2 => {
-                if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|cb| cb.const_int())
-                    {
+                if let Some(known_class) = self.known_classes.get(&op.arg(0).to_opref()).copied() {
+                    if let Some(expected) = op.arg(1).get_box_replacement(false).const_int() {
                         return known_class == expected;
                     }
                 }
                 // RPython: setinfo_from_preamble sets PtrInfo.KnownClass or
                 // Instance with known_class. Check ctx for imported info.
-                if let Some(expected) = ctx
-                    .get_box_replacement_box(op.arg(1))
-                    .and_then(|cb| cb.const_int())
-                {
-                    if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
-                        if let Some(class_ptr) = ctx.get_known_class(&b) {
-                            return class_ptr == expected;
-                        }
+                if let Some(expected) = op.arg(1).get_box_replacement(false).const_int() {
+                    let b = op.arg(0).get_box_replacement(false);
+                    if let Some(class_ptr) = ctx.get_known_class(&b) {
+                        return class_ptr == expected;
                     }
                 }
                 false
@@ -948,11 +942,8 @@ impl OptGuard {
             // guard.py: GUARD_VALUE subsumed if value is already known to be
             // that exact constant from a previous GuardValue.
             OpCode::GuardValue if op.num_args() >= 2 => {
-                if let Some(known) = self.known_constants.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|cb| cb.const_int())
-                    {
+                if let Some(known) = self.known_constants.get(&op.arg(0).to_opref()).copied() {
+                    if let Some(expected) = op.arg(1).get_box_replacement(false).const_int() {
                         return known == expected;
                     }
                 }
@@ -962,37 +953,28 @@ impl OptGuard {
             // AND a previous GUARD_CLASS with same args was already seen.
             OpCode::GuardNonnullClass if op.num_args() >= 2 => {
                 // RPython: subsumed if nonnull is known AND class matches.
-                let nonnull_known = self.truthy_values.contains(&op.arg(0))
-                    || ctx
-                        .get_box_replacement_box(op.arg(0))
-                        .map_or(false, |b| ctx.is_nonnull(&b));
+                let nonnull_known = self.truthy_values.contains(&op.arg(0).to_opref())
+                    || ctx.is_nonnull(&op.arg(0).get_box_replacement(false));
                 if !nonnull_known {
                     return false;
                 }
                 // Check class via guard pass state
-                if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
-                    if let Some(expected) = ctx
-                        .get_box_replacement_box(op.arg(1))
-                        .and_then(|cb| cb.const_int())
-                    {
+                if let Some(known_class) = self.known_classes.get(&op.arg(0).to_opref()).copied() {
+                    if let Some(expected) = op.arg(1).get_box_replacement(false).const_int() {
                         return known_class == expected;
                     }
                 }
                 // Check class via imported PtrInfo
-                if let Some(expected) = ctx
-                    .get_box_replacement_box(op.arg(1))
-                    .and_then(|cb| cb.const_int())
-                {
-                    if let Some(b) = ctx.get_box_replacement_box(op.arg(0)) {
-                        if let Some(class_ptr) = ctx.get_known_class(&b) {
-                            return class_ptr == expected;
-                        }
+                if let Some(expected) = op.arg(1).get_box_replacement(false).const_int() {
+                    let b = op.arg(0).get_box_replacement(false);
+                    if let Some(class_ptr) = ctx.get_known_class(&b) {
+                        return class_ptr == expected;
                     }
                 }
                 // Fallback: seen as a previous GuardClass with same args
                 let class_key = GuardKey {
                     opcode: OpCode::GuardClass,
-                    args: op.getarglist().to_vec(),
+                    args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
                 };
                 self.seen.contains(&class_key)
             }
@@ -1060,11 +1042,8 @@ impl Optimization for OptGuard {
         // RPython: GuardValue makes the value a known constant in the
         // optimizer context, enabling export to Phase 2.
         if op.opcode == OpCode::GuardValue {
-            if let Some(c) = ctx
-                .get_box_replacement_box(op.arg(1))
-                .and_then(|cb| cb.const_int())
-            {
-                ctx.make_constant(op.arg(0), majit_ir::Value::Int(c));
+            if let Some(c) = op.arg(1).get_box_replacement(false).const_int() {
+                ctx.make_constant(op.arg(0).to_opref(), majit_ir::Value::Int(c));
             }
         }
 
@@ -1127,9 +1106,15 @@ mod tests {
     #[test]
     fn test_duplicate_guard_true_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // duplicate
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1145,8 +1130,8 @@ mod tests {
     #[test]
     fn test_duplicate_guard_false_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardFalse, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::int_op(0)]), // duplicate
+            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(0))]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1161,8 +1146,14 @@ mod tests {
     #[test]
     fn test_duplicate_guard_nonnull_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(5)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(5)]), // duplicate
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(5))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(5))],
+            ), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1174,8 +1165,20 @@ mod tests {
     #[test]
     fn test_duplicate_guard_value_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardValue, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardValue, &[OpRef::int_op(0), OpRef::int_op(1)]), // duplicate
+            Op::new(
+                OpCode::GuardValue,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::GuardValue,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1187,8 +1190,20 @@ mod tests {
     #[test]
     fn test_duplicate_guard_class_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardClass, &[OpRef::int_op(0), OpRef::int_op(1)]), // duplicate
+            Op::new(
+                OpCode::GuardClass,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::GuardClass,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1201,8 +1216,8 @@ mod tests {
     #[test]
     fn test_different_guard_args_kept() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]), // different arg
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]), // different arg
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1217,8 +1232,8 @@ mod tests {
     #[test]
     fn test_different_guard_opcodes_kept() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::int_op(0)]), // different opcode
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(0))]), // different opcode
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1235,9 +1250,12 @@ mod tests {
     #[test]
     fn test_guard_order_preserved() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::int_op(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(2)]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(2))],
+            ),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1255,8 +1273,11 @@ mod tests {
         // guard_true(v) implies v is truthy/nonnull,
         // so a later guard_nonnull(v) is redundant.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(0)]), // subsumed
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1270,8 +1291,11 @@ mod tests {
         // guard_nonnull(v) implies v is truthy,
         // so a later guard_true(v) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // subsumed
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1285,8 +1309,17 @@ mod tests {
         // guard_class(v, cls) implies v is nonnull,
         // so a later guard_nonnull(v) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(0)]), // subsumed
+            Op::new(
+                OpCode::GuardClass,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(0))],
+            ), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1301,9 +1334,12 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GuardNonnullClass,
-                &[OpRef::int_op(0), OpRef::int_op(1)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
             ),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // subsumed
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1316,8 +1352,11 @@ mod tests {
     fn test_guard_strengthening_different_values_not_subsumed() {
         // guard_true(v0) does NOT subsume guard_nonnull(v1).
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(1)]), // different value
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(1))],
+            ), // different value
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1331,8 +1370,8 @@ mod tests {
     fn test_consecutive_guards_without_descr_no_crash() {
         // Two consecutive guards without descriptors should not crash.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1345,8 +1384,20 @@ mod tests {
     #[test]
     fn test_non_guard_ops_pass_through() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::IntSub, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::IntSub,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1359,10 +1410,22 @@ mod tests {
     #[test]
     fn test_guards_interleaved_with_ops() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // duplicate, removed
-            Op::new(OpCode::IntSub, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // duplicate, removed
+            Op::new(
+                OpCode::IntSub,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1376,9 +1439,9 @@ mod tests {
     #[test]
     fn test_three_duplicate_guards() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // duplicate
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // duplicate
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // duplicate
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1393,9 +1456,15 @@ mod tests {
     #[test]
     fn test_guard_strengthen_pass_removes_duplicate() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]), // should be removed
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]), // should be removed
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 100);
@@ -1441,14 +1510,30 @@ mod tests {
     #[test]
     fn test_overflow_guards_preserved_in_full_pipeline() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
-            Op::new(OpCode::IntSubOvf, &[OpRef::int_op(0), OpRef::int_op(2)]),
+            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(
+                OpCode::IntSubOvf,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                ],
+            ),
             Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::IntMulOvf, &[OpRef::int_op(2), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntMulOvf,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(2)),
+                    BoxRef::from_opref(OpRef::int_op(1)),
+                ],
+            ),
             Op::new(OpCode::GuardNoOverflow, &[]),
             Op::new(
                 OpCode::Jump,
-                &[OpRef::int_op(101), OpRef::int_op(101), OpRef::int_op(103)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(103)),
+                ],
             ),
         ];
         assign_positions(&mut ops, 100);
@@ -1481,16 +1566,31 @@ mod tests {
         // GUARD_NONNULL(v) then GUARD_CLASS(v, cls) already seen
         // → later GUARD_NONNULL_CLASS(v, cls) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(100)]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[BoxRef::from_opref(OpRef::int_op(100))],
+            ),
             Op::new(
                 OpCode::GuardClass,
-                &[OpRef::int_op(100), OpRef::int_op(200)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ),
             Op::new(
                 OpCode::GuardNonnullClass,
-                &[OpRef::int_op(100), OpRef::int_op(200)],
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 0);
         let result = run_guard_pass(&ops);
@@ -1509,12 +1609,21 @@ mod tests {
             {
                 let mut op = Op::new(
                     OpCode::GuardValue,
-                    &[OpRef::int_op(100), OpRef::int_op(200)],
+                    &[
+                        BoxRef::from_opref(OpRef::int_op(100)),
+                        BoxRef::from_opref(OpRef::int_op(200)),
+                    ],
                 );
                 op.pos.set(OpRef::void_op(0));
                 op
             },
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(100)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
         ];
         ops[1].pos.set(OpRef::int_op(1));
 

@@ -404,7 +404,15 @@ pub fn diff_recorded_ops(production: &[Op], shadow: &[Op]) -> Option<String> {
                 idx, p.opcode, s.opcode,
             ));
         }
-        if *p.getarglist() != *s.getarglist() {
+        if p.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>()
+            != s.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>()
+        {
             return Some(format!(
                 "shadow_walker: op[{}] ({:?}) args mismatch — \
                  production={:?}, shadow={:?}",
@@ -446,12 +454,14 @@ pub fn diff_recorded_ops(production: &[Op], shadow: &[Op]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{DescrRef, OpCode, OpRef};
 
     fn op(opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> Op {
+        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
         let mut op = match descr {
-            Some(d) => Op::with_descr(opcode, args, d),
-            None => Op::new(opcode, args),
+            Some(d) => Op::with_descr(opcode, &bx, d),
+            None => Op::new(opcode, &bx),
         };
         op.pos.set(OpRef::op_typed(0, opcode.result_type()));
         op

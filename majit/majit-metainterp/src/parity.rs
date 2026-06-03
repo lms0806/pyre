@@ -52,7 +52,7 @@ fn render_op(op: &Op, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering)
     let args = op
         .getarglist()
         .iter()
-        .map(|&arg| render_arg(arg, constants, vars))
+        .map(|arg| render_arg(arg.to_opref(), constants, vars))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -65,7 +65,7 @@ fn render_op(op: &Op, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering)
     if let Some(fail_args) = op.getfailargs() {
         let fail_args = fail_args
             .iter()
-            .map(|&arg| render_arg(arg, constants, vars))
+            .map(|arg| render_arg(arg.to_opref(), constants, vars))
             .collect::<Vec<_>>()
             .join(", ");
         line.push_str(&format!(" [fail_args={fail_args}]"));

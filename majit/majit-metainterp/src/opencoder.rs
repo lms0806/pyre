@@ -1,6 +1,7 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
+use crate::r#box::BoxRef;
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -261,8 +262,8 @@ impl<'a> TraceIterator<'a> {
             .iter()
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
-                    .chain(op.getarglist_copy())
-                    .chain(op.getfailargs().into_iter().flatten())
+                    .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
+                    .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()))
             })
             .filter(|opref| !opref.is_none() && !opref.is_constant())
             .map(|opref| opref.raw())
@@ -400,11 +401,11 @@ impl<'a> TraceIterator<'a> {
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(i, self._untag(res.arg(i)));
+            res.setarg(i, BoxRef::from_opref(self._untag(res.arg(i).to_opref())));
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = self._untag(*arg);
+                *arg = BoxRef::from_opref(self._untag(arg.to_opref()));
             }
         }
         // RPython opencoder.py:399-401:
@@ -811,9 +812,10 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // is a fresh Python object; the cache only receives non-void
         // results.  majit allocates an OpRef for every op (void or not)
         // so later non-void ops get contiguous positions.
+        let box_args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
         let mut op = match descr {
-            Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
-            None => majit_ir::Op::new(opcode, &args),
+            Some(d) => majit_ir::Op::with_descr(opcode, &box_args, d),
+            None => majit_ir::Op::new(opcode, &box_args),
         };
         op.rd_resume_position.set(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
@@ -2827,7 +2829,8 @@ mod tests {
     /// Helper: build an Op with a specific trace position and the same
     /// typed result class RPython's `opclasses[opnum]` would instantiate.
     fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
-        let mut op = majit_ir::Op::new(opcode, args);
+        let box_args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let mut op = majit_ir::Op::new(opcode, &box_args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
@@ -2842,7 +2845,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[iop(3)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[BoxRef::from_opref(iop(3))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -2857,19 +2860,19 @@ mod tests {
         // First IntAdd: result at fresh BoxInt(2), args translated via cache.
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(2));
-        assert_eq!(r1.arg(0), iarg(0));
-        assert_eq!(r1.arg(1), iarg(1));
+        assert_eq!(r1.arg(0).to_opref(), iarg(0));
+        assert_eq!(r1.arg(1).to_opref(), iarg(1));
 
         // Second IntAdd: result at fresh BoxInt(3); first arg references the
         // previous result (raw pos 2 → cached BoxInt(2)).
         let r2 = iter.next().unwrap();
         assert_eq!(r2.pos.get(), iop(3));
-        assert_eq!(r2.arg(0), iop(2));
-        assert_eq!(r2.arg(1), iarg(0));
+        assert_eq!(r2.arg(0).to_opref(), iop(2));
+        assert_eq!(r2.arg(1).to_opref(), iarg(0));
 
         // Finish is void: pos unchanged, arg cached → BoxInt(3).
         let finish = iter.next().unwrap();
-        assert_eq!(finish.arg(0), iop(3));
+        assert_eq!(finish.arg(0).to_opref(), iop(3));
         assert!(iter.done());
     }
 
@@ -2885,7 +2888,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[iop(3)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[BoxRef::from_opref(iop(3))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -2912,12 +2915,12 @@ mod tests {
         }
         assert_eq!(p2.inputargs, vec![iarg(4), iarg(5)]);
         assert_eq!(p2_ops[0].pos.get(), iop(6));
-        assert_eq!(p2_ops[0].arg(0), iarg(4));
-        assert_eq!(p2_ops[0].arg(1), iarg(5));
+        assert_eq!(p2_ops[0].arg(0).to_opref(), iarg(4));
+        assert_eq!(p2_ops[0].arg(1).to_opref(), iarg(5));
         assert_eq!(p2_ops[1].pos.get(), iop(7));
-        assert_eq!(p2_ops[1].arg(0), iop(6));
-        assert_eq!(p2_ops[1].arg(1), iarg(4));
-        assert_eq!(p2_ops[2].arg(0), iop(7));
+        assert_eq!(p2_ops[1].arg(0).to_opref(), iop(6));
+        assert_eq!(p2_ops[1].arg(1).to_opref(), iarg(4));
+        assert_eq!(p2_ops[2].arg(0).to_opref(), iop(7));
 
         // No Phase 1 OpRef equals any Phase 2 OpRef.
         let p1_positions: Vec<u32> = p1_ops
@@ -2945,8 +2948,8 @@ mod tests {
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(1));
-        assert_eq!(r.arg(0), iarg(0));
-        assert_eq!(r.arg(1), const_ref);
+        assert_eq!(r.arg(0).to_opref(), iarg(0));
+        assert_eq!(r.arg(1).to_opref(), const_ref);
     }
 
     #[test]
@@ -2961,7 +2964,7 @@ mod tests {
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]),
             op_at(2, majit_ir::OpCode::IntAdd, &[iop(1), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[iop(2)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[BoxRef::from_opref(iop(2))]),
         ];
         // Shifted phase: start_fresh = 100 so any confusion between
         // _index (raw trace position) and _fresh (fresh OpRef counter)
@@ -2982,8 +2985,8 @@ mod tests {
         // The next op references raw pos 1 as its first arg, so the
         // replaced value should flow through _untag → _get.
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.arg(0), iop(999));
-        assert_eq!(r2.arg(1), iarg(100));
+        assert_eq!(r2.arg(0).to_opref(), iop(999));
+        assert_eq!(r2.arg(1).to_opref(), iarg(100));
         // After writing raw pos 2, _index advances to 3.
         assert_eq!(iter._index, 3);
     }
@@ -2993,7 +2996,7 @@ mod tests {
         // opencoder.py:362-406 next() routes guard fail_args through the
         // same _untag/_get path as regular args.
         let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[iop(1)]);
-        guard.setfailargs(vec![iarg(0), iop(1)].into());
+        guard.setfailargs(vec![BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iop(1))].into());
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntEq, &[iarg(0), iarg(0)]),
             guard,
@@ -3003,13 +3006,13 @@ mod tests {
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(11));
-        assert_eq!(r1.arg(0), iarg(10));
-        assert_eq!(r1.arg(1), iarg(10));
+        assert_eq!(r1.arg(0).to_opref(), iarg(10));
+        assert_eq!(r1.arg(1).to_opref(), iarg(10));
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.arg(0), iop(11));
+        assert_eq!(r2.arg(0).to_opref(), iop(11));
         let fa = r2.getfailargs().unwrap();
-        assert_eq!(fa[0], iarg(10));
-        assert_eq!(fa[1], iop(11));
+        assert_eq!(fa[0].to_opref(), iarg(10));
+        assert_eq!(fa[1].to_opref(), iop(11));
     }
 
     #[test]
@@ -3019,7 +3022,7 @@ mod tests {
         let ops = vec![
             op_at(3, majit_ir::OpCode::GetfieldRawI, &[rarg(0)]),
             op_at(1, majit_ir::OpCode::GetarrayitemGcR, &[iop(3), rarg(1)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[rop(1)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[BoxRef::from_opref(rop(1))]),
         ];
         let inputarg_types = vec![
             majit_ir::Type::Ref,
@@ -3038,15 +3041,34 @@ mod tests {
 
         let op0 = iter.next().unwrap();
         assert_eq!(op0.pos.get(), iop(104));
-        assert_eq!(&*op0.getarglist(), &[rarg(100)]);
+        assert_eq!(
+            op0.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![rarg(100)]
+        );
 
         let op1 = iter.next().unwrap();
-        assert_eq!(&*op1.getarglist(), &[iop(104), rarg(101)]);
+        assert_eq!(
+            op1.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![iop(104), rarg(101)]
+        );
         assert_eq!(op1.pos.get(), rop(105));
         assert_eq!(iter._cache[1], Some(rop(105)));
 
         let finish = iter.next().unwrap();
-        assert_eq!(&*finish.getarglist(), &[rop(105)]);
+        assert_eq!(
+            finish
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![rop(105)]
+        );
     }
 
     // Phase B1 intentionally drops `test_trace_record_buffer` and
@@ -3241,8 +3263,8 @@ mod tests {
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
-        assert_eq!(op.arg(0), fresh_i0);
-        assert_eq!(op.arg(1), fresh_i1);
+        assert_eq!(op.arg(0).to_opref(), fresh_i0);
+        assert_eq!(op.arg(1).to_opref(), fresh_i1);
         assert!(it.done());
         assert!(it.next().is_none());
     }
@@ -3264,15 +3286,15 @@ mod tests {
         let fresh_i1 = it.inputargs[1];
         let add = it.next().expect("IntAdd");
         assert_eq!(add.opcode, OpCode::IntAdd);
-        assert_eq!(add.arg(0), fresh_i0);
-        assert_eq!(add.arg(1), fresh_i1);
+        assert_eq!(add.arg(0).to_opref(), fresh_i0);
+        assert_eq!(add.arg(1).to_opref(), fresh_i1);
         let mul = it.next().expect("IntMul");
         assert_eq!(mul.opcode, OpCode::IntMul);
         // The first arg of IntMul referenced the first op's result via
         // TAGBOX.  The iterator's `_cache` must map raw position 2 →
         // `add.pos` (the fresh OpRef emitted one `next()` ago).
-        assert_eq!(mul.arg(0), add.pos.get());
-        assert_eq!(mul.arg(1), fresh_i0);
+        assert_eq!(mul.arg(0).to_opref(), add.pos.get());
+        assert_eq!(mul.arg(1).to_opref(), fresh_i0);
         assert!(it.done());
     }
 
@@ -3291,7 +3313,10 @@ mod tests {
         let mut it = buf.get_byte_iter();
         let op = it.next().expect("SameAsR");
         assert_eq!(op.opcode, OpCode::SameAsR);
-        assert_eq!(op.arg(0).as_const_ptr(), Some(majit_ir::GcRef(0xdead_beef)));
+        assert_eq!(
+            op.arg(0).to_opref().as_const_ptr(),
+            Some(majit_ir::GcRef(0xdead_beef))
+        );
     }
 
     /// M4: a TAGINT arg round-trips to an inline-Const OpRef whose value
@@ -3305,7 +3330,7 @@ mod tests {
         let mut it = ByteTraceIter::new(&buf, buf._start as usize, buf._pos, buf.max_num_inputargs);
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::IntAdd);
-        let const_arg = op.arg(1);
+        let const_arg = op.arg(1).to_opref();
         assert!(const_arg.is_constant());
         // The TAGINT arg must round-trip to inline 42 (Int).
         drop(it);
@@ -3332,13 +3357,16 @@ mod tests {
         let second = it.next().unwrap();
         drop(it);
         use majit_trace::heapcache::SameConstantOracle;
-        assert!(crate::history::ConstOprefOracle.same_constant(first.arg(1), second.arg(0)));
+        assert!(
+            crate::history::ConstOprefOracle
+                .same_constant(first.arg(1).to_opref(), second.arg(0).to_opref())
+        );
         assert_eq!(
-            first.arg(1).inline_const_to_value(),
+            first.arg(1).to_opref().inline_const_to_value(),
             Some(majit_ir::Value::Int(7))
         );
         assert_eq!(
-            second.arg(0).inline_const_to_value(),
+            second.arg(0).to_opref().inline_const_to_value(),
             Some(majit_ir::Value::Int(7))
         );
     }
@@ -3498,7 +3526,7 @@ mod tests {
 
         let mut it = ByteTraceIter::new(&buf, buf._start as usize, buf._pos, buf.max_num_inputargs);
         let op = it.next().expect("one op");
-        let const_arg = op.arg(1);
+        let const_arg = op.arg(1).to_opref();
         drop(it);
         assert_eq!(
             const_arg.inline_const_to_value(),
@@ -4242,14 +4270,14 @@ mod tests {
         // assert l[1].opnum == rop.INT_ADD
         assert_eq!(l1.opcode, OpCode::IntAdd);
         // assert l[0].getarg(0) is i0; getarg(1) is i1
-        assert_eq!(l0.arg(0), fresh_i0);
-        assert_eq!(l0.arg(1), fresh_i1);
+        assert_eq!(l0.arg(0).to_opref(), fresh_i0);
+        assert_eq!(l0.arg(1).to_opref(), fresh_i1);
         // assert l[1].getarg(0) is l[0]
-        assert_eq!(l1.arg(0), l0.pos.get());
+        assert_eq!(l1.arg(0).to_opref(), l0.pos.get());
         // assert l[1].getarg(1).getint() == 1 — inline-resolved constant.
         drop(it);
         assert_eq!(
-            l1.arg(1).inline_const_to_value(),
+            l1.arg(1).to_opref().inline_const_to_value(),
             Some(majit_ir::Value::Int(1))
         );
     }
@@ -4387,7 +4415,14 @@ mod tests {
         // the outer `i0, i1` identifiers to the cut's unpacked
         // inputargs; the pyre port keeps the names distinct.)
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(&*ops[0].getarglist(), &[fresh_add1, fresh_i1]);
+        assert_eq!(
+            ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![fresh_add1, fresh_i1]
+        );
         // Second op is the guard; third is the INT_SUB tail.
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
         assert_eq!(ops[2].opcode, OpCode::IntSub);

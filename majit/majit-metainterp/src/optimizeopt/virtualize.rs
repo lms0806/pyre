@@ -255,9 +255,9 @@ impl VirtualizableTracker {
         ) {
             return None;
         }
-        let frame_ref = ctx.get_box_replacement(producer.arg(0));
+        let frame_ref = ctx.get_box_replacement(producer.arg(0).to_opref());
         let is_standard = ctx
-            .get_box_replacement_box(producer.arg(0))
+            .get_box_replacement_box(producer.arg(0).to_opref())
             .map_or(false, |b| self.is_standard_ref(&b, ctx));
         if !is_standard {
             return None;
@@ -481,7 +481,7 @@ impl OptVirtualize {
     }
 
     fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let size_ref = op.arg(0);
+        let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
             .get_box_replacement_box(size_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -566,9 +566,9 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
-        let value_ref = ctx.get_box_replacement(op.arg(1));
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+        let value_ref = ctx.get_box_replacement(op.arg(1).to_opref());
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -689,8 +689,8 @@ impl OptVirtualize {
 
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
         let field_descr_arc = op
             .getdescr()
             .expect("optimize_getfield_gc: field op without FieldDescr");
@@ -783,10 +783,10 @@ impl OptVirtualize {
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
-        let index_ref = op.arg(1);
-        let value_ref = ctx.get_box_replacement(op.arg(2));
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+        let index_ref = op.arg(1).to_opref();
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
 
         if let Some(index) = ctx
             .get_box_replacement_box(index_ref)
@@ -826,9 +826,9 @@ impl OptVirtualize {
     /// virtualize.py:276-296 optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
-        let index_ref = op.arg(1);
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+        let index_ref = op.arg(1).to_opref();
 
         if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             if let PtrInfo::VirtualArray(vinfo) = info {
@@ -869,8 +869,8 @@ impl OptVirtualize {
     /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
 
         if let Some(PtrInfo::VirtualArray(vinfo)) =
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
@@ -895,9 +895,9 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
-        let index_ref = op.arg(1);
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+        let index_ref = op.arg(1).to_opref();
         // `info.py:573-581 getinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Strip the surrounding
         // `InteriorFieldDescr` first (`descr.py:388 InteriorFieldDescr.
@@ -954,10 +954,10 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0))
-            .or_else(|| ctx.ensure_box(op.arg(0)));
-        let index_ref = op.arg(1);
-        let value_ref = ctx.get_box_replacement(op.arg(2));
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+        let index_ref = op.arg(1).to_opref();
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
         // counterpart — strip the outer `InteriorFieldDescr` first.
@@ -1030,14 +1030,14 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
-        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
         let Some(offset) = ctx
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(op.arg(1).to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         else {
             return OptimizationResult::PassOn;
         };
-        let arg0_box = ctx.get_box_replacement_box(op.arg(0));
+        let arg0_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let info = arg0_box.as_ref().and_then(|b| ctx.peek_ptr_info(b));
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
@@ -1049,8 +1049,8 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = op.arg(0);
-        let offset_ref = op.arg(1);
+        let buf_ref = op.arg(0).to_opref();
+        let offset_ref = op.arg(1).to_opref();
 
         if let Some(offset) = ctx
             .get_box_replacement_box(offset_ref)
@@ -1105,9 +1105,9 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_box_replacement(op.arg(0));
-        let offset_ref = op.arg(1);
-        let value_ref = ctx.get_box_replacement(op.arg(2));
+        let buf_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let offset_ref = op.arg(1).to_opref();
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
 
         if let Some(offset) = ctx
             .get_box_replacement_box(offset_ref)
@@ -1191,8 +1191,8 @@ impl OptVirtualize {
     /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
     /// `self.parent.getitem_raw(self.offset + offset, ...)`.
     fn optimize_getarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_box_replacement(op.arg(0));
-        let index_ref = op.arg(1);
+        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let index_ref = op.arg(1).to_opref();
 
         if let Some(index) = ctx
             .get_box_replacement_box(index_ref)
@@ -1325,9 +1325,9 @@ impl OptVirtualize {
     ///     return self.emit(op)
     /// ```
     fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_box_replacement(op.arg(0));
-        let index_ref = op.arg(1);
-        let value_ref = ctx.get_box_replacement(op.arg(2));
+        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let index_ref = op.arg(1).to_opref();
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
 
         if let Some(index) = ctx
             .get_box_replacement_box(index_ref)
@@ -1520,8 +1520,8 @@ impl OptVirtualize {
     /// here on the VirtualStruct half and the setfield_gc emit path is
     /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.get_box_replacement(op.arg(0));
-        let obj_ref = ctx.get_box_replacement(op.arg(1));
+        let vref_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let obj_ref = ctx.get_box_replacement(op.arg(1).to_opref());
 
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
@@ -1579,7 +1579,13 @@ impl OptVirtualize {
         // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
         // Arc from `virtualref.py:42`).
         if !obj_is_null {
-            let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
+            let mut set_forced = Op::new(
+                OpCode::SetfieldGc,
+                &[
+                    crate::r#box::BoxRef::from_opref(vref_ref),
+                    crate::r#box::BoxRef::from_opref(obj_ref),
+                ],
+            );
             set_forced.setdescr(self.vrefinfo.descr_forced.clone());
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
@@ -1587,7 +1593,13 @@ impl OptVirtualize {
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
-        let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
+        let mut set_token = Op::new(
+            OpCode::SetfieldGc,
+            &[
+                crate::r#box::BoxRef::from_opref(vref_ref),
+                crate::r#box::BoxRef::from_opref(null_ref),
+            ],
+        );
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
         ctx.emit_extra(ctx.current_pass_idx, set_token);
 
@@ -1626,7 +1638,7 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return false;
         }
-        let vref_box = ctx.get_box_replacement_box(op.arg(1));
+        let vref_box = ctx.get_box_replacement_box(op.arg(1).to_opref());
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
         let (token_ref, forced_ref) = match vref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(PtrInfo::Virtual(vinfo)) => {
@@ -1892,7 +1904,7 @@ impl Optimization for OptVirtualize {
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
                             && op.num_args() >= 3
                         {
-                            if Self::is_virtual(op.arg(2), ctx) {
+                            if Self::is_virtual(op.arg(2).to_opref(), ctx) {
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1941,12 +1953,12 @@ impl Optimization for OptVirtualize {
                             //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
                                 if let Some(size) = ctx
-                                    .get_box_replacement_box(op.arg(1))
+                                    .get_box_replacement_box(op.arg(1).to_opref())
                                     .and_then(|b| ctx.get_constant_int_box(&b))
                                 {
                                     // virtualize.py:53 func = source_op.getarg(0).getint()
                                     let func = ctx
-                                        .get_box_replacement_box(op.arg(0))
+                                        .get_box_replacement_box(op.arg(0).to_opref())
                                         .and_then(|cb| cb.const_int())
                                         .expect(
                                             "virtualize.py:53 source_op.getarg(0) must be ConstInt",
@@ -1966,7 +1978,7 @@ impl Optimization for OptVirtualize {
                             //       return
                             //   return self.emit(op)
                             if op.num_args() >= 2 {
-                                if Self::is_virtual(op.arg(1), ctx) {
+                                if Self::is_virtual(op.arg(1).to_opref(), ctx) {
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2596,7 +2608,7 @@ mod tests {
         seed_guard_snapshots_with(ops, |guard| {
             guard
                 .getfailargs()
-                .map(|fail_args| fail_args.iter().copied().collect())
+                .map(|fail_args| fail_args.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default()
         })
     }
@@ -2667,7 +2679,12 @@ mod tests {
             let mut resolved_op = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
+                resolved_op.setarg(
+                    i,
+                    crate::r#box::BoxRef::from_opref(
+                        ctx.get_box_replacement(resolved_op.arg(i).to_opref()),
+                    ),
+                );
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
@@ -2767,17 +2784,23 @@ mod tests {
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
-            &[OpRef::input_arg_ref(0)],
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
             field_descr,
         );
         let get_item = Op::with_descr(
             OpCode::GetarrayitemRawI,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(50)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+            ],
             arr_descr.clone(),
         );
         let get_item_again = Op::with_descr(
             OpCode::GetarrayitemRawI,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(50)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+            ],
             arr_descr,
         );
 
@@ -2787,14 +2810,19 @@ mod tests {
         // resolve_array_source() sees the producing OpRef, not the bare vable
         // inputarg.
         let array_ptr_ref = ops[0].pos.get();
-        ops[1].setarg(0, array_ptr_ref);
-        ops[2].setarg(0, array_ptr_ref);
+        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
 
         for op in &ops {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
+                resolved.setarg(
+                    i,
+                    crate::r#box::BoxRef::from_opref(
+                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                    ),
+                );
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2844,9 +2872,9 @@ mod tests {
         let mut call = Op::new(
             OpCode::CallMayForceI,
             &[
-                OpRef::input_arg_ref(0),
-                OpRef::int_op(100),
-                OpRef::input_arg_int(1),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
             ],
         );
         call.setdescr(majit_ir::descr::make_call_descr(
@@ -2889,7 +2917,10 @@ mod tests {
         });
         pass.setup();
 
-        let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
+        let mut get = Op::new(
+            OpCode::GetfieldRawI,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+        );
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos.set(OpRef::int_op(10));
 
@@ -2915,7 +2946,10 @@ mod tests {
 
         let mut set = Op::new(
             OpCode::SetfieldRaw,
-            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
@@ -2987,7 +3021,10 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
+        let mut get_field = Op::new(
+            OpCode::GetfieldRawI,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+        );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
@@ -2998,7 +3035,10 @@ mod tests {
 
         let mut get_item = Op::new(
             OpCode::GetarrayitemRawI,
-            &[OpRef::int_op(10), OpRef::input_arg_int(1)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+            ],
         );
         get_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&get_item, &mut ctx);
@@ -3021,7 +3061,10 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
+        let mut get_field = Op::new(
+            OpCode::GetfieldRawI,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+        );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
@@ -3032,7 +3075,11 @@ mod tests {
 
         let mut set_item = Op::new(
             OpCode::SetarrayitemRaw,
-            &[OpRef::int_op(10), OpRef::input_arg_int(1), OpRef::int_op(2)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+            ],
         );
         set_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&set_item, &mut ctx);
@@ -3055,12 +3102,23 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+                ],
             ),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
+            Op::new(
+                OpCode::GuardTrue,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(1))],
+            ),
             Op::new(
                 OpCode::Jump,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+                ],
             ),
         ];
         ops[1].setfailargs(Default::default());
@@ -3111,10 +3169,17 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                fd.clone(),
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3163,7 +3228,10 @@ mod tests {
 
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+            ],
             fd,
         );
         set_op.pos.set(OpRef::int_op(1));
@@ -3206,10 +3274,16 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3253,15 +3327,26 @@ mod tests {
         // OpRef::int_op(52) = value to store (arbitrary opref)
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef::int_op(50)], ad.clone()), // pos=0
+            Op::with_descr(
+                OpCode::NewArray,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                ad.clone(),
+            ), // pos=0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::int_op(52)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(52)),
+                ],
                 ad.clone(),
             ), // pos=1
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[OpRef::ref_op(0), OpRef::int_op(51)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                ],
                 ad.clone(),
             ), // pos=2
         ];
@@ -3337,20 +3422,35 @@ mod tests {
         let (arr, real, imag) = complex_array_descrs();
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
+            Op::with_descr(
+                OpCode::NewArrayClear,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                arr.clone(),
+            ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(60)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::BoxRef::from_opref(OpRef::float_op(60)),
+                ],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(61)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::BoxRef::from_opref(OpRef::float_op(61)),
+                ],
                 imag.clone(),
             ),
             Op::with_descr(
                 OpCode::GetinteriorfieldGcF,
-                &[OpRef::ref_op(0), OpRef::int_op(51)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                ],
                 real.clone(),
             ),
         ];
@@ -3384,18 +3484,33 @@ mod tests {
         let (arr, real, imag) = complex_array_descrs();
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
+            Op::with_descr(
+                OpCode::NewArrayClear,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                arr.clone(),
+            ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(60)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::BoxRef::from_opref(OpRef::float_op(60)),
+                ],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(61)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::BoxRef::from_opref(OpRef::float_op(61)),
+                ],
                 imag.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3448,8 +3563,16 @@ mod tests {
         let ad = array_descr(20);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef::int_op(50)], ad.clone()),
-            Op::with_descr(OpCode::ArraylenGc, &[OpRef::ref_op(0)], ad.clone()),
+            Op::with_descr(
+                OpCode::NewArray,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::ArraylenGc,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                ad.clone(),
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3481,7 +3604,13 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::GuardClass, &[OpRef::ref_op(0), OpRef::int_op(200)]),
+            Op::new(
+                OpCode::GuardClass,
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3508,7 +3637,10 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::GuardNonnull, &[OpRef::ref_op(0)]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3541,15 +3673,24 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()), // pos=1
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::ref_op(1)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                ],
                 fd_ref.clone(),
             ), // pos=2
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd_int.clone(),
             ), // pos=3
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),             // pos=4
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ), // pos=4
         ];
         assign_positions(&mut ops);
 
@@ -3595,10 +3736,17 @@ mod tests {
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                fd.clone(),
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3622,10 +3770,16 @@ mod tests {
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3651,14 +3805,23 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd,
             ),
             Op::new(
                 OpCode::CallR,
-                &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                ],
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2)]),
+            Op::new(
+                OpCode::Finish,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3703,15 +3866,24 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
-                &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                ],
                 call_descr,
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2)]),
+            Op::new(
+                OpCode::Finish,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3746,15 +3918,24 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
-                &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                ],
                 call_descr,
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2)]),
+            Op::new(
+                OpCode::Finish,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3786,20 +3967,32 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(1), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
-                &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                ],
                 call_descr,
             ),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2)]),
+            Op::new(
+                OpCode::Finish,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3812,14 +4005,16 @@ mod tests {
             .iter()
             .position(|op| {
                 op.opcode == OpCode::SetfieldGc
-                    && op.getarglist().first().copied() == Some(OpRef::input_arg_ref(0))
+                    && op.getarglist().first().map(|a| a.to_opref())
+                        == Some(OpRef::input_arg_ref(0))
             })
             .expect("escaping argument store must be emitted");
         let arg1_setfield_pos = result
             .iter()
             .position(|op| {
                 op.opcode == OpCode::SetfieldGc
-                    && op.getarglist().first().copied() == Some(OpRef::input_arg_ref(1))
+                    && op.getarglist().first().map(|a| a.to_opref())
+                        == Some(OpRef::input_arg_ref(1))
             })
             .expect("unrelated store must still be emitted by the final flush");
 
@@ -3854,16 +4049,30 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
                 fd_b.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd_a.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd_b.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                fd_a.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                fd_b.clone(),
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3888,15 +4097,24 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3926,11 +4144,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GuardClass,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ),
             Op::new(
                 OpCode::GuardClass,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ),
         ];
         assign_positions(&mut ops);
@@ -3958,10 +4182,17 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::int_op(100), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
                 fd.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::int_op(100)], fd.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(100))],
+                fd.clone(),
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3982,11 +4213,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=0
             Op::new(
                 OpCode::VirtualRefFinish,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(102)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(102)),
+                ],
             ), // pos=1
         ];
         assign_positions(&mut ops);
@@ -4023,9 +4260,15 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=0
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]), // pos=1
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -4059,11 +4302,17 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=0
             Op::new(
                 OpCode::VirtualRefFinish,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ), // pos=1, non-null
         ];
         assign_positions(&mut ops);
@@ -4094,9 +4343,15 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=1
-            Op::new(OpCode::CallN, &[OpRef::ref_op(1)]),            // pos=2
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(1))],
+            ), // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -4136,12 +4391,21 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=0
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]), // pos=1
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            ), // pos=1
             Op::new(
                 OpCode::VirtualRefFinish,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ), // pos=2
         ];
         assign_positions(&mut ops);
@@ -4173,9 +4437,16 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::VirtualRefR,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
             ), // pos=0
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::ref_op(0)], forced_descr), // pos=1
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                forced_descr,
+            ), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -4225,7 +4496,12 @@ mod tests {
             let mut resolved_op = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
+                resolved_op.setarg(
+                    i,
+                    crate::r#box::BoxRef::from_opref(
+                        ctx.get_box_replacement(resolved_op.arg(i).to_opref()),
+                    ),
+                );
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
@@ -4264,15 +4540,18 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(200),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 ad,
             ),
         ];
@@ -4303,29 +4582,35 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(200),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(101),
-                    OpRef::int_op(201),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(201)),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
                 ad,
             ),
         ];
@@ -4357,24 +4642,27 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(200),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(201),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(201)),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 ad,
             ),
         ];
@@ -4400,12 +4688,19 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef::int_op(50), OpRef::int_op(100), OpRef::int_op(200)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::int_op(50), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 ad,
             ),
         ];
@@ -4467,13 +4762,29 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::ref_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(100)),
+                ],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::ref_op(0)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(3)]),
-            Op::new(OpCode::Jump, &[OpRef::ref_op(100)]),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                fd.clone(),
+            ),
+            Op::new(
+                OpCode::CallN,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(3))],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(100))],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -4493,8 +4804,8 @@ mod tests {
                 OpCode::Jump,
             ]
         );
-        assert_eq!(result[3].arg(0), OpRef::ref_op(100));
-        assert_eq!(result[4].arg(0), OpRef::ref_op(100));
+        assert_eq!(result[3].arg(0).to_opref(), OpRef::ref_op(100));
+        assert_eq!(result[4].arg(0).to_opref(), OpRef::ref_op(100));
     }
 
     #[test]
@@ -4516,10 +4827,16 @@ mod tests {
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::ref_op(1)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                ],
                 next_fd.clone(),
             ),
-            Op::new(OpCode::Jump, &[OpRef::input_arg_ref(0)]),
+            Op::new(
+                OpCode::Jump,
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            ),
         ];
         ops[0].pos.set(OpRef::ref_op(1));
         ops[1].pos.set(OpRef::void_op(2));
@@ -4564,10 +4881,17 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], float_sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 float_fd,
             ),
-            Op::with_descr(OpCode::CallR, &[OpRef::input_arg_ref(0)], call_descr),
+            Op::with_descr(
+                OpCode::CallR,
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                call_descr,
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -4596,32 +4920,44 @@ mod tests {
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(2), OpRef::int_op(100)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                ],
                 value_fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(2), OpRef::input_arg_ref(0)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                ],
                 next_fd.clone(),
             ),
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(5), OpRef::int_op(101)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                ],
                 value_fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(5), OpRef::ref_op(2)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
+                ],
                 next_fd.clone(),
             ),
             Op::new(
                 OpCode::Finish,
                 &[
-                    OpRef::ref_op(5),
-                    OpRef::ref_op(2),
-                    OpRef::input_arg_ref(1),
-                    OpRef::input_arg_ref(0),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
                 ],
             ),
         ];
@@ -4649,7 +4985,7 @@ mod tests {
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             assert!(
-                new_positions.contains(&set_op.arg(0)),
+                new_positions.contains(&set_op.arg(0).to_opref()),
                 "SetfieldGc target must be one of the emitted News; got {:?} in {:?}",
                 set_op.arg(0),
                 result
@@ -4661,23 +4997,23 @@ mod tests {
             .find(|op| op.opcode == OpCode::Finish)
             .expect("optimized trace should keep Finish");
         assert!(
-            new_positions.contains(&finish.arg(0)),
+            new_positions.contains(&finish.arg(0).to_opref()),
             "first Finish ref should be a forced allocation; got {:?} in {:?}",
             finish.arg(0),
             result
         );
         assert!(
-            new_positions.contains(&finish.arg(1)),
+            new_positions.contains(&finish.arg(1).to_opref()),
             "second Finish ref should be a forced allocation; got {:?} in {:?}",
             finish.arg(1),
             result
         );
         assert!(
-            !constants.contains_key(&finish.arg(0).raw()),
+            !constants.contains_key(&finish.arg(0).to_opref().raw()),
             "forced allocation ref must not collide with an exported int constant"
         );
         assert!(
-            !constants.contains_key(&finish.arg(1).raw()),
+            !constants.contains_key(&finish.arg(1).to_opref().raw()),
             "forced allocation ref must not collide with an exported int constant"
         );
     }
@@ -4696,13 +5032,19 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::ref_op(0)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+        );
+        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(10)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                ],
                 fd.clone(),
             ), // pos=1
             guard,                                                  // pos=2
@@ -4743,7 +5085,7 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(10)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
             "virtual's int field (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
             fa
         );
@@ -4768,14 +5110,27 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::int_op(30), OpRef::ref_op(0), OpRef::int_op(40)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+        );
+        guard.setfailargs(
+            vec![
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(30)),
+                crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(40)),
+            ]
+            .into(),
+        );
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(10)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                ],
                 fd.clone(),
             ), // pos=1
             guard,                                        // pos=2
@@ -4809,17 +5164,17 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(30)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(30)),
             "non-virtual OpRef::int_op(30) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(40)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(40)),
             "non-virtual OpRef::int_op(40) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(10)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
             "virtual's field (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
             fa
         );
@@ -4832,8 +5187,17 @@ mod tests {
     #[test]
     fn test_guard_fail_args_no_virtual_no_rd_numb() {
         // Guard with no virtuals in fail_args should not have rd_numb.
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(10)]);
-        guard.setfailargs(vec![OpRef::int_op(20), OpRef::int_op(30)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(10))],
+        );
+        guard.setfailargs(
+            vec![
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(20)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(30)),
+            ]
+            .into(),
+        );
         let mut ops = vec![guard];
         assign_positions(&mut ops);
 
@@ -4857,13 +5221,19 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::ref_op(0)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+        );
+        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(10)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                ],
                 fd.clone(),
             ),
             guard,
@@ -4895,7 +5265,7 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(10)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
             "virtual struct's int field should appear in liveboxes; got {:?}",
             fa
         );
@@ -4912,18 +5282,27 @@ mod tests {
         let fd_a = field_descr(10);
         let fd_b = field_descr(20);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.setfailargs(vec![OpRef::ref_op(0)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(30))],
+        );
+        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(10)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                ],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(20)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(20)),
+                ],
                 fd_b.clone(),
             ),
             guard,
@@ -4951,12 +5330,12 @@ mod tests {
         );
         // Both field values must appear in liveboxes.
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(10)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
             "first field value (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(20)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(20)),
             "second field value (OpRef::int_op(20)) should appear in liveboxes; got {:?}",
             fa
         );
@@ -4979,19 +5358,28 @@ mod tests {
         let outer_fd = ref_field_descr(10);
         let inner_fd = field_descr(20);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.setfailargs(vec![OpRef::ref_op(0)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(30))],
+        );
+        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(40)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(40)),
+                ],
                 inner_fd,
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::ref_op(1)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                ],
                 outer_fd,
             ),
             guard,
@@ -5032,7 +5420,7 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef::int_op(40)),
+            fa.iter().any(|a| a.to_opref() == OpRef::int_op(40)),
             "leaf int field (OpRef::int_op(40)) should appear in liveboxes; got {:?}",
             fa
         );
@@ -5045,13 +5433,24 @@ mod tests {
         // the array's elements are added to liveboxes as TAGBOX, the array
         // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::ref_op(0)].into());
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+        );
+        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef::int_op(10)], ad.clone()),
+            Op::with_descr(
+                OpCode::NewArray,
+                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(10))],
+                ad.clone(),
+            ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef::ref_op(0), OpRef::int_op(11), OpRef::int_op(12)],
+                &[
+                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(11)),
+                    crate::r#box::BoxRef::from_opref(OpRef::int_op(12)),
+                ],
                 ad,
             ),
             guard,

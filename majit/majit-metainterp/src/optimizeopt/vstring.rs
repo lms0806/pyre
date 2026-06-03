@@ -2,6 +2,7 @@
 
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{
     PtrInfo, PtrInfoExt, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
     VStringVariant,
@@ -59,7 +60,10 @@ pub fn _int_add(box1: OpRef, box2: OpRef, ctx: &mut OptContext) -> OpRef {
     {
         return box1;
     }
-    let op = Op::new(OpCode::IntAdd, &[box1, box2]);
+    let op = Op::new(
+        OpCode::IntAdd,
+        &[BoxRef::from_opref(box1), BoxRef::from_opref(box2)],
+    );
     ctx.emit_for_force(op)
 }
 
@@ -164,16 +168,29 @@ pub fn copy_str_content(
                         if let Some(ch_val) = from_const {
                             ctx.emit_constant_int(ch_val)
                         } else {
-                            let getitem_op = Op::new(get_opcode, &[srcbox, src_offset]);
+                            let getitem_op = Op::new(
+                                get_opcode,
+                                &[BoxRef::from_opref(srcbox), BoxRef::from_opref(src_offset)],
+                            );
                             ctx.emit_for_force(getitem_op)
                         }
                     } else {
-                        let getitem_op = Op::new(get_opcode, &[srcbox, src_offset]);
+                        let getitem_op = Op::new(
+                            get_opcode,
+                            &[BoxRef::from_opref(srcbox), BoxRef::from_opref(src_offset)],
+                        );
                         ctx.emit_for_force(getitem_op)
                     }
                 };
                 src_offset = _int_add(src_offset, one, ctx);
-                let setitem_op = Op::new(set_opcode, &[targetbox, dst_offset, charbox]);
+                let setitem_op = Op::new(
+                    set_opcode,
+                    &[
+                        BoxRef::from_opref(targetbox),
+                        BoxRef::from_opref(dst_offset),
+                        BoxRef::from_opref(charbox),
+                    ],
+                );
                 ctx.emit_for_force(setitem_op);
                 dst_offset = _int_add(dst_offset, one, ctx);
             }
@@ -189,7 +206,13 @@ pub fn copy_str_content(
     };
     let copy_op = Op::new(
         copy_opcode,
-        &[srcbox, targetbox, srcoffsetbox, offsetbox, lengthbox],
+        &[
+            BoxRef::from_opref(srcbox),
+            BoxRef::from_opref(targetbox),
+            BoxRef::from_opref(srcoffsetbox),
+            BoxRef::from_opref(offsetbox),
+            BoxRef::from_opref(lengthbox),
+        ],
     );
     ctx.emit_for_force(copy_op);
     next_offset
@@ -261,7 +284,14 @@ pub fn string_copy_parts(
             for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let ch_resolved = ctx.get_box_replacement(*ch_ref);
-                    let setitem_op = Op::new(set_opcode, &[targetbox, offset, ch_resolved]);
+                    let setitem_op = Op::new(
+                        set_opcode,
+                        &[
+                            BoxRef::from_opref(targetbox),
+                            BoxRef::from_opref(offset),
+                            BoxRef::from_opref(ch_resolved),
+                        ],
+                    );
                     ctx.emit_for_force(setitem_op);
                 }
                 offset = _int_add(offset, one, ctx);
@@ -337,8 +367,9 @@ impl OptString {
         ctx: &mut OptContext,
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
-        let resolved = ctx.get_box_replacement(opref);
-        let b = ctx.ensure_box(resolved)?;
+        let b = ctx
+            .get_box_replacement_box(opref)
+            .or_else(|| ctx.ensure_box(opref))?;
         ctx.with_ptr_info_mut(&b, |info| {
             if let PtrInfo::Str(sinfo) = info {
                 if let VStringVariant::Plain(plain) = &mut sinfo.variant {
@@ -415,7 +446,7 @@ impl OptString {
     /// SameAsI(dummy) and record the constant in the context.
     fn emit_constant_int(&self, value: i64, ctx: &mut OptContext) -> OpRef {
         // Emit a dummy SameAsI to get an OpRef, then record the constant.
-        let op = Op::new(OpCode::SameAsI, &[OpRef::NONE]);
+        let op = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(OpRef::NONE)]);
         let opref = ctx.emit(op);
         ctx.make_constant(opref, Value::Int(value));
         opref
@@ -507,7 +538,7 @@ impl OptString {
     /// and emit the op. `postprocess_NEWSTR` (vstring.py:455-459) registers
     /// `pure(STRLEN, op) = length_arg` for CSE via the pure cache.
     fn _optimize_newstr(&mut self, op: &Op, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
-        let len_ref = op.arg(0);
+        let len_ref = op.arg(0).to_opref();
         if let Some(len) = ctx
             .get_box_replacement_box(len_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -554,9 +585,9 @@ impl OptString {
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0));
-        let idx_ref = op.arg(1);
-        let char_ref = op.arg(2);
+        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let idx_ref = op.arg(1).to_opref();
+        let char_ref = op.arg(2).to_opref();
         let char_resolved = ctx.get_box_replacement(char_ref);
 
         if let Some(idx) = ctx
@@ -584,20 +615,20 @@ impl OptString {
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
     fn optimize_strgetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0));
-        let idx_ref = op.arg(1);
+        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let idx_ref = op.arg(1).to_opref();
 
         if let Some(idx) = ctx
             .get_box_replacement_box(idx_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
-                let ch_resolved = ctx.get_box_replacement(ch_ref);
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_new = ctx
-                    .ensure_box(ch_resolved)
+                    .get_box_replacement_box(ch_ref)
+                    .or_else(|| ctx.ensure_box(ch_ref))
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 ctx.make_equal_to(&b_old, &b_new);
                 return OptimizationResult::Remove;
@@ -617,13 +648,13 @@ impl OptString {
         };
         // vstring.py:526-527
         let has_info = ctx
-            .get_box_replacement_box(op.arg(0))
+            .get_box_replacement_box(op.arg(0).to_opref())
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
             .is_some();
         if has_info {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
-            let lgtop = ctx.getstrlen_opref(op.arg(0), mode);
+            let lgtop = ctx.getstrlen_opref(op.arg(0).to_opref(), mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
             let b_old = ctx
                 .ensure_box(op.pos.get())
@@ -655,11 +686,11 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
-        let src_ref = ctx.get_box_replacement(op.arg(0));
-        let dst_ref = ctx.get_box_replacement(op.arg(1));
-        let src_start_ref = op.arg(2);
-        let dst_start_ref = op.arg(3);
-        let length_ref = op.arg(4);
+        let src_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let dst_ref = ctx.get_box_replacement(op.arg(1).to_opref());
+        let src_start_ref = op.arg(2).to_opref();
+        let dst_start_ref = op.arg(3).to_opref();
+        let length_ref = op.arg(4).to_opref();
         let src_ref_box = ctx.get_box_replacement_box(src_ref);
         let src_info = src_ref_box.as_ref().and_then(|b| ctx.getptrinfo(b));
         let src_is_virtual_or_constant = src_info
@@ -698,7 +729,10 @@ impl OptString {
                             let index_ref = ctx.make_constant_int(src_start + index);
                             ctx.emit_extra(
                                 ctx.current_pass_idx,
-                                Op::new(getitem_opcode, &[src_ref, index_ref]),
+                                Op::new(
+                                    getitem_opcode,
+                                    &[BoxRef::from_opref(src_ref), BoxRef::from_opref(index_ref)],
+                                ),
                             )
                         };
                     if dst_virtual {
@@ -708,7 +742,14 @@ impl OptString {
                         let dst_index_ref = ctx.make_constant_int(dst_start + index);
                         ctx.emit_extra(
                             ctx.current_pass_idx,
-                            Op::new(setitem_opcode, &[dst_ref, dst_index_ref, char_ref]),
+                            Op::new(
+                                setitem_opcode,
+                                &[
+                                    BoxRef::from_opref(dst_ref),
+                                    BoxRef::from_opref(dst_index_ref),
+                                    BoxRef::from_opref(char_ref),
+                                ],
+                            ),
                         );
                     }
                 }
@@ -730,11 +771,11 @@ impl OptString {
         // which may still inline small constant-length copies.
         copy_str_content(
             ctx,
-            op.arg(0),
-            op.arg(1),
-            op.arg(2),
-            op.arg(3),
-            op.arg(4),
+            op.arg(0).to_opref(),
+            op.arg(1).to_opref(),
+            op.arg(2).to_opref(),
+            op.arg(3).to_opref(),
+            op.arg(4).to_opref(),
             mode,
             false, // need_next_offset=False
         );
@@ -767,7 +808,10 @@ impl OptString {
                 return self.emit_constant_int(va - vb, ctx);
             }
         }
-        let op = Op::new(OpCode::IntSub, &[a, b]);
+        let op = Op::new(
+            OpCode::IntSub,
+            &[BoxRef::from_opref(a), BoxRef::from_opref(b)],
+        );
         ctx.emit(op)
     }
 
@@ -781,10 +825,10 @@ impl OptString {
             1u8
         };
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        if let Some(arg0_box) = ctx.ensure_box(op.arg(0)) {
+        if let Some(arg0_box) = ctx.ensure_box(op.arg(0).to_opref()) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
-        let str_ref = ctx.get_box_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref());
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             let _ = len;
         }
@@ -795,7 +839,7 @@ impl OptString {
         let args: Vec<OpRef> = op
             .getarglist()
             .iter()
-            .map(|a| ctx.get_box_replacement(*a))
+            .map(|a| ctx.get_box_replacement(a.to_opref()))
             .collect();
         for arg in args {
             if self.is_virtual(arg, ctx) {
@@ -839,8 +883,8 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let vleft = ctx.get_box_replacement(op.arg(1));
-            let vright = ctx.get_box_replacement(op.arg(2));
+            let vleft = ctx.get_box_replacement(op.arg(1).to_opref());
+            let vright = ctx.get_box_replacement(op.arg(2).to_opref());
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
             if let Some(vleft_box) = ctx.ensure_box(vleft) {
                 ctx.make_nonnull_str(&vleft_box, mode);
@@ -881,13 +925,13 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
-            let mut s = ctx.get_box_replacement(op.arg(1));
+            let mut s = ctx.get_box_replacement(op.arg(1).to_opref());
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
             if let Some(s_box) = ctx.ensure_box(s) {
                 ctx.make_nonnull_str(&s_box, mode);
             }
-            let mut start = ctx.get_box_replacement(op.arg(2));
-            let stop = ctx.get_box_replacement(op.arg(3));
+            let mut start = ctx.get_box_replacement(op.arg(2).to_opref());
+            let stop = ctx.get_box_replacement(op.arg(3).to_opref());
             let lgtop = self.int_sub(stop, start, ctx);
             if let Some(info) = self.get_slice_info(s, ctx) {
                 let source = info.s;
@@ -930,15 +974,15 @@ impl OptString {
             return OptimizationResult::PassOn;
         }
         // vstring.py:693-696
-        let arg1 = ctx.get_box_replacement(op.arg(1));
-        let arg2 = ctx.get_box_replacement(op.arg(2));
+        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
+        let arg2 = ctx.get_box_replacement(op.arg(2).to_opref());
         let i1 = ctx
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(op.arg(1).to_opref())
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
             .is_some();
         let i2 = ctx
-            .get_box_replacement_box(op.arg(2))
+            .get_box_replacement_box(op.arg(2).to_opref())
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
             .is_some();
@@ -1033,7 +1077,10 @@ impl OptString {
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1, mode);
                     let zero = ctx.emit_constant_int(0);
-                    let mut eq_op = Op::new(OpCode::IntEq, &[lengthbox, zero]);
+                    let mut eq_op = Op::new(
+                        OpCode::IntEq,
+                        &[BoxRef::from_opref(lengthbox), BoxRef::from_opref(zero)],
+                    );
                     eq_op.pos.set(op.pos.get());
                     return Some(OptimizationResult::Emit(eq_op));
                 }
@@ -1056,7 +1103,10 @@ impl OptString {
                     let c1 = self.strgetitem(arg1, 0, ctx);
                     let c2 = self.strgetitem(arg2, 0, ctx);
                     if let (Some(ch1), Some(ch2)) = (c1, c2) {
-                        let mut eq_op = Op::new(OpCode::IntEq, &[ch1, ch2]);
+                        let mut eq_op = Op::new(
+                            OpCode::IntEq,
+                            &[BoxRef::from_opref(ch1), BoxRef::from_opref(ch2)],
+                        );
                         eq_op.pos.set(op.pos.get());
                         return Some(OptimizationResult::Emit(eq_op));
                     }
@@ -1090,7 +1140,10 @@ impl OptString {
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
-            let mut eq_op = Op::new(OpCode::PtrEq, &[arg1, null_const]);
+            let mut eq_op = Op::new(
+                OpCode::PtrEq,
+                &[BoxRef::from_opref(arg1), BoxRef::from_opref(null_const)],
+            );
             eq_op.pos.set(op.pos.get());
             return Some(OptimizationResult::Emit(eq_op));
         }
@@ -1195,10 +1248,11 @@ impl OptString {
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
+        let call_args_box: Vec<BoxRef> = call_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
         let mut call_op = match calldescr {
-            Some(d) => Op::with_descr(OpCode::CallI, &call_args, d.clone()),
-            None => Op::new(OpCode::CallI, &call_args),
+            Some(d) => Op::with_descr(OpCode::CallI, &call_args_box, d.clone()),
+            None => Op::new(OpCode::CallI, &call_args_box),
         };
         call_op.pos.set(result_op.pos.get());
         Some(OptimizationResult::Emit(call_op))
@@ -1217,12 +1271,12 @@ impl OptString {
         }
         // vstring.py:819-822: bail out if either info is missing
         let i1 = ctx
-            .get_box_replacement_box(op.arg(1))
+            .get_box_replacement_box(op.arg(1).to_opref())
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
             .is_some();
         let i2 = ctx
-            .get_box_replacement_box(op.arg(2))
+            .get_box_replacement_box(op.arg(2).to_opref())
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
             .is_some();
@@ -1231,16 +1285,16 @@ impl OptString {
             return OptimizationResult::PassOn;
         }
         // vstring.py:823-824: l1box = i1.getstrlen(arg1, self, mode)
-        let l1box = ctx.getstrlen_opref(op.arg(1), mode);
-        let l2box = ctx.getstrlen_opref(op.arg(2), mode);
+        let l1box = ctx.getstrlen_opref(op.arg(1).to_opref(), mode);
+        let l2box = ctx.getstrlen_opref(op.arg(2).to_opref(), mode);
         // vstring.py:825-828: isinstance(ConstInt) and both == 1
         let l1c = ctx.isinstance_const_int(l1box);
         let l2c = ctx.isinstance_const_int(l2box);
         if l1c == Some(1) && l2c == Some(1) {
             // vstring.py:830-836: extract chars and INT_SUB
             if let (Some(char1), Some(char2)) = (
-                self.strgetitem(op.arg(1), 0, ctx),
-                self.strgetitem(op.arg(2), 0, ctx),
+                self.strgetitem(op.arg(1).to_opref(), 0, ctx),
+                self.strgetitem(op.arg(2).to_opref(), 0, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
                 let b_old = ctx
@@ -1292,17 +1346,19 @@ impl OptString {
     /// ```
     fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let arg1 = ctx.get_box_replacement(op.arg(1));
+            let arg1_box = ctx
+                .get_box_replacement_box(op.arg(1).to_opref())
+                .or_else(|| ctx.ensure_box(op.arg(1).to_opref()));
             let length = ctx
-                .get_box_replacement_box(op.arg(2))
+                .get_box_replacement_box(op.arg(2).to_opref())
                 .and_then(|b| ctx.get_constant_int_box(&b));
             // vstring.py:844-845: i2.is_constant() && i1.is_virtual() &&
             // isinstance(i1, VStringPlainInfo)
             if let Some(length) = length {
-                let did_shrink = ctx
-                    .ensure_box(arg1)
+                let did_shrink = arg1_box
+                    .as_ref()
                     .and_then(|b| {
-                        ctx.with_ptr_info_mut(&b, |info| {
+                        ctx.with_ptr_info_mut(b, |info| {
                             if let PtrInfo::Str(sinfo) = info {
                                 if matches!(sinfo.variant, VStringVariant::Plain(_)) {
                                     // vstring.py:847: i1.shrink(length)
@@ -1319,9 +1375,7 @@ impl OptString {
                     let b_old = ctx
                         .ensure_box(op.pos.get())
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    let b_arg1 = ctx
-                        .ensure_box(arg1)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg1 = arg1_box.expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.make_equal_to(&b_old, &b_arg1);
                     return OptimizationResult::Remove;
                 }
@@ -1359,7 +1413,7 @@ impl Optimization for OptString {
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
-                let src = ctx.get_box_replacement(op.arg(0));
+                let src = ctx.get_box_replacement(op.arg(0).to_opref());
                 self.force_if_virtual(src, ctx);
                 OptimizationResult::PassOn
             }
@@ -1468,7 +1522,10 @@ mod tests {
             let mut resolved_op = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
+                resolved_op.setarg(
+                    i,
+                    BoxRef::from_opref(ctx.get_box_replacement(resolved_op.arg(i).to_opref())),
+                );
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -1578,16 +1635,30 @@ mod tests {
         //   i3 = strgetitem(p0, i101) -> should resolve to i200, removed
 
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0: p0 = newstr(3)
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0: p0 = newstr(3)
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(102)),
+                    BoxRef::from_opref(OpRef::int_op(201)),
+                ],
             ), // op 2
-            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(0), OpRef::int_op(101)]), // op 3: get char at 0
+            Op::new(
+                OpCode::Strgetitem,
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ), // op 3: get char at 0
         ];
         assign_positions(&mut ops);
 
@@ -1615,8 +1686,8 @@ mod tests {
         // p0 = newstr(5)
         // i1 = strlen(p0) -> should be constant 5
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0
-            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),   // op 1
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0
+            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),   // op 1
         ];
         assign_positions(&mut ops);
 
@@ -1642,16 +1713,24 @@ mod tests {
         // strsetitem(p0, 1, c1)
         // call_n(p0)     -> forces the string
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(102)),
+                    BoxRef::from_opref(OpRef::int_op(201)),
+                ],
             ), // op 2
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),    // op 3: forces
+            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(0))]),    // op 3: forces
         ];
         assign_positions(&mut ops);
 
@@ -1842,7 +1921,14 @@ mod tests {
 
         assert_eq!(len_ref, last_op.pos.get());
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
-        assert_eq!(&*last_op.getarglist(), &[unicode_ref]);
+        assert_eq!(
+            last_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![unicode_ref]
+        );
     }
 
     // ── Test 7: Non-constant length NEWSTR passes through ──
@@ -1850,7 +1936,10 @@ mod tests {
     #[test]
     fn test_newstr_non_constant_passes_through() {
         // newstr(i0) where i0 is not a known constant -> should emit.
-        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::int_op(50)])];
+        let mut ops = vec![Op::new(
+            OpCode::Newstr,
+            &[BoxRef::from_opref(OpRef::int_op(50))],
+        )];
         assign_positions(&mut ops);
 
         let result = run_with_constants(&ops, &[]);
@@ -1863,7 +1952,10 @@ mod tests {
 
     #[test]
     fn test_newstr_too_large_passes_through() {
-        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::int_op(50)])];
+        let mut ops = vec![Op::new(
+            OpCode::Newstr,
+            &[BoxRef::from_opref(OpRef::int_op(50))],
+        )];
         assign_positions(&mut ops);
 
         let constants = vec![(50, (MAX_CONST_LEN + 1) as i64)];
@@ -1879,7 +1971,10 @@ mod tests {
     fn test_strgetitem_non_virtual() {
         let mut ops = vec![Op::new(
             OpCode::Strgetitem,
-            &[OpRef::ref_op(50), OpRef::int_op(51)],
+            &[
+                BoxRef::from_opref(OpRef::ref_op(50)),
+                BoxRef::from_opref(OpRef::int_op(51)),
+            ],
         )];
         assign_positions(&mut ops);
 
@@ -1897,8 +1992,8 @@ mod tests {
         // p0 = newstr(0) -> virtual (0 chars)
         // call_n(p0)      -> force: emits newstr(0) only, no strsetitem
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
+            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(0))]),
         ];
         assign_positions(&mut ops);
 
@@ -1923,27 +2018,41 @@ mod tests {
         // copystrcontent(src, dst, 0, 0, 2)
         // strgetitem(dst, 0) -> c0
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0: src
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0: src
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(200)),
+                ],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(102)),
+                    BoxRef::from_opref(OpRef::int_op(201)),
+                ],
             ), // op 2
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 3: dst
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 3: dst
             Op::new(
                 OpCode::Copystrcontent,
                 &[
-                    OpRef::ref_op(0),
-                    OpRef::ref_op(3),
-                    OpRef::int_op(101),
-                    OpRef::int_op(101),
-                    OpRef::int_op(100),
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::ref_op(3)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(100)),
                 ],
             ), // op 4: copy src->dst
-            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(3), OpRef::int_op(101)]), // op 5: get dst[0]
+            Op::new(
+                OpCode::Strgetitem,
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(3)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ), // op 5: get dst[0]
         ];
         assign_positions(&mut ops);
 
@@ -1963,16 +2072,22 @@ mod tests {
     #[test]
     fn test_copyunicodecontent_inline_uses_unicodegetitem() {
         let mut ops = vec![
-            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
-            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            Op::new(
+                OpCode::Newunicode,
+                &[BoxRef::from_opref(OpRef::int_op(100))],
+            ),
+            Op::new(
+                OpCode::Newunicode,
+                &[BoxRef::from_opref(OpRef::int_op(100))],
+            ),
             Op::new(
                 OpCode::Copyunicodecontent,
                 &[
-                    OpRef::ref_op(0),
-                    OpRef::ref_op(1),
-                    OpRef::int_op(101),
-                    OpRef::int_op(101),
-                    OpRef::int_op(100),
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::ref_op(1)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                    BoxRef::from_opref(OpRef::int_op(100)),
                 ],
             ),
         ];
@@ -2003,9 +2118,9 @@ mod tests {
         // i1 = strlen(p0) -> const 3
         // i2 = strlen(p0) -> const 3
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),
-            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
+            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),
+            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),
         ];
         assign_positions(&mut ops);
 
@@ -2023,8 +2138,14 @@ mod tests {
         // p0 = newstr(3), no strsetitem for index 0
         // strgetitem(p0, 0) -> char not set, must force and emit
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(0), OpRef::int_op(101)]),
+            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
+            Op::new(
+                OpCode::Strgetitem,
+                &[
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                    BoxRef::from_opref(OpRef::int_op(101)),
+                ],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -2123,8 +2244,8 @@ mod tests {
         // `known_lengths` cache wiring from panicking or regressing.
         // STRLEN on a non-virtual string should be cached for the second call.
         let mut ops = vec![
-            Op::new(OpCode::Strlen, &[OpRef::ref_op(100)]),
-            Op::new(OpCode::Strlen, &[OpRef::ref_op(100)]),
+            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(100))]),
+            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(100))]),
             Op::new(OpCode::Finish, &[]),
         ];
         assign_positions(&mut ops);
@@ -2148,7 +2269,7 @@ mod tests {
         let left = OpRef::ref_op(100);
 
         // Simulate: NEWSTR(2) for left
-        let mut left_op = Op::new(OpCode::Newstr, &[OpRef::int_op(200)]);
+        let mut left_op = Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(200))]);
         left_op.pos.set(left);
         let mut ctx = OptContext::new(10);
         ctx.make_constant(OpRef::int_op(200), Value::Int(2));
@@ -2383,7 +2504,14 @@ mod tests {
             .back()
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
-        assert_eq!(&*strlen_op.getarglist(), &[arg2]);
+        assert_eq!(
+            strlen_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg2]
+        );
         assert_eq!(strlen_ref, strlen_op.pos.get());
 
         // Subsequent call must return the cached lgtop.
@@ -2427,8 +2555,12 @@ mod tests {
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(
-            &*strlen_op.getarglist(),
-            &[arg1],
+            strlen_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg1],
             "STRLEN must use arg1 (op), not arg2 (info source)"
         );
         assert_eq!(strlen_ref, strlen_op.pos.get());

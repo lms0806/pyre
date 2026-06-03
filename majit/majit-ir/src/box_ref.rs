@@ -475,6 +475,62 @@ impl BoxRef {
         }
     }
 
+    /// Bridge: reconstruct the flat `OpRef` view of this box for the
+    /// OpRef-keyed side tables and `op.pos` comparisons that the optimizer,
+    /// GC rewriter, and backends still maintain while `Op.args` carry
+    /// `BoxRef`. A `Const*` box maps to the matching inline-const `OpRef`
+    /// (history.py:227/268/314); an InputArg / ResOp box maps to its typed
+    /// position. Inverse of [`BoxRef::from_opref`]; the two round-trip
+    /// (`from_opref(b.to_opref()) ≡ b` modulo identity).
+    pub fn to_opref(&self) -> OpRef {
+        if self.is_none() {
+            return OpRef::NONE;
+        }
+        match self.const_value() {
+            Some(Value::Int(v)) => return OpRef::const_int(v),
+            Some(Value::Float(v)) => return OpRef::const_float(v),
+            Some(Value::Ref(v)) => return OpRef::const_ptr(v),
+            Some(Value::Void) => return OpRef::NONE,
+            None => {}
+        }
+        let pos = self
+            .position()
+            .expect("non-const box must carry a position");
+        let ty = self.type_();
+        if self.is_inputarg() {
+            OpRef::input_arg_typed(pos, ty)
+        } else {
+            OpRef::op_typed(pos, ty)
+        }
+    }
+
+    /// Bridge inverse of [`BoxRef::to_opref`]: materialize a `BoxRef` view of
+    /// an `OpRef` held in a position-keyed side table. ResOp positions become
+    /// a position-carrying `new_resop` box (no live op handle — identity by
+    /// position, sufficient for the OpRef-keyed consumers that bridge back via
+    /// `to_opref`).
+    pub fn from_opref(r: OpRef) -> BoxRef {
+        if r.is_none() {
+            return BoxRef::none();
+        }
+        if r.is_constant() {
+            return match r {
+                OpRef::ConstInt(v) => BoxRef::new_const(Value::Int(v)),
+                OpRef::ConstFloat(v) => BoxRef::new_const(Value::Float(v)),
+                OpRef::ConstPtr(v) => BoxRef::new_const(Value::Ref(v)),
+                _ => unreachable!("is_constant but not a Const variant"),
+            };
+        }
+        let ty = r.ty().unwrap_or(Type::Void);
+        let pos = r.raw();
+        match r {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                BoxRef::new_inputarg(ty, pos)
+            }
+            _ => BoxRef::new_resop(ty, pos),
+        }
+    }
+
     /// GC root walk over an inline `Value::Ref` carried by a `Const` box —
     /// the `BoxRef` mirror of the per-arg `OpRef::ConstPtr` forwarding in
     /// `Op::walk_const_ptr_refs_mut`. The collector forwards in place; the

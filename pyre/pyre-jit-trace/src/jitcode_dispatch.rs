@@ -6559,8 +6559,11 @@ mod tests {
         let last = tc.ops().last().expect("Finish must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[arg_value],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg_value],
             "outermost Finish must carry the arg value the caller threaded through \
              inline_call_r_r",
         );
@@ -7082,8 +7085,11 @@ mod tests {
         let last = tc.ops().last().expect("FINISH must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[arg_value],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg_value],
             "FINISH args must carry the bubbled exc OpRef",
         );
         let recorded_descr = last
@@ -7272,8 +7278,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[expected_arg],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![expected_arg],
             "Finish args must select registers_r[3], not registers_r[0]",
         );
         let recorded_descr = last
@@ -7371,7 +7380,13 @@ mod tests {
         assert_eq!(tc.num_ops(), ops_before + 1);
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!((&*last.getarglist()), &[expected_arg]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![expected_arg]
+        );
         let recorded_descr = last
             .getdescr()
             .expect("Finish must carry done_with_this_frame_descr_int");
@@ -7864,8 +7879,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[expected_exc],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![expected_exc],
             "FINISH args must carry the exception OpRef from registers_r[src]",
         );
         let recorded_descr = last
@@ -7952,7 +7970,7 @@ mod tests {
         let guard = &ops[ops_before];
         assert_eq!(guard.opcode, majit_ir::OpCode::GuardClass);
         assert_eq!(
-            (&*guard.getarglist())[0],
+            (&*guard.getarglist())[0].to_opref(),
             exc_box,
             "GuardClass arg0 must be the exception OpRef",
         );
@@ -8017,8 +8035,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[active_exc],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![active_exc],
             "FINISH args must carry the standing last_exc_value OpRef",
         );
         let recorded_descr = last
@@ -8786,8 +8807,11 @@ mod tests {
             expected_opcode,
         );
         assert_eq!(
-            (&*last.getarglist()),
-            &[arg0, arg1],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg0, arg1],
             "`{opname}` args must be [registers_i[src1], registers_i[src2]] in source order",
         );
         assert_eq!(
@@ -8924,7 +8948,13 @@ mod tests {
         );
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
-        assert_eq!((&*last.getarglist()), &[arg0, arg1]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg0, arg1]
+        );
         assert_eq!(dst_post, last.pos.get());
     }
 
@@ -8987,8 +9017,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::FloatNeg);
         assert_eq!(
-            (&*last.getarglist()),
-            &[arg],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg],
             "FloatNeg args must be [registers_f[src]]",
         );
         assert_eq!(dst_post, last.pos.get());
@@ -9038,7 +9071,13 @@ mod tests {
         assert_eq!(tc.num_ops(), ops_before + 1);
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
-        assert_eq!((&*last.getarglist()), &[arg]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg]
+        );
         assert_eq!(dst_post, last.pos.get());
     }
 
@@ -9111,7 +9150,13 @@ mod tests {
         assert_eq!(tc.num_ops(), ops_before + 1);
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
-        assert_eq!((&*last.getarglist()), &[arg0, arg1]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![arg0, arg1]
+        );
         assert_eq!(dst_post, last.pos.get());
     }
 
@@ -9354,18 +9399,21 @@ mod tests {
             last_opcode = last.opcode;
             let args = last.getarglist();
             last_args_len = args.len();
-            last_args0 = args[0];
-            last_args1 = args[1];
+            last_args0 = args[0].clone();
+            last_args1 = args[1].clone();
         }
         assert_eq!(last_opcode, majit_ir::OpCode::PtrNe);
         assert_eq!(last_args_len, 2);
-        assert_eq!(last_args0, box_opref);
+        assert_eq!(last_args0.to_opref(), box_opref);
         assert_eq!(
-            wc.trace_ctx.const_value(last_args1),
+            wc.trace_ctx.const_value(last_args1.to_opref()),
             Some(0),
             "args[1] must point at the CONST_NULL pool entry (value=0)"
         );
-        assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
+        assert_eq!(
+            wc.trace_ctx.const_type(last_args1.to_opref()),
+            Some(Type::Ref)
+        );
         assert_ne!(wc.registers_i[0], OpRef::None);
     }
 
@@ -9465,19 +9513,23 @@ mod tests {
             let ops = wc.trace_ctx.ops();
             let last = ops.last().expect("ref_guard_value must record one op");
             let args = last.getarglist();
-            (last.opcode, args[0], args[1], args.len())
+            (last.opcode, args[0].clone(), args[1].clone(), args.len())
         };
         assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
         assert_eq!(last_args_len, 2);
-        assert_eq!(last_args0, value_opref);
+        assert_eq!(last_args0.to_opref(), value_opref);
         assert_eq!(
-            wc.trace_ctx.const_value(last_args1),
+            wc.trace_ctx.const_value(last_args1.to_opref()),
             Some(concrete_ptr as i64),
             "args[1] must point at the concrete pointer in the pool",
         );
-        assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
         assert_eq!(
-            wc.registers_r[0], last_args1,
+            wc.trace_ctx.const_type(last_args1.to_opref()),
+            Some(Type::Ref)
+        );
+        assert_eq!(
+            wc.registers_r[0],
+            last_args1.to_opref(),
             "register slot still holding the original OpRef must be rewritten \
              to the promoted constant (pyjitpl.py:1923 replace_box)",
         );
@@ -9629,8 +9681,12 @@ mod tests {
             .find(|o| o.opcode == majit_ir::OpCode::CallR)
             .expect("CallR must be recorded");
         assert_eq!(
-            (&*call_op.getarglist()),
-            &[funcptr_expected, arg0_expected, arg1_expected],
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![funcptr_expected, arg0_expected, arg1_expected],
             "CallR args must be [funcptr, ...args] from registers_i+registers_r",
         );
         let recorded_descr = call_op.getdescr().expect("CallR must carry the calldescr");
@@ -10370,8 +10426,12 @@ mod tests {
             .find(|o| o.opcode == majit_ir::OpCode::CallI)
             .expect("CallI must be recorded for the int-dst kind");
         assert_eq!(
-            (&*call_op.getarglist()),
-            &[funcptr_expected, arg0_expected, arg1_expected],
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![funcptr_expected, arg0_expected, arg1_expected],
             "CallI args must be [funcptr, ...args] from registers_i+registers_r",
         );
         let recorded_descr = call_op.getdescr().expect("CallI must carry the calldescr");
@@ -10542,8 +10602,12 @@ mod tests {
             .find(|o| o.opcode == majit_ir::OpCode::CallR)
             .expect("CallR must be recorded");
         assert_eq!(
-            (&*call_op.getarglist()),
-            &[
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
                 funcptr_expected,
                 iarg0_expected,
                 iarg1_expected,
@@ -10646,8 +10710,12 @@ mod tests {
             .find(|o| o.opcode == majit_ir::OpCode::CallR)
             .expect("CallR must be recorded");
         assert_eq!(
-            (&*call_op.getarglist()),
-            &[funcptr, r0, i0, r1, i1],
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![funcptr, r0, i0, r1, i1],
             "_build_allboxes must permute to match descr.arg_types \
              [Ref, Int, Ref, Int] — RPython pyjitpl.py:1960-1993",
         );
@@ -11532,8 +11600,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
         assert_eq!(
-            (&*last.getarglist()),
-            &[obj],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj],
             "GetfieldGcI args must be [obj] (the r-reg source)",
         );
         let recorded_descr = last
@@ -11661,7 +11732,13 @@ mod tests {
         assert_eq!(tc.num_ops(), ops_before + 1);
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
-        assert_eq!((&*last.getarglist()), &[obj]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj]
+        );
         assert_eq!(dst_post, last.pos.get());
     }
 
@@ -11773,8 +11850,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
         assert_eq!(
-            (&*last.getarglist()),
-            &[obj],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj],
             "GetfieldGcI args must be [obj] (the r-reg source)",
         );
         let recorded_descr = last
@@ -11845,8 +11925,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
         assert_eq!(
-            (&*last.getarglist()),
-            &[obj, value],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj, value],
             "SetfieldGc args must be [obj, value]",
         );
         let recorded_descr = last
@@ -11958,8 +12041,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
         assert_eq!(
-            (&*last.getarglist()),
-            &[obj, valuebox],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj, valuebox],
             "SetfieldGc args must be [obj, valuebox] in that order",
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -12024,7 +12110,13 @@ mod tests {
         assert_eq!(tc.num_ops(), ops_before + 1);
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
-        assert_eq!((&*last.getarglist()), &[obj, valuebox]);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![obj, valuebox]
+        );
     }
 
     #[test]
@@ -12083,8 +12175,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
         assert_eq!(
-            (&*last.getarglist()),
-            &[array, index],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index],
             "GetarrayitemGcR args must be [array, index]",
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -12211,8 +12306,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
         assert_eq!(
-            &*last.getarglist(),
-            &[array, index],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index],
             "GetarrayitemGcR args must be [array, index] read from r-bank",
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -12275,8 +12373,11 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::SetarrayitemGc);
         assert_eq!(
-            (&*last.getarglist()),
-            &[array, index, value],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index, value],
             "SetarrayitemGc args must be [array, index, value]",
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -12366,8 +12467,11 @@ mod tests {
         let last = tc.ops().last().expect("FINISH must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            (&*last.getarglist()),
-            &[expected_arg],
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![expected_arg],
             "FINISH args must be sym.registers_r[2] threaded through the MIFrame bridge",
         );
         let recorded_descr = last

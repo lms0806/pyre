@@ -6,6 +6,7 @@
 /// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
 use majit_ir::{Op, OpCode, OpRef};
 
+use crate::r#box::BoxRef;
 use crate::optimizeopt::OptContext;
 
 /// Compute magic numbers for division by constant `m`.
@@ -112,37 +113,70 @@ pub fn division_operations(
         let t_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::IntRshift, &[n_ref, shift63_ref]),
+            Op::new(
+                OpCode::IntRshift,
+                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(shift63_ref)],
+            ),
         );
 
         // nt = n ^ t
-        let nt_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[n_ref, t_ref]));
+        let nt_ref = emit_op(
+            ctx,
+            pass_idx,
+            Op::new(
+                OpCode::IntXor,
+                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(t_ref)],
+            ),
+        );
 
         // mul = UINT_MUL_HIGH(nt, k)
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintMulHigh, &[nt_ref, k_ref]),
+            Op::new(
+                OpCode::UintMulHigh,
+                &[BoxRef::from_opref(nt_ref), BoxRef::from_opref(k_ref)],
+            ),
         );
 
         // sh = UINT_RSHIFT(mul, i)
         let sh_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintRshift, &[mul_ref, i_ref]),
+            Op::new(
+                OpCode::UintRshift,
+                &[BoxRef::from_opref(mul_ref), BoxRef::from_opref(i_ref)],
+            ),
         );
 
         // result = sh ^ t
-        emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[sh_ref, t_ref]))
+        emit_op(
+            ctx,
+            pass_idx,
+            Op::new(
+                OpCode::IntXor,
+                &[BoxRef::from_opref(sh_ref), BoxRef::from_opref(t_ref)],
+            ),
+        )
     } else {
         // mul = UINT_MUL_HIGH(n, k)
-        let mul_ref = emit_op(ctx, pass_idx, Op::new(OpCode::UintMulHigh, &[n_ref, k_ref]));
+        let mul_ref = emit_op(
+            ctx,
+            pass_idx,
+            Op::new(
+                OpCode::UintMulHigh,
+                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(k_ref)],
+            ),
+        );
 
         // result = UINT_RSHIFT(mul, i)
         emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintRshift, &[mul_ref, i_ref]),
+            Op::new(
+                OpCode::UintRshift,
+                &[BoxRef::from_opref(mul_ref), BoxRef::from_opref(i_ref)],
+            ),
         )
     }
 }
@@ -161,13 +195,23 @@ pub fn modulo_operations(
 
     // product = div_result * m
     let m_ref = emit_constant_int(ctx, m);
-    let product_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntMul, &[div_ref, m_ref]));
+    let product_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(
+            OpCode::IntMul,
+            &[BoxRef::from_opref(div_ref), BoxRef::from_opref(m_ref)],
+        ),
+    );
 
     // remainder = n - product
     emit_op(
         ctx,
         pass_idx,
-        Op::new(OpCode::IntSub, &[n_ref, product_ref]),
+        Op::new(
+            OpCode::IntSub,
+            &[BoxRef::from_opref(n_ref), BoxRef::from_opref(product_ref)],
+        ),
     )
 }
 

@@ -1,10 +1,11 @@
-use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
-pub use majit_ir::rawbuffer::{RawBuffer, RawBufferError};
 /// Abstract information attached to operations during optimization.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
+use crate::r#box::BoxRef;
+use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
+pub use majit_ir::rawbuffer::{RawBuffer, RawBufferError};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
@@ -430,7 +431,7 @@ impl PtrInfoExt for PtrInfo {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
                 // info.py:120-122: NonNullPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353 InstancePtrInfo.make_guards line-by-line.
@@ -470,11 +471,17 @@ impl PtrInfoExt for PtrInfo {
                     // `cls_of_box()`.
                     let class_ref = alloc_const(ctx, Value::Int(cls));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardNonnull, &[op]));
-                        short.push(Op::new(OpCode::GuardIsObject, &[op]));
-                        short.push(Op::new(OpCode::GuardClass, &[op, class_ref]));
+                        short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                        short.push(Op::new(OpCode::GuardIsObject, &[BoxRef::from_opref(op)]));
+                        short.push(Op::new(
+                            OpCode::GuardClass,
+                            &[BoxRef::from_opref(op), BoxRef::from_opref(class_ref)],
+                        ));
                     } else {
-                        short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+                        short.push(Op::new(
+                            OpCode::GuardNonnullClass,
+                            &[BoxRef::from_opref(op), BoxRef::from_opref(class_ref)],
+                        ));
                     }
                 } else if let Some(descr) = &info.descr {
                     let vtable = descr
@@ -482,15 +489,18 @@ impl PtrInfoExt for PtrInfo {
                         .map(|sd| sd.vtable() as i64)
                         .unwrap_or(0);
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
-                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                    short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardIsObject, &[op]));
+                        short.push(Op::new(OpCode::GuardIsObject, &[BoxRef::from_opref(op)]));
                     }
-                    short.push(Op::new(OpCode::GuardSubclass, &[op, vtable_const]));
+                    short.push(Op::new(
+                        OpCode::GuardSubclass,
+                        &[BoxRef::from_opref(op), BoxRef::from_opref(vtable_const)],
+                    ));
                 } else {
                     // info.py:353 fall-through with neither class nor
                     // descr — base NonNullPtrInfo.make_guards.
-                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                    short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
                 }
             }
             PtrInfo::Struct(info) => {
@@ -505,13 +515,19 @@ impl PtrInfoExt for PtrInfo {
                     .map(|sd| sd.type_id() as i64)
                     .unwrap_or(0);
                 let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                short.push(Op::new(OpCode::GuardNonnull, &[op]));
-                short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
+                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                short.push(Op::new(
+                    OpCode::GuardGcType,
+                    &[BoxRef::from_opref(op), BoxRef::from_opref(type_id_const)],
+                ));
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
                 let c = alloc_const(ctx, Value::Ref(*gcref));
-                short.push(Op::new(OpCode::GuardValue, &[op, c]));
+                short.push(Op::new(
+                    OpCode::GuardValue,
+                    &[BoxRef::from_opref(op), BoxRef::from_opref(c)],
+                ));
             }
             PtrInfo::Array(info) => {
                 // info.py:632-639: ArrayPtrInfo.make_guards.
@@ -521,20 +537,27 @@ impl PtrInfoExt for PtrInfo {
                 //       lenop = ARRAYLEN_GC[op] (descr=self.descr)
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
-                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
                 let type_id = info
                     .descr
                     .as_array_descr()
                     .map(|ad| ad.type_id() as i64)
                     .unwrap_or(0);
                 let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
+                short.push(Op::new(
+                    OpCode::GuardGcType,
+                    &[BoxRef::from_opref(op), BoxRef::from_opref(type_id_const)],
+                ));
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
                 // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
                 // `Option`, so the parity check is on `is_unbounded()`
                 // rather than `is None`.
                 if !info.lenbound.is_unbounded() {
-                    let mut lenop = Op::with_descr(OpCode::ArraylenGc, &[op], info.descr.clone());
+                    let mut lenop = Op::with_descr(
+                        OpCode::ArraylenGc,
+                        &[BoxRef::from_opref(op)],
+                        info.descr.clone(),
+                    );
                     // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
                     // followed by `lenbound.make_guards(lenop, ...)` — the
                     // `lenop` object is the consumer's box arg via Python
@@ -564,17 +587,20 @@ impl PtrInfoExt for PtrInfo {
             // `RawSlicePtrInfo` (info.py:459) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
                 let zero = alloc_const(ctx, Value::Int(0));
-                let mut eq_op = Op::new(OpCode::IntEq, &[op, zero]);
+                let mut eq_op = Op::new(
+                    OpCode::IntEq,
+                    &[BoxRef::from_opref(op), BoxRef::from_opref(zero)],
+                );
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
                 eq_op.pos.set(ctx.alloc_op_position_typed(Type::Int));
                 let eq_pos = eq_op.pos.get();
                 short.push(eq_op);
-                short.push(Op::new(OpCode::GuardFalse, &[eq_pos]));
+                short.push(Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(eq_pos)]));
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
                 if let Some(ref bound) = sinfo.lenbound {
                     if bound.lower >= 1 {
                         let lenop_code = if sinfo.mode == 0 {
@@ -582,7 +608,7 @@ impl PtrInfoExt for PtrInfo {
                         } else {
                             OpCode::Unicodelen
                         };
-                        let mut lenop = Op::new(lenop_code, &[op]);
+                        let mut lenop = Op::new(lenop_code, &[BoxRef::from_opref(op)]);
                         // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                         // is consumed by `bound.make_guards(lenop, ...)`.
                         // Materialize the producer result before the chain.
@@ -931,7 +957,10 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                let mut set_op = Op::new(
+                    OpCode::SetfieldGc,
+                    &[BoxRef::from_opref(alloc_ref), BoxRef::from_opref(value_ref)],
+                );
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
             }
@@ -981,7 +1010,10 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                let mut set_op = Op::new(
+                    OpCode::SetfieldGc,
+                    &[BoxRef::from_opref(alloc_ref), BoxRef::from_opref(value_ref)],
+                );
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
             }
@@ -1004,7 +1036,7 @@ fn force_box_impl(
             } else {
                 OpCode::NewArray
             };
-            let mut alloc_op = Op::new(alloc_opcode, &[len_ref]);
+            let mut alloc_op = Op::new(alloc_opcode, &[BoxRef::from_opref(len_ref)]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1043,7 +1075,14 @@ fn force_box_impl(
                 }
                 let subbox = force_child(item_ref, ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
-                let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, subbox]);
+                let mut set_op = Op::new(
+                    OpCode::SetarrayitemGc,
+                    &[
+                        BoxRef::from_opref(alloc_ref),
+                        BoxRef::from_opref(idx_ref),
+                        BoxRef::from_opref(subbox),
+                    ],
+                );
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
             }
@@ -1064,7 +1103,7 @@ fn force_box_impl(
             }
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
-            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
+            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[BoxRef::from_opref(len_ref)]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1103,8 +1142,14 @@ fn force_box_impl(
                         continue;
                     }
                     let subbox = force_child(value_ref, ctx);
-                    let mut set_op =
-                        Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, subbox]);
+                    let mut set_op = Op::new(
+                        OpCode::SetinteriorfieldGc,
+                        &[
+                            BoxRef::from_opref(alloc_ref),
+                            BoxRef::from_opref(idx_ref),
+                            BoxRef::from_opref(subbox),
+                        ],
+                    );
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
                         set_op.setdescr(d);
                     }
@@ -1124,7 +1169,10 @@ fn force_box_impl(
             // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
             let func_ref = ctx.emit_constant_int(func);
             let size_ref = ctx.emit_constant_int(size as i64);
-            let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
+            let mut call_op = Op::new(
+                OpCode::CallI,
+                &[BoxRef::from_opref(func_ref), BoxRef::from_opref(size_ref)],
+            );
             call_op.pos.set(opref);
             if let Some(d) = calldescr {
                 call_op.setdescr(d);
@@ -1146,14 +1194,21 @@ fn force_box_impl(
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
-            let check_op = Op::new(OpCode::CheckMemoryError, &[alloc_ref]);
+            let check_op = Op::new(OpCode::CheckMemoryError, &[BoxRef::from_opref(alloc_ref)]);
             emit_op(ctx, check_op);
 
             // info.py:429-436: emit RAW_STORE for each buffered write
             for (offset, _length, descr, value) in entries {
                 let value_ref = force_child(value, ctx);
                 let offset_ref = ctx.emit_constant_int(offset);
-                let mut store_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
+                let mut store_op = Op::new(
+                    OpCode::RawStore,
+                    &[
+                        BoxRef::from_opref(alloc_ref),
+                        BoxRef::from_opref(offset_ref),
+                        BoxRef::from_opref(value_ref),
+                    ],
+                );
                 store_op.setdescr(descr);
                 emit_op(ctx, store_op);
             }
@@ -1184,7 +1239,13 @@ fn force_box_impl(
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(slice.parent, ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-            let mut add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
+            let mut add_op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(parent_forced),
+                    BoxRef::from_opref(offset_ref),
+                ],
+            );
             add_op.pos.set(opref);
             let new_ref = emit_op(ctx, add_op);
             // Preserve raw-slice identity; mark non-virtual via
@@ -1265,7 +1326,7 @@ fn force_box_impl(
             } else {
                 OpCode::Newstr
             };
-            let mut newstr_op = Op::new(new_opcode, &[lengthbox]);
+            let mut newstr_op = Op::new(new_opcode, &[BoxRef::from_opref(lengthbox)]);
             newstr_op.pos.set(opref);
             let newop = emit_op(ctx, newstr_op);
 
@@ -1312,7 +1373,14 @@ fn force_box_impl(
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
                             let ch_resolved = ctx.get_box_replacement(*ch_ref);
-                            let setitem_op = Op::new(set_opcode, &[newop, offset, ch_resolved]);
+                            let setitem_op = Op::new(
+                                set_opcode,
+                                &[
+                                    BoxRef::from_opref(newop),
+                                    BoxRef::from_opref(offset),
+                                    BoxRef::from_opref(ch_resolved),
+                                ],
+                            );
                             emit_op(ctx, setitem_op);
                         }
                         offset = crate::optimizeopt::vstring::_int_add(offset, one, ctx);
@@ -1706,7 +1774,10 @@ mod tests {
 
         let mut replay = Op::new(
             OpCode::GetarrayitemGcI,
-            &[OpRef::int_op(10), OpRef::const_int(0)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(10)),
+                BoxRef::from_opref(OpRef::const_int(0)),
+            ],
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
@@ -1734,7 +1805,10 @@ mod tests {
     fn test_all_items_exposes_preamble_source_box() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::instance(Some(descr), None);
-        let replay = Op::new(OpCode::GetfieldGcI, &[OpRef::int_op(10)]);
+        let replay = Op::new(
+            OpCode::GetfieldGcI,
+            &[BoxRef::from_opref(OpRef::int_op(10))],
+        );
         let pop = PreambleOp {
             op: OpRef::int_op(88),
             invented_name: false,
