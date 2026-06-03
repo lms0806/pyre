@@ -170,22 +170,17 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     ///     return result
     /// ```
     ///
-    /// Pyre surfaces every `**attrs`-set funcobj member through
-    /// `_func.attrs` (the same mirror that carries `external`,
-    /// `canraise`, `random_effects_on_gcobjs`). `_callbacks` is exposed
-    /// there as a `ConstValue::Graphs` graph-key list — upstream's
-    /// `function -> bk.getdesc(function).getgraphs()` indirection
-    /// collapses to the resolved callback graphs, resolved through
-    /// `TranslationContext.graphs` exactly like the `indirect_call` arm.
-    /// When the key is absent (no callback-bearing external modelled
-    /// yet) the loop runs zero times and the result is `bottom_result()`,
-    /// matching upstream's `hasattr(funcobj, '_callbacks') == False` path.
+    /// Like upstream, this receives the unwrapped `funcobj` (`_func`):
+    /// `analyze`'s `direct_call` arm performs the `op.args[0].value._obj`
+    /// unwrap once (`graphanalyze.py:96`) and hands the result here, so
+    /// the method surface matches `analyze_external_call(self, funcobj,
+    /// seen)`.
     fn analyze_external_call(
         &mut self,
-        op: &SpaceOperation,
+        funcobj: &lltype::_func,
         seen: Option<&mut DependencyTracker<R>>,
     ) -> R {
-        framework_analyze_external_call(self, op, seen)
+        framework_analyze_external_call(self, funcobj, seen)
     }
 
     /// `analyze_exceptblock(block, seen)`
@@ -269,23 +264,24 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     ) -> R {
         match op.opname.as_str() {
             "direct_call" => {
-                // Upstream `:94-116`: pull the callee graph, route
-                // external/null/normal arms. Do not use
-                // `simplify::get_graph_for_call` here: that helper is
-                // intentionally lossy and returns `None` for delayed
-                // pointers, null pointers, external calls, and
-                // malformed callees alike. `graphanalyze.py` assigns
-                // different lattice values to those cases, and pyre's
-                // freethreaded `gilanalysis` relies on unknown calls
-                // being conservative rather than silently bottom.
+                // Upstream `:95-96 funcobj = op.args[0].value._obj`. The
+                // read is direct: a `direct_call` always carries a constant
+                // function pointer as `args[0]`. A missing arg, a
+                // non-constant operand, or a non-pointer constant is
+                // malformed and fails loud, matching upstream's `IndexError`
+                // / `AttributeError` on `op.args[0].value._obj` (only the
+                // `DelayedPointer` and null-pointer cases below are caught).
                 let Some(arg0) = op.args.first() else {
-                    return R::top_result();
+                    panic!("graphanalyze.py:96 direct_call has no args[0] callee");
                 };
                 let Hlvalue::Constant(c) = arg0 else {
-                    return R::top_result();
+                    panic!("graphanalyze.py:96 direct_call args[0] is not a constant callee");
                 };
                 let ConstValue::LLPtr(f) = &c.value else {
-                    return R::top_result();
+                    panic!(
+                        "graphanalyze.py:96 direct_call args[0] is not a function pointer ({:?})",
+                        c.value
+                    );
                 };
                 if !f.nonzero() {
                     // Upstream `funcobj is None`: a null call would
@@ -313,7 +309,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
                 // `lltype.functionptr` (`rffi.py:162`) lands in
                 // `attrs["external"]` as a non-`None` ConstValue.
                 if !matches!(funcobj.attrs.get("external"), None | Some(ConstValue::None)) {
-                    return self.analyze_external_call(op, seen);
+                    return self.analyze_external_call(&funcobj, seen);
                 }
                 // Upstream `:109-112`:
                 //     try:
@@ -542,18 +538,21 @@ where
 ///     return result
 /// ```
 ///
-/// Pyre surfaces every `**attrs`-set funcobj member through `_func.attrs`
-/// (the same mirror that carries `external` / `canraise` /
-/// `random_effects_on_gcobjs`). `_callbacks` is normalised there to a
-/// `ConstValue::Graphs` graph-key list — upstream's
-/// `function -> bk.getdesc(function).getgraphs()` indirection collapses to
-/// the resolved callback graphs, resolved through `TranslationContext.graphs`
-/// exactly like the `indirect_call` arm. A subclass override
+/// PRE-EXISTING-ADAPTATION (`graphanalyze.py:62-68`). Upstream resolves the
+/// callback graphs through the annotator bookkeeper: `for function in
+/// funcobj._callbacks.callbacks: bk.getdesc(function).getgraphs()`. Pyre has
+/// no live bookkeeper desc walk yet, so `_callbacks` is normalised at the
+/// `_func.attrs` mirror (the same mirror that carries `external` / `canraise`
+/// / `random_effects_on_gcobjs`) into the already-resolved `ConstValue::Graphs`
+/// graph-key list, resolved through `TranslationContext.graphs` exactly like
+/// the `indirect_call` arm. Convergence path: reinstate the
+/// `function -> getdesc -> getgraphs` walk once the real annotator bookkeeper
+/// is wired (GH #139 real-rtyper cutover). A subclass override
 /// (e.g. [`super::collectanalyze`]) delegates here for the no-special-case
 /// path, matching upstream's `BoolGraphAnalyzer.analyze_external_call` super-call.
 pub fn framework_analyze_external_call<A, R, I>(
     analyzer: &mut A,
-    op: &SpaceOperation,
+    funcobj: &lltype::_func,
     seen: Option<&mut DependencyTracker<R>>,
 ) -> R
 where
@@ -563,16 +562,6 @@ where
 {
     // `result = self.bottom_result()`.
     let result = R::bottom_result();
-    // `funcobj` upstream is `op.args[0].value._obj`.
-    let Some(Hlvalue::Constant(c)) = op.args.first() else {
-        return result;
-    };
-    let ConstValue::LLPtr(f) = &c.value else {
-        return result;
-    };
-    let Ok(lltype::_ptr_obj::Func(funcobj)) = f._obj() else {
-        return result;
-    };
     // `if hasattr(funcobj, '_callbacks'):` — absent attr keeps the
     // `bottom_result()` (`hasattr == False` path).
     let Some(callbacks) = funcobj.attrs.get("_callbacks") else {
@@ -580,7 +569,9 @@ where
     };
     // The attr is present, so pyre's normalisation invariant requires a
     // graph-key list; any other shape is a malformed `_callbacks` and
-    // fails loud rather than silently degrading to bottom/top.
+    // fails loud rather than silently degrading to bottom/top. Upstream's
+    // direct `funcobj._callbacks.callbacks` access is likewise fail-loud
+    // on a malformed attr.
     let ConstValue::Graphs(keys) = callbacks else {
         panic!(
             "_callbacks funcobj attr is not a ConstValue::Graphs key list ({callbacks:?}) \

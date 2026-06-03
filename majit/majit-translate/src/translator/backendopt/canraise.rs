@@ -13,12 +13,12 @@
 //! `gilanalysis::GilAnalyzer` already consumes — and short-circuits on
 //! the boolean lattice (`top_result == True` ends the walk).
 
-use crate::flowspace::model::{BlockRef, ConstValue, GraphRef, Hlvalue, SpaceOperation};
+use crate::flowspace::model::{BlockRef, GraphRef, SpaceOperation};
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{Dependency, DependencyTracker, GraphAnalyzer};
 use crate::translator::backendopt::ssa::DataFlowFamilyBuilder;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
-use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
 
 /// `class RaiseAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
@@ -108,34 +108,26 @@ impl<'t> GraphAnalyzer<bool, ()> for RaiseAnalyzer<'t> {
     ///     return getattr(fnobj, 'canraise', True)
     /// ```
     ///
-    /// `direct_call`'s callee descriptor (`op.args[0].value._obj`) is
-    /// what upstream calls `fnobj`. Pyre's `_func` carrier holds the
+    /// The `analyze` dispatcher passes the unwrapped `funcobj` (`_func`),
+    /// which upstream calls `fnobj`. Pyre's `_func` carrier holds the
     /// upstream attribute mirror in `_func.attrs`
     /// (`lltype.rs:690 attrs: HashMap<String, ConstValue>`); the
     /// `canraise` slot is set by `lltype.functionptr(canraise=...)`
     /// at the same upstream site that originates the attribute on
-    /// the Python `_func`. Read it here; default to `True` per
-    /// upstream's `getattr(..., True)` when the slot is absent.
+    /// the Python `_func`. `getattr(fnobj, 'canraise', True)` returns the
+    /// raw value (a bool on the regular path), which the BoolGraphAnalyzer
+    /// then folds into its `or` lattice — i.e. by Python truthiness. Read
+    /// the slot through the same truthiness; default to `True` when absent.
     fn analyze_external_call(
         &mut self,
-        op: &SpaceOperation,
+        funcobj: &_func,
         _seen: Option<&mut DependencyTracker<bool>>,
     ) -> bool {
-        let Some(arg0) = op.args.first() else {
-            return true;
-        };
-        let Hlvalue::Constant(c) = arg0 else {
-            return true;
-        };
-        let ConstValue::LLPtr(f) = &c.value else {
-            return true;
-        };
-        let Ok(_ptr_obj::Func(funcobj)) = f._obj() else {
-            return true;
-        };
         match funcobj.attrs.get("canraise") {
-            Some(ConstValue::Bool(b)) => *b,
-            _ => true,
+            Some(value) => value.truthy().unwrap_or_else(|| {
+                panic!("canraise.py:22 canraise attr has unknown truthiness: {value:?}")
+            }),
+            None => true,
         }
     }
 

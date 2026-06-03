@@ -28,6 +28,7 @@ use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{
     Dependency, DependencyTracker, GraphAnalyzer, framework_analyze_direct_call,
 };
+use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
@@ -107,7 +108,7 @@ impl<'t> GraphAnalyzer<bool, ()> for GilAnalyzer<'t> {
     /// calls explicitly.
     fn analyze_external_call(
         &mut self,
-        _op: &SpaceOperation,
+        _funcobj: &_func,
         _seen: Option<&mut DependencyTracker<bool>>,
     ) -> bool {
         true

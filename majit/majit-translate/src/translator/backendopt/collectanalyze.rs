@@ -32,7 +32,7 @@ use crate::translator::backendopt::graphanalyze::{
     framework_analyze_external_call,
 };
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
-use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
 
 /// `class CollectAnalyzer(graphanalyze.BoolGraphAnalyzer)` at
@@ -113,40 +113,35 @@ impl<'t> GraphAnalyzer<bool, ()> for CollectAnalyzer<'t> {
     ///         self, funcobj, seen)
     /// ```
     ///
-    /// `funcobj` upstream is `op.args[0].value._obj`; pyre routes
-    /// through the same LLPtr unwrap that
-    /// [`super::canraise::RaiseAnalyzer::analyze_external_call`] does.
-    /// `random_effects_on_gcobjs` is read off `_func.attrs` — the
-    /// same attribute mirror that carries `canraise`.
+    /// The `analyze` dispatcher passes the unwrapped `funcobj` (`_func`).
+    /// `random_effects_on_gcobjs` is read off `_func.attrs` — the same
+    /// attribute mirror that carries `canraise`.
     fn analyze_external_call(
         &mut self,
-        op: &SpaceOperation,
+        funcobj: &_func,
         seen: Option<&mut DependencyTracker<bool>>,
     ) -> bool {
-        // `if funcobj.random_effects_on_gcobjs: return True`. `funcobj`
-        // upstream is `op.args[0].value._obj`; pyre reads the flag off
-        // the `_func.attrs` mirror that carries `canraise` / `external`.
-        if let Some(Hlvalue::Constant(c)) = op.args.first() {
-            if let ConstValue::LLPtr(f) = &c.value {
-                if let Ok(_ptr_obj::Func(funcobj)) = f._obj() {
-                    let Some(value) = funcobj.attrs.get("random_effects_on_gcobjs") else {
-                        panic!("collectanalyze.py:22 funcobj.random_effects_on_gcobjs missing");
-                    };
-                    if value.truthy().unwrap_or_else(|| {
-                        panic!(
-                            "collectanalyze.py:22 random_effects_on_gcobjs has unknown truthiness: \
-                             {value:?}"
-                        )
-                    }) {
-                        return true;
-                    }
-                }
-            }
+        // `if funcobj.random_effects_on_gcobjs: return True` — Python
+        // truthiness of the flag read off the `_func.attrs` mirror. A
+        // missing attr is upstream's direct-attribute-access AttributeError
+        // and fails loud; a present value (the `rffi.py:156`-normalised
+        // bool on the regular path, or a raw `functionptr(...)` operand) is
+        // evaluated through the same truthiness as the upstream `if`.
+        let value = match funcobj.attrs.get("random_effects_on_gcobjs") {
+            Some(value) => value,
+            None => panic!("collectanalyze.py:22 funcobj.random_effects_on_gcobjs missing"),
+        };
+        if value.truthy().unwrap_or_else(|| {
+            panic!(
+                "collectanalyze.py:22 random_effects_on_gcobjs has unknown truthiness: {value:?}"
+            )
+        }) {
+            return true;
         }
         // `return graphanalyze.BoolGraphAnalyzer.analyze_external_call(
         //      self, funcobj, seen)` — the base walk: `bottom_result()`
         // (`False`) unless a `_callbacks` graph proves collection.
-        framework_analyze_external_call(self, op, seen)
+        framework_analyze_external_call(self, funcobj, seen)
     }
 
     /// Upstream `:27-33`:
@@ -168,32 +163,29 @@ impl<'t> GraphAnalyzer<bool, ()> for CollectAnalyzer<'t> {
     fn analyze_simple_operation(&mut self, op: &SpaceOperation, _graphinfo: &()) -> bool {
         if op.opname == "malloc" || op.opname == "malloc_varsize" {
             // Upstream `:29-30 flags = op.args[1].value;
-            // return flags['flavor'] == 'gc'`.
-            return op
-                .args
-                .get(1)
-                .and_then(|arg| match arg {
-                    Hlvalue::Constant(c) => Some(&c.value),
-                    _ => None,
-                })
-                .and_then(|v| match v {
-                    ConstValue::Dict(d) => Some(d),
-                    _ => None,
-                })
-                .and_then(|d| {
-                    d.get(&ConstValue::UniStr("flavor".to_string()))
-                        .or_else(|| d.get(&ConstValue::ByteStr(b"flavor".to_vec())))
-                })
-                .map(|v| {
-                    matches!(
-                        v,
-                        ConstValue::UniStr(s) if s == "gc"
-                    ) || matches!(
-                        v,
-                        ConstValue::ByteStr(s) if s == b"gc"
-                    )
-                })
-                .unwrap_or(false);
+            // return flags['flavor'] == 'gc'`. The reads are direct: a
+            // missing `args[1]`, a non-constant operand, a non-dict value,
+            // or an absent `'flavor'` key is malformed and fails loud
+            // (upstream `IndexError` / `AttributeError` / `KeyError`). The
+            // `== 'gc'` comparison itself is fail-soft: any other flavor
+            // value is simply not a GC allocation.
+            let Some(Hlvalue::Constant(c)) = op.args.get(1) else {
+                panic!("collectanalyze.py:29 malloc op args[1] is not a constant");
+            };
+            let ConstValue::Dict(flags) = &c.value else {
+                panic!(
+                    "collectanalyze.py:29 malloc flags is not a dict ({:?})",
+                    c.value
+                );
+            };
+            let flavor = flags
+                .get(&ConstValue::UniStr("flavor".to_string()))
+                .or_else(|| flags.get(&ConstValue::ByteStr(b"flavor".to_vec())))
+                .unwrap_or_else(|| {
+                    panic!("collectanalyze.py:30 malloc flags missing 'flavor' key")
+                });
+            return matches!(flavor, ConstValue::UniStr(s) if s == "gc")
+                || matches!(flavor, ConstValue::ByteStr(s) if s == b"gc");
         }
         // Upstream `:32-33`: opname in LL_OPERATIONS and canmallocgc.
         match ll_operations().get(op.opname.as_str()) {
@@ -207,8 +199,7 @@ impl<'t> GraphAnalyzer<bool, ()> for CollectAnalyzer<'t> {
 mod tests {
     use super::*;
     use crate::flowspace::model::{
-        Block, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey, Hlvalue, SpaceOperation,
-        Variable,
+        Block, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, SpaceOperation, Variable,
     };
     use crate::translator::rtyper::lltypesystem::lltype;
     use crate::translator::translator::TranslationContext;
@@ -224,26 +215,6 @@ mod tests {
             Constant::new(ConstValue::Dict(HashMap::new())),
         ));
         Rc::new(RefCell::new(graph))
-    }
-
-    fn direct_call_to(graph: Option<&GraphRef>) -> SpaceOperation {
-        let graph_key = graph.map(|graph| GraphKey::of(graph).as_usize());
-        let ptr = lltype::functionptr(
-            lltype::FuncType {
-                args: Vec::new(),
-                result: lltype::LowLevelType::Void,
-            },
-            "callee",
-            graph_key,
-            None,
-        );
-        SpaceOperation::new(
-            "direct_call",
-            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
-                Box::new(ptr),
-            )))],
-            Hlvalue::Variable(Variable::named("result")),
-        )
     }
 
     /// `flags={'flavor': 'gc'}` malloc op fixture.
@@ -263,36 +234,12 @@ mod tests {
         )
     }
 
-    fn external_direct_call_with_attrs(attrs: HashMap<String, ConstValue>) -> SpaceOperation {
+    fn external_func_with_attrs(attrs: HashMap<String, ConstValue>) -> lltype::_func {
         let functype = lltype::FuncType {
             args: vec![],
             result: lltype::LowLevelType::Void,
         };
-        let ptr = crate::translator::rtyper::lltypesystem::lltype::_ptr::new(
-            crate::translator::rtyper::lltypesystem::lltype::Ptr {
-                TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
-                    functype.clone(),
-                ),
-            },
-            Ok(Some(
-                crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Func(
-                    crate::translator::rtyper::lltypesystem::lltype::_func::new(
-                        functype,
-                        "ext".to_string(),
-                        None,
-                        None,
-                        attrs,
-                    ),
-                ),
-            )),
-        );
-        SpaceOperation::new(
-            "direct_call",
-            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
-                Box::new(ptr),
-            )))],
-            Hlvalue::Variable(Variable::named("r")),
-        )
+        lltype::_func::new(functype, "ext".to_string(), None, None, attrs)
     }
 
     #[test]
@@ -366,8 +313,8 @@ mod tests {
             "random_effects_on_gcobjs".to_string(),
             ConstValue::Bool(true),
         );
-        let op = external_direct_call_with_attrs(attrs);
-        assert!(analyzer.analyze_external_call(&op, None));
+        let funcobj = external_func_with_attrs(attrs);
+        assert!(analyzer.analyze_external_call(&funcobj, None));
     }
 
     #[test]
@@ -382,18 +329,18 @@ mod tests {
             "random_effects_on_gcobjs".to_string(),
             ConstValue::Bool(false),
         );
-        let op = external_direct_call_with_attrs(attrs);
-        assert!(!analyzer.analyze_external_call(&op, None));
+        let funcobj = external_func_with_attrs(attrs);
+        assert!(!analyzer.analyze_external_call(&funcobj, None));
     }
 
     #[test]
-    #[should_panic(expected = "funcobj.random_effects_on_gcobjs missing")]
+    #[should_panic(expected = "random_effects_on_gcobjs missing")]
     fn external_call_missing_random_effects_fails_loud() {
         let translator = TranslationContext::new();
         let mut analyzer = CollectAnalyzer::new(&translator);
         // Upstream reads `funcobj.random_effects_on_gcobjs` directly,
         // so a missing attr is not the same as a false attr.
-        let op = direct_call_to(None);
-        let _ = analyzer.analyze_external_call(&op, None);
+        let funcobj = external_func_with_attrs(HashMap::new());
+        let _ = analyzer.analyze_external_call(&funcobj, None);
     }
 }
