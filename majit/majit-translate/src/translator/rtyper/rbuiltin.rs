@@ -2896,24 +2896,39 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     use crate::translator::rtyper::rmodel::PtrRepr;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    // TODO: this block IS the retirement-readiness diagnostic for
-    // the legacy late InstanceRepr→PtrRepr swap.  pyre's surface DSL
-    // has no `lltype.*` HostObject, so typed `&Foo` references whose
-    // owning struct is NOT in the walker lltype catalog lift to
-    // `SomeInstance(classdef=None)` instead of upstream's
-    // `SomePtr(ll_ptrtype)`.  Catalog-registered typed-refs lift to
-    // `SomeValue::Ptr` at producer time
-    // (`flowspace/rust_source/build_flow.rs::annotate_typed_ptr_inputs`)
-    // so the rtyper makerepr path
-    // (`rmodel.rs:2545 SomeValue::Ptr → PtrRepr`) lands them in
-    // `hop.args_r[0]` already as `PtrRepr` — the swap below is now
-    // load-bearing only for unregistered structs.
+    // `cast_ptr_to_int` is a LOW-LEVEL op (emitted for `expr as i64`
+    // on a Ref source, see the doc above): its operand must reach the
+    // typer as a `PtrRepr`.  This block relabels a late-arriving
+    // `InstanceRepr` operand to `PtrRepr` via its `concretetype`
+    // (`InstanceRepr.lowleveltype` IS `Ptr(GcStruct(OBJECT))`,
+    // rclass.py:166/477).  A low-level struct param that is in the
+    // walker catalog already lands as `PtrRepr` because the producer
+    // (`build_flow::annotate_typed_ptr_inputs`) wrote `SomeValue::Ptr`
+    // onto its `Variable.annotation` (`rmodel.rs:2545
+    // SomeValue::Ptr → PtrRepr`); the swap is load-bearing for
+    // uncataloged low-level operands.
     //
-    // Progression gate: SWAP_FALLBACK_HITS reading 0 across a
-    // representative production run (currently `pyre/check.py`) is the
-    // sign every reachable struct has been added to the walker catalog;
-    // once that holds the swap can be deleted in favour of the
-    // line-by-line `rbuiltin.py:541-549` port below.
+    // Scope caveat (do NOT mis-read this as "drive every struct to
+    // SomePtr"): RPython sets the annotation node by ORIGIN, not by
+    // eventual LL type.  A value born in the lltype universe
+    // (`lltype.malloc` / `GcStruct` / `rffi.CStruct`) is `SomePtr` from
+    // annotation (`llannotation.py:185`, `lltype.py:1516-1518`); an
+    // RPython class instance — and a host-struct method RECEIVER, which
+    // is USED like one (classdef-mediated `getattr`/method dispatch,
+    // `signature.py:103-104` `annotationoftype → SomeInstance`) — is
+    // `SomeInstance(ClassDef)` at annotation and only lowered to
+    // `Ptr(GcStruct(OBJECT))` at the rtyper.  `SomePtr.getattr` cannot
+    // resolve a class-owned host method (PtrRepr → `_nofield`), so
+    // annotating a receiver as `SomePtr` is lateral.  Narrowing a
+    // receiver to a real `SomeInstance(ClassDef)` is a SEPARATE
+    // convergence path (call-propagation / bind_self, gated on a
+    // registered host ClassDef origin) — not this gate.
+    //
+    // Progression gate: SWAP_FALLBACK_HITS reading 0 means every
+    // `cast_ptr_to_int` OPERAND already reaches the typer as a
+    // registered low-level `PtrRepr` (NOT that every reachable struct
+    // lifts to SomePtr); once that holds the swap can be deleted in
+    // favour of the line-by-line `rbuiltin.py:541-549` port below.
     let producer_set_someptr = matches!(
         hop.args_v.borrow()[0].clone(),
         Hlvalue::Variable(ref var) if matches!(

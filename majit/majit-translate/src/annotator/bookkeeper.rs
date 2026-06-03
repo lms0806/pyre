@@ -284,21 +284,12 @@ pub struct Bookkeeper {
     /// observable.
     pub needs_generic_instantiate:
         RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
-    /// TODO: no upstream equivalent.  Pyre struct parameters
-    /// (`Ref` / `State` `ValueType`s) lack a Python `HostObject` /
-    /// `ClassDesc` identity — they're Rust struct types known only by a
-    /// qualified type-root string (e.g. `crate::pyframe::PyFrame`).
-    /// The rtyper adapter still needs `SomeInstance(classdef=stub)` so
-    /// `s_getattr` has an `attrs` HashMap to walk, so the bookkeeper
-    /// caches a synthetic ClassDef per type-root name here — wrapping a
-    /// fresh `HostObject::new_class` + `ClassDesc::new_shell` pair.
-    pub pyre_stub_classdefs: RefCell<HashMap<String, Rc<RefCell<ClassDef>>>>,
     /// TODO: no upstream equivalent.  Pyre-only struct-field
     /// metadata snapshot (`struct_name -> [(field_name, type_string)]`)
-    /// used by [`Self::get_pyre_classdef_by_name`] to populate the
-    /// synthetic `ClassDef.attrs`.  `None` for unit-test fixtures that
+    /// used by [`Self::getuniqueclassdef_for_struct_root`] to project the
+    /// registered `ClassDef.attrs`.  `None` for unit-test fixtures that
     /// build the bookkeeper directly, in which case
-    /// `get_pyre_classdef_by_name` leaves `attrs` empty.
+    /// `getuniqueclassdef_for_struct_root` leaves `attrs` empty.
     pub pyre_struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
     /// TODO: no upstream equivalent.  Interning table mapping a struct
     /// type-root name to its canonical host class `HostObject`.  Because
@@ -482,17 +473,22 @@ impl Bookkeeper {
             pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
-            pyre_stub_classdefs: RefCell::new(HashMap::new()),
             pyre_struct_fields: RefCell::new(None),
             pyre_struct_root_classes: RefCell::new(HashMap::new()),
         }
     }
 
     /// TODO: no upstream equivalent.  Wire the pyre-only
-    /// `StructFieldRegistry` so [`Self::get_pyre_classdef_by_name`]
-    /// can populate the synthetic stub `ClassDef.attrs` from
-    /// struct-field metadata.  Idempotent: a second call overwrites
-    /// the previous registry.
+    /// `StructFieldRegistry` so [`Self::getuniqueclassdef_for_struct_root`]
+    /// can project the registered `ClassDef.attrs` from struct-field
+    /// metadata.
+    ///
+    /// May be called before or after roots are registered:
+    /// [`Self::getuniqueclassdef_for_struct_root`] re-traverses and
+    /// re-projects on every call, so a root cached before the registry
+    /// arrived has its attrs back-filled on the next lookup (RPython grows
+    /// class attrs as annotation proceeds).  Idempotent: a second call
+    /// overwrites the previous registry.
     pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.pyre_struct_fields.borrow_mut() = Some(registry);
     }
@@ -1385,117 +1381,11 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
-    /// TODO: no upstream equivalent.  Return a cached synthetic
-    /// ClassDef stub for a pyre type-root name (qualified Rust path
-    /// string such as `crate::pyframe::PyFrame`).  Used by the rtyper
-    /// adapter's `seed_variable` to project pyre `Ref` / `State`
-    /// parameters into `SomeInstance(classdef=stub)` so `s_getattr`'s
-    /// `attrs` walk has somewhere to land.
-    ///
-    /// The first call for a given name fabricates a fresh
-    /// `HostObject::new_class(name, vec![])` + `ClassDesc::new_shell`
-    /// pair and wraps them in `ClassDef::new` (skipping
-    /// `register_classdef` so the stub never leaks into
-    /// `bookkeeper.classdefs` — `normalizecalls` iterators stay
-    /// upstream-orthodox).  Subsequent calls hit the cache.
-    pub fn get_pyre_classdef_by_name(self: &Rc<Self>, name: &str) -> Rc<RefCell<ClassDef>> {
-        if let Some(cached) = self.pyre_stub_classdefs.borrow().get(name) {
-            return cached.clone();
-        }
-        // Phase 1 — iterative discovery.  Walk the registry's field-
-        // graph rooted at `name`, fabricating an empty stub ClassDef
-        // for every reachable struct name BEFORE any attribute is
-        // projected.  Using an explicit work-list keeps the recursion
-        // bound at type-string nesting depth (Vec<Vec<…>>, ≤5 typical)
-        // instead of the registry's struct-chain depth (200+ would
-        // otherwise overflow the build worker's stack).
-        let mut to_fabricate: Vec<String> = vec![name.to_string()];
-        while let Some(n) = to_fabricate.pop() {
-            if self.pyre_stub_classdefs.borrow().contains_key(&n) {
-                continue;
-            }
-            let pyobj = crate::flowspace::model::HostObject::new_class(n.clone(), Vec::new());
-            let desc = Rc::new(RefCell::new(super::classdesc::ClassDesc::new_shell(
-                self,
-                pyobj,
-                n.clone(),
-            )));
-            let classdef = super::classdesc::ClassDef::new(self, &desc);
-            self.pyre_stub_classdefs
-                .borrow_mut()
-                .insert(n.clone(), classdef);
-            let referenced: Vec<String> = {
-                let guard = self.pyre_struct_fields.borrow();
-                if let Some(reg) = guard.as_ref() {
-                    if let Some(fields) = reg.fields.get(&n) {
-                        let mut out: Vec<String> = Vec::new();
-                        for (field_name, field_ty) in fields {
-                            if field_name == "__class__" {
-                                continue;
-                            }
-                            collect_referenced_struct_names(field_ty, reg, &mut out);
-                        }
-                        out
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            };
-            for r in referenced {
-                if !self.pyre_stub_classdefs.borrow().contains_key(&r) {
-                    to_fabricate.push(r);
-                }
-            }
-        }
-        // Phase 2 — projection.  Project struct-field metadata into
-        // the requested root stub's `classdef.attrs`.  Inner stubs
-        // reached transitively through field references stay
-        // attrs-empty until they too are requested as a root — at
-        // that point the cache hit at the top of this function
-        // short-circuits, so inner-stub attrs remain empty for the
-        // bookkeeper's lifetime.  The gap vs
-        // `add_source_for_attribute` (classdesc.py:189-216) remains.
-        let fields_to_project: Option<Vec<(String, String)>> = {
-            let guard = self.pyre_struct_fields.borrow();
-            guard.as_ref().and_then(|r| r.fields.get(name).cloned())
-        };
-        if let Some(fields) = fields_to_project {
-            let classdef = self
-                .pyre_stub_classdefs
-                .borrow()
-                .get(name)
-                .cloned()
-                .expect("phase-1 fabrication invariant: root name is always cached");
-            for (field_name, field_ty) in &fields {
-                if field_name == "__class__" {
-                    continue;
-                }
-                let s_value = self.project_pyre_field_type(field_ty);
-                let mut classdef_mut = classdef.borrow_mut();
-                let attr = classdef_mut
-                    .attrs
-                    .entry(field_name.clone())
-                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
-                if matches!(attr.s_value, SomeValue::Impossible) {
-                    attr.s_value = s_value;
-                }
-            }
-        }
-        self.pyre_stub_classdefs
-            .borrow()
-            .get(name)
-            .cloned()
-            .expect("phase-1 fabrication invariant: root name is always cached after the loop")
-    }
-
     /// Resolve a struct type-root name to its canonical, bookkeeper-
     /// REGISTERED `ClassDef`, with instance attributes projected from
     /// the threaded `StructFieldRegistry`.
     ///
-    /// Orthodox counterpart of the name-keyed
-    /// [`Self::get_pyre_classdef_by_name`] stub.  pyre's `W_IntObject` /
+    /// pyre's `W_IntObject` /
     /// `PyFrame` / `W_DictObject` Rust structs are ports of RPython
     /// classes (`W_Root` subclasses), so their annotation is
     /// `SomeInstance(classdef)` — `InstanceRepr._setup_repr`
@@ -1515,32 +1405,52 @@ impl Bookkeeper {
     /// host structs, so the registry projection (via
     /// [`Self::project_pyre_field_type`]) stands in.  The whole reachable
     /// struct-field graph is registered and projected — an explicit
-    /// work-list bounds recursion at the registry's struct-chain depth —
-    /// so a field typed as another struct resolves to a fully populated
-    /// inner `SomeInstance(classdef)` rather than the attrs-empty inner
-    /// stub left by `get_pyre_classdef_by_name`.
+    /// work-list bounds recursion at the reachable-struct count — so a
+    /// field typed as another struct resolves to a fully populated inner
+    /// `SomeInstance(classdef)`, not an attrs-empty inner stub.
+    ///
+    /// Order-independent w.r.t. [`Self::set_pyre_struct_fields`]: the call
+    /// re-traverses and re-projects every time, so a root registered
+    /// before the field registry arrived has its (and its transitive
+    /// structs') attrs back-filled on a later call — RPython grows class
+    /// attrs as annotation proceeds.  Identity is stable across calls
+    /// (the host class is interned once), so the back-fill mutates the
+    /// already-published `ClassDef` rather than minting a fresh one.
     pub fn getuniqueclassdef_for_struct_root(
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        // Pass 1 — register every reachable struct as an identity-keyed
-        // `ClassDef` and publish it into `pyre_stub_classdefs` so
-        // `project_pyre_field_type`'s bare-name arm resolves inner struct
-        // references to the registered classdef.  The work-list keeps
-        // recursion bound at type-string nesting depth, not the
-        // registry's struct-chain depth (200+ would overflow the stack).
+        // Pass 1 — traverse the registry's struct-field graph from `root`,
+        // registering an identity-keyed `ClassDef` in `descs` for every
+        // reachable struct (via `intern_struct_root_class` ->
+        // `getuniqueclassdef`).  `project_pyre_field_type`'s bare-name arm
+        // resolves inner struct references through the same identity path,
+        // so it sees the registered classdef.  Registration is idempotent
+        // (the identity cache is the memo), so a root reached before the
+        // field registry arrived still has its transitive structs
+        // discovered — and its attrs re-projected in pass 2 — on a later
+        // call.  Cycles are broken by testing membership against `graph`
+        // itself (the
+        // insertion-order result list): the reachable-struct count is small
+        // (bounded by the registry, not the 200+ struct-chain depth that
+        // would overflow a recursive walk), so a linear scan over `graph`
+        // needs no parallel hash index and lets every node move into
+        // `graph` without a clone.
         let mut worklist: Vec<String> = vec![root.to_string()];
         let mut graph: Vec<String> = Vec::new();
         while let Some(n) = worklist.pop() {
-            if self.pyre_stub_classdefs.borrow().contains_key(&n) {
+            if graph.contains(&n) {
                 continue;
             }
+            // Register the node's identity ClassDef in `descs` (RPython's
+            // HostObject-identity cache, bookkeeper.py:361) via
+            // `intern_struct_root_class` -> `getuniqueclassdef`.  Idempotent:
+            // interning resolves the type-root name to one stable
+            // `HostObject`, so `getuniqueclassdef` returns the same
+            // `ClassDef` on every call — the identity cache is the memo, no
+            // name-keyed side table needed.
             let host = self.intern_struct_root_class(&n);
-            let classdef = self.getuniqueclassdef(&host)?;
-            self.pyre_stub_classdefs
-                .borrow_mut()
-                .insert(n.clone(), classdef);
-            graph.push(n.clone());
+            self.getuniqueclassdef(&host)?;
             let referenced: Vec<String> = {
                 let guard = self.pyre_struct_fields.borrow();
                 if let Some(reg) = guard.as_ref() {
@@ -1561,15 +1471,22 @@ impl Bookkeeper {
                 }
             };
             for r in referenced {
-                if !self.pyre_stub_classdefs.borrow().contains_key(&r) {
+                if !graph.contains(&r) {
                     worklist.push(r);
                 }
             }
+            // `n` is no longer borrowed (registry lookup done); move it into
+            // the ordered result list without a clone.
+            graph.push(n);
         }
-        // Pass 2 — project each registered node's fields into its
+        // Pass 2 — project each reachable node's fields into its
         // `classdef.attrs`.  All nodes are published from pass 1, so a
         // field referencing another struct resolves to the registered
-        // inner classdef.
+        // inner classdef.  Idempotent: the `Impossible` guard fills an attr
+        // exactly once, so re-running after the field registry arrives
+        // back-fills a root that was cached attrs-empty without disturbing
+        // attrs already set (RPython grows class attrs as annotation
+        // proceeds).
         for n in &graph {
             let fields: Option<Vec<(String, String)>> = {
                 let guard = self.pyre_struct_fields.borrow();
@@ -1578,12 +1495,8 @@ impl Bookkeeper {
             let Some(fields) = fields else {
                 continue;
             };
-            let classdef = self
-                .pyre_stub_classdefs
-                .borrow()
-                .get(n)
-                .cloned()
-                .expect("pass-1 registration invariant: node is always cached");
+            let host = self.intern_struct_root_class(n);
+            let classdef = self.getuniqueclassdef(&host)?;
             for (field_name, field_ty) in &fields {
                 if field_name == "__class__" {
                     continue;
@@ -1599,15 +1512,8 @@ impl Bookkeeper {
                 }
             }
         }
-        self.pyre_stub_classdefs
-            .borrow()
-            .get(root)
-            .cloned()
-            .ok_or_else(|| {
-                AnnotatorError::new(format!(
-                    "getuniqueclassdef_for_struct_root({root:?}): root not registered after pass 1"
-                ))
-            })
+        let host = self.intern_struct_root_class(root);
+        self.getuniqueclassdef(&host)
     }
 
     /// Resolve a struct type-root name to its canonical host class
@@ -1632,8 +1538,9 @@ impl Bookkeeper {
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
     /// `s_getattr` would observe for a class attribute seeded with a
-    /// value of that type.  Used by [`Self::get_pyre_classdef_by_name`]
-    /// to populate the synthetic stub's `attrs`.  Bare named types
+    /// value of that type.  Used by
+    /// [`Self::getuniqueclassdef_for_struct_root`] to project the
+    /// registered `ClassDef.attrs`.  Bare named types
     /// (`PyFrame`, `W_DictObject`) resolve to
     /// `SomeInstance(stub)` only when the registry contains a matching
     /// entry; unknown bare names fall to `Impossible`.
@@ -1765,14 +1672,21 @@ impl Bookkeeper {
         if !registered {
             return SomeValue::Impossible;
         }
-        if let Some(cached) = self.pyre_stub_classdefs.borrow().get(stripped) {
-            return SomeValue::Instance(super::model::SomeInstance::new(
-                Some(cached.clone()),
+        // Resolve the struct-typed field to its identity-registered
+        // `ClassDef` through `descs` (`intern_struct_root_class` ->
+        // `getuniqueclassdef`), the same identity path
+        // `getuniqueclassdef_for_struct_root` registers it on.  Pass-1 of
+        // that method has already registered every reachable struct, so this
+        // returns the same `ClassDef` Rc whose `attrs` pass-2 fills in place.
+        let host = self.intern_struct_root_class(stripped);
+        match self.getuniqueclassdef(&host) {
+            Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
                 false,
                 std::collections::BTreeMap::new(),
-            ));
+            )),
+            Err(_) => SomeValue::Impossible,
         }
-        SomeValue::Impossible
     }
 
     /// RPython `Bookkeeper.getuniqueclassdef(cls)` (bookkeeper.py:282-287):
@@ -2642,9 +2556,9 @@ impl Default for Bookkeeper {
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
 /// type that the `StructFieldRegistry` recognises.  Used by
-/// [`Bookkeeper::get_pyre_classdef_by_name`]'s phase-1 discovery pass
-/// to pre-fabricate stub ClassDefs for every reachable struct before
-/// any attribute is projected.  Recursion bound is type-string nesting
+/// [`Bookkeeper::getuniqueclassdef_for_struct_root`]'s pass-1 discovery
+/// to register a ClassDef for every reachable struct before any
+/// attribute is projected.  Recursion bound is type-string nesting
 /// (Vec<Vec<…>>) which is shallow, NOT the registry's field-graph
 /// depth.
 fn collect_referenced_struct_names(
@@ -3193,14 +3107,31 @@ mod tests {
         }
 
         // The transitively-referenced inner struct is ALSO registered
-        // with its own fields projected (closes the attrs-empty
-        // inner-stub gap of `get_pyre_classdef_by_name`).
+        // with its own fields projected (no attrs-empty inner stub).
         let inner = bk
             .getuniqueclassdef_for_struct_root("PyCode")
             .expect("PyCode registers");
         assert!(
             inner.borrow().attrs.contains_key("argcount"),
             "inner struct's own fields are projected too"
+        );
+
+        // Order-independent identity: the inner classdef reached through
+        // `PyFrame.pycode` is the SAME Rc as the standalone `PyCode`
+        // lookup.  With a single identity route there is no name-keyed
+        // path that could mint a divergent unregistered stub.
+        let pycode_via_field = {
+            let g = cd1.borrow();
+            match &g.attrs.get("pycode").expect("pycode attr").s_value {
+                SomeValue::Instance(si) => si.classdef.clone(),
+                _ => None,
+            }
+        };
+        assert!(
+            pycode_via_field
+                .as_ref()
+                .is_some_and(|c| Rc::ptr_eq(c, &inner)),
+            "PyFrame.pycode inner classdef must be the same Rc as the standalone PyCode lookup"
         );
     }
 
@@ -3258,6 +3189,163 @@ mod tests {
         assert!(
             Rc::ptr_eq(&ty, &ty2),
             "cycle node interned to one identity-keyed ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_handles_deep_plus_cyclic_chain() {
+        // Deep-chain regression gate for the iterative worklist (task #100).
+        // The 2026-05-29 route-b measurement overflowed the native stack in
+        // the RECURSIVE transitive walk of `FixedObjectArray`.  The walk now
+        // drives an explicit `Vec` worklist (no native recursion over the
+        // struct-field graph), so a chain far deeper than any native stack
+        // can hold must register in O(reachable) heap without overflowing.
+        // A back-edge from the tail to the head folds a cycle into the same
+        // fixture, pinning depth and cycle handling together: if this test
+        // ever overflows, the transitive registration regressed back to a
+        // recursive walk.  `DEPTH` is chosen well past the frame budget a
+        // recursive walk would exhaust on the default 8 MiB main stack.
+        use crate::front::StructFieldRegistry;
+        const DEPTH: usize = 2000;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for i in 0..DEPTH {
+            // `Si { next: S{i+1} }` — each link references the next struct.
+            reg.fields.insert(
+                format!("S{i}"),
+                vec![("next".to_string(), format!("S{}", i + 1))],
+            );
+        }
+        // Terminal node: a scalar leaf plus a back-edge to the head, so the
+        // reachable graph is both `DEPTH`-deep and cyclic.
+        reg.fields.insert(
+            format!("S{DEPTH}"),
+            vec![
+                ("leaf".to_string(), "i64".to_string()),
+                ("back".to_string(), "S0".to_string()),
+            ],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // Registering from the head walks the full depth + the back-edge
+        // cycle without overflowing.
+        let head = bk
+            .getuniqueclassdef_for_struct_root("S0")
+            .expect("deep + cyclic graph registers without stack overflow");
+        assert!(
+            matches!(
+                head.borrow().attrs.get("next").map(|a| &a.s_value),
+                Some(SomeValue::Instance(_))
+            ),
+            "head's struct-typed field projects to SomeInstance"
+        );
+
+        // A node midway down the chain is registered with its field
+        // projected — the worklist reached the full depth (a recursive walk
+        // would have overflowed long before here).
+        let mid = format!("S{}", DEPTH / 2);
+        let mid_cd = bk
+            .getuniqueclassdef_for_struct_root(&mid)
+            .unwrap_or_else(|e| panic!("deep node {mid} registers: {e}"));
+        assert!(
+            mid_cd.borrow().attrs.contains_key("next"),
+            "deep node's field is projected"
+        );
+        let mid_cd2 = bk
+            .getuniqueclassdef_for_struct_root(&mid)
+            .expect("deep node re-lookup");
+        assert!(
+            Rc::ptr_eq(&mid_cd, &mid_cd2),
+            "deep node interned to one identity-keyed ClassDef"
+        );
+
+        // The scalar leaf at the tail projects as an integer — confirming
+        // the worklist reached the terminal node past the cycle.
+        let tail = bk
+            .getuniqueclassdef_for_struct_root(&format!("S{DEPTH}"))
+            .expect("tail registers");
+        assert!(
+            matches!(
+                tail.borrow().attrs.get("leaf").map(|a| &a.s_value),
+                Some(SomeValue::Integer(_))
+            ),
+            "tail scalar leaf projects to SomeInteger"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_reprojects_after_late_registry() {
+        // Order-independence: a root resolved BEFORE the field registry
+        // arrives is registered attrs-empty, then back-filled — at the SAME
+        // identity — once the registry is supplied and the lookup re-runs.
+        // RPython grows `classdef.attrs` as annotation proceeds; the same
+        // `ClassDef` object accrues attributes, never a fresh divergent one.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+
+        // Registry-less lookup: identity-registered, but no fields to
+        // project, so `attrs` stays empty.
+        let early = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame registers without a registry");
+        assert!(
+            bk.classdef_snapshot().iter().any(|c| Rc::ptr_eq(c, &early)),
+            "registry-less root is still identity-registered"
+        );
+        assert!(
+            !early.borrow().attrs.contains_key("depth"),
+            "no registry -> no projected attrs"
+        );
+
+        // Registry arrives late.
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "PyFrame".to_string(),
+            vec![
+                ("pycode".to_string(), "PyCode".to_string()),
+                ("depth".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "PyCode".to_string(),
+            vec![("argcount".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // Re-lookup re-projects onto the SAME ClassDef Rc.
+        let late = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame re-lookup after registry");
+        assert!(
+            Rc::ptr_eq(&early, &late),
+            "late re-projection keeps the original identity"
+        );
+        {
+            let g = late.borrow();
+            assert!(
+                matches!(
+                    g.attrs.get("depth").map(|a| &a.s_value),
+                    Some(SomeValue::Integer(_))
+                ),
+                "depth back-filled after late registry"
+            );
+            assert!(
+                matches!(
+                    g.attrs.get("pycode").map(|a| &a.s_value),
+                    Some(SomeValue::Instance(_))
+                ),
+                "pycode back-filled as SomeInstance after late registry"
+            );
+        }
+
+        // The transitive inner struct discovered on the late pass is
+        // registered with its own field projected too.
+        let inner = bk
+            .getuniqueclassdef_for_struct_root("PyCode")
+            .expect("PyCode registers on the late pass");
+        assert!(
+            inner.borrow().attrs.contains_key("argcount"),
+            "inner struct projected on the late pass"
         );
     }
 

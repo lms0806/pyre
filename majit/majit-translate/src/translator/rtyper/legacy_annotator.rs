@@ -414,13 +414,23 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
         }
         (ValueType::Ref(_), ValueType::Ref(_)) => ValueType::Ref(None),
         // SomeBool ⊂ SomeInteger: `pair(SomeBool, SomeInteger).union`
-        // dispatches through inheritance to `pair(SomeInteger,
-        // SomeInteger).union` at `binaryop.py:178` and returns
-        // SomeInteger.  Bool unions with the signed Int variant
-        // (knowntype=int) only; Unsigned widens to Unknown so the
-        // unsigned-signedness UnionError at `binaryop.py:191` is not
-        // silently coerced away.
+        // resolves by inheritance to `pair(SomeInteger, SomeInteger).union`
+        // (`binaryop.py:178`; there is no `pairtype(SomeBool, SomeInteger)`
+        // override).  SomeBool is `nonneg=True, unsigned=False,
+        // knowntype=bool` (`model.py:227-231`); bool→int is normalised at
+        // `binaryop.py:183-184`.  Against signed Int the same-signedness
+        // branch returns SomeInteger(knowntype=int) = Int.  Against Unsigned
+        // (`unsigned=True, nonneg=True, knowntype=r_uint`) the differing-
+        // signedness branch reaches `elif t1 is int` with `int1.nonneg ==
+        // True`, so NO UnionError fires and `knowntype = r_uint` →
+        // SomeInteger(unsigned) = Unsigned (`binaryop.py:189-201`).  The
+        // UnionError at `binaryop.py:191` is reserved for SIGNED Int
+        // (`nonneg=False`) ∪ Unsigned — the `(Int, Unsigned)` case left to
+        // the `_` arm below.
         (ValueType::Bool, ValueType::Int) | (ValueType::Int, ValueType::Bool) => ValueType::Int,
+        (ValueType::Bool, ValueType::Unsigned) | (ValueType::Unsigned, ValueType::Bool) => {
+            ValueType::Unsigned
+        }
         _ => ValueType::Unknown,
     }
 }
@@ -634,6 +644,47 @@ mod tests {
             FunctionGraph::concretetype_of(&ret_var),
             crate::jit_codewriter::type_state::ConcreteType::Void,
             "rtyping-layer projection honours Constant.concretetype=Void from set_return",
+        );
+    }
+
+    #[test]
+    fn union_bool_unsigned_is_unsigned() {
+        // `binaryop.py:189-201`: SomeBool(nonneg=True) ∪ SomeInteger(unsigned)
+        // reaches `elif t1 is int` with `int1.nonneg == True`, so no
+        // UnionError fires and `knowntype = r_uint` → Unsigned.
+        assert_eq!(
+            union_type(&ValueType::Bool, &ValueType::Unsigned),
+            ValueType::Unsigned
+        );
+        assert_eq!(
+            union_type(&ValueType::Unsigned, &ValueType::Bool),
+            ValueType::Unsigned
+        );
+    }
+
+    #[test]
+    fn union_bool_int_is_int() {
+        assert_eq!(
+            union_type(&ValueType::Bool, &ValueType::Int),
+            ValueType::Int
+        );
+        assert_eq!(
+            union_type(&ValueType::Int, &ValueType::Bool),
+            ValueType::Int
+        );
+    }
+
+    #[test]
+    fn union_int_unsigned_stays_unknown() {
+        // `binaryop.py:191`: signed Int (`nonneg=False`) ∪ Unsigned raises
+        // UnionError — the coarse enum widens it to Unknown.
+        assert_eq!(
+            union_type(&ValueType::Int, &ValueType::Unsigned),
+            ValueType::Unknown
+        );
+        assert_eq!(
+            union_type(&ValueType::Unsigned, &ValueType::Int),
+            ValueType::Unknown
         );
     }
 }

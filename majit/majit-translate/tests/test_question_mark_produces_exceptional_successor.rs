@@ -129,6 +129,39 @@ fn test_question_mark_produces_exceptional_successor() {
 }
 
 #[test]
+fn question_mark_on_nonunit_transparent_ctor_records_canraise_block() {
+    // A non-unit (1-arg) `Ok(x)` ctor lowers to
+    // `simple_call(HostClass(qualname), x)` (the
+    // `SyntheticTransparentCtor` arm in `translate_op`).  The `?` /
+    // Result / Option transparent-ctor elision is a Rust-specific
+    // adaptation with no RPython counterpart, but the simple_call it emits
+    // is classified by the ordinary `CallOp.canraise` rule: a Constant
+    // class callable outside `__builtin__` / `exceptions` raises
+    // `[Exception]` (operation.py:648-661).  So `flowcontext.py:379-393
+    // do_op` runs `guessexception(op.canraise)` with a non-empty set and
+    // installs the `exitswitch = c_last_exception` edge — a non-unit `?`
+    // operand closes a canraise block, exactly as a non-builtin call does.
+    // (Only the 0-arg unit-variant ctor, pre-folded to a `Constant` with
+    // no op emitted, is non-raising.)
+    let func: syn::ItemFn =
+        syn::parse_str("fn f(x: i64) -> Result<i64, ()> { let y = Ok(x)?; Ok(y) }")
+            .expect("fixture must parse");
+    let sf = build_function_graph_pub(&func).expect("fixture must lower");
+    let canraise = sf
+        .graph
+        .blocks
+        .iter()
+        .filter(|b| block_is_canraise(b))
+        .count();
+    assert_eq!(
+        canraise, 1,
+        "`Ok(x)?` lowers to a non-builtin `simple_call` (canraise \
+         `[Exception]`, operation.py:648-661), so it must close exactly \
+         one canraise block (flowcontext.py:379-393)"
+    );
+}
+
+#[test]
 fn no_new_opname_introduced_for_may_raise_paths() {
     // Plan acceptance criterion: `rg "_may_raise" majit/majit-translate/src/ = 0`.
     // RPython `jtransform.py:467-470` folds raising calls into the

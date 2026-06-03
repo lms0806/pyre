@@ -3090,6 +3090,93 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         }
     }
 
+    /// A local bound BEFORE a `match` and read AFTER it (in the
+    /// post-merge continuation) must thread `Link.args` back through the
+    /// scrutinee block.  Until the scrutinee block's framestate was
+    /// stamped — mirroring the `Expr::If` pre-branch `set_branch` +
+    /// framestate stamp pair (`ast.rs:4919-4920`) — the lazy installer's
+    /// predecessor recursion reached the scrutinee block, found no
+    /// recorded snapshot, and fell back to the naked body-`Input` emit
+    /// the rtyper adapter rejects.  RPython parity:
+    /// `flowspace/flowcontext.py:38 SpamBlock.framestate` — every
+    /// branching block records its frame state at close time so
+    /// `flowcontext.py:449 getoutputargs` can produce the predecessor
+    /// link args.
+    ///
+    /// The value-producing match goes through the value-phi merge path,
+    /// which types the merge inputargs concretely — both gates agree
+    /// end-to-end.  The statement (`()`-shaped) match goes through the
+    /// framestate migrate path (`create_block_from_framestate`); the
+    /// scrutinee stamp threads `base` so the naked body-`Input` is gone,
+    /// but the rtyper does not yet type that path's merge inputarg.  That
+    /// residual is a pre-existing Skip shared verbatim with
+    /// `lower_if_expr`'s migrate path — the analogue
+    /// `if x > 0 {} else {} base + x` fails the identical
+    /// `slot N: legacy=Signed, real=Unknown` dual-gate diff — so this
+    /// slice asserts only what it owns for the statement case: `base`
+    /// threads (no naked body-`Input`), leaving the orthogonal
+    /// migrate-typing gap to its own fix.
+    #[test]
+    fn anchor_cat_2_1_pre_match_local_threads_past_match() {
+        let _lock = anchor_lock();
+        // (name, src, requires_full_dual_gate_agreement)
+        let cases: &[(&str, &str, bool)] = &[
+            // Value-producing match: `base` (bound pre-match) read after
+            // the match merge alongside the match's own phi value `r`.
+            (
+                "match_value_then_read",
+                "fn match_value_then_read(x: i64, k: i64) -> i64 { \
+                 let base: i64 = k + 1; \
+                 let r: i64 = match x { 0 => 10, _ => 20 }; base + r }\n",
+                true,
+            ),
+            // Statement match (no value): `base` (bound pre-match) read
+            // in the post-match continuation block.
+            (
+                "match_stmt_then_read",
+                "fn match_stmt_then_read(x: i64, k: i64) -> i64 { \
+                 let base: i64 = k + 1; \
+                 match x { 0 => {}, _ => {} } base + x }\n",
+                false,
+            ),
+        ];
+        for (name, src, requires_full_dual_gate) in cases {
+            let graph = build_anchor_graph(src, name);
+            if let Err(e) = dual_gate_check(&graph) {
+                // The thing this slice owns: the pre-match local threads,
+                // so the rtyper adapter never sees a naked body-`Input`.
+                assert!(
+                    !e.contains("body Input"),
+                    "{name} must thread the pre-match local past the match \
+                     (no naked body-`Input`): {e}"
+                );
+                // The value-phi path additionally agrees end-to-end; the
+                // migrate path's residual inputarg-typing Skip is allowed
+                // (pre-existing, shared with `lower_if_expr`).
+                assert!(
+                    !requires_full_dual_gate,
+                    "{name} must agree under dual-gate end-to-end: {e}"
+                );
+            }
+            // Every link's `args` arity must equal the target's
+            // inputargs arity (`flowspace/model.py:114 Link.__init__`).
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    let target_arity = graph.block(link.target).inputargs.len();
+                    assert_eq!(
+                        link.args.len(),
+                        target_arity,
+                        "{name}: Link B{} -> B{} arity {} != target inputargs {}",
+                        block.id.0,
+                        link.target.0,
+                        link.args.len(),
+                        target_arity,
+                    );
+                }
+            }
+        }
+    }
+
     // `build_program_annotator_starts_empty_after_step3` retired at
     // Step 4 first slice (2026-05-07).  The function being tested
     // (`build_program_annotator`) was retired together with the

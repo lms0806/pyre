@@ -624,19 +624,15 @@ fn fmt_op_result_slot(graph: &crate::model::FunctionGraph, op: &SpaceOperation) 
     }
 }
 
-/// `true` for exactly the `OpKind`s that [`translate_op`] maps to
-/// `Ok(Vec::new())` — ops fully consumed by other adapter infrastructure
-/// (pre-pass constants, JIT-trace markers) plus the pre-folded 0-arg
-/// synthetic unit-variant ctor.  None of these survive into the converted
-/// flowspace block as a raising operation.
-///
-/// The `Expr::Try` guard in `front/ast.rs` consults this to decide whether
-/// a `?`-operand recorded a real raising flowspace op: a surviving
-/// (non-skipped) tail op is a raising op the `?` closes the block against;
-/// a skipped tail op (e.g. a cross-block `OpKind::Input`) is not, so the
-/// block must NOT be closed as canraise.  KEEP IN SYNC with `translate_op`'s
-/// `Ok(Vec::new())` arms below.
-pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
+/// `true` iff `kind` is a 0-arg unit-variant transparent ctor
+/// (`StepResult::Continue`, `LoopResult::Done`, …) that [`translate_op`]
+/// pre-folds to a `Constant` and emits no `FlowspaceOp` (the unit-variant
+/// guard at the top of `translate_op`).  The `?` / Result / Option
+/// transparent-ctor handling has no RPython counterpart; this is the one
+/// shape that records nothing, so [`op_canraise`] and [`translate_op`]
+/// consult the SAME predicate — `op_canraise` is false exactly when
+/// `translate_op` emits no op.
+fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     if let OpKind::Call {
         target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
         args,
@@ -646,24 +642,98 @@ pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
     {
         let mut segments = owner_path.clone();
         segments.push(name.clone());
-        if crate::front::ast::is_synthetic_unit_variant_path(&segments) {
-            return true;
-        }
+        return crate::front::ast::is_synthetic_unit_variant_path(&segments);
     }
-    matches!(
-        kind,
-        OpKind::Input { .. }
-            | OpKind::ConstInt(_)
-            | OpKind::ConstBool(_)
-            | OpKind::ConstFloat(_)
-            | OpKind::ConstRefNull
-            | OpKind::ConstRefAddr(_)
-            | OpKind::GuardTrue { .. }
-            | OpKind::GuardFalse { .. }
-            | OpKind::GuardValue { .. }
-            | OpKind::VableForce { .. }
-            | OpKind::Abort { .. }
-    )
+    false
+}
+
+/// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
+/// non-empty `canraise` (`operation.py`).
+///
+/// The `Expr::Try` guard in `front/ast.rs` consults this to decide
+/// whether a `?`-operand's recorded tail op closes the block with
+/// `exitswitch = c_last_exception`: `flowcontext.py:379-393 do_op` runs
+/// `guessexception(op.canraise)`, which installs the exception edge only
+/// when `op.canraise` is non-empty.  A non-raising tail op (a transparent
+/// ctor, `same_as`, a pure cast / binop, getattr / setattr, a const) must
+/// NOT close the block as canraise.
+///
+/// KEEP IN SYNC with [`translate_op`]'s `OpKind` -> flowspace-opname arms.
+pub(crate) fn op_canraise(kind: &OpKind) -> bool {
+    match kind {
+        // getitem / setitem -> `[IndexError, KeyError, Exception]`
+        // (operation.py:727-730).
+        OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => true,
+        // `InteriorField*` unfolds in `translate_op` into a chained
+        // `getitem(base, index)` followed by `getattr` / `setattr`, so it
+        // carries the getitem's `[IndexError, KeyError, Exception]`
+        // (operation.py:727-730).  The getattr / setattr step is itself
+        // non-raising, but the getitem makes the op raise.
+        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => true,
+        // A transparent `Ok(x)` / `Some(x)` / `Err(e)` ctor lowers to
+        // `simple_call(HostClass(qualname), x…)` (the
+        // `SyntheticTransparentCtor` arm in `translate_op`).  The `?` /
+        // Result / Option transparent-ctor elision is a Rust-specific
+        // adaptation with no RPython counterpart, but the simple_call it
+        // emits is classified by the ordinary `CallOp.canraise` rule: a
+        // Constant class callable outside `__builtin__` / `exceptions`
+        // raises `[Exception]` (operation.py:648-661), so a non-unit ctor
+        // raises like any non-builtin call.  The sole non-raising case is
+        // the 0-arg unit-variant ctor, which `translate_op` pre-folds to a
+        // `Constant` and emits no op — `op_canraise` is false exactly when
+        // that happens.  Matched before the general `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::SyntheticTransparentCtor { .. },
+            ..
+        } => !is_elided_unit_variant_ctor(kind),
+        // simple_call -> `CallOp.canraise` is `[Exception]` for a
+        // non-builtin callable (operation.py:648-661).  Constant builtin
+        // callables (int / float / chr / unicode) carry the narrower
+        // `builtins_exceptions` set, but a `?` operand is Result/Option-
+        // typed so over-approximating those few builtins is inert.  The
+        // jtransform-generated call variants cannot appear as a front-end
+        // `Expr::Try` tail op (they are produced by a later pass); listing
+        // them only keeps the predicate faithful to `CallOp`.
+        OpKind::Call { .. }
+        | OpKind::IndirectCall { .. }
+        | OpKind::CallElidable { .. }
+        | OpKind::CallResidual { .. }
+        | OpKind::CallMayForce { .. } => true,
+        // Plain binops: div / mod / divmod / truediv / floordiv / pow carry
+        // ZeroDivisionError, and pow / lshift / rshift carry ValueError,
+        // even without the `_ovf` suffix (operation.py:751-756); plain
+        // add / sub / mul / cmp / bitops are `[]`.  Compound-assign names
+        // (`*_assign`) are seen here BEFORE `normalize_binop_name` maps
+        // them to `inplace_*`, so they are classified by their `inplace_*`
+        // canraise: `inplace_div/mod/lshift/rshift` keep the plain
+        // ZeroDivisionError/ValueError, and `inplace_add/sub/mul` carry
+        // OverflowError (they have no `_ovf` variant) (operation.py:751-756);
+        // `inplace_and/or/xor` are `[]`.  The Rust front end emits the
+        // plain div / mod / lshift / rshift and the `*_assign` family; the
+        // other plain names are faithful but never produced.
+        OpKind::BinOp { op, .. } => matches!(
+            op.as_str(),
+            "div"
+                | "mod"
+                | "divmod"
+                | "truediv"
+                | "floordiv"
+                | "pow"
+                | "lshift"
+                | "rshift"
+                | "add_assign"
+                | "sub_assign"
+                | "mul_assign"
+                | "div_assign"
+                | "mod_assign"
+                | "lshift_assign"
+                | "rshift_assign"
+        ),
+        // getattr / setattr / neg / not / type / same_as / Const* /
+        // Guard* / VableForce / Input / Abort (JIT-abort marker) -> all
+        // `canraise = []`.
+        _ => false,
+    }
 }
 
 pub fn translate_op(
@@ -678,26 +748,16 @@ pub fn translate_op(
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
     graph: &crate::model::FunctionGraph,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
-    // RPython parity: unit-variant ctors (`StepResult::Continue`,
-    // `LoopResult::Done`, …) pre-fold to `Hlvalue::Constant(
-    // HostObject(prebuilt_instance))` in the pre-pass (see
-    // `legacy_const_define_hlvalue`).  Skip translation here so they
-    // do not double-emit as `simple_call(HostClass(qualname))` —
-    // matches the `ConstInt`/`ConstBool`/`ConstFloat` pattern below
-    // (the pre-pass owns the slot's `Hlvalue::Constant`, translate_op
-    // emits no FlowspaceOp).
-    if let OpKind::Call {
-        target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
-        args,
-        ..
-    } = &op.kind
-        && args.is_empty()
-    {
-        let mut segments = owner_path.clone();
-        segments.push(name.clone());
-        if crate::front::ast::is_synthetic_unit_variant_path(&segments) {
-            return Ok(Vec::new());
-        }
+    // Unit-variant ctors (`StepResult::Continue`, `LoopResult::Done`, …)
+    // pre-fold to `Hlvalue::Constant(HostObject(prebuilt_instance))` in the
+    // pre-pass (see `legacy_const_define_hlvalue`).  Skip translation here
+    // so they do not double-emit as `simple_call(HostClass(qualname))` —
+    // matches the `ConstInt`/`ConstBool`/`ConstFloat` pattern below (the
+    // pre-pass owns the slot's `Hlvalue::Constant`, translate_op emits no
+    // FlowspaceOp).  `op_canraise` consults the same predicate, so it
+    // reports these — and only these — transparent ctors as non-raising.
+    if is_elided_unit_variant_ctor(&op.kind) {
+        return Ok(Vec::new());
     }
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
@@ -1215,20 +1275,6 @@ pub fn translate_op(
                         // PRE-EXISTING-ADAPTATION as documented above.
                         attr
                     } else if segments.len() == 2
-                        && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
-                    {
-                        // Branch 4 — associated-function call
-                        // `Type::method(self, ...)` whose impl method is
-                        // registered under a module-qualified key
-                        // `[...module..., Type, method]`.  The exact
-                        // lookup at layer 1 missed because the call site
-                        // spells only `[Type, method]`; recover the
-                        // canonical entry by its `[Type, method]` tail,
-                        // mirroring the bound method-call suffix match
-                        // (`call.rs:3155 target_to_path`).  Upstream
-                        // resolves both spellings to one `FunctionDesc`.
-                        entry.host_object.clone()
-                    } else if segments.len() == 2
                         && segments[0] == "simple_call"
                         && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
                     {
@@ -1264,12 +1310,12 @@ pub fn translate_op(
                     } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
                         // Fuzzy leaf-match is the last registry fallback.
                         // Exact registry entries, lexical imports, HOST_ENV
-                        // module paths, associated-method suffixes, and the
-                        // `simple_call(<exc class>)` raise reconstruction must
-                        // win first so external stubs such as `BigInt::from`,
-                        // `Vec::new`, and `Box::new` — and exception classes
-                        // sharing a leaf — cannot be captured by an unrelated
-                        // user function with the same leaf.
+                        // module paths, and the `simple_call(<exc class>)`
+                        // raise reconstruction must win first so external
+                        // stubs such as `BigInt::from`, `Vec::new`, and
+                        // `Box::new` — and exception classes sharing a leaf —
+                        // cannot be captured by an unrelated user function
+                        // with the same leaf.
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
@@ -3442,6 +3488,42 @@ mod tests {
             elem_v2.id(),
             "elem Variable identity must thread"
         );
+    }
+
+    #[test]
+    fn op_canraise_covers_getitem_bearing_and_inplace_binops() {
+        // `InteriorField*` unfolds to a getitem (raising) + getattr/setattr,
+        // so as a `?` tail it carries the getitem's `[IndexError, KeyError,
+        // Exception]` (operation.py:727-730).
+        let interior = OpKind::InteriorFieldRead {
+            base: Variable::new(),
+            index: Variable::new(),
+            field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
+            item_ty: ValueType::Int,
+            array_type_id: None,
+        };
+        assert!(
+            op_canraise(&interior),
+            "InteriorFieldRead carries the unfolded getitem's canraise"
+        );
+
+        // Compound-assign names reach `op_canraise` BEFORE
+        // `normalize_binop_name` maps them to `inplace_*`.
+        // `inplace_div`/`inplace_add`/`inplace_lshift` carry
+        // ZeroDivisionError/OverflowError/ValueError; `inplace_and` and
+        // plain `add` are `[]` (operation.py:751-756).
+        let binop = |name: &str| OpKind::BinOp {
+            op: name.to_string(),
+            lhs: Variable::new(),
+            rhs: Variable::new(),
+            result_ty: ValueType::Int,
+        };
+        assert!(op_canraise(&binop("div_assign")));
+        assert!(op_canraise(&binop("add_assign")));
+        assert!(op_canraise(&binop("lshift_assign")));
+        assert!(op_canraise(&binop("div")));
+        assert!(!op_canraise(&binop("bitand_assign")));
+        assert!(!op_canraise(&binop("add")));
     }
 
     #[test]

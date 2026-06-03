@@ -151,9 +151,9 @@ impl CodeWriter {
         registry.set_use_imports(callcontrol.use_imports.clone());
         // Thread the program-wide struct field shapes into the shared
         // bookkeeper (mirrors the `set_use_imports` threading above) so
-        // `get_pyre_classdef_by_name` / `project_pyre_field_type` can
-        // project a struct's fields onto its classdef when the real-rtyper
-        // seed path resolves a `Ref(type_root)` to a class.
+        // `getuniqueclassdef_for_struct_root` / `project_pyre_field_type`
+        // can project a struct's fields onto its classdef when the
+        // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_pyre_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
         // the caller (`bookkeeper.py:108-127`); pyre's dual-gate

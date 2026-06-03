@@ -7055,105 +7055,33 @@ fn lower_expr_inner(
             // whole match so the enclosing `build_function_graph` body
             // loop breaks at the first unsupported construct, matching
             // upstream's all-or-nothing flowgraph semantics.
-            let mut arm_entries: Vec<BlockId> = Vec::with_capacity(m.arms.len());
-            // Each arm carries (tail, value, exit_framestate,
-            // exit_local_bindings).  The trailing
-            // `LocalBindingSnapshot` is the per-arm version of the
-            // `then_exit_ctx` / `else_exit_ctx` captures in
-            // [`lower_if_expr`]: when exactly one arm survives the
-            // merge (siblings all closed via `return` / `raise` /
-            // `break` / `panic!`), the post-merge `ctx` must
-            // restore to that arm's bindings rather than the
-            // pre-match snapshot, so post-merge reads of the
-            // surviving arm's rebinds resolve to the correct SSA
-            // values.  This is the if-let path's regression carrier
-            // — `if let pat = scrut { x = 1; } else { return 0; } x`
-            // desugars to a 2-arm match where only the open arm
-            // contributes bindings, and the bound `x` must be
-            // visible past the merge.
-            let mut arm_tails: Vec<(
-                BlockId,
-                Option<crate::flowspace::model::Variable>,
-                FrameState,
-                LocalBindingSnapshot,
-            )> = Vec::with_capacity(m.arms.len());
-            for arm in &m.arms {
-                let entry = graph.create_block();
-                let mut tail = entry;
-                let saved_locals = LocalBindingSnapshot::capture(ctx);
-                bind_pattern_locals(&arm.pat, scrutinee_type_string.as_deref(), ctx);
-                let arm_lowered_result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
-                // Snapshot this arm's exit framestate BEFORE
-                // `restore` wipes the per-arm rebinds.  The merge
-                // block's lazy installer uses
-                // `Block.framestate` on each predecessor to thread
-                // `Link.args` back through the arm tail (RPython
-                // parity: `flowspace/flowcontext.py:407-408
-                // record_block(block)` calls `setstate(block.framestate)`
-                // and `flowspace/flowcontext.py:449
-                // currentstate.getoutputargs(newstate)` reads the
-                // predecessor's snapshot to produce link args).
-                // Without this, the predecessor walk in
-                // `lazy_install_local_at_current_block` finds no
-                // snapshot and falls back to the legacy naked-`Input`
-                // emit, which loses the per-arm rebind information.
-                let arm_exit_snapshot = ctx.getstate(graph, 0);
-                let arm_exit_locals = LocalBindingSnapshot::capture(ctx);
-                saved_locals.restore(ctx);
-                let arm_lowered = arm_lowered_result?;
-                // A closed arm (body is `return x` / `break` / `panic!`
-                // / `raise`) does not contribute a value to the merge —
-                // its path terminates inside `tail` and no outgoing
-                // goto is synthesised.  Per RPython
-                // `flowspace/flowcontext.py:1253` `Raise.nomoreblocks`,
-                // sibling walks continue irrespective of this arm's
-                // closure.
-                arm_entries.push(entry);
-                let arm_lowered_var = arm_lowered.value_var(graph);
-                arm_tails.push((tail, arm_lowered_var, arm_exit_snapshot, arm_exit_locals));
-            }
+            // Pre-create every arm's entry block so the scrutinee's exits
+            // + framestate are installed BEFORE the arm bodies are
+            // lowered — mirroring `lower_if_expr`, where `set_branch`
+            // (creating the then/else edges) and the framestate stamp both
+            // precede the then/else walk (ast.rs:4919-4920).  A cross-block
+            // read of a pre-match local — whether inside an arm body or in
+            // the post-merge continuation — then finds the scrutinee→entry
+            // edge and the recorded snapshot already present, so the lazy
+            // installer threads `Link.args` back through the scrutinee
+            // block instead of falling to the naked body-`Input` emit the
+            // rtyper adapter rejects.
+            let arm_entries: Vec<BlockId> = m.arms.iter().map(|_| graph.create_block()).collect();
 
-            // Merge gets a Phi inputarg iff every arm that actually
-            // reaches the merge carries a value.  Closed arms (early
-            // `return` / `break`) don't emit a goto to merge, so they
-            // contribute nothing to the phi arity.  Mixing some-value
-            // and no-value open arms would require a fake phi arg for
-            // the no-value arms (RPython `jit/codewriter/flatten.py:308`
-            // — every outgoing goto's arg list must match the target's
-            // inputarg arity), so in that case we emit no phi at all.
-            let all_open_arms_have_value = arm_tails
-                .iter()
-                .all(|(tail, r, _, _)| !graph.block(*tail).is_open() || r.is_some());
+            // Capture the scrutinee block's locals frame as it stands when
+            // it branches to the arm entries; stamped on `Block.framestate`
+            // below (after the exits are installed).  RPython parity:
+            // `flowspace/flowcontext.py:38 SpamBlock.framestate`.
+            let pre_match_snapshot = ctx.getstate(graph, 0);
 
-            let open_arm_snapshots: Vec<(
-                BlockId,
-                Option<crate::flowspace::model::Variable>,
-                FrameState,
-                LocalBindingSnapshot,
-            )> = arm_tails
-                .iter()
-                .filter(|(tail, _, _, _)| graph.block(*tail).is_open())
-                .map(|(tail, result, exit_snapshot, exit_locals)| {
-                    (
-                        *tail,
-                        result.clone(),
-                        exit_snapshot.clone(),
-                        exit_locals.clone(),
-                    )
-                })
-                .collect();
-            let any_open = !open_arm_snapshots.is_empty();
-
-            // Dispatch (set_branch / exitswitch / single-goto fallback)
-            // runs BEFORE per-arm close + merge construction so the
-            // migration's dry-run sees `*block` as a predecessor of
-            // each `arm_entries[i]`.  Without this ordering, the
-            // dry-run walking back from a tail would dead-end at an
-            // orphan arm_entry even when dispatch was eventually
-            // wired.  Slice 4.2-style `set_goto` to merge is order-
-            // independent (links from tail are unaffected by *block's
-            // branch shape), so the legacy lean-merge-block path stays
-            // structurally equivalent under the reorder.
+            // Dispatch (set_branch / exitswitch / single-goto fallback).
+            // Runs BEFORE the arm bodies are lowered so (a) a cross-block
+            // read inside an arm body threads back through the
+            // scrutinee→entry edge, and (b) the migration's dry-run below
+            // sees `*block` as a predecessor of each `arm_entries[i]`
+            // rather than dead-ending at an orphan entry.  Slice 4.2-style
+            // `set_goto` to merge is order-independent (links from tail are
+            // unaffected by `*block`'s branch shape).
             if let Some(arm_exitcases) = bool_exitcases {
                 // RPython `flatten.py:240-267` lowers Bool exitswitch
                 // blocks through the two-link `goto_if_not` path, not the
@@ -7213,6 +7141,104 @@ fn lower_expr_inner(
                     vec![],
                 );
             }
+
+            // Stamp the scrutinee block's framestate now that its exits to
+            // the arm entries are installed (all four dispatch shapes above
+            // set exits on `*block`).  This is what lets a cross-block read
+            // of a pre-match local thread `Link.args` back through the
+            // scrutinee block; without it the lazy installer's predecessor
+            // recursion reaches the scrutinee block, finds no recorded
+            // snapshot, and falls back to the naked body-`Input` emit.
+            // Mirror of `lower_if_expr`'s `set_branch` + framestate stamp
+            // pair (ast.rs:4919-4920).
+            graph.block_mut(*block).framestate = Some(pre_match_snapshot);
+
+            // Each arm carries (tail, value, exit_framestate,
+            // exit_local_bindings).  The trailing
+            // `LocalBindingSnapshot` is the per-arm version of the
+            // `then_exit_ctx` / `else_exit_ctx` captures in
+            // [`lower_if_expr`]: when exactly one arm survives the
+            // merge (siblings all closed via `return` / `raise` /
+            // `break` / `panic!`), the post-merge `ctx` must
+            // restore to that arm's bindings rather than the
+            // pre-match snapshot, so post-merge reads of the
+            // surviving arm's rebinds resolve to the correct SSA
+            // values.  This is the if-let path's regression carrier
+            // — `if let pat = scrut { x = 1; } else { return 0; } x`
+            // desugars to a 2-arm match where only the open arm
+            // contributes bindings, and the bound `x` must be
+            // visible past the merge.
+            let mut arm_tails: Vec<(
+                BlockId,
+                Option<crate::flowspace::model::Variable>,
+                FrameState,
+                LocalBindingSnapshot,
+            )> = Vec::with_capacity(m.arms.len());
+            for (arm_idx, arm) in m.arms.iter().enumerate() {
+                let entry = arm_entries[arm_idx];
+                let mut tail = entry;
+                let saved_locals = LocalBindingSnapshot::capture(ctx);
+                bind_pattern_locals(&arm.pat, scrutinee_type_string.as_deref(), ctx);
+                let arm_lowered_result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
+                // Snapshot this arm's exit framestate BEFORE
+                // `restore` wipes the per-arm rebinds.  The merge
+                // block's lazy installer uses
+                // `Block.framestate` on each predecessor to thread
+                // `Link.args` back through the arm tail (RPython
+                // parity: `flowspace/flowcontext.py:407-408
+                // record_block(block)` calls `setstate(block.framestate)`
+                // and `flowspace/flowcontext.py:449
+                // currentstate.getoutputargs(newstate)` reads the
+                // predecessor's snapshot to produce link args).
+                // Without this, the predecessor walk in
+                // `lazy_install_local_at_current_block` finds no
+                // snapshot and falls back to the legacy naked-`Input`
+                // emit, which loses the per-arm rebind information.
+                let arm_exit_snapshot = ctx.getstate(graph, 0);
+                let arm_exit_locals = LocalBindingSnapshot::capture(ctx);
+                saved_locals.restore(ctx);
+                let arm_lowered = arm_lowered_result?;
+                // A closed arm (body is `return x` / `break` / `panic!`
+                // / `raise`) does not contribute a value to the merge —
+                // its path terminates inside `tail` and no outgoing
+                // goto is synthesised.  Per RPython
+                // `flowspace/flowcontext.py:1253` `Raise.nomoreblocks`,
+                // sibling walks continue irrespective of this arm's
+                // closure.
+                let arm_lowered_var = arm_lowered.value_var(graph);
+                arm_tails.push((tail, arm_lowered_var, arm_exit_snapshot, arm_exit_locals));
+            }
+
+            // Merge gets a Phi inputarg iff every arm that actually
+            // reaches the merge carries a value.  Closed arms (early
+            // `return` / `break`) don't emit a goto to merge, so they
+            // contribute nothing to the phi arity.  Mixing some-value
+            // and no-value open arms would require a fake phi arg for
+            // the no-value arms (RPython `jit/codewriter/flatten.py:308`
+            // — every outgoing goto's arg list must match the target's
+            // inputarg arity), so in that case we emit no phi at all.
+            let all_open_arms_have_value = arm_tails
+                .iter()
+                .all(|(tail, r, _, _)| !graph.block(*tail).is_open() || r.is_some());
+
+            let open_arm_snapshots: Vec<(
+                BlockId,
+                Option<crate::flowspace::model::Variable>,
+                FrameState,
+                LocalBindingSnapshot,
+            )> = arm_tails
+                .iter()
+                .filter(|(tail, _, _, _)| graph.block(*tail).is_open())
+                .map(|(tail, result, exit_snapshot, exit_locals)| {
+                    (
+                        *tail,
+                        result.clone(),
+                        exit_snapshot.clone(),
+                        exit_locals.clone(),
+                    )
+                })
+                .collect();
+            let any_open = !open_arm_snapshots.is_empty();
 
             // Iterative left-fold over 2-way `FrameState::union` —
             // direct port of `flowspace/flowcontext.py:430-436
@@ -8051,36 +8077,34 @@ fn lower_expr_inner(
             // non-empty.  A bare-local read (`kwargs?`) records no
             // operation, so the block must NOT be closed as canraise.
             // Snapshot the operations cursor before lowering the operand,
-            // then classify by the kind of op the operand actually
-            // appended: a surviving (non-adapter-skipped) tail op is a
-            // real raising flowspace op (Call / getattr / getitem) that
-            // `?` closes the block against; a bare value records nothing
-            // or only a cross-block `OpKind::Input` that the adapter skips
-            // (`flowspace_adapter::translate_op_is_skipped`), neither of
-            // which can raise.
+            // then classify the tail op the operand actually appended by
+            // its `op.canraise` (`flowspace_adapter::op_canraise`): a
+            // raising tail op (a call — including a non-unit transparent
+            // ctor, which lowers to a non-builtin `simple_call` —, getitem /
+            // setitem, or a div / mod / shift binop) is what `?` closes the
+            // block against; a non-raising tail op (an elided unit-variant
+            // ctor, getattr / setattr, a pure binop / cast / const, or a
+            // cross-block `OpKind::Input`) records nothing that can raise,
+            // so the block must NOT be closed as canraise.
             let block_before = *block;
             let len_before = graph.block(*block).operations.len();
             let inner_pre_var =
                 get_value_var!(lower_expr(graph, block, &t.expr, options, ctx)?, graph);
             let recorded_raising_op = {
                 let ops = &graph.block(*block).operations;
-                let last_is_raising = ops
+                let last_can_raise = ops
                     .last()
-                    .map(|op| {
-                        !crate::translator::rtyper::flowspace_adapter::translate_op_is_skipped(
-                            &op.kind,
-                        )
-                    })
+                    .map(|op| crate::translator::rtyper::flowspace_adapter::op_canraise(&op.kind))
                     .unwrap_or(false);
                 if *block == block_before {
                     // Operand stayed in this block: it raises iff it
-                    // appended a surviving op as the new tail.
-                    ops.len() > len_before && last_is_raising
+                    // appended a raising op as the new tail.
+                    ops.len() > len_before && last_can_raise
                 } else {
                     // Operand moved the cursor (nested `?`, if-expr
                     // operand): its final op landed in the new `*block`;
                     // that op is what `?` raises against.
-                    last_is_raising
+                    last_can_raise
                 }
             };
             ctx.pushvid_var(&inner_pre_var);
@@ -9803,11 +9827,73 @@ fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarge
                     qualified.extend(segments);
                     segments = qualified;
                 }
+            } else if segments.len() == 2 {
+                // `Type::method` — LOAD_GLOBAL <Type> resolves the class
+                // OBJECT in the caller's lexical scope and LOAD_ATTR
+                // <method> reaches the method's `FunctionDesc` by that
+                // class identity (`flowcontext.py:845-866`,
+                // `bookkeeper.py:353-396`), never by a global name scan.
+                // Resolve the Type head the same way registration does
+                // (`qualify_type_name_with_imports`, `parse.rs:1163`): a
+                // `use a::S as T` alias resolves through `use_imports`
+                // first, then the module prefix, so an aliased spelling
+                // `T::m(...)` lands on the same key the impl registered.
+                //
+                // Do NOT feed every `A::b` head through
+                // `qualify_type_name_with_imports`: that helper is type-name
+                // specific and falls back to `module_prefix::A`, which would
+                // corrupt module/root paths such as `crate::helper()` inside
+                // `mod a` into `a::crate::helper`.  This path resolver only
+                // rewrites when lexical/global evidence identifies the head
+                // as an import alias, a known/canonical struct, or a
+                // same-scope nested item.
+                if let Some(qualified) =
+                    qualify_two_segment_call_target(&segments[0], &segments[1], ctx)
+                {
+                    segments = qualified;
+                }
             }
             CallTarget::function_path(segments)
         }
         _ => CallTarget::UnsupportedExpr,
     }
+}
+
+fn qualify_two_segment_call_target(
+    head: &str,
+    leaf: &str,
+    ctx: &GraphBuildContext,
+) -> Option<Vec<String>> {
+    if is_absolute_or_internal_path_root(head) {
+        return None;
+    }
+    if let Some(full) = ctx.use_imports.get(head) {
+        let mut resolved: Vec<String> = full.split("::").map(str::to_string).collect();
+        resolved.push(leaf.to_string());
+        return Some(resolved);
+    }
+    let canonical = majit_ir::descr::canonical_struct_name(head);
+    if canonical != head {
+        let mut resolved: Vec<String> = canonical.split("::").map(str::to_string).collect();
+        resolved.push(leaf.to_string());
+        return Some(resolved);
+    }
+    if ctx.module_prefix.is_empty() {
+        return None;
+    }
+    let prefixed = format!("{}::{}", ctx.module_prefix, head);
+    let prefixed_key = format!("{}::{}", prefixed, leaf);
+    if ctx.known_struct_names.contains(&prefixed) || ctx.fn_return_types.contains_key(&prefixed_key)
+    {
+        let mut resolved: Vec<String> = prefixed.split("::").map(str::to_string).collect();
+        resolved.push(leaf.to_string());
+        return Some(resolved);
+    }
+    None
+}
+
+fn is_absolute_or_internal_path_root(head: &str) -> bool {
+    matches!(head, "crate" | "self" | "super") || crate::parse::PYRE_INTERNAL_CRATES.contains(&head)
 }
 
 /// Decide whether `segments` should be lowered as
@@ -13349,6 +13435,181 @@ mod tests {
                     if target == &CallTarget::function_path(["crate", "math", "w_int_add"])
             )),
             "expected canonical Call target path, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn two_segment_absolute_root_call_is_not_type_qualified_inside_mod() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn helper(x: i64) -> i64 { x }
+            mod a {
+                fn caller(x: i64) -> i64 {
+                    crate::helper(x)
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let caller = program
+            .functions
+            .iter()
+            .find(|func| func.name == "a::caller")
+            .expect("a::caller graph");
+        let ops = &caller.graph.block(caller.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::function_path(["crate", "helper"])
+            )),
+            "`crate::helper` inside `mod a` must stay absolute, got {:?}",
+            ops
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &vec![
+                    "a".to_string(),
+                    "crate".to_string(),
+                    "helper".to_string()
+                ]
+            )),
+            "`crate::helper` must not be rewritten to `a::crate::helper`: {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn two_segment_child_module_call_qualifies_with_current_mod() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            mod a {
+                mod child {
+                    fn f(x: i64) -> i64 { x }
+                }
+                fn caller(x: i64) -> i64 {
+                    child::f(x)
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let caller = program
+            .functions
+            .iter()
+            .find(|func| func.name == "a::caller")
+            .expect("a::caller graph");
+        let ops = &caller.graph.block(caller.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::function_path(["a", "child", "f"])
+            )),
+            "`child::f` inside `mod a` must resolve to `a::child::f`, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn two_segment_same_scope_type_method_qualifies_with_current_mod() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            mod a {
+                struct S;
+                impl S {
+                    fn m(x: i64) -> i64 { x }
+                }
+                fn caller(x: i64) -> i64 {
+                    S::m(x)
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let caller = program
+            .functions
+            .iter()
+            .find(|func| func.name == "a::caller")
+            .expect("a::caller graph");
+        let ops = &caller.graph.block(caller.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::function_path(["a", "S", "m"])
+            )),
+            "`S::m` inside `mod a` must resolve to `a::S::m`, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn two_segment_import_alias_call_expands_import_target() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            use b::S as T;
+            mod b {
+                pub struct S;
+                impl S {
+                    pub fn m(x: i64) -> i64 { x }
+                }
+            }
+            mod a {
+                fn caller(x: i64) -> i64 {
+                    T::m(x)
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let caller = program
+            .functions
+            .iter()
+            .find(|func| func.name == "a::caller")
+            .expect("a::caller graph");
+        let ops = &caller.graph.block(caller.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::function_path(["b", "S", "m"])
+            )),
+            "`T::m` must resolve through `use b::S as T`, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn two_segment_internal_crate_root_call_is_not_type_qualified_inside_mod() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            mod a {
+                fn caller() {
+                    pyre_object::w_none();
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let caller = program
+            .functions
+            .iter()
+            .find(|func| func.name == "a::caller")
+            .expect("a::caller graph");
+        let ops = &caller.graph.block(caller.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::function_path(["pyre_object", "w_none"])
+            )),
+            "`pyre_object::w_none` inside `mod a` must stay module-rooted, got {:?}",
             ops
         );
     }
