@@ -182,11 +182,6 @@ pub struct MiniMarkGC {
     /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
     /// flag has been cleared by the write barrier.
     remembered_set: Vec<usize>,
-    /// Last old-gen object accepted by the write barrier membership check.
-    /// Tight loops usually update the same container repeatedly; caching this
-    /// avoids repeatedly scanning OldGen's allocation list without changing
-    /// OldGen's RPython-like list shape.
-    last_write_barrier_old_obj: usize,
     /// incminimark.py:346-352: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -280,7 +275,6 @@ impl MiniMarkGC {
             types: TypeRegistry::new(),
             roots: RootSet::new(),
             remembered_set: Vec::new(),
-            last_write_barrier_old_obj: 0,
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
@@ -353,9 +347,12 @@ impl MiniMarkGC {
             if self.card_page_shift > 0 && has_gc_ptrs_in_var && length > 0 {
                 let extra_words = self.card_marking_words_for_length(length);
                 let chs = 8 * extra_words; // WORD * extra_words
-                (chs, flags::HAS_CARDS | flags::TRACK_YOUNG_PTRS)
+                (
+                    chs,
+                    flags::HAS_CARDS | flags::TRACK_YOUNG_PTRS | flags::OLDGEN_TRACKED,
+                )
             } else {
-                (0, flags::TRACK_YOUNG_PTRS)
+                (0, flags::TRACK_YOUNG_PTRS | flags::OLDGEN_TRACKED)
             };
 
         let ptr = self
@@ -432,16 +429,30 @@ impl MiniMarkGC {
         self.nursery.contains(addr) || self.oldgen.contains(addr)
     }
 
+    /// Whether `addr` is a real old-gen object that may enter the remembered
+    /// set. Callers have already ruled out null and nursery addresses, so the
+    /// only other thing reaching here is a Box-allocated PyFrame: it carries a
+    /// GcHeader and TRACK_YOUNG_PTRS but is not GC-owned and must be excluded.
+    ///
+    /// Old-gen objects are the only ones tagged `OLDGEN_TRACKED` (set at every
+    /// old-gen allocation/promotion), so the test is an O(1) header read.
+    /// Reading the header is safe: the inline COND_CALL_GC_WB already loads the
+    /// flag byte from this same header before calling into the barrier.
+    ///
+    /// The leading guard is a cheap defensive filter, not a membership test: a
+    /// real GcRef payload is non-null, word-aligned, and well above the zero
+    /// page, so a malformed barrier target (null, a small integer mistaken for
+    /// a pointer, a misaligned address) returns `false` instead of faulting in
+    /// `header_of`. It deliberately does NOT range-check the old-gen extent —
+    /// that would need a side table maintained in lockstep with
+    /// `OLDGEN_TRACKED`, and a stale entry would silently drop a live old-gen
+    /// object from the remembered set.
     #[inline]
-    fn is_oldgen_write_barrier_object(&mut self, addr: usize) -> bool {
-        if self.last_write_barrier_old_obj == addr {
-            return true;
+    fn is_oldgen_write_barrier_object(&self, addr: usize) -> bool {
+        if addr < 0x1000 || addr & (GcHeader::SIZE - 1) != 0 {
+            return false;
         }
-        if self.oldgen.contains_fast(addr) {
-            self.last_write_barrier_old_obj = addr;
-            return true;
-        }
-        false
+        unsafe { (*header_of(addr)).has_flag(flags::OLDGEN_TRACKED) }
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
@@ -535,7 +546,8 @@ impl MiniMarkGC {
         let ptr = self.oldgen.alloc(total_size);
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
-        *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
+        // OLDGEN_TRACKED marks this as a GC-owned old-gen object for the barrier.
+        *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS | flags::OLDGEN_TRACKED);
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         GcRef((ptr as usize) + GcHeader::SIZE)
@@ -862,6 +874,9 @@ impl MiniMarkGC {
         let shadow_obj = shadow_hdr_ptr as usize + GcHeader::SIZE;
         unsafe {
             (*(shadow_hdr_ptr as *mut GcHeader)).tid_and_flags = (*hdr_ptr).tid_and_flags;
+            // The shadow lives in old-gen: tag it so the write barrier treats it
+            // as GC-owned even before the nursery object is copied into it.
+            (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::OLDGEN_TRACKED);
             if type_info.item_size > 0 {
                 let len_ofs = type_info.length_offset;
                 *((shadow_obj + len_ofs) as *mut usize) = *((obj_addr + len_ofs) as *const usize);
@@ -992,9 +1007,14 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
 
-        // Set TRACK_YOUNG_PTRS on the new old-gen object.
+        // Set TRACK_YOUNG_PTRS on the new old-gen object, and OLDGEN_TRACKED so
+        // the write barrier recognises this promoted copy as a GC-owned old-gen
+        // object. (The source header was copied from the nursery object, which
+        // carries neither flag.)
         unsafe {
-            (*(new_header_ptr as *mut GcHeader)).set_flag(flags::TRACK_YOUNG_PTRS);
+            let h = new_header_ptr as *mut GcHeader;
+            (*h).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*h).set_flag(flags::OLDGEN_TRACKED);
         }
 
         // Install forwarding pointer in the nursery copy.
@@ -1322,7 +1342,6 @@ impl MiniMarkGC {
             self.invalidate_old_weakrefs();
         }
         self.oldgen.sweep();
-        self.last_write_barrier_old_obj = 0;
         self.last_major_bytes = self.oldgen.total_bytes();
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
@@ -2502,6 +2521,75 @@ mod tests {
         // Second call: flag already cleared, should not add again.
         gc.do_write_barrier(old_obj);
         assert_eq!(gc.remembered_set.len(), 1);
+    }
+
+    // `is_oldgen_write_barrier_object` makes OLDGEN_TRACKED the entire old-gen
+    // eligibility test, so every path that places an object in old-gen must set
+    // the flag. These lock that invariant down across all four producers, plus
+    // a negative case so a stray TRACK_YOUNG_PTRS object stays out.
+
+    #[test]
+    fn oldgen_tracked_set_on_direct_oldgen_alloc() {
+        let mut gc = test_gc(1024);
+        gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::OLDGEN_TRACKED) });
+        assert!(gc.is_oldgen_write_barrier_object(obj.0));
+    }
+
+    #[test]
+    fn oldgen_tracked_set_on_card_alloc() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
+        let length = 4usize;
+        let total_size = GcHeader::SIZE + 8 + ptr_size * length;
+        let obj = gc.alloc_in_oldgen_with_cards(tid, total_size, length, true);
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::OLDGEN_TRACKED) });
+        assert!(gc.is_oldgen_write_barrier_object(obj.0));
+    }
+
+    #[test]
+    fn oldgen_tracked_set_on_nursery_promotion() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+        let mut root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe { gc.roots.add(&mut root) };
+        gc.collect_nursery();
+        // `root` now holds the promoted old-gen address.
+        assert!(!gc.is_in_nursery(root.0));
+        assert!(unsafe { (*header_of(root.0)).has_flag(flags::OLDGEN_TRACKED) });
+        assert!(gc.is_oldgen_write_barrier_object(root.0));
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn oldgen_tracked_set_on_shadow_alloc() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(0, 16);
+        let shadow = gc.allocate_shadow(obj.0);
+        assert!(unsafe { (*header_of(shadow)).has_flag(flags::OLDGEN_TRACKED) });
+        assert!(gc.is_oldgen_write_barrier_object(shadow));
+    }
+
+    #[test]
+    fn write_barrier_object_rejects_tracked_young_without_oldgen_tracked() {
+        let mut gc = test_gc(1024);
+        gc.register_type(TypeInfo::simple(16));
+        // A header-shaped Box allocation outside the GC heap (mirrors
+        // PyFrame-style host allocations during the migration window): it
+        // carries a GcHeader with TRACK_YOUNG_PTRS but no OLDGEN_TRACKED, so it
+        // must be rejected without entering the remembered set.
+        let mut buf = Box::new([0u64; 2]);
+        let base = buf.as_mut_ptr() as usize;
+        unsafe { *(base as *mut GcHeader) = GcHeader::with_flags(0, flags::TRACK_YOUNG_PTRS) };
+        let payload = base + GcHeader::SIZE;
+        assert!(!gc.is_oldgen_write_barrier_object(payload));
+        gc.do_write_barrier(GcRef(payload));
+        assert_eq!(gc.remembered_set.len(), 0);
+        drop(buf);
     }
 
     #[test]
