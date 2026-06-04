@@ -343,19 +343,6 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     }
 }
 
-/// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
-/// resume data from the last guard failure. rd_numb provides frame
-/// boundaries (jitcode_index, pc); values are resolved from deadframe.
-thread_local! {
-    static LAST_GUARD_FRAMES: std::cell::RefCell<Option<Vec<crate::call_jit::ResumedFrame>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Take the last guard frames (consuming them).
-pub(crate) fn take_last_guard_frames() -> Option<Vec<crate::call_jit::ResumedFrame>> {
-    LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take())
-}
-
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -3567,18 +3554,30 @@ fn handle_fail(
     HandleFailOutcome::ResumeInBlackhole
 }
 
+/// Short tag for a `BlackholeResult` variant, for the `[bh-rd-numb]`
+/// blackhole-resume log line.
+fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
+    use crate::call_jit::BlackholeResult as R;
+    match r {
+        R::ContinueRunningNormally { .. } => "ContinueRunningNormally",
+        R::DoneWithThisFrameVoid => "DoneWithThisFrameVoid",
+        R::DoneWithThisFrameInt(_) => "DoneWithThisFrameInt",
+        R::DoneWithThisFrameRef(_) => "DoneWithThisFrameRef",
+        R::DoneWithThisFrameFloat(_) => "DoneWithThisFrameFloat",
+        R::ExitFrameWithExceptionRef(_) => "ExitFrameWithExceptionRef",
+        R::Failed => "Failed",
+    }
+}
+
 /// compile.py:710-716 resume_in_blackhole parity.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
 ///
 fn resume_in_blackhole_from_exit_layout(
-    frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> crate::call_jit::BlackholeResult {
-    use crate::call_jit::BlackholeResult;
-
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
@@ -3587,39 +3586,57 @@ fn resume_in_blackhole_from_exit_layout(
             exit_layout.storage.as_deref().map(|s| s.rd_numb.len())
         );
     }
-    // Save frame state before consume_vable_info modifies it.
-    // RPython's blackhole always completes; pyre currently keeps a
-    // partial rollback path for the `BlackholeResult::Failed` escape
-    // (defensive null/bounds checks inside `resume_in_blackhole`
-    // fall back here). The full removal of `Failed` depends on
-    // auditing those remaining sites separately — see
-    // memory/rd_numb_audit_2026_04_19.md step 5.
-    let saved_ni = frame.next_instr();
-    let saved_code = frame.pycode;
-    let saved_vsd = frame.valuestackdepth;
-    let saved_ns = frame.w_globals_obj;
-    let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_w().as_slice().to_vec();
 
-    build_blackhole_frames_from_deadframe(raw_values, exit_layout);
-    // `build_blackhole_frames_from_deadframe` asserts that rd_numb is
-    // present and non-empty (commit c7ea7cb58b + the fallback removal
-    // above), so `LAST_GUARD_FRAMES` is always populated by the time we
-    // read it back here. `take_last_guard_frames` must return Some.
-    let frames = take_last_guard_frames()
-        .expect("LAST_GUARD_FRAMES must be set by build_blackhole_frames_from_deadframe");
-    let result = crate::call_jit::resume_in_blackhole(frame, &frames);
-    if matches!(result, BlackholeResult::Failed) {
-        // Restore frame to pre-consume state so the fallback
-        // interpreter can continue from the original frame.
-        frame.set_last_instr_from_next_instr(saved_ni);
-        frame.pycode = saved_code;
-        frame.valuestackdepth = saved_vsd;
-        frame.w_globals_obj = saved_ns;
-        let dest = frame.locals_w_mut().as_mut_slice();
-        let n = dest.len().min(saved_array.len());
-        dest[..n].copy_from_slice(&saved_array[..n]);
+    // resume.py:1312 blackhole_from_resumedata is the single blackhole
+    // resume mechanism: every exit_layout that carries resume storage
+    // decodes through the orthodox rd_numb reader
+    // `blackhole_resume_via_rd_numb`. It walks jitcode liveness once per
+    // resume frame, so it reconstructs the full inline framestack.
+    // exit_layout already carries (rd_loop_token, trace_id, fail_index,
+    // storage), mirroring the CALL_ASSEMBLER caller
+    // `jit_blackhole_resume_from_guard` (call_jit.rs:1855-1881) without the
+    // green_key recovery that path needs.
+    if let Some(storage) = exit_layout.storage.as_deref() {
+        let deadframe_types = {
+            let (driver, _) = driver_pair();
+            driver.get_recovery_slot_types(
+                exit_layout.rd_loop_token,
+                exit_layout.trace_id,
+                exit_layout.fail_index,
+            )
+        };
+        let result = crate::call_jit::blackhole_resume_via_rd_numb(
+            &storage.rd_numb,
+            storage.rd_consts(),
+            raw_values,
+            Some(&storage.rd_pendingfields),
+            Some(&storage.rd_virtuals),
+            deadframe_types.as_deref(),
+        );
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[bh-rd-numb] trace={} fail_idx={} result={}",
+                exit_layout.trace_id,
+                exit_layout.fail_index,
+                blackhole_result_tag(&result),
+            );
+        }
+        return result;
     }
-    result
+    // resume.py:1369-1372 `ResumeDataDirectReader._prepare` dereferences
+    // `storage.rd_numb_list` with no fallback: a guard reaching the
+    // blackhole resume MUST carry rd_numb. `storage` is None only for
+    // terminal FINISH/JUMP exit layouts (compile.rs
+    // `infer_terminal_exit_layout`) and synthesized fallback layouts,
+    // none of which reach the guard blackhole path. If one ever did,
+    // there would be no resume data to decode — fail loudly rather than
+    // silently mis-resume. (Task #64 tracks proving storage=None can
+    // never reach here.)
+    panic!(
+        "resume_in_blackhole_from_exit_layout: exit_layout.storage missing \
+         (trace={} fail_idx={})",
+        exit_layout.trace_id, exit_layout.fail_index,
+    );
 }
 
 /// RPython warmstate.py:387-423 execute_assembler.
@@ -3796,8 +3813,7 @@ fn execute_assembler(
                 HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -4040,8 +4056,7 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -4218,8 +4233,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     // Fall through to eval_loop_jit below.
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
                             // Fall through to eval_loop_jit
@@ -5504,7 +5518,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // `rd_numb` here indicates an unported guard-emission site — hard
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.
-    let resumed_frames = {
+    {
         // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts from the guard-owned shared Arc instead of a
         // per-guard Vec copy.
@@ -5517,15 +5531,18 @@ pub(crate) fn decode_and_restore_guard_failure(
             "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
             exit_layout.fail_index
         );
+        // build_resumed_frames is driven only for its side effect: the
+        // GuardFailureSync mode writes the captured vable boxes back onto
+        // the physical frame (see comment above). The decoded frame chain
+        // itself is unused on the guard-failure path.
         build_resumed_frames(
             raw_values,
             storage.rd_numb.as_slice(),
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
-        )
-    };
-    LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
+        );
+    }
 
     // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
@@ -5542,53 +5559,6 @@ pub(crate) fn decode_and_restore_guard_failure(
     } else {
         None
     }
-}
-
-/// compile.py:710 resume_in_blackhole(deadframe) →
-/// resume.py:1312 blackhole_from_resumedata(deadframe) parity:
-/// Build LAST_GUARD_FRAMES directly from deadframe.
-/// RPython does NOT call rebuild_from_resumedata (guard restore)
-/// before the blackhole path — the blackhole chain consumes
-/// deadframe values directly via consume_one_section.
-pub(crate) fn build_blackhole_frames_from_deadframe(
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-) {
-    // resume.py:1312-1343 blackhole_from_resumedata: rd_numb is mandatory.
-    // RPython dereferences `storage.rd_numb_list` inside `ResumeDataDirectReader._prepare`
-    // (resume.py:1369-1372); there is no fallback for a missing numbering.
-    // Pyre borrows `rd_numb` / `rd_consts` from the guard-owned shared
-    // `ResumeStorage` Arc (compile.py:853 `ResumeGuardDescr`) so post-
-    // eviction backend-origin layouts still carry it.
-    let storage = exit_layout
-        .storage
-        .as_deref()
-        .expect("build_blackhole_frames_from_deadframe: exit_layout.storage missing");
-    let rd_numb = storage.rd_numb.as_slice();
-    let rd_consts = storage.rd_consts();
-    assert!(
-        !rd_numb.is_empty(),
-        "build_blackhole_frames_from_deadframe: storage.rd_numb is empty (fail_index={})",
-        exit_layout.fail_index
-    );
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[jit][deadframe] fail_index={} rd_numb_len={} exit_types={}",
-            exit_layout.fail_index,
-            rd_numb.len(),
-            exit_layout.exit_types.len(),
-        );
-    }
-    // resume.py:1399 consume_vable_info parity: blackhole path writes the
-    // captured virtualizable fields directly from the resume reader stream.
-    let resumed_frames = build_resumed_frames(
-        raw_values,
-        rd_numb,
-        rd_consts,
-        exit_layout,
-        ResumeVableMode::BlackholeConsume,
-    );
-    LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
 }
 
 /// Decode rd_numb to produce typed values via
@@ -5708,8 +5678,9 @@ fn rebuild_typed_from_rd_numb(
     // resume.py:1049-1056: rebuild_from_resumedata iterates all frames
     // via newframe()+consume_boxes(). For guard-failure restore into the
     // outer pyre interpreter state (restore_guard_failure_values), only
-    // the JIT-entry frame's values are needed — inner-frame state lives
-    // in the build_resumed_frames chain consumed by resume_in_blackhole.
+    // the JIT-entry frame's values are needed; the decoded inner frames
+    // are unused here (build_resumed_frames runs only for its vable-sync
+    // side effect on the guard-failure path).
     // After `opencoder.py:217` `framestack.reverse()` parity (encoder at
     // `trace_opcode.rs::build_framestack_snapshot`) `frames[0]` is the
     // outermost (caller / JIT-driver) frame, so `frames.first()` is the
@@ -5744,7 +5715,6 @@ fn rebuild_typed_from_rd_numb(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResumeVableMode {
     GuardFailureSync,
-    BlackholeConsume,
 }
 
 fn value_to_static_vable_bits(value: &Value, expected_type: Type, field_index: usize) -> i64 {
@@ -6037,27 +6007,15 @@ fn build_resumed_frames(
         })
         .unwrap_or(std::ptr::null());
 
-    // resume.py:1399-1408 consume_vable_info literal port:
-    //
-    //     def consume_vable_info(self, vinfo, vable_size):
-    //         assert vable_size
-    //         virtualizable = self.next_ref()
-    //         assert vinfo.get_total_size(virtualizable) == vable_size - 1
-    //         vinfo.reset_token_gcref(virtualizable)
-    //         vinfo.write_from_resume_data_partial(virtualizable, self)
-    //
-    // Called from `consume_vref_and_vable` (resume.py:1424-1431) in the
-    // ResumeDataBoxReader path that `blackhole_from_resumedata`
-    // (resume.py:1312-1342) drives. majit's blackhole entry mirrors that
-    // path by selecting `ResumeVableMode::BlackholeConsume`, which writes
-    // the captured vable payload to the heap BEFORE any blackhole
-    // interpreter starts running.
-    //
-    // Guard-failure recovery is a different upstream helper chain:
-    // pyjitpl.py:3419-3430 stores `self.virtualizable_boxes`, resets the
-    // token, then calls `self.synchronize_virtualizable()` which ends at
-    // virtualizable.py:101-113 `write_boxes`. That exact path is modeled by
-    // `ResumeVableMode::GuardFailureSync`.
+    // pyjitpl.py:3419-3430 synchronize_virtualizable on guard-failure
+    // bridge entry: stores `self.virtualizable_boxes`, resets the token,
+    // then calls `self.synchronize_virtualizable()` which ends at
+    // virtualizable.py:101-113 `write_boxes`. `ResumeVableMode::GuardFailureSync`
+    // models that path: it writes the captured vable boxes back onto the
+    // physical frame so the tracer's subsequent vable reads see the
+    // resume-data values, not the pre-guard heap. (The blackhole resume
+    // path performs its own consume_vable_info write inside
+    // `blackhole_resume_via_rd_numb` (resume.py:1399-1408).)
     if !vable_frame_ptr.is_null() {
         let frame_u8 = vable_frame_ptr as *mut u8;
         // resume.py:1312-1314 blackhole_from_resumedata parity:
@@ -6071,72 +6029,6 @@ fn build_resumed_frames(
             ResumeVableMode::GuardFailureSync => {
                 sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
             }
-            ResumeVableMode::BlackholeConsume => unsafe {
-                // resume.py:1407 reset_token_gcref
-                vinfo.reset_vable_token(frame_u8);
-
-                // virtualizable.py:126-137 write_from_resume_data_partial:
-                //
-                //     for FIELDTYPE, fieldname in unroll_static_fields:
-                //         x = reader.load_next_value_of_type(FIELDTYPE)
-                //         setattr(virtualizable, fieldname, x)
-                //
-                // resolved_vable layout (opencoder.py:722
-                // _list_of_boxes_virtualizable parity):
-                //   [0]            virtualizable_ptr  (= the frame itself)
-                //   [1..num_scalars] static fields
-                //     (last_instr, pycode, valuestackdepth, debugdata,
-                //      lastblock, w_globals — line-by-line PyPy parity
-                //      with `interp_jit.py:25-31`)
-                //   [num_scalars..] array items
-                //
-                // resume.py:1406 exact-size invariant:
-                // assert vinfo.get_total_size(virtualizable) == vable_size - 1.
-                let expected = vinfo.num_static_extra_boxes
-                    + (0..vinfo.array_fields.len())
-                        .map(|array_index| {
-                            vinfo.get_array_length(frame_u8.cast_const(), array_index)
-                        })
-                        .sum::<usize>();
-                assert_eq!(
-                    resolved_vable.len(),
-                    expected + 1,
-                    "consume_vable_info: virtualizable box count mismatch (expected {}, got {})",
-                    expected + 1,
-                    resolved_vable.len(),
-                );
-                let static_boxes: Vec<i64> = vinfo
-                    .static_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(field_index, field)| {
-                        value_to_static_vable_bits(
-                            &resolved_vable[field_index + 1],
-                            field.field_type,
-                            field_index,
-                        )
-                    })
-                    .collect();
-
-                let mut cursor = 1 + vinfo.num_static_extra_boxes;
-                let mut array_boxes: Vec<Vec<i64>> = Vec::with_capacity(vinfo.array_fields.len());
-                for (array_index, array_field) in vinfo.array_fields.iter().enumerate() {
-                    let array_len = vinfo.get_array_length(frame_u8.cast_const(), array_index);
-                    let mut array_items: Vec<i64> = Vec::with_capacity(array_len);
-                    for item_index in 0..array_len {
-                        array_items.push(value_to_vable_array_item_bits(
-                            &resolved_vable[cursor],
-                            array_field.item_type,
-                            array_index,
-                            item_index,
-                        ));
-                        cursor += 1;
-                    }
-                    array_boxes.push(array_items);
-                }
-                debug_assert_eq!(cursor, resolved_vable.len());
-                vinfo.write_all_boxes(frame_u8, &static_boxes, &array_boxes);
-            },
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(

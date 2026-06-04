@@ -4233,6 +4233,180 @@ impl BridgeVirtualCache {
 /// Value for shadow slots / continue_tracing. Replaces the separate
 /// `resolve()` + `decode_concrete()` closures so both paths always execute
 /// together — no drift between symbolic and concrete materialization.
+/// Task #64 bug-2: decode one inlined-callee resume frame
+/// (`resume_data.frames[i]`, `i >= 1`) into a [`ReconstructRecipe`] for the
+/// multi-frame bridge carrier. Mirrors the per-bank `consume_boxes` decode
+/// `setup_bridge_sym` runs for the portal frame (resume.py:1054) but writes a
+/// fresh recipe instead of the root `sym`, and emits NO trace IR (the
+/// forward-call guard_value / callee-frame helper / no-exception guard belong
+/// to a call with a LIVE caller; a reconstructed suspended frame has none).
+///
+/// The decoded bank vectors are indexed by pyre's semantic register index
+/// (Python-bytecode `locals_cells_stack_w` position, not an RPython color),
+/// so they align with `write_stack_slot`'s `nlocals + stack_idx`. The
+/// assembly into a `PyFrame` + `PyreSym` is deferred to `trace_bytecode`
+/// (the carrier drain), where the root concrete frame's globals/EC are
+/// available and the rebuilt locals are GC-rooted immediately.
+///
+/// Returns `None` (→ abort the multi-frame path, fall back to the
+/// single-frame bridge) when the callee cannot be faithfully rebuilt:
+///   - `pc` is the no-snapshot sentinel (`< 0`),
+///   - `jitcode_index` does not resolve to a code object,
+///   - the callee has cell or free variables — `locals_cells_stack_w` then
+///     carries cell objects whose contents are not in the resume liveness
+///     stream, so a dead-frame rebuild would seed null cells and LOAD_DEREF
+///     would raise `NameError`,
+///   - the liveness enumeration count disagrees with the encoded section.
+fn reconstruct_inline_recipe(
+    ctx: &mut majit_metainterp::TraceCtx,
+    frame: &majit_ir::resumedata::RebuiltFrame,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache,
+) -> Option<ReconstructRecipe> {
+    if frame.pc < 0 {
+        return None;
+    }
+    let w_code = code_for_jitcode_index(frame.jitcode_index)?;
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return None;
+    }
+    let code_ref = unsafe { &*raw_code };
+    if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
+        return None;
+    }
+    let nlocals = code_ref.varnames.len();
+
+    let reg_indices = frame_liveness_reg_indices_by_bank_at(frame.jitcode_index, frame.pc);
+    // resume.py:1054 consume_boxes: the liveness enumeration count must match
+    // the encoded frame section exactly.
+    if reg_indices.total_len() != frame.values.len() {
+        return None;
+    }
+    // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
+    // the frame's locals_cells_stack_w is a W_Root array — all live slots are
+    // boxed Ref. The encoder confirms this empirically (both reconstructed
+    // function_calls frames decode 0 int / 0 float registers). A reconstructed
+    // inline callee has no virtualizable array, so an int/float-bank register
+    // here would have no boxed-Ref source to seed `registers_r` (the reader
+    // always reads `registers_r[k]`, trace_opcode.rs:2128/684). Fall back to
+    // the single-frame bridge rather than synthesize an unboxed local.
+    if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
+        return None;
+    }
+
+    let mut registers_i: Vec<OpRef> = Vec::new();
+    let mut registers_r: Vec<OpRef> = Vec::new();
+    let mut registers_f: Vec<OpRef> = Vec::new();
+    let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
+    let mut value_cursor = 0usize;
+    for &reg_idx in &reg_indices.int {
+        let (op, _val) = bridge_decode_box(
+            ctx,
+            &frame.values[value_cursor],
+            Type::Int,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_i.len() {
+            registers_i.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_i[reg_idx] = op;
+        value_cursor += 1;
+    }
+    for &reg_idx in &reg_indices.ref_ {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            &frame.values[value_cursor],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_r.len() {
+            registers_r.resize(reg_idx + 1, OpRef::NONE);
+            concrete_r.resize(reg_idx + 1, majit_ir::Value::Void);
+        }
+        registers_r[reg_idx] = op;
+        concrete_r[reg_idx] = val;
+        value_cursor += 1;
+    }
+    for &reg_idx in &reg_indices.float {
+        let (op, _val) = bridge_decode_box(
+            ctx,
+            &frame.values[value_cursor],
+            Type::Float,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_f.len() {
+            registers_f.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_f[reg_idx] = op;
+        value_cursor += 1;
+    }
+
+    // pyframe.py:107-110: locals + cells + stack. Cells are gated out above.
+    // The semantic `valuestackdepth` is `stack_base() + operand_depth`, where
+    // `operand_depth` is the logical stack height the codewriter's forward
+    // dataflow computes for this pc (`LiveVars::stack_depth_at`). It is NOT
+    // the live-register count: the liveness file can keep dead temp slots
+    // live ABOVE the logical stack top (e.g. at a conditional-branch target
+    // the not-taken branch's stack colors stay live), so `registers_r.len()`
+    // over-counts the stack. The portal frame reads the equivalent figure
+    // from the encoded vable `valuestackdepth` scalar (state.rs:6382); an
+    // inline frame has no such scalar, so derive it from the bytecode here.
+    // Dead-temp register slots above `valuestackdepth` stay in `registers_r`
+    // (the reader never accesses them as stack) but are NOT seeded as
+    // concrete operands. An unreachable resume pc aborts the multi-frame path.
+    let valuestackdepth =
+        match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize) {
+            Some(d) => nlocals + d,
+            None => return None,
+        };
+    if registers_r.len() < valuestackdepth {
+        registers_r.resize(valuestackdepth, OpRef::NONE);
+        concrete_r.resize(valuestackdepth, majit_ir::Value::Void);
+    }
+
+    Some(ReconstructRecipe {
+        w_code,
+        jitcode_index: frame.jitcode_index,
+        pc: frame.pc as usize,
+        nlocals,
+        valuestackdepth,
+        registers_i,
+        registers_r,
+        registers_f,
+        concrete_r,
+        nargs: nlocals,
+    })
+}
+
 fn bridge_decode_box(
     ctx: &mut majit_metainterp::TraceCtx,
     v: &majit_ir::resumedata::RebuiltValue,
@@ -6294,8 +6468,28 @@ impl JitState for PyreJitState {
             .enumerate()
             .take(semantic_prefix_len)
         {
-            if slot.is_none() {
-                *slot = vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE);
+            // virtualizable.py:86-98 + pyjitpl.py:3430 synchronize_virtualizable:
+            // the frame's `locals_cells_stack_w` array (the vable image) is the
+            // authoritative post-guard source for the frame's locals. The
+            // per-frame liveness register reconstruction (`frame.values`) is
+            // only canonicalized-to-locals at a merge point; at an arbitrary
+            // interior resume pc a local slot's jitcode color may hold a dead
+            // temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`).
+            // Such a dead-temp NULL must not shadow the vable's live local, so
+            // for local slots prefer the vable array item over a NONE or
+            // null-const register value. Stack slots keep the NONE-only
+            // fallback (a real stack value must not be overwritten).
+            let is_local = idx < nlocals;
+            let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+            let want_vable = slot.is_none() || (is_local && slot_is_null_const);
+            if want_vable {
+                if let Some(v) = vable_array_items.get(idx).copied() {
+                    if !v.is_none() {
+                        *slot = v;
+                    } else if slot.is_none() {
+                        *slot = OpRef::NONE;
+                    }
+                }
             }
         }
         let bridge_locals: Vec<OpRef> = bridge_registers_r.iter().take(nlocals).copied().collect();
@@ -6548,6 +6742,54 @@ impl JitState for PyreJitState {
         // GuardFailureSync`) which runs in the compiled bridge's
         // guard-failure recovery chain BEFORE `setup_bridge_sym`.
         // No additional synchronize call is needed here.
+
+        // Task #64 bug-2: multi-frame bridge. The body above reconstructed
+        // the portal (`frames[0]`) into the caller-visible root `sym`. When
+        // the guard fired inside inlined callees, `frames[1..]` (OUTERMOST-
+        // FIRST) must also be reconstructed and pushed so the framestack
+        // matches the inline depth (`rebuild_from_resumedata` resume.py:1049-
+        // 1056: every frame via `newframe`+`consume_boxes`, then tracing
+        // continues at `framestack[-1]`). Decode each into a lightweight
+        // recipe here (while `resume_data` / `virtuals_cache` are in scope);
+        // `trace_bytecode` assembles+pushes them right before `interpret()`.
+        // Any callee that cannot be faithfully rebuilt aborts the whole
+        // multi-frame path back to the single-frame bridge (status quo).
+        // The outermost (root) frame resumes at its OWN pc once the
+        // reconstructed callees return — NOT at the innermost pc that
+        // `decode_and_restore_guard_failure` returns as the trace start.
+        // Thread `frames[0].pc` so `trace_bytecode` can root main@34 while
+        // the carrier callees resume at their frames[i].pc. A negative
+        // (no-snapshot) root pc aborts the multi-frame path.
+        if resume_data.frames.len() > 1 && resume_data.frames[0].pc >= 0 {
+            let root_pc = resume_data.frames[0].pc as usize;
+            let mut recipes: Vec<ReconstructRecipe> =
+                Vec::with_capacity(resume_data.frames.len() - 1);
+            let mut ok = true;
+            for frame in &resume_data.frames[1..] {
+                match reconstruct_inline_recipe(
+                    ctx,
+                    frame,
+                    rd_virtuals,
+                    resume_data,
+                    fail_values,
+                    fail_types,
+                    backend,
+                    &mut virtuals_cache,
+                ) {
+                    Some(recipe) => recipes.push(recipe),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !recipes.is_empty() {
+                crate::state::set_bridge_inline_carrier(crate::state::BridgeInlineCarrier {
+                    root_pc,
+                    recipes,
+                });
+            }
+        }
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
@@ -10156,6 +10398,215 @@ pub struct PendingInlineFrame {
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
     pub caller_result_type: Option<Type>,
+}
+
+/// Task #64 bug-2: a decoded-but-not-yet-built description of one inlined
+/// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
+/// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
+/// while `resume_data` / the rd_virtuals cache are in scope; `trace_bytecode`
+/// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
+/// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
+/// frame's globals/EC available and immediate GC-rooting (`rebuild_from_
+/// resumedata` resume.py:1042-1057 rebuilds frames and immediately interprets;
+/// pyre defers the build to the drain so the reconstructed locals are never
+/// held unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
+///
+/// The bank vectors are indexed by pyre's semantic register index
+/// (`frame_liveness_reg_indices_by_bank_at`): pyre traces Python bytecode, so
+/// these are `locals_cells_stack_w` positions, NOT RPython regalloc colors,
+/// and align with `write_stack_slot`/LOAD_FAST's `nlocals + stack_idx`.
+/// `concrete_r` is parallel to `registers_r` and seeds the assembled frame's
+/// `locals_cells_stack_w` (Int/Float boxed at assembly time per
+/// `value_to_vable_array_item_bits` eval.rs:5829).
+pub struct ReconstructRecipe {
+    pub w_code: *const (),
+    pub jitcode_index: i32,
+    pub pc: usize,
+    pub nlocals: usize,
+    pub valuestackdepth: usize,
+    pub registers_i: Vec<OpRef>,
+    pub registers_r: Vec<OpRef>,
+    pub registers_f: Vec<OpRef>,
+    pub concrete_r: Vec<majit_ir::Value>,
+    pub nargs: usize,
+}
+
+/// Task #64 bug-2: the decoded inline-callee recipes for one multi-frame
+/// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
+/// builds the caller-visible root frame at `root_pc` and pushes each
+/// recipe on top (innermost last), so the framestack matches the inline
+/// depth the guard fired at (`rebuild_from_resumedata` resume.py:1049-1056).
+pub struct BridgeInlineCarrier {
+    /// `resume_data.frames[0].pc` — where the outermost (portal/root) frame
+    /// resumes once the reconstructed callees return. The bridge's returned
+    /// resume pc (`decode_and_restore_guard_failure`) is the INNERMOST frame's
+    /// pc; the root must instead resume at its own `frames[0].pc`, so this is
+    /// threaded separately rather than derived from the trace start pc.
+    pub root_pc: usize,
+    /// `resume_data.frames[1..]`, OUTERMOST-FIRST. The portal (`frames[0]`)
+    /// is NOT here — it is the caller-visible root `sym`.
+    pub recipes: Vec<ReconstructRecipe>,
+}
+
+thread_local! {
+    /// Task #64 bug-2: the multi-frame bridge carrier decoded by
+    /// `setup_bridge_sym` and drained once by `trace_bytecode`, which
+    /// assembles+pushes each recipe through `push_inline_frame`. `None` for
+    /// primary traces and single-frame bridges.
+    ///
+    /// pyre-only side channel with no upstream counterpart (RPython's
+    /// rebuild and `_interpret` are methods on one `MetaInterp`). Carrying
+    /// the lightweight `ReconstructRecipe` (no `PyreSym`/`PyFrame`)
+    /// thread-locally is safe against re-entrancy: each bridge attempt runs
+    /// `setup_bridge_sym` (`call_jit.rs` start_bridge_tracing) then
+    /// `trace_bytecode` sequentially on one thread before any tracing begins.
+    /// ORDER INVARIANT: recipes stay OUTERMOST-FIRST and carry per-frame
+    /// greenkey inputs, because `push_inline_frame` re-runs
+    /// `enter_inline_frame` + `push_inline_trace_position` +
+    /// `portal_call_depth += 1` per frame (metainterp.rs:421-475).
+    static BRIDGE_INLINE_CARRIER: RefCell<Option<BridgeInlineCarrier>> =
+        const { RefCell::new(None) };
+}
+
+/// Stash the decoded inline-callee carrier for the bridge currently being
+/// set up. Overwrites any prior unconsumed value.
+pub(crate) fn set_bridge_inline_carrier(carrier: BridgeInlineCarrier) {
+    BRIDGE_INLINE_CARRIER.with(|c| *c.borrow_mut() = Some(carrier));
+}
+
+/// Take the decoded inline-callee carrier for the bridge about to be
+/// traced, leaving the carrier empty. Returns `None` for single-frame
+/// bridges and primary traces.
+pub(crate) fn take_bridge_inline_carrier() -> Option<BridgeInlineCarrier> {
+    BRIDGE_INLINE_CARRIER.with(|c| c.borrow_mut().take())
+}
+
+/// Reify one Ref-bank recipe slot as the boxed `W_Root` pointer that
+/// `locals_cells_stack_w` (a W_Root array, virtualizable.py:86-98) must
+/// hold. `reconstruct_inline_recipe` gates int/float banks out of multi-
+/// frame recipes, so a live slot is always `Value::Ref` (the decoded box,
+/// possibly null) and a dead slot is `Value::Void`; the int/float arms only
+/// exist defensively (box back to a heap object) and never fire in practice.
+fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
+    match v {
+        majit_ir::Value::Ref(gc) => gc.0 as PyObjectRef,
+        majit_ir::Value::Void => pyre_object::PY_NULL,
+        majit_ir::Value::Int(i) => w_int_new(i),
+        majit_ir::Value::Float(f) => pyre_object::w_float_new(f),
+    }
+}
+
+/// Task #64 bug-2: assemble one decoded inline-callee [`ReconstructRecipe`]
+/// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
+/// for `trace_bytecode` to push onto the bridge framestack.
+///
+/// Mirrors `build_pending_inline_frame`'s IR-FREE FAST branch
+/// (`trace_opcode.rs:6035-6084`): set `jitcode` FIRST (the
+/// `setup_kind_register_banks` debug_assert requires a non-null jitcode),
+/// then fill the per-bank register files + the lazy-boxing concrete shadow.
+/// It emits NO trace IR — the forward FAST branch's guard_value /
+/// callee-frame helper / GUARD_NO_EXCEPTION belong to a LIVE caller making a
+/// call; a reconstructed suspended frame is simply pushed.
+///
+/// `globals` / `w_globals_obj` / `execution_context` come from the bridge's
+/// root concrete frame. The resume stream does not carry per-inline-frame
+/// globals (inline frames are not virtualizable owners, so `vable_w_globals`
+/// is only encoded for `frames[0]`), but every multi-frame bridge resume pc
+/// is a CALL return point, so the reconstructed callee never re-runs
+/// LOAD_GLOBAL before returning, and same-module callees (the common case,
+/// e.g. `function_calls` main/mix/add3) share the root's module dict.
+///
+/// `parent_frames` is the OUTER chain (immediate parent first) the drain
+/// builds from the framestack; `push_inline_frame` stamps
+/// `parent_frames.first().pending_result_*` with the caller result slot.
+pub(crate) fn assemble_bridge_inline_pending(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+    globals: *mut pyre_interpreter::DictStorage,
+    w_globals_obj: PyObjectRef,
+    execution_context: *const pyre_interpreter::PyExecutionContext,
+    parent_frames: Vec<ResumeFrameState>,
+) -> PendingInlineFrame {
+    use pyre_interpreter::pyframe::PyFrame;
+
+    let nlocals = recipe.nlocals;
+    let valuestackdepth = recipe.valuestackdepth;
+
+    // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
+    // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from
+    // the decoded boxes. The callee has no cells/freevars (gated in
+    // `reconstruct_inline_recipe`), so `closure = PY_NULL` and the array
+    // layout is `[locals | stack]` with `stack_base() == nlocals`.
+    let mut concrete_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        recipe.w_code,
+        &[],
+        globals,
+        w_globals_obj,
+        execution_context,
+        pyre_object::PY_NULL,
+    );
+    {
+        let arr = concrete_frame.locals_w_mut();
+        for k in 0..nlocals {
+            arr[k] = recipe_slot_to_pyobj(recipe.concrete_r[k]);
+        }
+    }
+    for k in nlocals..valuestackdepth {
+        concrete_frame.push(recipe_slot_to_pyobj(recipe.concrete_r[k]));
+    }
+    // last_instr = recipe.pc - 1 so next_instr() resumes AT recipe.pc.
+    concrete_frame.set_last_instr_from_next_instr(recipe.pc);
+
+    // Symbolic side: mirror the FAST branch field-for-field.
+    let mut sym = PyreSym::new_uninit(OpRef::NONE);
+    sym.nlocals = nlocals;
+    sym.valuestackdepth = valuestackdepth;
+    // jitcode FIRST — setup_kind_register_banks debug_asserts non-null.
+    sym.jitcode = jitcode_for(recipe.w_code);
+    // The Ref bank IS the unified locals+stack register file decoded by
+    // `reconstruct_inline_recipe`; int/float banks are empty (gated out).
+    sym.registers_i = recipe.registers_i.clone();
+    sym.registers_r = recipe.registers_r.clone();
+    sym.registers_f = recipe.registers_f.clone();
+    // locals_cells_stack_w is a W_Root array — every live slot is Ref.
+    sym.symbolic_local_types = vec![Type::Ref; nlocals];
+    sym.symbolic_stack_types = vec![Type::Ref; valuestackdepth - nlocals];
+    // Box-identity shadow: unbox per the FAST branch (`ConcreteValue::
+    // from_pyobj`), so a boxed int/float local tracks as Int/Float.
+    sym.concrete_locals = (0..nlocals)
+        .map(|k| ConcreteValue::from_pyobj(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .collect();
+    sym.concrete_stack = (nlocals..valuestackdepth)
+        .map(|k| ConcreteValue::from_pyobj(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .collect();
+    sym.concrete_namespace = w_globals_obj;
+    sym.concrete_execution_context = execution_context;
+    // pyjitpl.py:74-90 MIFrame.setup: size the per-kind banks + copy_constants.
+    // The constant tail lands at `[num_regs_X..]`, beyond the live
+    // valuestackdepth prefix (`num_regs_r` is the full Ref register file),
+    // so the live slots set above are preserved. `locals_cells_stack_array_
+    // ref` stays NONE: dead (NONE) slots are never read — the liveness stream
+    // only carries live values, so no heap fall-through is needed (and
+    // `s.frame` is NONE, so emitting the array getfield would be invalid).
+    sym.setup_kind_register_banks(ctx);
+
+    PendingInlineFrame {
+        sym,
+        concrete_frame,
+        // No virtual_ref for a reconstructed frame: the forward trace's
+        // virtual_ref was already finished/encoded; None skips the
+        // opimpl_virtual_ref emission in push_inline_frame.
+        drop_frame_opref: None,
+        // The reconstructed frame represents the same inlined call the
+        // forward trace pushed at function entry; match its (code, 0)
+        // greenkey identity for recursion-depth + inline-position tracking.
+        green_key: crate::driver::make_green_key(recipe.w_code, 0),
+        green_key_raw: (recipe.w_code as usize, 0),
+        parent_frames,
+        nargs: recipe.nargs,
+        caller_result_stack_idx: None,
+        caller_result_type: Some(Type::Ref),
+    }
 }
 
 pub enum InlineTraceStepAction {

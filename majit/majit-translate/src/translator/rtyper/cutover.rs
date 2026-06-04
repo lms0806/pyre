@@ -666,8 +666,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // most frequent reach is `OpKind::Abort` emitted by
         // `front/ast.rs::stop_unsupported` / `continue_with_unknown`
         // when the surface DSL hits an unsupported expression — pyre
-        // source like `execute_opcode_step` / `eval_loop_jit` /
-        // `build_blackhole_frames_from_deadframe` all carry such
+        // source like `execute_opcode_step` / `eval_loop_jit` carry such
         // placeholders today.  Convergence path: retire each Abort
         // emit-site at the front-end (per-variant epic — closure
         // body, complex match arms, unsupported literals), then

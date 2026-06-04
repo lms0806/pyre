@@ -436,6 +436,21 @@ impl LiveVars {
             .map_or(false, |&d| d != usize::MAX)
     }
 
+    /// Semantic operand-stack depth at `pc` (count of values above
+    /// `stack_base()`, excluding locals/cells), or `None` for an
+    /// unreachable pc (forward-pass `usize::MAX` sentinel). The liveness
+    /// register file may keep dead temp slots live above this depth, so the
+    /// resume reconstruction sizes a frame's `valuestackdepth` from this —
+    /// the true logical stack top — not from the live-register count (the
+    /// portal path reads the equivalent value from the encoded vable
+    /// `valuestackdepth` scalar; inline frames have no such scalar).
+    pub fn stack_depth_at(&self, pc: usize) -> Option<usize> {
+        match self.stack_depth_at.get(pc).copied() {
+            Some(d) if d != usize::MAX => Some(d),
+            _ => None,
+        }
+    }
+
     /// G.4.2: per-PC stack depth in `u16`, sized to
     /// `code.instructions.len()`.
     ///

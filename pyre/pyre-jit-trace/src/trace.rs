@@ -33,6 +33,31 @@ pub fn trace_bytecode(
     let ctx = meta
         .trace_ctx()
         .expect("trace_bytecode invariant: meta.tracing must be Some during merge_point closure");
+    // Task #64 bug-2: a multi-frame bridge carrier overrides the trace-start
+    // pc with the OUTERMOST (`frames[0]`) resume pc. The passed `start_pc` is
+    // the INNERMOST frame's pc (`decode_and_restore_guard_failure` returns
+    // `jit_state.next_instr()`), which belongs to the deepest reconstructed
+    // callee — NOT the root. The callees are reconstructed + pushed below
+    // (innermost last) so `interpret()` resumes at the deepest frame; the root
+    // resumes at `root_pc` once they return (`rebuild_from_resumedata`
+    // resume.py:1049-1056). Snapshot the root frame's globals/EC now, before
+    // `concrete_frame` is moved into the root `MetaInterpFrame`.
+    let carrier = crate::state::take_bridge_inline_carrier();
+    let (start_pc, root_globals, root_w_globals_obj, root_ec) = if let Some(ref c) = carrier {
+        (
+            c.root_pc,
+            concrete_frame.get_w_globals(),
+            concrete_frame.w_globals_obj,
+            concrete_frame.execution_context,
+        )
+    } else {
+        (
+            start_pc,
+            std::ptr::null_mut(),
+            pyre_object::PY_NULL,
+            std::ptr::null(),
+        )
+    };
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
@@ -82,6 +107,67 @@ pub fn trace_bytecode(
             })
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
+    }
+
+    // Task #64 bug-2: assemble + push each reconstructed inline callee onto the
+    // root, OUTERMOST-FIRST, so the framestack matches the inline depth the
+    // guard fired at (`[root@root_pc, frames[1]@pc, .., frames[N]@pc]`).
+    // `interpret()` resumes at the innermost (last-pushed) frame, runs it to
+    // RETURN, writes its result into its caller's stack, and unwinds up to the
+    // root — `rebuild_from_resumedata` resume.py:1049-1056 then `_interpret`.
+    if let Some(carrier) = carrier {
+        for recipe in &carrier.recipes {
+            // Snapshot the immediate parent (current framestack top) before the
+            // mutable push. The caller result slot uses the same formula the
+            // forward call site applies (trace_opcode/metainterp `perform_call`):
+            // `valuestackdepth - nlocals - 1` overwrites the consumed callable
+            // slot the resume snapshot still carries.
+            let (parent_sym, parent_cf_addr, parent_pc, parent_parents, result_idx) = {
+                let parent = metainterp
+                    .framestack
+                    .last()
+                    .expect("trace_bytecode: root frame pushed before carrier drain");
+                let psym = unsafe { &*parent.sym };
+                let result_idx = psym
+                    .valuestackdepth
+                    .saturating_sub(psym.nlocals)
+                    .checked_sub(1);
+                (
+                    parent.sym,
+                    parent.concrete_frame,
+                    parent.pc,
+                    parent.parent_frames.clone(),
+                    result_idx,
+                )
+            };
+            // opencoder.py:819-834: this callee's parent chain = immediate
+            // parent (just snapshotted) followed by the parent's own ancestors.
+            let mut parent_frames = vec![crate::state::ResumeFrameState {
+                sym: parent_sym,
+                concrete_frame_addr: parent_cf_addr,
+                resume_pc: parent_pc,
+                pending_result_stack_idx: None,
+                pending_result_type: None,
+            }];
+            parent_frames.extend(parent_parents);
+            let pending = crate::state::assemble_bridge_inline_pending(
+                ctx,
+                recipe,
+                root_globals,
+                root_w_globals_obj,
+                root_ec,
+                parent_frames,
+            );
+            metainterp.push_inline_frame(ctx, pending, result_idx);
+            // push_inline_frame hardcodes MetaInterpFrame.pc = 0; retarget to
+            // the reconstructed resume pc. The concrete frame's last_instr was
+            // already set in assemble_bridge_inline_pending.
+            let top = metainterp
+                .framestack
+                .last_mut()
+                .expect("trace_bytecode: pushed inline frame missing");
+            top.pc = recipe.pc;
+        }
     }
 
     let action = metainterp.interpret(ctx);

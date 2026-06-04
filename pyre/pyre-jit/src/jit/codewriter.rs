@@ -7315,23 +7315,20 @@ impl CodeWriter {
                             // level. Keep that graph shape; the residual helper
                             // below is walker/backend adaptation only.
                             let scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // Walker-side getfield_vable_r for w_globals (field 3)
-                            // and pycode (field 1) — namespace for lookup,
-                            // code for names.  Do not dual-write these into the
-                            // graph: RPython flowspace's LOAD_GLOBAL path has
-                            // already folded the value to a Constant.
+                            // Walker-side getfield_vable_r for w_globals
+                            // (field 5) — the namespace for the lookup.  Do not
+                            // dual-write into the graph: RPython flowspace's
+                            // LOAD_GLOBAL path has already folded the value to a
+                            // Constant.  `w_globals` stays a register read: its
+                            // traced GetfieldVableR form is what the optimizer
+                            // matches in the known-result cache, so a ConstRef
+                            // would break that fold (see
+                            // `compile_jitcode_for_callee` doc block).
                             emit_vable_getfield_ref_walker_only(
                                 &current_block,
                                 portal_frame_reg,
                                 scratch_ns,
                                 VABLE_NAMESPACE_FIELD_IDX,
-                            );
-                            emit_vable_getfield_ref_walker_only(
-                                &current_block,
-                                portal_frame_reg,
-                                scratch_code,
-                                VABLE_CODE_FIELD_IDX,
                             );
                             // Write the load_global result directly to the
                             // stack slot it will occupy after the push (and
@@ -7348,17 +7345,52 @@ impl CodeWriter {
                             // (emit_pushvalue_ref ref_copy elimination).
                             let null_offset: u16 = if raw_namei & 1 != 0 { 1 } else { 0 };
                             let loaded_dst_reg = stack_base + current_depth + null_offset;
-                            push_walker_emit(
-                                &current_block,
-                                super::flatten::build_load_global_fn_residual_call_ir_r_insn(
-                                    load_global_fn_idx,
-                                    raw_namei,
-                                    scratch_ns,
-                                    scratch_code,
+                            // pyframe.py:509-510 `getcode(): hint(self.pycode,
+                            // promote=True)`: `frame.pycode` (field 1) is a
+                            // promote-to-constant on every trace.  A portal
+                            // entry promotes at the merge point via the vable
+                            // getfield; a non-portal callee's pycode is the
+                            // callee's own `W_Code` pointer, already a
+                            // compile-time constant.  In a chained blackhole
+                            // resume `portal_frame_reg` aliases the OUTERMOST
+                            // (caller) frame, so reading pycode off it would
+                            // pick up the caller's `names` table — the
+                            // function_calls miscompile.  Mirror the
+                            // `Instruction::LoadConst` arm: portal keeps the
+                            // vable getfield + register operand, non-portal
+                            // feeds `w_code` directly as `Operand::ConstRef`.
+                            if is_portal {
+                                let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                                emit_vable_getfield_ref_walker_only(
+                                    &current_block,
                                     portal_frame_reg,
-                                    loaded_dst_reg,
-                                ),
-                            );
+                                    scratch_code,
+                                    VABLE_CODE_FIELD_IDX,
+                                );
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_load_global_fn_residual_call_ir_r_insn(
+                                        load_global_fn_idx,
+                                        raw_namei,
+                                        scratch_ns,
+                                        scratch_code,
+                                        portal_frame_reg,
+                                        loaded_dst_reg,
+                                    ),
+                                );
+                            } else {
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_load_global_fn_residual_call_ir_r_insn_with_const_pycode(
+                                        load_global_fn_idx,
+                                        raw_namei,
+                                        scratch_ns,
+                                        w_code as i64,
+                                        portal_frame_reg,
+                                        loaded_dst_reg,
+                                    ),
+                                );
+                            }
                             let name_idx = raw_namei as usize >> 1;
                             let result_value = code
                                 .names
@@ -10288,47 +10320,66 @@ pub fn register_portal_jitdriver(
 ///     and emits `build_load_const_fn_residual_call_ir_r_insn_with_const_pycode`
 ///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
 ///   * `bh_load_global_fn(namespace_ptr, w_code_ptr, frame_ptr, namei)` —
-///     **dormant helpers landed**:
+///     **pycode operand migrated**.  Walker emit in the
+///     `Instruction::LoadGlobal` arm splits on `is_portal`: portal keeps
+///     the `getfield_vable_r(portal_frame_reg, code_field)` + register
+///     operand; non-portal skips that vable getfield and emits
 ///     `build_load_global_fn_residual_call_ir_r_insn_with_const_pycode`
-///     (pycode-only ConstRef) and
+///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
+///     This fixes the function_calls miscompile: in a chained blackhole
+///     resume `portal_frame_reg` aliases the OUTERMOST (caller) frame, so
+///     `getfield_vable_r(portal_frame_reg, pycode)` returned the caller's
+///     `W_Code`, and an inlined callee's `LOAD_GLOBAL` then indexed the
+///     caller's `names` table (resolving the wrong global, e.g. calling
+///     an int).  Same basis as the migrated LoadConst pycode ConstRef
+///     (`pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`)
+///     and safe for the same reason (see "Why LoadConst ConstRef works"
+///     below): pycode is a promoted constant whose value equals the
+///     pointer `getfield_vable_r` would read, so the QuasiimmutField key
+///     matches.
+///
+///     The `ns` (namespace) and `frame` operands stay register-form and
+///     are NOT migrated.  `pyframe.py:49 self.w_globals = w_globals` at
+///     frame construction initializes the namespace from
+///     `pycode.w_globals`, so its VALUE is derivable from the promoted
+///     pycode, but the trace walker reads `frame.w_globals` as a
+///     register-form operand (via `GetfieldVableR`) so the optimizer can
+///     match it in the known-result cache — a ConstRef would break that
+///     fold.  A trial wire of the dormant
 ///     `build_load_global_fn_residual_call_ir_r_insn_with_all_consts`
 ///     (all-three ConstRef: namespace from `W_CodeObject.w_globals`,
-///     pycode = callee `w_code`, frame = `ConstRef(0)` — **unsound**:
-///     null frame skips `get_builtin()` fallback required by
-///     `pyopcode.py:957`; see flatten.rs doc on that helper).
-///     `pyframe.py:49 self.w_globals = w_globals` at frame construction
-///     initializes the namespace from `pycode.w_globals`, so its VALUE
-///     is derivable from the promoted pycode.  However the trace walker
-///     reads `frame.w_globals` as a register-form operand (via
-///     `GetfieldVableR`) so the optimizer can match it in the
-///     known-result cache — a ConstRef would break that fold.  A trial
-///     wire of `_with_all_consts` from the `Instruction::LoadGlobal` arm
-///     was attempted and reverted — **root cause found and CLOSED**.
-///     The "latent for non-portal callees" assumption was WRONG:
-///     non-portal jitcode bytecode IS walked by the trace recorder
-///     (`jitcode_dispatch.rs` walker) during callee inlining.  The
-///     walker's `read_ref_var_list` (jitcode_dispatch.rs:1029) reads
-///     `ctx.registers_r[reg]` for each ref operand — register-form
+///     pycode = callee `w_code`, frame = `ConstRef(0)`) was attempted and
+///     reverted — **root cause found and CLOSED**.  `_with_all_consts`
+///     is doubly unsound: the null frame skips the `get_builtin()`
+///     fallback required by `pyopcode.py:957` (breaks `print`/`len`),
+///     and non-portal jitcode bytecode IS walked by the trace recorder
+///     (`jitcode_dispatch.rs` walker) during callee inlining — its
+///     `read_ref_var_list` (jitcode_dispatch.rs:1029) reads
+///     `ctx.registers_r[reg]` for each ref operand, so register-form
 ///     operands produce TRACED variables (results of `GetfieldVableR`
 ///     IR ops) that participate in the optimizer's
 ///     `RecordKnownResult`/`QuasiimmutField` fold, while ConstRef
-///     operands produce RAW CONSTANT arguments that the optimizer
-///     cannot match against the known-result cache.  The mismatch
-///     causes the optimizer to emit wrong code (mismatched fold →
+///     operands produce RAW CONSTANT arguments that cannot match the
+///     known-result cache, emitting wrong code (mismatched fold →
 ///     wrong result patched into the portal's resume snapshot →
 ///     fastlocal corruption on guard failure).
 ///     **Why LoadConst ConstRef works**: `load_const_fn(pycode, idx)`
 ///     has pycode as its sole ref arg; the ConstRef value IS the same
 ///     pointer the walker would read from `getfield_vable_r`, so the
-///     QuasiimmutField key matches.  **Why LoadGlobal ConstRef fails**:
+///     QuasiimmutField key matches — and the same holds for the migrated
+///     LoadGlobal pycode operand.  **Why LoadGlobal `ns` ConstRef fails**:
 ///     `load_global_fn(ns, code, frame, namei)` has ns as a ref arg
 ///     whose traced form (GetfieldVableR result) differs from the raw
 ///     constant form in the optimizer's value-identity tracking.
-///     **Resolution**: non-portal callee LoadGlobal MUST keep the
-///     register-form emit (getfield_vable_r + Register operands) so
-///     the trace walker produces proper traced variables.  The ConstRef
-///     optimization requires separating the walker path from the
-///     blackhole path — a structural prerequisite not yet in place.
+///     **Resolution**: migrate only the fold-safe pycode operand to
+///     ConstRef; `ns`/`frame` keep the register-form emit
+///     (getfield_vable_r + Register operands) so the trace walker
+///     produces proper traced variables.  A cross-module inlined
+///     `LOAD_GLOBAL` is therefore still latently wrong (ns reads the
+///     portal frame's globals); function_calls is single-module so this
+///     does not surface.  Fully retiring the register-form `ns`/`frame`
+///     reads requires separating the walker path from the blackhole
+///     path — a structural prerequisite not yet in place.
 ///   * `bh_call_fn` / `bh_call_fn_N(frame_ptr, callable, args...)` —
 ///     `frame_ptr` non-null asserted at runtime entry; used for
 ///     `bh_call_self_recursive_portal`, `set_last_exec_ctx`, and

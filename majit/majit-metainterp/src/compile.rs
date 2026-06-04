@@ -1070,8 +1070,8 @@ pub(crate) fn merge_backend_exit_layouts(
         // exposes resume data (rd_numb / rd_consts / rd_virtuals /
         // rd_pendingfields) for an exit the frontend never saw, assemble
         // them into a `ResumeStorage` so downstream consumers
-        // (rebuild_guard_fail_state, build_blackhole_frames_from_deadframe)
-        // see the same shared pool they get on the frontend-primed path.
+        // (rebuild_guard_fail_state, blackhole_resume_via_rd_numb) see the
+        // same shared pool they get on the frontend-primed path.
         let storage_from_backend = layout.rd_numb.clone().map(|numb| {
             crate::resume::ResumeStorage::new(
                 numb,

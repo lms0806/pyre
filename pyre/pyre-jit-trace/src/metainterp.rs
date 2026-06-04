@@ -418,7 +418,7 @@ impl PyreMetaInterp {
     /// frame-stack mutation (this method) so the trace handler stays
     /// borrow-isolated from the metainterp framestack.  The
     /// `PendingInlineFrame` struct itself has no upstream counterpart.
-    fn push_inline_frame(
+    pub(crate) fn push_inline_frame(
         &mut self,
         ctx: &mut TraceCtx,
         mut pending: PendingInlineFrame,
