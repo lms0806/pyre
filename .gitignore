@@ -76,11 +76,11 @@ benchmarks/*
 /target
 Cargo.lock
 
-# Local Claude settings (personal, not committed)
+# Local Claude settings (personal)
 .claude/settings.local.json
 .claude/stop-hook.sh
 aheui/
 CLAUDE.md
 
-# Personal planning docs (not committed)
+# Personal planning docs
 docs/superpowers/plans/

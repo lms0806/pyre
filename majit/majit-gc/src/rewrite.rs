@@ -509,9 +509,10 @@ impl RewriteState {
 
     fn with_constants(hint: usize, next_pos: u32, constants: VecAssoc<u32, i64>) -> Self {
         // P3 category E — `constants` is an index-keyed constant pool
-        // (raw u32 key), not a Box-identity dict.  Bit-helpers replace
-        // the `OpRef::from_raw(k).is_constant()` round-trip that would
-        // land on the to-be-retired `OpRef::Untyped` variant.
+        // (raw u32 key), not a Box-identity dict.  The `raw_is_constant`
+        // / `raw_const_index` bit-helpers read the pool index directly;
+        // the former `OpRef::from_raw(k).is_constant()` round-trip — and
+        // the `OpRef::Untyped` variant it relied on — have been retired.
         let next_const_idx = constants
             .keys()
             .filter(|&&k| OpRef::raw_is_constant(k))
@@ -3946,8 +3947,9 @@ mod tests {
     fn test_explicit_result_positions_are_preserved_through_rewrite() {
         let rw = make_rewriter();
         // `OpCode::New` produces a Ref result (resoperation.py:469
-        // `RefOp` mixin), so the test mints typed `RefOp` pos rather
-        // than the default `Untyped` minted by `mk_op_with_descr`.
+        // `RefOp` mixin), so the test sets a typed `RefOp` pos
+        // explicitly rather than relying on the default pos that
+        // `mk_op_with_descr` assigns.
         let new_a = Op::with_descr(OpCode::New, &[], size_descr(24, 1));
         new_a.pos.set(OpRef::ref_op(2));
         let new_b = Op::with_descr(OpCode::New, &[], size_descr(16, 2));

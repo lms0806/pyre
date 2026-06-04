@@ -3545,8 +3545,8 @@ mod tests {
         backend.attach_default_test_descrs();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
         // Match the typed `InputArg{Ref,Int}` boxes registered by the
-        // backend regalloc — variant-aware Eq makes Untyped(N) and
-        // InputArg{Ref,Int}(N) distinct keys.
+        // backend regalloc — variant-aware Eq keys each `InputArg`
+        // operand by its (variant, N) pair, not by the raw `N` alone.
         let ops = vec![mk_op(
             OpCode::Finish,
             &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],

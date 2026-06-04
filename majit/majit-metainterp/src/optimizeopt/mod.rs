@@ -6482,9 +6482,10 @@ impl OptContext {
     /// the backend — compiler.rs:14570). Wraps the read in a freshly
     /// allocated const OpRef matching `InputArg*` parity.
     ///
-    /// Concrete-Ref extractor is `runtime_value_of` (mod.rs) which
-    /// cascades box-forwarding chain → const_pool → stamped BoxRef
-    /// runtime value (the RPython `InputArg*.value` analog).
+    /// Concrete-Ref extractor is `runtime_value_of` (mod.rs), which reads
+    /// the box's own value slot at its `resolve_to_boxref` position without
+    /// walking the `_forwarded` chain (the RPython `getref_base` /
+    /// `InputArg*.value` analog).
     /// Returns `None` when the OpRef does not resolve to a concrete
     /// non-null Ref, when the descr is not a FieldDescr, or when the
     /// runtime pointer is null.
@@ -6494,8 +6495,8 @@ impl OptContext {
         descr: &majit_ir::descr::DescrRef,
     ) -> Option<OpRef> {
         // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped BoxRef value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own value slot (no _forwarded
+        // walk), the RPython `getref_base` / `InputArg*.value` analog.
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
@@ -6564,8 +6565,8 @@ impl OptContext {
         i: usize,
     ) -> Option<OpRef> {
         // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped BoxRef value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own value slot (no _forwarded
+        // walk), the RPython `getref_base` / `InputArg*.value` analog.
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
@@ -6632,8 +6633,8 @@ impl OptContext {
         i: usize,
     ) -> Option<OpRef> {
         // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped BoxRef value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own value slot (no _forwarded
+        // walk), the RPython `getref_base` / `InputArg*.value` analog.
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
