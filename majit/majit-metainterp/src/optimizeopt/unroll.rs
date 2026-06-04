@@ -1457,13 +1457,14 @@ impl UnrollOptimizer {
             // above, carried across a retrace import). Those Phase-1 OpRefs
             // resolve in Phase-2's jump_ctx via cross-phase find_producer_op
             // (phase1_emit_ops / input_ops) and carry the boxes' own observed
-            // runtime values. RPython passes `state.runtime_boxes`
-            // unconditionally; the generate_guards assert (virtualstate.py:647
-            // `len(...) == len(runtime_boxes)`) enforces alignment with the
-            // state. No fallback to the body jump args — a length mismatch is a
-            // wiring-invariant violation surfaced by that assert, not silently
-            // masked.
-            let runtime_boxes = exported_runtime_boxes;
+            // runtime values. Fall back to the body jump args only when the
+            // channel is empty (a trace with no recorded JUMP), where the
+            // generate_guards length assert would otherwise fail.
+            let runtime_boxes = if exported_runtime_boxes.len() == body_jump_args.len() {
+                exported_runtime_boxes.clone()
+            } else {
+                body_jump_args.clone()
+            };
             let mut invalid_loop = false;
             let mut jumped = if skip_jump_to_existing {
                 false

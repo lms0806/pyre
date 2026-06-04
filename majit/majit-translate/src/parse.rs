@@ -56,9 +56,13 @@ impl CallPath {
     /// `rpython/jit/codewriter/call.py:174-187`).
     ///
     // Structural adaptation: Rust `::` ↔ PyPy `.` path separator.
-    // Both are accepted because ClassDef.name mirrors classdesc.py
-    // `cls.__module__ + '.' + cls.__name__` while Rust extraction
-    // emits `module::Type`.
+    // `impl_type_joined` may arrive in either spelling — Rust extraction
+    // emits `module::Type`, while `ClassDef.name` mirrors classdesc.py
+    // `cls.__module__ + '.' + cls.__name__` (a `.`-joined `module.Class`).
+    // Split on both so the segment granularity is independent of which
+    // caller minted the string: callers in lib.rs / call.rs /
+    // codewriter.rs do not all route through a `.`→`::` normalization
+    // boundary, so accepting both keeps the invariant statically true.
     pub fn for_impl_method(impl_type_joined: &str, method: &str) -> Self {
         let mut segments: Vec<String> = impl_type_joined
             .split("::")
@@ -89,18 +93,14 @@ impl CallPath {
     }
 }
 
-/// Strip every `::` and `.` prefix and return the trailing segment.
+/// Strip the module prefix and return the trailing identifier.
 ///
-/// Type-name strings traversing the codewriter boundary carry one of
-/// two separator conventions: `module.Class` (RPython parity:
-/// `classdesc.py:500-502 cls.__module__ + '.' + cls.__name__`) or
-/// `module::Class` (Rust path extraction at `parse.rs:632-635
-/// self_ty_root_qualified`). Comparators that want the bare leaf
-/// (override pattern matchers, debug printers) must accept both — a
-/// plain `rsplit('.')` misses Rust-rooted values and a plain
-/// `rsplit("::")` misses Python-rooted values. Strip the longer
-/// `::` first, then the single-char `.`, so the returned slice is
-/// the final identifier regardless of mix.
+/// Accepts both spellings: a `::`-joined Rust path and the `.`-joined
+/// `ClassDef.name` form (classdesc.py `cls.__module__ + '.' +
+/// cls.__name__`). A plain `rsplit('.')` misses Rust-rooted values and a
+/// plain `rsplit("::")` misses Python-rooted values, so strip the longer
+/// `::` prefix first and then any residual `.` prefix — the final
+/// identifier is recovered regardless of which separator the caller used.
 pub fn canonical_leaf(name: &str) -> &str {
     let after_colon = name.rsplit("::").next().unwrap_or(name);
     after_colon.rsplit('.').next().unwrap_or(after_colon)

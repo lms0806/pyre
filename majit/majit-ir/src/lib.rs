@@ -33,8 +33,7 @@ pub use descr::{
     make_vtable_field_descr, memcpy_fn_addr, recover_fail_descr_cell, unpack_fielddescr,
 };
 pub use effectinfo::{
-    CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, QuasiImmutAnalyzer,
-    RandomEffectsAnalyzer, UnsupportedFieldExc, VirtualizableAnalyzer, consider_array,
+    CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, UnsupportedFieldExc, consider_array,
     consider_struct, frozenset_or_none,
 };
 pub use op_type_index::OpTypeIndex;

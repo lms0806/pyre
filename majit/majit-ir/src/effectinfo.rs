@@ -736,53 +736,6 @@ impl EffectInfo {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// effectinfo.py:401-418: Three analyzer classes derived from
-// `BoolGraphAnalyzer`. TODO: pyre's `CallControl`
-// already inspects Rust source operations directly, so the analyzers
-// are kept as marker types whose `analyze_simple_operation` mirrors
-// upstream's discriminator (op-name match) for documentation parity.
-// ════════════════════════════════════════════════════════════════════════
-
-/// effectinfo.py:401-404: VirtualizableAnalyzer
-pub struct VirtualizableAnalyzer;
-
-impl VirtualizableAnalyzer {
-    /// effectinfo.py:402-404: analyze_simple_operation(op, graphinfo)
-    pub fn analyze_simple_operation(opname: &str) -> bool {
-        opname == "jit_force_virtualizable" || opname == "jit_force_virtual"
-    }
-}
-
-/// effectinfo.py:406-408: QuasiImmutAnalyzer
-pub struct QuasiImmutAnalyzer;
-
-impl QuasiImmutAnalyzer {
-    /// effectinfo.py:407-408: analyze_simple_operation(op, graphinfo)
-    pub fn analyze_simple_operation(opname: &str) -> bool {
-        opname == "jit_force_quasi_immutable"
-    }
-}
-
-/// effectinfo.py:410-418: RandomEffectsAnalyzer
-pub struct RandomEffectsAnalyzer;
-
-impl RandomEffectsAnalyzer {
-    /// effectinfo.py:411-415: analyze_external_call(funcobj)
-    /// Returns true when an external call is annotated
-    /// `random_effects_on_gcobjs`. Pyre has no analogous attribute on
-    /// Rust function items, so this is a stub that always returns
-    /// false; CallControl marks `RandomEffects` explicitly when needed.
-    pub fn analyze_external_call(_random_effects_on_gcobjs: bool) -> bool {
-        _random_effects_on_gcobjs
-    }
-
-    /// effectinfo.py:417-418: analyze_simple_operation(op, graphinfo)
-    pub fn analyze_simple_operation(_opname: &str) -> bool {
-        false
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════
 // effectinfo.py:422-461: CallInfoCollection
 // ════════════════════════════════════════════════════════════════════════
 

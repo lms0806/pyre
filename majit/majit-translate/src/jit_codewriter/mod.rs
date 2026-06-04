@@ -8,6 +8,7 @@ pub mod annotation_state;
 pub mod assembler;
 pub mod call;
 pub mod codewriter;
+pub mod effectinfo;
 pub mod flatten;
 pub mod format;
 pub mod insns;

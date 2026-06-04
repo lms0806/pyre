@@ -234,9 +234,15 @@ pub enum CallTarget {
     Method {
         name: String,
         receiver_root: Option<String>,
-        /// Graph identity key resolved at stamp time by the codewriter
-        /// producer. call.py:181 `getfunctionptr(graph)` — consumer
-        /// does `function_graphs.get(&path)` directly. Transient.
+        /// Resolved call path stamped at codewriter time by
+        /// `stamp_classdef_hints_on_graph`. This is a synthesized
+        /// [`crate::parse::CallPath`] (re-derived from the receiver's
+        /// `SomeInstance.classdef` → `MethodDesc.selfclassdef` → impl
+        /// type), NOT a graph-object pointer. It is pyre's surrogate for
+        /// `call.py:29`'s graph-object dict key: the consumer does
+        /// `function_graphs.get(&path)` directly, the `CallPath`-keyed
+        /// stand-in for `getfunctionptr(graph)` (call.py:181). Transient
+        /// (`#[serde(skip)]`) — never reaches codegen / serde.
         #[serde(skip, default)]
         resolved_path: Option<crate::parse::CallPath>,
     },
@@ -2826,14 +2832,13 @@ pub struct FunctionGraph {
     /// type intrinsically as `op.result.concretetype` of the
     /// returnblock's input variable.  Pyre stores the source string and
     /// projects to `Type` via `return_type_string_to_value_type` so the
-    /// JIT codewriter's signature validator (`call.rs:3502/3555`) can
-    /// read `FUNC.RESULT` directly off the callee graph without
-    /// consulting the `CallControl::return_types` side-table.
+    /// JIT codewriter's signature validator reads `FUNC.RESULT` directly
+    /// off the callee graph.
     ///
     /// `None` for synthetic test-fixture graphs constructed via
     /// `FunctionGraph::new("name")`; production paths populate via
-    /// `with_return_type(rt)` after construction (parse.rs +
-    /// lib.rs:430-512 trait-method + free-fn registration).
+    /// `with_return_type(rt)` after construction (parse.rs + lib.rs
+    /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
     /// Source-file module path the function was lifted from (e.g.
     /// `pyre_jit::jit::trace`).  RPython equivalent: every
@@ -2855,6 +2860,13 @@ pub struct FunctionGraph {
     /// the unrestricted HOST_ENV-curated path resolution that pyre
     /// uses today.
     pub source_module: Option<String>,
+    /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
+    /// attributes RPython `policy.py:48-62 look_inside_graph` reads off
+    /// `graph.func`. Pyre carries them on the graph itself so
+    /// [`crate::policy::JitPolicy::look_inside_graph`] reads the canonical
+    /// carrier directly. Empty for graphs with no hints (the common case
+    /// and all `FunctionGraph::new` fixtures).
+    pub hints: Vec<String>,
 }
 
 impl FunctionGraph {
@@ -2928,6 +2940,7 @@ impl FunctionGraph {
             return_type: None,
             source_module: None,
             owner_root: None,
+            hints: Vec::new(),
         }
     }
 
@@ -2935,10 +2948,19 @@ impl FunctionGraph {
     /// registration paths (parse.rs / lib.rs) where the source-level
     /// type is available; test fixtures that construct via
     /// `FunctionGraph::new("name")` may skip and leave `None`. The JIT
-    /// codewriter signature validator (`call.rs:3502/3555`) falls back
-    /// to `CallControl::return_types` for `None`-carrying graphs.
+    /// codewriter signature validator leaves the result un-validated for
+    /// `None`-carrying graphs.
     pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
         self.return_type = Some(rt.into());
+        self
+    }
+
+    /// Builder-style setter for `hints`. Production registration paths
+    /// (lib.rs free-function, trait-method, and inherent-method loops)
+    /// stamp the parsed `_jit_*_` / `_elidable_function_` hints onto the
+    /// graph; test fixtures may skip and leave the list empty.
+    pub fn with_hints(mut self, hints: Vec<String>) -> Self {
+        self.hints = hints;
         self
     }
 

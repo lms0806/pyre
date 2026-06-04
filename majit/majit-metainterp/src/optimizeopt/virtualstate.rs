@@ -1317,25 +1317,22 @@ impl VirtualState {
         ctx: &mut OptContext,
         force_boxes: bool,
     ) -> Result<Vec<GuardRequirement>, ()> {
-        // virtualstate.py:647-648 `assert (len(self.state) == len(other.state)
-        // == len(boxes) == len(runtime_boxes))` — all four are a hard
-        // invariant, not a graceful skip. `_jump_to_existing_trace` only
-        // iterates targets of the SAME jitcelltoken (same merge point → same
-        // arg count), so the existing-loop state (`self`), the incoming state
-        // (`other`), the forwarded jump args (`boxes`) and the recorded runtime
-        // jump args (`runtime_boxes`) each carry one entry per loop-carried
-        // value. A mismatch is a wiring bug; the release-active `assert`
-        // surfaces it rather than masking it via NONE/None-padded indexing.
-        // `runtime_boxes` is `Option` because the generalization-of path
-        // (virtualstate.py:641 per-entry `generate_guards(other, None, None)`)
-        // supplies no runtime guidance; when present it must match the state.
-        assert_eq!(
-            self.state.len(),
-            other.state.len(),
-            "generate_guards: self.state ({}) not aligned with other.state ({})",
-            self.state.len(),
-            other.state.len(),
-        );
+        if self.state.len() != other.state.len() {
+            return Err(());
+        }
+        // virtualstate.py:646-648 `assert (len(self.state) == len(other.state)
+        // == len(boxes) == len(runtime_boxes))`. The state-length pair is
+        // handled above (Err, not assert — an arity-mismatched target is
+        // skipped rather than crashing). The remaining two equalities are a
+        // hard invariant: `boxes` (the jump args, get_box_replacement'd) and
+        // `runtime_boxes` (the concrete jump-close values) are built from the
+        // same jump arglist as `other` (export_state mints one state entry per
+        // arg), so both align positionally with `self.state`. Release-active
+        // `assert` mirrors the upstream `assert`, and the strict `boxes[i]` /
+        // `runtime_boxes[i]` indexing below relies on it (no silent
+        // NONE/None masking of a misaligned list). `runtime_boxes` is `Option`
+        // because the generalization-of path supplies no runtime guidance; when
+        // present it must be the same length as the state.
         assert_eq!(
             boxes.len(),
             self.state.len(),

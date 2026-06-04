@@ -4391,10 +4391,10 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
 /// The match is loose only in the asymmetric receiver-root direction:
 /// when the pattern leaves `receiver_root` as `None`, any target
 /// receiver matches; otherwise both sides must agree, either by
-/// exact source-syntax equality or — when the target carries an
-/// `impl_type_hint` — by direct string comparison or leaf-suffix
-/// match via `canonical_leaf` (accepts both `module.Class` and
-/// `module::Class` forms).
+/// exact source-syntax equality or — when the target carries a
+/// `resolved_path` — by comparing the pattern against the path's
+/// `impl_type_prefix()`, directly or via leaf-suffix `canonical_leaf`
+/// (the `::`-joined path's trailing segment).
 fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool {
     match (pattern, target) {
         (
@@ -6756,14 +6756,11 @@ mod tests {
             g
         };
 
-        let mut cc = CallControl::new();
-        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
-        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
         // The indirect branch of `getcalldescr(op)` validates that the
         // caller's `result_type` matches the witness impl's declared
-        // return type (`call.rs` indirect-arm signature check).  Inject
-        // matching strings so the non-void kind-matrix cases resolve
-        // without panicking.
+        // return type (`call.rs` indirect-arm signature check).  Stamp the
+        // matching return type onto the impl graphs so the non-void
+        // kind-matrix cases resolve without panicking.
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
@@ -6772,16 +6769,17 @@ mod tests {
             ValueType::Void => "",
             ValueType::Bool => "bool",
         };
-        if !return_str.is_empty() {
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("A", "m"),
-                return_str.to_string(),
-            );
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("B", "m"),
-                return_str.to_string(),
-            );
-        }
+        let build_witness = |name: &str| {
+            let g = build_impl(name);
+            if return_str.is_empty() {
+                g
+            } else {
+                g.with_return_type(return_str)
+            }
+        };
+        let mut cc = CallControl::new();
+        cc.register_trait_method("m", Some("T"), "A", build_witness("A::m"));
+        cc.register_trait_method("m", Some("T"), "B", build_witness("B::m"));
         cc.find_all_graphs_for_tests();
 
         let mut graph = FunctionGraph::new("outer");
@@ -7013,9 +7011,6 @@ mod tests {
             g
         };
 
-        let mut cc = CallControl::new();
-        cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
-        cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
@@ -7024,16 +7019,17 @@ mod tests {
             ValueType::Void => "",
             ValueType::Bool => "bool",
         };
-        if !return_str.is_empty() {
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("A", "m"),
-                return_str.to_string(),
-            );
-            cc.return_types.insert(
-                crate::parse::CallPath::for_impl_method("B", "m"),
-                return_str.to_string(),
-            );
-        }
+        let build_witness = |name: &str| {
+            let g = build_impl(name);
+            if return_str.is_empty() {
+                g
+            } else {
+                g.with_return_type(return_str)
+            }
+        };
+        let mut cc = CallControl::new();
+        cc.register_trait_method("m", Some("T"), "A", build_witness("A::m"));
+        cc.register_trait_method("m", Some("T"), "B", build_witness("B::m"));
         // NOTE: intentionally *no* `find_all_graphs_for_tests` — that keeps
         // `candidate_graphs` empty so `guess_call_kind(op)` classifies
         // this call as `CallKind::Residual` via the call.py:137-139

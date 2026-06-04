@@ -29,38 +29,6 @@ pub struct CallEffectSpec {
 
 pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["w_int_add"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["w_int_sub"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["w_int_mul"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["crate", "math", "w_int_add"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["crate", "math", "w_int_sub"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["crate", "math", "w_int_mul"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["w_float_add"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
-        target: CallTargetSpec::FunctionPath(&["w_float_sub"]),
-        effect: CallEffectKind::Elidable,
-    },
-    CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "peek_at",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,

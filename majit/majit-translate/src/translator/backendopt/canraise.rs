@@ -218,9 +218,10 @@ impl<'t> GraphAnalyzer<bool, ()> for RaiseAnalyzer<'t> {
 mod tests {
     use super::*;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
-        Variable,
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphKey, Hlvalue, Link,
+        SpaceOperation, Variable, c_last_exception,
     };
+    use crate::translator::rtyper::lltypesystem::lltype;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -302,6 +303,95 @@ mod tests {
         // branch of `raise_analyzer_default_treats_direct_call_*`.
     }
 
+    /// `analyze_exceptblock_in_graph` reraise-of-caught suppression
+    /// (`canraise.py:27-41`) exercised directly on a flowspace graph.
+    ///
+    /// This is the standalone home for the coverage that otherwise lives
+    /// only in `jit_codewriter::call`'s
+    /// `well_formed_raise_flowspace_raiseanalyzer_matches_flat_canraise`
+    /// `MemoryErrorOnly` case — which builds a flat `crate::model` graph,
+    /// runs it through `function_graph_to_flowspace`, and compares to the
+    /// flat `_canraise`. That oracle is coupled to the flat model + the
+    /// adapter, both of which the graph-model unification retires; this
+    /// test depends on neither.
+    ///
+    /// The graph's only op is `int_add` (`canraise=[]`), so the op layer
+    /// contributes no raise. The startblock reaches the graph's
+    /// exceptblock through a `last_exception` edge whose `last_exc_value`
+    /// is the very variable the exceptblock binds as its exc-instance
+    /// inputarg — a re-raise of the caught exception. Therefore:
+    /// - default `RaiseAnalyzer`: the reachable exceptblock counts as
+    ///   raising → `analyze_direct_call` == `True`.
+    /// - `do_ignore_memory_error`: `analyze_exceptblock_in_graph` matches
+    ///   the re-raised value's family to `inputargs[1]` and suppresses it
+    ///   → `False`.
+    ///
+    /// `(default=True, ignore=False)` is the boolean pair the flat
+    /// `_canraise` maps to `MemoryErrorOnly`.
+    #[test]
+    fn ignore_memory_error_suppresses_reraise_of_caught_exceptblock() {
+        let translator = fixture();
+
+        // startblock: (a, b) -> v3 = int_add(a, b), then raises.
+        let a = Variable::named("a");
+        let b = Variable::named("b");
+        let v3 = Variable::named("v3");
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(a), Hlvalue::Variable(b)],
+            Hlvalue::Variable(v3.clone()),
+        ));
+
+        let graph = FunctionGraph::new("reraise_caught", start.clone());
+        let returnblock = graph.returnblock.clone();
+        let exceptblock = graph.exceptblock.clone();
+
+        // The exceptblock binds [etype, evalue]; the re-raise edge carries
+        // those same caught values into it and tags the link's
+        // last_exception / last_exc_value with them.
+        let (etype, evalue) = {
+            let eb = exceptblock.borrow();
+            (eb.inputargs[0].clone(), eb.inputargs[1].clone())
+        };
+
+        let normal = Link::new(vec![Hlvalue::Variable(v3)], Some(returnblock), None).into_ref();
+        let mut exc = Link::new(
+            vec![etype.clone(), evalue.clone()],
+            Some(exceptblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::None))),
+        );
+        exc.extravars(Some(etype), Some(evalue));
+        let exc = exc.into_ref();
+
+        {
+            let mut s = start.borrow_mut();
+            s.exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+            s.exits = vec![normal, exc];
+        }
+        let graph: GraphRef = Rc::new(RefCell::new(graph));
+
+        // default: ignore_exact_class is None, so the reachable
+        // exceptblock counts as raising (canraise.py:41 `return True`).
+        let mut default = RaiseAnalyzer::new(&translator);
+        assert!(
+            default.analyze_direct_call(&graph, None),
+            "default RaiseAnalyzer: reachable exceptblock => raising",
+        );
+
+        // do_ignore_memory_error: the re-raise of the caught exception is
+        // suppressed (canraise.py:33-40), so the graph no longer raises.
+        let mut ignore = RaiseAnalyzer::new(&translator);
+        ignore.do_ignore_memory_error();
+        assert!(
+            !ignore.analyze_direct_call(&graph, None),
+            "do_ignore_memory_error: re-raise of caught exception is suppressed",
+        );
+    }
+
     #[test]
     fn analyze_direct_call_walks_callee_graph_and_returns_true_on_raising_op() {
         // `int_add_ovf` is a regular simple op with
@@ -360,5 +450,126 @@ mod tests {
         ]);
         let graph: GraphRef = Rc::new(RefCell::new(graph));
         assert!(!a.analyze_direct_call(&graph, None));
+    }
+
+    /// A `direct_call` op whose callee descriptor
+    /// (`lltype.functionptr(..., graph=...)`) carries `callee`'s
+    /// `GraphKey`, so `framework_analyze_direct_call` resolves it
+    /// through `TranslationContext.graphs` (graphanalyze.rs:308-321).
+    fn direct_call_to(callee: &GraphRef) -> SpaceOperation {
+        let graph_key = Some(GraphKey::of(callee).as_usize());
+        let ptr = lltype::functionptr(
+            lltype::FuncType {
+                args: Vec::new(),
+                result: lltype::LowLevelType::Void,
+            },
+            "callee",
+            graph_key,
+            None,
+        );
+        SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
+                Box::new(ptr),
+            )))],
+            Hlvalue::Variable(Variable::named("call_result")),
+        )
+    }
+
+    /// Single-block callee whose only op is `int_add` (canraise=[]) — it
+    /// cannot raise, so a caller that only `direct_call`s it cannot
+    /// raise either once the callee is resolvable.
+    fn non_raising_callee() -> GraphRef {
+        let v = Variable::named("x");
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::new("callee", start.clone());
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(2))),
+            ],
+            Hlvalue::Variable(Variable::named("r")),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(v)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        Rc::new(RefCell::new(graph))
+    }
+
+    /// Single-block caller whose only op is a `direct_call` to `callee`.
+    fn caller_calling(callee: &GraphRef) -> GraphRef {
+        let v = Variable::named("x");
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::new("caller", start.clone());
+        start.borrow_mut().operations.push(direct_call_to(callee));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(v)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        Rc::new(RefCell::new(graph))
+    }
+
+    #[test]
+    fn analyze_direct_call_resolves_registered_callee_else_top_result() {
+        // Behavioral payoff of the cachedgraph keystone (the registration
+        // proved by
+        // `cutover::cachedgraph_hit_registers_callee_graph_into_translator_graphs`):
+        // a caller whose only op is a `direct_call` to a SEPARATE callee
+        // graph is resolved by `RaiseAnalyzer` through `funcobj.graph` ->
+        // `TranslationContext.graphs` (`framework_analyze_direct_call`,
+        // graphanalyze.rs:308-321) to the callee's actual can-raise. With
+        // the callee absent from `translator.graphs` the lookup misses and
+        // the framework returns `top_result()` — the conservative `true`
+        // (graphanalyze.rs:318-320, bool top is `true`).
+        //
+        // The callee's only op is `int_add` (canraise=[]), proven
+        // flat<->flowspace-equivalent non-raising by `jit_codewriter::call`'s
+        // `well_formed_raise_flowspace_raiseanalyzer_matches_flat_canraise`.
+        // So the RESOLVED verdict (non-raising) is the one matching flat
+        // `_canraise`, and the unregistered `top_result` (raising) is exactly
+        // the divergence the keystone removes — the precondition for routing
+        // `CallControl` effect analysis through the flowspace `RaiseAnalyzer`
+        // on the call-recursion path.
+
+        // -- callee NOT registered: funcobj.graph misses -> top_result --
+        {
+            let translator = fixture();
+            let callee = non_raising_callee();
+            let caller = caller_calling(&callee);
+            translator.graphs.borrow_mut().push(caller.clone());
+            let mut a = RaiseAnalyzer::new(&translator);
+            assert!(
+                a.analyze_direct_call(&caller, None),
+                "callee absent from translator.graphs -> direct_call resolves to \
+                 top_result (conservatively raising)"
+            );
+        }
+
+        // -- callee registered: resolves to its non-raising verdict --
+        {
+            let translator = fixture();
+            let callee = non_raising_callee();
+            let caller = caller_calling(&callee);
+            translator
+                .graphs
+                .borrow_mut()
+                .extend([caller.clone(), callee]);
+            let mut a = RaiseAnalyzer::new(&translator);
+            assert!(
+                !a.analyze_direct_call(&caller, None),
+                "registered non-raising callee -> RaiseAnalyzer resolves funcobj.graph \
+                 through translator.graphs and reports not-raising"
+            );
+        }
     }
 }

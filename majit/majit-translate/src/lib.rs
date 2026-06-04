@@ -390,7 +390,7 @@ fn register_function_graph_alias(
 /// Compute the full alias spelling set for a free function lifted
 /// from a Rust source.  Mirrors the graph-alias loop in
 /// [`analyze_pipeline_from_parsed`] so call-site lookups that key on
-/// these spellings (function_graphs, function_hints,
+/// these spellings (function_graphs,
 /// elidable/loopinvariant/cannot_collect/oopspec targets) all see
 /// the same FunctionPath set.  Without this, a module-qualified call
 /// site finds the graph alias but misses the elidable/loopinvariant
@@ -836,38 +836,6 @@ fn analyze_pipeline_from_parsed(
             );
         }
     }
-    // RPython: op.result.concretetype — register return types per function.
-    // Each function's return type is registered under its exact canonical path(s).
-    // No name-based reverse lookup — avoids collision between same-named
-    // functions in different modules.
-    {
-        for func in &program.functions {
-            let Some(ref ret_type) = func.return_type else {
-                continue;
-            };
-            if let Some(ref owner) = func.self_ty_root {
-                // impl method: ["owner", "method_name"]
-                let path =
-                    crate::parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
-                call_control.return_types.insert(path, ret_type.clone());
-            } else {
-                // free function: register under every spelling the
-                // graph alias loop produced (`free_function_alias_paths`:
-                // bare + `crate::` + `pyre_interpreter|pyre_object|
-                // pyre_jit::` + the `source_module`-prefixed variants).
-                //
-                // RPython parity: return type lives on graph identity and
-                // surfaces uniformly to every callsite (`call.py:223-230`).
-                // Pyre keys `return_types` on `CallPath`; alias spellings
-                // that lack the return type silently make
-                // `signature validate` fall back to Ref and the direct-
-                // call type tail goes silent.
-                for path in free_function_alias_paths(&func.name, &func.module_path) {
-                    call_control.return_types.insert(path, ret_type.clone());
-                }
-            }
-        }
-    }
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -887,8 +855,7 @@ fn analyze_pipeline_from_parsed(
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
-                // (RPython `funcptr._obj.TO.RESULT`) without the
-                // `CallControl::return_types` side-table fallback.
+                // (RPython `funcptr._obj.TO.RESULT`).
                 let graph = match &method.return_type {
                     Some(rt) => graph.clone().with_return_type(rt),
                     None => graph.clone(),
@@ -924,20 +891,14 @@ fn analyze_pipeline_from_parsed(
                     call_control.register_function_graph(direct_path, direct_graph);
                 }
             }
-            // RPython: op.result.concretetype for trait/default method calls.
             let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
-            if let Some(ref ret_type) = method.return_type {
-                call_control
-                    .return_types
-                    .insert(path.clone(), ret_type.clone());
-            }
             // Mirror RPython `func._elidable_function_` / `func._jit_*_`:
-            // `register_trait_method` populates `function_graphs` only, so
-            // the BFS sees hint-less SemanticFunctions for trait methods
-            // and inlines elidable methods that should remain residual.
-            // `register_function_hints_for` is a side-table-only write
-            // (no graph re-insertion) that fills `function_hints` keyed
-            // on the same `[impl_type, method_name]` path the BFS uses.
+            // `register_trait_method` registers the graph without hints, so
+            // the BFS would see hint-less SemanticFunctions for trait methods
+            // and inline elidable methods that should remain residual.
+            // `register_function_hints_for` stamps the hints onto the
+            // already-registered graph (`graph.hints`) keyed on the same
+            // `[impl_type, method_name]` path the BFS reads.
             if !method.hints.is_empty() {
                 call_control.register_function_hints_for(path.clone(), method.hints.clone());
                 // Default-method bodies also register under `[trait_name,
@@ -1011,19 +972,22 @@ fn analyze_pipeline_from_parsed(
         // `getattr(func, "_elidable_function_", False)`.  Without this
         // the BFS sees impl methods as hint-less and inlines elidable
         // methods (e.g. `PyFrame::nlocals`) that should remain residual.
+        // Stamp the source return type onto the graph so the JIT
+        // codewriter signature validator reads `FUNC.RESULT` directly off
+        // the callee graph (`funcptr._obj.TO.RESULT`), matching the
+        // free-function and trait-method registration paths above.
+        let graph = match &method_info.return_type {
+            Some(rt) => method_info.graph.clone().with_return_type(rt),
+            None => method_info.graph.clone(),
+        };
         if method_info.hints.is_empty() {
-            call_control.register_function_graph(path.clone(), method_info.graph.clone());
+            call_control.register_function_graph(path.clone(), graph);
         } else {
             call_control.register_function_graph_with_hints(
                 path.clone(),
-                method_info.graph.clone(),
+                graph,
                 method_info.hints.clone(),
             );
-        }
-        if let Some(ref ret_type) = method_info.return_type {
-            call_control
-                .return_types
-                .insert(path.clone(), ret_type.clone());
         }
         // RPython: hints bound to graph identity.
         for hint in &method_info.hints {
@@ -1291,20 +1255,6 @@ fn analyze_pipeline_from_parsed(
         call_control.make_virtualizable_infos(|jd_idx, vtypeptr_token| {
             vinfo_factory(jd_idx, vtypeptr_token)
         });
-    }
-    // Mark known builtins (elidable helpers).
-    // RPython: detected via funcobj.graph.func.oopspec attribute.
-    for builtin_name in &[
-        "w_int_add",
-        "w_int_sub",
-        "w_int_mul",
-        "w_float_add",
-        "w_float_sub",
-    ] {
-        let path = parse::CallPath::from_segments([*builtin_name]);
-        if call_control.function_graphs().contains_key(&path) {
-            call_control.mark_builtin(path);
-        }
     }
     // Register oopspecs for jit.* builtin functions.
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;

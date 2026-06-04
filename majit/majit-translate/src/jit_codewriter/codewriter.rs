@@ -461,13 +461,15 @@ impl CodeWriter {
         // step here.
         // Annotator monomorphization producer — for every Call(Method)
         // op in the graph, look up the receiver's annotated flowspace
-        // Variable via `real_value_to_var` and stamp its concrete
-        // `ClassDefKey` onto `CallTarget::Method.classdef_hint`. The
-        // resolver fast path in `CallControl::resolve_method` /
-        // `resolve_method_impl_type` then bypasses the receiver-root
-        // heuristic (mirrors `bookkeeper.py:431-442 getmethoddesc`
-        // classdef-keyed dispatch). Ops whose receiver carries no
-        // SomeInstance annotation are left untouched.
+        // Variable via `real_value_to_var`, resolve its concrete impl
+        // type from `SomeInstance.classdef` → `MethodDesc.selfclassdef`,
+        // and stamp the synthesized `CallPath` onto
+        // `CallTarget::Method.resolved_path`. The resolver fast path in
+        // `CallControl::resolve_method` / `resolve_method_impl_type`
+        // then does `function_graphs.get(&path)` directly instead of
+        // the receiver-root heuristic (mirrors `bookkeeper.py:431-442
+        // getmethoddesc` classdef-keyed dispatch). Ops whose receiver
+        // carries no SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
             crate::jit_codewriter::transform_profile::time_phase(
                 "step0c_stamp_classdef_hints_on_graph",
@@ -659,7 +661,7 @@ impl CodeWriter {
             // Cross-check: when both sources are present they must agree,
             // with one pre-existing exception. RPython `call.py:182-187
             // get_jitcode_calldescr` derives FUNC.RESULT from the declared
-            // Rust-side return type (via `function_return_types`).
+            // Rust-side return type (via the callee graph's `return_type`).
             // `graph_result_kind` independently walks the CFG and reports
             // the coloring produced by the rtyper. In pyre these two
             // sources can disagree specifically on `i ↔ r`: PyObjectRef
@@ -913,7 +915,15 @@ fn stamp_classdef_hints_on_graph(
             let Some(classdef_rc) = &inst.classdef else {
                 continue;
             };
-            // Resolve impl_type from MethodDesc selfclassdef.
+            // Resolve impl_type from the MethodDesc selfclassdef.
+            // `getmethoddesc_for_attribute` returns the filtered desc
+            // set (classdesc.py:336-374 lookup_filter); in pyre's
+            // closed world the receiver SomeInstance carries a single
+            // concrete classdef, so the set binds to one selfclassdef
+            // and `.next()` selects it. A multi-desc PBC set has no
+            // representation in `CallTarget::Method` (carries one path)
+            // — that polymorphic case is the §M3 annotator
+            // monomorphization boundary, not reachable here.
             // Fallback to receiver classdef.name when:
             //   1. Bookkeeper weak-ref upgrade fails (fixture).
             //   2. getmethoddesc_for_attribute returns empty Vec.
@@ -1188,7 +1198,7 @@ mod stamp_classdef_hints_tests {
             "bound entry is a distinct MethodDesc rc from the seeded unbound carrier",
         );
 
-        // impl_type_hint stamped directly on the op.
+        // resolved_path stamped directly on the op.
         let op = &graph.blocks[graph.startblock.0].operations[0];
         let OpKind::Call { target, .. } = &op.kind else {
             panic!("expected Call op");

@@ -7831,12 +7831,14 @@ impl<M: Clone> MetaInterp<M> {
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
         if let Some(front_target) = compiled.front_target_tokens.first() {
             let target_descr = front_target.as_jump_target_descr();
-            // Build the type index from the stored trace's inputargs / ops.
-            // `opref_type_at` reads the typed OpRef variant tag directly for
-            // constants, inputargs, and op results; the index still supplies
-            // the backend object lookup surface. `history.py:220` parity: a
-            // typed Box's `.type` is intrinsic, so no separate constant-type
-            // side map is needed.
+            // `root_trace.constant_types` was populated alongside `ops`
+            // / `inputargs` at compile time (`build_trace_value_maps`
+            // → `OpTypeIndex` seed) and survives in the stored trace.
+            // Passing an empty map here would let any legacy
+            // `Untyped(x | CONST_BIT)` operand fall through
+            // `OpTypeIndex::opref_type_at`'s constant_types miss to the
+            // hard-panic boundary (`history.py:220` parity), so reuse
+            // the saved map instead.
             let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label

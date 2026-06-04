@@ -8963,9 +8963,10 @@ enum UnaryNotOperandKind {
 /// different types would collide here even if they belong to
 /// different types — the classifier is structurally not 1:1 with
 /// `getdesc`.  Retire when pyre's surface DSL learns to emit a
-/// callable-resolved Path (via the M2.c `classdef_impl_types`
-/// registry, `description.py:407-519` parity); the classifier
-/// can then route through the resolved callable and the shortlist
+/// callable-resolved Path (via the `resolved_path` producer
+/// `codewriter.rs::stamp_classdef_hints_on_graph`,
+/// `description.py:407-519` parity); the classifier can then route
+/// through the resolved callable and the shortlist
 /// retires.  Until then, name-shortlist hits that diverge
 /// from upstream behaviour surface as dual-gate `Skip` (typed-Ref
 /// classdef-less SomeInstance) or production divergence panic.
