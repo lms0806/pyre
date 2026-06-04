@@ -3720,7 +3720,10 @@ impl<'a> Assembler386<'a> {
                     let store_may_need_wb = op.opcode == OpCode::SetarrayitemGc
                         && is_ref_array
                         && item_size as usize == WORD
-                        && self.setarrayitem_value_needs_write_barrier(op.arg(2).to_opref(), value_loc);
+                        && self.setarrayitem_value_needs_write_barrier(
+                            op.arg(2).to_opref(),
+                            value_loc,
+                        );
                     if store_may_need_wb {
                         self.emit_setarrayitem_gc_write_barrier(&arglocs[..2]);
                     }
@@ -4987,7 +4990,10 @@ impl<'a> Assembler386<'a> {
             jump_offset: self.mc.offset(),
             fail_label,
             fail_descr: cell.clone(),
-            fail_args: op.getfailargs().map(|fa| fa.iter().map(|a| a.to_opref()).collect()).unwrap_or_default(),
+            fail_args: op
+                .getfailargs()
+                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
+                .unwrap_or_default(),
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
             gcmap,
@@ -5555,14 +5561,15 @@ impl<'a> Assembler386<'a> {
                 op.getarglist()
                     .iter()
                     .map(|opref| {
-                        self.opref_type_at(opref.to_opref(), op_index).unwrap_or_else(|| {
-                            panic!(
-                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                        self.opref_type_at(opref.to_opref(), op_index)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "infer_fail_arg_types: opref_type_at({:?}) returned None at \
                                  op_index={:?} (Finish/Jump arg): RPython box.type is fixed at \
                                  construction (resoperation.py:719/727/739)",
-                                opref, op_index
-                            )
-                        })
+                                    opref, op_index
+                                )
+                            })
                     })
                     .collect()
             } else if let Some(fa) = op.getfailargs() {
@@ -5604,14 +5611,15 @@ impl<'a> Assembler386<'a> {
                         // Type::Void is the "hole" sentinel.
                         Type::Void
                     } else {
-                        self.opref_type_at(opref.to_opref(), op_index).unwrap_or_else(|| {
-                            panic!(
-                                "infer_fail_arg_types: opref_type_at({:?}) returned None at \
+                        self.opref_type_at(opref.to_opref(), op_index)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "infer_fail_arg_types: opref_type_at({:?}) returned None at \
                                  op_index={:?} (fail_arg): RPython box.type is fixed at \
                                  construction (resoperation.py:719/727/739)",
-                                opref, op_index
-                            )
-                        })
+                                    opref, op_index
+                                )
+                            })
                     }
                 })
                 .collect()
@@ -8077,7 +8085,9 @@ impl<'a> Assembler386<'a> {
         if op.num_args() < 4 {
             return; // 3-arg GC rewrite form — skip for now
         }
-        let itemsize = self.resolve_const_or(op.arg(3).to_opref(), 8).unsigned_abs() as usize;
+        let itemsize = self
+            .resolve_const_or(op.arg(3).to_opref(), 8)
+            .unsigned_abs() as usize;
 
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -8094,7 +8104,9 @@ impl<'a> Assembler386<'a> {
     fn genop_discard_gc_store_indexed(&mut self, op: &Op) {
         let scale = self.resolve_const_or(op.arg(3).to_opref(), 1) as i32;
         let base_offset = self.resolve_const_or(op.arg(4).to_opref(), 0) as i32;
-        let itemsize = self.resolve_const_or(op.arg(5).to_opref(), 8).unsigned_abs() as usize;
+        let itemsize = self
+            .resolve_const_or(op.arg(5).to_opref(), 8)
+            .unsigned_abs() as usize;
 
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());

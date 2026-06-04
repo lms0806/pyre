@@ -291,7 +291,10 @@ impl RegisterHints {
         };
         let gc_level = compute_gc_level(calldescr, guard_not_forced);
         let arglist = op.getarglist();
-        let args: Vec<OpRef> = arglist[first_arg_index..].iter().map(|a| a.to_opref()).collect();
+        let args: Vec<OpRef> = arglist[first_arg_index..]
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
         let argtypes = calldescr.arg_types();
         self.hint(longevity, position, &args, argtypes, gc_level);
     }
