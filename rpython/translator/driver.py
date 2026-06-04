@@ -503,7 +503,8 @@ class TranslationDriver(SimpleTaskEngine):
                     shutil.copyfile(str(oldlibname), libname)
                     self.log.info("copied: %s to %s" % (oldlibname, libname,))
                     # the pdb file goes in the same place as pypy(w).exe
-                    ext_to_copy = ['pdb',]
+                    if soname.new(ext="pdb").exists():
+                        ext_to_copy = ['pdb',]
                     for ext in ext_to_copy:
                         name = soname.new(ext=ext)
                         newname = newexename.new(basename=soname.basename)
