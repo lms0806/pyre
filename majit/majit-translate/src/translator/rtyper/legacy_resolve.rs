@@ -69,15 +69,15 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // outputs always produce a concrete kind, so every populated cell
     // commits a real
     // `FunctionGraph::set_concretetype_of_inline` write.
-    for (_, var) in graph.iter_variable_slots() {
-        if exceptblock_inputargs.iter().any(|e| e == var) {
+    for var in graph.iter_variables() {
+        if exceptblock_inputargs.iter().any(|e| *e == var) {
             continue;
         }
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
             let concrete = valuetype_to_concrete(&vtype);
-            FunctionGraph::set_concretetype_of_inline(var, concrete);
+            FunctionGraph::set_concretetype_of_inline(&var, concrete);
         }
     }
 

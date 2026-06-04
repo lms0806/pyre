@@ -64,7 +64,7 @@ use crate::front;
 use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, SlotToVariable};
+use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, LegacyToTyped};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pyre_call_registry::{
     FunctionPathKey, PyreCallRegistry, PyreFunctionEntry,
@@ -143,8 +143,12 @@ struct LegacyAnnotationGuard {
 impl LegacyAnnotationGuard {
     fn snapshot(graph: &LegacyGraph) -> Self {
         let snapshot = graph
-            .iter_variable_slots()
-            .map(|(_, var)| (var.clone(), var.annotation.borrow().clone()))
+            .iter_variables()
+            .into_iter()
+            .map(|var| {
+                let ann = var.annotation.borrow().clone();
+                (var, ann)
+            })
             .collect();
         Self { snapshot }
     }
@@ -207,7 +211,9 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
         specialize_legacy_graph(legacy_graph)
     }));
     let real_state = match result {
-        Ok(Ok((value_to_var, constants))) => project_value_to_var_to_map(&value_to_var, &constants),
+        Ok(Ok((value_to_var, constants))) => {
+            project_value_to_var_to_map(&value_to_var, &constants, legacy_graph)
+        }
         Ok(Err(e)) => return Err(format!("real path failed: {e}")),
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -307,7 +313,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// a known-unported feature (`Skip(reason)` — production falls back
 /// to the legacy walker for the affected graph).
 ///
-/// `Match` carries the real path's `SlotToVariable` map (each
+/// `Match` carries the real path's `LegacyToTyped` map (each
 /// `Variable.concretetype` cell set by `RPythonTyper::specialize`) so
 /// production callers consume it directly.  The real path is the
 /// authoritative producer; legacy is the fallback for
@@ -338,16 +344,16 @@ pub(crate) enum DualGateOutcome {
     /// is pyre-only scaffolding that retires once the legacy walker
     /// itself retires.
     Match {
-        /// `slot → flowspace::Variable` (`SlotToVariable =
-        /// HashMap<usize, Variable>`) mapping built by the
-        /// flowspace adapter.  Each Variable carries the
+        /// `legacy Variable → typed flowspace::Variable`
+        /// (`LegacyToTyped = HashMap<Variable, Variable>`) mapping built
+        /// by the flowspace adapter.  Each typed Variable carries the
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
-        /// model.py:280`), so codewriter callers rebind each slot to
-        /// the upstream-typed Variable via
+        /// model.py:280`), so codewriter callers copy that lltype onto
+        /// the matching legacy Variable via
         /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
-        /// `FunctionGraph::concretetype_of(&v)` then reads its
-        /// `concretetype` cell directly.
-        real_value_to_var: SlotToVariable,
+        /// `FunctionGraph::concretetype_of(&v)` then reads the legacy
+        /// Variable's `concretetype` cell directly.
+        real_value_to_var: LegacyToTyped,
     },
     /// Real path failed on a known-unported feature — the gate
     /// cannot validate this graph yet but the failure is *not* a
@@ -380,7 +386,7 @@ pub(crate) enum DualGateOutcome {
 /// Returns:
 ///
 /// - `Ok(DualGateOutcome::Match)` when the real path succeeds.  The
-///   real path's `SlotToVariable` map (with each
+///   real path's `LegacyToTyped` map (with each
 ///   `Variable.concretetype` cell populated) is the authoritative
 ///   source for production consumption.
 /// - `Ok(DualGateOutcome::Skip(reason))` when the real path failed
@@ -474,21 +480,34 @@ pub(crate) fn dual_gate_check_with_registry(
 /// `dual_gate_check_with_registry` baseline strip — anchor tests still
 /// diff the real path against the legacy walker for hand-built
 fn project_value_to_var_to_map(
-    value_to_var: &SlotToVariable,
-    constant_concretetypes: &HashMap<usize, LowLevelType>,
+    value_to_var: &LegacyToTyped,
+    constant_concretetypes: &HashMap<Variable, LowLevelType>,
+    legacy_graph: &LegacyGraph,
 ) -> std::collections::BTreeMap<usize, ConcreteType> {
     let mut real_state = std::collections::BTreeMap::new();
-    for (&idx, var) in value_to_var {
-        if let Some(lltype) = var.concretetype().as_ref() {
+    // `value_to_var` is keyed by the legacy graph Variable's identity;
+    // this comparison diffs against the dense slot-indexed legacy
+    // snapshot, so project each key Variable back to its slot here.
+    for (legacy_var, typed_var) in value_to_var {
+        let Some(idx) = legacy_graph.slot_of(legacy_var) else {
+            continue;
+        };
+        if let Some(lltype) = typed_var.concretetype().as_ref() {
             if let Ok(kind) = lowleveltype_to_concrete(lltype) {
                 real_state.insert(idx, kind);
             }
         }
     }
     // `Constant.concretetype` is the ground truth for constant operands
-    // — read it from the adapter's per-slot map rather than attempting
-    // to reconstruct from the reduced legacy `ValueType` view.
-    for (&idx, lltype) in constant_concretetypes {
+    // — read it from the adapter's per-`Variable` map rather than
+    // attempting to reconstruct from the reduced legacy `ValueType`
+    // view.  Project each const-define result Variable back to its slot
+    // (same as the `value_to_var` loop above) so it lands in the dense
+    // slot-indexed snapshot this helper diffs against.
+    for (legacy_var, lltype) in constant_concretetypes {
+        let Some(idx) = legacy_graph.slot_of(legacy_var) else {
+            continue;
+        };
         if let Ok(kind) = lowleveltype_to_concrete(lltype) {
             real_state.insert(idx, kind);
         }
@@ -497,11 +516,11 @@ fn project_value_to_var_to_map(
 }
 
 fn compare_real_against_legacy(
-    value_to_var: &SlotToVariable,
-    constants: &HashMap<usize, LowLevelType>,
+    value_to_var: &LegacyToTyped,
+    constants: &HashMap<Variable, LowLevelType>,
     legacy_graph: &LegacyGraph,
 ) -> Option<String> {
-    let real_state = project_value_to_var_to_map(value_to_var, constants);
+    let real_state = project_value_to_var_to_map(value_to_var, constants, legacy_graph);
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
@@ -1274,7 +1293,7 @@ pub(crate) fn populate_call_registry_from_program(
 /// dual-gate validation against graphs that have no `Call` ops.
 pub fn specialize_legacy_graph(
     legacy: &LegacyGraph,
-) -> Result<(SlotToVariable, HashMap<usize, LowLevelType>), TyperError> {
+) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
     let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
@@ -1282,12 +1301,13 @@ pub fn specialize_legacy_graph(
 }
 
 /// `specialize_legacy_graph_with_registry` extended return shape that
-/// also surfaces the [`SlotToVariable`] map and the per-slot
+/// also surfaces the [`LegacyToTyped`] map and the per-`Variable`
 /// `Constant.concretetype` table produced by the flowspace adapter.
-/// Codewriter callers consume `value_to_var` directly (the rtyper's
-/// `Variable.concretetype` writes propagate via
-/// `FunctionGraph::set_concretetype_of_inline` at the dual-gate `Match` arm);
-/// `constants` feeds [`project_value_to_var_to_state`] for the
+/// Codewriter callers consume `value_to_var` directly: the rtyper's
+/// typed `Variable.concretetype` writes are copied onto the matching
+/// legacy Variables by
+/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`].
+/// `constants` feeds [`project_value_to_var_to_map`] for the
 /// dual-gate baseline comparison.
 ///
 /// Test fixtures that hand-roll minimal SSA shapes without
@@ -1298,7 +1318,7 @@ pub fn specialize_legacy_graph(
 pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(SlotToVariable, HashMap<usize, LowLevelType>), TyperError> {
+) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
     // RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1484,7 +1504,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // deleted.  Each callable that needs
     // a kind view derives one on demand from `value_to_var` +
     // `constant_concretetypes` via
-    // [`project_value_to_var_to_state`] — same `Variable.concretetype`
+    // [`project_value_to_var_to_map`] — same `Variable.concretetype`
     // / `Constant.concretetype` ground truth, just routed at the
     // consumer instead of eagerly materialised here.  Run a
     // validation pass so unsupported lltypes still surface as a
@@ -1513,13 +1533,15 @@ mod tests {
         crate::model::Link::new_mixed(args, returnblock_id, None)
     }
 
-    /// Test helper — read the concrete kind for the slot at `idx`
-    /// directly from the post-rtyper `SlotToVariable` map's
-    /// `Variable.concretetype` cell (`flowspace/model.py:280`).
-    /// Replaces the retired `TypeResolutionState::get(vid)` path.
-    fn kind_of_in(value_to_var: &SlotToVariable, idx: usize) -> ConcreteType {
+    /// Test helper — read the concrete kind for the legacy graph slot at
+    /// `idx` from the post-rtyper `LegacyToTyped` map's
+    /// `Variable.concretetype` cell (`flowspace/model.py:280`).  The map
+    /// is keyed by the legacy Variable's identity, so resolve the slot to
+    /// its backing Variable on `graph` first.
+    fn kind_of_in(value_to_var: &LegacyToTyped, graph: &LegacyGraph, idx: usize) -> ConcreteType {
+        let key = graph.must_variable_at(idx);
         let var = value_to_var
-            .get(&idx)
+            .get(&key)
             .unwrap_or_else(|| panic!("slot {idx} missing from value_to_var"));
         let ll = var
             .concretetype()
@@ -1567,7 +1589,7 @@ mod tests {
 
     #[test]
     fn known_unported_classifies_indirect_call_adapter_invariant() {
-        let msg = "translate_op: Call with CallTarget::Indirect at result=Some(slot 4) \
+        let msg = "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
                    must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
                    reaching the flowspace adapter";
         assert!(
@@ -1673,7 +1695,7 @@ mod tests {
             specialize_legacy_graph(&graph).expect("identity int graph must specialize");
 
         assert_eq!(
-            kind_of_in(&value_to_var, 1),
+            kind_of_in(&value_to_var, &graph, 1),
             ConcreteType::Signed,
             "Int-typed inputarg must specialize to Signed via SomeInteger → IntegerRepr"
         );
@@ -1713,7 +1735,7 @@ mod tests {
             specialize_legacy_graph(&graph).expect("identity float graph must specialize");
 
         assert_eq!(
-            kind_of_in(&value_to_var, 1),
+            kind_of_in(&value_to_var, &graph, 1),
             ConcreteType::Float,
             "Float-typed inputarg must specialize to Float via SomeFloat → FloatRepr"
         );
@@ -1760,7 +1782,7 @@ mod tests {
         let (value_to_var, _constants) = specialize_legacy_graph(&graph)
             .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
         assert_eq!(
-            kind_of_in(&value_to_var, 1),
+            kind_of_in(&value_to_var, &graph, 1),
             ConcreteType::GcRef,
             "Ref-typed inputarg must project to GcRef matching legacy"
         );
@@ -2329,7 +2351,7 @@ fn fib(n: i64) -> i64 {
         let (value_to_var, _constants) = specialize_legacy_graph(&graph)
             .expect("GuardValue must be a no-op for the rtyper adapter");
         assert_eq!(
-            kind_of_in(&value_to_var, 1),
+            kind_of_in(&value_to_var, &graph, 1),
             ConcreteType::Signed,
             "Int operand passing through GuardValue must specialize to Signed"
         );
@@ -2523,13 +2545,13 @@ fn fib(n: i64) -> i64 {
         //      `concretetype` is set to `Signed`
         //      (`int_is_true → Bool` style projection).
         assert_eq!(
-            kind_of_in(&value_to_var, 2),
+            kind_of_in(&value_to_var, &graph, 2),
             ConcreteType::Signed,
             "leaf Call (fn foo(x: i64) -> i64 {{ x }}) result must project to Signed \
              through the rtyper's full simple_call → FunctionRepr.call chain"
         );
         assert_eq!(
-            kind_of_in(&value_to_var, 1),
+            kind_of_in(&value_to_var, &graph, 1),
             ConcreteType::Signed,
             "Int inputarg must project to Signed (independent of the \
              call resolution path)"

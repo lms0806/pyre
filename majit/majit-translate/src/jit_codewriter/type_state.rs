@@ -1,8 +1,8 @@
 //! Concrete-kind helpers — `ConcreteType` projection from
 //! `LowLevelType`, `ValueType`, op-result kinds, plus
-//! `apply_from_flowspace_variables` (rebinds graph slots to the
-//! rtyper-typed Variables, propagating `Variable.concretetype` into
-//! every alias).
+//! `apply_from_flowspace_variables` (copies rtyper-typed lltypes onto
+//! the matching legacy Variables, propagating `Variable.concretetype`
+//! into every alias).
 //!
 //! Type kinds flow through `Variable.concretetype`
 //! (`rpython/flowspace/model.py:280 Variable.__slots__ = [..., "concretetype"]`;
@@ -30,48 +30,32 @@ use crate::model::{FunctionGraph, OpKind, ValueType};
 /// `FunctionGraph::concretetype_of(&v)`.
 pub use crate::model::ConcreteType;
 
-/// Rebind each per-slot Variable handle to the upstream-typed
-/// Variable in `value_to_var`, so subsequent
+/// Copy each typed Variable's `concretetype` onto the legacy graph
+/// Variable it was seeded from, so subsequent
 /// `FunctionGraph::concretetype_of(&v)` reads route through the
 /// rtyper's `Variable.concretetype` directly.
 ///
-/// The codewriter reads kinds via `FunctionGraph::concretetype_of(&v)`,
-/// which routes to each `Variable.concretetype` cell (set by the
-/// `RPythonTyper`) and projects through [`crate::model::getkind`],
-/// matching upstream's `getkind(v.concretetype)` access pattern.
+/// `value_to_var` is keyed by the legacy graph Variable's object
+/// identity (`legacy_var -> typed_var`).  Each legacy Variable's
+/// `Rc<RefCell>` concretetype cell is shared across every reference to
+/// it in the graph — `Block.inputargs`, op operands, `Link.args`,
+/// `exitswitch`, `last_exception`, `last_exc_value` — so a single write
+/// onto the key Variable propagates everywhere, mirroring upstream
+/// `v.concretetype = T` attribute aliasing (`history.py:46-71 getkind`
+/// reads `v.concretetype` off the Variable).
 ///
-/// Variables whose `concretetype` is still `None` (rtyper hasn't
-/// processed them yet) leave the graph slot untouched —
-/// equivalent to RPython's "no `.concretetype` attribute" window
-/// before `setconcretetype` runs.  Pyre's
-/// [`crate::model::ConcreteType::Unknown`] sentinel covers that
-/// state.
+/// A typed Variable whose `concretetype` is still `None` (rtyper hasn't
+/// processed it yet) leaves its legacy counterpart untouched —
+/// equivalent to RPython's "no `.concretetype` attribute" window before
+/// `setconcretetype` runs.
 pub fn apply_from_flowspace_variables(
-    graph: &mut FunctionGraph,
-    value_to_var: &crate::translator::rtyper::flowspace_adapter::SlotToVariable,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
 ) {
-    for (idx, var) in value_to_var.iter() {
-        // Honour the docstring contract above: a source `Variable`
-        // whose `concretetype` is still `None` represents the pre-
-        // `setconcretetype` window in RPython, where the graph slot
-        // must remain untouched.  `bind_variable_at` is defensive
-        // about this (it only copies a `Some` concretetype onto the
-        // placeholder), but invoking it with an untyped source still
-        // registers a spurious `variable_to_vid[var.id()] -> slot`
-        // entry that subsequent `slot_of(&var)` lookups would
-        // resolve unexpectedly.  Skip the call outright so the
-        // docstring claim holds bit-for-bit.
-        if var.concretetype().is_none() {
+    for (legacy_var, typed_var) in value_to_var.iter() {
+        let Some(ct) = typed_var.concretetype() else {
             continue;
-        }
-        // `bind_variable_at` merges the rtyper Variable's
-        // `concretetype` onto the existing placeholder in
-        // `value_variables[slot]`, preserving Variable identity
-        // across every graph slot that holds the placeholder
-        // (Block.inputargs, op operands, Link.args, exitswitch,
-        // last_exception, last_exc_value).  Mirrors upstream
-        // `v.concretetype = T` attribute aliasing.
-        graph.bind_variable_at(*idx, var.clone());
+        };
+        legacy_var.set_concretetype(Some(ct));
     }
 }
 

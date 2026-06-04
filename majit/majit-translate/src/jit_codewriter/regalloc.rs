@@ -545,9 +545,9 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     // concretetype lands in `kind`.  `getcolor` projects through the
     // unionfind rep to recover the chordal coloring entry — matches
     // upstream `regalloc.py:118 self.coloring[self.unionfind.find_rep(v)]`.
-    for (_slot, var) in graph.iter_variable_slots() {
-        if variable_regkind(var) == Some(kind) {
-            if let Some(color) = allocator.getcolor(var) {
+    for var in graph.iter_variables() {
+        if variable_regkind(&var) == Some(kind) {
+            if let Some(color) = allocator.getcolor(&var) {
                 coloring.insert(var.clone(), color);
                 if color + 1 > max_reg {
                     max_reg = color + 1;

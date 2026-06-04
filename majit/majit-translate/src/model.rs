@@ -3035,29 +3035,8 @@ impl FunctionGraph {
     /// recloseblock at this entry point keeps `link.args.len() ==
     /// target.inputargs.len()` (`simplify.py:513`) invariant for every
     /// predecessor of the new block.
-    ///
-    /// Precondition — every Variable returned by `getvariables` must
-    /// already be registered in `variable_to_vid`.  Locals slots
-    /// satisfy this trivially: `alloc_value` mints a placeholder
-    /// Variable that is registered at the same call.  Stack /
-    /// exception phi Variables are registered by
-    /// `FrameState::union`'s `register_phi_variables_in_stack_exc`
-    /// at the union site, and carry-through Variables retain the
-    /// registration from their original upstream definition.
     pub fn create_block_from_framestate(&mut self, fs: &FrameState) -> BlockId {
         let inputargs = fs.getvariables(self);
-        for var in &inputargs {
-            assert!(
-                self.slot_of(var).is_some(),
-                "create_block_from_framestate: Variable id={} not registered \
-                 in graph.variable_to_vid on graph {:?}; mint sites must \
-                 invoke `ensure_variable_registered_void` (or the cfg(test) \
-                 `ensure_variable_registered` form) before constructing a \
-                 framestate-derived merge block",
-                var.id(),
-                self.name,
-            );
-        }
         let id = BlockId(self.blocks.len());
         self.blocks.push(Block {
             id,
@@ -3168,9 +3147,13 @@ impl FunctionGraph {
     }
 
     /// Bind an existing flowspace `Variable` to a previously-minted
-    /// dense slot — used by [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
-    /// when the adapter discovers the upstream Variable for a slot
-    /// that was already allocated through the legacy front-end.
+    /// dense slot — a test fixture primitive that installs a rtyper-typed
+    /// Variable's `concretetype` onto the placeholder at `idx`.  The
+    /// production rtyper hand-off
+    /// ([`crate::jit_codewriter::type_state::apply_from_flowspace_variables`])
+    /// no longer routes through a slot: it writes `v.concretetype = T`
+    /// straight onto the legacy graph Variable carried by the
+    /// identity-keyed `LegacyToTyped` map.
     ///
     /// **RPython parity** — upstream `rtyper.setconcretetype(v)`
     /// (`rpython/rtyper/rmodel.py:160`) performs `v.concretetype = T`
@@ -3191,6 +3174,7 @@ impl FunctionGraph {
     /// pulled from `iter_variable_slots()` while flatten looks them up via
     /// the block/op references), so a divergent identity surfaces as
     /// missing colors.
+    #[cfg(test)]
     pub(crate) fn bind_variable_at(&mut self, idx: usize, var: crate::flowspace::model::Variable) {
         if idx >= self.value_variables.len() {
             let old_len = self.value_variables.len();
@@ -3279,8 +3263,8 @@ impl FunctionGraph {
     ///     backing slot are written in a single call; idempotent
     ///     re-call on an already-registered Variable leaves the
     ///     existing slot intact without advancing the allocator cursor.
-    ///   - `bind_variable_at` — rtyper handoff that swaps the
-    ///     placeholder Variable for the upstream one.
+    ///   - `bind_variable_at` — cfg(test) fixture hook that copies a
+    ///     typed Variable's `concretetype` onto an existing slot Variable.
     ///
     /// `ensure_variable_registered` is the cfg(test) slot-returning
     /// form of the same allocator sequence, retained for fixtures
@@ -3543,6 +3527,64 @@ impl FunctionGraph {
             .iter()
             .enumerate()
             .filter_map(|(idx, opt)| opt.as_ref().map(|var| (idx, var)))
+    }
+
+    /// Walk the graph structure and collect every distinct
+    /// [`crate::flowspace::model::Variable`] it references: block
+    /// `inputargs`, operation operands
+    /// ([`crate::inline::op_variable_refs`]) and results, link `args` /
+    /// exception extravars, and the `exitswitch` condition.  Distinct by
+    /// identity, in first-appearance order.
+    ///
+    /// The Variable-direct counterpart to `iter_variable_slots()` for
+    /// passes that enumerate the graph's values and discard the dense
+    /// slot index (regalloc coloring, `Variable.annotation` reset /
+    /// commit).  Reads the value set straight off the IR instead of the
+    /// slot registry, so those passes no longer depend on
+    /// `value_variables`.  Values minted but never referenced are
+    /// naturally absent — every consumer filters such values out anyway
+    /// (`getcolor` returns `None`, `annotation` is empty).
+    pub fn iter_variables(&self) -> Vec<crate::flowspace::model::Variable> {
+        use crate::flowspace::model::Variable;
+        let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+        let mut out: Vec<Variable> = Vec::new();
+        let push = |v: Variable,
+                    seen: &mut std::collections::HashSet<Variable>,
+                    out: &mut Vec<Variable>| {
+            if seen.insert(v.clone()) {
+                out.push(v);
+            }
+        };
+        for block in &self.blocks {
+            for v in block.input_variables() {
+                push(v.clone(), &mut seen, &mut out);
+            }
+            for op in &block.operations {
+                for v in crate::inline::op_variable_refs(&op.kind) {
+                    push(v, &mut seen, &mut out);
+                }
+                if let Some(result) = &op.result {
+                    push(result.clone(), &mut seen, &mut out);
+                }
+            }
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let Some(v) = arg.as_variable() {
+                        push(v.clone(), &mut seen, &mut out);
+                    }
+                }
+                if let Some(v) = link.last_exception.as_ref().and_then(LinkArg::as_variable) {
+                    push(v.clone(), &mut seen, &mut out);
+                }
+                if let Some(v) = link.last_exc_value.as_ref().and_then(LinkArg::as_variable) {
+                    push(v.clone(), &mut seen, &mut out);
+                }
+            }
+            if let Some(ExitSwitch::Value(cond)) = &block.exitswitch {
+                push(cond.clone(), &mut seen, &mut out);
+            }
+        }
+        out
     }
 
     /// Re-seat the slot allocator cursor.  Must be called after a
@@ -3925,10 +3967,7 @@ impl FunctionGraph {
             .any(|op| matches!(op.kind, OpKind::Input { .. }));
         self.block_mut(block).inputargs.push(var.clone());
         if is_phi_block {
-            let name = self
-                .slot_of(var)
-                .and_then(|slot| self.value_name_at(slot))
-                .unwrap_or_default();
+            let name = self.value_name_for(var).unwrap_or_default();
             self.push_op_with_result_var(
                 block,
                 OpKind::Input {
@@ -3942,8 +3981,10 @@ impl FunctionGraph {
         for (pred_block, exit_idx) in pred_edges {
             let ok = self.ensure_variable_at_block(pred_block, var);
             if !ok {
-                let slot = self.slot_of(var);
-                let name = slot.and_then(|s| self.value_name_at(s));
+                // The Variable's source name is read identity-first off
+                // its `OpKind::Input` op via `value_name_for`; the panic
+                // identifies the variable by `id` + source name.
+                let name = self.value_name_for(var);
                 // Dump the blocks whose framestate references `var` and the
                 // blocks that actually define it.  Surfaces stale carry-
                 // through bindings (e.g. a sibling control-flow path's
@@ -3977,13 +4018,12 @@ impl FunctionGraph {
                 }
                 panic!(
                     "ensure_variable_at_block: predecessor {:?} cannot define \
-                     Variable id={} (slot={:?}, name={:?}) when threading to block {:?} on graph {:?} \
+                     Variable id={} (name={:?}) when threading to block {:?} on graph {:?} \
                      — graph corruption: no transitive predecessor chain leads \
                      to a definition site. \
                      Variable appears in framestate of blocks {:?} and in inputargs/operations of blocks {:?}.",
                     pred_block,
                     var.id(),
-                    slot,
                     name,
                     block,
                     self.name,
@@ -4248,14 +4288,15 @@ impl FunctionGraph {
         v.rename(&name.into());
     }
 
-    /// Source name of the value at the given dense slot, if it enters
-    /// SSA through an `OpKind::Input` op. This is the raw, uncleaned
-    /// name (the equivalent of `co_varnames`, read by `signature_for`
-    /// and the flowspace adapter's same-name dedup); it is distinct
-    /// from the cleaned `Variable._name` carried on the object via
-    /// `rename` (read by `backendopt/ssa`). Values that do not enter
-    /// through an `Input` op (e.g. a `let` binding to an arithmetic
-    /// result) have no source name here.
+    /// Source name of `var` if it entered SSA through an
+    /// `OpKind::Input` op, resolved by Variable identity directly — no
+    /// graph-slot round trip. This is the raw, uncleaned name (the
+    /// equivalent of `co_varnames`, read by `signature_for` and the
+    /// flowspace adapter's same-name dedup); it is distinct from the
+    /// cleaned `Variable._name` carried on the object via `rename`
+    /// (read by `backendopt/ssa`). Values that do not enter through an
+    /// `Input` op (e.g. a `let` binding to an arithmetic result) have
+    /// no source name.
     ///
     /// The `Input` op is the *only* carrier of the raw name: `rename`
     /// stores `clean_name(name)` on `Variable._name` (which appends a
@@ -4270,16 +4311,7 @@ impl FunctionGraph {
     /// `code.signature` on the `PyGraph` wrapper; pyre's lifted callee
     /// graphs carry no such wrapper, so the raw name is recovered from
     /// the `Input` op until a `PyGraph`-equivalent signature store
-    /// lands.
-    pub fn value_name_at(&self, idx: usize) -> Option<String> {
-        let var = self.variable_at(idx)?;
-        self.value_name_for(var)
-    }
-
-    /// Identity-based counterpart of [`Self::value_name_at`]: the source
-    /// name of `var` if it entered SSA through an `OpKind::Input` op,
-    /// resolved by Variable identity directly — no graph-slot round
-    /// trip. Orthodox reader for callers that already hold the
+    /// lands. Orthodox reader for callers that already hold the
     /// `Variable` (e.g. `signature_for_graph` walking
     /// `startblock.inputargs`); RPython reads the source name off the
     /// Variable / `co_varnames`, never via an integer value index.
@@ -4384,11 +4416,7 @@ impl FunctionGraph {
             self.num_ops()
         );
         for block in &self.blocks {
-            let args: Vec<String> = block
-                .inputargs
-                .iter()
-                .map(|v| self.fmt_variable(v))
-                .collect();
+            let args: Vec<String> = block.inputargs.iter().map(|v| v.name()).collect();
             if args.is_empty() {
                 out.push_str(&format!("  Block {}:\n", block.id.0));
             } else {
@@ -4398,7 +4426,7 @@ impl FunctionGraph {
                 let result = op
                     .result
                     .as_ref()
-                    .map(|v| format!("{} = ", self.fmt_variable(v)))
+                    .map(|v| format!("{} = ", v.name()))
                     .unwrap_or_default();
                 out.push_str(&format!("    {}{:?}\n", result, op.kind));
             }
@@ -4415,20 +4443,6 @@ impl FunctionGraph {
             }
         }
         out
-    }
-
-    /// RPython `flowspace/model.py:282 Variable.__repr__` produces
-    /// `'v%d' % self._nr`; the pyre dump prefers the dense graph-local
-    /// slot index when the Variable has one registered, falling back
-    /// to upstream's `_nr` for stand-alone Variables.
-    fn fmt_variable(&self, var: &crate::flowspace::model::Variable) -> String {
-        match self.slot_of(var) {
-            Some(slot) => match self.value_name_at(slot) {
-                Some(name) => format!("v{}:{}", slot, name),
-                None => format!("v{}", slot),
-            },
-            None => format!("v{}", var.id()),
-        }
     }
 }
 

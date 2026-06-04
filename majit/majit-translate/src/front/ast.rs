@@ -2963,11 +2963,7 @@ impl<'a> GraphBuildContext<'a> {
         for (_slot_idx, name, payload) in entries {
             match payload {
                 Some((var, ty)) => {
-                    if graph
-                        .slot_of(&var)
-                        .and_then(|s| graph.value_name_at(s))
-                        .is_none()
-                    {
+                    if graph.value_name_for(&var).is_none() {
                         graph.name_value_var(&var, name.clone());
                     }
                     self.local_value_ids

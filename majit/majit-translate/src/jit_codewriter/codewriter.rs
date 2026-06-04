@@ -253,7 +253,7 @@ impl CodeWriter {
     /// below (`merge_synth_kinds_into_graph`) stamps each synth
     /// Variable's `.concretetype` cell via
     /// `set_concretetype_of_inline`, then `apply_from_flowspace_variables`
-    /// rebinds per-Variable from the `value_to_var` map so the
+    /// copies lltypes from typed Variables in the `value_to_var` map so the
     /// rtyper's authoritative `Variable.concretetype` overrides
     /// any synthetic stamp.  Slots without a rtyper-bound Variable
     /// keep the synthetic canonical type the merge wrote.
@@ -275,7 +275,7 @@ impl CodeWriter {
     ///
     /// Runs [`dual_gate_check_with_registry`] against the
     /// program-wide `PyreCallRegistry`; on Match the real path's
-    /// `SlotToVariable` map (with each `Variable.concretetype`
+    /// `LegacyToTyped` map (with each `Variable.concretetype`
     /// cell populated by `RPythonTyper::specialize`) is returned
     /// directly, on Skip the legacy walker (`legacy_annotator::annotate` +
     /// `legacy_resolve::resolve_types`) commits kinds to
@@ -289,7 +289,7 @@ impl CodeWriter {
     /// Run the dual-gate type resolver and commit every resolved kind
     /// to each backing `Variable.concretetype` cell on `graph` (RPython
     /// `rtyper.py:258 v.concretetype = ...`).  Returns the
-    /// `SlotToVariable` map produced by the Match arm so the
+    /// `LegacyToTyped` map produced by the Match arm so the
     /// post-jtransform path can rebind operand Variables to the
     /// upstream-typed ones; Skip arm returns `None`.
     pub fn dual_gate_publish_concretetypes(
@@ -297,7 +297,7 @@ impl CodeWriter {
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
         diag_label: &str,
-    ) -> Option<crate::translator::rtyper::flowspace_adapter::SlotToVariable> {
+    ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
             crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
@@ -360,7 +360,7 @@ impl CodeWriter {
                 // `RPythonAnnotator.__init__` starts with `bindings =
                 // {}`, equivalent to clearing every cell to `None`
                 // before the iterative fixpoint loop.
-                for (_, var) in graph.iter_variable_slots() {
+                for var in graph.iter_variables() {
                     *var.annotation.borrow_mut() = None;
                 }
                 crate::translator::rtyper::legacy_annotator::annotate(graph);
@@ -392,7 +392,7 @@ impl CodeWriter {
                 // Variable, tripping `bindinputargs::setbinding`
                 // monotonicity when the real path's flowin computes a
                 // narrower binding.
-                for (_, var) in graph.iter_variable_slots() {
+                for var in graph.iter_variables() {
                     *var.annotation.borrow_mut() = None;
                 }
                 None
@@ -565,17 +565,15 @@ impl CodeWriter {
             }
         }
         // Long-term parity hydration: when the dual-gate Match arm
-        // surfaced a `SlotToVariable` map, rebind each slot to the
-        // upstream-typed `Variable` so `FunctionGraph::concretetype_of(&v)`
-        // reads its `concretetype` cell directly.  Upstream parity:
+        // surfaced a `LegacyToTyped` map, copy each upstream-typed
+        // Variable's lltype onto the matching legacy Variable so
+        // `FunctionGraph::concretetype_of(&v)` reads its `concretetype`
+        // cell directly.  Upstream parity:
         // `history.py:46-71 getkind` reads `v.concretetype` from the
-        // Variable, so this rebinding makes pyre's read path
+        // Variable, so this hydration makes pyre's read path
         // line-for-line equivalent.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            crate::jit_codewriter::type_state::apply_from_flowspace_variables(
-                &mut rewritten.graph,
-                value_to_var,
-            );
+            crate::jit_codewriter::type_state::apply_from_flowspace_variables(value_to_var);
         }
 
         // Step 2: regalloc (codewriter.py:45-47)
@@ -614,11 +612,10 @@ impl CodeWriter {
         // committing the shell via `set_body`.
         let mut body =
             crate::jit_codewriter::transform_profile::time_phase("step4_assemble", || {
-                self.assembler.assemble_with_callcontrol_and_graph(
+                self.assembler.assemble_with_callcontrol(
                     &mut ssarepr,
                     &regallocs,
                     Some(callcontrol),
-                    &rewritten.graph,
                 )
             });
 
@@ -876,7 +873,7 @@ impl Default for CodeWriter {
 /// `function_graphs.get(&path)` directly.
 fn stamp_classdef_hints_on_graph(
     graph: &mut FunctionGraph,
-    value_to_var: &crate::translator::rtyper::flowspace_adapter::SlotToVariable,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
 ) {
     use crate::annotator::model::SomeValue;
     use crate::model::{CallTarget, OpKind};
@@ -899,10 +896,7 @@ fn stamp_classdef_hints_on_graph(
             let Some(receiver) = args.first() else {
                 continue;
             };
-            let Some(slot) = graph.slot_of(receiver) else {
-                continue;
-            };
-            let Some(annotated_var) = value_to_var.get(&slot) else {
+            let Some(annotated_var) = value_to_var.get(receiver) else {
                 continue;
             };
             let annotation = annotated_var.annotation.borrow();
@@ -1024,7 +1018,6 @@ mod stamp_classdef_hints_tests {
 
         let mut graph = FunctionGraph::new("producer_test");
         graph.ensure_variable_registered_void(&recv_var);
-        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         let _result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -1037,7 +1030,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op_var should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_slot, recv_var.clone());
+        value_to_var.insert(recv_var.clone(), recv_var.clone());
 
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 
@@ -1059,7 +1052,6 @@ mod stamp_classdef_hints_tests {
         // No annotation bound.
         let mut graph = FunctionGraph::new("producer_test");
         graph.ensure_variable_registered_void(&recv_var);
-        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
             .push_op_var(
                 graph.startblock,
@@ -1072,7 +1064,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op_var should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_slot, recv_var.clone());
+        value_to_var.insert(recv_var.clone(), recv_var.clone());
 
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 
@@ -1153,7 +1145,6 @@ mod stamp_classdef_hints_tests {
 
         let mut graph = FunctionGraph::new("producer_test");
         graph.ensure_variable_registered_void(&recv_var);
-        let recv_slot = graph.slot_of(&recv_var).expect("just registered above");
         graph
             .push_op_var(
                 graph.startblock,
@@ -1166,7 +1157,7 @@ mod stamp_classdef_hints_tests {
             )
             .expect("push_op_var should succeed");
         let mut value_to_var = std::collections::HashMap::new();
-        value_to_var.insert(recv_slot, recv_var.clone());
+        value_to_var.insert(recv_var.clone(), recv_var.clone());
 
         stamp_classdef_hints_on_graph(&mut graph, &value_to_var);
 

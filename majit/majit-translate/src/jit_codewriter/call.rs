@@ -7935,23 +7935,28 @@ mod tests {
         use crate::translator::translator::TranslationContext;
         use std::rc::Rc;
 
-        // Entry computes slot 3 = OP(slot 1, slot 2). When `raises` is
+        // Entry computes `op_result = OP(lhs, rhs)`. When `raises` is
         // set the block exits on `LastException`: the normal edge carries
-        // slot 3 to the returnblock and the exception edge carries the
-        // caught (last_exception, last_exc_value) = (slot 10, slot 11)
-        // into the exceptblock inputargs via `.extravars` — a
-        // reraise-of-caught shape. When `raises` is clear the block has a
-        // single unconditional exit to the returnblock (no exceptblock
-        // reach), so the only raise source is the op itself.
+        // `op_result` to the returnblock and the exception edge carries
+        // the caught `(exc_type, exc_value)` into the exceptblock
+        // inputargs via `.extravars` — a reraise-of-caught shape. When
+        // `raises` is clear the block has a single unconditional exit to
+        // the returnblock (no exceptblock reach), so the only raise
+        // source is the op itself.
         fn build(name: &str, opname: &str, raises: bool) -> FunctionGraph {
             let mut g = FunctionGraph::new(name);
-            g.set_next_value(12);
+            let lhs = g.alloc_value_var();
+            let rhs = g.alloc_value_var();
+            let op_result = g.alloc_value_var();
+            let ret_param = g.alloc_value_var();
+            let exc_type = g.alloc_value_var();
+            let exc_value = g.alloc_value_var();
             let op = crate::model::SpaceOperation {
-                result: Some(g.must_variable_at(3)),
+                result: Some(op_result.clone()),
                 kind: crate::model::OpKind::BinOp {
                     op: opname.to_string(),
-                    lhs: g.must_variable_at(1),
-                    rhs: g.must_variable_at(2),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
                     result_ty: crate::model::ValueType::Int,
                 },
             };
@@ -7960,21 +7965,21 @@ mod tests {
                     Some(ExitSwitch::LastException),
                     vec![
                         Link::new_mixed(
-                            vec![LinkArg::Value(g.must_variable_at(3))],
+                            vec![LinkArg::Value(op_result.clone())],
                             g.returnblock,
                             None,
                         ),
                         Link::new_mixed(
                             vec![
-                                LinkArg::Value(g.must_variable_at(10)),
-                                LinkArg::Value(g.must_variable_at(11)),
+                                LinkArg::Value(exc_type.clone()),
+                                LinkArg::Value(exc_value.clone()),
                             ],
                             g.exceptblock,
                             Some(exception_exitcase()),
                         )
                         .extravars(
-                            Some(LinkArg::Value(g.must_variable_at(10))),
-                            Some(LinkArg::Value(g.must_variable_at(11))),
+                            Some(LinkArg::Value(exc_type.clone())),
+                            Some(LinkArg::Value(exc_value.clone())),
                         ),
                     ],
                 )
@@ -7982,7 +7987,7 @@ mod tests {
                 (
                     None,
                     vec![Link::new_mixed(
-                        vec![LinkArg::Value(g.must_variable_at(3))],
+                        vec![LinkArg::Value(op_result.clone())],
                         g.returnblock,
                         None,
                     )],
@@ -7990,7 +7995,7 @@ mod tests {
             };
             let startblock = crate::model::Block {
                 id: g.startblock,
-                inputargs: vec![g.must_variable_at(1), g.must_variable_at(2)],
+                inputargs: vec![lhs.clone(), rhs.clone()],
                 operations: vec![op],
                 exitswitch,
                 exits,
@@ -7999,7 +8004,7 @@ mod tests {
             };
             let returnblock = crate::model::Block {
                 id: g.returnblock,
-                inputargs: vec![g.must_variable_at(4)],
+                inputargs: vec![ret_param.clone()],
                 operations: vec![],
                 exitswitch: None,
                 exits: vec![],
@@ -8010,7 +8015,7 @@ mod tests {
             if raises {
                 blocks.push(crate::model::Block {
                     id: g.exceptblock,
-                    inputargs: vec![g.must_variable_at(10), g.must_variable_at(11)],
+                    inputargs: vec![exc_type.clone(), exc_value.clone()],
                     operations: vec![],
                     exitswitch: None,
                     exits: vec![],

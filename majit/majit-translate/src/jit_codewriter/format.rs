@@ -56,24 +56,20 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
 /// read directly from each operand `Variable`'s `concretetype` cell
 /// (`flowspace/model.py:280` `__slots__ = [..., "concretetype"]`); no
 /// side-table is consulted.
+///
+/// **PRE-EXISTING-ADAPTATION** — upstream's `SSARepr` already holds
+/// post-flatten [`crate::flatten::Register`]s (the regalloc color) by
+/// the time `format_assembler` runs, so `format.py:17-18` renders
+/// `'%%%s%d' % (x.kind[0], x.index)` straight off the color.  Pyre's
+/// `serialize_op` (`flatten.py:373-380` analogue) defers per-op arg
+/// rewriting — `FlatOp::Op` keeps the unflattened
+/// [`crate::model::SpaceOperation`] with `Variable` operands — so the
+/// register suffix here renders `Variable.id()` (process-wide
+/// identity) rather than the regalloc color.  Convergence path:
+/// colorize op operands at flatten (`flatten_list(op.args)`) so the
+/// `SSARepr` becomes self-contained and this formatter reads
+/// `Register.index` with neither a graph nor the regalloc result.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
-    format_assembler_full(ssarepr, None)
-}
-
-/// Graph-aware sibling of [`format_assembler`].  When `graph` is
-/// supplied, Variable-typed operands resolve their render suffix via
-/// `graph.slot_of(v)` (graph-local SSA numbering) rather than
-/// `Variable.id()` (process-wide identity).  Tests that need stable
-/// RPython-shaped `%i<n>` suffixes across runs should route through
-/// this entry point.
-pub fn format_assembler_with_graph(
-    ssarepr: &SSARepr,
-    graph: &crate::model::FunctionGraph,
-) -> String {
-    format_assembler_full(ssarepr, Some(graph))
-}
-
-fn format_assembler_full(ssarepr: &SSARepr, graph: Option<&crate::model::FunctionGraph>) -> String {
     // First pass: collect every label that appears as a target so the
     // numbering matches format.py's getlabelname (labels are numbered in
     // first-seen order).
@@ -129,7 +125,7 @@ fn format_assembler_full(ssarepr: &SSARepr, graph: Option<&crate::model::Functio
                 }
             }
             FlatOp::Op(space_op) => {
-                let args = op_args_repr(space_op, graph);
+                let args = op_args_repr(space_op);
                 if args.is_empty() {
                     let _ = writeln!(out, "{prefix}{}", op_name(space_op));
                 } else {
@@ -342,13 +338,9 @@ fn register_repr_for_kind(suffix: u64, kind: RegKind) -> String {
 /// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot —
 /// it is passed in directly rather than fetched from a side-table.
 /// Argument storage is `Vec<Variable>` (orthodox per `flowspace/model.py:Variable`);
-/// the Variable's render suffix resolves via `graph.slot_of(v)`
-/// when a graph is provided, falling back to `Variable.id()`.
-fn list_of_kind_repr_vars(
-    kind_char: char,
-    args: &[crate::flowspace::model::Variable],
-    graph: Option<&crate::model::FunctionGraph>,
-) -> String {
+/// the Variable's register suffix renders `Variable.id()` (the
+/// PRE-EXISTING-ADAPTATION documented on [`format_assembler`]).
+fn list_of_kind_repr_vars(kind_char: char, args: &[crate::flowspace::model::Variable]) -> String {
     let kind = match kind_char.to_ascii_lowercase() {
         'i' => RegKind::Int,
         'f' => RegKind::Float,
@@ -356,26 +348,9 @@ fn list_of_kind_repr_vars(
     };
     let parts: Vec<String> = args
         .iter()
-        .map(|v| register_repr_for_kind(variable_register_suffix(v, graph), kind))
+        .map(|v| register_repr_for_kind(v.id(), kind))
         .collect();
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
-}
-
-/// Resolve a [`crate::flowspace::model::Variable`] to the numeric
-/// suffix used in `%i<n>`/`%r<n>`/`%f<n>` register renderings.  When
-/// `graph` is provided we look the bridge up via
-/// [`crate::model::FunctionGraph::slot_of`] for graph-local SSA
-/// numbering; failing that (and when no graph is supplied) we fall
-/// back to `Variable.id()` (process-wide identity counter).  The
-/// fallback is sufficient for tests and `JitCode.dump` where the
-/// original graph is no longer accessible.
-fn variable_register_suffix(
-    v: &crate::flowspace::model::Variable,
-    graph: Option<&crate::model::FunctionGraph>,
-) -> u64 {
-    graph
-        .and_then(|g| g.slot_of(v).map(|slot| slot as u64))
-        .unwrap_or(v.id())
 }
 
 /// format.py:20-23 — render a `funcptr` slot.
@@ -416,10 +391,7 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
     }
 }
 
-fn call_funcptr_repr(
-    funcptr: &crate::model::CallFuncPtr,
-    graph: Option<&crate::model::FunctionGraph>,
-) -> String {
+fn call_funcptr_repr(funcptr: &crate::model::CallFuncPtr) -> String {
     match funcptr {
         crate::model::CallFuncPtr::Target(target) => call_target_repr(target),
         // RPython's funcptr slot is `lltype.Ptr(FUNC)` (kind 'r')
@@ -431,9 +403,8 @@ fn call_funcptr_repr(
         // kind matches the upstream `getkind(v.concretetype)` slot
         // shape.  Falls back to `Ref` when the cell is unset.
         crate::model::CallFuncPtr::Value(var) => {
-            let suffix = variable_register_suffix(var, graph);
             let kind = variable_kind(var).unwrap_or(RegKind::Ref);
-            register_repr_for_kind(suffix, kind)
+            register_repr_for_kind(var.id(), kind)
         }
     }
 }
@@ -527,10 +498,7 @@ fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T]) -> String {
     out
 }
 
-fn op_args_repr(
-    op: &crate::model::SpaceOperation,
-    graph: Option<&crate::model::FunctionGraph>,
-) -> String {
+fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
     match &op.kind {
@@ -542,18 +510,15 @@ fn op_args_repr(
         // unset (anchor-test fixtures that build SSA shapes without
         // running the rtyper).
         OpKind::Call { args, .. } => {
-            // When a graph is provided we resolve the Variable's
-            // graph-local register suffix via `slot_of` so the
-            // render matches RPython's graph-local SSA numbering.
-            // Without it we fall back to `Variable.id()` (process-wide
-            // identity) — sufficient for tests that allocate Variables
-            // sequentially.
+            // Each Variable's register suffix renders `Variable.id()`
+            // (process-wide identity) — the PRE-EXISTING-ADAPTATION
+            // documented on [`format_assembler`]; upstream renders the
+            // post-flatten `Register.index` color.
             let parts: Vec<String> = args
                 .iter()
                 .map(|v| {
-                    let suffix = variable_register_suffix(v, graph);
                     let kind = variable_kind(v).unwrap_or(RegKind::Ref);
-                    register_repr_for_kind(suffix, kind)
+                    register_repr_for_kind(v.id(), kind)
                 })
                 .collect();
             out.push_str(&parts.join(", "));
@@ -597,17 +562,17 @@ fn op_args_repr(
             args_f,
             ..
         } => {
-            let mut parts = vec![call_funcptr_repr(funcptr, graph)];
+            let mut parts = vec![call_funcptr_repr(funcptr)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr_vars('i', args_i, graph));
+                parts.push(list_of_kind_repr_vars('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr_vars('r', args_r, graph));
+                parts.push(list_of_kind_repr_vars('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr_vars('f', args_f, graph));
+                parts.push(list_of_kind_repr_vars('f', args_f));
             }
             // jtransform.py:434 — descr is the last sublist when set.
             parts.push(format!("{:?}", descriptor.extra_info));
@@ -631,13 +596,13 @@ fn op_args_repr(
             };
             let mut parts = vec![head];
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr_vars('i', args_i, graph));
+                parts.push(list_of_kind_repr_vars('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr_vars('r', args_r, graph));
+                parts.push(list_of_kind_repr_vars('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr_vars('f', args_f, graph));
+                parts.push(list_of_kind_repr_vars('f', args_f));
             }
             out.push_str(&parts.join(", "));
         }
@@ -655,12 +620,12 @@ fn op_args_repr(
             ..
         } => {
             let mut parts = vec![format!("${jd_index}")];
-            parts.push(list_of_kind_repr_vars('i', greens_i, graph));
-            parts.push(list_of_kind_repr_vars('r', greens_r, graph));
-            parts.push(list_of_kind_repr_vars('f', greens_f, graph));
-            parts.push(list_of_kind_repr_vars('i', reds_i, graph));
-            parts.push(list_of_kind_repr_vars('r', reds_r, graph));
-            parts.push(list_of_kind_repr_vars('f', reds_f, graph));
+            parts.push(list_of_kind_repr_vars('i', greens_i));
+            parts.push(list_of_kind_repr_vars('r', greens_r));
+            parts.push(list_of_kind_repr_vars('f', greens_f));
+            parts.push(list_of_kind_repr_vars('i', reds_i));
+            parts.push(list_of_kind_repr_vars('r', reds_r));
+            parts.push(list_of_kind_repr_vars('f', reds_f));
             out.push_str(&parts.join(", "));
         }
         _ => {
@@ -672,18 +637,11 @@ fn op_args_repr(
             // test demands it.
         }
     }
-    let result_suffix: Option<u64> = match graph {
-        Some(g) => op
-            .result
-            .as_ref()
-            .and_then(|v| g.slot_of(v).map(|slot| slot as u64)),
-        // No-graph render path: fall back to the Variable's `id()`
-        // (process-wide identity counter) when callers cannot supply a
-        // graph.  Preserves the historical render behaviour for
-        // standalone test fixtures that build `SpaceOperation` ahead of
-        // any graph context.
-        None => op.result.as_ref().map(|v| v.id()),
-    };
+    // Result register suffix renders the Variable's `id()`
+    // (process-wide identity) — the PRE-EXISTING-ADAPTATION documented
+    // on [`format_assembler`]; upstream renders the post-flatten
+    // `Register.index` color.
+    let result_suffix: Option<u64> = op.result.as_ref().map(|v| v.id());
     if let Some(suffix) = result_suffix {
         if !out.is_empty() {
             out.push(' ');
@@ -772,7 +730,7 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
-        // only reaches this fall-through when `op.result.as_ref().and_then(|v| graph.slot_of(v)) == Some(_)`,
+        // only reaches this fall-through when `op.result.is_some()`,
         // so any miss surfaces as a real coverage gap to extend.
         _ => RegKind::Ref,
     }
@@ -863,20 +821,20 @@ mod tests {
     #[test]
     fn format_constint_emits_dollar_value() {
         // format.py:23 `'$%r' % (x.value,)`.
-        use crate::model::{FunctionGraph, OpKind, SpaceOperation};
-        let mut graph = FunctionGraph::new("format_constint");
-        let result_var = graph.alloc_value_var();
-        let suffix = graph.slot_of(&result_var).expect("result registered");
+        use crate::flowspace::model::Variable;
+        use crate::model::{OpKind, SpaceOperation};
+        let result_var = Variable::new();
+        let result_id = result_var.id();
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::ConstInt(42),
             result: Some(result_var),
         }));
-        let text = format_assembler_with_graph(&ssa, &graph);
+        let text = format_assembler(&ssa);
         assert!(text.contains("$42"), "expected `$42` in: {text}");
         assert!(
-            text.contains(&format!("-> %i{suffix}")),
-            "expected `-> %i{suffix}` in: {text}"
+            text.contains(&format!("-> %i{result_id}")),
+            "expected `-> %i{result_id}` in: {text}"
         );
     }
 
@@ -884,17 +842,16 @@ mod tests {
     fn format_residual_call_emits_descr_and_listofkind() {
         // jtransform.py:414-435 + format.py:27,32-33.
         use crate::call::CallDescriptor;
-        use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, SpaceOperation};
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallFuncPtr, CallTarget, OpKind, SpaceOperation};
         use majit_ir::descr::EffectInfo;
 
-        let mut graph = FunctionGraph::new("format_residual_call");
-        let int_arg = graph.alloc_value_var();
-        let ref_arg = graph.alloc_value_var();
-        let _funcptr_var = graph.alloc_value_var();
-        let result_var = graph.alloc_value_var();
-        let int_arg_id = graph.slot_of(&int_arg).expect("int_arg registered");
-        let ref_arg_id = graph.slot_of(&ref_arg).expect("ref_arg registered");
-        let result_id = graph.slot_of(&result_var).expect("result registered");
+        let int_arg = Variable::new();
+        let ref_arg = Variable::new();
+        let result_var = Variable::new();
+        let int_arg_id = int_arg.id();
+        let ref_arg_id = ref_arg.id();
+        let result_id = result_var.id();
 
         let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);
@@ -911,7 +868,7 @@ mod tests {
             },
             result: Some(result_var),
         }));
-        let text = format_assembler_with_graph(&ssa, &graph);
+        let text = format_assembler(&ssa);
         assert!(
             text.contains("residual_call_ir_i "),
             "expected residual_call_ir_i in: {text}"
