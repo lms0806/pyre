@@ -5938,11 +5938,8 @@ impl OptContext {
         self.protect_speculative_operation(op);
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
-            let b = self.get_box_replacement_box(op.arg(i).to_opref()).expect(
-                "constant_fold: arg BoxRef must be registered (pure.rs:993-1006 pre-check)",
-            );
             argboxes.push(
-                self.get_constant_box(&b)
+                self.get_constant_box(&op.arg(i).get_box_replacement(false))
                     .expect("constant_fold: arg must be Const (pure.rs:993-1006 pre-check)"),
             );
         }
@@ -6007,11 +6004,8 @@ impl OptContext {
         let descr = op.getdescr();
         if opnum.is_getfield() {
             // optimizer.py:829-832 pure-getfield branch.
-            let arg0 = self
-                .get_box_replacement_box(op.arg(0).to_opref())
-                .expect("protect_speculative_operation: arg0 BoxRef must be registered");
             let gcref = match self
-                .get_constant_box(&arg0)
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .expect("protect_speculative_operation: arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6038,11 +6032,8 @@ impl OptContext {
                 | OpCode::ArraylenGc
         ) {
             // optimizer.py:834-841 array branch.
-            let arg0 = self
-                .get_box_replacement_box(op.arg(0).to_opref())
-                .expect("protect_speculative_operation: array arg0 BoxRef must be registered");
             let array = match self
-                .get_constant_box(&arg0)
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .expect("protect_speculative_operation: array arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6067,11 +6058,8 @@ impl OptContext {
                 .expect("bh_arraylen_gc must succeed after protect_speculative_array");
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
-            let arg0 = self
-                .get_box_replacement_box(op.arg(0).to_opref())
-                .expect("protect_speculative_operation: string arg0 BoxRef must be registered");
             let string = match self
-                .get_constant_box(&arg0)
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .expect("protect_speculative_operation: string arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6089,11 +6077,8 @@ impl OptContext {
                 .expect("bh_strlen must succeed after protect_speculative_string");
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
-            let arg0 = self
-                .get_box_replacement_box(op.arg(0).to_opref())
-                .expect("protect_speculative_operation: unicode arg0 BoxRef must be registered");
             let unicode = match self
-                .get_constant_box(&arg0)
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .expect("protect_speculative_operation: unicode arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6120,11 +6105,8 @@ impl OptContext {
         // optimizer.py:860-862 shared bounds check:
         //   index = self.get_constant_box(op.getarg(1)).getint()
         //   if not (0 <= index < arraylength): raise SpeculativeError
-        let arg1 = self
-            .get_box_replacement_box(op.arg(1).to_opref())
-            .expect("protect_speculative_operation: arg1 BoxRef must be registered");
         let index = match self
-            .get_constant_box(&arg1)
+            .get_constant_box(&op.arg(1).get_box_replacement(false))
             .expect("protect_speculative_operation: arg1 must be Const")
         {
             Value::Int(i) => i,

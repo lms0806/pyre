@@ -661,9 +661,7 @@ impl OptString {
         };
         // vstring.py:526-527
         let has_info = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .getptrinfo(&op.arg(0).get_box_replacement(false))
             .is_some();
         if has_info {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
@@ -991,14 +989,10 @@ impl OptString {
         let arg1 = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
         let arg2 = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
         let i1 = ctx
-            .get_box_replacement_box(op.arg(1).to_opref())
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .getptrinfo(&op.arg(1).get_box_replacement(false))
             .is_some();
         let i2 = ctx
-            .get_box_replacement_box(op.arg(2).to_opref())
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .getptrinfo(&op.arg(2).get_box_replacement(false))
             .is_some();
         // vstring.py:698-705: l1box = i1.getstrlen(arg1, self, mode)
         let l1box = if i1 {
@@ -1286,14 +1280,10 @@ impl OptString {
         }
         // vstring.py:819-822: bail out if either info is missing
         let i1 = ctx
-            .get_box_replacement_box(op.arg(1).to_opref())
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .getptrinfo(&op.arg(1).get_box_replacement(false))
             .is_some();
         let i2 = ctx
-            .get_box_replacement_box(op.arg(2).to_opref())
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .getptrinfo(&op.arg(2).get_box_replacement(false))
             .is_some();
         if !i1 || !i2 {
             self.force_args_if_virtual(op, ctx);
@@ -1537,7 +1527,10 @@ mod tests {
         for op in ops {
             // Resolve forwarded arguments.
             let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
+            // optimizer.py:651-652 setarg loop parity. Store the canonical
+            // terminal box (carrying the live _forwarded chain) like
+            // propagate_from_pass_range, so the pass reads PtrInfo/IntBound
+            // directly off resolved_op.arg(i) instead of a fresh unbound box.
             for i in 0..resolved_op.num_args() {
                 resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i).to_opref()));
             }

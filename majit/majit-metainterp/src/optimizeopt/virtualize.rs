@@ -1037,8 +1037,7 @@ impl OptVirtualize {
         else {
             return OptimizationResult::PassOn;
         };
-        let arg0_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
-        let info = arg0_box.as_ref().and_then(|b| ctx.peek_ptr_info(b));
+        let info = ctx.peek_ptr_info(&op.arg(0).get_box_replacement(false));
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
                 self.make_virtual_raw_slice(offset, arg0, op, op_rc, ctx);
@@ -1644,9 +1643,9 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return false;
         }
-        let vref_box = ctx.get_box_replacement_box(op.arg(1).to_opref());
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
-        let (token_ref, forced_ref) = match vref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let (token_ref, forced_ref) = match ctx.peek_ptr_info(&op.arg(1).get_box_replacement(false))
+        {
             Some(PtrInfo::Virtual(vinfo)) => {
                 // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
                 // if tokenop is None: return False
@@ -1963,15 +1962,12 @@ impl Optimization for OptVirtualize {
                             //   self.make_virtual_raw_memory(sizebox.getint(), op)
                             //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
-                                if let Some(size) = ctx
-                                    .get_box_replacement_box(op.arg(1).to_opref())
-                                    .and_then(|b| ctx.get_constant_int_box(&b))
+                                if let Some(size) =
+                                    ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false))
                                 {
                                     // virtualize.py:53 func = source_op.getarg(0).getint()
-                                    let func = ctx
-                                        .get_box_replacement_box(op.arg(0).to_opref())
-                                        .and_then(|cb| cb.const_int())
-                                        .expect(
+                                    let func =
+                                        op.arg(0).get_box_replacement(false).const_int().expect(
                                             "virtualize.py:53 source_op.getarg(0) must be ConstInt",
                                         );
                                     self.make_virtual_raw_memory(
@@ -2630,6 +2626,22 @@ mod tests {
         })
     }
 
+    /// Canonicalize an op's args the way the production driver does in
+    /// `Optimizer::propagate_forward` (optimizer.py:651-652 setarg loop):
+    /// resolve each arg through the box environment so the op carries the
+    /// canonical BoxRef that the handlers read via
+    /// `op.arg(i).get_box_replacement(false)`. Tests that drive a pass's
+    /// `propagate_forward` directly bypass that loop, so they must
+    /// canonicalize explicitly before invoking the handler.
+    fn resolve_op_args(op: &mut Op, ctx: &mut OptContext) {
+        for i in 0..op.num_args() {
+            let canonical = ctx
+                .get_box_replacement_box(op.arg(i).to_opref())
+                .unwrap_or_else(|| op.arg(i).clone());
+            op.setarg(i, canonical);
+        }
+    }
+
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         run_pass_typed(ops, &[])
     }
@@ -3046,6 +3058,7 @@ mod tests {
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
+        resolve_op_args(&mut get_field, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
             OptimizationResult::PassOn
@@ -3087,6 +3100,7 @@ mod tests {
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
+        resolve_op_args(&mut get_field, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
             OptimizationResult::PassOn
@@ -3258,6 +3272,7 @@ mod tests {
             fd,
         );
         set_op.pos.set(OpRef::int_op(1));
+        resolve_op_args(&mut set_op, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&set_op, &std::rc::Rc::new(set_op.clone()), &mut ctx),
             OptimizationResult::Remove
@@ -4199,21 +4214,24 @@ mod tests {
 
     #[test]
     fn test_non_virtual_passthrough() {
-        // Operations on non-virtual objects should pass through unchanged
+        // Operations on non-virtual objects should pass through unchanged.
+        // The struct base is the non-virtual Ref inputarg 0 (a real,
+        // driver-bound box); a no-producer ResOp position would not resolve
+        // to a bound box, which the canonical-arg handler requires.
         let fd = field_descr(10);
 
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
                     crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(100))],
+                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
                 fd.clone(),
             ),
         ];

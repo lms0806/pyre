@@ -1686,10 +1686,7 @@ impl Optimizer {
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF => {
                 // Check arg(0) is not null constant.
-                if let Some(0) = ctx
-                    .get_box_replacement_box(op.arg(0).to_opref())
-                    .and_then(|b| ctx.get_constant_int_box(&b))
-                {
+                if let Some(0) = ctx.get_constant_int_box(&op.arg(0).get_box_replacement(false)) {
                     return false; // would deref null
                 }
                 true
@@ -3868,12 +3865,25 @@ impl Optimizer {
             }
         }
 
-        // optimizer.py:623-625: force_box on every arg unconditionally.
+        // optimizer.py:623-625: force_box on every arg unconditionally,
+        // then store the CANONICAL box for the forced value (carrying its
+        // _forwarded chain) rather than a fresh from_opref box, so emitted
+        // ops and get_producing_op consumers can read info off op.arg(i) —
+        // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
-            op.setarg(
-                i,
-                BoxRef::from_opref(self.force_box(op.arg(i).to_opref(), ctx)),
+            let forced = self.force_box(op.arg(i).to_opref(), ctx);
+            let resolved = ctx
+                .get_box_replacement_box(forced)
+                .unwrap_or_else(|| BoxRef::from_opref(forced));
+            // The forced value is a chain terminal, so its canonical box's
+            // OpRef identity equals `forced`; OpRef-keyed consumers (backend,
+            // box_pool) see the same key, only the _forwarded info is added.
+            debug_assert_eq!(
+                resolved.to_opref(),
+                forced,
+                "emit_operation canonical box to_opref diverged from force_box",
             );
+            op.setarg(i, resolved);
         }
 
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
@@ -4482,10 +4492,7 @@ impl Optimizer {
             return op;
         }
         // optimizer.py:762: constvalue = op.getarg(1).getint()
-        let Some(constvalue) = ctx
-            .get_box_replacement_box(op.arg(1).to_opref())
-            .and_then(|cb| cb.const_int())
-        else {
+        let Some(constvalue) = op.arg(1).get_box_replacement(false).const_int() else {
             return op;
         };
         // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
@@ -4584,10 +4591,7 @@ mod tests {
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 // Check if second arg is constant 0
-                if let Some(0) = ctx
-                    .get_box_replacement_box(op.arg(1).to_opref())
-                    .and_then(|b| ctx.get_constant_int_box(&b))
-                {
+                if let Some(0) = ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false)) {
                     // Replace with first arg
                     let old = op.pos.get();
                     let new = op.arg(0).to_opref();
@@ -4994,7 +4998,7 @@ mod tests {
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcPureI,
-                &[BoxRef::from_opref(OpRef::int_op(3))],
+                &[BoxRef::from_opref(OpRef::ref_op(3))],
                 field_descr.clone(),
             ),
             Op::with_descr(
@@ -5008,7 +5012,7 @@ mod tests {
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcPureI,
-                &[BoxRef::from_opref(OpRef::int_op(6))],
+                &[BoxRef::from_opref(OpRef::ref_op(6))],
                 field_descr,
             ),
             Op::new(
@@ -5102,12 +5106,12 @@ mod tests {
         guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[BoxRef::from_opref(OpRef::ref_op(3))],
             field_descr.clone(),
         );
         let get_a_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[BoxRef::from_opref(OpRef::ref_op(3))],
             field_descr.clone(),
         );
         let mut call_b = Op::with_descr(
@@ -5139,12 +5143,12 @@ mod tests {
         guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::int_op(6))],
+            &[BoxRef::from_opref(OpRef::ref_op(7))],
             field_descr.clone(),
         );
         let get_b_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::int_op(6))],
+            &[BoxRef::from_opref(OpRef::ref_op(7))],
             field_descr,
         );
         let add = Op::new(

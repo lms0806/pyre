@@ -1246,10 +1246,7 @@ impl OptHeap {
             .collect();
         for (field_idx, descr, obj, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
-            let is_virtual = ctx
-                .get_box_replacement_box(op.arg(1).to_opref())
-                .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+            let is_virtual = ctx.is_virtual(&op.arg(1).get_box_replacement(false));
             if is_virtual {
                 // heap.py:618-619: virtual value → pendingfields
                 pendingfields.push(op);
@@ -1301,10 +1298,7 @@ impl OptHeap {
             .collect();
         for (descr_idx, index, _obj, mut op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
-            let is_virtual = ctx
-                .get_box_replacement_box(op.arg(2).to_opref())
-                .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+            let is_virtual = ctx.is_virtual(&op.arg(2).get_box_replacement(false));
             if is_virtual {
                 // heap.py:634: pendingfields.append(op)
                 pendingfields.push(op);
@@ -1421,10 +1415,7 @@ impl OptHeap {
         if op.num_args() < 5 {
             return false;
         }
-        let flag = match ctx
-            .get_box_replacement_box(op.arg(4).to_opref())
-            .and_then(|b| ctx.get_constant_int_or_bound_box(&b))
-        {
+        let flag = match ctx.get_constant_int_or_bound_box(&op.arg(4).get_box_replacement(false)) {
             Some(v) => v,
             None => return false,
         };
@@ -1553,36 +1544,18 @@ impl OptHeap {
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6
-            && ctx
-                .get_box_replacement_box(op.arg(3).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
-            && ctx
-                .get_box_replacement_box(op.arg(4).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
-            && ctx
-                .get_box_replacement_box(op.arg(5).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
+            && op.arg(3).get_box_replacement(false).const_int().is_some()
+            && op.arg(4).get_box_replacement(false).const_int().is_some()
+            && op.arg(5).get_box_replacement(false).const_int().is_some()
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
             && op.num_args() >= 5
-            && ctx
-                .get_box_replacement_box(op.arg(2).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
-            && ctx
-                .get_box_replacement_box(op.arg(3).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
-            && ctx
-                .get_box_replacement_box(op.arg(4).to_opref())
-                .and_then(|cb| cb.const_int())
-                .is_some()
+            && op.arg(2).get_box_replacement(false).const_int().is_some()
+            && op.arg(3).get_box_replacement(false).const_int().is_some()
+            && op.arg(4).get_box_replacement(false).const_int().is_some()
         {
             return;
         }
@@ -1901,11 +1874,8 @@ impl OptHeap {
         //       resbox = self.optimizer.constant_fold(op)
         //       self.optimizer.make_constant(op, resbox)
         if descr.is_always_pure() {
-            // BoxRef shim for `get_constant_box` — read-only.
-            let arg0_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
-            if arg0_box
-                .as_ref()
-                .and_then(|b| ctx.get_constant_box(b))
+            if ctx
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .is_some()
             {
                 if let Some(value) = ctx.constant_fold(&op) {
@@ -2972,9 +2942,8 @@ impl OptHeap {
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        if let Some(index) = ctx
-                            .get_box_replacement_box(pending_op.arg(1).to_opref())
-                            .and_then(|b| ctx.get_constant_int_box(&b))
+                        if let Some(index) =
+                            ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false))
                         {
                             let array = ctx
                                 .get_box_replacement(pending_op.arg(0).to_opref())
@@ -3047,8 +3016,7 @@ impl OptHeap {
                     )
                 } else if op.num_args() > 1 {
                     let idx = ctx
-                        .get_box_replacement_box(op.arg(1).to_opref())
-                        .and_then(|b| ctx.get_constant_int_box(&b))
+                        .get_constant_int_box(&op.arg(1).get_box_replacement(false))
                         .map(|v| v as u32);
                     (idx, idx.map(|v| v as usize))
                 } else {
@@ -4399,7 +4367,7 @@ mod tests {
         // the value back via getfield_from_cache's _lazy_set check.
         let d = descr(0);
         let idx = OpRef::int_op(50);
-        let op = Op::with_descr(
+        let mut op = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
                 BoxRef::from_opref(OpRef::int_op(100)),
@@ -6058,6 +6026,11 @@ mod tests {
         ctx.snapshot_boxes = snapshots;
         let mut pass = OptHeap::new();
         pass.setup();
+        // Bind the variable index input box before the pass: post-resolver
+        // op.arg(1) must be bound for getintbound to install its IntBound on
+        // `_forwarded` (the real recorder binds input args).
+        ctx.ensure_box(idx)
+            .expect("variable index input must bind to a BoxRef");
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6153,6 +6126,11 @@ mod tests {
         ctx.snapshot_boxes = snapshots;
         let mut pass = OptHeap::new();
         pass.setup();
+        // Bind the variable index input box before the pass: post-resolver
+        // op.arg(1) must be bound for getintbound to install its IntBound on
+        // `_forwarded` (the real recorder binds input args).
+        ctx.ensure_box(idx)
+            .expect("variable index input must bind to a BoxRef");
 
         for op in &ops {
             let mut resolved = op.clone();

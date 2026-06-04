@@ -893,9 +893,7 @@ impl Optimization for OptPure {
                 // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
                 // where p is an inputarg).
                 let all_args_const = (0..postponed.num_args()).all(|i| {
-                    ctx.get_box_replacement_box(postponed.arg(i).to_opref())
-                        .as_ref()
-                        .and_then(|b| ctx.get_constant_box(b))
+                    ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
                         .is_some()
                 });
                 if all_args_const {
@@ -1018,9 +1016,7 @@ impl Optimization for OptPure {
             //         self.optimizer.make_constant(op, resbox)
             //         return
             let all_args_const = (0..op.num_args()).all(|i| {
-                ctx.get_box_replacement_box(op.arg(i).to_opref())
-                    .as_ref()
-                    .and_then(|b| ctx.get_constant_box(b))
+                ctx.get_constant_box(&op.arg(i).get_box_replacement(false))
                     .is_some()
             });
             if all_args_const {
@@ -2259,6 +2255,13 @@ mod tests {
         ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
+        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
+        // carries the canonical const box the pass reads via get_constant_box.
+        let resolved = ctx
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .expect("constant arg resolves");
+        op.setarg(0, resolved);
+
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -2290,6 +2293,13 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
+
+        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
+        // carries the canonical const box the pass reads via get_constant_box.
+        let resolved = ctx
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .expect("constant arg resolves");
+        op.setarg(0, resolved);
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2324,6 +2334,13 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef::ref_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
+
+        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
+        // carries the canonical const box the pass reads via get_constant_box.
+        let resolved = ctx
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .expect("constant arg resolves");
+        op.setarg(0, resolved);
 
         assert_eq!(
             ctx.constant_fold(&op),
@@ -2361,6 +2378,13 @@ mod tests {
 
         let mut ctx = OptContext::with_num_inputs(4, 0);
         ctx.make_constant(OpRef::int_op(10), Value::Int(2));
+
+        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
+        // carries the canonical const box the pass reads via get_constant_box.
+        let resolved = ctx
+            .get_box_replacement_box(op.arg(0).to_opref())
+            .expect("constant arg resolves");
+        op.setarg(0, resolved);
 
         let _ = ctx.constant_fold(&op);
     }
@@ -2818,6 +2842,15 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         ));
+        // optimizer.py:651-652 setarg loop parity: canonicalize args the way
+        // propagate_from_pass_range does before propagate_forward.
+        for i in 0..op.num_args() {
+            op.setarg(
+                i,
+                ctx.get_box_replacement_box(op.arg(i).to_opref())
+                    .unwrap_or_else(|| op.arg(i).clone()),
+            );
+        }
         // OptRewrite demotes CallLoopinvariantI → CallI
         let rewrite_result =
             rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
