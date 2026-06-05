@@ -489,7 +489,7 @@ if HAS_AF_ALG:
                                rffi.cast(rffi.CCHARP, addr.c_salg_name), 64)
 
 HAS_AF_QIPCRTR = 'AF_QIPCRTR' in constants
-if HAS_AF_ALG:
+if HAS_AF_QIPCRTR:
     class QrtrAddress(Address):
         family = AF_QIPCRTR
         struct = _c.sockaddr_qrtr
