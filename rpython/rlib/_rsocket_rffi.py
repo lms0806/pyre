@@ -399,7 +399,7 @@ CConfig.sockaddr_qrtr = platform.Struct('struct sockaddr_qrtr',
                                          [('sq_family', rffi.INT),
                                           ('sq_node', rffi.INT),
                                           ('sq_port', rffi.INT),
-                                         ], ifdef='AF_ALG')
+                                         ], ifdef='AF_QIPCRTR')
 
 CConfig.addrinfo = platform.Struct('struct addrinfo',
                                      [('ai_flags', rffi.INT),
