@@ -105,30 +105,28 @@ impl VectorLoop {
         ))
     }
 
-    /// vector.py:54-56: setup_vectorization — attach VectorizationInfo to
-    /// each operation in the loop body.
-    pub fn setup_vectorization(&mut self) {
-        for op in &mut self.operations {
-            if !op.has_vecinfo() {
-                let mut vi = majit_ir::VectorizationInfo::new();
-                let tp = op.opcode.result_type();
-                let dt = match tp {
-                    majit_ir::Type::Float => 'f',
-                    majit_ir::Type::Void => '\0',
-                    _ => 'i',
-                };
-                if dt != '\0' {
-                    vi.setinfo(dt, -1, true);
-                }
-                op.set_vecinfo(vi);
-            }
+    /// vector.py:54-56: setup_vectorization — attach a `VectorizationInfo`
+    /// to every loop operation (`for op in self.operations:
+    /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
+    /// `op._forwarded`; pyre's flat-OpRef operands keep the per-op vecinfo
+    /// in the scheduler's pos-keyed store, so `state` carries it. INT_SIGNEXT
+    /// reads arg1's constant through `constant_of` (resoperation.py:181).
+    pub fn setup_vectorization(
+        &self,
+        state: &mut VecScheduleState,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+    ) {
+        for op in &self.operations {
+            state.set_op_forwarded_vecinfo(op, constant_of);
         }
     }
 
-    /// vector.py:58-60: teardown_vectorization — remove VectorizationInfo.
-    pub fn teardown_vectorization(&mut self) {
-        for op in &mut self.operations {
-            op.clear_vecinfo();
+    /// vector.py:58-60: teardown_vectorization — drop every loop op's
+    /// `VectorizationInfo` (`for op in self.operations:
+    /// op.set_forwarded(None)`), clearing the scheduler's forwarded store.
+    pub fn teardown_vectorization(&self, state: &mut VecScheduleState) {
+        for op in &self.operations {
+            state.clear_op_forwarded_vecinfo(op.pos.get());
         }
     }
 
@@ -145,13 +143,16 @@ impl VectorLoop {
     /// `label`: include `self.label` at the front. When false, follow
     ///   `vector.py:87-90` and clear the vectorize-time scratch
     ///   (`set_forwarded(None)` upstream) from every emitted prefix op plus
-    ///   the jump. In majit the vectorize-time scratch lives on
-    ///   `VectorizationInfo`, so the equivalent is `clear_vecinfo()`.
+    ///   the jump. That scratch lives in the scheduler's pos-keyed forwarded
+    ///   store (`state`), not on the permanent `Op.vecinfo`, so the
+    ///   equivalent is `state.clear_op_forwarded_vecinfo(pos)` — clearing
+    ///   `Op.vecinfo` here would instead wipe VecOperationNew metadata.
     pub fn finaloplist(
         &self,
         jitcell_token: Option<&std::sync::Arc<majit_backend::JitCellToken>>,
         reset_label_token: bool,
         label: bool,
+        state: &mut VecScheduleState,
     ) -> Vec<Op> {
         // vector.py:63-79: descr wiring against the owning JitCellToken.
         if let Some(jcell) = jitcell_token {
@@ -200,11 +201,13 @@ impl VectorLoop {
         // vector.py:87-90: when not emitting the label op (i.e. the prefix
         // is the *only* thing being compiled this round, e.g. a bridge),
         // strip vectorization scratch so nothing leaks into the next pass.
+        // The scratch is the pos-keyed forwarded store, not the permanent
+        // `Op.vecinfo`; mirror `teardown_vectorization`.
         if !label {
             for op in &oplist {
-                op.clear_vecinfo();
+                state.clear_op_forwarded_vecinfo(op.pos.get());
             }
-            self.jump.clear_vecinfo();
+            state.clear_op_forwarded_vecinfo(self.jump.pos.get());
         }
         // vector.py:91
         oplist.extend(self.operations.iter().cloned());
@@ -282,17 +285,15 @@ pub fn optimize_vector(
     // error path; on success we hand back the vectorized ops directly.
     let version = loop_.clone_loop();
 
-    // vector.py:135: loop.setup_vectorization()
-    loop_.setup_vectorization();
-
     let result = (|| -> Result<Vec<Op>, VectorizeError> {
-        // vector.py:142-143
+        // vector.py:142-143. `run_optimization` owns the scheduler state, so
+        // it calls vector.py:135 `loop.setup_vectorization()` (and the
+        // vector.py:172 `teardown_vectorization()`) against that state
+        // internally, stamping each op's VectorizationInfo into the
+        // `_forwarded` equivalent that `forwarded_vecinfo` reads.
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_)
     })();
-
-    // vector.py:172: finally: loop.teardown_vectorization()
-    loop_.teardown_vectorization();
 
     if result.is_err() {
         // vector.py:155 / :160: `return loop_info, version.loop.finaloplist()`.
@@ -473,8 +474,12 @@ impl VectorizingOptimizer {
             return Err(VectorizeError::NotVectorizeable);
         }
 
-        // vector.py:237-240: analyse_index_calculations → reorder
-        let constant_of = |_opref: OpRef| -> Option<i64> { None };
+        // vector.py:237-240: analyse_index_calculations → reorder.
+        // resoperation.py:181 reads `op.getarg(1).value` off the inline
+        // ConstInt; the standalone pass has no Optimizer context, so an
+        // inline `OpRef::ConstInt` is the only — and the faithful — const
+        // source for INT_SIGNEXT bytesize and adjacent-ref index detection.
+        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
         if let Some(graph) = self.analyse_index_calculations(loop_, &constant_of) {
             let schedule = schedule_operations(&graph);
             if schedule.len() == loop_.operations.len() {
@@ -501,7 +506,7 @@ impl VectorizingOptimizer {
         let graph = DependencyGraph::build(&loop_.operations, &constant_of);
         // VecScheduleState is created before find_adjacent_memory_refs/
         // extend_packset because PackSet::can_be_packed now consults it via
-        // isomorphic_with_state (vector.py: packset.can_be_packed reaches
+        // isomorphic (vector.py: packset.can_be_packed reaches
         // state for accumulation/invariant lookups; pre-state form was a
         // pre-rebase fork).
         let start_pos = loop_
@@ -513,7 +518,7 @@ impl VectorizingOptimizer {
             + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
         // vector.py:135 loop.setup_vectorization()
-        sched_state.setup_vectorization(&loop_.operations, &constant_of);
+        loop_.setup_vectorization(&mut sched_state, &constant_of);
         // vector.py:606-609 CostModel.__init__: savings = 0, threshold stored
         // separately. Initializing savings = self.cost_threshold inverted the
         // gate — a positive threshold made profitable() trivially true.
@@ -581,13 +586,12 @@ impl VectorizingOptimizer {
                 return Err(VectorizeError::NotVectorizeable);
             }
             let datatype = 'i';
-            let bytesize: i32 = loop_
-                .operations
-                .iter()
-                .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.get_vecinfo())
-                .map(|vi| vi.getbytesize() as i32)
-                .unwrap_or(8);
+            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // seed's forwarded VectorizationInfo from the same cache that
+            // VectorizationInfo(op) populated, not a separate inline slot.
+            let bytesize: i32 = sched_state
+                .forwarded_vecinfo_for_ref(seed, &loop_.operations)
+                .getbytesize() as i32;
             let vec_reg_size: i32 = self.vec_size as i32;
             let count = (vec_reg_size / bytesize) as usize;
             let signed = true;
@@ -675,32 +679,35 @@ impl VectorizingOptimizer {
             }
         }
 
-        // schedule.py:762-779: VecScheduleState.post_schedule. Mirrors the call
-        // at the tail of schedule.py:103-106 schedule() (prepare → walk_and_emit →
-        // post_schedule), which runs unconditionally — moving invariant_oplist into
-        // loop.prefix and routing invariant_vector_vars through prefix_label/jump.
-        sched_state.post_schedule(loop_, &mut seen);
-
-        // vector.py:257-258: profitability check — runs AFTER post_schedule
-        // (schedule.py:103-106 runs post_schedule inside schedule(); the
-        // `if not state.profitable(): raise` check is the next statement at
-        // vector.py:257). A distinct error variant lets the caller react to
-        // cost-model rejection separately from a structural bail. On this Err
-        // the optimize_vector caller restores the pre-vectorize snapshot
-        // (vector.rs `*loop_ = version`), discarding the post_schedule mutation.
+        // vector.py:515-520 schedule(): `walk_and_emit` then, only when the
+        // cost model is profitable, `post_schedule()`. An unprofitable loop
+        // returns *before* post_schedule, so loop_ is never mutated by it.
+        // vector.py:256-258 then raises NotAProfitableLoop on the same check;
+        // run_optimization collapses both into this single early Err.
         if !sched_state.costmodel.profitable() {
             return Err(VectorizeError::NotProfitable);
         }
+
+        // schedule.py:762-779: VecScheduleState.post_schedule — moves
+        // invariant_oplist into loop.prefix and routes invariant_vector_vars
+        // through prefix_label/jump.
+        sched_state.post_schedule(loop_, &mut seen);
 
         // vector.py:267-269: extra_before_label = loop.align_operations;
         // for op in loop.align_operations: op.set_forwarded(None).
         // We hand the align_operations back through `loop_.align_operations`
         // (already populated by `unroll_loop_iterations` on the align arm);
-        // clearing vecinfo matches the upstream `set_forwarded(None)` reset
-        // so post-vectorize passes don't see stale VectorizationInfo.
+        // clearing the pos-keyed forwarded scratch matches the upstream
+        // `set_forwarded(None)` reset so post-vectorize passes don't see
+        // stale VectorizationInfo; the permanent `Op.vecinfo` is preserved.
         for op in &loop_.align_operations {
-            op.clear_vecinfo();
+            sched_state.clear_op_forwarded_vecinfo(op.pos.get());
         }
+
+        // vector.py:172 `finally: loop.teardown_vectorization()`. The
+        // earlier `?`/`return Err` exits drop `sched_state` instead, which
+        // discards the same pos-keyed forwarded store.
+        loop_.teardown_vectorization(&mut sched_state);
 
         // vector.py:271: return loop.finaloplist(jitcell_token, reset_label_token=False).
         // post_schedule already set loop_.operations / prefix / prefix_label / jump,
@@ -709,7 +716,7 @@ impl VectorizingOptimizer {
         // compiler; None here skips the descr/token wiring (faithful for the
         // currently-disconnected compile path). `label=false` matches RPython's
         // default (the vector.py:271 call omits the `label` argument).
-        Ok(loop_.finaloplist(None, false, false))
+        Ok(loop_.finaloplist(None, false, false, &mut sched_state))
     }
 
     // ── vector.py:273-344: unroll_loop_iterations ──────────────────────
@@ -865,7 +872,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_dep].op;
                 let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_dep < r_dep {
+                if isomorphic(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -909,7 +916,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_user].op;
                 let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_user < r_user {
+                if isomorphic(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -1045,7 +1052,7 @@ impl VectorizingOptimizer {
         // value for bytesize (resoperation.py:181); the constant_of
         // resolver feeds that through so the inline vecinfo slot matches
         // PyPy's VectorizationInfo(op) constructor.
-        sched_state.setup_vectorization(&loop_.operations, &constant_of);
+        loop_.setup_vectorization(&mut sched_state, &constant_of);
 
         // Phase 1: Schedule operations for ILP before packing.
         let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
@@ -1056,7 +1063,7 @@ impl VectorizingOptimizer {
                 .map(|&i| loop_.operations[i].clone())
                 .collect();
             loop_.operations = scheduled;
-            sched_state.setup_vectorization(&loop_.operations, &constant_of);
+            loop_.setup_vectorization(&mut sched_state, &constant_of);
         }
 
         // Phase 2: Rebuild dependency graph and find packs.
@@ -1117,13 +1124,12 @@ impl VectorizingOptimizer {
                 return None;
             }
             let datatype = 'i';
-            let bytesize: i32 = loop_
-                .operations
-                .iter()
-                .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.get_vecinfo())
-                .map(|vi| vi.getbytesize() as i32)
-                .unwrap_or(8);
+            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // seed's forwarded VectorizationInfo from the same cache that
+            // VectorizationInfo(op) populated, not a separate inline slot.
+            let bytesize: i32 = sched_state
+                .forwarded_vecinfo_for_ref(seed, &loop_.operations)
+                .getbytesize() as i32;
             let vec_reg_size: i32 = self.vec_size as i32;
             let count = (vec_reg_size / bytesize) as usize;
             let signed = true;
@@ -1210,6 +1216,13 @@ impl VectorizingOptimizer {
             }
         }
 
+        // vector.py:515-520 schedule(): post_schedule runs only when the cost
+        // model is profitable; an unprofitable loop returns before post_schedule
+        // mutates loop_ (matches the run_optimization path and PyPy).
+        if !sched_state.costmodel.profitable() {
+            return None;
+        }
+
         // schedule.py:762-779: VecScheduleState.post_schedule. Moves
         // invariant_oplist into loop_.prefix and routes invariant_vector_vars
         // through prefix_label/jump renaming. Reachable in the streaming path
@@ -1217,10 +1230,6 @@ impl VectorizingOptimizer {
         // the JUMP, builds this VectorLoop, and emits the finaloplist result —
         // so prefix ops land BEFORE the loop entry, not inside the body.
         sched_state.post_schedule(loop_, &mut seen);
-
-        if !sched_state.costmodel.profitable() {
-            return None;
-        }
 
         // Emit the original loop label only when post_schedule did NOT mint a
         // prefix_label (which replaces the label as the vectorized loop entry):
@@ -1232,8 +1241,13 @@ impl VectorizingOptimizer {
         // correctly targets prefix_label. TODO: thread a JitCellToken when the
         // compile path is un-gated so finaloplist mints fresh prefix-label
         // tokens (vector.rs:156-185).
+        // vector.py:172 `finally: loop.teardown_vectorization()`. The earlier
+        // `return None` exits drop `sched_state` instead, discarding the same
+        // pos-keyed forwarded store.
+        loop_.teardown_vectorization(&mut sched_state);
+
         let include_label = loop_.prefix_label.is_none();
-        Some(loop_.finaloplist(None, false, include_label))
+        Some(loop_.finaloplist(None, false, include_label, &mut sched_state))
     }
 
     // ── Static variants for extend/combine (used by try_vectorize) ─────
@@ -1714,11 +1728,12 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]);
         let vloop = VectorLoop::new(label, ops, jump);
 
-        let with_label = vloop.finaloplist(None, true, true);
+        let mut state = VecScheduleState::new(0);
+        let with_label = vloop.finaloplist(None, true, true, &mut state);
         assert_eq!(with_label.len(), 3); // Label + IntAdd + Jump
         assert_eq!(with_label[0].opcode, OpCode::Label);
 
-        let without_label = vloop.finaloplist(None, true, false);
+        let without_label = vloop.finaloplist(None, true, false, &mut state);
         assert_eq!(without_label.len(), 2); // IntAdd + Jump
     }
 
@@ -1864,6 +1879,41 @@ mod tests {
         assert!(vloop.prefix_label.is_none());
         assert_eq!(vloop.jump.getarglist_copy().len(), 2);
         assert_eq!(vloop.operations.len(), 1);
+    }
+
+    /// `run_optimization`'s standalone resolver has no Optimizer context, so
+    /// an `INT_SIGNEXT(x, ConstInt(n))` must take arg1's bytesize from the
+    /// inline `OpRef::ConstInt` (resoperation.py:181 reads `arg1.value`).
+    /// Regression: the resolver previously returned `None` for every opref,
+    /// so `int_signext_vecinfo`'s fail-fast `.expect()` panicked on a valid
+    /// INT_SIGNEXT.
+    #[test]
+    fn int_signext_setup_resolves_inline_const_in_standalone_pass() {
+        let label = Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        );
+        let signext = Op::new(
+            OpCode::IntSignext,
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::const_int(4)),
+            ],
+        );
+        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]);
+        let mut body = vec![signext];
+        assign_positions(&mut body, 10);
+        let vloop = VectorLoop::new(label, body, jump);
+
+        let mut st = VecScheduleState::new(100);
+        // The standalone run_optimization resolver: inline consts only.
+        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
+        vloop.setup_vectorization(&mut st, &constant_of);
+
+        let info = st.forwarded_vecinfo(&vloop.operations[0]);
+        assert_eq!(info.datatype, 'i');
+        assert_eq!(info.bytesize, 4);
+        assert!(info.signed);
     }
 
     /// Streaming refactor: a 4-op loop runs through the VectorizingOptimizer
@@ -2540,6 +2590,7 @@ mod tests {
 
     #[test]
     fn test_isomorphic_same_opcode() {
+        let mut state = VecScheduleState::new(0);
         let a = Op::new(
             OpCode::IntAdd,
             &[
@@ -2554,11 +2605,12 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(isomorphic(&a, &b));
+        assert!(isomorphic(&mut state, &a, &b));
     }
 
     #[test]
     fn test_isomorphic_different_opcode() {
+        let mut state = VecScheduleState::new(0);
         let a = Op::new(
             OpCode::IntAdd,
             &[
@@ -2573,7 +2625,7 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(!isomorphic(&a, &b));
+        assert!(!isomorphic(&mut state, &a, &b));
     }
 
     #[test]
