@@ -738,6 +738,49 @@ impl SpamBlockRef {
         self.0.borrow_mut().per_block_ssarepr.extend(moved);
         base
     }
+
+    /// Strip a trailing block-boundary `goto TLabel(<label>) + Unreachable`
+    /// pair from this block's `per_block_ssarepr`, if the goto targets `label`.
+    /// Returns whether a pair was removed.
+    ///
+    /// Used by the `remove_trivial_links` merge bridge: after absorbing
+    /// `target`'s bytecode, the source's OLD boundary goto would otherwise sit
+    /// in the middle of the merged stream, before the absorbed opcodes.
+    /// `emit_link_renamings_into_block`'s `SourceBeforeTerminator` splice
+    /// forward-scans for the FIRST terminator, so the absorbed link's renamings
+    /// would land before `target`'s opcodes and read stale slots (codex P1,
+    /// PR #127).  Removing the old boundary goto makes `target`'s own
+    /// terminator the first one, so renamings splice after its opcodes.
+    fn strip_trailing_boundary_goto(&self, label: &str) -> bool {
+        let mut b = self.0.borrow_mut();
+        let n = b.per_block_ssarepr.len();
+        if n < 2 {
+            return false;
+        }
+        let tail_unreachable = matches!(
+            b.per_block_ssarepr[n - 1],
+            super::flatten::Insn::Unreachable
+        );
+        let tail_goto = matches!(
+            &b.per_block_ssarepr[n - 2],
+            super::flatten::Insn::Op { opname, args, .. }
+                if opname == "goto"
+                    && args.len() == 1
+                    && matches!(&args[0], super::flatten::Operand::TLabel(tl) if tl.name == label)
+        );
+        if tail_unreachable && tail_goto {
+            b.per_block_ssarepr.truncate(n - 2);
+            // Keep the original-terminator anchor within bounds.
+            if let Some(end) = b.original_terminator_end {
+                if end > b.per_block_ssarepr.len() {
+                    b.original_terminator_end = Some(b.per_block_ssarepr.len());
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -1622,6 +1665,11 @@ fn rewrite_trivial_link_merges(
         if src_spam == tgt_spam {
             continue;
         }
+        // Drop source's old boundary `goto target + ---` before appending, so
+        // target's own terminator is the first terminator in the merged block
+        // and the single-exit renaming splice lands after target's opcodes
+        // (codex P1, PR #127).
+        src_spam.strip_trailing_boundary_goto(&super::flatten::block_label_name(target));
         let base = src_spam.absorb_per_block_ssarepr(&tgt_spam);
         // Re-point `-live-` markers: (tgt_spam, off) -> (src_spam, base + off).
         for pc_entries in walker_pc_live_marker_pos.iter_mut() {
@@ -9282,15 +9330,6 @@ impl CodeWriter {
         // `simplify.rs`).
         eliminate_empty_blocks(&graph);
         super::simplify::constfold_exitswitch(&graph);
-        // remove_trivial_links merges single-entry/single-exit chains; the
-        // merge bridge relocates each merged target's inline per_block_ssarepr
-        // into its surviving source so the drain keeps the opcodes (issue #73).
-        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
-        rewrite_trivial_link_merges(
-            &trivial_link_merges,
-            &all_walker_blocks,
-            &mut walker_pc_live_marker_pos,
-        );
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),
@@ -9310,7 +9349,27 @@ impl CodeWriter {
                 );
             }
         }
+        // Byte-stream companion to `eliminate_empty_blocks`: retarget the
+        // walker's inline-emitted gotos that still name a collapsed dead
+        // forwarder to the surviving generalization.  MUST run before the
+        // merge bridge below: for a `source -> dead_forwarder -> target`
+        // shape `remove_trivial_links` records the merge `(source, target)`,
+        // but the source block's boundary terminator still reads
+        // `goto TLabel(dead_forwarder)` until this rewrite — so the merge
+        // strip (which looks for `block_label_name(target)`) would miss it
+        // and leave the stale terminator in front of the absorbed target
+        // opcodes, letting the single-exit renaming splice land before
+        // them (codex P2, PR #130).
         rewrite_dead_forwarder_gotos(&all_walker_blocks);
+        // remove_trivial_links merges single-entry/single-exit chains; the
+        // merge bridge relocates each merged target's inline per_block_ssarepr
+        // into its surviving source so the drain keeps the opcodes (issue #73).
+        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
+        rewrite_trivial_link_merges(
+            &trivial_link_merges,
+            &all_walker_blocks,
+            &mut walker_pc_live_marker_pos,
+        );
 
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53

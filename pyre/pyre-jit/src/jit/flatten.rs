@@ -695,8 +695,19 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `getfield_gc_X(v, descr)` after rtyping; pyre's lack of rtyping
 /// keeps the HLOp unmodified, so eliding it under lowering_ctx is the
 /// production-safe path.
+///
+/// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
+/// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
+/// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
+/// `StoreAttr` arm (codewriter.rs:8551) pairs it with an inline
+/// `emit_abort_permanent!`, so the compiled trace bails to the
+/// interpreter at the `abort_permanent` Insn canonical already emits.
+/// A literal `setattr` Insn would be unreachable at runtime and
+/// undispatchable by the assembler.  Upstream `rclass.py rtype_setattr`
+/// rewrites to `setfield_gc(v, descr, w_value)` after rtyping; pyre's
+/// lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
-    matches!(opname, "type" | "getattr")
+    matches!(opname, "type" | "getattr" | "setattr")
 }
 
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
@@ -1336,7 +1347,32 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         let insn = self.flatten_space_operation(op);
+        // `jtransform.py:467-482` appends a `-live-` AFTER a call op so the
+        // metainterp can snapshot the post-call resume state for
+        // `guard_no_exception` (residual) / inline-call boundaries:
+        //   handle_residual_call: `op1 = [op1, ('-live-', [], None)]`
+        //     emitted iff `may_call_jitcodes or calldescr_canraise(...)`.
+        //   handle_regular_call:  `[op0, ('-live-', [], None)]` — always.
+        // The walker covers this point incidentally via its per-PC `-live-`;
+        // the canonical driver must emit it explicitly so the encoder's
+        // FALLTHROUGH_pc read (`handle_possible_exception` ->
+        // `guard_no_exception`, trace_opcode.rs:7032) and the resume reader
+        // find a marker at the post-call position.  Gated on `lowering_ctx`
+        // so the production walker stream is untouched.  `may_call_jitcodes`
+        // has no analogue at this site: the canonical lowering emits only
+        // direct `residual_call_*` to fixed helper indices for the retired
+        // HLOp families, never the indirect call that is upstream's sole
+        // `may_call_jitcodes=True` caller — so the residual gate reduces to
+        // `calldescr_canraise`, read off each Insn's `CallDescrStub` operand
+        // (`insn_needs_trailing_live`).  Most retired families carry
+        // `EF_CAN_RAISE` / `EF_FORCES_*` so they keep the marker; the
+        // `get_current_exception` helper (`EF_CANNOT_RAISE`) does not, so it
+        // gets no trailing `-live-` — matching upstream's per-call gate.
+        let trailing_live = self.lowering_ctx.is_some() && insn_needs_trailing_live(&insn);
         self.emitline(insn);
+        if trailing_live {
+            self.emitline(Insn::live(Vec::new()));
+        }
     }
 
     fn emitline(&mut self, insn: Insn) {
@@ -2333,6 +2369,56 @@ fn regalloc_color(
         )
     });
     Register::new(kind, color)
+}
+
+/// `true` iff a trailing `-live-` must follow this Insn in the canonical
+/// stream — the call ops that `jtransform.py:467-482` pairs with a
+/// post-op `-live-`.  `residual_call_*` (`handle_residual_call`) and
+/// `inline_call_*` (`handle_regular_call`) are the families; both produce
+/// a `guard_no_exception` / inline-boundary resume point that the encoder
+/// reads at the FALLTHROUGH position.  See `serialize_op` for the
+/// canraise-superset rationale.
+/// `jtransform.py:469-470 handle_residual_call` /
+/// `jtransform.py:481 handle_regular_call`: a call op is followed by a
+/// trailing `('-live-', [], None)` marker, but the two call families gate
+/// it differently:
+///   * `inline_call_*` (handle_regular_call) — ALWAYS.
+///   * `residual_call_*` (handle_residual_call) — iff `may_call_jitcodes
+///     or calldescr_canraise(calldescr)`.
+/// The canonical lowering driver never emits the indirect call that is
+/// upstream's only `may_call_jitcodes=True` caller, so the residual gate
+/// is exactly `calldescr_canraise` = `effect_info.check_can_raise(false)`
+/// (`call.py:353-355 calldescr_canraise` -> `effectinfo.py:232
+/// check_can_raise`), read off the trailing `CallDescrStub` operand.
+fn insn_needs_trailing_live(insn: &Insn) -> bool {
+    let Insn::Op { opname, args, .. } = insn else {
+        return false;
+    };
+    if opname.starts_with("inline_call") {
+        return true;
+    }
+    if opname.starts_with("residual_call") {
+        return residual_call_can_raise(args);
+    }
+    false
+}
+
+/// `call.py:353-355 calldescr_canraise` — `calldescr.get_extra_info()
+/// .check_can_raise()` (default `ignore_memoryerror=False`).  Reads the
+/// `EffectInfo` off the residual call's trailing `CallDescrStub` operand;
+/// every `build_residual_call_*` appends exactly one.  A residual_call
+/// with no such operand is a malformed shape this measurement-only path
+/// treats as non-raising (no trailing `-live-`).
+fn residual_call_can_raise(args: &[Operand]) -> bool {
+    args.iter()
+        .find_map(|arg| match arg {
+            Operand::Descr(descr) => match descr.as_ref() {
+                DescrOperand::CallDescrStub(stub) => Some(stub.effect_info.check_can_raise(false)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn is_bool_or_tuple_exitswitch(
@@ -5347,6 +5433,84 @@ mod tests {
                 ssarepr.insns
             );
         }
+    }
+
+    #[test]
+    fn lowering_emits_trailing_live_after_residual_call() {
+        // `jtransform.py:467-471 handle_residual_call` pairs a
+        // `residual_call_*` with a trailing `('-live-', [], None)` so the
+        // metainterp can snapshot the post-call `guard_no_exception`
+        // resume state.  The canonical driver (`serialize_op` under
+        // `lowering_ctx`) must emit that marker immediately AFTER the
+        // lowered call; the production walker covers the same point via
+        // its per-PC `-live-`.  A single `add` HLOp lowers to one
+        // `residual_call_ir_r` that must be followed by a `-live-`.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let add_res = Variable::new(VariableId(2), Kind::Ref);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("trailing_live", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(add_res.into()), 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![add_res.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+            portal_frame_var: None,
+        };
+
+        let mut ssarepr = SSARepr::new("trailing_live");
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
+
+        let call_pos = ssarepr
+            .insns
+            .iter()
+            .position(
+                |insn| matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r"),
+            )
+            .unwrap_or_else(|| panic!("expected residual_call_ir_r: {:?}", ssarepr.insns));
+        assert!(
+            ssarepr.insns[call_pos + 1].is_live(),
+            "residual_call must be followed by a `-live-` marker, got {:?}",
+            &ssarepr.insns[call_pos..]
+        );
+    }
+
+    #[test]
+    fn insn_needs_trailing_live_gates_residual_call_on_calldescr_canraise() {
+        // `jtransform.py:469 handle_residual_call` emits the trailing
+        // `-live-` iff `may_call_jitcodes or calldescr_canraise(calldescr)`.
+        // The canonical driver has no `may_call_jitcodes` site, so the gate
+        // is `calldescr_canraise` = `effect_info.check_can_raise(false)`.
+        // A MayForce residual call (BINARY_OP, `EF_FORCES_*`) can raise →
+        // marker; the PlainCannotRaiseNoHeap `get_current_exception` helper
+        // (`EF_CANNOT_RAISE`) cannot raise → no marker.
+        let can_raise = build_binary_op_residual_call_ir_r_insn(11, 0, 0, 1, 2);
+        assert!(
+            insn_needs_trailing_live(&can_raise),
+            "MayForce residual_call (EF_FORCES_*) must take a trailing -live-"
+        );
+        let cannot_raise = build_get_current_exception_fn_residual_call_r_r_insn(7, 0);
+        assert!(
+            !insn_needs_trailing_live(&cannot_raise),
+            "PlainCannotRaiseNoHeap residual_call (EF_CANNOT_RAISE) must NOT \
+             take a trailing -live-"
+        );
     }
 
     #[test]

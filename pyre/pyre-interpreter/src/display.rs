@@ -141,10 +141,10 @@ thread_local! {
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-struct ReprGuard(usize);
+pub(crate) struct ReprGuard(usize);
 
 impl ReprGuard {
-    fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
+    pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
         let key = obj as usize;
         REPR_ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
@@ -169,10 +169,98 @@ impl Drop for ReprGuard {
     }
 }
 
+/// `dictmultiobject.py:130-150 descr_repr` — `{k: v, ...}`.  Iterates
+/// `w_dict_items` (which routes through `is_module_dict`), guarded against
+/// self-recursion.  Shared by the `py_repr` dict fast path and the dict
+/// type's `__repr__` method (so dict-subclass instances and `super().
+/// __repr__()` format their backing the same way).
+///
+/// # Safety
+/// `obj` must be a real `W_DictObject` (caller resolves any subclass
+/// backing via `resolve_dict_backing` first).
+pub unsafe fn dict_repr(obj: PyObjectRef) -> String {
+    let Some(_guard) = ReprGuard::enter(obj) else {
+        return "{...}".to_string();
+    };
+    let entries = pyre_object::w_dict_items(obj);
+    let mut parts = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
 /// Format a PyObjectRef for debug display.
 ///
 /// # Safety
 /// `obj` must be a valid pointer to a known Python object type.
+/// Format an `int`/`long`/`float`/`bool` storage object with its builtin
+/// `repr` (which equals its `str` for these types).  Returns `None` for
+/// any other storage type.  Shared by `py_repr`'s leaf path and `py_str`'s
+/// fallback so a builtin leaf subclass that overrides only `__repr__`
+/// still `str()`s via the inherited builtin `tp_str`.
+unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Option<String> {
+    unsafe {
+        if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
+            let int_obj = obj as *const pyre_object::intobject::W_IntObject;
+            Some(format!("{}", (*int_obj).intval))
+        } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
+            let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
+            Some(format_float_repr((*float_obj).floatval))
+        } else if std::ptr::eq(tp, &LONG_TYPE as *const PyType) {
+            let long_obj = obj as *const pyre_object::longobject::W_LongObject;
+            Some(format!("{}", &*(*long_obj).value))
+        } else if std::ptr::eq(tp, &BOOL_TYPE as *const PyType) {
+            let bool_obj = obj as *const pyre_object::boolobject::W_BoolObject;
+            Some(if (*bool_obj).boolval { "True" } else { "False" }.to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// Dispatch a user-defined `__repr__`/`__str__` override for a builtin leaf
+/// subclass instance.  `int`/`float`/`str`/... keep `ob_type` at the
+/// canonical storage type and carry the Python class in `w_class`, so the
+/// `ob_type`-keyed formatters ignore a subclass override.  Returns `Some`
+/// only when the dunder resolves above `object` (whose inherited default
+/// must fall through to the builtin formatting instead of re-entering).
+pub(crate) unsafe fn builtin_subclass_dunder(
+    obj: PyObjectRef,
+    tp: *const PyType,
+    name: &str,
+) -> Option<String> {
+    unsafe {
+        let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
+            || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
+            || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
+            || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
+            || std::ptr::eq(tp, &STR_TYPE as *const PyType);
+        if !is_leaf {
+            return None;
+        }
+        let w_class = (*obj).w_class;
+        if w_class.is_null() || !pyre_object::is_type(w_class) {
+            return None;
+        }
+        let found = crate::baseobjspace::lookup_in_type_where(w_class, name)?;
+        // `object`'s inherited default is not a leaf override — fall through
+        // so the builtin formatting runs (and `object.__repr__` does not
+        // re-enter through this path).
+        let w_object = crate::typedef::w_object();
+        if let Some(default) = crate::baseobjspace::lookup_in_type_where(w_object, name) {
+            if std::ptr::eq(found, default) {
+                return None;
+            }
+        }
+        let r = crate::call_function(found, &[obj]);
+        if !r.is_null() && pyre_object::is_str(r) {
+            return Some(pyre_object::w_str_get_value(r).to_string());
+        }
+        None
+    }
+}
+
 pub unsafe fn py_repr(obj: PyObjectRef) -> String {
     let obj = crate::baseobjspace::unwrap_cell(obj);
     if obj.is_null() {
@@ -180,23 +268,14 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
     }
     unsafe {
         let tp = (*obj).ob_type;
-        if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
-            let int_obj = obj as *const pyre_object::intobject::W_IntObject;
-            format!("{}", (*int_obj).intval)
-        } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
-            let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
-            let val = (*float_obj).floatval;
-            format_float_repr(val)
-        } else if std::ptr::eq(tp, &LONG_TYPE as *const PyType) {
-            let long_obj = obj as *const pyre_object::longobject::W_LongObject;
-            format!("{}", &*(*long_obj).value)
-        } else if std::ptr::eq(tp, &BOOL_TYPE as *const PyType) {
-            let bool_obj = obj as *const pyre_object::boolobject::W_BoolObject;
-            if (*bool_obj).boolval {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            }
+        // A builtin leaf subclass keeps `ob_type` at the canonical storage
+        // type but carries the Python class in `w_class`; dispatch its
+        // `__repr__` override before the `ob_type`-keyed formatting below.
+        if let Some(s) = builtin_subclass_dunder(obj, tp, "__repr__") {
+            return s;
+        }
+        if let Some(s) = builtin_leaf_repr_string(obj, tp) {
+            s
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
             let Some(_guard) = ReprGuard::enter(obj) else {
                 return "[...]".to_string();
@@ -259,21 +338,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 format!("({})", parts.join(", "))
             }
         } else if unsafe { pyre_object::is_dict(obj) } {
-            // `pypy/objspace/std/dictmultiobject.py:130-150 descr_repr`
-            // iterates `self.iteritems()`, which dispatches to the
-            // strategy on both `W_DictObject` and `W_ModuleDictObject`.
-            // `w_dict_items` already routes through `is_module_dict`,
-            // so reach for the unified surface instead of casting
-            // through the W_DictObject layout.
-            let Some(_guard) = ReprGuard::enter(obj) else {
-                return "{...}".to_string();
-            };
-            let entries = pyre_object::w_dict_items(obj);
-            let mut parts = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
-                parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
-            }
-            format!("{{{}}}", parts.join(", "))
+            unsafe { dict_repr(obj) }
         } else if pyre_object::sliceobject::is_slice(obj) {
             // `pypy/objspace/std/sliceobject.py descr_repr` —
             // `slice(%r, %r, %r)`.
@@ -514,6 +579,9 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
         let tp = (*obj).ob_type;
         // For strings, return the value directly (no quotes).
         if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+            if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__") {
+                return s;
+            }
             return pyre_object::w_str_get_value(obj).to_string();
         }
         if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
@@ -595,6 +663,14 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                 return py_str(first);
             }
             return py_str(args);
+        }
+        // `int`/`float`/... define no `tp_str`, so `str()` falls back to
+        // `repr()` (a `__str__` override wins, otherwise the `__repr__`
+        // override or builtin formatting from `py_repr`).  `str` itself
+        // has its own `tp_str` and is handled by the `STR_TYPE` branch
+        // above, so this fallthrough never reaches a bare-`str` subclass.
+        if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__") {
+            return s;
         }
         py_repr(obj)
     }

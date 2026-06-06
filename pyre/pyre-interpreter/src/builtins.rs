@@ -1197,6 +1197,83 @@ pub(crate) fn kwarg_reject_unknown(
     Ok(())
 }
 
+/// `true` when the last argument is the `__pyre_kw__`-tagged dict the
+/// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
+pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
+    matches!(args.last(), Some(&last) if unsafe {
+        is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+    })
+}
+
+/// Bind positional + `__pyre_kw__` keyword arguments into a resolved
+/// scope of length `names.len()`, mirroring the gateway's
+/// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
+/// slot is filled by a positional, then by a keyword of the matching
+/// name; an absent optional slot becomes `PY_NULL` (the generated
+/// `#[pyre_function]` unwrap reads that as "argument omitted"). An absent
+/// required slot, an unknown keyword, a keyword duplicating a positional,
+/// or too many positionals raises `TypeError`.
+///
+/// This is the consumer-side counterpart that lets a builtin resolve
+/// keywords by parameter name without a per-function `Signature`; the
+/// `#[pyre_function]` wrapper supplies the name/required tables it knows
+/// at expansion time.
+pub(crate) fn bind_builtin_kwargs(
+    args: &[PyObjectRef],
+    names: &[&str],
+    required: &[bool],
+    fn_name: &str,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if positional.len() > names.len() {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes at most {} positional argument{} ({} given)",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            positional.len(),
+        )));
+    }
+    let mut scope: Vec<PyObjectRef> = vec![PY_NULL; names.len()];
+    let mut filled: Vec<bool> = vec![false; names.len()];
+    for (i, &v) in positional.iter().enumerate() {
+        scope[i] = v;
+        filled[i] = true;
+    }
+    if let Some(dict) = kwargs {
+        let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+        for (key, val) in entries.iter() {
+            if key == "__pyre_kw__" {
+                continue;
+            }
+            match names.iter().position(|n| *n == key.as_str()) {
+                Some(idx) => {
+                    if filled[idx] {
+                        return Err(crate::PyError::type_error(format!(
+                            "{fn_name}() got multiple values for argument '{key}'"
+                        )));
+                    }
+                    scope[idx] = *val;
+                    filled[idx] = true;
+                }
+                None => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{fn_name}() got an unexpected keyword argument '{key}'"
+                    )));
+                }
+            }
+        }
+    }
+    for i in 0..names.len() {
+        if !filled[i] && required[i] {
+            return Err(crate::PyError::type_error(format!(
+                "{fn_name}() missing required argument: '{}'",
+                names[i]
+            )));
+        }
+    }
+    Ok(scope)
+}
+
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
 /// The flat builtin ABI leaves this validation to each kw-aware method.
 pub(crate) fn kwarg_reject_duplicate(
@@ -1466,10 +1543,35 @@ fn type_descr_new_with_metaclass(
         // walks correctly.
         let mut class_ns = Box::new(crate::DictStorage::new());
         class_ns.fix_ptr();
-        if unsafe { is_dict(w_namespace_dict) } {
-            for (k, v) in unsafe { pyre_object::w_dict_items(w_namespace_dict) } {
+        // type_new_classcell — capture the `__classcell__` cell and keep
+        // both explicit class cells out of the new type's `__dict__`
+        // (CPython consumes them here rather than storing them).
+        let mut classcell = pyre_object::PY_NULL;
+        // `type.__new__` accepts any `dict` subclass as the namespace
+        // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
+        // the dict backing so e.g. an `enum._EnumDict` class body is
+        // walked instead of dropped.
+        let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
+        if !w_ns_backing.is_null() {
+            for (k, v) in unsafe { pyre_object::w_dict_items(w_ns_backing) } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
+                    if key == "__classcell__" {
+                        if !unsafe { pyre_object::is_cell(v) } {
+                            let tp_name = match unsafe { crate::typedef::r#type(v) } {
+                                Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+                                None => "object".to_string(),
+                            };
+                            return Err(crate::PyError::type_error(format!(
+                                "__classcell__ must be a nonlocal cell, not {tp_name}"
+                            )));
+                        }
+                        classcell = v;
+                        continue;
+                    }
+                    if key == "__classdictcell__" {
+                        continue;
+                    }
                     crate::dict_storage_store(&mut class_ns, key, v);
                 }
             }
@@ -1532,17 +1634,23 @@ fn type_descr_new_with_metaclass(
         // observe this class.
         unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
-        // __set_name__ protocol — CPython: type_new_set_names
-        // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
-        // `w_dict_items` dispatches through `is_module_dict`.
-        if unsafe { is_dict(w_namespace_dict) } {
-            let entries = unsafe { pyre_object::w_dict_items(w_namespace_dict) };
+        // type_new_classcell — bind the captured `__classcell__` to the
+        // new type so `__class__` / zero-arg `super()` in the methods
+        // resolve; the key was already dropped from the namespace above.
+        if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
+            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+        }
+
+        // __set_name__ protocol — type_new_set_names
+        // typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
+        if !w_ns_backing.is_null() {
+            let entries = unsafe { pyre_object::w_dict_items(w_ns_backing) };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
                         // getattr returns a bound method, so self is already bound.
-                        // Call: bound_set_name(owner, name)
-                        let _ = crate::call_function(set_name, &[w_type, k]);
+                        // Call: bound_set_name(owner, name); propagate a raise.
+                        call_and_check(set_name, &[w_type, k])?;
                     }
                 }
             }
@@ -2230,6 +2338,13 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let obj = args[0];
     unsafe {
         if is_str(obj) {
+            // A `str` subclass keeps `ob_type` at STR_TYPE but carries the
+            // Python class in `w_class`; honor its `__str__` override before
+            // returning the raw value.
+            let tp = (*obj).ob_type;
+            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__") {
+                return Ok(w_str_new(&s));
+            }
             return Ok(obj);
         }
     }

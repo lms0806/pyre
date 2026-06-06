@@ -1183,7 +1183,38 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )))
 }
 descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
-descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
+
+/// tuple.__new__(cls, iterable) — tupleobject.py descr__new__.
+///
+/// For a tuple subclass (e.g. `collections.namedtuple`), build a fresh
+/// tuple and set `w_class = cls` so `type(obj) == cls`, attribute lookup
+/// resolves the subclass's field descriptors, and `__repr__` dispatches.
+fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_tuple(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let tuple_typeobj = gettypefor(&pyre_object::pyobject::TUPLE_TYPE);
+    if tuple_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    // Subclass path — copy into a fresh tuple so setting w_class does not
+    // clobber a shared/literal source tuple.
+    let n = unsafe { pyre_object::w_tuple_len(value) };
+    let items: Vec<_> = (0..n)
+        .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
+        .collect();
+    let obj = pyre_object::w_tuple_new(items);
+    unsafe {
+        (*obj).w_class = cls;
+    }
+    Ok(obj)
+}
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 /// typeobject.py:511-524 W_TypeObject.check_user_subclass.
@@ -2198,7 +2229,19 @@ fn init_dict_type(ns: &mut DictStorage) {
                         if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
-                                return crate::baseobjspace::getitem(backing, args[1]);
+                                // `dictmultiobject.py:166-170` — on a miss,
+                                // dispatch `__missing__` against the SUBCLASS
+                                // instance's type, not the plain-`dict` backing
+                                // (so e.g. `defaultdict.__missing__` fires).
+                                return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                                    backing, args[1],
+                                ) {
+                                    Ok(Some(val)) => Ok(val),
+                                    Ok(None) => crate::baseobjspace::dict_missing_or_key_error(
+                                        args[0], args[1],
+                                    ),
+                                    Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
+                                };
                             }
                         }
                     }
@@ -2255,6 +2298,35 @@ fn init_dict_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                // `dictmultiobject.py:130-150 descr_repr`.  Registered as a
+                // method (not only the `py_repr` fast path) so dict-subclass
+                // instances and `super().__repr__()` format their backing.
+                if args.is_empty() {
+                    return Ok(pyre_object::w_str_new("{}"));
+                }
+                let recv = args[0];
+                let dict = crate::type_methods::resolve_dict_backing(recv);
+                if dict.is_null() {
+                    // Unbound `dict.__repr__(x)` on a non-dict receiver —
+                    // reject it like a builtin descriptor rather than
+                    // formatting an empty `{}`.
+                    let tp_name = unsafe { (*(*recv).ob_type).name };
+                    return Err(crate::PyError::type_error(format!(
+                        "descriptor '__repr__' for 'dict' objects \
+                         doesn't apply to a '{tp_name}' object"
+                    )));
+                }
+                unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict))) }
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "__iter__",
         make_builtin_function_with_arity(
             "__iter__",
@@ -2281,7 +2353,20 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
                 }
-                crate::baseobjspace::delitem(args[0], args[1])?;
+                // For plain dict: direct delete. For dict subclass instance: use backing dict.
+                unsafe {
+                    if pyre_object::is_dict(args[0]) {
+                        crate::baseobjspace::delitem(args[0], args[1])?;
+                    } else if pyre_object::is_instance(args[0]) {
+                        // dict subclass — delete from __dict_data__ backing dict
+                        if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
+                        {
+                            if pyre_object::is_dict(backing) {
+                                crate::baseobjspace::delitem(backing, args[1])?;
+                            }
+                        }
+                    }
+                }
                 Ok(pyre_object::w_none())
             },
             2,
@@ -4454,6 +4539,21 @@ fn init_type_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
+
+    // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
+    // form returns the MRO as a fresh list (the `__mro__` getset above
+    // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
+    let mro_method = make_builtin_function("mro", |args| {
+        let cls = args[0];
+        unsafe {
+            let mro_ptr = pyre_object::w_type_get_mro(cls);
+            if mro_ptr.is_null() {
+                return Ok(pyre_object::w_list_new(vec![]));
+            }
+            Ok(pyre_object::w_list_new((*mro_ptr).clone()))
+        }
+    });
+    dict_storage_store(ns, "mro", mro_method);
 
     // `pypy/objspace/std/typeobject.py:614-624 get_module` /
     // `:1241-1247 descr_get__module` / `descr_set__module`.
