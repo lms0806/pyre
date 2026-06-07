@@ -788,7 +788,7 @@ class W_Socket(W_Root):
                 if w_ancillary is not None:
                     anc_iter = space.unpackiterable(w_ancillary)
                     for w_i in anc_iter:
-                        if not space.isinstance_w(w_i, space.w_tuple):
+                        if not space.issequence_w(w_i):
                             raise oefmt(space.w_TypeError, "[sendmsg() ancillary data items]() argument must be sequence")
                         if space.len_w(w_i) == 3:
                             intemtup = space.unpackiterable(w_i)
