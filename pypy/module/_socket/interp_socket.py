@@ -906,7 +906,7 @@ class W_Socket(W_Root):
             if not space.is_none(args_w[2]):
                 raise oefmt(space.w_TypeError,
                       "setsockopt() takse exactly 3 arguments (4 given)")
-            optlen = space.int_w(args_w[2])
+            optlen = space.int_w(args_w[3])
             try:
                 self.sock.setsockopt_None(level, optname, optlen)
             except SocketError as e:
