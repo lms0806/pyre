@@ -79,6 +79,12 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool), lexopt::Error>
 }
 
 pub fn main_entry(binary_name: &'static str) {
+    // Block async signals on this (the process's original) thread so the
+    // kernel delivers process-directed signals to the interpreter thread
+    // spawned below, where they can interrupt blocking syscalls.  The
+    // interpreter thread inherits this mask and unblocks them at the top of
+    // `real_main`.
+    pyre_interpreter::module::_signal::signalstate::block_async_signals_on_origin_thread();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| real_main(binary_name))
@@ -88,6 +94,10 @@ pub fn main_entry(binary_name: &'static str) {
 }
 
 fn real_main(binary_name: &str) {
+    // Receive process-directed async signals on this thread (see
+    // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
+    // alarms.
+    pyre_interpreter::module::_signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for InvalidLoop — these are caught by
     // catch_unwind in the JIT optimizer but the default panic hook still
     // prints to stderr, making it look like a crash.
@@ -211,6 +221,13 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     // updates the slot.  Mirrors PyPy's `space.threadlocals` always
     // holding the active EC for the current thread.
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
+    // raises KeyboardInterrupt, and register the periodic signal-check
+    // action on the execution context.
+    unsafe {
+        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+    }
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {

@@ -7,6 +7,26 @@ use crate::{
     pow, rshift, sub, truediv, xor,
 };
 
+/// Maps an in-place `BinaryOperator` to its special-method name
+/// (`__iadd__` etc.), or `None` for non-in-place operators.
+fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
+    Some(match op {
+        BinaryOperator::InplaceAdd => "__iadd__",
+        BinaryOperator::InplaceSubtract => "__isub__",
+        BinaryOperator::InplaceMultiply => "__imul__",
+        BinaryOperator::InplaceFloorDivide => "__ifloordiv__",
+        BinaryOperator::InplaceRemainder => "__imod__",
+        BinaryOperator::InplaceTrueDivide => "__itruediv__",
+        BinaryOperator::InplacePower => "__ipow__",
+        BinaryOperator::InplaceLshift => "__ilshift__",
+        BinaryOperator::InplaceRshift => "__irshift__",
+        BinaryOperator::InplaceAnd => "__iand__",
+        BinaryOperator::InplaceOr => "__ior__",
+        BinaryOperator::InplaceXor => "__ixor__",
+        _ => return None,
+    })
+}
+
 pub fn binary_value(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -14,6 +34,27 @@ pub fn binary_value(
 ) -> Result<PyObjectRef, PyError> {
     let a = crate::baseobjspace::unwrap_cell(a);
     let b = crate::baseobjspace::unwrap_cell(b);
+    // descroperation.py:825 `inplace_impl` — consult the in-place
+    // special first; fall through to the binary op below when absent or
+    // `NotImplemented`.
+    if let Some(idunder) = inplace_dunder_name(op) {
+        // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
+        // name so the builtin-sequence rhs-first branch can fire.
+        let (rdunder, seq_bug_compat) = match op {
+            BinaryOperator::InplaceAdd => (Some("__radd__"), true),
+            BinaryOperator::InplaceMultiply => (Some("__rmul__"), true),
+            _ => (None, false),
+        };
+        if let Some(result) = crate::objspace::descroperation::try_inplace_special(
+            a,
+            b,
+            idunder,
+            rdunder,
+            seq_bug_compat,
+        )? {
+            return Ok(result);
+        }
+    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => add(a, b),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => sub(a, b),
@@ -25,27 +66,9 @@ pub fn binary_value(
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
         BinaryOperator::And | BinaryOperator::InplaceAnd => and_(a, b),
-        BinaryOperator::Or => or_(a, b),
-        BinaryOperator::InplaceOr => {
-            // `pypy/objspace/std/dictproxyobject.py:67 descr_ior` —
-            // mappingproxy `__ior__` raises TypeError unconditionally
-            // (the proxy is read-only, in-place merge cannot be
-            // honoured even if `__or__` would accept the rhs).  PyPy
-            // `descroperation.inplace_or` tries `__ior__` first; for
-            // mappingproxy that resolves to the raise, so the
-            // surrounding INPLACE_OR opcode propagates.  Pyre's
-            // dispatcher otherwise routes Inplace/non-Inplace to the
-            // same `or_`, so detect proxy LHS up front to preserve the
-            // raise.
-            unsafe {
-                if pyre_object::is_dict_proxy(a) {
-                    return Err(PyError::type_error(
-                        "'|=' is not supported by mappingproxy; use '|' instead",
-                    ));
-                }
-            }
-            or_(a, b)
-        }
+        // mappingproxy `__ior__` (read-only) raises TypeError, handled
+        // above by `try_inplace_special`; both fall through to `or_`.
+        BinaryOperator::Or | BinaryOperator::InplaceOr => or_(a, b),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => xor(a, b),
         BinaryOperator::Subscr => getitem(a, b),
         _ => Err(PyError::type_error(format!(
@@ -59,6 +82,17 @@ pub fn binary_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // In-place tags (13-24) must consult the in-place special (`__iadd__`
+    // etc.) first; route them through `binary_value`.  Tags 0-12 use the
+    // plain dispatch below.
+    if op_tag > 12 {
+        let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag) else {
+            return Err(PyError::type_error(format!(
+                "unsupported binary op tag: {op_tag}"
+            )));
+        };
+        return binary_value(a, b, op);
+    }
     match op_tag {
         0 => add(a, b),
         1 => sub(a, b),

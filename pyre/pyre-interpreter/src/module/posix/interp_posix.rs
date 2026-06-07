@@ -8,19 +8,128 @@ use crate::DictStorage;
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
 
-/// Shared `posix.stat_result` builtin type — a plain instance bag with
-/// hasdict so that `st_mode`, `st_ino`, etc. attributes can be set from
-/// Rust when building stat results. PyPy builds a structseq subclass with
-/// named fields; this is the pyre approximation.
-fn stat_result_type() -> PyObjectRef {
+/// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
+/// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
+/// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
+/// integer fields, with the integer-seconds times at 7..10 under the
+/// hidden `_integer_atime`/`_integer_mtime`/`_integer_ctime` names; the
+/// float `st_atime`/`st_mtime`/`st_ctime`, the `st_*_ns` integers, and the
+/// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
+/// extras.
+fn stat_result_seq_type() -> PyObjectRef {
     thread_local! {
-        static STAT_RESULT_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+        static STAT_RESULT_SEQ_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
     }
-    STAT_RESULT_TYPE.with(|c| {
+    STAT_RESULT_SEQ_TYPE.with(|c| {
         *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("stat_result", |_ns| {});
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
+            crate::structseq::make_struct_seq_with_extra(
+                // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
+                "os.stat_result",
+                // `app_posix.py:20-37` — slots 7..10 are the hidden integer
+                // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
+                // named-only extras, never indexable.
+                &[
+                    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+                    "_integer_atime", "_integer_mtime", "_integer_ctime",
+                ],
+                &[
+                    "st_atime",
+                    "st_mtime",
+                    "st_ctime",
+                    "st_atime_ns",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                    // `build_stat_result` (interp_posix.py:554-557) +
+                    // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
+                    // — the sub-second nanosecond remainders, exposed on
+                    // every platform.
+                    "nsec_atime",
+                    "nsec_mtime",
+                    "nsec_ctime",
+                    // `app_posix.py:45-48` — present where the platform's
+                    // `struct stat` carries them (every Unix target).
+                    #[cfg(unix)]
+                    "st_blksize",
+                    #[cfg(unix)]
+                    "st_blocks",
+                    #[cfg(unix)]
+                    "st_rdev",
+                    // `rposix_stat.py` exposes `st_flags` where the C
+                    // `struct stat` carries it (BSD family / macOS).
+                    #[cfg(target_os = "macos")]
+                    "st_flags",
+                ],
+            )
+        })
+    })
+}
+
+/// `os.terminal_size` structseq — `(columns, lines)`.
+fn terminal_size_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
+        })
+    })
+}
+
+/// `os.uname_result` structseq — `(sysname, nodename, release, version,
+/// machine)`; repr renders "posix.uname_result(...)".
+fn uname_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "posix.uname_result",
+                &["sysname", "nodename", "release", "version", "machine"],
+            )
+        })
+    })
+}
+
+/// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
+/// extra named field (`n_sequence_fields=10`, `n_fields=11`).
+fn statvfs_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq_with_extra(
+                "os.statvfs_result",
+                &[
+                    "f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
+                    "f_favail", "f_flag", "f_namemax",
+                ],
+                &["f_fsid"],
+            )
+        })
+    })
+}
+
+/// `os.times_result` structseq — `(user, system, children_user,
+/// children_system, elapsed)`; repr renders "posix.times_result(...)".
+fn times_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "posix.times_result",
+                &[
+                    "user",
+                    "system",
+                    "children_user",
+                    "children_system",
+                    "elapsed",
+                ],
+            )
         })
     })
 }
@@ -600,42 +709,14 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    // os.terminal_size — namedtuple-like type with columns/lines.
-    // Uses stat_result_type (hasdict instance) so setattr works.
+    // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
-        let instance = pyre_object::w_instance_new(stat_result_type());
-        let _ = crate::baseobjspace::setattr(instance, "columns", pyre_object::w_int_new(cols));
-        let _ = crate::baseobjspace::setattr(instance, "lines", pyre_object::w_int_new(lines));
-        instance
+        crate::structseq::new_instance(
+            terminal_size_seq_type(),
+            vec![pyre_object::w_int_new(cols), pyre_object::w_int_new(lines)],
+        )
     }
-    let terminal_size_type = crate::typedef::make_builtin_type("terminal_size", |ns| {
-        crate::dict_storage_store(
-            ns,
-            "__new__",
-            crate::make_builtin_function("__new__", |args| {
-                let (cols, rows) = if args.len() >= 2 {
-                    let seq = args[1];
-                    unsafe {
-                        if pyre_object::is_tuple(seq) {
-                            let c = pyre_object::w_tuple_getitem(seq, 0)
-                                .map(|v| pyre_object::w_int_get_value(v))
-                                .unwrap_or(80);
-                            let r = pyre_object::w_tuple_getitem(seq, 1)
-                                .map(|v| pyre_object::w_int_get_value(v))
-                                .unwrap_or(24);
-                            (c, r)
-                        } else {
-                            (80, 24)
-                        }
-                    }
-                } else {
-                    (80, 24)
-                };
-                Ok(make_terminal_size(cols, rows))
-            }),
-        );
-    });
-    crate::dict_storage_store(ns, "terminal_size", terminal_size_type);
+    crate::dict_storage_store(ns, "terminal_size", terminal_size_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     crate::dict_storage_store(
@@ -660,17 +741,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         (80, 24)
                     }
                 };
-                let result = pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(cols),
-                    pyre_object::w_int_new(rows),
-                ]);
-                let wrapper = pyre_object::w_instance_new(stat_result_type());
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "columns", pyre_object::w_int_new(cols));
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "lines", pyre_object::w_int_new(rows));
-                let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", result);
-                Ok(wrapper)
+                Ok(make_terminal_size(cols, rows))
             },
             0,
         ),
@@ -710,7 +781,46 @@ pub fn register_module(ns: &mut DictStorage) {
     // (st_mode, st_ino, ...). We expose it as a plain instance with
     // attributes so that both `os.stat(p).st_mode` and
     // `os.stat(p)[0]` work.
-    fn make_stat_result(meta: &std::fs::Metadata) -> pyre_object::PyObjectRef {
+    // `st_flags` lives in the BSD/macOS `struct stat` but `std`'s
+    // `Metadata`/`MetadataExt` does not surface it, so read it with a raw
+    // `stat`/`lstat`/`fstat`; on failure default to 0 (the primary
+    // metadata read already succeeded).
+    #[cfg(target_os = "macos")]
+    fn macos_path_st_flags(path: &str, follow: bool) -> u32 {
+        let Ok(c) = std::ffi::CString::new(path) else {
+            return 0;
+        };
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            let rc = if follow {
+                libc::stat(c.as_ptr(), &mut st)
+            } else {
+                libc::lstat(c.as_ptr(), &mut st)
+            };
+            if rc == 0 {
+                st.st_flags
+            } else {
+                0
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn macos_fd_st_flags(fd: i32) -> u32 {
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) == 0 {
+                st.st_flags
+            } else {
+                0
+            }
+        }
+    }
+
+    /// `st_flags` (macOS/BSD) is not surfaced by `std::fs::Metadata`, so
+    /// the caller obtains it via a raw `stat`/`lstat`/`fstat` and passes
+    /// it in; it is ignored (and unread) on platforms whose `struct stat`
+    /// lacks the field.
+    fn make_stat_result(meta: &std::fs::Metadata, st_flags: u32) -> pyre_object::PyObjectRef {
         // Extract stat fields in a cross-platform way.
         #[cfg(unix)]
         let (
@@ -798,7 +908,16 @@ pub fn register_module(ns: &mut DictStorage) {
             )
         };
 
-        let tuple = pyre_object::w_tuple_new(vec![
+        #[cfg(unix)]
+        let (st_blksize, st_blocks, st_rdev) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.blksize() as i64, meta.blocks() as i64, meta.rdev() as i64)
+        };
+
+        // The 10 sequence slots are the integer fields (integer-seconds
+        // times at 7..10, named `_integer_*`); the float times, `st_*_ns`,
+        // and the platform block/device extras are named-only fields.
+        let seq = vec![
             pyre_object::w_int_new(st_mode),
             pyre_object::w_int_new(st_ino),
             pyre_object::w_int_new(st_dev),
@@ -809,48 +928,48 @@ pub fn register_module(ns: &mut DictStorage) {
             pyre_object::w_int_new(st_atime),
             pyre_object::w_int_new(st_mtime),
             pyre_object::w_int_new(st_ctime),
-        ]);
-        // Attach st_* attributes via a wrapping instance.
-        let wrapper = pyre_object::w_instance_new(stat_result_type());
-        let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", tuple);
-        let _ = crate::baseobjspace::setattr(wrapper, "st_mode", pyre_object::w_int_new(st_mode));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_ino", pyre_object::w_int_new(st_ino));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_dev", pyre_object::w_int_new(st_dev));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_nlink", pyre_object::w_int_new(st_nlink));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_uid", pyre_object::w_int_new(st_uid));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_gid", pyre_object::w_int_new(st_gid));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_size", pyre_object::w_int_new(st_size));
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_atime",
-            pyre_object::w_float_new(st_atime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_mtime",
-            pyre_object::w_float_new(st_mtime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_ctime",
-            pyre_object::w_float_new(st_ctime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_atime_ns",
-            pyre_object::w_int_new(st_atime_ns),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_mtime_ns",
-            pyre_object::w_int_new(st_mtime_ns),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_ctime_ns",
-            pyre_object::w_int_new(st_ctime_ns),
-        );
-        wrapper
+        ];
+        // `_ll_get_st_atime` — float times keep sub-second precision:
+        // `float(seconds) + 1e-9 * nanosecond_fraction`, where the
+        // fraction is recovered from the full-nanosecond field.
+        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - st_atime * 1_000_000_000) as f64;
+        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - st_mtime * 1_000_000_000) as f64;
+        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - st_ctime * 1_000_000_000) as f64;
+        #[allow(unused_mut)]
+        let mut extras = vec![
+            ("st_atime", pyre_object::w_float_new(st_atime_f)),
+            ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
+            ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
+            ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
+            ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
+            ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+            // `build_stat_result` (interp_posix.py:554-557): the
+            // sub-second remainder of each full-nanosecond timestamp,
+            // `value % 1_000_000_000` (non-negative for pre-1970 times).
+            (
+                "nsec_atime",
+                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_mtime",
+                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_ctime",
+                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000)),
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            extras.push(("st_blksize", pyre_object::w_int_new(st_blksize)));
+            extras.push(("st_blocks", pyre_object::w_int_new(st_blocks)));
+            extras.push(("st_rdev", pyre_object::w_int_new(st_rdev)));
+        }
+        #[cfg(target_os = "macos")]
+        extras.push(("st_flags", pyre_object::w_int_new(st_flags as i64)));
+        #[cfg(not(target_os = "macos"))]
+        let _ = st_flags;
+        crate::structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
@@ -887,7 +1006,13 @@ pub fn register_module(ns: &mut DictStorage) {
             host_fs::symlink_metadata(&path_str)
         };
         match meta {
-            Ok(m) => Ok(make_stat_result(&m)),
+            Ok(m) => {
+                #[cfg(target_os = "macos")]
+                let st_flags = macos_path_st_flags(&path_str, follow_symlinks);
+                #[cfg(not(target_os = "macos"))]
+                let st_flags = 0u32;
+                Ok(make_stat_result(&m, st_flags))
+            }
             Err(e) => {
                 let kind = e.raw_os_error().unwrap_or(2);
                 Err(crate::PyError::os_error_with_errno(
@@ -908,9 +1033,8 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "uname",
             |_| {
-                let wrapper = pyre_object::w_instance_new(stat_result_type());
                 #[cfg(all(unix, feature = "host_env"))]
-                {
+                let (sysname, nodename, release, version, machine) = {
                     let info = rustpython_host_env::posix::uname_info().unwrap_or(
                         rustpython_host_env::posix::UnameInfo {
                             sysname: String::new(),
@@ -920,63 +1044,32 @@ pub fn register_module(ns: &mut DictStorage) {
                             machine: String::new(),
                         },
                     );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "sysname",
-                        pyre_object::w_str_new(&info.sysname),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "nodename",
-                        pyre_object::w_str_new(&info.nodename),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "release",
-                        pyre_object::w_str_new(&info.release),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "version",
-                        pyre_object::w_str_new(&info.version),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "machine",
-                        pyre_object::w_str_new(&info.machine),
-                    );
-                }
+                    (
+                        info.sysname,
+                        info.nodename,
+                        info.release,
+                        info.version,
+                        info.machine,
+                    )
+                };
                 #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let sysname = std::env::consts::OS.to_string();
-                    let machine = std::env::consts::ARCH.to_string();
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "sysname",
+                let (sysname, nodename, release, version, machine) = (
+                    std::env::consts::OS.to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    std::env::consts::ARCH.to_string(),
+                );
+                Ok(crate::structseq::new_instance(
+                    uname_result_seq_type(),
+                    vec![
                         pyre_object::w_str_new(&sysname),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "nodename",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "release",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "version",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "machine",
+                        pyre_object::w_str_new(&nodename),
+                        pyre_object::w_str_new(&release),
+                        pyre_object::w_str_new(&version),
                         pyre_object::w_str_new(&machine),
-                    );
-                }
-                Ok(wrapper)
+                    ],
+                ))
             },
             0,
         ),
@@ -1008,7 +1101,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     let meta = f.metadata();
                     let _ = std::mem::ManuallyDrop::new(f); // don't close
                     match meta {
-                        Ok(m) => Ok(make_stat_result(&m)),
+                        Ok(m) => {
+                            #[cfg(target_os = "macos")]
+                            let st_flags = macos_fd_st_flags(fd);
+                            #[cfg(not(target_os = "macos"))]
+                            let st_flags = 0u32;
+                            Ok(make_stat_result(&m, st_flags))
+                        }
                         Err(e) => Err(crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(9),
                             format!("{}", e),
@@ -1024,9 +1123,9 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    // stat_result type — simple instance with hasdict so setattr works.
-    // Exported so that `posix.stat_result` can be looked up.
-    crate::dict_storage_store(ns, "stat_result", stat_result_type());
+    // stat_result type — structseq (tuple subclass). Exported so that
+    // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
+    crate::dict_storage_store(ns, "stat_result", stat_result_seq_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::dict_storage_store(
         ns,
@@ -1568,63 +1667,20 @@ pub fn register_module(ns: &mut DictStorage) {
         fn statvfs_to_obj(
             info: rustpython_host_env::posix::StatVfsInfo,
         ) -> pyre_object::PyObjectRef {
-            let wrapper = pyre_object::w_instance_new(stat_result_type());
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bsize",
+            let seq = vec![
                 pyre_object::w_int_new(info.f_bsize as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_frsize",
                 pyre_object::w_int_new(info.f_frsize as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_blocks",
                 pyre_object::w_int_new(info.f_blocks as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bfree",
                 pyre_object::w_int_new(info.f_bfree as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bavail",
                 pyre_object::w_int_new(info.f_bavail as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_files",
                 pyre_object::w_int_new(info.f_files as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_ffree",
                 pyre_object::w_int_new(info.f_ffree as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_favail",
                 pyre_object::w_int_new(info.f_favail as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_flag",
                 pyre_object::w_int_new(info.f_flag as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_namemax",
                 pyre_object::w_int_new(info.f_namemax as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_fsid",
-                pyre_object::w_int_new(info.f_fsid as i64),
-            );
-            wrapper
+            ];
+            let extras = vec![("f_fsid", pyre_object::w_int_new(info.f_fsid as i64))];
+            crate::structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
         }
         #[cfg(not(target_os = "redox"))]
         crate::dict_storage_store(
@@ -1863,33 +1919,16 @@ pub fn register_module(ns: &mut DictStorage) {
                 |_| {
                     let t =
                         rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
-                    let wrapper = pyre_object::w_instance_new(stat_result_type());
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "user",
-                        pyre_object::w_float_new(t.user),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "system",
-                        pyre_object::w_float_new(t.system),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "children_user",
-                        pyre_object::w_float_new(t.children_user),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "children_system",
-                        pyre_object::w_float_new(t.children_system),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "elapsed",
-                        pyre_object::w_float_new(t.elapsed),
-                    );
-                    Ok(wrapper)
+                    Ok(crate::structseq::new_instance(
+                        times_result_seq_type(),
+                        vec![
+                            pyre_object::w_float_new(t.user),
+                            pyre_object::w_float_new(t.system),
+                            pyre_object::w_float_new(t.children_user),
+                            pyre_object::w_float_new(t.children_system),
+                            pyre_object::w_float_new(t.elapsed),
+                        ],
+                    ))
                 },
                 0,
             ),

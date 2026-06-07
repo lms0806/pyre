@@ -139,7 +139,11 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut stripped = inner_sig.clone();
     for arg in stripped.inputs.iter_mut() {
         if let FnArg::Typed(pt) = arg {
-            pt.attrs.retain(|a| !a.path().is_ident("default"));
+            pt.attrs.retain(|a| {
+                !a.path().is_ident("default")
+                    && !a.path().is_ident("kwonly")
+                    && !a.path().is_ident("kwargs")
+            });
         }
     }
     rewrite_alias_args(&mut stripped);
@@ -159,9 +163,70 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // Companion `<name>_pyre_sig()` — derives a keyword-aware `Signature`
+    // from the typed parameter names so the registration path can bind
+    // keyword / kw-only / `**kwargs`-style calls by name.  A `#[kwonly]`
+    // marker starts the keyword-only tail at that parameter; a `#[kwargs]`
+    // marker designates the `**kwargs` catch-all dict.
+    //
+    // A bare `&[PyObjectRef]` parameter is the raw whole-args-slice
+    // passthrough ABI (the wrapper hands it the entire `args` slice), which
+    // is incompatible with by-name binding — such a builtin gets no
+    // `Signature` (`None`) and keeps the raw positional fast path.
+    let sig_fn_name = format_ident!("{}_pyre_sig", user_name);
+    let mut sig_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut kwonly_marked = false;
+    let mut raw_slice = false;
+    for arg in user_sig.inputs.iter() {
+        let FnArg::Typed(pt) = arg else { continue };
+        let name_lit = match &*pt.pat {
+            Pat::Ident(pi) => pi.ident.to_string(),
+            _ => continue,
+        };
+        if pt.attrs.iter().any(|a| a.path().is_ident("kwargs")) {
+            sig_stmts.push(quote! { __b.kwargname = ::std::option::Option::Some(#name_lit); });
+            continue;
+        }
+        // Only a `&[PyObjectRef]` slice is the raw whole-args passthrough
+        // that suppresses the signature.  A `&[u8]` (or other element type)
+        // is a positioned bytes-like parameter and keeps by-name binding.
+        let is_slice = match unwrap_type_group(&pt.ty) {
+            Type::Reference(r) => match unwrap_type_group(&r.elem) {
+                Type::Slice(s) => type_is_py_object_ref(unwrap_type_group(&s.elem)),
+                _ => false,
+            },
+            _ => false,
+        };
+        if is_slice {
+            raw_slice = true;
+            continue;
+        }
+        if !kwonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("kwonly")) {
+            sig_stmts.push(quote! { __b.marker_kwonly(); });
+            kwonly_marked = true;
+        }
+        sig_stmts.push(quote! { __b.append(#name_lit); });
+    }
+    let sig_body = if raw_slice {
+        quote! { ::std::option::Option::None }
+    } else {
+        quote! {
+            let mut __b = crate::SignatureBuilder::default();
+            #(#sig_stmts)*
+            ::std::option::Option::Some(__b.signature())
+        }
+    };
+    let sig_fn = quote! {
+        #[allow(dead_code)]
+        #vis fn #sig_fn_name() -> ::std::option::Option<crate::Signature> {
+            #sig_body
+        }
+    };
+
     Ok(quote! {
         #inner_fn
         #wrapper
+        #sig_fn
     })
 }
 
@@ -179,11 +244,40 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
     let ty = &*pt.ty;
 
     let unwrap = unwrap_expr(ty, idx)?;
+    // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
+    // slice — it has no per-slot index to bounds-check.  Other slice
+    // element types (e.g. `&[u8]`) are positioned params indexing
+    // `args[idx]`, so they keep the missing-argument bounds guard.
+    let is_whole_slice = if let Type::Reference(r) = unwrap_type_group(ty) {
+        if let Type::Slice(s) = unwrap_type_group(&r.elem) {
+            type_is_py_object_ref(unwrap_type_group(&s.elem))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let argname = ident.to_string();
     let expr = match arg_default(pt)? {
+        // `bind_kwargs_to_signature` pads `args` to the parameter count
+        // with PY_NULL, so the default only applies when the slot is both
+        // present and non-null.
         Some(default) => quote! {
             if #idx < args.len() && !args[#idx].is_null() { #unwrap } else { #default }
         },
-        None => unwrap,
+        None if is_whole_slice => unwrap,
+        None => quote! {
+            {
+                if #idx >= args.len() || args[#idx].is_null() {
+                    return ::std::result::Result::Err(
+                        crate::PyError::type_error(
+                            format!("missing required argument: '{}'", #argname)
+                        )
+                    );
+                }
+                #unwrap
+            }
+        },
     };
     // Typed-receiver aliases erase to the binding type declared in
     // `typed_alias` (PyObjectRef for passthrough, String for PyPath).
@@ -294,17 +388,125 @@ fn typed_alias(
             quote! { crate::gateway::fsencode_w(args[#idx])? },
         ),
         "PyIndex" => (
-            // Mirrors PyPy `space.getindex_w(w_obj)` / `space_index` in
-            // baseobjspace.rs.  Consults `__index__` per PEP 357 and
-            // returns the underlying i64.  Raises TypeError when the
-            // object has no `__index__` and is not already int-like.
+            // Mirrors PyPy `space.getindex_w(w_obj, None)`: consults
+            // `__index__` per PEP 357 and returns the underlying i64,
+            // clamping to i64::MAX / i64::MIN on overflow.  Raises
+            // TypeError when the object has no `__index__` and is not
+            // already int-like.
             quote! { i64 },
+            quote! { crate::baseobjspace::getindex_w(args[#idx])? },
+        ),
+        // Integer aliases — route through the `space.gateway_nonnegint_w`
+        // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
+        // checks and their exception messages live in one place.
+        "PyNonNegInt" => (
+            quote! { i64 },
+            quote! { crate::baseobjspace::gateway_nonnegint_w(args[#idx])? },
+        ),
+        "PyCInt" => (
+            quote! { i32 },
+            quote! { crate::baseobjspace::c_int_w(args[#idx])? },
+        ),
+        "PyCUInt" => (
+            quote! { u32 },
+            quote! { crate::baseobjspace::c_uint_w(args[#idx])? },
+        ),
+        "PyCShort" => (
+            quote! { i16 },
+            quote! { crate::baseobjspace::c_short_w(args[#idx])? },
+        ),
+        "PyCUShort" => (
+            quote! { u16 },
+            quote! { crate::baseobjspace::c_ushort_w(args[#idx])? },
+        ),
+        "PyCUidT" => (
+            quote! { u32 },
+            quote! { crate::baseobjspace::c_uid_t_w(args[#idx])? },
+        ),
+        "PyTruncatedInt" => (
+            quote! { i64 },
+            quote! { crate::baseobjspace::truncatedint_w(args[#idx])? },
+        ),
+        "PyText0" => (
+            quote! { &'static str },
+            quote! { crate::baseobjspace::text0_w(args[#idx])? },
+        ),
+        "PyBytes0" => (
+            // space.bytes0_w — bytes_w plus a rejection of embedded NUL.
+            quote! { &'static [u8] },
             quote! {
                 {
-                    let __obj = crate::baseobjspace::space_index(args[#idx])?;
-                    unsafe { ::pyre_object::w_int_get_value(__obj) }
+                    if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
+                        return ::std::result::Result::Err(
+                            crate::PyError::type_error(
+                                format!("argument {} must be bytes-like", #idx)
+                            )
+                        );
+                    }
+                    let __b = unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) };
+                    if __b.contains(&0) {
+                        return ::std::result::Result::Err(
+                            crate::PyError::value_error(
+                                "embedded null byte".to_string()
+                            )
+                        );
+                    }
+                    __b
                 }
             },
+        ),
+        "PyPathOrNone" => (
+            // space.fsencode_or_none_w — None passes through, otherwise
+            // fsencode_w (same conversion as the `PyPath` alias).
+            quote! { ::std::option::Option<::std::string::String> },
+            quote! {
+                if unsafe { ::pyre_object::is_none(args[#idx]) } {
+                    ::std::option::Option::None
+                } else {
+                    ::std::option::Option::Some(crate::gateway::fsencode_w(args[#idx])?)
+                }
+            },
+        ),
+        // space.realunicode_w / space.utf8_w — a str argument as unicode
+        // text; both route through baseobjspace and return the borrowed
+        // utf8 buffer, differing only in the TypeError message they raise.
+        "PyUnicode" => (
+            quote! { &'static str },
+            quote! { crate::baseobjspace::realunicode_w(args[#idx])? },
+        ),
+        "PyUtf8" => (
+            quote! { &'static str },
+            quote! { crate::baseobjspace::utf8_w(args[#idx])? },
+        ),
+        "PyTextOrNone" => (
+            // space.text_or_none_w — None passes through, otherwise text_w.
+            quote! { ::std::option::Option<&'static str> },
+            quote! {
+                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
+                    ::std::option::Option::None
+                } else {
+                    ::std::option::Option::Some(crate::baseobjspace::text_w(args[#idx])?)
+                }
+            },
+        ),
+        "PyText0OrNone" => (
+            // space.text0_or_none_w — None passes through, otherwise text0_w.
+            quote! { ::std::option::Option<&'static str> },
+            quote! {
+                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
+                    ::std::option::Option::None
+                } else {
+                    ::std::option::Option::Some(crate::baseobjspace::text0_w(args[#idx])?)
+                }
+            },
+        ),
+        "PyBufferStr" => (
+            quote! { &'static [u8] },
+            quote! { crate::baseobjspace::charbuf_w(args[#idx])? },
+        ),
+        "PyCNonNegInt" => (
+            quote! { i32 },
+            quote! { crate::baseobjspace::c_nonnegint_w(args[#idx])? },
         ),
         _ => return None,
     })
@@ -1007,6 +1209,11 @@ struct PyreMethodsAttrs {
     doc: Option<syn::LitStr>,
     weakrefable: bool,
     unhashable: bool,
+    /// Optional base class expression — the `__base` of the TypeDef.
+    /// Mirrors `TypeDef("X", __base=W_Base.typedef)` in
+    /// `pypy/interpreter/typedef.py`.  Defaults to `w_object()` (the
+    /// `object` base) when omitted.
+    base: Option<syn::Expr>,
 }
 
 impl syn::parse::Parse for PyreMethodsAttrs {
@@ -1024,12 +1231,16 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                 }
                 "weakrefable" => out.weakrefable = true,
                 "unhashable" => out.unhashable = true,
+                "base" => {
+                    input.parse::<syn::Token![=]>()?;
+                    out.base = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `#[pyre_methods]` key `{other}` — expected \
-                             `doc = \"...\"` / `weakrefable` / `unhashable`",
+                             `doc = \"...\"` / `weakrefable` / `unhashable` / `base = <expr>`",
                         ),
                     ));
                 }
@@ -1059,8 +1270,63 @@ enum MethodKind {
     Instance,
     Static,
     Class,
-    Getter(String),
-    Setter(String),
+    // `(py_name, doc)` — doc is the optional `doc="…"` arg shared by all
+    // three accessors, mirroring `GetSetProperty(fget, fset, fdel, doc=)`.
+    Getter(String, Option<String>),
+    Setter(String, Option<String>),
+    Deleter(String, Option<String>),
+}
+
+/// One `#[getter(...)]` / `#[setter(...)]` / `#[deleter(...)]` argument:
+/// either a positional `"name"` (or `name = "…"`) or `doc = "…"`.
+enum GetSetArg {
+    Name(String),
+    Doc(String),
+}
+
+impl syn::parse::Parse for GetSetArg {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.peek(syn::LitStr) {
+            let s: syn::LitStr = input.parse()?;
+            return Ok(GetSetArg::Name(s.value()));
+        }
+        let key: syn::Ident = input.parse()?;
+        let _: syn::Token![=] = input.parse()?;
+        let val: syn::LitStr = input.parse()?;
+        match key.to_string().as_str() {
+            "name" => Ok(GetSetArg::Name(val.value())),
+            "doc" => Ok(GetSetArg::Doc(val.value())),
+            _ => Err(syn::Error::new(key.span(), "expected `name` or `doc`")),
+        }
+    }
+}
+
+/// Parse a `#[getter]` / `#[setter]` / `#[deleter]` attribute into its
+/// optional `(name, doc)`.  Accepts `#[x]`, `#[x("name")]`,
+/// `#[x(doc = "…")]`, and `#[x("name", doc = "…")]`.
+fn parse_getset_attr(a: &syn::Attribute) -> syn::Result<(Option<String>, Option<String>)> {
+    use syn::Meta;
+    match &a.meta {
+        Meta::Path(_) => Ok((None, None)),
+        Meta::List(_) => {
+            let args = a.parse_args_with(
+                syn::punctuated::Punctuated::<GetSetArg, syn::Token![,]>::parse_terminated,
+            )?;
+            let mut name = None;
+            let mut doc = None;
+            for arg in args {
+                match arg {
+                    GetSetArg::Name(s) => name = Some(s),
+                    GetSetArg::Doc(s) => doc = Some(s),
+                }
+            }
+            Ok((name, doc))
+        }
+        Meta::NameValue(_) => Err(syn::Error::new(
+            a.span(),
+            "expected `#[attr]`, `#[attr(\"name\")]`, or `#[attr(doc = \"…\")]`",
+        )),
+    }
 }
 
 /// Inspect `#[staticmethod]` / `#[classmethod]` / `#[getter]` /
@@ -1081,16 +1347,23 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
         } else if a.path().is_ident("classmethod") {
             Some(MethodKind::Class)
         } else if a.path().is_ident("getter") {
-            let py_name = attr_string_arg(a)?.unwrap_or_else(|| m.sig.ident.to_string());
-            Some(MethodKind::Getter(py_name))
+            let (name, doc) = parse_getset_attr(a)?;
+            let py_name = name.unwrap_or_else(|| m.sig.ident.to_string());
+            Some(MethodKind::Getter(py_name, doc))
         } else if a.path().is_ident("setter") {
+            let (name, doc) = parse_getset_attr(a)?;
             let fn_name = m.sig.ident.to_string();
-            let derived = fn_name.strip_prefix("set_").map(str::to_owned);
-            let py_name = match attr_string_arg(a)? {
-                Some(n) => n,
-                None => derived.unwrap_or(fn_name),
-            };
-            Some(MethodKind::Setter(py_name))
+            let py_name = name
+                .or_else(|| fn_name.strip_prefix("set_").map(str::to_owned))
+                .unwrap_or(fn_name);
+            Some(MethodKind::Setter(py_name, doc))
+        } else if a.path().is_ident("deleter") {
+            let (name, doc) = parse_getset_attr(a)?;
+            let fn_name = m.sig.ident.to_string();
+            let py_name = name
+                .or_else(|| fn_name.strip_prefix("del_").map(str::to_owned))
+                .unwrap_or(fn_name);
+            Some(MethodKind::Deleter(py_name, doc))
         } else {
             None
         };
@@ -1099,7 +1372,7 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
             return Err(syn::Error::new(
                 a.span(),
                 "#[pyre_methods]: at most one of \
-                 `#[classmethod]` / `#[staticmethod]` / `#[getter]` / `#[setter]`",
+                 `#[classmethod]` / `#[staticmethod]` / `#[getter]` / `#[setter]` / `#[deleter]`",
             ));
         }
         kind = new_kind;
@@ -1108,58 +1381,70 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
     Ok(kind)
 }
 
-/// Insert a getter/setter wrapper into the `properties` Vec, merging
-/// with an existing pair on the same py-name and rejecting duplicates.
-fn record_property(
-    properties: &mut Vec<(String, Option<syn::Ident>, Option<syn::Ident>)>,
+/// One python-visible GetSetProperty being assembled across `#[getter]` /
+/// `#[setter]` / `#[deleter]` arms that share a py-name.  Mirrors
+/// `GetSetProperty(fget, fset, fdel, doc=)`.
+#[derive(Default)]
+struct PropEntry {
     name: String,
-    new_fget: Option<syn::Ident>,
-    new_fset: Option<syn::Ident>,
-    m: &syn::ImplItemFn,
-) -> syn::Result<()> {
-    for entry in properties.iter_mut() {
-        if entry.0 != name {
-            continue;
-        }
-        if new_fget.is_some() {
-            if entry.1.is_some() {
-                return Err(syn::Error::new(
-                    m.sig.span(),
-                    format!("#[getter]: property `{name}` already has a getter"),
-                ));
-            }
-            entry.1 = new_fget;
-        }
-        if new_fset.is_some() {
-            if entry.2.is_some() {
-                return Err(syn::Error::new(
-                    m.sig.span(),
-                    format!("#[setter]: property `{name}` already has a setter"),
-                ));
-            }
-            entry.2 = new_fset;
-        }
-        return Ok(());
-    }
-    properties.push((name, new_fget, new_fset));
-    Ok(())
+    fget: Option<syn::Ident>,
+    fset: Option<syn::Ident>,
+    fdel: Option<syn::Ident>,
+    doc: Option<String>,
 }
 
-/// Extract `"name"` from `#[X("name")]`.  `None` if the attribute has
-/// no arguments; `Err` if the arg list is malformed.
-fn attr_string_arg(a: &syn::Attribute) -> syn::Result<Option<String>> {
-    use syn::Meta;
-    match &a.meta {
-        Meta::Path(_) => Ok(None),
-        Meta::List(_) => {
-            let lit: syn::LitStr = a.parse_args()?;
-            Ok(Some(lit.value()))
+/// Which accessor a `record_property` call contributes.
+enum Accessor {
+    Get,
+    Set,
+    Del,
+}
+
+/// Insert one accessor wrapper into the `properties` Vec, merging with an
+/// existing entry on the same py-name and rejecting duplicate accessors.
+/// A `doc` provided by any accessor is adopted; conflicting docs error.
+fn record_property(
+    properties: &mut Vec<PropEntry>,
+    name: String,
+    accessor: Accessor,
+    wrapper: syn::Ident,
+    doc: Option<String>,
+    m: &syn::ImplItemFn,
+) -> syn::Result<()> {
+    let entry = match properties.iter_mut().find(|e| e.name == name) {
+        Some(e) => e,
+        None => {
+            properties.push(PropEntry {
+                name: name.clone(),
+                ..PropEntry::default()
+            });
+            properties.last_mut().unwrap()
         }
-        Meta::NameValue(_) => Err(syn::Error::new(
-            a.span(),
-            "expected `#[attr]` or `#[attr(\"name\")]`",
-        )),
+    };
+    let (slot, label) = match accessor {
+        Accessor::Get => (&mut entry.fget, "getter"),
+        Accessor::Set => (&mut entry.fset, "setter"),
+        Accessor::Del => (&mut entry.fdel, "deleter"),
+    };
+    if slot.is_some() {
+        return Err(syn::Error::new(
+            m.sig.span(),
+            format!("#[{label}]: property `{name}` already has a {label}"),
+        ));
     }
+    *slot = Some(wrapper);
+    if let Some(doc) = doc {
+        match &entry.doc {
+            Some(existing) if *existing != doc => {
+                return Err(syn::Error::new(
+                    m.sig.span(),
+                    format!("property `{name}` has conflicting `doc` values"),
+                ));
+            }
+            _ => entry.doc = Some(doc),
+        }
+    }
+    Ok(())
 }
 
 fn expand_pyre_methods(
@@ -1210,7 +1495,7 @@ fn expand_pyre_methods(
     // slot; after the loop we emit one `w_getset_property_new` per
     // distinct py_name.  Mirrors PyPy `name = GetSetProperty(fget=,
     // fset=)` where both handlers share the python-visible name.
-    let mut properties: Vec<(String, Option<syn::Ident>, Option<syn::Ident>)> = Vec::new();
+    let mut properties: Vec<PropEntry> = Vec::new();
 
     for item in imp.items.iter() {
         let ImplItem::Fn(m) = item else { continue };
@@ -1246,7 +1531,10 @@ fn expand_pyre_methods(
         // `w_getset_property_new(fget=, fset=)` build keyed by py_name.
         let mut inputs = m.sig.inputs.iter().peekable();
         let (preamble, call_target, first_arg_idx) = match &kind {
-            MethodKind::Instance | MethodKind::Getter(_) | MethodKind::Setter(_) => {
+            MethodKind::Instance
+            | MethodKind::Getter(..)
+            | MethodKind::Setter(..)
+            | MethodKind::Deleter(..) => {
                 let recv = match inputs.next() {
                     Some(FnArg::Receiver(r)) => r,
                     _ => {
@@ -1262,7 +1550,7 @@ fn expand_pyre_methods(
                 // actual `self` slides one slot right.  Mirrors
                 // `typedef.py:312-325` fget_unwrap_spec.
                 let self_idx: usize = match &kind {
-                    MethodKind::Getter(_) | MethodKind::Setter(_) => 1,
+                    MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..) => 1,
                     _ => 0,
                 };
                 let from_obj_call = if recv.mutability.is_some() {
@@ -1403,38 +1691,55 @@ fn expand_pyre_methods(
                         ::pyre_object::w_classmethod_new(#raw_fn));
                 });
             }
-            MethodKind::Getter(prop_name) => {
+            MethodKind::Getter(prop_name, doc) => {
                 record_property(
                     &mut properties,
                     prop_name.clone(),
-                    Some(wrapper_name.clone()),
-                    None,
+                    Accessor::Get,
+                    wrapper_name.clone(),
+                    doc.clone(),
                     m,
                 )?;
             }
-            MethodKind::Setter(prop_name) => {
+            MethodKind::Setter(prop_name, doc) => {
                 record_property(
                     &mut properties,
                     prop_name.clone(),
-                    None,
-                    Some(wrapper_name.clone()),
+                    Accessor::Set,
+                    wrapper_name.clone(),
+                    doc.clone(),
+                    m,
+                )?;
+            }
+            MethodKind::Deleter(prop_name, doc) => {
+                record_property(
+                    &mut properties,
+                    prop_name.clone(),
+                    Accessor::Del,
+                    wrapper_name.clone(),
+                    doc.clone(),
                     m,
                 )?;
             }
         }
     }
 
-    // Property pair emission: one `w_getset_property_new` per distinct
+    // Property emission: one `w_getset_property_new` per distinct
     // py-name.  Slots not provided fall back to `PY_NULL` (matching
     // PyPy `GetSetProperty(fget=W_X.descr_get_X, fset=None, fdel=None)`
-    // when only a getter is declared).
-    for (prop_name, fget, fset) in &properties {
-        let fget_expr = match fget {
+    // when only a getter is declared).  A `doc="…"` provided on any
+    // accessor populates the `doc` slot; otherwise `PY_NULL`.
+    for prop in &properties {
+        let prop_name = &prop.name;
+        let accessor_expr = |slot: &Option<syn::Ident>| match slot {
             Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
             None => quote! { ::pyre_object::PY_NULL },
         };
-        let fset_expr = match fset {
-            Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
+        let fget_expr = accessor_expr(&prop.fget);
+        let fset_expr = accessor_expr(&prop.fset);
+        let fdel_expr = accessor_expr(&prop.fdel);
+        let doc_expr = match &prop.doc {
+            Some(doc) => quote! { ::pyre_object::w_str_new(#doc) },
             None => quote! { ::pyre_object::PY_NULL },
         };
         registrations.push(quote! {
@@ -1444,8 +1749,8 @@ fn expand_pyre_methods(
                 ::pyre_object::getsetproperty::w_getset_property_new(
                     #fget_expr,
                     #fset_expr,
-                    ::pyre_object::PY_NULL,
-                    ::pyre_object::PY_NULL,
+                    #fdel_expr,
+                    #doc_expr,
                     ::pyre_object::PY_NULL,
                     false,
                     ::pyre_object::w_str_new(#prop_name),
@@ -1494,7 +1799,8 @@ fn expand_pyre_methods(
                 || a.path().is_ident("classmethod")
                 || a.path().is_ident("staticmethod")
                 || a.path().is_ident("getter")
-                || a.path().is_ident("setter"))
+                || a.path().is_ident("setter")
+                || a.path().is_ident("deleter"))
         });
         for arg in m.sig.inputs.iter_mut() {
             if let FnArg::Typed(pt) = arg {
@@ -1503,6 +1809,13 @@ fn expand_pyre_methods(
         }
         rewrite_alias_args(&mut m.sig);
     }
+
+    // Base class for the TypeDef.  `#[pyre_methods(base = <expr>)]`
+    // supplies the parent type; absent it, the class inherits `object`.
+    let base_expr = match &attrs.base {
+        Some(e) => quote! { #e },
+        None => quote! { crate::typedef::w_object() },
+    };
 
     let type_object_fn = quote! {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
@@ -1515,7 +1828,7 @@ fn expand_pyre_methods(
                     let tp = crate::typedef::make_builtin_type_with_layout(
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                         |ns| { #(#registrations)* },
-                        crate::typedef::w_object(),
+                        #base_expr,
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                     );
                     ::pyre_object::pyobject::set_instantiate(

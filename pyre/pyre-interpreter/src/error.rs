@@ -580,6 +580,39 @@ impl PyError {
         }
     }
 
+    /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
+    /// matching `OSError.__init__`'s 2-argument form: `args` becomes
+    /// `(errno, strerror)`, `str(e)` is `"[Errno N] strerror"`, and
+    /// `e.errno` / `e.strerror` read back the two values.  ENOENT keeps
+    /// the FileNotFoundError subclass mapping of `os_error_with_errno`.
+    pub fn os_error_errno_strerror(errno: i32, strerror: impl Into<String>) -> Self {
+        let strerror = strerror.into();
+        let kind = if errno == 2 {
+            PyErrorKind::FileNotFoundError
+        } else {
+            PyErrorKind::OSError
+        };
+        let exc_kind = if errno == 2 {
+            ExcKind::FileNotFoundError
+        } else {
+            ExcKind::OSError
+        };
+        let message = format!("[Errno {errno}] {strerror}");
+        let exc = w_exception_new(exc_kind, &message);
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind,
+            message,
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<String>) -> Self {
@@ -768,13 +801,31 @@ impl PyError {
     }
 
     pub fn render_exception(&self) -> String {
-        let name = exc_kind_name(self.to_exc_kind());
+        let name = exc_object_class_name(self.exc_object)
+            .unwrap_or_else(|| exc_kind_name(self.to_exc_kind()).to_string());
         if self.message.is_empty() {
-            name.to_string()
+            name
         } else {
             format!("{name}: {}", self.message)
         }
     }
+}
+
+/// Resolve an exception instance's actual Python class name for display.
+///
+/// `crate::typedef::type` trusts the instance's `w_class`, which the
+/// `__new__` wrapper sets to the exact class that was raised — including
+/// user subclasses (`class MyErr(ValueError)`) and class-only builtins
+/// such as `KeyboardInterrupt` whose `ExcKind` tag degrades to
+/// `BaseException`.  Reading the class name here makes the printed header
+/// match `type(e).__name__` instead of the coarse kind tag.  Returns
+/// `None` for a null pointer or non-exception object so callers fall back
+/// to the kind-based name.
+fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return None;
+    }
+    crate::typedef::r#type(exc).map(|tp| unsafe { pyre_object::w_type_get_name(tp).to_string() })
 }
 
 impl std::fmt::Display for PyError {
@@ -885,8 +936,10 @@ fn render_exc_object(exc: PyObjectRef) -> String {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return String::from("<no exception>");
     }
-    let kind = unsafe { pyre_object::excobject::w_exception_get_kind(exc) };
-    let name = exc_kind_name(kind);
+    let name = exc_object_class_name(exc).unwrap_or_else(|| {
+        let kind = unsafe { pyre_object::excobject::w_exception_get_kind(exc) };
+        exc_kind_name(kind).to_string()
+    });
     // `str(e)` semantically — pyre stores args as a list; the
     // first arg's str repr is the message.  Empty args produces
     // bare `ExcName` per `traceback.format_exception_only`.
@@ -917,7 +970,7 @@ fn render_exc_object(exc: PyObjectRef) -> String {
         }
     };
     if msg.is_empty() {
-        name.to_string()
+        name
     } else {
         format!("{name}: {msg}")
     }

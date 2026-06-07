@@ -309,12 +309,16 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let w_class = (*obj).w_class;
             let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
-                // try_call_dunder gates on is_instance(obj); structseq
-                // instances are tuple subclasses with ob_type ==
-                // TUPLE_TYPE, so reach for the subclass __repr__
-                // directly via lookup(MRO).
-                if let Some(method) = crate::baseobjspace::lookup(obj, "__repr__") {
-                    if !method.is_null() {
+                // structseq instances are tuple subclasses with ob_type ==
+                // TUPLE_TYPE, so reach for a subclass __repr__ via the MRO.
+                // `tuple` itself installs no `__repr__` dict entry (it is
+                // handled natively below), so a plain tuple subclass
+                // resolves `__repr__` to `object` — fall through to the
+                // tuple formatting in that case rather than printing the
+                // generic `<object at ...>`.
+                if let Some((src, method)) = crate::baseobjspace::lookup_where(w_class, "__repr__")
+                {
+                    if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
                         let r = crate::call_function(method, &[obj]);
                         if !r.is_null() && pyre_object::is_str(r) {
                             return pyre_object::w_str_get_value(r).to_string();
@@ -643,6 +647,64 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                     {
                         let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
                         return py_repr(first);
+                    }
+                }
+                // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
+                // the `errno`/`strerror`/`filename`/`filename2` slots:
+                // the 2-argument form renders as `"[Errno N] strerror"`,
+                // extended with `": 'filename'"` and `" -> 'filename2'"`
+                // when those are present.  `_init_error` drops filename
+                // from `args`, so prefer the slot and fall back to the
+                // positional arg (same 2..=5 gate as the getters) for the
+                // internal-constructor path that leaves the slots `PY_NULL`.
+                // Both errno and strerror absent falls back to
+                // `W_BaseException.descr_str` below.
+                pyre_object::excobject::ExcKind::OSError
+                | pyre_object::excobject::ExcKind::FileNotFoundError => {
+                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                    let n = if !args.is_null() && pyre_object::is_tuple(args) {
+                        pyre_object::w_tuple_len(args)
+                    } else {
+                        0
+                    };
+                    let slot_or_arg = |slot: pyre_object::PyObjectRef,
+                                       idx: usize|
+                     -> Option<pyre_object::PyObjectRef> {
+                        if !slot.is_null() {
+                            return Some(slot);
+                        }
+                        if (2..=5).contains(&n) && idx < n {
+                            unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
+                        } else {
+                            None
+                        }
+                    };
+                    let w_errno =
+                        slot_or_arg(pyre_object::excobject::w_exception_get_errno(obj), 0);
+                    let w_strerror =
+                        slot_or_arg(pyre_object::excobject::w_exception_get_strerror(obj), 1);
+                    if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
+                        let errno = py_str(w_errno);
+                        let strerror = py_str(w_strerror);
+                        let w_filename =
+                            slot_or_arg(pyre_object::excobject::w_exception_get_filename(obj), 2)
+                                .filter(|&f| !pyre_object::is_none(f));
+                        if let Some(fname) = w_filename {
+                            let w_filename2 = slot_or_arg(
+                                pyre_object::excobject::w_exception_get_filename2(obj),
+                                4,
+                            )
+                            .filter(|&f| !pyre_object::is_none(f));
+                            if let Some(fname2) = w_filename2 {
+                                return format!(
+                                    "[Errno {errno}] {strerror}: {} -> {}",
+                                    py_repr(fname),
+                                    py_repr(fname2)
+                                );
+                            }
+                            return format!("[Errno {errno}] {strerror}: {}", py_repr(fname));
+                        }
+                        return format!("[Errno {errno}] {strerror}");
                     }
                 }
                 _ => {}

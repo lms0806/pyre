@@ -514,6 +514,14 @@ pub struct BuiltinCode {
     /// positional arity 0-4, this equals the arity directly. Builtins
     /// with optional/variadic args use HOPELESS (0x400).
     pub fast_natural_arity: u16,
+    /// gateway.py:743 `BuiltinCode.sig` — the argument `Signature`
+    /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
+    /// keyword arguments into positional order before the function runs.
+    /// `null` means "no declared signature" (positional-only), which is
+    /// every builtin today.  The pointee is leaked to `'static` so the
+    /// raw pointer carries no Drop obligation and is not a GC pointer,
+    /// matching the `func` function-pointer convention.
+    pub sig: *const Signature,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -554,7 +562,7 @@ pub fn builtin_code_new_with_arity(
         arity <= 4,
         "builtin arity {arity} for {name} exceeds fast-path max 4"
     );
-    builtin_code_new_full(name, func, None, arity)
+    builtin_code_new_full(name, func, None, arity, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with an explicit docstring.
@@ -567,7 +575,7 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    builtin_code_new_full(name, func, docstring, HOPELESS)
+    builtin_code_new_full(name, func, docstring, HOPELESS, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
@@ -580,15 +588,18 @@ pub fn builtin_code_new_with_doc(
 /// `function.rs:funccall_valuestack` peeks `args[0]` separately to mirror
 /// `function.py:194-199`, but the closure still receives `[w_obj, ...rest]`.
 pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
-    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1)
+    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1, std::ptr::null())
 }
 
-/// Full constructor for `BuiltinCode`.
+/// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
+/// (null for positional-only builtins); the pointee must outlive the
+/// object — callers leak it to `'static`.
 fn builtin_code_new_full(
     name: &'static str,
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
     fast_natural_arity: u16,
+    sig: *const Signature,
 ) -> PyObjectRef {
     pyre_object::lltype::malloc_typed(BuiltinCode {
         ob: PyObject {
@@ -599,7 +610,24 @@ fn builtin_code_new_full(
         func,
         docstring,
         fast_natural_arity,
+        sig,
     }) as PyObjectRef
+}
+
+/// Allocate a `BuiltinCode` carrying an argument `Signature`.  The
+/// signature is leaked to `'static` so the raw pointer stored on the
+/// object has no Drop obligation, matching the `func`/`name` convention.
+/// `fast_natural_arity` is `HOPELESS`: a builtin with a declared
+/// signature takes the keyword-binding slow path, not the fixed-arity
+/// fast path.
+pub fn builtin_code_new_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    builtin_code_new_full(name, func, docstring, HOPELESS, sig)
 }
 
 /// Check if an object is a built-in function.
@@ -628,6 +656,17 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
 #[inline]
 pub unsafe fn builtin_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     unsafe { (*(obj as *const BuiltinCode)).fast_natural_arity }
+}
+
+/// Read the declared argument `Signature` from a BuiltinCode, or `None`
+/// when the builtin is positional-only (`sig` is null — every builtin
+/// today).  The pointee is leaked to `'static`, so the borrow is sound.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_get_signature(obj: PyObjectRef) -> Option<&'static Signature> {
+    unsafe { (*(obj as *const BuiltinCode)).sig.as_ref() }
 }
 
 /// Get the name of a built-in function.
@@ -661,6 +700,64 @@ pub unsafe fn builtin_code_get_docstring(obj: PyObjectRef) -> PyObjectRef {
 ///   `fn = FunctionWithFixedCode(space, code, None, defs, forcename=gateway.name)`
 pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
+/// `make_builtin_function` for a builtin with a declared argument
+/// `Signature`, so the call path binds keyword arguments into positional
+/// order before the function runs (see `call::bind_kwargs_to_signature`).
+pub fn make_builtin_function_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, None, signature);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
+/// `make_builtin_function`, optionally carrying a `Signature`.  `Some`
+/// routes through `make_builtin_function_with_signature` (keyword-aware
+/// binding); `None` falls back to the positional-only constructor.  Used
+/// by the `#[pyre_function]`-derived `<name>_pyre_sig()` companion so a
+/// builtin that declares keyword / kw-only parameters binds them by name.
+pub fn make_builtin_function_maybe_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    match signature {
+        Some(signature) => make_builtin_function_with_signature(name, func, signature),
+        None => make_builtin_function(name, func),
+    }
+}
+
+/// `make_builtin_function` recording both a fixed `fast_natural_arity`
+/// and an optional argument `Signature`.  The arity preserves the fast
+/// positional dispatch path; the `Some` signature additionally lets the
+/// keyword-call path bind arguments by name.  Used by the
+/// `inline_functions:` arm so a `#[pyre_function]` builtin keeps its
+/// derived arity while gaining keyword / kw-only binding.
+///
+/// A `*args` / `**kwargs` / keyword-only parameter makes the passed
+/// fixed `arity` meaningless (the raw param count over-counts the
+/// variadic slots and the kw-only tail cannot be filled positionally),
+/// so any such signature is demoted to `HOPELESS` — the call always
+/// takes the keyword-binding slow path.
+pub fn make_builtin_function_with_arity_and_maybe_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    let arity = match &signature {
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
+        _ => arity,
+    };
+    let sig: *const Signature = match signature {
+        Some(signature) => Box::into_raw(Box::new(signature)),
+        None => std::ptr::null(),
+    };
+    let code = builtin_code_new_full(name, func, None, arity, sig);
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 

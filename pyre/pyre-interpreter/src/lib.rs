@@ -118,6 +118,8 @@ macro_rules! py_module {
     (
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, int_constants: { $($int_key:literal => $int_value:expr),* $(,)? })?
+        $(, exceptions: { $($exc_key:literal => $exc_base:expr),* $(,)? })?
         $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
         $(, inline_app: { $($inline_src:literal => [ $($inline_name:literal),* $(,)? ]),* $(,)? })?
         $(, inline_functions: {
@@ -134,6 +136,34 @@ macro_rules! py_module {
             let _name = $name;
             $($(
                 $crate::dict_storage_store(ns, $key, $value);
+            )*)?
+            // int_constants: integer module constants — PyPy MixedModule
+            // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
+            // common int case (errno/fcntl/select flags).  Each `$int_value`
+            // is an `i64`-valued expression wrapped via `w_int_new`, saving
+            // the per-entry `dict_storage_store(ns, k, w_int_new(v))`.
+            $($(
+                $crate::dict_storage_store(
+                    ns, $int_key,
+                    ::pyre_object::w_int_new($int_value as i64),
+                );
+            )*)?
+            // exceptions: module-local exception classes — PyPy
+            // `new_exception_class("<mod>.Name", base)` (error.py:857).
+            // The class name is auto-qualified as `"<$name>.<key>"` and
+            // built via `make_exc_type` (which also records it in the
+            // exc-class registry); the short `key` is the attribute name
+            // stored in the module dict.  The RHS is the base class
+            // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
+            $($(
+                $crate::dict_storage_store(
+                    ns, $exc_key,
+                    $crate::builtins::make_exc_type(
+                        ::std::concat!($name, ".", $exc_key),
+                        $crate::builtins::exc_exception_new,
+                        $exc_base,
+                    ),
+                );
             )*)?
             // appleveldefs: bundle Python source via `include_str!` at
             // compile time, then resolve each name through
@@ -173,10 +203,11 @@ macro_rules! py_module {
                     $crate::dict_storage_store(
                         ns,
                         stringify!($ifn_name),
-                        $crate::make_builtin_function_with_arity(
+                        $crate::make_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
                             $ifn_name,
                             $crate::pyre_count_typed_args!($($ifn_args)*) as u16,
+                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
                     );
                 }
@@ -206,12 +237,15 @@ macro_rules! py_module {
 /// Count typed `name: ty` arguments in a `fn` parameter list.  Used by
 /// `py_module!`'s `inline_functions:` arm to derive arity from the
 /// signature.  Treats `&[PyObjectRef]` varargs as zero (caller should
-/// route those through path-ref `functions:` form instead).
+/// route those through path-ref `functions:` form instead).  Each
+/// parameter may carry leading attributes (`#[default(...)]`,
+/// `#[kwonly]`, `#[kwargs]`) — they are consumed and ignored here; the
+/// `#[pyre_function]` expansion strips them from the emitted fn.
 #[macro_export]
 macro_rules! pyre_count_typed_args {
     () => { 0usize };
-    ($a:ident : $t:ty) => { 1usize };
-    ($a:ident : $t:ty, $($rest:tt)*) => {
+    ( $(#[$m:meta])* $a:ident : $t:ty ) => { 1usize };
+    ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
         1usize + $crate::pyre_count_typed_args!($($rest)*)
     };
 }
@@ -652,10 +686,13 @@ pub use executioncontext::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, PASSTHROUGHARGS1,
-    builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_name, builtin_code_new,
-    builtin_code_new_passthrough_args1, builtin_code_new_with_arity, is_builtin_code,
-    make_builtin_function, make_builtin_function_passthrough_args1,
-    make_builtin_function_with_arity, make_module_builtin_function,
+    Signature, SignatureBuilder, builtin_code_get, builtin_code_get_fast_natural_arity,
+    builtin_code_get_signature, builtin_code_name, builtin_code_new,
+    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
+    builtin_code_new_with_signature, is_builtin_code, make_builtin_function,
+    make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
+    make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
+    make_builtin_function_with_signature, make_module_builtin_function,
     make_module_builtin_function_with_arity,
 };
 pub use jit_fnaddr::*;

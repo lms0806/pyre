@@ -1,9 +1,13 @@
 //! _signal module — PyPy: pypy/module/signal/
 //!
-//! signal() / getsignal() / set_wakeup_fd() remain stubs because the
-//! real implementations need interpreter-side trampolines to invoke
-//! Python handlers from a Rust signal context.  alarm / pause /
-//! raise_signal / strsignal / valid_signals are full implementations
-//! backed by `rustpython_host_env::signal`.
+//! `signal()` / `getsignal()` register real handlers via `signalstate`
+//! (sigaction + a pending-signal flag) and deliver them through
+//! `CheckSignalAction` at the next interpreter checkpoint.  alarm / pause
+//! / raise_signal / strsignal / valid_signals are backed by
+//! `rustpython_host_env::signal`.  `set_wakeup_fd` records the fd (and
+//! `warn_on_full_buffer`); the handler writes the signal-number byte to
+//! it and stashes any write errno for the next checkpoint to report.
+
+pub mod signalstate;
 
 crate::pyre_module_init!(interp_signal);

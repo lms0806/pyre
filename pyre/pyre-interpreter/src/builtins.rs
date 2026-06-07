@@ -730,33 +730,33 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_exc_type("AssertionError", exc_assertion_error_new, exception),
     );
 
-    let os_error = make_exc_type("OSError", exc_exception_new, exception);
+    let os_error = make_exc_type("OSError", exc_os_error_new, exception);
     crate::dict_storage_store(namespace, "OSError", os_error);
     crate::dict_storage_store(namespace, "IOError", os_error);
     crate::dict_storage_store(
         namespace,
         "FileNotFoundError",
-        make_exc_type("FileNotFoundError", exc_exception_new, os_error),
+        make_exc_type("FileNotFoundError", exc_file_not_found_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "FileExistsError",
-        make_exc_type("FileExistsError", exc_exception_new, os_error),
+        make_exc_type("FileExistsError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "PermissionError",
-        make_exc_type("PermissionError", exc_exception_new, os_error),
+        make_exc_type("PermissionError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "NotADirectoryError",
-        make_exc_type("NotADirectoryError", exc_exception_new, os_error),
+        make_exc_type("NotADirectoryError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "IsADirectoryError",
-        make_exc_type("IsADirectoryError", exc_exception_new, os_error),
+        make_exc_type("IsADirectoryError", exc_os_error_new, os_error),
     );
 
     let warning = make_exc_type("Warning", exc_exception_new, exception);
@@ -851,57 +851,49 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "BlockingIOError",
-        make_exc_type("BlockingIOError", exc_exception_new, os_error),
+        make_exc_type("BlockingIOError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "ChildProcessError",
-        make_exc_type("ChildProcessError", exc_exception_new, os_error),
+        make_exc_type("ChildProcessError", exc_os_error_new, os_error),
     );
-    let connection_error = make_exc_type("ConnectionError", exc_exception_new, os_error);
+    let connection_error = make_exc_type("ConnectionError", exc_os_error_new, os_error);
     crate::dict_storage_store(namespace, "ConnectionError", connection_error);
     crate::dict_storage_store(
         namespace,
         "BrokenPipeError",
-        make_exc_type("BrokenPipeError", exc_exception_new, connection_error),
+        make_exc_type("BrokenPipeError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
         "ConnectionAbortedError",
-        make_exc_type(
-            "ConnectionAbortedError",
-            exc_exception_new,
-            connection_error,
-        ),
+        make_exc_type("ConnectionAbortedError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
         "ConnectionRefusedError",
-        make_exc_type(
-            "ConnectionRefusedError",
-            exc_exception_new,
-            connection_error,
-        ),
+        make_exc_type("ConnectionRefusedError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
         "ConnectionResetError",
-        make_exc_type("ConnectionResetError", exc_exception_new, connection_error),
+        make_exc_type("ConnectionResetError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
         "InterruptedError",
-        make_exc_type("InterruptedError", exc_exception_new, os_error),
+        make_exc_type("InterruptedError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "ProcessLookupError",
-        make_exc_type("ProcessLookupError", exc_exception_new, os_error),
+        make_exc_type("ProcessLookupError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
         "TimeoutError",
-        make_exc_type("TimeoutError", exc_exception_new, os_error),
+        make_exc_type("TimeoutError", exc_os_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
@@ -1830,6 +1822,75 @@ exc_constructor!(
     exc_unicode_error,
     pyre_object::excobject::ExcKind::UnicodeError
 );
+
+/// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.
+/// A 2..=5 positional-argument call fills the `errno` / `strerror` /
+/// `filename` / `filename2` slots; when a filename is present it is
+/// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
+/// 652) for pickle / repr compatibility.  The winerror argument (idx 3,
+/// Windows-only) and the `BlockingIOError.written` special-case are not
+/// modelled.  `kind` is `OSError` for the base type and `FileNotFoundError`
+/// for that dedicated kind; every other OSError subclass routes here as
+/// `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
+fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) -> PyObjectRef {
+    use pyre_object::excobject;
+    let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
+        let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+        excobject::w_exception_new_wtf8(kind, w)
+    } else {
+        let msg: String = if args.is_empty() {
+            String::new()
+        } else if args.len() == 1 {
+            unsafe { crate::display::py_str(args[0]) }
+        } else {
+            let parts: Vec<String> = args
+                .iter()
+                .map(|&a| unsafe { crate::display::py_repr(a) })
+                .collect();
+            format!("({})", parts.join(", "))
+        };
+        excobject::w_exception_new(kind, &msg)
+    };
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { excobject::w_exception_set_args(exc, args_list) };
+    // `_parse_init_args`: only a 2..=5 argument call carries
+    // errno/strerror (and optionally filename/filename2).
+    let n = args.len();
+    if (2..=5).contains(&n) {
+        unsafe {
+            excobject::w_exception_set_errno(exc, args[0]);
+            excobject::w_exception_set_strerror(exc, args[1]);
+            // idx 2 = filename, idx 3 = winerror (ignored off Windows),
+            // idx 4 = filename2.
+            let w_filename = args.get(2).copied().filter(|&f| !pyre_object::is_none(f));
+            if let Some(fname) = w_filename {
+                excobject::w_exception_set_filename(exc, fname);
+                if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
+                    excobject::w_exception_set_filename2(exc, f2);
+                }
+                // `_init_error`: filename is removed from the args tuple.
+                let rebind = pyre_object::w_list_new(vec![args[0], args[1]]);
+                excobject::w_exception_set_args(exc, rebind);
+            }
+        }
+    }
+    exc
+}
+
+fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(os_error_init(
+        pyre_object::excobject::ExcKind::OSError,
+        args,
+    ))
+}
+
+fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(os_error_init(
+        pyre_object::excobject::ExcKind::FileNotFoundError,
+        args,
+    ))
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
 /// applied to UnicodeTranslateError: allocate the W_ExceptionObject
 /// and store the raw constructor args verbatim into `args_w`.  PyPy's
@@ -2098,6 +2159,8 @@ macro_rules! exc_new_wrapper {
 
 exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
 exc_new_wrapper!(exc_exception_new, exc_exception);
+exc_new_wrapper!(exc_os_error_new, exc_os_error);
+exc_new_wrapper!(exc_file_not_found_error_new, exc_file_not_found_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);

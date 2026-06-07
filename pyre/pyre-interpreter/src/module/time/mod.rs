@@ -9,6 +9,10 @@ crate::py_module! {
     interpleveldefs: {
         // `app_time.py:5-23 class struct_time` — exposed as `time.struct_time`.
         "struct_time" => t::struct_time_type(),
+        // `interp_time.py:290` — 9 base fields plus tm_zone/tm_gmtoff when
+        // the platform's `struct tm` carries them (always on the Unix
+        // targets pyre supports).
+        "_STRUCT_TM_ITEMS" => pyre_object::w_int_new(t::STRUCT_TM_ITEMS),
         "timezone"    => pyre_object::w_int_new(0),
         "altzone"     => pyre_object::w_int_new(0),
         "daylight"    => pyre_object::w_int_new(0),
@@ -21,8 +25,12 @@ crate::py_module! {
         "time"         / 0 = t::time,
         "time_ns"      / 0 = t::time_ns,
         "monotonic"    / 0 = t::monotonic,
+        "monotonic_ns" / 0 = t::monotonic_ns,
         "sleep"        / 1 = t::sleep,
         "perf_counter" / 0 = t::perf_counter,
+        "perf_counter_ns" / 0 = t::perf_counter_ns,
+        "process_time" / 0 = t::process_time,
+        "process_time_ns" / 0 = t::process_time_ns,
         "localtime"    / * = t::localtime,
         "gmtime"       / * = t::gmtime,
         "strftime"     / * = t::strftime,

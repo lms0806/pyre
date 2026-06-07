@@ -506,6 +506,25 @@ pub fn call_user_function_resolved(
     eval_fn(&mut func_frame)
 }
 
+/// Invoke a builtin's function pointer for a positional-only call,
+/// packing the `*args` tuple / `**kwargs` dict tail when the builtin's
+/// `Signature` declares one.  A variadic builtin is registered with
+/// `HOPELESS` arity (see `make_builtin_function_with_arity_and_maybe_sig`),
+/// so even a no-keyword call must materialize the (possibly empty) tail
+/// slots the `#[pyre_function]` wrapper reads.  Non-variadic builtins keep
+/// the raw `func(args)` fast path.
+fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+    let func = unsafe { builtin_code_get(code) };
+    if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
+        if sig.has_vararg() || sig.has_kwarg() || sig.num_kwonlyargnames() > 0 {
+            let fname = unsafe { crate::builtin_code_name(code) };
+            let bound = bind_kwargs_to_signature(sig, fname, args, &[])?;
+            return func(&bound);
+        }
+    }
+    func(args)
+}
+
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
@@ -580,8 +599,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
                 return Ok(w_res);
             }
             let code = unsafe { crate::getcode(callable) };
-            let func = unsafe { builtin_code_get(code as pyre_object::PyObjectRef) };
-            func(args)
+            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         },
         |callable| call_user_function(frame, callable, args),
     )
@@ -694,8 +712,7 @@ pub fn call_callable_inline_residual(
         callable,
         |callable| {
             let code = unsafe { crate::getcode(callable) };
-            let func = unsafe { builtin_code_get(code as pyre_object::PyObjectRef) };
-            func(args)
+            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         },
         |callable| call_user_function_plain(frame, callable, args),
     )
@@ -1049,6 +1066,127 @@ pub(crate) fn resolve_kwargs(
     Ok(result)
 }
 
+/// Bind keyword arguments to a builtin's declared `Signature`, producing
+/// the flat positional slice the `#[pyre_function]` wrapper reads.
+///
+/// Mirrors `resolve_kwargs` / argument.py `_match_keywords`, but sources
+/// parameter names from the `Signature` rather than a `CodeObject`, and
+/// leaves missing slots as `PY_NULL` (the wrapper applies its own
+/// `#[default]` values).  Excess positionals pack into the `*args` tuple
+/// when `varargname` is set; unmatched keywords pack into the `**kwargs`
+/// dict when `kwargname` is set, otherwise raise TypeError.
+pub(crate) fn bind_kwargs_to_signature(
+    sig: &crate::Signature,
+    fname: &str,
+    pos_args: &[PyObjectRef],
+    kwargs: &[(String, PyObjectRef)],
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let nparams = sig.argnames.len();
+    let n_pos_params = sig.num_argnames(); // positional params (excludes kwonly tail)
+    let posonly = sig.posonlyargcount;
+    let has_varargs = sig.varargname.is_some();
+    let has_varkw = sig.kwargname.is_some();
+    let n_pos = pos_args.len();
+
+    // argument.py:235-236 — too many positionals and no `*args` to absorb.
+    if n_pos > n_pos_params && !has_varargs {
+        return Err(crate::PyError::type_error(format!(
+            "{}() takes {} positional argument{} but {} {} given",
+            fname,
+            n_pos_params,
+            if n_pos_params != 1 { "s" } else { "" },
+            n_pos,
+            if n_pos != 1 { "were" } else { "was" },
+        )));
+    }
+
+    let mut result = vec![pyre_object::PY_NULL; nparams];
+    for i in 0..n_pos.min(n_pos_params) {
+        result[i] = pos_args[i];
+    }
+
+    // _match_keywords — match each keyword to a param name by index.
+    let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
+    let mut unmatched_kw_names: Vec<String> = Vec::new();
+    for (key, value) in kwargs {
+        let mut matched = false;
+        for pi in 0..nparams {
+            if sig.argnames[pi] == key.as_str() {
+                // argument.py:474 — positional-only param passed by keyword:
+                // absorb into **kwargs if present, else error.
+                if pi < posonly {
+                    if has_varkw {
+                        break;
+                    }
+                    return Err(crate::PyError::type_error(format!(
+                        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                        fname, key
+                    )));
+                }
+                if !result[pi].is_null() {
+                    return Err(crate::PyError::type_error(format!(
+                        "{}() got multiple values for argument '{}'",
+                        fname, key
+                    )));
+                }
+                result[pi] = *value;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            if has_varkw {
+                extra_kwargs.push((pyre_object::w_str_new(key), *value));
+            } else {
+                unmatched_kw_names.push(key.clone());
+            }
+        }
+    }
+
+    if !unmatched_kw_names.is_empty() {
+        let msg = if unmatched_kw_names.len() == 1 {
+            format!(
+                "{}() got an unexpected keyword argument '{}'",
+                fname, unmatched_kw_names[0]
+            )
+        } else {
+            let joined = unmatched_kw_names
+                .iter()
+                .map(|s| format!("'{}'", s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}() got {} unexpected keyword arguments: {}",
+                fname,
+                unmatched_kw_names.len(),
+                joined
+            )
+        };
+        return Err(crate::PyError::type_error(msg));
+    }
+
+    // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
+    if has_varargs {
+        let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
+            pos_args[n_pos_params..n_pos].to_vec()
+        } else {
+            vec![]
+        };
+        result.push(pyre_object::w_tuple_new(extra_pos));
+    }
+    if has_varkw {
+        let kw_dict = pyre_object::w_dict_new_kwargs();
+        for (key, value) in &extra_kwargs {
+            unsafe {
+                pyre_object::w_dict_store(kw_dict, *key, *value);
+            }
+        }
+        result.push(kw_dict);
+    }
+
+    Ok(result)
+}
+
 /// Call a user function with positional args + keyword args from a dict.
 ///
 /// PyPy: argument.py Arguments._match_signature with keyword handling.
@@ -1096,6 +1234,23 @@ pub fn call_with_kwargs(
         // Keep the marker here, in the one builtin kwargs packing site, so
         // CALL_KW and CALL_FUNCTION_EX have the same shape.
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
+            // Signature-bearing builtins bind keywords into positional
+            // order via their declared Signature instead of receiving a
+            // trailing `__pyre_kw__` dict.  A null sig (every builtin
+            // today) falls through to the dict-packing path below.
+            if let Some(sig) =
+                unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
+            {
+                let fname = unsafe { crate::builtin_code_name(code as pyre_object::PyObjectRef) };
+                let bound = bind_kwargs_to_signature(sig, fname, pos_args, kwargs)?;
+                // `bound` is already the final flat slice (positional slots
+                // plus packed `*args` / `**kwargs` tail), so invoke the
+                // builtin directly — routing back through `call_callable`
+                // would re-enter `call_builtin_code_positional` and pack the
+                // tail a second time.
+                let func = unsafe { crate::builtin_code_get(code as pyre_object::PyObjectRef) };
+                return func(&bound);
+            }
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
                 let kwargs_dict = pyre_object::w_dict_new();
@@ -1564,9 +1719,11 @@ pub fn call_function_impl_result(
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
                 // Builtin function: direct Rust call. Errors propagate
                 // naturally through the Result return type — this is the
-                // PyPy/OperationError equivalent.
-                let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                return func(args);
+                // PyPy/OperationError equivalent. Route through the
+                // signature-aware positional path so variadic builtins
+                // (*args / **kwargs) get their tail packed; non-variadic
+                // builtins fall through to the raw fast path.
+                return call_builtin_code_positional(code as pyre_object::PyObjectRef, args);
             }
             // User function: create frame + eval. The bare-PyObjectRef
             // helper stashes any error in `PENDING_CALL_ERROR` and returns

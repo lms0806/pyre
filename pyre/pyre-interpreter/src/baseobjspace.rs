@@ -415,7 +415,10 @@ pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
 /// tuple — that one is followed by re-entering the loop.
-fn p_abstract_issubclass_w(w_derived: PyObjectRef, w_cls: PyObjectRef) -> Result<bool, PyError> {
+pub(crate) fn p_abstract_issubclass_w(
+    w_derived: PyObjectRef,
+    w_cls: PyObjectRef,
+) -> Result<bool, PyError> {
     let mut w_derived = w_derived;
     loop {
         if is_w(w_derived, w_cls) {
@@ -1353,6 +1356,26 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
 /// PyPy-compatible identity check returning a Python bool object.
 pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
     w_bool_from(is_w(w_one, w_two))
+}
+
+/// `W_TypeObject.flag_sequence_bug_compat` — set on exactly the builtin
+/// sequence types (list/tuple/bytes/bytearray/str); subclasses do not
+/// inherit it, so this is an exact type-object identity check.  Used by
+/// the in-place `+=` / `*=` bug-to-bug compatibility branch in
+/// descroperation.
+pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
+    use pyre_object::pyobject;
+    is_w(w_type, crate::typedef::gettypeobject(&pyobject::LIST_TYPE))
+        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::TUPLE_TYPE))
+        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::STR_TYPE))
+        || is_w(
+            w_type,
+            crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+        )
+        || is_w(
+            w_type,
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+        )
 }
 
 /// Python-level `not` operation.
@@ -2784,6 +2807,70 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
             }
+            // `interp_exceptions.py:739-742 W_OSError` exposes
+            // `errno` / `strerror` / `filename` / `filename2` as
+            // `readwrite_attrproperty_w('w_errno', ...)` slots, populated
+            // by the 2..=5-argument constructor (`errno = args[0]`,
+            // `strerror = args[1]`, `filename = args[2]`,
+            // `filename2 = args[4]`).  Read the writable slot first so a
+            // `e.errno = ...` assignment (`object_setattr`) persists; when
+            // the slot is `PY_NULL` (the internal-constructor path that
+            // never goes through the public setter) fall back to deriving
+            // the value from `args_w` with the same argument-count gate.
+            // Fewer than two arguments leaves all four `None` (the class
+            // defaults).
+            "errno" | "strerror" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    let stored = if name == "errno" {
+                        unsafe { pyre_object::excobject::w_exception_get_errno(obj) }
+                    } else {
+                        unsafe { pyre_object::excobject::w_exception_get_strerror(obj) }
+                    };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
+                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let n = unsafe { pyre_object::w_tuple_len(args) };
+                    if (2..=5).contains(&n) {
+                        let idx = if name == "errno" { 0 } else { 1 };
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx) } {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(w_none());
+                }
+            }
+            "filename" | "filename2" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    let stored = if name == "filename" {
+                        unsafe { pyre_object::excobject::w_exception_get_filename(obj) }
+                    } else {
+                        unsafe { pyre_object::excobject::w_exception_get_filename2(obj) }
+                    };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
+                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let n = unsafe { pyre_object::w_tuple_len(args) };
+                    let idx: usize = if name == "filename" { 2 } else { 4 };
+                    if (3..=5).contains(&n) && idx < n {
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx as i64) } {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(w_none());
+                }
+            }
             // `interp_exceptions.py:468-471`
             // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
             // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
@@ -3041,6 +3128,177 @@ pub fn gateway_int_w(obj: PyObjectRef) -> Result<i64, PyError> {
     int_w(obj)
 }
 
+/// pypy/interpreter/baseobjspace.py gateway_nonnegint_w.
+pub fn gateway_nonnegint_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("expected a non-negative integer"));
+    }
+    Ok(value)
+}
+
+/// intobject.py:577 / longobject.py:164 uint_w. Unlike int_w this does NOT
+/// apply __int__/__index__ conversion: a non-int object raises TypeError
+/// (W_Root.uint_w → _typed_unwrap_error).
+pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
+    use num_traits::ToPrimitive;
+    if obj.is_null() {
+        return Err(PyError::type_error("uint_w: null object"));
+    }
+    // W_IntObject.uint_w (covers bool).
+    if unsafe { pyre_object::pyobject::is_int(obj) } {
+        let value = unsafe { pyre_object::intobject::w_int_get_value(obj) };
+        if value < 0 {
+            return Err(PyError::value_error(
+                "cannot convert negative integer to unsigned",
+            ));
+        }
+        return Ok(value as u64);
+    }
+    // W_LongObject.uint_w — num.touint().
+    if unsafe { pyre_object::pyobject::is_long(obj) } {
+        let big = unsafe { crate::builtins::obj_to_bigint(obj) };
+        if big.sign() == malachite_bigint::Sign::Minus {
+            return Err(PyError::value_error(
+                "cannot convert negative integer to unsigned int",
+            ));
+        }
+        return big
+            .to_u64()
+            .ok_or_else(|| PyError::overflow_error("int too large to convert to unsigned int"));
+    }
+    // W_Root.uint_w → _typed_unwrap_error(space, "integer").
+    let tp_name = unsafe { (*(*obj).ob_type).name };
+    Err(PyError::type_error(format!(
+        "expected integer, got {tp_name} object"
+    )))
+}
+
+/// pypy/interpreter/baseobjspace.py c_uint_w.
+pub fn c_uint_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    let value = uint_w(obj)?;
+    if value > u32::MAX as u64 {
+        return Err(PyError::overflow_error(
+            "expected an unsigned 32-bit integer",
+        ));
+    }
+    Ok(value as u32)
+}
+
+/// pypy/interpreter/baseobjspace.py c_nonnegint_w.
+pub fn c_nonnegint_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("expected a non-negative integer"));
+    }
+    if value > i32::MAX as i64 {
+        return Err(PyError::overflow_error("expected a 32-bit integer"));
+    }
+    Ok(value as i32)
+}
+
+/// pypy/interpreter/baseobjspace.py c_short_w.
+pub fn c_short_w(obj: PyObjectRef) -> Result<i16, PyError> {
+    let value = int_w(obj)?;
+    if value < i16::MIN as i64 {
+        return Err(PyError::overflow_error(
+            "signed short integer is less than minimum",
+        ));
+    }
+    if value > i16::MAX as i64 {
+        return Err(PyError::overflow_error(
+            "signed short integer is greater than maximum",
+        ));
+    }
+    Ok(value as i16)
+}
+
+/// pypy/interpreter/baseobjspace.py c_ushort_w.
+pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("value must be positive"));
+    }
+    if value > u16::MAX as i64 {
+        return Err(PyError::overflow_error(
+            "Python int too large for C unsigned short",
+        ));
+    }
+    Ok(value as u16)
+}
+
+/// pypy/interpreter/baseobjspace.py c_uid_t_w. Equivalent to c_uint_w,
+/// except -1 maps to UINT_MAX ((uid_t)-1) and values below -1 raise
+/// OverflowError rather than ValueError. `uint_w` does not run any
+/// __index__ conversion, so the `int_w` retry on the negative branch sees
+/// only the real int and is side-effect free.
+pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    match c_uint_w(obj) {
+        Ok(value) => Ok(value),
+        Err(e) if e.kind == PyErrorKind::ValueError => {
+            if int_w(obj)? == -1 {
+                Ok(u32::MAX)
+            } else {
+                Err(PyError::overflow_error(
+                    "user/group id smaller than minimum (-1)",
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// baseobjspace.py:2063 c_filedescriptor_w — an int or an object exposing
+/// a `fileno()` method (deliberately NOT an `__int__`), coerced to a
+/// non-negative C int.
+pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let w_fd = if unsafe { pyre_object::pyobject::is_int(obj) } {
+        obj
+    } else {
+        let fileno = getattr(obj, "fileno").map_err(|e| {
+            if e.kind == PyErrorKind::AttributeError {
+                PyError::type_error("argument must be an int, or have a fileno() method.")
+            } else {
+                e
+            }
+        })?;
+        let w_fd = crate::builtins::call_and_check(fileno, &[])?;
+        if unsafe { !pyre_object::pyobject::is_int(w_fd) } {
+            return Err(PyError::type_error("fileno() returned a non-integer"));
+        }
+        w_fd
+    };
+    let fd = c_int_w(w_fd)?;
+    if fd < 0 {
+        return Err(PyError::value_error(format!(
+            "file descriptor cannot be a negative integer ({fd})"
+        )));
+    }
+    Ok(fd)
+}
+
+/// pypy/interpreter/baseobjspace.py truncatedint_w.
+pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    match int_w(obj) {
+        Ok(value) => Ok(value),
+        Err(e) if e.kind == PyErrorKind::OverflowError => {
+            use num_traits::ToPrimitive;
+            // intmask(self.bigint_w(w_obj).uintmask()): bigint_w applies
+            // __int__/__index__ conversion, so read the bigint from the
+            // converted int object rather than the raw argument.
+            let w_int_obj = if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+                obj
+            } else {
+                space_int(obj)?
+            };
+            let big = unsafe { crate::builtins::obj_to_bigint(w_int_obj) };
+            let low = (&big & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
+            Ok(low as i64)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// pypy/interpreter/baseobjspace.py:1976-1982 `c_int_w(w_obj)`.
 ///
 /// ```python
@@ -3061,6 +3319,44 @@ pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
         return Err(PyError::overflow_error("expected a 32-bit integer"));
     }
     Ok(value as i32)
+}
+
+/// baseobjspace.py:1784 text_w.
+pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    if unsafe { !isinstance_str_w(obj) } {
+        return Err(PyError::type_error("expected str"));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+}
+
+/// baseobjspace.py:1791 utf8_w.
+pub fn utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    text_w(obj)
+}
+
+/// baseobjspace.py realunicode_w.
+pub fn realunicode_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    if unsafe { !isinstance_str_w(obj) } {
+        return Err(PyError::type_error("expected unicode"));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+}
+
+/// baseobjspace.py text0_w — rejects an embedded null character.
+pub fn text0_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    let s = text_w(obj)?;
+    if s.contains('\0') {
+        return Err(PyError::value_error("embedded null character"));
+    }
+    Ok(s)
+}
+
+/// baseobjspace.py:1819 charbuf_w — a read-only character buffer as raw bytes.
+pub fn charbuf_w(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
+    if unsafe { !pyre_object::bytesobject::is_bytes_like(obj) } {
+        return Err(PyError::type_error("expected a readable buffer"));
+    }
+    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(obj) })
 }
 
 /// Look up a descriptor on an object's type.
@@ -3191,11 +3487,15 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     }
 }
 
-/// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`.
+/// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`,
+/// returning the MRO class that defines `key` together with the found descriptor.
 /// NOTE: PyPy's elidable wrapper (_pure_lookup_where_with_method_cache) takes
 /// a version_tag argument to invalidate on type mutation. Until pyre has
 /// version tags, this raw lookup must NOT be marked elidable.
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub(crate) unsafe fn lookup_where(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
@@ -3217,12 +3517,18 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
             let ns = &*ns_ptr;
             if let Some(&value) = ns.get(name) {
                 if !value.is_null() {
-                    return Some(value);
+                    return Some((*cls, value));
                 }
             }
         }
     }
     None
+}
+
+/// `lookup_in_type` / `lookup_in_type_where` descriptor-only projection of
+/// [`lookup_where`], for the callers that do not need the defining class.
+pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
 /// Determine what `self` value to bind for a super-resolved attribute.
@@ -3825,6 +4131,21 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
                 return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
                     .map(|_| w_none());
             }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // descroperation.py:247 looks up __setattr__ on the receiver
+            // type regardless of receiver kind.  Non-instance receivers
+            // (e.g. structseq tuple subclasses) may install a non-default
+            // __setattr__; only a real override (≠ object.__setattr__)
+            // needs invoking — the default terminal path is object_setattr.
+            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__setattr__")
+                    .is_some_and(|d| std::ptr::eq(sa, d));
+                if !is_default {
+                    let w_name = w_str_new(name);
+                    return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
+                        .map(|_| w_none());
+                }
+            }
         }
     }
     object_setattr(obj, name, value)
@@ -4091,6 +4412,36 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         | pyre_object::excobject::ExcKind::UnicodeEncodeError
                 ) {
                     unsafe { pyre_object::excobject::w_exception_set_encoding(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            // `interp_exceptions.py:739-742` —
+            // `readwrite_attrproperty_w('w_errno' / 'w_strerror' /
+            // 'w_filename' / 'w_filename2', W_OSError)`.  The
+            // `attrproperty_w` writer stores the raw `w_value` into the
+            // slot; the matching getattr arm reads it back ahead of the
+            // `args_w`-derived fallback.  Gated on the OSError family
+            // (OSError / FileNotFoundError) because PyPy installs these
+            // descriptors only on `W_OSError.typedef`.
+            "errno" | "strerror" | "filename" | "filename2" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    unsafe {
+                        match name {
+                            "errno" => pyre_object::excobject::w_exception_set_errno(obj, value),
+                            "strerror" => {
+                                pyre_object::excobject::w_exception_set_strerror(obj, value)
+                            }
+                            "filename" => {
+                                pyre_object::excobject::w_exception_set_filename(obj, value)
+                            }
+                            _ => pyre_object::excobject::w_exception_set_filename2(obj, value),
+                        }
+                    };
                     return Ok(w_none());
                 }
             }
@@ -4967,6 +5318,25 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         "__index__ returned non-int (type {})",
         unsafe { (*(*w_result).ob_type).name },
     )))
+}
+
+/// baseobjspace.py:1564 `getindex_w` with `w_exception=None` — apply
+/// `space.index` (`__index__`) then convert to an i64, silently clamping
+/// to `i64::MAX` / `i64::MIN` on overflow rather than raising.
+pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    let w_index = space_index(obj)?;
+    match int_w(w_index) {
+        Ok(index) => Ok(index),
+        Err(e) if e.kind == PyErrorKind::OverflowError => {
+            let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
+            if big.sign() == malachite_bigint::Sign::Minus {
+                Ok(i64::MIN)
+            } else {
+                Ok(i64::MAX)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
