@@ -63,7 +63,12 @@ impl Default for OptEarlyForce {
 impl Optimization for OptEarlyForce {
     /// earlyforce.py:15-29: propagate_forward.
     /// Force all virtual args of non-exempt operations, then emit.
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if Self::should_force_args(op) {
             // earlyforce.py:28: self.optimizer.force_box(arg, self)
             // In Rust, we can't call Optimizer.force_box (borrow conflict).
@@ -71,11 +76,12 @@ impl Optimization for OptEarlyForce {
             // which uses ctx.current_pass_idx (== earlyforce_idx) for
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
-                let arg = ctx.get_box_replacement(op.arg(i).to_opref());
-                let arg_is_virtual = ctx
-                    .get_box_replacement_box(op.arg(i).to_opref())
+                let arg_box = ctx.get_box_replacement_box(op.arg(i).to_opref());
+                let arg = arg_box
                     .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(b));
+                    .map(|b| b.to_opref())
+                    .unwrap_or_else(|| op.arg(i).to_opref());
+                let arg_is_virtual = arg_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
                 if arg_is_virtual {
                     // optimizer.py:345-364: force_box path.
                     // potential_extra_ops are handled by Optimizer.force_box,
@@ -91,7 +97,7 @@ impl Optimization for OptEarlyForce {
                         .get_box_replacement_box(arg)
                         .expect("recorder-populated");
                     let mut info = ctx.take_ptr_info(&arg_box).unwrap();
-                    let _forced = info.force_box(arg, ctx);
+                    let _forced = info.force_box(arg_box, ctx);
                 }
             }
         }

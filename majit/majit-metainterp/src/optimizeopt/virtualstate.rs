@@ -1048,7 +1048,7 @@ impl VirtualState {
                             .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
                             .and_then(|e| e.as_opref())
-                            .map(|f| ctx.get_box_replacement(f))
+                            .map(|f| ctx.get_box_replacement(f).to_opref())
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect();
@@ -1199,7 +1199,7 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_box_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref).to_opref();
                 let forced = match ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
@@ -1227,7 +1227,7 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_box_replacement(forced);
+                let resolved_for_store = ctx.get_box_replacement(forced).to_opref();
                 // virtualstate.py:417 NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -2662,7 +2662,7 @@ fn export_single_value(
     // distinct field-side OpRefs that resolve to the same forwarded box
     // would each receive their own Rc, breaking the dedup invariant
     // `enum_forced_boxes` and RPython matching rely on.
-    let opref = ctx.get_box_replacement(opref);
+    let opref = ctx.get_box_replacement(opref).to_opref();
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
         return Rc::clone(cached);
@@ -3055,9 +3055,7 @@ mod tests {
         let rb0 = ctx.make_constant_ref(GcRef(0x200));
         let rb1 = ctx.make_constant_ref(GcRef(0x300));
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
-        let b0 = ctx
-            .ensure_box(boxes[0])
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b0 = ctx.materialize_box_at(boxes[0]);
         ctx.set_ptr_info(
             &b0,
             crate::optimizeopt::info::PtrInfo::known_class(0x100, false),
@@ -3151,9 +3149,7 @@ mod tests {
         // virtualstate.py:185 requires `info.is_virtual()` for the
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
-        let b11 = ctx
-            .ensure_box(OpRef::ref_op(11))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b11 = ctx.materialize_box_at(OpRef::ref_op(11));
         ctx.set_ptr_info(
             &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3189,9 +3185,7 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(16);
-        let b21 = ctx
-            .ensure_box(OpRef::ref_op(21))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b21 = ctx.materialize_box_at(OpRef::ref_op(21));
         ctx.set_ptr_info(
             &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3248,12 +3242,8 @@ mod tests {
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
-        let outer_a_box = ctx
-            .ensure_box(outer_a_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let outer_b_box = ctx
-            .ensure_box(outer_b_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let outer_a_box = ctx.materialize_box_at(outer_a_ref);
+        let outer_b_box = ctx.materialize_box_at(outer_b_ref);
         ctx.set_ptr_info(
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3324,9 +3314,7 @@ mod tests {
             field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
-        let virtual_box = ctx
-            .ensure_box(virtual_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let virtual_box = ctx.materialize_box_at(virtual_ref);
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3385,9 +3373,7 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let virtual_box = ctx
-            .ensure_box(virtual_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let virtual_box = ctx.materialize_box_at(virtual_ref);
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3413,7 +3399,10 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(inputargs[0], ctx.get_box_replacement(virtual_ref));
+        assert_eq!(
+            inputargs[0],
+            ctx.get_box_replacement(virtual_ref).to_opref()
+        );
         assert!(virtuals.is_empty());
     }
 }

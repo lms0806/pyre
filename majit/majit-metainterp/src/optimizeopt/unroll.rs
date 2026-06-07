@@ -1171,14 +1171,14 @@ impl UnrollOptimizer {
                     // dispatcher, matching optimizer.py:306-319.
                     let resolved_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
                         .collect();
                     for &arg in &resolved_jump_args {
                         let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
                         .collect();
                     let current_vs = crate::optimizeopt::virtualstate::export_state(
                         &forced_jump_args,
@@ -1257,7 +1257,7 @@ impl UnrollOptimizer {
                                 continue;
                             }
                             visited_force.insert(arg);
-                            let resolved = final_ctx.get_box_replacement(arg);
+                            let resolved = final_ctx.get_box_replacement(arg).to_opref();
                             let needs_force = final_ctx
                                 .potential_extra_ops
                                 .iter()
@@ -1809,7 +1809,9 @@ impl UnrollOptimizer {
     /// unroll.py: _check_no_forwarding(lsts)
     /// Debug assertion: verify no OpRef in the lists has been forwarded.
     pub fn check_no_forwarding(ctx: &crate::optimizeopt::OptContext, oprefs: &[OpRef]) -> bool {
-        oprefs.iter().all(|&r| ctx.get_box_replacement(r) == r)
+        oprefs
+            .iter()
+            .all(|&r| ctx.get_box_replacement(r).to_opref() == r)
     }
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
@@ -1928,7 +1930,7 @@ pub struct ExportedState {
     pub patchguardop: Option<majit_ir::Op>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
-    /// forwarded away. `reserve_pos_typed` skips `ensure_box` on the
+    /// forwarded away. `reserve_pos_typed` skips `materialize_box_at` on the
     /// zero-inputarg / retrace baselines (`optimizeopt/mod.rs:2026`),
     /// so capturing `ctx.next_pos` at export is the only reliable
     /// floor. Phase 2 / retrace seed their TraceIterator namespace
@@ -2822,7 +2824,7 @@ impl OptUnroll {
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
             original_label_args
                 .iter()
-                .map(|&a| ctx.get_box_replacement(a))
+                .map(|&a| ctx.get_box_replacement(a).to_opref())
                 .collect()
         });
         // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`
@@ -2901,7 +2903,7 @@ impl OptUnroll {
         // unroll.py:458 `end_args = [get_box_replacement(arg) for arg in end_args]`.
         let resolved_next_iteration_args: Vec<OpRef> = end_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a))
+            .map(|&a| ctx.get_box_replacement(a).to_opref())
             .collect();
         // Phase B B1: `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
@@ -2921,7 +2923,7 @@ impl OptUnroll {
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
-        // `reserve_pos_typed` skips `ensure_box` on the zero-inputarg /
+        // `reserve_pos_typed` skips `materialize_box_at` on the zero-inputarg /
         // retrace baselines (`optimizeopt/mod.rs:2026`), so capturing
         // `ctx.next_pos` at export is the only reliable floor for
         // `opref_high_water()` to feed retrace's `start_fresh`.
@@ -2958,7 +2960,7 @@ impl OptUnroll {
                 }
                 // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
                 // to the same `InputArgRc` as `inputarg_refs[idx]` after
-                // `ensure_inputarg_bindings` / `ensure_box`'s InputArg
+                // `ensure_inputarg_bindings` / `materialize_box_at`'s InputArg
                 // placeholder arm have run (both write the canonical
                 // `InputArgRc` matching the OpRef's type). Drop the
                 // box_pool fallback — fall through to a fresh `InputArg`
@@ -3025,7 +3027,7 @@ impl OptUnroll {
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
-        let resolved = ctx.get_box_replacement(arg);
+        let resolved = ctx.get_box_replacement(arg).to_opref();
         if infos.contains_key(&resolved) {
             // Also store under the original key so import_state can
             // find the info using the unresolved next_iteration_args key.
@@ -3212,7 +3214,7 @@ impl OptUnroll {
             .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
         let mut args: Vec<OpRef> = jump_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a))
+            .map(|&a| ctx.get_box_replacement(a).to_opref())
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
@@ -3343,7 +3345,7 @@ impl OptUnroll {
                     if force_boxes {
                         args = jump_args
                             .iter()
-                            .map(|&a| ctx.get_box_replacement(a))
+                            .map(|&a| ctx.get_box_replacement(a).to_opref())
                             .collect();
                         virtual_state = crate::optimizeopt::virtualstate::export_state(&args, ctx);
                     }
@@ -3691,7 +3693,7 @@ impl OptUnroll {
                         } else {
                             *mapping.get(jump_arg).expect("mapping missing jump_arg")
                         };
-                        ctx.get_box_replacement(mapped)
+                        ctx.get_box_replacement(mapped).to_opref()
                     })
                     .collect();
                 // unroll.py:419-421
@@ -3715,7 +3717,7 @@ impl OptUnroll {
             .iter()
             .map(|&jump_arg| {
                 let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
-                ctx.get_box_replacement(mapped)
+                ctx.get_box_replacement(mapped).to_opref()
             })
             .collect()
     }
@@ -3778,12 +3780,14 @@ impl OptUnroll {
             // makes this hold by construction in production callers.
             debug_assert!(source != *target, "import_state: source is target");
             // source.set_forwarded(target)
+            // `source` is `targetargs[i]`, produced by the caller's
+            // cross-slot resolution as either a materialized inputarg or a
+            // `reserve_virtual_box`-minted alias — both resolve without
+            // minting here.
             let b_source = ctx
-                .ensure_box(source)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_target = ctx
-                .ensure_box(*target)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+                .get_box_replacement_box(source)
+                .expect("import_state source must have a materialized BoxRef slot");
+            let b_target = ctx.get_box_replacement(*target);
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -3979,7 +3983,7 @@ impl OptUnroll {
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
-        let resolved = ctx.get_box_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref).to_opref();
         // unroll.py:432-443 `_expand_info` calls `self.optimizer.getinfo(arg)`
         // which itself runs `get_box_replacement` first, so a non-constant
         // OpRef forwarded to a Const surfaces the corresponding constant
@@ -4527,11 +4531,9 @@ fn assemble_peeled_trace_with_jump_args(
                 // Label carries the forwarded Box, but first fall-through
                 // only has the preamble source; pyre's flat OpRef model
                 // needs an explicit SameAs bridge before the Label.
-                if let Some(source) = preamble_defs
-                    .iter()
-                    .copied()
-                    .find(|&source| source != arg && ctx.get_box_replacement(source) == arg)
-                {
+                if let Some(source) = preamble_defs.iter().copied().find(|&source| {
+                    source != arg && ctx.get_box_replacement(source).to_opref() == arg
+                }) {
                     let tp = ctx
                         .opref_type(arg)
                         .or_else(|| ctx.opref_type(source))
@@ -4652,12 +4654,8 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                let b_js = ctx
-                    .ensure_box(jump_source)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_ela = ctx
-                    .ensure_box(extended_label_arg)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_js = ctx.materialize_box_at(jump_source);
+                let b_ela = ctx.get_box_replacement(extended_label_arg);
                 ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
@@ -5223,7 +5221,12 @@ impl Default for OptUnroll {
 }
 
 impl Optimization for OptUnroll {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // Only peel once per trace, and only for Jump (back-edge).
         if op.opcode == OpCode::Jump && !self.seen_jump {
             self.seen_jump = true;
@@ -6244,10 +6247,10 @@ mod tests {
         // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
-        let imported_bound = ctx2
-            .ensure_box(OpRef::int_op(21))
-            .map(|b| ctx2.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let imported_bound = {
+            let __mb = ctx2.materialize_box_at(OpRef::int_op(21));
+            ctx2.getintbound_handle(&__mb).borrow().clone()
+        };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
 
@@ -6620,12 +6623,8 @@ mod tests {
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        let b_src = ctx
-            .ensure_box(OpRef::ref_op(19))
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let b_tgt = ctx
-            .ensure_box(OpRef::ref_op(14))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
+        let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
         ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::ref_op(19),

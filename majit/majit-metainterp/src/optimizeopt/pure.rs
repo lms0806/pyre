@@ -310,6 +310,12 @@ pub struct OptPure {
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
     postponed_op: Option<Op>,
+    /// Bound `BoxRef` of `postponed_op`, captured from the live `OpRc` at
+    /// postponement. The OVF op is `Remove`d before emit, so its head box
+    /// is never bound by the emit path; capturing it here (where the op
+    /// object is live) gives `make_equal_to` a bound receiver without an
+    /// `materialize_box_at` round-trip through the opref.
+    postponed_box: Option<crate::r#box::BoxRef>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -358,6 +364,7 @@ impl OptPure {
         OptPure {
             cache: RecentPureOpTable::new(crate::jit::PARAMETERS.pureop_historylength as usize),
             postponed_op: None,
+            postponed_box: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
@@ -783,13 +790,20 @@ impl Default for OptPure {
 
 impl OptPure {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref);
+        // Single resolve through the BoxRef terminal; the OpRef view is the
+        // terminal's `to_opref()` (keystone equivalence, #113), so the prior
+        // paired `get_box_replacement` + `get_box_replacement_box` of the
+        // same `opref` was a redundant double walk.
         let resolved_box = ctx.get_box_replacement_box(opref);
+        let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-            let forced = info.force_box(resolved, ctx);
-            return ctx.get_box_replacement(forced);
+            let forced = info.force_box(resolved_box, ctx);
+            return ctx
+                .get_box_replacement_box(forced)
+                .map(|b| b.to_opref())
+                .unwrap_or(forced);
         }
         resolved
     }
@@ -828,7 +842,12 @@ impl Optimization for OptPure {
         self.cache = RecentPureOpTable::new(limit);
     }
 
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
         // and virtualize pass (ARRAYLEN_GC with array descr keying per
@@ -855,11 +874,16 @@ impl Optimization for OptPure {
         // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
         if op.opcode.is_ovf() {
             self.postponed_op = Some(op.clone());
+            self.postponed_box = Some(BoxRef::from_bound_op(op_rc));
             return OptimizationResult::Remove;
         }
 
         // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
         if let Some(mut postponed) = self.postponed_op.take() {
+            let postponed_box = self
+                .postponed_box
+                .take()
+                .expect("postponed_box is set whenever postponed_op is set");
             if op.opcode == OpCode::GuardNoOverflow {
                 // pure.py:126-136 — only call `constant_fold` when every
                 // arg has resolved to a `Const*` via `get_constant_box`
@@ -885,12 +909,8 @@ impl Optimization for OptPure {
                 // pure.py:50-55: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    let b_old = ctx
-                        .ensure_box(postponed.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
-                    let b_cached = ctx
-                        .ensure_box(cached_ref)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = postponed_box.clone();
+                    let b_cached = ctx.get_box_replacement(cached_ref);
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -903,13 +923,8 @@ impl Optimization for OptPure {
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
-                        let b_old = ctx
-                            .ensure_box(postponed.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
-                        let b_cached = ctx
-                            .get_box_replacement_box(cached_ref)
-                            .or_else(|| ctx.ensure_box(cached_ref))
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = postponed_box.clone();
+                        let b_cached = ctx.get_box_replacement(cached_ref);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
@@ -1049,12 +1064,8 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_cached = ctx
-                    .ensure_box(cached_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1064,13 +1075,8 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_cached = ctx
-                    .get_box_replacement_box(cached_ref)
-                    .or_else(|| ctx.ensure_box(cached_ref))
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1115,13 +1121,8 @@ impl Optimization for OptPure {
                         ctx,
                     ) {
                         let cached_src = old_op.pos.get();
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
-                        let b_cached = ctx
-                            .get_box_replacement_box(cached_src)
-                            .or_else(|| ctx.ensure_box(cached_src))
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                        let b_cached = ctx.get_box_replacement(cached_src);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
@@ -1177,26 +1178,16 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_cached = ctx
-                    .get_box_replacement_box(entry_result)
-                    .or_else(|| ctx.ensure_box(entry_result))
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_cached = ctx.get_box_replacement(entry_result);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_result = ctx
-                    .get_box_replacement_box(result_ref)
-                    .or_else(|| ctx.ensure_box(result_ref))
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_result = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1225,6 +1216,7 @@ impl Optimization for OptPure {
         let limit = self.cache.history_length();
         self.cache = RecentPureOpTable::new(limit);
         self.postponed_op = None;
+        self.postponed_box = None;
         self.call_pure_positions.clear();
         self.short_preamble_pure_ops.clear();
         self.last_emitted_was_removed = false;
@@ -1714,6 +1706,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure {
             cache: RecentPureOpTable::new(16),
             postponed_op: None,
+            postponed_box: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
@@ -1746,7 +1739,7 @@ mod tests {
         );
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
-        let result0 = pass.propagate_forward(&op0, &mut ctx);
+        let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
@@ -1759,7 +1752,7 @@ mod tests {
         );
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
-        let result1 = pass.propagate_forward(&op1, &mut ctx);
+        let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
 
@@ -2267,7 +2260,7 @@ mod tests {
         pass.setup();
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(0))
@@ -2299,7 +2292,7 @@ mod tests {
         pass.setup();
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::float_op(0))
@@ -2336,7 +2329,7 @@ mod tests {
             ctx.constant_fold(&op),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::ref_op(0))
@@ -2471,12 +2464,8 @@ mod tests {
         let canonical_arg = OpRef::int_op(8);
         let other_arg = OpRef::int_op(9);
         let result = OpRef::int_op(42);
-        let b_query = ctx
-            .ensure_box(query_arg)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let b_canonical = ctx
-            .ensure_box(canonical_arg)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_query = ctx.materialize_box_at(query_arg);
+        let b_canonical = ctx.get_box_replacement(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
@@ -2707,9 +2696,19 @@ mod tests {
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
-        let result = pass.propagate_forward(&op, &mut ctx);
+        // Register the dispatched op as the producer at its position so the
+        // collapsed `from_bound_op(op_rc)` resolves to the same box the test
+        // reads back via `get_box_replacement_box(pos)` (mirrors production
+        // input-op binding).
+        let op_rc = std::rc::Rc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .map(|b| b.to_opref()),
+            Some(OpRef::int_op(1))
+        );
     }
 
     #[test]
@@ -2726,7 +2725,7 @@ mod tests {
             ],
         );
         op.pos.set(OpRef::int_op(2));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
@@ -2771,7 +2770,7 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         ));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             other => panic!("expected emitted demoted call, got {other:?}"),
@@ -2820,14 +2819,15 @@ mod tests {
             ),
         ));
         // OptRewrite demotes CallLoopinvariantI → CallI
-        let rewrite_result = rewrite.propagate_forward(&op, &mut ctx);
+        let rewrite_result =
+            rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         let demoted = match rewrite_result {
             OptimizationResult::Emit(emitted) => emitted,
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
         };
         assert_eq!(demoted.opcode, OpCode::CallI);
         // OptPure sees the demoted CallI
-        let result = pass.propagate_forward(&demoted, &mut ctx);
+        let result = pass.propagate_forward(&demoted, &std::rc::Rc::new(demoted.clone()), &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             OptimizationResult::PassOn => {} // PassOn is also acceptable
