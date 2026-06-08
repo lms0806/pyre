@@ -20,11 +20,11 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let cls = args[0];
     let subclass = args[1];
-    let registry = match crate::baseobjspace::getattr(cls, "_abc_registry") {
+    let registry = match crate::baseobjspace::getattr_str(cls, "_abc_registry") {
         Ok(r) if !unsafe { is_none(r) } => r,
         _ => {
             let fresh = w_list_new(vec![]);
-            crate::baseobjspace::setattr(cls, "_abc_registry", fresh)?;
+            crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
             fresh
         }
     };
@@ -55,7 +55,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> bool {
             }
         }
     }
-    if let Ok(registry) = crate::baseobjspace::getattr(cls, "_abc_registry") {
+    if let Ok(registry) = crate::baseobjspace::getattr_str(cls, "_abc_registry") {
         if !registry.is_null() && unsafe { is_list(registry) } {
             unsafe {
                 let n = w_list_len(registry);

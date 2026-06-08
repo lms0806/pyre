@@ -752,13 +752,13 @@ pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef)
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
 pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
-    crate::baseobjspace::getattr(obj, "__dict__").unwrap_or(pyre_object::w_none())
+    crate::baseobjspace::getattr_str(obj, "__dict__").unwrap_or(pyre_object::w_none())
 }
 
 /// PyPy-compatible `__dict__` mutator.
 #[inline]
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) {
-    let _ = crate::baseobjspace::setattr(obj, "__dict__", value);
+    let _ = crate::baseobjspace::setattr_str(obj, "__dict__", value);
 }
 
 /// PyPy-compatible `getdict()` descriptor helper.

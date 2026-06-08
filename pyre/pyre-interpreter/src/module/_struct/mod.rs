@@ -227,7 +227,7 @@ crate::py_module! {
         "Struct" / 1 = |args| {
             let fmt = args.first().copied().unwrap_or(w_str_new(""));
             let obj = w_instance_new(crate::typedef::w_object());
-            let _ = crate::baseobjspace::setattr(obj, "format", fmt);
+            let _ = crate::baseobjspace::setattr_str(obj, "format", fmt);
             Ok(obj)
         },
     },

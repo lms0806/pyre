@@ -47,7 +47,7 @@ fn faulthandler_extract_fd(w_file: pyre_object::PyObjectRef) -> Result<i32, crat
         }
         return Ok(fd);
     }
-    let method = crate::baseobjspace::getattr(w_file, "fileno")?;
+    let method = crate::baseobjspace::getattr_str(w_file, "fileno")?;
     let res = crate::call_function(method, &[]);
     if res.is_null() || !unsafe { pyre_object::is_int(res) } {
         return Err(crate::PyError::type_error("fileno() returned non-integer"));

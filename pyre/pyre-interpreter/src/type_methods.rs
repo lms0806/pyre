@@ -1112,7 +1112,7 @@ fn resolve_format_lookups(w_obj: PyObjectRef, rest: &str) -> Result<PyObjectRef,
                     "Empty attribute in format string".to_string(),
                 ));
             }
-            w_obj = crate::baseobjspace::getattr(w_obj, &rest[start..i])?;
+            w_obj = crate::baseobjspace::getattr_str(w_obj, &rest[start..i])?;
         } else if c == b'[' {
             i += 1;
             let start = i;
@@ -3095,7 +3095,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             }
         }
         if is_instance(obj) {
-            if let Ok(backing) = crate::baseobjspace::getattr(obj, "__dict_data__") {
+            if let Ok(backing) = crate::baseobjspace::getattr_str(obj, "__dict_data__") {
                 if is_dict(backing) {
                     return backing;
                 }
@@ -3280,7 +3280,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
             }
         } else {
             // `dictmultiobject.py:1388-1398 update1`
-            let w_keys_method = match crate::baseobjspace::getattr(w_data, "keys") {
+            let w_keys_method = match crate::baseobjspace::getattr_str(w_data, "keys") {
                 Ok(value) => Some(value),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
                 Err(e) => return Err(e),

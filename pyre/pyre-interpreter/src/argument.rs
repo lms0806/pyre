@@ -483,7 +483,7 @@ pub fn combine_starstarargs_wrapped(
         // `space.call_method(w_starstararg, "keys")`, so an
         // AttributeError raised either while finding `keys` OR inside
         // the keys() call is converted to the mapping TypeError below.
-        let w_keys_meth = match crate::baseobjspace::getattr(w_starstararg, "keys") {
+        let w_keys_meth = match crate::baseobjspace::getattr_str(w_starstararg, "keys") {
             Ok(m) => m,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 let tp = type_name_of(w_starstararg);

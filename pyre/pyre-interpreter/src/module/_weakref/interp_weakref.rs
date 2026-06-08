@@ -41,7 +41,7 @@ const ATTR_W_HASH: &str = "w_hash";
 
 /// Read a per-instance slot from the underlying `INSTANCE_DICT` directly,
 /// bypassing the public `getattr` path. The proxy fast-path in
-/// `baseobjspace::getattr` would otherwise force the receiver and recurse
+/// `baseobjspace::getattr_str` would otherwise force the receiver and recurse
 /// indefinitely while the proxy is reading its OWN `w_obj_weak`/etc.
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     let w_dict = crate::baseobjspace::getdict(obj);
@@ -999,7 +999,7 @@ fn forward_to_dunder(
     methname: &str,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    let method = crate::baseobjspace::getattr(w_obj, methname)?;
+    let method = crate::baseobjspace::getattr_str(w_obj, methname)?;
     crate::call::call_function_impl_result(method, args)
 }
 
@@ -1172,19 +1172,19 @@ pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pub fn proxy_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::getattr(w_obj0, name)
+    crate::baseobjspace::getattr_str(w_obj0, name)
 }
 
 pub fn proxy_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::setattr(w_obj0, name, args[2])
+    crate::baseobjspace::setattr_str(w_obj0, name, args[2])
 }
 
 pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-    crate::baseobjspace::delattr(w_obj0, name)
+    crate::baseobjspace::delattr_str(w_obj0, name)
 }
 
 // Item ops — interp__weakref.py:365 single special method, so
@@ -1739,10 +1739,10 @@ mod tests {
         let user_type = crate::typedef::make_builtin_type("ProxyTarget", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
         let referent = pyre_object::instanceobject::w_instance_new(user_type);
-        crate::baseobjspace::setattr(referent, "x", pyre_object::w_int_new(7)).unwrap();
+        crate::baseobjspace::setattr_str(referent, "x", pyre_object::w_int_new(7)).unwrap();
 
         let proxy = W_Proxy_new(referent, PY_NULL);
-        let result = crate::baseobjspace::getattr(proxy, "x").unwrap();
+        let result = crate::baseobjspace::getattr_str(proxy, "x").unwrap();
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7);
     }
 
@@ -1755,11 +1755,11 @@ mod tests {
         let referent = pyre_object::instanceobject::w_instance_new(user_type);
 
         let proxy = W_Proxy_new(referent, PY_NULL);
-        crate::baseobjspace::setattr(proxy, "y", pyre_object::w_int_new(11)).unwrap();
+        crate::baseobjspace::setattr_str(proxy, "y", pyre_object::w_int_new(11)).unwrap();
 
         // Read back via the referent directly to confirm the write
         // landed there, not on the proxy itself.
-        let result = crate::baseobjspace::getattr(referent, "y").unwrap();
+        let result = crate::baseobjspace::getattr_str(referent, "y").unwrap();
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 11);
     }
 

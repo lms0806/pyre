@@ -237,7 +237,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
 pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
-    match crate::getattr(obj as PyObjectRef, name) {
+    match crate::getattr_str(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
         Err(err) => panic!("getattr failed in JIT: {err}"),
     }
@@ -247,7 +247,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
 pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
-    match crate::setattr(obj as PyObjectRef, name, value as PyObjectRef) {
+    match crate::setattr_str(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
         Err(err) => panic!("setattr failed in JIT: {err}"),
     }

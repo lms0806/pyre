@@ -14,8 +14,8 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 unsafe fn memoryview_data(
     mv: PyObjectRef,
 ) -> Result<(Vec<u8>, usize, PyObjectRef), crate::PyError> {
-    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
-    let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+    let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
+    let itemsize_obj = crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
     let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
     let data = if pyre_object::bytesobject::is_bytes_like(buf) {
         pyre_object::bytesobject::bytes_like_data(buf).to_vec()
@@ -64,14 +64,18 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             }
             let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
             let inst = pyre_object::w_instance_new(cls);
-            let fmt = crate::baseobjspace::getattr(mv, "__pyre_fmt__")?;
-            crate::baseobjspace::setattr(
+            let fmt = crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")?;
+            crate::baseobjspace::setattr_str(
                 inst,
                 "__pyre_buf__",
                 pyre_object::bytesobject::w_bytes_from_bytes(&out),
             )?;
-            crate::baseobjspace::setattr(inst, "__pyre_fmt__", fmt)?;
-            crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(itemsize as i64))?;
+            crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", fmt)?;
+            crate::baseobjspace::setattr_str(
+                inst,
+                "__pyre_itemsize__",
+                w_int_new(itemsize as i64),
+            )?;
             return Ok(inst);
         }
         Err(crate::PyError::type_error(
@@ -87,8 +91,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let index = args.get(1).copied().unwrap_or(w_none());
     let value = args.get(2).copied().unwrap_or(w_none());
     unsafe {
-        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
-        let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
+        let itemsize_obj = crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
         let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
         if !pyre_object::bytearrayobject::is_bytearray(buf) {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
@@ -169,7 +173,7 @@ fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
-        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
         Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(
             buf,
         )))
@@ -188,7 +192,7 @@ fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `memoryview.format` — the stored struct format string.
 fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    crate::baseobjspace::getattr(mv, "__pyre_fmt__")
+    crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")
 }
 
 /// `memoryview.ndim` — the stub models only 1-D views.
@@ -389,9 +393,9 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         let cls = args.get(0).copied().unwrap_or(w_none());
                         let buf = args.get(1).copied().unwrap_or(w_none());
                         let inst = pyre_object::w_instance_new(cls);
-                        crate::baseobjspace::setattr(inst, "__pyre_buf__", buf)?;
-                        crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new("B"))?;
-                        crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(1))?;
+                        crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
+                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new("B"))?;
+                        crate::baseobjspace::setattr_str(inst, "__pyre_itemsize__", w_int_new(1))?;
                         Ok(inst)
                     },
                     2,
@@ -416,12 +420,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                             "H" | "h" => 2,
                             _ => 1,
                         };
-                        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
                         let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
                         let inst = pyre_object::w_instance_new(cls);
-                        crate::baseobjspace::setattr(inst, "__pyre_buf__", buf)?;
-                        crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new(fmt))?;
-                        crate::baseobjspace::setattr(
+                        crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
+                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new(fmt))?;
+                        crate::baseobjspace::setattr_str(
                             inst,
                             "__pyre_itemsize__",
                             w_int_new(itemsize),
@@ -438,8 +442,9 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     "tolist",
                     |args| {
                         let mv = args.get(0).copied().unwrap_or(w_none());
-                        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
-                        let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
+                        let itemsize_obj =
+                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
                         let itemsize =
                             unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
                         let data = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
@@ -469,8 +474,9 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     "__len__",
                     |args| {
                         let mv = args.get(0).copied().unwrap_or(w_none());
-                        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
-                        let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
+                        let itemsize_obj =
+                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
                         let itemsize =
                             unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
                         let n = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
@@ -493,7 +499,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         "itemsize",
                         |args| {
                             let mv = args.get(0).copied().unwrap_or(w_none());
-                            crate::baseobjspace::getattr(mv, "__pyre_itemsize__")
+                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")
                         },
                         1,
                     ),
@@ -1482,6 +1488,30 @@ fn type_descr_new_without_metaclass(
     type_descr_new_with_metaclass(args, pyre_object::PY_NULL, kwargs)
 }
 
+/// typeobject.py:141 `_check_surrogate` — a type name may not contain a
+/// lone surrogate.  Scan the code points through the surrogate-aware WTF-8
+/// view (reading the name as `&str` would fail on the surrogate) and raise
+/// `UnicodeEncodeError('utf8', name, pos, pos + 1, 'surrogates not allowed')`
+/// at the first one, matching `check_utf8(name, allow_surrogates=False)`.
+pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    let mut pos = 0usize;
+    for cp in wtf8.code_points() {
+        let c = cp.to_u32();
+        if c >= 0xd800 && c <= 0xdfff {
+            return Err(crate::typedef::unicode_encode_error(
+                "utf8",
+                w_name,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ));
+        }
+        pos += 1;
+    }
+    Ok(())
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -1496,6 +1526,11 @@ fn type_descr_new_with_metaclass(
         let name_obj = args[0];
         let bases = args[1];
         let w_namespace_dict = args[2];
+        // typeobject.py:953 `_check_surrogate(space, name)` — reject a lone
+        // surrogate in the name before it is read as UTF-8 below.
+        if unsafe { pyre_object::is_str(name_obj) } {
+            check_surrogate(name_obj)?;
+        }
         let name = unsafe { pyre_object::w_str_get_value(name_obj) };
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
@@ -1639,7 +1674,7 @@ fn type_descr_new_with_metaclass(
             let entries = unsafe { pyre_object::w_dict_items(w_ns_backing) };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
-                    if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
+                    if let Ok(set_name) = crate::baseobjspace::getattr_str(v, "__set_name__") {
                         // getattr returns a bound method, so self is already bound.
                         // Call: bound_set_name(owner, name); propagate a raise.
                         call_and_check(set_name, &[w_type, k])?;
@@ -2270,7 +2305,7 @@ fn make_exc_type_with_init(
                 // The list lives in ATTR_TABLE rather than a typed
                 // W_ExceptionObject slot — notes are a rare attribute,
                 // and the per-instance side store already handles
-                // `e.__notes__` reads via baseobjspace::getattr.
+                // `e.__notes__` reads via baseobjspace::getattr_str.
                 crate::dict_storage_store(
                     ns,
                     "add_note",
@@ -2297,7 +2332,7 @@ fn make_exc_type_with_init(
                             // attribute is already set but NOT a list,
                             // PyPy raises TypeError("Cannot add note:
                             // __notes__ is not a list") per `:254`.
-                            let existing = crate::baseobjspace::getattr(w_self, "__notes__")
+                            let existing = crate::baseobjspace::getattr_str(w_self, "__notes__")
                                 .ok()
                                 .filter(|w| !w.is_null());
                             let notes = match existing {
@@ -2309,8 +2344,11 @@ fn make_exc_type_with_init(
                                 }
                                 None => {
                                     let fresh = pyre_object::w_list_new(Vec::new());
-                                    let _ =
-                                        crate::baseobjspace::setattr(w_self, "__notes__", fresh);
+                                    let _ = crate::baseobjspace::setattr_str(
+                                        w_self,
+                                        "__notes__",
+                                        fresh,
+                                    );
                                     fresh
                                 }
                             };
@@ -2807,16 +2845,16 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "hasattr() takes exactly two arguments");
     let obj = args[0];
-    let name = unsafe { w_str_get_value(args[1]) };
-    Ok(w_bool_from(crate::baseobjspace::getattr(obj, name).is_ok()))
+    Ok(w_bool_from(
+        crate::baseobjspace::getattr(obj, args[1]).is_ok(),
+    ))
 }
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "getattr() takes at least two arguments");
     let obj = args[0];
-    let name = unsafe { w_str_get_value(args[1]) };
-    match crate::baseobjspace::getattr(obj, name) {
+    match crate::baseobjspace::getattr(obj, args[1]) {
         Ok(val) => Ok(val),
         Err(e) => {
             if args.len() > 2 {
@@ -2843,8 +2881,7 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 3, "setattr() takes exactly three arguments");
     let obj = args[0];
-    let name = unsafe { w_str_get_value(args[1]) };
-    crate::baseobjspace::setattr(obj, name, args[2])?;
+    crate::baseobjspace::setattr(obj, args[1], args[2])?;
     Ok(w_none())
 }
 
@@ -2852,8 +2889,7 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "delattr() takes exactly 2 arguments");
     let obj = args[0];
-    let name = unsafe { w_str_get_value(args[1]) };
-    crate::baseobjspace::delattr(obj, name)?;
+    crate::baseobjspace::delattr(obj, args[1])?;
     Ok(w_none())
 }
 
@@ -2943,7 +2979,7 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     //
     // Mapping protocol: if arg has `keys()`, iterate keys and use __getitem__.
     // This handles dict subclasses (e.g. enum.EnumDict) where is_dict() is false.
-    if let Ok(keys_method) = crate::baseobjspace::getattr(src, "keys") {
+    if let Ok(keys_method) = crate::baseobjspace::getattr_str(src, "keys") {
         let dict = w_dict_new();
         let keys_obj = crate::call_function(keys_method, &[]);
         let keys = collect_iterable(keys_obj)?;
@@ -3559,7 +3595,7 @@ fn exec_or_eval(
         // dict-subclass `setdefault` overrides fire.
         if !w_globals_obj.is_null() {
             let key = pyre_object::w_str_new("__builtins__");
-            let setdefault = crate::baseobjspace::getattr(w_globals_obj, "setdefault")?;
+            let setdefault = crate::baseobjspace::getattr_str(w_globals_obj, "setdefault")?;
             crate::call_and_check(setdefault, &[key, w_builtin])?;
             return Ok(());
         }
@@ -3875,7 +3911,7 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "vars() argument must have __dict__ attribute",
         ));
     }
-    let dict = crate::baseobjspace::getattr(obj, "__dict__")
+    let dict = crate::baseobjspace::getattr_str(obj, "__dict__")
         .map_err(|_| crate::PyError::type_error("vars() argument must have __dict__ attribute"))?;
     if dict.is_null() || unsafe { pyre_object::is_none(dict) } {
         return Err(crate::PyError::type_error(
@@ -5069,7 +5105,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         "seek",
         make_builtin_function("seek", |args| {
             if args.len() >= 2 {
-                let _ = crate::baseobjspace::setattr(args[0], "__file_pos__", args[1]);
+                let _ = crate::baseobjspace::setattr_str(args[0], "__file_pos__", args[1]);
             }
             Ok(w_none())
         }),
@@ -5080,7 +5116,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "tell",
             |args| {
-                if let Ok(pos) = crate::baseobjspace::getattr(args[0], "__file_pos__") {
+                if let Ok(pos) = crate::baseobjspace::getattr_str(args[0], "__file_pos__") {
                     Ok(pos)
                 } else {
                     Ok(w_int_new(0))
@@ -5092,7 +5128,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
 }
 
 fn file_get_data(self_obj: PyObjectRef) -> String {
-    crate::baseobjspace::getattr(self_obj, "__file_data__")
+    crate::baseobjspace::getattr_str(self_obj, "__file_data__")
         .ok()
         .and_then(|d| unsafe {
             if pyre_object::is_str(d) {
@@ -5105,7 +5141,7 @@ fn file_get_data(self_obj: PyObjectRef) -> String {
 }
 
 fn file_get_pos(self_obj: PyObjectRef) -> usize {
-    crate::baseobjspace::getattr(self_obj, "__file_pos__")
+    crate::baseobjspace::getattr_str(self_obj, "__file_pos__")
         .ok()
         .and_then(|p| unsafe {
             if pyre_object::is_int(p) {
@@ -5118,7 +5154,7 @@ fn file_get_pos(self_obj: PyObjectRef) -> usize {
 }
 
 fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
-    let _ = crate::baseobjspace::setattr(self_obj, "__file_pos__", w_int_new(pos as i64));
+    let _ = crate::baseobjspace::setattr_str(self_obj, "__file_pos__", w_int_new(pos as i64));
 }
 
 fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5194,8 +5230,8 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         };
         let new_data = format!("{prev}{s}");
         let len = s.len();
-        let _ = crate::baseobjspace::setattr(args[0], "__file_data__", w_str_new(&new_data));
-        let _ = crate::baseobjspace::setattr(args[0], "__file_dirty__", w_bool_from(true));
+        let _ = crate::baseobjspace::setattr_str(args[0], "__file_data__", w_str_new(&new_data));
+        let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
         Ok(w_int_new(len as i64))
     }
 }
@@ -5206,14 +5242,14 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     // If the file was opened in a writable mode, flush the in-memory
     // buffer to disk.
-    let dirty = crate::baseobjspace::getattr(args[0], "__file_dirty__")
+    let dirty = crate::baseobjspace::getattr_str(args[0], "__file_dirty__")
         .ok()
         .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
         .unwrap_or(false);
     if dirty {
         if let (Ok(name), Ok(mode)) = (
-            crate::baseobjspace::getattr(args[0], "__file_name__"),
-            crate::baseobjspace::getattr(args[0], "__file_mode__"),
+            crate::baseobjspace::getattr_str(args[0], "__file_name__"),
+            crate::baseobjspace::getattr_str(args[0], "__file_mode__"),
         ) {
             let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
             let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
@@ -5234,7 +5270,7 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                     format!("{e}: '{name_s}'"),
                 ));
             }
-            let _ = crate::baseobjspace::setattr(args[0], "__file_dirty__", w_bool_from(false));
+            let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(false));
         }
     }
     Ok(w_none())
@@ -5254,7 +5290,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
             let data = pyre_object::bytesobject::bytes_like_data(path_obj);
             String::from_utf8_lossy(data).into_owned()
-        } else if let Ok(fspath) = crate::baseobjspace::getattr(path_obj, "__fspath__") {
+        } else if let Ok(fspath) = crate::baseobjspace::getattr_str(path_obj, "__fspath__") {
             let result = crate::call_function(fspath, &[path_obj]);
             if !result.is_null() && pyre_object::is_str(result) {
                 pyre_object::w_str_get_value(result).to_string()
@@ -5326,13 +5362,13 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     };
 
     let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-    let _ = crate::baseobjspace::setattr(wrapper, "__file_data__", w_str_new(&data));
-    let _ = crate::baseobjspace::setattr(wrapper, "__file_pos__", w_int_new(0));
-    let _ = crate::baseobjspace::setattr(wrapper, "__file_name__", w_str_new(&path));
-    let _ = crate::baseobjspace::setattr(wrapper, "__file_mode__", w_str_new(&mode));
-    let _ = crate::baseobjspace::setattr(wrapper, "name", w_str_new(&path));
-    let _ = crate::baseobjspace::setattr(wrapper, "mode", w_str_new(&mode));
-    let _ = crate::baseobjspace::setattr(wrapper, "closed", w_bool_from(false));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_data__", w_str_new(&data));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
     Ok(wrapper)
 }
 

@@ -696,7 +696,7 @@ fn patch_typeobject_descriptor_names() {
         let ns = unsafe { &*dict_ptr };
         let entries: Vec<(String, PyObjectRef)> = ns
             .keys()
-            .filter_map(|k| ns.get(k).map(|&v| (k.clone(), v)))
+            .filter_map(|k| ns.get(k).map(|&v| (k.to_string(), v)))
             .collect();
         for (key, value) in entries {
             if value.is_null() {
@@ -1080,7 +1080,7 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // PyPy: allocate W_DictObject with custom type
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
-    let _ = crate::baseobjspace::setattr(instance, "__dict_data__", backing);
+    let _ = crate::baseobjspace::setattr_str(instance, "__dict_data__", backing);
 
     // Initialize from args if provided
     if args.len() > 1 {
@@ -2207,7 +2207,8 @@ fn init_dict_type(ns: &mut DictStorage) {
                         crate::type_methods::dict_store_checked(args[0], args[1], args[2])?;
                     } else if pyre_object::is_instance(args[0]) {
                         // dict subclass — store in __dict_data__ backing dict
-                        if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
+                        if let Ok(backing) =
+                            crate::baseobjspace::getattr_str(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
                                 crate::type_methods::dict_store_checked(backing, args[1], args[2])?;
@@ -2234,7 +2235,8 @@ fn init_dict_type(ns: &mut DictStorage) {
                         return crate::baseobjspace::getitem(args[0], args[1]);
                     }
                     if pyre_object::is_instance(args[0]) {
-                        if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
+                        if let Ok(backing) =
+                            crate::baseobjspace::getattr_str(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
                                 // `dictmultiobject.py:166-170` — on a miss,
@@ -2367,7 +2369,8 @@ fn init_dict_type(ns: &mut DictStorage) {
                         crate::baseobjspace::delitem(args[0], args[1])?;
                     } else if pyre_object::is_instance(args[0]) {
                         // dict subclass — delete from __dict_data__ backing dict
-                        if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
+                        if let Ok(backing) =
+                            crate::baseobjspace::getattr_str(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
                                 crate::baseobjspace::delitem(backing, args[1])?;
@@ -4321,7 +4324,7 @@ fn patch_getset_descriptor_metadata() {
                     let type_qualname = if reqcls.is_null() {
                         "?".to_string()
                     } else {
-                        match crate::baseobjspace::getattr(reqcls, "__qualname__") {
+                        match crate::baseobjspace::getattr_str(reqcls, "__qualname__") {
                             Ok(qn) if pyre_object::is_str(qn) => {
                                 pyre_object::w_str_get_value(qn).to_string()
                             }
@@ -4695,7 +4698,54 @@ fn init_type_type(ns: &mut DictStorage) {
         },
         2,
     );
-    dict_storage_store(ns, "__name__", make_getset_descriptor(name_getter));
+    // typeobject.py:1046 descr_set__name__
+    let name_setter = make_builtin_function_with_arity(
+        "__name__",
+        |args| {
+            let w_type = args[1];
+            let w_value = args[2];
+            // typeobject.py:1048 — only heap types may be renamed.
+            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+                return Err(crate::PyError::type_error(format!(
+                    "can't set {}.__name__",
+                    unsafe { pyre_object::w_type_get_name(w_type) }
+                )));
+            }
+            // typeobject.py:1050 — value must be a str.
+            if !unsafe { pyre_object::is_str(w_value) } {
+                return Err(crate::PyError::type_error(format!(
+                    "can only assign string to {}.__name__, not '{}'",
+                    unsafe { pyre_object::w_type_get_name(w_type) },
+                    unsafe { (*(*w_value).ob_type).name }
+                )));
+            }
+            // typeobject.py:1054 text_w — read through the surrogate-aware
+            // WTF-8 view so a lone surrogate does not panic before the
+            // checks below run.
+            let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
+            // typeobject.py:1055 — reject embedded null characters.
+            for cp in wtf8.code_points() {
+                if cp.to_u32() == 0 {
+                    return Err(crate::PyError::value_error(
+                        "type name must not contain null characters",
+                    ));
+                }
+            }
+            // typeobject.py:1057 _check_surrogate.
+            crate::builtins::check_surrogate(w_value)?;
+            // typeobject.py:1058 `w_type.name = name` — surrogate-free, so
+            // the str view is valid UTF-8.
+            let name = unsafe { pyre_object::w_str_get_value(w_value) };
+            unsafe { pyre_object::w_type_set_name(w_type, name) };
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "__name__",
+        make_getset_property_named(name_getter, name_setter, pyre_object::PY_NULL, "__name__"),
+    );
 
     let bases_getter = make_builtin_function_with_arity(
         "__bases__",
@@ -7155,11 +7205,18 @@ fn init_object_type(ns: &mut DictStorage) {
                 if !unsafe { pyre_object::is_str(args[1]) } {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(args[1]) };
                 // `object.__setattr__` is the terminal implementation
                 // that writes directly to the instance dict, bypassing
                 // any user __setattr__ override.
-                crate::baseobjspace::object_setattr(args[0], name, args[2])
+                let name = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                match name.as_str() {
+                    Ok(s) => crate::baseobjspace::object_setattr(args[0], s, args[2]),
+                    Err(_) => unsafe {
+                        crate::baseobjspace::object_setattr_surrogate(
+                            args[0], args[1], name, args[2],
+                        )
+                    },
+                }
             },
             3,
         ),
@@ -7179,8 +7236,13 @@ fn init_object_type(ns: &mut DictStorage) {
                 if !unsafe { pyre_object::is_str(args[1]) } {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-                crate::baseobjspace::object_delattr(args[0], name)
+                let name = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                match name.as_str() {
+                    Ok(s) => crate::baseobjspace::object_delattr(args[0], s),
+                    Err(_) => unsafe {
+                        crate::baseobjspace::object_delattr_surrogate(args[0], args[1], name)
+                    },
+                }
             },
             2,
         ),
@@ -7200,8 +7262,13 @@ fn init_object_type(ns: &mut DictStorage) {
                 if !unsafe { pyre_object::is_str(args[1]) } {
                     return Err(crate::PyError::type_error("attribute name must be string"));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(args[1]) };
-                crate::baseobjspace::object_getattribute(args[0], name)
+                let name = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                match name.as_str() {
+                    Ok(s) => crate::baseobjspace::object_getattribute(args[0], s),
+                    Err(_) => unsafe {
+                        crate::baseobjspace::object_getattribute_surrogate(args[0], args[1], name)
+                    },
+                }
             },
             2,
         ),

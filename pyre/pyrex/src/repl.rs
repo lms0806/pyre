@@ -192,20 +192,23 @@ fn configure_sys_for_repl(sys_module: pyre_object::PyObjectRef) {
     ensure_sys_prompt(sys_module, "ps1", DEFAULT_PRIMARY_PROMPT);
     ensure_sys_prompt(sys_module, "ps2", DEFAULT_SECONDARY_PROMPT);
 
-    if let Ok(flags) = pyre_interpreter::baseobjspace::getattr(sys_module, "flags") {
-        let _ = pyre_interpreter::baseobjspace::setattr(
+    if let Ok(flags) = pyre_interpreter::baseobjspace::getattr_str(sys_module, "flags") {
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
             flags,
             "interactive",
             pyre_object::w_int_new(1),
         );
-        let _ =
-            pyre_interpreter::baseobjspace::setattr(flags, "inspect", pyre_object::w_int_new(1));
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            flags,
+            "inspect",
+            pyre_object::w_int_new(1),
+        );
     }
 }
 
 fn ensure_sys_prompt(sys_module: pyre_object::PyObjectRef, name: &str, fallback: &str) {
-    if pyre_interpreter::baseobjspace::getattr(sys_module, name).is_err() {
-        let _ = pyre_interpreter::baseobjspace::setattr(
+    if pyre_interpreter::baseobjspace::getattr_str(sys_module, name).is_err() {
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
             sys_module,
             name,
             pyre_object::w_str_new(fallback),
@@ -218,7 +221,7 @@ fn load_prompt(runtime: &ReplRuntime, name: &str, fallback: &str) -> String {
 }
 
 fn read_prompt(sys_module: pyre_object::PyObjectRef, name: &str) -> Option<String> {
-    let prompt = pyre_interpreter::baseobjspace::getattr(sys_module, name).ok()?;
+    let prompt = pyre_interpreter::baseobjspace::getattr_str(sys_module, name).ok()?;
     if prompt.is_null() || unsafe { pyre_object::is_none(prompt) } {
         return None;
     }

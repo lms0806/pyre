@@ -883,7 +883,7 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
             return Ok(String::from_utf8_lossy(data).into_owned());
         }
     }
-    if let Ok(fspath) = crate::baseobjspace::getattr(obj, "__fspath__") {
+    if let Ok(fspath) = crate::baseobjspace::getattr_str(obj, "__fspath__") {
         let result = crate::call_function(fspath, &[obj]);
         if !result.is_null() && unsafe { pyre_object::is_str(result) } {
             return Ok(unsafe { pyre_object::w_str_get_value(result).to_string() });

@@ -8,7 +8,7 @@ use pyre_object::{
     w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8,
     w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
     DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code,
@@ -176,6 +176,30 @@ pub fn register_jit_function_caller(caller: JitFunctionCaller) {
     let _ = JIT_FUNCTION_CALLER.set(caller);
 }
 
+type JitExcRaiser = extern "C" fn(value: i64);
+
+static JIT_EXC_RAISER: OnceLock<JitExcRaiser> = OnceLock::new();
+
+pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
+    let _ = JIT_EXC_RAISER.set(raiser);
+}
+
+/// llmodel.py:194-199 _store_exception: publish `exc_obj` into the
+/// backend's pos_exception/pos_exc_value cells so the residual call's
+/// GuardNoException sees it and side-exits into the handler. Mirrors
+/// `jit_call_user_function_from_frame` (call_jit.rs:362-379). MUST NOT use
+/// a side-channel TLS slot — that path is drained before the guard
+/// machinery runs and would bypass try/except. The call helpers return
+/// garbage on Err; resume data hands control to the except block.
+#[inline]
+fn jit_publish_exception(exc_obj: PyObjectRef) {
+    if exc_obj != PY_NULL {
+        if let Some(raiser) = JIT_EXC_RAISER.get() {
+            raiser(exc_obj as i64);
+        }
+    }
+}
+
 fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     let callable = callable as PyObjectRef;
     unsafe {
@@ -184,7 +208,10 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
         match func(arg_slice) {
             Ok(result) => result as i64,
-            Err(e) => panic!("jit builtin call failed: {e}"),
+            Err(e) => {
+                jit_publish_exception(e.to_exc_object());
+                0 // garbage — GuardNoException will fire
+            }
         }
     }
 }
@@ -205,7 +232,10 @@ fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
         unsafe { std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len()) };
     match crate::call::call_function_impl_result(callable_ref, arg_slice) {
         Ok(result) => result as i64,
-        Err(err) => panic!("jit callable dispatch failed: {err}"),
+        Err(err) => {
+            jit_publish_exception(err.to_exc_object());
+            0 // garbage — GuardNoException will fire
+        }
     }
 }
 
@@ -768,8 +798,18 @@ pub fn dict_storage_store(namespace: &mut DictStorage, name: &str, value: PyObje
     namespace.insert(name.to_string(), value);
 }
 
+/// WTF-8 keyed store — surrogate-safe sibling of [`dict_storage_store`].
+pub fn dict_storage_store_wtf8(namespace: &mut DictStorage, name: &Wtf8, value: PyObjectRef) {
+    namespace.insert_wtf8(name.to_wtf8_buf(), value);
+}
+
 pub fn dict_storage_delete(namespace: &mut DictStorage, name: &str) -> bool {
     namespace.remove(name).is_some()
+}
+
+/// WTF-8 keyed deletion — surrogate-safe sibling of [`dict_storage_delete`].
+pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> bool {
+    namespace.remove_wtf8(name).is_some()
 }
 
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {

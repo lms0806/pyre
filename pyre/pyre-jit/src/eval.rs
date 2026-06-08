@@ -3807,6 +3807,7 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
 fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
+    guard_exc: i64,
 ) -> crate::call_jit::BlackholeResult {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -3842,6 +3843,7 @@ fn resume_in_blackhole_from_exit_layout(
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             deadframe_types.as_deref(),
+            guard_exc,
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -4026,6 +4028,7 @@ fn execute_assembler(
             owning_key,
             ref raw_values,
             ref exit_layout,
+            guard_exc,
         } => {
             match handle_fail(
                 frame,
@@ -4042,7 +4045,8 @@ fn execute_assembler(
                 HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -4267,6 +4271,7 @@ fn bound_reached(
             owning_key,
             ref raw_values,
             ref exit_layout,
+            guard_exc,
         } = outcome
         {
             match handle_fail(
@@ -4285,7 +4290,8 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -4442,6 +4448,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             owning_key,
             ref raw_values,
             ref exit_layout,
+            guard_exc,
         } = outcome
         {
             match handle_fail(
@@ -4462,7 +4469,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     // Fall through to eval_loop_jit below.
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(raw_values, exit_layout);
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
                             // Fall through to eval_loop_jit
@@ -8667,8 +8675,12 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut keys: Vec<_> =
-                unsafe { (*frame_globals_storage(&frame)).keys().cloned().collect() };
+            let mut keys: Vec<String> = unsafe {
+                (*frame_globals_storage(&frame))
+                    .keys()
+                    .map(|k| k.to_string())
+                    .collect()
+            };
             keys.sort();
             eprintln!("module result: {:?}", result);
             eprintln!("module namespace keys: {:?}", keys);

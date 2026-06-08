@@ -769,6 +769,23 @@ impl SpamBlockRef {
         self.0.borrow().per_block_ssarepr.len()
     }
 
+    /// `True` iff the last op currently in the per-block accumulator is a
+    /// `-live-` marker.  Mirrors `flatten.py:206-217`'s "is the block's
+    /// last operation a `-live-`?" scan, which decides whether a
+    /// canraise block already carries the resume marker the
+    /// `catch_exception` needs.  Used before `emit_catch_exception!` to
+    /// emit the post-residual-call `-live-` only when the opcode body
+    /// left a non-`-live-` op (e.g. the `setfield_vable_i` valuestackdepth
+    /// bump after a `residual_call`) between the per-PC start marker and
+    /// the catch.
+    fn per_block_last_is_live(&self) -> bool {
+        self.0
+            .borrow()
+            .per_block_ssarepr
+            .last()
+            .map_or(false, |insn| insn.is_live())
+    }
+
     /// Move `other`'s per-block accumulator onto the end of `self`'s and clear
     /// `other` (issue #73 `remove_trivial_links` merge bridge).  Returns the
     /// index in `self` where `other`'s insns now begin so callers can re-point
@@ -3923,7 +3940,8 @@ fn filter_liveness_in_place(
     portal_frame_reg: u16,
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
-) -> Vec<usize> {
+    walker_after_call_pc_indices: Option<&[Option<usize>]>,
+) -> (Vec<usize>, Vec<Option<usize>>) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Walker-tracked positions are required: the post-merge
     // `live_markers` vector is built by translating each walker-
@@ -3945,7 +3963,18 @@ fn filter_liveness_in_place(
     // exactly — adjacent walker `-live-` markers may fold; the
     // tolerant filter below handles PCs that resolve to a shared
     // marker by emitting the UNION of per-PC narrowed sets.
-    let live_markers = super::liveness::compute_liveness_with_pc_anchors(ssarepr, walker_tracked);
+    // The after-residual-call anchors are sparse (one entry per Python
+    // PC; `Some` only for canraise opcodes whose body emitted a
+    // post-call `-live-`).  Default to all-`None` for callers (unit
+    // tests) that do not track them.
+    let after_call_anchors: Vec<Option<usize>> = walker_after_call_pc_indices
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| vec![None; walker_tracked.len()]);
+    let (live_markers, after_call_post_merge) = super::liveness::compute_liveness_with_pc_anchors(
+        ssarepr,
+        walker_tracked,
+        &after_call_anchors,
+    );
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -4122,7 +4151,7 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
-    live_markers_out
+    (live_markers_out, after_call_post_merge)
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -4818,6 +4847,18 @@ impl CodeWriter {
         // walker-tracked positions, without per-PC `Insn::Label`
         // anchors in the final SSARepr (label retirement).
         let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
+            vec![Vec::new(); num_instrs];
+        // Parallel to `walker_pc_live_marker_pos`, but tracks the
+        // post-`residual_call` `-live-` (the marker emitted between a
+        // canraise opcode's body and its `catch_exception`, see the
+        // emit site below).  `Some` only for the canraise PCs whose body
+        // ended with a non-`-live-` op; resolved through the same
+        // `remove_repeated_live` remap and exposed as
+        // `PyJitCodeMetadata.after_residual_call_resume_pc` so blackhole
+        // after-residual-call resume lands on the call's own
+        // `catch_exception` rather than the next opcode's marker
+        // (`blackhole.py:396-410 handle_exception_in_frame`).
+        let mut walker_pc_after_call_live_pos: Vec<Vec<(SpamBlockRef, usize)>> =
             vec![Vec::new(); num_instrs];
         // Catch landings live on `ExceptionCatchSite::landing` (decode-
         // time SpamBlockRef::new with framestate=None) and are NOT pushed
@@ -9165,6 +9206,37 @@ impl CodeWriter {
                         // just-emitted opcode already closed.
                         let block_already_closed = !current_block.block().borrow().exits.is_empty();
                         if !block_already_closed {
+                            // `flatten.py:206-217` + `jtransform.py:311-313`:
+                            // a `catch_exception` must be immediately
+                            // preceded by a `-live-` so the blackhole's
+                            // after-residual-call resume
+                            // (`pyjitpl.py:2610-2624 capture_resumedata`,
+                            // `resumepc=-1`) lands on a marker it can
+                            // decode (`blackhole.py:396-410
+                            // handle_exception_in_frame` skips one
+                            // `-live-` then reads the catch).  When the
+                            // opcode body ended with a non-`-live-` op
+                            // (e.g. a `residual_call` followed by the
+                            // `setfield_vable_i` valuestackdepth bump),
+                            // the per-PC start marker is no longer
+                            // adjacent to the catch, so emit the
+                            // post-call `-live-` here.  Trivial in-try
+                            // opcodes whose body emitted nothing already
+                            // end with the per-PC start marker, so skip
+                            // the redundant emit (it would only fold in
+                            // `remove_repeated_live`).
+                            if !current_block.per_block_last_is_live() {
+                                emit_live_placeholder!();
+                                // Record the post-call `-live-` position
+                                // (the insn just pushed) so resume for
+                                // after-residual-call guards can target
+                                // this PC's own `catch_exception`.  Mirror
+                                // the per-PC start-marker recording at the
+                                // `emit_mark_label_pc!` site.
+                                let offset = current_block.per_block_ssarepr_len() - 1;
+                                walker_pc_after_call_live_pos[py_pc]
+                                    .push((current_block.clone(), offset));
+                            }
                             emit_catch_exception!(catch_label);
                         }
                     }
@@ -9707,6 +9779,11 @@ impl CodeWriter {
         // (translated through the `remove_repeated_live` remap) as the
         // sole source for `pc_map`.
         let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
+        // Per-PC pre-merge SSARepr index of the post-`residual_call`
+        // `-live-` (sparse: `Some` only for canraise PCs).  Resolved in
+        // the drain block alongside `walker_tracked_pc_live_indices_out`
+        // and threaded through `filter_liveness_in_place`'s remap.
+        let mut walker_after_call_pc_indices_out: Option<Vec<Option<usize>>> = None;
         {
             // Walker post-walk insert_renamings.
             // Run BEFORE the per-block drain so the splice positions
@@ -9850,6 +9927,27 @@ impl CodeWriter {
                         }
                         Some(translated)
                     };
+                // Resolve the sparse after-residual-call anchors with the
+                // same post-strip block math, but per-entry: a PC without
+                // a recorded post-call `-live-` stays `None` instead of
+                // collapsing the whole map (unlike `resolve_walker_pc`'s
+                // all-or-nothing contract for the dense start markers).
+                let after_call_indices: Vec<Option<usize>> = walker_pc_after_call_live_pos
+                    .iter()
+                    .map(|py_pc_entries| {
+                        py_pc_entries.iter().find_map(|(block_ref, offset)| {
+                            let block_pos = reordered.iter().position(|b| b == block_ref)?;
+                            if post_strip_lens[block_pos] == 0 {
+                                return None;
+                            }
+                            if *offset >= post_strip_lens[block_pos] {
+                                return None;
+                            }
+                            Some(post_strip_block_starts[block_pos] + offset)
+                        })
+                    })
+                    .collect();
+                walker_after_call_pc_indices_out = Some(after_call_indices);
                 resolve_walker_pc(&walker_pc_live_marker_pos)
             };
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
@@ -10113,7 +10211,7 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        let post_remove_live_indices = filter_liveness_in_place(
+        let (post_remove_live_indices, after_call_post_merge) = filter_liveness_in_place(
             &mut ssarepr,
             code,
             &depth_at_pc,
@@ -10122,6 +10220,7 @@ impl CodeWriter {
             portal_frame_reg,
             portal_ec_reg,
             walker_tracked_pc_live_indices_out.as_deref(),
+            walker_after_call_pc_indices_out.as_deref(),
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
@@ -10157,6 +10256,7 @@ impl CodeWriter {
             code,
             w_code,
             pc_map,
+            after_call_post_merge,
             depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -10195,6 +10295,7 @@ impl CodeWriter {
         code: &CodeObject,
         w_code: *const (),
         pc_map: Vec<usize>,
+        after_call_post_merge: Vec<Option<usize>>,
         depth_at_pc: Vec<u16>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
@@ -10226,10 +10327,28 @@ impl CodeWriter {
         // parity: borrow the CodeWriter's single Assembler so
         // `all_liveness` / `num_liveness_ops` continue to accumulate
         // across every jitcode compiled on this thread.
-        let (jitcode, pc_map_bytes) = {
+        // Translate the per-PC `pc_map` insn indices AND the sparse
+        // after-residual-call insn indices to JitCode byte offsets in a
+        // single `finish_with_positions_from` pass: append the `Some`
+        // after-call indices after the `pc_map` entries, then split the
+        // returned byte offsets back apart.  `finish_with_positions_from`
+        // consumes `ssarepr`, so both translations must share one call.
+        let after_call_some: Vec<(usize, usize)> = after_call_post_merge
+            .iter()
+            .enumerate()
+            .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
+            .collect();
+        let mut combined_indices = pc_map.clone();
+        combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
+        let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
-            assembler.finish_with_positions_from(&mut *asm, ssarepr, &pc_map, num_regs)
+            assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
         };
+        let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
+        let mut after_residual_call_resume_pc: Vec<Option<usize>> = vec![None; pc_map.len()];
+        for (k, (py_pc, _)) in after_call_some.iter().enumerate() {
+            after_residual_call_resume_pc[*py_pc] = Some(combined_bytes[pc_map.len() + k]);
+        }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
         // the shell returned by `grab_initial_jitcodes`; pyre still
@@ -10254,6 +10373,7 @@ impl CodeWriter {
 
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
+            after_residual_call_resume_pc,
             depth_at_py_pc: depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -11575,7 +11695,7 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let post_remove_live_indices = filter_liveness_in_place(
+        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,
@@ -11584,6 +11704,7 @@ mod tests {
             u16::MAX,
             u16::MAX,
             Some(&walker_tracked_pc_live_indices),
+            None,
         );
 
         let live_idx = post_remove_live_indices[reachable_pc];

@@ -33,7 +33,7 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
         let fd_val = if pyre_object::is_int(w_fd) {
             pyre_object::w_int_get_value(w_fd)
         } else {
-            let fileno = crate::baseobjspace::getattr(w_fd, "fileno").map_err(|_| {
+            let fileno = crate::baseobjspace::getattr_str(w_fd, "fileno").map_err(|_| {
                 crate::PyError::type_error("argument must be an int, or have a fileno() method")
             })?;
             let res = crate::call::call_function_impl_result(fileno, &[])?;
@@ -261,7 +261,7 @@ pub fn register_module(ns: &mut DictStorage) {
                                 pyre_object::w_int_get_value(item)
                             } else {
                                 let fileno =
-                                    crate::baseobjspace::getattr(item, "fileno").map_err(|_| {
+                                    crate::baseobjspace::getattr_str(item, "fileno").map_err(|_| {
                                         crate::PyError::type_error(
                                             "argument must be an int, or have a fileno() method",
                                         )

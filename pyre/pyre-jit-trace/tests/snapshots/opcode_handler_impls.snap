@@ -238,7 +238,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let mut result_concrete = crate::state::ConcreteValue::Null;
         let c_obj = obj.concrete.to_pyobj();
         if !c_obj.is_null() {
-            if let Ok(result) = pyre_interpreter::baseobjspace::getattr(c_obj, name) {
+            if let Ok(result) = pyre_interpreter::baseobjspace::getattr_str(c_obj, name) {
                 result_concrete = crate::state::ConcreteValue::from_pyobj(result);
             }
         }

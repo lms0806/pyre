@@ -55,17 +55,31 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
 pub(super) fn compute_liveness_with_pc_anchors(
     ssarepr: &mut SSARepr,
     walker_tracked_pc_live_indices: &[usize],
-) -> Vec<usize> {
+    after_call_anchors: &[Option<usize>],
+) -> (Vec<usize>, Vec<Option<usize>>) {
     // `remove_repeated_live` folds adjacent `-live-` markers freely,
     // matching upstream `liveness.py` semantics.  Multiple Python PCs
     // may share a post-merge marker index; `filter_liveness_in_place`
     // groups PCs by `insn_idx` and writes the UNION of per-PC narrowed
     // sets, so per-PC pc_map dispatch reads a conservative superset.
+    //
+    // `after_call_anchors[py_pc]` carries the pre-merge index of the
+    // post-`residual_call` `-live-` (the one immediately preceding a
+    // `catch_exception`) for canraise opcodes, `None` otherwise.  Each
+    // such marker is a lone live followed by `catch_exception`, so it
+    // never folds and `remap` maps it to its own surviving position —
+    // resolving the after-residual-call resume target through the same
+    // `remove_repeated_live` remap as the per-PC start markers.
     let remap = compute_liveness_with_remap_internal(ssarepr);
-    walker_tracked_pc_live_indices
+    let live_markers = walker_tracked_pc_live_indices
         .iter()
         .map(|&old| remap[old])
-        .collect()
+        .collect();
+    let after_call = after_call_anchors
+        .iter()
+        .map(|entry| entry.map(|old| remap[old]))
+        .collect();
+    (live_markers, after_call)
 }
 
 fn compute_liveness_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize> {

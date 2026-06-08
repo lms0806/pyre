@@ -2066,6 +2066,12 @@ impl<S: JitState> JitDriver<S> {
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+            // blackhole.py:1794 `_prepare_resume_from_failure(deadframe)`:
+            // the pending exception grabbed at guard failure
+            // (cpu.grab_exc_value) must seed the blackhole resume so an
+            // exception guard unwinds into its handler instead of resuming
+            // the no-exception continuation.
+            let guard_exc = result.exception.exc_value;
             drop(result);
 
             // must_compile tick for bridge threshold counting.
@@ -2231,8 +2237,9 @@ impl<S: JitState> JitDriver<S> {
                     allocator,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
-                    let exc =
-                        crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
+                    let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
+                        guard_exc,
+                    );
                     let jit_exc = crate::blackhole::run_forever_with_portal(
                         &mut bh_builder,
                         bh,
@@ -2941,6 +2948,10 @@ impl<S: JitState> JitDriver<S> {
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
+        // llmodel.py:240 grab_exc_value: the pending exception captured at
+        // guard failure travels with the GuardFailure outcome so the
+        // blackhole resume can seed it (blackhole.py:1794).
+        let guard_exc = result.exception.exc_value;
         drop(result);
 
         // memmgr.py:58-61: keep_loop_alive(loop_token)
@@ -2987,6 +2998,7 @@ impl<S: JitState> JitDriver<S> {
             owning_key,
             raw_values,
             exit_layout,
+            guard_exc,
         }
     }
 
@@ -3789,6 +3801,10 @@ impl<S: JitState> JitDriver<S> {
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
             let descr_arc = result.descr_arc.clone();
+            // blackhole.py:1794 `_prepare_resume_from_failure(deadframe)`:
+            // seed the blackhole resume with the exception grabbed at guard
+            // failure so an exception guard unwinds into its handler.
+            let result_exc = result.exception.exc_value;
 
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
@@ -3979,8 +3995,9 @@ impl<S: JitState> JitDriver<S> {
                     allocator,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
-                    let exc =
-                        crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
+                    let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
+                        result_exc,
+                    );
                     let jit_exc = crate::blackhole::run_forever_with_portal(
                         &mut bh_builder,
                         bh,

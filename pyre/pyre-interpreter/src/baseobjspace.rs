@@ -22,7 +22,7 @@ use crate::function::is_function;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 // ── Re-exports from split-out modules ────────────────────────────────
 pub use crate::objspace::descroperation::*;
@@ -249,7 +249,7 @@ pub unsafe fn exception_issubclass_w(w_cls1: PyObjectRef, w_cls2: PyObjectRef) -
 /// and is a tuple, `None` when the attribute is missing or not a tuple.
 /// AttributeError is swallowed; other errors propagate.
 fn _get_bases(w_cls: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
-    let w_bases = match getattr(w_cls, "__bases__") {
+    let w_bases = match getattr_str(w_cls, "__bases__") {
         Ok(b) => b,
         Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(None),
         Err(e) => return Err(e),
@@ -289,7 +289,7 @@ unsafe fn p_recursive_isinstance_type_w(
     if isinstance_w(w_inst, w_type) {
         return Ok(true);
     }
-    let w_abstractclass = match getattr(w_inst, "__class__") {
+    let w_abstractclass = match getattr_str(w_inst, "__class__") {
         Ok(cls) => cls,
         Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(false),
         Err(e) => return Err(e),
@@ -316,7 +316,7 @@ unsafe fn p_recursive_isinstance_w(
         w_cls,
         "isinstance() arg 2 must be a type, a tuple of types, or a union",
     )?;
-    let w_abstractclass = match getattr(w_inst, "__class__") {
+    let w_abstractclass = match getattr_str(w_inst, "__class__") {
         Ok(cls) => cls,
         Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(false),
         Err(e) => return Err(e),
@@ -601,7 +601,7 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
 /// reraises any other PyError so the caller (typedef descr_isabstract
 /// for staticmethod / classmethod) can propagate it.
 pub fn isabstractmethod_w(obj: PyObjectRef) -> Result<bool, crate::PyError> {
-    match getattr(obj, "__isabstractmethod__") {
+    match getattr_str(obj, "__isabstractmethod__") {
         Ok(w_result) => Ok(is_true(w_result)),
         Err(e) if matches!(e.kind, crate::PyErrorKind::AttributeError) => Ok(false),
         Err(e) => Err(e),
@@ -668,7 +668,7 @@ pub fn is_true(obj: PyObjectRef) -> bool {
                 }
             }
             // Also check per-instance __len__ (ATTR_TABLE)
-            if let Ok(method) = getattr(obj, "__len__") {
+            if let Ok(method) = getattr_str(obj, "__len__") {
                 let result = crate::call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
@@ -1388,7 +1388,7 @@ pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if unsafe { is_none(obj) } {
         return None;
     }
-    match getattr(obj, name) {
+    match getattr_str(obj, name) {
         Ok(value) => Some(value),
         Err(err) => {
             if err.kind == crate::PyErrorKind::AttributeError
@@ -1506,7 +1506,7 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 return crate::builtins::call_and_check(method, &[obj]);
             }
             // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
-            if let Ok(method) = getattr(obj, "__len__") {
+            if let Ok(method) = getattr_str(obj, "__len__") {
                 return crate::builtins::call_and_check(method, &[obj]);
             }
             Err(PyError::type_error(format!(
@@ -1752,9 +1752,18 @@ pub fn dict_storage_to_dict_kind(
         }
     };
     unsafe {
-        for (key, &value) in storage.entries() {
-            if !value.is_null() {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, key, value);
+        for (key, &value) in storage.entries_wtf8() {
+            if value.is_null() {
+                continue;
+            }
+            // Valid names take the str no-proxy setter (Unicode strategy);
+            // a lone-surrogate name routes through the WTF-8 setter, which
+            // forces the dict onto the surrogate-safe ObjectKey strategy.
+            match key.as_str() {
+                Ok(s) => pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, s, value),
+                Err(_) => {
+                    pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(dict, key, value)
+                }
             }
         }
     }
@@ -1768,7 +1777,7 @@ pub fn dict_storage_to_dict_kind(
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
-pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
+pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `pypy/interpreter/baseobjspace.py:1146-1162 getattr`:
     //
     //     def getattr(self, w_obj, w_name):
@@ -2218,6 +2227,255 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     object_getattr_miss(obj, name)
 }
 
+// ─── `w_name`-taking attribute API ───
+//
+// `descroperation.py:225/247/255 getattr/setattr/delattr(space, w_obj,
+// w_name)` take the attribute name as a wrapped str object and only
+// extract the WTF-8 bytes at the `object.__*__` boundary
+// (`get_attribute_name → space.text_w(w_name)`, descroperation.py:69-75).
+// `text_w` returns raw WTF-8 and never raises on a lone surrogate
+// (`unicodeobject.py:133`), so a surrogate attribute name flows through.
+//
+// A lone-surrogate name can never equal any type/builtin attribute (all
+// valid identifiers), so it is dispatched to the generic instance /
+// module `__dict__` lookup only — the strict subset of `getattr_str`/
+// `setattr_str`/`delattr_str` that a non-identifier name can reach.  A
+// valid UTF-8 name takes the `&str` fast path unchanged.
+
+/// `space.getattr(w_obj, w_name)`.
+pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    match name.as_str() {
+        Ok(s) => getattr_str(obj, s),
+        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    }
+}
+
+/// `space.setattr(w_obj, w_name, w_val)`.
+pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    match name.as_str() {
+        Ok(s) => setattr_str(obj, s, value),
+        Err(_) => unsafe { setattr_surrogate(obj, w_name, name, value) },
+    }
+}
+
+/// `space.delattr(w_obj, w_name)`.
+pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    match name.as_str() {
+        Ok(s) => delattr_str(obj, s),
+        Err(_) => unsafe { delattr_surrogate(obj, w_name, name) },
+    }
+}
+
+/// `space.getattr` for a lone-surrogate name — mirrors `getattr_str`'s
+/// generic-instance tail: terminal `__dict__` read, then the
+/// `__getattr__` hook on miss.  (A surrogate cannot match any of
+/// `getattr_str`'s builtin-type special-cases, all valid identifiers.)
+unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
+    unsafe {
+        match object_getattribute_surrogate(obj, w_name, name) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if is_instance(obj) {
+                    let w_type = w_instance_get_type(obj);
+                    if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
+                        let result = crate::call_function(getattr_fn, &[obj, w_name]);
+                        if !result.is_null() {
+                            return Ok(result);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `object.__getattribute__` terminal for a lone-surrogate name —
+/// generic module / instance `__dict__` read, AttributeError on miss.
+/// `w_name` is passed straight to the `ObjectKey`-keyed dict ops
+/// (already WTF-8 safe).
+pub(crate) unsafe fn object_getattribute_surrogate(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+) -> PyResult {
+    unsafe {
+        if is_module(obj) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+                    if !v.is_null() {
+                        return Ok(v);
+                    }
+                }
+            }
+            return Err(attr_error_wtf8(obj, name));
+        }
+        if is_type(obj) {
+            // `typeobject.py lookup_where` over the type's own MRO. A
+            // surrogate cannot name a metatype descriptor, so the
+            // class-attribute search is the whole protocol.
+            if let Some(v) = lookup_in_type_wtf8(obj, name) {
+                return Ok(v);
+            }
+            return Err(attr_error_wtf8(obj, name));
+        }
+        // Instance: the instance `__dict__` first (a surrogate can never
+        // be a data descriptor), then the class attribute via the type
+        // MRO.
+        let w_dict = getdict(obj);
+        if !w_dict.is_null() {
+            if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+                if !v.is_null() {
+                    return Ok(v);
+                }
+            }
+        }
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(v) = lookup_in_type_wtf8(w_type, name) {
+                return Ok(v);
+            }
+        }
+        Err(attr_error_wtf8(obj, name))
+    }
+}
+
+/// `space.setattr` for a lone-surrogate name — mirrors `setattr_str`:
+/// dispatch through the type's `__setattr__` (the slot is WTF-8 safe),
+/// else the terminal store.
+unsafe fn setattr_surrogate(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+    value: PyObjectRef,
+) -> PyResult {
+    let value = unwrap_cell(value);
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
+                return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
+                    .map(|_| w_none());
+            }
+        }
+    }
+    unsafe { object_setattr_surrogate(obj, w_name, name, value) }
+}
+
+/// `object.__setattr__` terminal for a lone-surrogate name — generic
+/// module / instance `__dict__` store.  A surrogate cannot name a data
+/// descriptor, type attribute, or special slot (all valid identifiers).
+pub(crate) unsafe fn object_setattr_surrogate(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+    value: PyObjectRef,
+) -> PyResult {
+    let value = unwrap_cell(value);
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    unsafe {
+        if is_module(obj) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                setitem(w_dict, w_name, value)?;
+                return Ok(w_none());
+            }
+        }
+        // Type objects: store into the type's own WTF-8 keyed namespace
+        // and reset the method caches — `typeobject.py type.__setattr__`
+        // → `w_type.dict_w[name] = w_value; self.mutated(name)`.
+        if is_type(obj) {
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
+            if !dict_ptr.is_null() {
+                crate::dict_storage_store_wtf8(&mut *dict_ptr, name, value);
+                mutated(obj, None);
+                return Ok(w_none());
+            }
+        }
+        let w_dict = getdict(obj);
+        if !w_dict.is_null() {
+            setitem(w_dict, w_name, value)?;
+            return Ok(w_none());
+        }
+        Err(attr_error_wtf8(obj, name))
+    }
+}
+
+/// `space.delattr` for a lone-surrogate name — mirrors `delattr_str`.
+unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
+            }
+        }
+    }
+    unsafe { object_delattr_surrogate(obj, w_name, name) }
+}
+
+/// `object.__delattr__` terminal for a lone-surrogate name.
+pub(crate) unsafe fn object_delattr_surrogate(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+) -> PyResult {
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    unsafe {
+        if is_module(obj) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
+                return Ok(w_none());
+            }
+            return Err(attr_error_wtf8(obj, name));
+        }
+        if is_type(obj) {
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
+            if !dict_ptr.is_null() && crate::dict_storage_delete_wtf8(&mut *dict_ptr, name) {
+                mutated(obj, None);
+                return Ok(w_none());
+            }
+            return Err(attr_error_wtf8(obj, name));
+        }
+        let w_dict = getdict(obj);
+        if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
+            return Ok(w_none());
+        }
+        Err(attr_error_wtf8(obj, name))
+    }
+}
+
+/// `raiseattrerror` for a lone-surrogate name; the message renders the
+/// name lossily (a surrogate has no `&str` form).
+fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
+    let tp_name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*obj).ob_type).name.to_string(),
+        }
+    };
+    let display = match name.as_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let mut out = String::new();
+            for cp in name.code_points() {
+                out.push(cp.to_char().unwrap_or('\u{FFFD}'));
+            }
+            out
+        }
+    };
+    PyError::new(
+        PyErrorKind::AttributeError,
+        format!("'{tp_name}' object has no attribute '{display}'"),
+    )
+}
+
 /// `object.__getattribute__` terminal — the default descriptor protocol
 /// without the user `__getattribute__` override check.
 pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
@@ -2275,7 +2533,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             ));
         }
     }
-    getattr(obj, name)
+    getattr_str(obj, name)
 }
 
 fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
@@ -3255,7 +3513,7 @@ pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
     let w_fd = if unsafe { pyre_object::pyobject::is_int(obj) } {
         obj
     } else {
-        let fileno = getattr(obj, "fileno").map_err(|e| {
+        let fileno = getattr_str(obj, "fileno").map_err(|e| {
             if e.kind == PyErrorKind::AttributeError {
                 PyError::type_error("argument must be an int, or have a fileno() method.")
             } else {
@@ -3531,6 +3789,42 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
     lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
+/// WTF-8 keyed MRO attribute lookup — surrogate-safe sibling of
+/// `lookup_in_type` / `lookup_in_type_where`.  A lone-surrogate name
+/// can only live in a class namespace's `DictStorage` (never as a
+/// descriptor or special slot), so this walks the MRO comparing raw
+/// WTF-8 bytes via `DictStorage::get_wtf8`.
+///
+/// # Safety
+/// `w_type` must point at a valid `W_TypeObject` (null tolerated).
+pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return None;
+    }
+    let cached = w_type_get_mro(w_type);
+    let mro_owned;
+    let mro: &[PyObjectRef] = if !cached.is_null() {
+        &*cached
+    } else {
+        mro_owned = compute_mro(w_type);
+        &mro_owned
+    };
+    for cls in mro {
+        if (*cls).is_null() || !is_type(*cls) {
+            continue;
+        }
+        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
+        if !ns_ptr.is_null() {
+            let ns = &*ns_ptr;
+            if let Some(&value) = ns.get_wtf8(name) {
+                if !value.is_null() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
 /// Determine what `self` value to bind for a super-resolved attribute.
 ///
 /// Walks the MRO of `self_obj` starting after `super_type`, finds the
@@ -4118,7 +4412,7 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
     Ok(w_none())
 }
 
-pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     // descroperation.py:247 — space.lookup for __setattr__ through MRO,
@@ -4525,7 +4819,7 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 /// Delete an attribute: `del obj.name`.
 ///
 /// PyPy: descroperation.py descr__delattr__
-pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
+pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
@@ -4862,7 +5156,7 @@ pub fn call_args_and_c_profile_args(
 /// either the attribute lookup or the call itself raises — same bare-
 /// PyObjectRef contract as `call_function_impl_raw`.
 pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
-    match getattr(obj, methname) {
+    match getattr_str(obj, methname) {
         Ok(method) => call_function(method, args),
         Err(e) => {
             crate::call::set_call_error(e);
@@ -5812,7 +6106,7 @@ fn object_functionstr_findattr(
     if unsafe { is_none(obj) } {
         return Ok(None);
     }
-    match getattr(obj, name) {
+    match getattr_str(obj, name) {
         Ok(value) => Ok(Some(value)),
         Err(e) if e.kind == crate::PyErrorKind::SystemExit => Err(e),
         Err(_) => Ok(None),
@@ -6087,7 +6381,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 pyre_object::typeobject::w_type_get_flag_map_or_seq(w_user_type) == b'M';
             if !is_mapping
                 && (lookup_in_type_where(w_type, "__getitem__").is_some()
-                    || getattr(obj, "__getitem__").is_ok())
+                    || getattr_str(obj, "__getitem__").is_ok())
             {
                 // Try to use __len__ to bound the iteration.
                 let mut items = Vec::new();
@@ -6706,24 +7000,24 @@ mod tests {
         // type. Use a hasdict instance: a W_InstanceObject of a fresh
         // user class created via type().
         let obj = make_user_instance();
-        setattr(obj, "name", w_int_new(100)).unwrap();
-        let result = getattr(obj, "name").unwrap();
+        setattr_str(obj, "name", w_int_new(100)).unwrap();
+        let result = getattr_str(obj, "name").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 100) };
     }
 
     #[test]
     fn test_getattr_missing() {
         let obj = w_int_new(1);
-        let err = getattr(obj, "missing").unwrap_err();
+        let err = getattr_str(obj, "missing").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
     }
 
     #[test]
     fn test_setattr_overwrite() {
         let obj = make_user_instance();
-        setattr(obj, "x", w_int_new(1)).unwrap();
-        setattr(obj, "x", w_int_new(2)).unwrap();
-        let result = getattr(obj, "x").unwrap();
+        setattr_str(obj, "x", w_int_new(1)).unwrap();
+        setattr_str(obj, "x", w_int_new(2)).unwrap();
+        let result = getattr_str(obj, "x").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 
@@ -6747,8 +7041,8 @@ mod tests {
             Box::into_raw(namespace) as *mut u8,
         );
 
-        setattr(module, "ps1", w_str_new("py> ")).unwrap();
-        let result = getattr(module, "ps1").unwrap();
+        setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
+        let result = getattr_str(module, "ps1").unwrap();
         unsafe { assert_eq!(w_str_get_value(result), "py> ") };
     }
 
@@ -6761,9 +7055,9 @@ mod tests {
             Box::into_raw(namespace) as *mut u8,
         );
 
-        setattr(module, "ps1", w_str_new("py> ")).unwrap();
-        delattr(module, "ps1").unwrap();
-        let err = getattr(module, "ps1").unwrap_err();
+        setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
+        delattr_str(module, "ps1").unwrap();
+        let err = getattr_str(module, "ps1").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
     }
 
@@ -7209,7 +7503,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
                 return Ok(is_true(result));
             }
             // Also check per-instance attributes (ATTR_TABLE)
-            if let Ok(method) = getattr(haystack, "__contains__") {
+            if let Ok(method) = getattr_str(haystack, "__contains__") {
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result));
             }

@@ -132,7 +132,7 @@ impl OperationError {
                     if pyre_object::is_exception(w_value) {
                         pyre_object::excobject::w_exception_set_traceback(w_value, tb);
                     } else {
-                        let _ = crate::baseobjspace::setattr(w_value, "__traceback__", tb);
+                        let _ = crate::baseobjspace::setattr_str(w_value, "__traceback__", tb);
                     }
                 }
             } else {
@@ -909,7 +909,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
-    let notes = match crate::baseobjspace::getattr(exc, "__notes__") {
+    let notes = match crate::baseobjspace::getattr_str(exc, "__notes__") {
         Ok(v) if !v.is_null() => v,
         _ => return Ok(()),
     };

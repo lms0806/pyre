@@ -330,6 +330,11 @@ struct GuardToken {
     const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
+    /// llsupport/assembler.py:40-44 must_save_exception: true for
+    /// GUARD_EXCEPTION / GUARD_NO_EXCEPTION / GUARD_NOT_FORCED.  Selects the
+    /// exc=True failure-recovery variant that stages pos_exc_value into
+    /// jf_guard_exc (store_info_on_descr:236) so grab_exc_value can read it.
+    must_save_exception: bool,
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -3786,6 +3791,10 @@ impl<'a> AssemblerARM64<'a> {
             fail_descr: cell.clone(),
             const_stores,
             gcmap,
+            must_save_exception: matches!(
+                op.opcode,
+                OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
+            ),
         });
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
@@ -3818,6 +3827,27 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
+
+        // llsupport/assembler.py:236 store_info_on_descr — must_save_exception
+        // guards run the exc=True failure-recovery variant: stage pos_exc_value
+        // into jf_guard_exc and clear both globals so grab_exc_value reads the
+        // value off the deadframe (assembler.py:316-329 _build_failure_recovery).
+        // x16/x17 are scratch (ip0/ip1); all managed regs were saved by the
+        // bl above, so clobbering them here is safe.
+        if guard_token.must_save_exception {
+            let exc_value_addr = crate::jit_exc_value_addr() as i64;
+            let exc_type_addr = crate::jit_exc_type_addr() as i64;
+            self.emit_mov_imm64(16, exc_value_addr);
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x17, [x16]                            // x17 = *pos_exc_value
+                ; str x17, [x29, JF_GUARD_EXC_OFS as u32]   // jf_guard_exc = excval
+                ; str xzr, [x16]                            // *pos_exc_value = 0
+            );
+            self.emit_mov_imm64(16, exc_type_addr);
+            dynasm!(self.mc ; .arch aarch64
+                ; str xzr, [x16]                            // *pos_exception = 0
+            );
+        }
 
         let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as *const () as i64;
         self.emit_mov_imm64(0, descr_ptr);

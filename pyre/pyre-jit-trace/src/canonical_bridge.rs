@@ -218,6 +218,7 @@ pub fn install_portal_for(
         runtime,
         PyJitCodeMetadata {
             pc_map: Vec::new(),
+            after_residual_call_resume_pc: Vec::new(),
             depth_at_py_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -408,6 +409,7 @@ def f(x, y):
             std::sync::Arc::new(drained_runtime),
             PyJitCodeMetadata {
                 pc_map: vec![0],
+                after_residual_call_resume_pc: vec![None],
                 depth_at_py_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,

@@ -525,7 +525,7 @@ pub unsafe fn w_exception_get_cause(obj: PyObjectRef) -> PyObjectRef {
 
 /// `interp_exceptions.py:166-174 descr_setcause` parity — writes the
 /// `w_cause` slot.  Type validation (None or BaseException subclass
-/// instance) is enforced at the call site (`baseobjspace::setattr`).
+/// instance) is enforced at the call site (`baseobjspace::setattr_str`).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ExceptionObject`.
@@ -552,7 +552,7 @@ pub unsafe fn w_exception_get_context(obj: PyObjectRef) -> PyObjectRef {
 
 /// `interp_exceptions.py:183-190 descr_setcontext` parity — writes
 /// the `w_context` slot.  Type validation lives in
-/// `baseobjspace::setattr`.
+/// `baseobjspace::setattr_str`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ExceptionObject`.
@@ -566,7 +566,7 @@ pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
 /// `interp_exceptions.py:196-201 descr_gettraceback` parity (minus
 /// the `PyTraceback.frame.mark_as_escaped()` callback, which pyre
 /// does not have yet — see TODO on
-/// `baseobjspace::getattr`'s `__traceback__` arm).
+/// `baseobjspace::getattr_str`'s `__traceback__` arm).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ExceptionObject`.
@@ -577,7 +577,7 @@ pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
 
 /// `interp_exceptions.py:203-205 descr_settraceback` parity — writes
 /// the `w_traceback` slot.  Type validation lives in
-/// `baseobjspace::setattr`.
+/// `baseobjspace::setattr_str`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ExceptionObject`.
@@ -623,7 +623,7 @@ pub unsafe fn w_exception_set_suppress_context(obj: PyObjectRef, value: bool) {
 // (and `:1080-1084 W_UnicodeDecodeError.typedef` /
 // `:1200-1204 W_UnicodeEncodeError.typedef`) wire each field via
 // `readwrite_attrproperty_w('w_object', ...)` etc.  Pyre's
-// `baseobjspace::getattr` and `setattr` arms dispatch on the
+// `baseobjspace::getattr_str` and `setattr` arms dispatch on the
 // attribute name + ExcKind and route here.
 //
 // All five accessors return `space.w_None` (resolved by the caller)

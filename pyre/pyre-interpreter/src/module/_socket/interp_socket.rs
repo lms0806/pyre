@@ -114,7 +114,7 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
             if s.is_ascii() {
                 s.as_bytes().to_vec()
             } else {
-                let method = crate::baseobjspace::getattr(w_host, "encode")?;
+                let method = crate::baseobjspace::getattr_str(w_host, "encode")?;
                 let codec = pyre_object::w_str_new("idna");
                 let encoded = crate::call_function(method, &[codec]);
                 if encoded.is_null() {
@@ -184,7 +184,7 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
     }
     if let Some(t) = crate::typedef::r#type(obj) {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            let buf = crate::baseobjspace::getattr(obj, "__pyre_buf__")?;
+            let buf = crate::baseobjspace::getattr_str(obj, "__pyre_buf__")?;
             if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
                 return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf) });
             }

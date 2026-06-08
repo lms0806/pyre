@@ -319,7 +319,7 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn read_class_int(cls: PyObjectRef, attr: &str) -> Option<i64> {
-    let v = crate::baseobjspace::getattr(cls, attr).ok()?;
+    let v = crate::baseobjspace::getattr_str(cls, attr).ok()?;
     if unsafe { pyre_object::is_int(v) } {
         Some(unsafe { pyre_object::w_int_get_value(v) })
     } else {

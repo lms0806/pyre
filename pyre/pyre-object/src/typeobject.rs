@@ -120,8 +120,8 @@ pub struct W_TypeObject {
     /// `W_TypeObject.compares_by_identity` (`:353-371`); UNKNOWN
     /// until first lookup forces a `__eq__` / `__hash__` MRO walk.
     ///
-    /// Invalidated by `baseobjspace::setattr` /
-    /// `baseobjspace::delattr` whenever a type-dict entry changes
+    /// Invalidated by `baseobjspace::setattr_str` /
+    /// `baseobjspace::delattr_str` whenever a type-dict entry changes
     /// (matches `typeobject.py:280 mutated()`), which walks
     /// `weak_subclasses` and recurses, so a base-class mutation
     /// eagerly resets cached subclasses.
@@ -405,6 +405,14 @@ pub unsafe fn w_type_set_weakrefable(obj: PyObjectRef, v: bool) {
 /// Get the class name.
 pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
     &*(*(obj as *const W_TypeObject)).name
+}
+
+/// Replace the class name (`descr_set__name__`, typeobject.py:1058
+/// `w_type.name = name`).  `name` is an owned `String` behind a raw
+/// pointer (`malloc_raw` = boxed); assigning through it drops the old
+/// name and installs the new one, leaving the slot itself unchanged.
+pub unsafe fn w_type_set_name(obj: PyObjectRef, name: &str) {
+    *(*(obj as *mut W_TypeObject)).name = name.to_string();
 }
 
 /// Get the bases tuple.

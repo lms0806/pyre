@@ -79,6 +79,17 @@ pub struct PyJitCodeMetadata {
     /// the Python frame's `next_instr` to the JitCode entry point
     /// for blackhole resume / inline call tracing.
     pub pc_map: Vec<usize>,
+    /// py_pc → jitcode byte offset of the post-`residual_call` `-live-`
+    /// marker (the one immediately preceding the opcode's own
+    /// `catch_exception`), `None` for PCs that do not make a residual
+    /// call.  RPython keeps `frame.pc` at this position for
+    /// `capture_resumedata(after_residual_call=True, resumepc=-1)`
+    /// (`pyjitpl.py:2610-2624`); pyre stores Python PCs in the snapshot
+    /// and translates through `pc_map`, so after-residual-call resume
+    /// needs this second map to reach the call's own catch rather than
+    /// the next opcode's start marker (`blackhole.py:396-410
+    /// handle_exception_in_frame`).  Same length as `pc_map`.
+    pub after_residual_call_resume_pc: Vec<Option<usize>>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
@@ -373,6 +384,39 @@ impl PyJitCode {
         self.metadata.pc_map.get(py_pc).copied()
     }
 
+    /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
+    /// (the marker preceding the opcode's own `catch_exception`), or
+    /// `None` if `py_pc` makes no residual call.  After-residual-call
+    /// guard resume (`blackhole.py:396-410 handle_exception_in_frame`)
+    /// uses this instead of [`Self::resume_jitcode_pc_for`] so it lands
+    /// on the call's own catch rather than the next opcode's start
+    /// marker (`pc_map[next_pc]`).
+    pub fn after_residual_call_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
+        self.metadata
+            .after_residual_call_resume_pc
+            .get(py_pc)
+            .copied()
+            .flatten()
+    }
+
+    /// Translate a resume-data pc word (as carried in rd_numb / RebuiltFrame)
+    /// to a JitCode byte offset, honoring the after-residual-call marker:
+    /// flagged words route through [`Self::after_residual_call_resume_pc_for`],
+    /// plain words through [`Self::resume_jitcode_pc_for`].  Every decode-side
+    /// py_pc→jitcode translation funnels through here so the marker is
+    /// interpreted consistently.
+    pub fn resolve_resume_pc(&self, raw_pc: i32) -> Option<usize> {
+        let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(raw_pc);
+        if py_pc < 0 {
+            return None;
+        }
+        if after_residual_call {
+            self.after_residual_call_resume_pc_for(py_pc as usize)
+        } else {
+            self.resume_jitcode_pc_for(py_pc as usize)
+        }
+    }
+
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`
     /// nor `pc_map` populated yet. See the discriminator table on
     /// the module doc.
@@ -435,6 +479,7 @@ impl PyJitCode {
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
                 pc_map: Vec::new(),
+                after_residual_call_resume_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
                 // (canonical_bridge.rs:165-166). Encoder/decoder readers in

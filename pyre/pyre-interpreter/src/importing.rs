@@ -1102,7 +1102,7 @@ pub fn import_from(
     }
 
     // Fallback: try getattr (for non-module objects or attrs set via setattr)
-    if let Ok(value) = crate::baseobjspace::getattr(module, name) {
+    if let Ok(value) = crate::baseobjspace::getattr_str(module, name) {
         return Ok(value);
     }
 
@@ -1202,16 +1202,16 @@ where
     F: FnMut(&str, PyObjectRef) -> Result<(), crate::PyError>,
 {
     let (w_iterable, skip_leading_underscores) =
-        match crate::baseobjspace::getattr(module, "__all__") {
+        match crate::baseobjspace::getattr_str(module, "__all__") {
             Ok(w_all) => (w_all, false),
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 // pyopcode.py:2225-2230 — `dict = module.__dict__; all = dict.keys()`.
                 // `space.getattr(module, '__dict__')` so any object exposing
                 // `__dict__` (Module, class, instance with `__dict__`,
                 // bytes-keyed proxies, ...) participates.
-                match crate::baseobjspace::getattr(module, "__dict__") {
+                match crate::baseobjspace::getattr_str(module, "__dict__") {
                     Ok(w_dict) => {
-                        let w_keys_method = crate::baseobjspace::getattr(w_dict, "keys")?;
+                        let w_keys_method = crate::baseobjspace::getattr_str(w_dict, "keys")?;
                         // pyopcode.py:2230 `all = dict.keys()` — pyre's
                         // `call_function` stashes errors as PY_NULL; use
                         // `call_and_check` so a misbehaving `keys()` (or
@@ -1234,7 +1234,7 @@ where
         };
 
     // pyopcode.py:2235-2237 — `module_name = module.__name__` with str check.
-    let module_name_w = crate::baseobjspace::getattr(module, "__name__")?;
+    let module_name_w = crate::baseobjspace::getattr_str(module, "__name__")?;
     if !unsafe { is_str(module_name_w) } {
         return Err(crate::PyError::type_error(format!(
             "module __name__ must be a string, not {}",
@@ -1270,7 +1270,7 @@ where
             continue;
         }
         // pyopcode.py:2258 — `into_locals[name] = getattr(module, name)`.
-        let value = crate::baseobjspace::getattr(module, &name)?;
+        let value = crate::baseobjspace::getattr_str(module, &name)?;
         write(&name, value)?;
     }
     Ok(())

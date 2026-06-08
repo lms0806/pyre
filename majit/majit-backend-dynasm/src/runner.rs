@@ -2272,13 +2272,20 @@ impl Backend for DynasmBackend {
             }
         }
 
+        // grab_exc_value (llmodel.py:240): read jf_guard_exc off the deadframe
+        // tip before the libc jitframe chain is freed.  The exc=True
+        // failure-recovery stub (generate_quick_failure) staged pos_exc_value
+        // here for must_save_exception guards; FrameData carries it to
+        // `grab_exc_value` since the frame is gone after the free below.
+        let exc_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
+
         // The deadframe `result_jf` is the tip of `jf_ptr`'s `jf_forward`
         // chain whenever `_check_frame_depth` realloc'd; free every frame in
         // the chain (jitframe.py:139-145), not just the original head.
         unsafe { Self::free_jitframe_chain(jf_ptr) };
 
         DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr, None)),
+            data: Box::new(FrameData::new(raw_values, descr, None, exc_value)),
         }
     }
 
@@ -2385,6 +2392,10 @@ impl Backend for DynasmBackend {
             descr_fd.trace_id(),
         ));
 
+        // grab_exc_value (llmodel.py:240): read jf_guard_exc off the deadframe
+        // tip before the libc jitframe chain is freed (same as execute_token).
+        let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
+
         // Free the whole `jf_forward` realloc chain (jitframe.py:139-145).
         unsafe { Self::free_jitframe_chain(jf_ptr) };
 
@@ -2395,7 +2406,7 @@ impl Backend for DynasmBackend {
             exit_layout,
             force_token_slots: Vec::new(),
             savedata: None,
-            exception_value: GcRef::NULL,
+            exception_value,
             fail_index: descr_fd.fail_index_per_trace(),
             trace_id: descr_fd.trace_id(),
             is_finish: descr_fd.is_finish(),
@@ -2421,6 +2432,15 @@ impl Backend for DynasmBackend {
         // shared identity.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
         Arc::clone(&data.fail_descr)
+    }
+
+    /// `cpu.grab_exc_value(deadframe)` (llmodel.py:240): return the
+    /// `jf_guard_exc` value captured off the deadframe tip in `execute_token`.
+    /// The exc=True failure-recovery stub stored pos_exc_value there for
+    /// must_save_exception guards (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
+    /// GUARD_NOT_FORCED); other guards leave it NULL.
+    fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
+        frame.data.downcast_ref::<FrameData>().unwrap().exc_value
     }
 
     /// `llmodel.py:252-268 free_loop_and_bridges` parity.  When the CLT

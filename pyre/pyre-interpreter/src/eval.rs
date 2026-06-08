@@ -369,7 +369,7 @@ fn dict_update_from_mapping(dict: PyObjectRef, source: PyObjectRef) -> Result<()
         }
     }
     // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr(source, "keys") {
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             let type_name = unsafe { (*(*source).ob_type).name };
@@ -433,7 +433,7 @@ fn dict_merge_from_mapping(
         }
     }
     // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr(source, "keys") {
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             let type_name = unsafe { (*(*source).ob_type).name };
@@ -1035,7 +1035,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        getattr(obj, name)
+        getattr_str(obj, name)
     }
 
     fn store_attr(
@@ -1044,7 +1044,7 @@ impl SharedOpcodeHandler for PyFrame {
         name: &str,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        setattr(obj, name, value).map(|_| ())
+        setattr_str(obj, name, value).map(|_| ())
     }
 }
 
@@ -1886,7 +1886,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
         let exc_type = crate::typedef::r#type(val).unwrap_or(pyre_object::w_none());
         let exc_tb =
-            crate::baseobjspace::getattr(val, "__traceback__").unwrap_or(pyre_object::w_none());
+            crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
         let res = crate::call_function(exit_func, &[exc_type, val, exc_tb]);
         self.push(res);
         Ok(())
@@ -2423,7 +2423,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), PyError> {
         let dict = self.pop();
         // Try dict first (if it's a dict or has attrs)
-        if let Ok(val) = crate::baseobjspace::getattr(dict, name) {
+        if let Ok(val) = crate::baseobjspace::getattr_str(dict, name) {
             self.push(val);
             return Ok(());
         }
@@ -2694,7 +2694,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let value = if !e.exc_object.is_null()
                     && unsafe { pyre_object::is_exception(e.exc_object) }
                 {
-                    crate::baseobjspace::getattr(e.exc_object, "value")
+                    crate::baseobjspace::getattr_str(e.exc_object, "value")
                         .unwrap_or_else(|_| pyre_object::w_none())
                 } else {
                     pyre_object::w_none()
@@ -2739,7 +2739,7 @@ impl OpcodeStepExecutor for PyFrame {
         let _global_super = self.pop();
 
         let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
-        let result = crate::baseobjspace::getattr(proxy, name)?;
+        let result = crate::baseobjspace::getattr_str(proxy, name)?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr
         // is an unbound method (needs self binding) or a staticmethod /
@@ -2769,7 +2769,7 @@ impl OpcodeStepExecutor for PyFrame {
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
-        let attr = crate::baseobjspace::getattr(obj, name)?;
+        let attr = crate::baseobjspace::getattr_str(obj, name)?;
         if unsafe { pyre_object::is_method(attr) } {
             self.push(attr);
             self.push(PY_NULL);
@@ -3246,7 +3246,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
     fn delete_attr(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
-        crate::baseobjspace::delattr(obj, name)?;
+        crate::baseobjspace::delattr_str(obj, name)?;
         Ok(())
     }
 
@@ -3574,7 +3574,10 @@ mod tests {
             .execute_frame(None, None)
             .expect_err("raise from should fail");
         assert_eq!(err.to_exc_object(), exc);
-        assert_eq!(crate::getattr(exc, "__cause__").expect("read cause"), cause);
+        assert_eq!(
+            crate::getattr_str(exc, "__cause__").expect("read cause"),
+            cause
+        );
     }
 
     #[test]
@@ -5670,13 +5673,13 @@ code = f.__code__";
         unsafe {
             let x = pyre_object::w_dict_lookup(globals, pyre_object::w_str_new("x")).unwrap();
             assert_eq!(w_int_get_value(x), 7);
-            let argcount = crate::baseobjspace::getattr(code, "co_argcount").unwrap();
+            let argcount = crate::baseobjspace::getattr_str(code, "co_argcount").unwrap();
             assert_eq!(w_int_get_value(argcount), 1);
-            let kwonly = crate::baseobjspace::getattr(code, "co_kwonlyargcount").unwrap();
+            let kwonly = crate::baseobjspace::getattr_str(code, "co_kwonlyargcount").unwrap();
             assert_eq!(w_int_get_value(kwonly), 1);
-            let name = crate::baseobjspace::getattr(code, "co_name").unwrap();
+            let name = crate::baseobjspace::getattr_str(code, "co_name").unwrap();
             assert_eq!(w_str_get_value(name), "f");
-            let varnames = crate::baseobjspace::getattr(code, "co_varnames").unwrap();
+            let varnames = crate::baseobjspace::getattr_str(code, "co_varnames").unwrap();
             let first = w_tuple_getitem(varnames, 0).unwrap();
             assert_eq!(w_str_get_value(first), "a");
         }

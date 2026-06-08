@@ -763,7 +763,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     }
                 }
                 // Try __fspath__ — for pathlib.Path-like objects.
-                if let Ok(method) = crate::baseobjspace::getattr(arg, "__fspath__") {
+                if let Ok(method) = crate::baseobjspace::getattr_str(arg, "__fspath__") {
                     let result = crate::call_function(method, &[arg]);
                     if !result.is_null() {
                         return Ok(result);
@@ -985,7 +985,7 @@ pub fn register_module(ns: &mut DictStorage) {
             } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
                 let data = pyre_object::bytesobject::bytes_like_data(path_obj);
                 String::from_utf8_lossy(data).into_owned()
-            } else if let Ok(fspath) = crate::baseobjspace::getattr(path_obj, "__fspath__") {
+            } else if let Ok(fspath) = crate::baseobjspace::getattr_str(path_obj, "__fspath__") {
                 let result = crate::call_function(fspath, &[path_obj]);
                 if !result.is_null() && pyre_object::is_str(result) {
                     pyre_object::w_str_get_value(result).to_string()

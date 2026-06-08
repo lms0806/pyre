@@ -266,7 +266,7 @@ macro_rules! pyre_count_typed_args {
 ///     "_random.Random",
 ///     methods: {
 ///         fn __init__(self_obj: PyObjectRef, seed: i64) -> Result<(), crate::PyError> {
-///             crate::baseobjspace::setattr(self_obj, "_state", ::pyre_object::w_int_new(seed))?;
+///             crate::baseobjspace::setattr_str(self_obj, "_state", ::pyre_object::w_int_new(seed))?;
 ///             Ok(())
 ///         }
 ///         fn random(self_obj: PyObjectRef) -> f64 {

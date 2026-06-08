@@ -2279,7 +2279,7 @@ fn build_class_inner(
     // Returns the namespace dict to use for the class body.
     let w_namespace = if let Some(w_metaclass) = w_metaclass {
         if unsafe { pyre_object::is_type(w_metaclass) } {
-            match crate::baseobjspace::getattr(w_metaclass, "__prepare__") {
+            match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
                 Ok(prepare) => {
                     let ns_obj =
                         crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
@@ -2582,7 +2582,7 @@ fn build_class_inner(
                 ns.entries().map(|(k, &v)| (k.to_string(), v)).collect();
             for (attr_name, value) in entries {
                 if !value.is_null() {
-                    if let Ok(set_name) = crate::baseobjspace::getattr(value, "__set_name__") {
+                    if let Ok(set_name) = crate::baseobjspace::getattr_str(value, "__set_name__") {
                         crate::builtins::call_and_check(
                             set_name,
                             &[w, pyre_object::w_str_new(&attr_name)],

@@ -3783,11 +3783,55 @@ impl MIFrame {
         self.orgpc = resume_pc;
 
         // The snapshot's frame.pc must match the liveness PC used by
-        // get_list_of_active_boxes.
-        let snapshot_live_pc = if after_residual_call {
-            self.fallthrough_pc
+        // get_list_of_active_boxes.  For after-residual-call guards the
+        // resume target depends on whether the residual call sits inside
+        // a try-block: only then did the jitcode emit a post-call
+        // `-live-`/`catch_exception` (`after_residual_call_resume_pc` has
+        // an entry keyed by the CALL pc).
+        //
+        //   * try-block call: resume at the call's OWN catch.  Store the
+        //     CALL pc (`saved_orgpc`) with the marker bit folded in so the
+        //     decoder routes it through `after_residual_call_resume_pc`
+        //     rather than `pc_map` (which would re-execute the call).
+        //   * non-try call: no catch to land on, so keep the next-opcode
+        //     resume (`fallthrough_pc`) — the exception then propagates
+        //     out of the frame via `handle_exception_in_frame`, exactly
+        //     as before this fix.
+        //
+        // RPython always keeps `frame.pc` at the post-call `-live-`
+        // (`pyjitpl.py:2610-2624`) and lets `handle_exception_in_frame`
+        // decide catch-vs-propagate; pyre only emits that marker for
+        // try-block calls, so the non-try case falls back here.
+        // The marker bit (1 << 14) steals the top bit of the i16 pc word
+        // `resumecode::append_int` allows.  A *marked* pc ORs the bit onto
+        // a value gated `< 1 << 14`; an *unmarked* pc (no try-block catch,
+        // or the non-after_residual_call path) must independently leave
+        // bit 14 free, or `decode_resume_pc` mis-reads it as marked.  A
+        // function with >= 16384 trace-bytecode units exceeds this and
+        // cannot be encoded under the bit-14 scheme — fail loudly here
+        // rather than corrupt decode silently at resume time
+        // (resumedata.rs:48-62).
+        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
+        let marked = after_residual_call && {
+            let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
+            crate::state::pyjitcode_for_jitcode_index(jitcode_index)
+                .and_then(|pj| pj.after_residual_call_resume_pc_for(saved_orgpc))
+                .is_some()
+        };
+        let snapshot_live_pc = if marked && saved_orgpc < flag {
+            majit_ir::resumedata::encode_after_residual_call_pc(saved_orgpc as i32) as usize
         } else {
-            self.orgpc
+            let raw = if after_residual_call {
+                self.fallthrough_pc
+            } else {
+                self.orgpc
+            };
+            assert!(
+                raw < flag,
+                "resume pc {raw} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
+                 function too large for bit-14 resume encoding"
+            );
+            raw
         };
 
         // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
@@ -3881,6 +3925,16 @@ impl MIFrame {
             } else {
                 &[]
             };
+            // Parent frames never carry the after-residual-call marker, so
+            // their raw resume pc must leave bit 14 free or decode would
+            // mis-read it as marked (resumedata.rs:48-62).
+            assert!(
+                (parent.resume_pc as usize)
+                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
+                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                 function too large for bit-14 resume encoding",
+                parent.resume_pc
+            );
             frames.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent.resume_pc as u32,
@@ -5696,7 +5750,7 @@ impl MIFrame {
         // path: port the rtyper/codewriter inlining + oopspec
         // recognition and remove this arm.
         //
-        // `baseobjspace::getattr` returns a fresh `W_MethodObject` per
+        // `baseobjspace::getattr_str` returns a fresh `W_MethodObject` per
         // iteration, so the receiver is pushed by `load_method` as
         // `null_value` (load_method:6334) and call sees
         // `concrete_callable = W_MethodObject`, with the receiver missing

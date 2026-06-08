@@ -35,7 +35,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
         }
     }
-    if let Ok(method) = crate::baseobjspace::getattr(obj, "__float__") {
+    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__float__") {
         let result = crate::call_function(method, &[obj]);
         if !result.is_null() {
             unsafe {
@@ -48,7 +48,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             }
         }
     }
-    if let Ok(method) = crate::baseobjspace::getattr(obj, "__index__") {
+    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__index__") {
         let result = crate::call_function(method, &[obj]);
         if !result.is_null() {
             unsafe {
@@ -211,7 +211,7 @@ fn math_unary_int(args: &[PyObjectRef], dunder: &str, fname: &str) -> PyResult {
     // override even when the parent float path would also succeed. If the
     // descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
     // propagate that error rather than silently falling back to float.
-    match crate::baseobjspace::getattr(args[0], dunder) {
+    match crate::baseobjspace::getattr_str(args[0], dunder) {
         Ok(method) => {
             crate::call::clear_call_error();
             let result = crate::call_function(method, &[args[0]]);
@@ -498,7 +498,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyErr
         }
     }
     // __index__ dunder — PyPy: descroperation.py space.index.
-    if let Ok(method) = crate::baseobjspace::getattr(obj, "__index__") {
+    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__index__") {
         let result = crate::call_function(method, &[obj]);
         if !result.is_null() {
             unsafe {

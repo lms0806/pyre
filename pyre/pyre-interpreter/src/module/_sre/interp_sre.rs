@@ -340,7 +340,7 @@ fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State, s: &str) -> 
         };
         spans.push(span);
     }
-    let _ = crate::baseobjspace::setattr(m, "_spans", w_list_new(spans));
+    let _ = crate::baseobjspace::setattr_str(m, "_spans", w_list_new(spans));
     m
 }
 
@@ -421,8 +421,8 @@ fn sre_match_group(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         0
     };
-    let string = crate::baseobjspace::getattr(m, "string")?;
-    let spans = crate::baseobjspace::getattr(m, "_spans")?;
+    let string = crate::baseobjspace::getattr_str(m, "string")?;
+    let spans = crate::baseobjspace::getattr_str(m, "_spans")?;
     let s = unsafe { w_str_get_value(string) };
     unsafe {
         if let Some(span) = w_list_getitem(spans, gi as i64) {
@@ -443,8 +443,8 @@ fn sre_match_groups(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Ok(w_tuple_new(vec![]));
     }
     let m = args[0];
-    let string = crate::baseobjspace::getattr(m, "string")?;
-    let spans = crate::baseobjspace::getattr(m, "_spans")?;
+    let string = crate::baseobjspace::getattr_str(m, "string")?;
+    let spans = crate::baseobjspace::getattr_str(m, "_spans")?;
     let s = unsafe { w_str_get_value(string) };
     let n = unsafe { w_list_len(spans) };
     let mut groups = Vec::new();
@@ -475,21 +475,21 @@ fn sre_match_start(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if args.is_empty() {
         return Ok(w_int_new(0));
     }
-    crate::baseobjspace::getattr(args[0], "_start")
+    crate::baseobjspace::getattr_str(args[0], "_start")
 }
 
 fn sre_match_end(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_int_new(0));
     }
-    crate::baseobjspace::getattr(args[0], "_end")
+    crate::baseobjspace::getattr_str(args[0], "_end")
 }
 
 fn sre_match_span(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_tuple_new(vec![w_int_new(0), w_int_new(0)]));
     }
-    let s = crate::baseobjspace::getattr(args[0], "_start")?;
-    let e = crate::baseobjspace::getattr(args[0], "_end")?;
+    let s = crate::baseobjspace::getattr_str(args[0], "_start")?;
+    let e = crate::baseobjspace::getattr_str(args[0], "_end")?;
     Ok(w_tuple_new(vec![s, e]))
 }

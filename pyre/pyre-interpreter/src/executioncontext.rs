@@ -3,6 +3,7 @@ use pyre_object::object_array::{
     ItemsBlock, alloc_list_items_block, dealloc_list_items_block, grow_list_items_block,
     items_block_capacity, items_block_items_base,
 };
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::sync::OnceLock;
 
 use crate::PyFrame;
@@ -40,7 +41,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     if frame.is_null() || w_frame.is_null() {
         return;
     }
-    let new_f_trace = match crate::baseobjspace::getattr(w_frame, "f_trace") {
+    let new_f_trace = match crate::baseobjspace::getattr_str(w_frame, "f_trace") {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -64,7 +65,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
             d.f_lineno = (*frame).get_last_lineno();
         }
     }
-    if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr(w_frame, "f_lineno") {
+    if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr_str(w_frame, "f_lineno") {
         if !new_f_lineno_obj.is_null() && unsafe { pyre_object::is_int(new_f_lineno_obj) } {
             let new_lineno = unsafe { pyre_object::w_int_get_value(new_f_lineno_obj) };
             // TODO: pyframe.py:683-764
@@ -87,7 +88,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     // pyframe.py:799-806 fset_f_trace_lines / fset_f_trace_opcodes.
     // Both setters apply `space.is_true(w_trace)` to coerce arbitrary
     // truthy values; pyre's `is_true` is the equivalent.
-    if let Ok(new_lines_obj) = crate::baseobjspace::getattr(w_frame, "f_trace_lines") {
+    if let Ok(new_lines_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_lines") {
         if !new_lines_obj.is_null() {
             let new_lines = unsafe { crate::baseobjspace::is_true(new_lines_obj) };
             unsafe {
@@ -95,7 +96,7 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
             }
         }
     }
-    if let Ok(new_opcodes_obj) = crate::baseobjspace::getattr(w_frame, "f_trace_opcodes") {
+    if let Ok(new_opcodes_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_opcodes") {
         if !new_opcodes_obj.is_null() {
             let new_opcodes = unsafe { crate::baseobjspace::is_true(new_opcodes_obj) };
             unsafe {
@@ -129,10 +130,12 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // per callback invocation) so the per-trace overhead scales
         // with stack depth rather than total executed bytecodes.
         let f_back_obj = wrap_trace_frame(frame_ref.get_f_back());
-        let _ = crate::baseobjspace::setattr(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
-        let _ = crate::baseobjspace::setattr(w_frame, "f_back", f_back_obj);
+        let _ =
+            crate::baseobjspace::setattr_str(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
+        let _ = crate::baseobjspace::setattr_str(w_frame, "f_back", f_back_obj);
         // pyframe.py:768-771 fget_f_builtins → self.get_builtin().getdict(space)
-        let _ = crate::baseobjspace::setattr(w_frame, "f_builtins", frame_ref.fget_f_builtins());
+        let _ =
+            crate::baseobjspace::setattr_str(w_frame, "f_builtins", frame_ref.fget_f_builtins());
         // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
         // directly — same identity as `module.__dict__` so trace
         // hooks (`sys.settrace`) observe `frame.f_globals is
@@ -142,7 +145,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // allocating a fresh dict per trace callback would silently
         // break that identity.  `f_locals` follows the same shape (PyPy
         // `pyframe.py:546 fast2locals` then `self.debugdata.w_locals`).
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_globals",
             if w_globals_obj.is_null() {
@@ -151,7 +154,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
                 w_globals_obj
             },
         );
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_locals",
             if w_locals.is_null() {
@@ -166,17 +169,17 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
                 )
             },
         );
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_lineno",
             pyre_object::w_int_new(frame_ref.fget_f_lineno() as i64),
         );
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_lasti",
             pyre_object::w_int_new(frame_ref.fget_f_lasti() as i64),
         );
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_trace",
             if w_trace.is_null() {
@@ -191,12 +194,12 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // callback can read or set them.  flush_trace_frame_writeback
         // copies the wrapper's post-callback values back onto the
         // live frame.
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_trace_lines",
             pyre_object::w_bool_from(frame_ref.get_f_trace_lines()),
         );
-        let _ = crate::baseobjspace::setattr(
+        let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_trace_opcodes",
             pyre_object::w_bool_from(frame_ref.get_f_trace_opcodes()),
@@ -274,7 +277,7 @@ pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize = std::mem::offset_of!(DictStora
 /// `ITEMS_BLOCK_ITEMS_OFFSET` for the items base pointer.
 #[repr(C)]
 pub struct DictStorage {
-    names: Vec<String>,
+    names: Vec<Wtf8Buf>,
     /// Number of live entries. Matches upstream `l.length` (rlist.py:
     /// 116).
     length: usize,
@@ -433,7 +436,16 @@ impl DictStorage {
 
     #[inline]
     pub fn slot_of(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|candidate| candidate == name)
+        self.slot_of_wtf8(Wtf8::new(name))
+    }
+
+    /// WTF-8 keyed slot lookup — surrogate-safe sibling of [`slot_of`].
+    #[inline]
+    pub fn slot_of_wtf8(&self, name: &Wtf8) -> Option<usize> {
+        let key = name.as_bytes();
+        self.names
+            .iter()
+            .position(|candidate| candidate.as_bytes() == key)
     }
 
     pub fn get(&self, name: &str) -> Option<&PyObjectRef> {
@@ -441,14 +453,29 @@ impl DictStorage {
         Some(unsafe { &self.values_slice()[idx] })
     }
 
+    /// WTF-8 keyed read — surrogate-safe sibling of [`get`].
+    pub fn get_wtf8(&self, name: &Wtf8) -> Option<&PyObjectRef> {
+        let idx = self.slot_of_wtf8(name)?;
+        Some(unsafe { &self.values_slice()[idx] })
+    }
+
     /// Iterate over (name, value) pairs, skipping tombstoned slots.
+    /// Lone-surrogate names have no `&str` form and are skipped here;
+    /// callers that must observe them use [`entries_wtf8`].
     pub fn entries(&self) -> impl Iterator<Item = (&str, &PyObjectRef)> {
+        self.entries_wtf8()
+            .filter_map(|(name, value)| name.as_str().ok().map(|s| (s, value)))
+    }
+
+    /// Iterate over (name, value) pairs as raw WTF-8, skipping
+    /// tombstoned slots — surrogate-safe sibling of [`entries`].
+    pub fn entries_wtf8(&self) -> impl Iterator<Item = (&Wtf8, &PyObjectRef)> {
         let values = unsafe { self.values_slice() };
         self.names
             .iter()
             .zip(values.iter())
             .filter(|(name, _)| !name.is_empty())
-            .map(|(name, value)| (name.as_str(), value))
+            .map(|(name, value)| (&**name, value))
     }
 
     #[inline]
@@ -470,7 +497,7 @@ impl DictStorage {
             return unsafe { self.values_slice()[idx] };
         }
         let value = make();
-        self.names.push(name.to_string());
+        self.names.push(Wtf8Buf::from_string(name.to_string()));
         unsafe { self.push(value) };
         self.slot_watchers.push(Vec::new());
         if !self.mirror_target.is_null() {
@@ -495,7 +522,7 @@ impl DictStorage {
             }
             Some(old)
         } else {
-            self.names.push(name.clone());
+            self.names.push(Wtf8Buf::from_string(name.clone()));
             unsafe { self.push(value) };
             self.slot_watchers.push(Vec::new());
             None
@@ -509,6 +536,37 @@ impl DictStorage {
         if !self.mirror_target.is_null() {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    self.mirror_target,
+                    &name,
+                    value,
+                );
+            }
+        }
+        result
+    }
+
+    /// WTF-8 keyed store — surrogate-safe sibling of [`insert`].  The
+    /// back-mirror uses the WTF-8 no-proxy setter so a lone-surrogate
+    /// key reaches the bound `W_DictObject` (which is `ObjectKey`-keyed
+    /// and surrogate-safe).
+    pub fn insert_wtf8(&mut self, name: Wtf8Buf, value: PyObjectRef) -> Option<PyObjectRef> {
+        let result = if let Some(idx) = self.slot_of_wtf8(&name) {
+            let slice = unsafe { self.values_slice_mut() };
+            let old = slice[idx];
+            slice[idx] = value;
+            if old != value {
+                self.notify_slot_watchers(idx);
+            }
+            Some(old)
+        } else {
+            self.names.push(name.clone());
+            unsafe { self.push(value) };
+            self.slot_watchers.push(Vec::new());
+            None
+        };
+        if !self.mirror_target.is_null() {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
                     self.mirror_target,
                     &name,
                     value,
@@ -533,6 +591,28 @@ impl DictStorage {
         if !self.mirror_target.is_null() {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(self.mirror_target, name);
+            }
+        }
+        result
+    }
+
+    /// WTF-8 keyed deletion — surrogate-safe sibling of [`remove`].
+    pub fn remove_wtf8(&mut self, name: &Wtf8) -> Option<PyObjectRef> {
+        let result = if let Some(idx) = self.slot_of_wtf8(name) {
+            self.notify_slot_watchers(idx);
+            self.names.remove(idx);
+            let old = unsafe { self.remove_at(idx) };
+            self.slot_watchers.remove(idx);
+            Some(old)
+        } else {
+            None
+        };
+        if !self.mirror_target.is_null() {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_delitem_wtf8_no_proxy(
+                    self.mirror_target,
+                    name,
+                );
             }
         }
         result
@@ -587,8 +667,8 @@ impl DictStorage {
     }
 
     #[inline]
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.names.iter().filter(|n| !n.is_empty())
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries().map(|(name, _)| name)
     }
 
     /// Remove all entries from the namespace.

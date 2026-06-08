@@ -38,7 +38,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals,
-    function_get_globals_obj, function_get_name, is_function, register_jit_function_caller,
+    function_get_globals_obj, function_get_name, is_function, register_jit_exc_raiser,
+    register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -379,6 +380,17 @@ extern "C" fn jit_call_user_function_from_frame(
             0 // garbage — GUARD_NO_EXCEPTION will fire
         }
     }
+}
+
+/// Backend bridge for pyre-interpreter's residual-call helpers, which
+/// cannot reference the backend crates directly. Publishes a materialised
+/// exception object into the active backend's _store_exception cells so
+/// the GuardNoException after the call detects it.
+extern "C" fn jit_exc_raise_shim(value: i64) {
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_raise(value);
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_raise(value);
 }
 
 #[majit_macros::jit_may_force]
@@ -1045,6 +1057,7 @@ pub fn install_jit_call_bridge() {
             majit_ir::value::default_unicode_hash,
         );
         register_jit_function_caller(jit_call_user_function_from_frame);
+        register_jit_exc_raiser(jit_exc_raise_shim);
         // compile.py:1090 `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // pyre's lazy `W_ExceptionObject(MemoryError, "")` singleton
@@ -1260,6 +1273,15 @@ fn jit_blackhole_resume_from_guard(
         // pool; TAGCONST Ref entries stay visible to `walk_rd_consts_refs`.
         // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
         // deferred field writes must be replayed before consume_vref_and_vable.
+        // blackhole.py:1794 `current_exc = _prepare_resume_from_failure(
+        // guard_opnum, deadframe)`. The CALL_ASSEMBLER resume reaches here
+        // through the C-ABI with raw fail-value pointers, not a `DeadFrame`,
+        // so `cpu.grab_exc_value(deadframe)` (which reads the JITFRAME
+        // `jf_guard_exc` field set by `emit_guard_exit`) is not yet wired in
+        // on this path. Pass 0 (no pending exception) — unchanged from the
+        // prior behavior — until the JITFRAME exc field is threaded through
+        // the CALL_ASSEMBLER guard-exit ABI.
+        let guard_exc = 0;
         let result = blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -1267,6 +1289,7 @@ fn jit_blackhole_resume_from_guard(
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             deadframe_types.as_deref(),
+            guard_exc,
         );
         return handle_blackhole_result(result, actual_green_key);
     }
@@ -1293,6 +1316,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
+    guard_exc: i64,
 ) -> BlackholeResult {
     let nbody_debug = pyre_nbody_debug_enabled();
     use majit_metainterp::resume;
@@ -1324,7 +1348,7 @@ pub fn blackhole_resume_via_rd_numb(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let resolved_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
+        let resolved_pc = pyjitcode.resolve_resume_pc(pc)?;
         // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
         // `state::code_for_jitcode_index` indices name the runtime
         // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
@@ -1443,6 +1467,43 @@ pub fn blackhole_resume_via_rd_numb(
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
+    }
+
+    // blackhole.py:1794-1795 resume_in_blackhole:
+    //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
+    //   _run_forever(blackholeinterp, current_exc)
+    // `_resume_mainloop` prologue (blackhole.py:1614-1618): when the guard
+    // failure carries a pending exception (GUARD_NO_EXCEPTION /
+    // GUARD_EXCEPTION / GUARD_NOT_FORCED → `cpu.grab_exc_value(deadframe)`),
+    // hand it to the resumed frame before running any bytecode so an
+    // exception guard unwinds to its `catch_exception` handler instead of
+    // resuming the no-exception path. `_run_forever` re-offers the exception
+    // to each caller in turn (resume_mainloop returns the unhandled exc, the
+    // loop advances to nextblackholeinterp), so walk the chain here.
+    if guard_exc != 0 {
+        loop {
+            if bh.handle_exception_in_frame(guard_exc) {
+                // Handler found in this frame; `position` now points at it.
+                // Fall through to the run loop to execute the handler.
+                break;
+            }
+            // blackhole.py:1616 no handler here → propagate to the caller.
+            let next = bh.nextblackholeinterp.take();
+            release_bh_rd(bh);
+            match next {
+                Some(caller) => bh = *caller,
+                None => {
+                    // blackhole.py:1629 bottommost frame, unhandled →
+                    // raise ExitFrameWithExceptionRef(exc).
+                    let err = unsafe {
+                        pyre_interpreter::PyError::from_exc_object(
+                            guard_exc as pyre_object::PyObjectRef,
+                        )
+                    };
+                    return BlackholeResult::ExitFrameWithExceptionRef(err);
+                }
+            }
+        }
     }
 
     // blackhole.py:1752 _run_forever parity.
@@ -3504,7 +3565,7 @@ pub fn cranelift_resumedata_deopt(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let resolved_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
+        let resolved_pc = pyjitcode.resolve_resume_pc(pc)?;
         Some((pyjitcode.jitcode.clone(), resolved_pc, op_live))
     };
 

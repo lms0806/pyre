@@ -13245,6 +13245,12 @@ pub enum DetailedDriverRunOutcome {
         raw_values: Vec<i64>,
         /// Guard exit layout (rd_numb, fail_arg_types, etc.).
         exit_layout: CompiledExitLayout,
+        /// `cpu.grab_exc_value(deadframe)` (llmodel.py:240) — the pending
+        /// exception object captured at guard failure (0 if none). Seeds
+        /// the blackhole resume (blackhole.py:1794
+        /// `_prepare_resume_from_failure`) so an exception guard unwinds
+        /// to its handler instead of resuming the no-exception path.
+        guard_exc: i64,
     },
     Abort {
         restored: bool,

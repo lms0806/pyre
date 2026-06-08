@@ -16,8 +16,8 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let obj = w_instance_new(crate::typedef::w_object());
-    let _ = crate::baseobjspace::setattr(obj, "name", args[0]);
-    let _ = crate::baseobjspace::setattr(
+    let _ = crate::baseobjspace::setattr_str(obj, "name", args[0]);
+    let _ = crate::baseobjspace::setattr_str(
         obj,
         "get",
         // `W_ContextVar.get(*default)` raises LookupError when no
@@ -31,7 +31,7 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ))
         }),
     );
-    let _ = crate::baseobjspace::setattr(
+    let _ = crate::baseobjspace::setattr_str(
         obj,
         "set",
         crate::make_builtin_function_with_arity("set", |_| Ok(w_none()), 2),

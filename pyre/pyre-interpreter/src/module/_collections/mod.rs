@@ -20,7 +20,7 @@ mod deque_class {
     use super::*;
 
     fn data(self_obj: PyObjectRef) -> Option<PyObjectRef> {
-        crate::baseobjspace::getattr(self_obj, "__data__").ok()
+        crate::baseobjspace::getattr_str(self_obj, "__data__").ok()
     }
 
     /// Snapshot the backing list into a `Vec`.
@@ -37,14 +37,14 @@ mod deque_class {
 
     /// Replace the backing list with `items`.
     fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
-        let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_list_new(items));
+        let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_list_new(items));
     }
 
     /// `self.maxlen`: `None` (unbounded) or a non-negative bound.  The
     /// bound is validated non-negative at construction, so the stored
     /// value is read back directly.
     fn maxlen_bound(self_obj: PyObjectRef) -> Option<usize> {
-        let w = crate::baseobjspace::getattr(self_obj, "__maxlen__").ok()?;
+        let w = crate::baseobjspace::getattr_str(self_obj, "__maxlen__").ok()?;
         if w.is_null() || unsafe { is_none(w) } {
             None
         } else {
@@ -114,7 +114,7 @@ mod deque_class {
         }
         let ty = unsafe { w_instance_get_type(self_obj) };
         let list = w_list_new(items);
-        match crate::baseobjspace::getattr(self_obj, "__maxlen__") {
+        match crate::baseobjspace::getattr_str(self_obj, "__maxlen__") {
             Ok(m) if !(m.is_null() || unsafe { is_none(m) }) => {
                 crate::call::call_function_impl_result(ty, &[list, m])
             }
@@ -157,7 +157,7 @@ mod deque_class {
                     }
                     _ => w_none(),
                 };
-                let _ = crate::baseobjspace::setattr(self_obj, "__maxlen__", w_maxlen);
+                let _ = crate::baseobjspace::setattr_str(self_obj, "__maxlen__", w_maxlen);
                 if let Some(it) = iterable {
                     for item in crate::builtins::collect_iterable(it)? {
                         do_append(self_obj, item);
@@ -277,7 +277,7 @@ mod deque_class {
                 // `type(self)(self)` or `type(self)(self, maxlen)`.
                 let ty = unsafe { w_instance_get_type(self_obj) };
                 let list = w_list_new(snapshot(self_obj));
-                match crate::baseobjspace::getattr(self_obj, "__maxlen__") {
+                match crate::baseobjspace::getattr_str(self_obj, "__maxlen__") {
                     Ok(m) if !(m.is_null() || unsafe { is_none(m) }) =>
                         crate::call::call_function_impl_result(ty, &[list, m]),
                     _ => crate::call::call_function_impl_result(ty, &[list]),
@@ -385,7 +385,7 @@ mod deque_class {
         properties: {
             // GetSetProperty fget is invoked as `fget(descriptor, instance)`.
             fn maxlen(_descr: PyObjectRef, self_obj: PyObjectRef) -> PyObjectRef {
-                crate::baseobjspace::getattr(self_obj, "__maxlen__")
+                crate::baseobjspace::getattr_str(self_obj, "__maxlen__")
                     .unwrap_or_else(|_| w_none())
             }
         }
@@ -406,23 +406,23 @@ mod defaultdict_class {
         "defaultdict",
         methods: {
             fn __init__(self_obj: PyObjectRef, factory: Option<PyObjectRef>) {
-                let _ = crate::baseobjspace::setattr(
+                let _ = crate::baseobjspace::setattr_str(
                     self_obj, "default_factory", factory.unwrap_or(w_none()));
-                let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_dict_new());
+                let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_dict_new());
             }
             fn __getitem__(self_obj: PyObjectRef, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
                 // `interp_defaultdict.py W_DefaultDict.missing` — present key
                 // returns stored value; missing key + no factory raises
                 // KeyError(key); missing key + factory invokes the factory
                 // and stores the result.
-                let d = crate::baseobjspace::getattr(self_obj, "__data__")
+                let d = crate::baseobjspace::getattr_str(self_obj, "__data__")
                     .map_err(|_| crate::PyError::key_error_with_key(key))?;
                 unsafe {
                     if let Some(v) = w_dict_lookup(d, key) {
                         return Ok(v);
                     }
                 }
-                let factory = crate::baseobjspace::getattr(self_obj, "default_factory")
+                let factory = crate::baseobjspace::getattr_str(self_obj, "default_factory")
                     .unwrap_or_else(|_| w_none());
                 if factory.is_null() || unsafe { is_none(factory) } {
                     return Err(crate::PyError::key_error_with_key(key));
@@ -432,7 +432,7 @@ mod defaultdict_class {
                 Ok(value)
             }
             fn __setitem__(self_obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
-                if let Ok(d) = crate::baseobjspace::getattr(self_obj, "__data__") {
+                if let Ok(d) = crate::baseobjspace::getattr_str(self_obj, "__data__") {
                     unsafe { w_dict_store(d, key, value) };
                 }
             }

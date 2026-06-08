@@ -2424,6 +2424,68 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     }
 }
 
+/// WTF-8 keyed sibling of `w_dict_setitem_str_no_proxy` — lets a
+/// lone-surrogate namespace key reach the back-mirror `W_DictObject`.
+/// The dict is forced onto `ObjectDictStrategy` (ObjectKey-keyed via
+/// hashed WTF-8 bytes); the Unicode strategy's str fast paths would
+/// hit `w_str_get_value`, which panics on a lone surrogate.  Only the
+/// regular (Instance) `W_DictObject` shape back-mirrors a type
+/// namespace, so the module-dict case is a no-op.
+///
+/// # Safety
+/// `obj` must point to a valid regular `W_DictObject`.
+pub unsafe fn w_dict_setitem_wtf8_no_proxy(
+    obj: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+    value: PyObjectRef,
+) {
+    if is_module_dict(obj) {
+        return;
+    }
+    let dict = &mut *(obj as *mut W_DictObject);
+    let s = dict.dstrategy as *const _ as *const u8;
+    let is_object = std::ptr::eq(
+        s,
+        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
+    );
+    if !is_object {
+        dict.dstrategy.switch_to_object_strategy(obj);
+    }
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+    entries.insert(object_key_for(w_key), value);
+    dict_write_barrier(obj);
+}
+
+/// WTF-8 keyed sibling of `w_dict_delitem_str_no_proxy`.
+///
+/// # Safety
+/// `obj` must point to a valid regular `W_DictObject`.
+pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wtf8::Wtf8) -> bool {
+    if is_module_dict(obj) {
+        return false;
+    }
+    let dict = &mut *(obj as *mut W_DictObject);
+    let s = dict.dstrategy as *const _ as *const u8;
+    let is_empty = std::ptr::eq(
+        s,
+        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
+    );
+    if is_empty {
+        return false;
+    }
+    let is_object = std::ptr::eq(
+        s,
+        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
+    );
+    if !is_object {
+        dict.dstrategy.switch_to_object_strategy(obj);
+    }
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+    entries.shift_remove(&object_key_for(w_key)).is_some()
+}
+
 /// `pypy/objspace/std/dictmultiobject.py:469-471 W_DictMultiObject.descr_delitem`
 /// — `space.delitem(w_dict, w_key)` which calls
 /// `w_dict.get_strategy().delitem(w_dict, w_key)`.  PyPy has no
@@ -2777,8 +2839,13 @@ pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
     let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
         return entries.len();
     };
-    let non_str = entries.keys().filter(|k| !crate::is_str(k.obj)).count();
-    storage_items.len() + non_str
+    // The proxy str view covers valid-UTF-8 str keys; count the IndexMap
+    // entries it cannot represent (non-str and lone-surrogate str keys).
+    let extra = entries
+        .keys()
+        .filter(|k| !(crate::is_str(k.obj) && crate::w_str_get_value_opt(k.obj).is_some()))
+        .count();
+    storage_items.len() + extra
 }
 
 /// Iterate over all (key, value) pairs without type assumptions.
@@ -3005,7 +3072,14 @@ pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef
         .map(|(name, value)| (crate::w_str_new(&name), value))
         .collect();
     for (key, &v) in entries.iter() {
-        if !crate::is_str(key.obj) {
+        // The proxy str view above is authoritative for valid-UTF-8 str
+        // keys; a lone-surrogate str key has no `&str` form and is dropped
+        // there, so the IndexMap is its only source.  Add every IndexMap
+        // entry the proxy view does not already cover (non-str keys and
+        // surrogate str keys).
+        let covered_by_proxy =
+            crate::is_str(key.obj) && crate::w_str_get_value_opt(key.obj).is_some();
+        if !covered_by_proxy {
             out.push((key.obj, v));
         }
     }
@@ -3052,7 +3126,10 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         .map(|(name, value)| (crate::w_str_new(&name), value))
         .collect();
     for &(k, v) in local.iter() {
-        if !crate::is_str(k) {
+        // See `w_dict_items_object_strategy`: keep IndexMap keys the proxy
+        // str view cannot represent — non-str and lone-surrogate str keys.
+        let covered_by_proxy = crate::is_str(k) && crate::w_str_get_value_opt(k).is_some();
+        if !covered_by_proxy {
             out.push((k, v));
         }
     }

@@ -795,7 +795,11 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             None => return 0,
         };
         let payload = &jc.payload;
-        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
+        // The rd_numb pc word may carry the after-residual-call marker;
+        // `resolve_resume_pc` routes it through the right map, while
+        // `real_pc` is the plain Python PC for the py_pc-keyed fallbacks.
+        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
+        let resolved_jit_pc: Option<usize> = payload.resolve_resume_pc(pc);
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
@@ -835,7 +839,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             let depth = payload
                 .metadata
                 .depth_at_py_pc
-                .get(pc as usize)
+                .get(real_pc as usize)
                 .copied()
                 .unwrap_or(0) as usize;
             return payload.metadata.stack_base + depth;
@@ -990,11 +994,15 @@ pub fn frame_liveness_reg_indices_by_bank_at(
         // Without this fallback, `setup_bridge_sym`'s `reg_indices.len() ==
         // frame.values.len()` assert fires on every guard exit out of a
         // portal-bridge trace.
+        // The rd_numb pc word may carry the after-residual-call marker;
+        // `real_pc` is the plain Python PC for the py_pc-keyed fallback,
+        // `resolve_resume_pc` routes the marker through the right map.
+        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
         if payload.is_portal_bridge() {
             let depth = payload
                 .metadata
                 .depth_at_py_pc
-                .get(pc as usize)
+                .get(real_pc as usize)
                 .copied()
                 .unwrap_or(0) as usize;
             let total = payload.metadata.stack_base + depth;
@@ -1004,7 +1012,7 @@ pub fn frame_liveness_reg_indices_by_bank_at(
                 float: Vec::new(),
             };
         }
-        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
+        let resolved_jit_pc: Option<usize> = payload.resolve_resume_pc(pc);
         let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };
@@ -7115,7 +7123,16 @@ impl JitState for PyreJitState {
         // blackhole.py:337: position was set by setposition(jitcode, pc) where
         // pc comes from rd_numb — the same orgpc used by get_list_of_active_boxes.
         // next_instr = orgpc + 1 + caches, which may have different liveness.
-        let live_pc = self.resume_pc.take().unwrap_or_else(|| self.next_instr());
+        // `self.resume_pc` is the rd_numb pc word (set from
+        // `RebuiltFrame.pc`), so it may carry the after-residual-call
+        // marker.  Split it: `live_pc` is the plain Python PC for all
+        // py_pc-keyed liveness lookups, `live_after_residual_call`
+        // selects the post-call resume map below.
+        let live_pc_raw = self.resume_pc.take().unwrap_or_else(|| self.next_instr());
+        let (live_pc, live_after_residual_call) = {
+            let (p, a) = majit_ir::resumedata::decode_resume_pc(live_pc_raw as i32);
+            (p as usize, a)
+        };
         let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         // resume.py:1077 consume_boxes parity — iterate the SAME
         // `all_liveness` BC_LIVE data the encoder used in
@@ -7181,7 +7198,12 @@ impl JitState for PyreJitState {
                 }
                 return true;
             }
-            let Some(jit_pc) = payload.resume_jitcode_pc_for(live_pc) else {
+            let resolved_jit_pc = if live_after_residual_call {
+                payload.after_residual_call_resume_pc_for(live_pc)
+            } else {
+                payload.resume_jitcode_pc_for(live_pc)
+            };
+            let Some(jit_pc) = resolved_jit_pc else {
                 return false;
             };
             let all_liveness = liveness_info_snapshot();
@@ -8586,7 +8608,7 @@ mod tests {
             OpcodeStepExecutor::raise_varargs(&mut state, 2).expect_err("raise from should raise");
         assert_eq!(err.to_exc_object(), exc);
         assert_eq!(
-            pyre_interpreter::getattr(exc, "__cause__").expect("read cause"),
+            pyre_interpreter::getattr_str(exc, "__cause__").expect("read cause"),
             cause
         );
     }
@@ -10154,6 +10176,7 @@ mod tests {
             runtime_jitcode,
             crate::PyJitCodeMetadata {
                 pc_map: vec![0],
+                after_residual_call_resume_pc: vec![None],
                 depth_at_py_pc: vec![2],
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,

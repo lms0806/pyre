@@ -17,6 +17,17 @@ pub struct FrameData {
     /// Original `jf_descr` object identity when the exit used an attached
     /// metainterp descr (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub(crate) latest_descr: Option<DescrRef>,
+    /// `jf_guard_exc` captured off the deadframe tip before the libc jitframe
+    /// chain is freed.  `cpu.grab_exc_value(deadframe)` (llmodel.py:240) reads
+    /// it back; the jitframe is gone by then, so the value is staged here.
+    ///
+    /// Held as a bare `GcRef` (not a registered GC root): exception instances
+    /// are `malloc_typed` Box-immortal today (excobject.rs:843-844), so the
+    /// pointer can never dangle.  The whole exception channel
+    /// (`ExceptionState.exc_value`, threaded as a raw `i64`) shares this
+    /// assumption; future GC-managed exceptions must root all of it, not just
+    /// this slot.
+    pub(crate) exc_value: GcRef,
 }
 
 impl std::fmt::Debug for FrameData {
@@ -33,11 +44,17 @@ impl std::fmt::Debug for FrameData {
 }
 
 impl FrameData {
-    pub fn new(raw_values: Vec<i64>, fail_descr: DescrRef, latest_descr: Option<DescrRef>) -> Self {
+    pub fn new(
+        raw_values: Vec<i64>,
+        fail_descr: DescrRef,
+        latest_descr: Option<DescrRef>,
+        exc_value: GcRef,
+    ) -> Self {
         FrameData {
             raw_values,
             fail_descr,
             latest_descr,
+            exc_value,
         }
     }
 

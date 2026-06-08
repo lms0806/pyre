@@ -45,6 +45,57 @@ pub const TAGINT: u8 = 1;
 pub const TAGBOX: u8 = 2;
 pub const TAGVIRTUAL: u8 = 3;
 
+/// After-residual-call marker folded into a snapshot frame's pc word.
+///
+/// The same Python PC serves two resume semantics: a normal guard at a
+/// `residual_call` opcode re-executes from the call start
+/// (`pc_map[pc]`), while an after-residual-call guard (`GUARD_EXCEPTION`
+/// / `GUARD_NO_EXCEPTION` / `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS`)
+/// must resume at the call's own post-call `-live-`/`catch_exception`
+/// (`PyJitCode.after_residual_call_resume_pc`).  RPython keeps
+/// `frame.pc` at the post-call jitcode position
+/// (`pyjitpl.py:2610-2624 capture_resumedata(resumepc=-1)`); pyre stores
+/// the Python PC and translates at decode time, so this high bit on the
+/// rd_numb pc word carries the distinction without a format change.
+///
+/// Stealing bit 14 narrows the storable Python PC from `append_int`'s
+/// full `i16` range down to `[0, 1 << 14)`: a pc `>= 1 << 14` sets bit 14
+/// on its own and `decode_resume_pc` would mis-read it as marked.
+/// RPython has no such cap at this layer — it stores the JitCode pc
+/// directly (`pyjitpl.py:2610-2624`), needing no marker bit.  This is a
+/// PRE-EXISTING-ADAPTATION of pyre's pc_map indirection (resume.rs:259-263
+/// stores the Python PC, not the jitcode offset); the convergence path is
+/// to store the jitcode pc directly and drop both pc_map and this marker.
+/// Until then every resume pc is bounds-checked against this constant at
+/// capture — marked pcs through `encode_after_residual_call_pc`, unmarked
+/// pcs at their `build_framestack_snapshot` / `capture_resumedata` sites —
+/// so an out-of-range pc fails loudly at trace time instead of corrupting
+/// decode at resume time.
+pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
+
+/// Fold the after-residual-call marker into a snapshot frame pc word.
+/// `pc` must be a non-negative Python PC `< AFTER_RESIDUAL_CALL_PC_FLAG`.
+/// The bound is enforced in release builds, not only under `debug_assert`,
+/// because a stored pc `>= 1 << 14` is silently mis-decoded as marked.
+pub fn encode_after_residual_call_pc(pc: i32) -> i32 {
+    assert!(
+        pc >= 0 && pc < AFTER_RESIDUAL_CALL_PC_FLAG,
+        "after-residual-call pc {pc} out of range for marker bit"
+    );
+    pc | AFTER_RESIDUAL_CALL_PC_FLAG
+}
+
+/// Split a snapshot frame pc word into `(python_pc, after_residual_call)`.
+/// A negative word (sentinel / invalid pc) passes through unflagged so the
+/// existing `pc < 0` guards keep rejecting it.
+pub fn decode_resume_pc(raw_pc: i32) -> (i32, bool) {
+    if raw_pc >= 0 && raw_pc & AFTER_RESIDUAL_CALL_PC_FLAG != 0 {
+        (raw_pc & !AFTER_RESIDUAL_CALL_PC_FLAG, true)
+    } else {
+        (raw_pc, false)
+    }
+}
+
 /// `resume.py` tag discriminator used by `ResumeValueSource` /
 /// `ResumeValueLayoutSummary` to record where a guard-time value
 /// comes from.  Moved here from `majit-metainterp::resume` so it can
