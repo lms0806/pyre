@@ -209,6 +209,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
+            unsafe_fn_stubs: Vec::new(),
         }),
     )
 }
@@ -406,6 +407,9 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         enum_variant_by_discriminant,
         struct_origins,
         struct_field_attrs,
+        // Populated post-build in `build_semantic_program_via_active_frontend`
+        // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
+        unsafe_fn_stubs: Vec::new(),
     })
 }
 
@@ -2746,6 +2750,89 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
+/// Charon-sourced equivalent of the syn
+/// `flowspace::rust_source::register::extract_unsafe_fn_stubs`: collect
+/// `(path-segments, Signature, return-lltype)` for every local `unsafe
+/// fn` / unsafe impl-method whose return type projects to `Void` (unit)
+/// or `Bool`.  These callees cannot lower their bodies (raw-pointer
+/// access the flowspace adapter does not model), but downstream
+/// `OpKind::Call::FunctionPath` sites still need their signature
+/// registered so the dual gate does not Skip with "not registered in
+/// PyreCallRegistry".
+///
+/// The single registration key must equal the call-site lookup. A free
+/// fn keys as the crate-included `name_path()` split on every `::`
+/// (`["pyre_interpreter", "objspace", "std", "mapdict", "fn"]`) — the
+/// exact segment vector the Call terminator and `FnDef`-constant
+/// call-sites emit (`call_target_segments` / `decode_constant` both
+/// `name_path().split("::")` without stripping the crate).
+/// `register_unsafe_fn_stubs` registers a single verbatim key with no
+/// alias fan-out (unlike `free_function_alias_paths`), and three-plus-
+/// segment paths are excluded from the `lookup_with_leaf_match`
+/// fallback, so a crate-stripped or module-collapsed key would miss the
+/// nested call site.  An impl method keys as
+/// `[owner-module-segments..., Owner, method]` (the
+/// `impl_method_owner_for_fundecl` qualified owner split on `::`).
+/// Argument names are synthesised `arg{N}` by
+/// `signature.inputs.len()`; the receiver is counted on both sides
+/// (Charon includes `self` in `inputs`, the syn
+/// `extract_argnames_from_sig` emits a `self` entry), so the count
+/// matches.  Return types other than unit / bool surface no entry,
+/// preserving the original "not registered" Skip for those fns —
+/// matches `simple_return_type_to_lltype`'s Void/Bool-only projection.
+pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    use crate::flowspace::argument::Signature;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if !fd.signature.is_unsafe {
+            continue;
+        }
+        // Global initializers are synthetic, not user-callable fns; the
+        // MIR-driver lowering loop skips them too.
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        // Reference returns (`&bool`, `&()`, …) are not plain unit/bool
+        // stubs: `tyref_to_ast_string` strips the reference to its
+        // referent, which would misclassify `&bool` as `bool`.  The syn
+        // extractor's `simple_return_type_to_lltype` rejects
+        // `syn::Type::Reference`, so skip references here to match it.
+        if output_type_is_ref(&fd.signature.output, llbc) {
+            continue;
+        }
+        let lltype = match tyref_to_ast_string(&fd.signature.output, llbc).as_str() {
+            "()" => LowLevelType::Void,
+            "bool" => LowLevelType::Bool,
+            _ => continue,
+        };
+        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
+            Some((owner_qualified, leaf)) => {
+                let mut segs: Vec<String> = owner_qualified.split("::").map(String::from).collect();
+                segs.push(leaf);
+                segs
+            }
+            None => fd
+                .item_meta
+                .name_path()
+                .split("::")
+                .map(String::from)
+                .collect(),
+        };
+        let argnames: Vec<String> = (0..fd.signature.inputs.len())
+            .map(|i| format!("arg{i}"))
+            .collect();
+        out.push((segments, Signature::new(argnames, None, None), lltype));
+    }
+    out
+}
+
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
 fn resolve_impl_owner_adt_def_id_free(
     llbc: &Llbc,
@@ -3338,6 +3425,50 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|t| t.as_array())
         .is_some_and(|t| t.is_empty());
     is_tuple && empty_types
+}
+
+/// True when `ty`'s top-level constructor — after the dedup /
+/// hash-cons indirections [`charon_type_value_to_ast_string`] itself
+/// follows — is a reference (`&T` / `&mut T`).
+///
+/// `tyref_to_ast_string` strips references to their referent, so a
+/// `-> &bool` return would otherwise classify as a plain `bool` stub.
+/// `simple_return_type_to_lltype` rejects `syn::Type::Reference` (only
+/// a bare `bool` / unit projects), so the unsafe-stub collector skips
+/// reference returns to keep the stub set parity-exact.
+fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut node = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(body) => {
+                    node = body;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj.contains_key("Ref");
+    }
+    false
 }
 
 /// Resolve a Charon [`TyRef`] to the Rust type STRING the

@@ -764,40 +764,15 @@ pub struct CallControl {
     /// itself carries the immutability.  Pyre annotates per-field; the
     /// summary collapses field-level marks to type-level lookup keys.
     pub immutable_array_types: HashSet<String>,
-    /// Per-source-file module path collected from
-    /// `ParsedInterpreter.module_path` (`parse.rs:parse_source_with_module`).
-    /// Indexed by file order at `analyze_pipeline_from_parsed` invocation
-    /// time.  Each entry is the crate-stripped module path
-    /// (`build.rs::module_path_from_source_file`).
-    ///
-    /// PyPy bookkeeper resolves names lexically per source-file scope
-    /// (`bookkeeper.getdesc(value)` + `annrpython.Bookkeeper.position`).
-    /// Pyre's analyzer currently routes the canonicalisation through
-    /// the process-global `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`
-    /// (`majit-ir/src/descr.rs:148-225`); this carrier records the
-    /// per-file module path so a future per-graph lexical resolver
-    /// (orthodox PyPy `getdesc` parity) can consume it.
-    pub parsed_module_paths: Vec<String>,
-    /// Per-source-file `use` import map collected from
-    /// `ParsedInterpreter.use_imports` (`parse.rs::collect_use_imports`).
-    /// Keyed on `(source_module_path, alias)` → `fully_qualified_path`.
-    /// Mirrors PyPy bookkeeper's lexical/import-scope name resolution
-    /// (`annrpython.Bookkeeper.getdesc` + `frame.f_globals` lookups);
-    /// pyre's `qualify_type_name` does not yet consult this table,
-    /// awaiting the per-FunctionGraph use_imports carrier.
-    /// Populated here as the data
-    /// carrier so the future resolver lands without re-plumbing.
-    pub use_imports: HashMap<(String, String), String>,
     /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
-    /// impl-method discovered in the parsed source set.  These callees
-    /// cannot lower their bodies (`build_flow.rs:215` rejects
+    /// impl-method discovered by the LLBC/module-path pipeline.  These
+    /// callees cannot lower their bodies (`build_flow.rs:215` rejects
     /// `sig.unsafety.is_some()` because raw-pointer ops are not
     /// modelled), but `OpKind::Call::FunctionPath` sites still need
-    /// the path registered in `PyreCallRegistry`.  Populated by
-    /// `lib.rs::analyze_pipeline_from_parsed` via
-    /// `flowspace::rust_source::register::extract_unsafe_fn_stubs`;
-    /// consumed by
+    /// the path registered in `PyreCallRegistry`.  Populated by `lib.rs`
+    /// from `program.unsafe_fn_stubs` via
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`; consumed by
     /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
     /// `dual_gate_registry` after the function-graph populate pass.
     pub unsafe_fn_stubs: Vec<(
@@ -1135,8 +1110,6 @@ impl CallControl {
             oopspec_argnames: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
-            parsed_module_paths: Vec::new(),
-            use_imports: HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
         }
     }
@@ -1147,7 +1120,7 @@ impl CallControl {
     /// `ImmutableArray` (or `QuasiImmutableArray` for the future quasi-
     /// array path), records the field's type string into the set.
     /// Called after both `immutable_fields_by_struct` and `struct_fields`
-    /// have been populated (`lib.rs::analyze_pipeline_from_parsed`).
+    /// have been populated (`lib.rs::analyze_pipeline_from_module_paths`).
     pub fn recompute_immutable_array_types(&mut self) {
         self.immutable_array_types.clear();
         for (struct_name, fields) in self.immutable_fields_by_struct.iter() {
@@ -1609,7 +1582,7 @@ impl CallControl {
                 // the mutable default.
                 // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
                 // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
-                // (`front::semantic::qualify_type_name_with_imports`) 인
+                // (`front::mir` 이 Charon `name_path()` 에서 기록) 인
                 // 동안 런타임 publish 는
                 // `path_hash(strip_crate(module_path!())::Name)` (def-path).
                 // `canonical_struct_name` 가 `STRUCT_ORIGIN_REGISTRY`
@@ -2042,8 +2015,8 @@ impl CallControl {
     /// Structured binding for an impl-method helper. `impl_type_joined`
     /// is the `::`-joined type path exactly as written at the `impl`
     /// header (e.g. `"a::Foo"` for `impl a::Foo { fn bar() }`), matching
-    /// the parser's `self_ty_root` canonicalization (parse.rs:702 +
-    /// `front::semantic::qualify_type_name_with_imports`).  Registers
+    /// the `self_ty_root` impl-owner spelling `front::mir` records from
+    /// Charon's `name_path()`.  Registers
     /// `[impl_type_joined, method]` as a 2-segment CallPath where
     /// `impl_type_joined` is stored verbatim as a single segment — same
     /// shape `register_trait_method` / inherent method graphs use at
@@ -2061,9 +2034,9 @@ impl CallControl {
         if fnaddr == 0 || impl_type_as_written.is_empty() || method.is_empty() {
             return;
         }
-        // `front::semantic::qualify_type_name_with_imports`: bare types
-        // take the current module prefix; already-qualified types keep
-        // their exact written form.  Module prefix is everything after the
+        // Bare types take the current module prefix; already-qualified
+        // types keep their exact written form.  Module prefix is
+        // everything after the
         // first `::`-separated segment (the crate name) of
         // `module_path_with_crate`, matching the parser's `prefix`
         // argument which starts empty at crate root and accumulates
@@ -3199,16 +3172,15 @@ impl CallControl {
                 if self.function_graphs.contains_key(&path) {
                     return Some(path);
                 }
-                // Cross-module reference fallback.  `front::mir`'s
-                // call-target resolution expands single-ident callsites
-                // through the caller's
-                // `use_imports` *first*, so `use foo::bar; bar();`
-                // resolves verbatim to `["foo", "bar"]` against the
-                // registry.  The remaining case the leaf-match needs to
-                // cover is the bare callsite the caller's
-                // `use_imports` could not resolve directly — typically
-                // a same-file declaration whose registration spelling
-                // diverges from the `module_prefix` qualification (e.g.
+                // Cross-module reference fallback.  `front::mir` resolves
+                // each callee through Charon to its fully-qualified
+                // `name_path()`, so a `use foo::bar; bar();` callsite
+                // arrives already spelled with its full crate-included
+                // path and hits the registry verbatim above.  The
+                // remaining case the leaf-match needs to cover is the
+                // bare callsite whose registration spelling diverges from
+                // the call-target qualification — typically a same-file
+                // declaration (e.g.
                 // `lib.rs::register_function_graph_alias` chains).
                 //
                 // PyPy parity: `flowcontext.py:845-866 LOAD_GLOBAL`
@@ -3353,13 +3325,12 @@ impl CallControl {
                     }
                 }
                 // `call.py:97` direct_call → `funcobj.graph` — inherent
-                // method receivers carry a canonical `module::Type` spelling
-                // (`parse::extract_inherent_impl_methods` registration and
-                // `front::semantic::qualify_type_name_with_imports` callsite
-                // both route bare names through `STRUCT_ORIGIN_REGISTRY`, and
-                // `joined_use_path` strips the syntactic `crate::` prefix
-                // off `use_imports` entries), so the single qualified
-                // lookup hits the same `CallPath` registered above.
+                // method receivers carry a canonical `module::Type`
+                // spelling (`front::mir` records the impl owner from
+                // Charon's `name_path()`, and `canonical_struct_name`
+                // normalizes bare names through `STRUCT_ORIGIN_REGISTRY`),
+                // so the single qualified lookup hits the same `CallPath`
+                // registered above.
                 if let Some(receiver) = receiver_root.as_deref() {
                     let qualified = CallPath::for_impl_method(receiver, name.as_str());
                     if self.function_graphs.contains_key(&qualified) {
@@ -6950,9 +6921,9 @@ mod tests {
         // `impl_type_as_written = "Adder"` (bare), and
         // `module_path_with_crate = "testcrate::impl_module"`.  The
         // codewriter must prepend the module prefix so the canonical
-        // CallPath matches the parser's
-        // `front::semantic::qualify_type_name_with_imports("Adder",
-        // "impl_module", &{}) = "impl_module::Adder"` result.
+        // CallPath becomes `["impl_module", "Adder", "add"]`
+        // (`register_macro_impl_helper_trace_fnaddr` qualifies the bare
+        // `"Adder"` to `"impl_module::Adder"`).
         let mut cc = CallControl::new();
         cc.register_macro_impl_helper_trace_fnaddr(
             "testcrate::impl_module",
@@ -6971,8 +6942,8 @@ mod tests {
     fn register_macro_impl_helper_keeps_qualified_type_unchanged() {
         // `impl a::Foo { fn bar() }` — already-qualified type must not
         // get the module prefix prepended
-        // (`front::semantic::qualify_type_name_with_imports` returns
-        // bare-as-is when it contains `::`).  The canonical path
+        // (`register_macro_impl_helper_trace_fnaddr` keeps the type
+        // verbatim when it already contains `::`).  The canonical path
         // matches `CallPath::for_impl_method("a::Foo", "bar")`.
         let mut cc = CallControl::new();
         cc.register_macro_impl_helper_trace_fnaddr(

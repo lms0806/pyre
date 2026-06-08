@@ -1,5 +1,5 @@
 //! Front-end shared types — the data shapes `front::mir` produces, and
-//! that the rest of the pipeline (`analyze_pipeline_from_parsed`,
+//! that the rest of the pipeline (`analyze_pipeline_from_module_paths`,
 //! `jit_codewriter::*`, `parse::*`) consumes.
 //!
 //! These types do not depend on any graph builder, so they live in
@@ -117,28 +117,13 @@ impl StructFieldRegistry {
     /// suffix-match shim absorbs `pyre_object::rangeobject::W_X` vs
     /// `rangeobject::W_X` divergence — orthogonal to lexical scope
     /// resolution, kept for test entries (`parse::parse_source`)
-    /// that bypass `analyze_pipeline_from_parsed`'s
+    /// that bypass `analyze_pipeline_from_module_paths`'s
     /// `register_struct_origins`.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
         self.lookup_fields(owner)?
             .iter()
             .find(|(name, _)| name == field_name)
             .map(|(_, ty)| ty.as_str())
-    }
-
-    /// Per-scope `field_type` lookup: route `owner` through the call
-    /// site's `use_imports` + `module_prefix` first (PyPy
-    /// `frame.f_globals` analog) so a bare receiver leaf lands at the
-    /// canonical key before the program-wide bookkeeper fallback.
-    pub fn field_type_in_scope(
-        &self,
-        owner: &str,
-        field_name: &str,
-        prefix: &str,
-        use_imports: &HashMap<String, String>,
-    ) -> Option<&str> {
-        let canonical_owner = qualify_type_name_with_imports(owner, prefix, use_imports);
-        self.field_type(&canonical_owner, field_name)
     }
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
@@ -228,6 +213,21 @@ pub struct SemanticProgram {
     /// match the qualname `_init_classdef` reads; primitive fields carry
     /// `Int`/`Unsigned`/`Bool`/`Float`, every other shape `Ref(None)`.
     pub struct_field_attrs: HashMap<String, Vec<(String, crate::model::ValueType)>>,
+    /// `(path-segments, Signature, return-lltype)` for every local
+    /// `unsafe fn` / unsafe impl-method whose return type resolves to
+    /// unit or bool, harvested from the LLBC by
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`.  Feeds
+    /// `CallControl.unsafe_fn_stubs` →
+    /// `cutover::register_unsafe_fn_stubs` so the dual gate registers a
+    /// stub PyGraph for each, covering the "not registered in
+    /// PyreCallRegistry" Skip cluster dominated by `pyre_object::is_*`.
+    /// These callees' bodies access raw pointers the flowspace adapter
+    /// does not model, so only a typed signature stub is registered.
+    pub unsafe_fn_stubs: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so the
@@ -386,47 +386,6 @@ impl<'a> MirGraphLookup<'a> {
             Err(()) => None,
         }
     }
-}
-
-/// Qualify a bare type name with module prefix or, when the resolver
-/// knows the canonical defining module, with the canonical prefix.
-///
-/// Resolves a per-source `use <path> as alias` table first, then the
-/// program-wide `STRUCT_ORIGIN_REGISTRY` canonical-defining-module
-/// table, then falls back to `prefix::bare`.
-///
-/// `bookkeeper.py:353-409 getdesc` resolves a bare identifier first in
-/// the frame's `f_globals` (the file's own imports), then in the
-/// program-wide scope summary; pyre's `STRUCT_ORIGIN_REGISTRY` plays
-/// the role of the program-wide scope, while `use_imports` carries
-/// the per-source `f_globals` slice.
-///
-/// `use_imports` is expected to be `GraphBuildContext.use_imports` —
-/// each entry maps a local alias (`use other_mod::Foo as Q` →
-/// `Q → other_mod::Foo`, plain `use other_mod::Foo` →
-/// `Foo → other_mod::Foo`) to the fully-qualified path.  Pass
-/// `&HashMap::new()` when the call site has no per-source scope
-/// (parse-time registration, test fixtures, `lower_expr_into_graph`);
-/// resolution then reduces to `STRUCT_ORIGIN_REGISTRY` + `prefix::bare`.
-pub fn qualify_type_name_with_imports(
-    bare: &str,
-    prefix: &str,
-    use_imports: &HashMap<String, String>,
-) -> String {
-    if bare.contains("::") {
-        return bare.to_string();
-    }
-    if let Some(full) = use_imports.get(bare) {
-        return full.clone();
-    }
-    let canonical = majit_ir::descr::canonical_struct_name(bare);
-    if canonical != bare {
-        return canonical;
-    }
-    if prefix.is_empty() {
-        return bare.to_string();
-    }
-    format!("{}::{}", prefix, bare)
 }
 
 #[cfg(test)]

@@ -76,7 +76,7 @@
 //!
 //! - Inherent impl methods (e.g. `PyFrame::push`, `PyFrame::pop`) are
 //!   registered via `extract_inherent_impl_methods` in
-//!   `analyze_pipeline_from_parsed`; without them, direct_call targets
+//!   `analyze_pipeline_from_module_paths`; without them, direct_call targets
 //!   like `self.pop()` cannot resolve to a concrete graph.
 //! - `struct_fields` / `known_struct_names` carry array-type identity
 //!   that `extract_trait_impls` consults; an empty context silently
@@ -151,7 +151,7 @@ pub use crate::codewriter::AllJitCodes;
 /// `(source_text, crate-stripped module_path)` pairs.  The module path
 /// matches the form `pyre-jit-trace/build.rs::module_path_from_source_file`
 /// emits, so analyzer-side `struct_origins[bare_name] = module_path` and
-/// `qualify_type_name_with_imports` produce the same canonical spelling
+/// `canonical_struct_name` produce the same canonical spelling
 /// the runtime + production analyser pipeline produce.  Empty module
 /// path (test fixtures that bypass module wiring) is reserved for
 /// `parse_source`; here every entry carries its real module path.

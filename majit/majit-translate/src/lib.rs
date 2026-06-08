@@ -59,9 +59,7 @@ pub use jtransform::{
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 pub use opcode_dispatch::PipelineOpcodeArm;
-pub use parse::{
-    CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter, parse_source,
-};
+pub use parse::{CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector};
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 
 use serde::{Deserialize, Serialize};
@@ -127,7 +125,7 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// `scripts/extract-llbc.sh` not run) is a fatal misconfiguration
 /// rather than a fallback to another path.
 fn build_semantic_program_via_active_frontend(
-    parsed_files: &[parse::ParsedInterpreter],
+    module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
@@ -148,7 +146,7 @@ fn build_semantic_program_via_active_frontend(
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
-            .or_else(|| auto_discover_workspace_llbc_paths(parsed_files));
+            .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
                 .iter()
@@ -174,6 +172,14 @@ fn build_semantic_program_via_active_frontend(
             // RPython's translator reading `func._elidable_function_` off
             // the function object.
             merge_hints_from_llbcs(&mut program, &llbcs);
+            // Re-source the unsafe-fn stub carrier from Charon: walk the
+            // full LLBC set for every local `unsafe fn` / unsafe
+            // impl-method projecting to a unit/bool return.  The consumer
+            // at `call_control.unsafe_fn_stubs` (lib.rs) reads this carrier.
+            program.unsafe_fn_stubs = llbcs
+                .iter()
+                .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
+                .collect();
             // Whole-program type metadata (`known_struct_names`,
             // `known_trait_names`, `struct_fields`) comes from the MIR
             // builder's `derive_program_metadata` walk over Charon's
@@ -184,7 +190,7 @@ fn build_semantic_program_via_active_frontend(
             return program;
         }
     }
-    let _ = parsed_files; // silence unused warning when the feature is off
+    let _ = module_paths; // silence unused warning when the feature is off
     // The MIR front-end is the only graph builder.  Reaching this
     // point means neither `PYRE_MIR_FRONTEND_LLBC` nor the workspace
     // auto-discover located an LLBC source — surface the
@@ -204,11 +210,10 @@ fn build_semantic_program_via_active_frontend(
 /// fixture).
 ///
 /// Returns `None` when:
-///   - no parsed_file carries a `module_path` (test fixtures use
-///     `parse::parse_source` which leaves `module_path` empty;
-///     production uses `parse::parse_source_with_module`),
-///   - the caller passed fewer than `PROD_PARSED_FILES_FLOOR`
-///     parsed_files (single-source diagnostic),
+///   - no source carries a `module_path` (test fixtures pass empty
+///     module paths; production passes per-file crate-stripped paths),
+///   - the caller passed fewer than `PROD_SOURCE_FILES_FLOOR`
+///     module paths (single-source diagnostic),
 ///   - a mandatory artefact (`pyre-object.ullbc` /
 ///     `pyre-interpreter.ullbc`) is missing (contributor without
 ///     Charon installed), or
@@ -220,10 +225,10 @@ fn build_semantic_program_via_active_frontend(
 /// before `pyre-jit.ullbc` exists.
 ///
 /// The two gates together match the production fingerprint:
-/// `pyre-jit-trace/build.rs:157` calls
+/// `pyre-jit-trace/build.rs` calls
 /// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
 /// per-file `module_path`.  Tests via
-/// `analyze_multiple_pipeline_with_config` parse without module
+/// `analyze_multiple_pipeline_with_config` pass empty module
 /// paths and stay below the floor, so auto-discovery does not
 /// silently swap their front-end.
 ///
@@ -234,14 +239,12 @@ fn build_semantic_program_via_active_frontend(
 /// `<workspace>/build/llbc/` directory by convention, so the two
 /// halves stay in sync.
 #[cfg(feature = "mir-frontend")]
-fn auto_discover_workspace_llbc_paths(
-    parsed_files: &[parse::ParsedInterpreter],
-) -> Option<Vec<String>> {
-    const PROD_PARSED_FILES_FLOOR: usize = 50;
-    if parsed_files.len() < PROD_PARSED_FILES_FLOOR {
+fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<String>> {
+    const PROD_SOURCE_FILES_FLOOR: usize = 50;
+    if module_paths.len() < PROD_SOURCE_FILES_FLOOR {
         return None;
     }
-    if !parsed_files.iter().any(|p| !p.module_path.is_empty()) {
+    if !module_paths.iter().any(|mp| !mp.is_empty()) {
         return None;
     }
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -343,9 +346,9 @@ pub fn analyze_multiple_pipeline_with_config(
     sources: &[&str],
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         None,
         &|_, _| None,
@@ -365,9 +368,9 @@ pub fn analyze_multiple_pipeline_with_layout(
     config: &AnalyzeConfig,
     layout_provider: &dyn layout::LayoutProvider,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         Some(layout_provider),
         &|_, _| None,
@@ -388,20 +391,21 @@ pub type VirtualizableInfoFactory<'a> =
 /// (`module_path!()::helper_name`) to the compiled trace-call address.
 ///
 /// `#[jit_module]::__majit_helper_trace_fnaddrs()` produces this shape.
-/// `analyze_pipeline_from_parsed` strips the crate-name prefix and binds
+/// `analyze_pipeline_from_module_paths` strips the crate-name prefix and binds
 /// both canonical aliases (`helpers::foo` and `crate::helpers::foo`) on
 /// `CallControl` before `get_jitcode()` / `jtransform` query fnaddrs.
 pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
 /// Structured binding table for impl-method helpers.  Each entry is
 /// `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`.
-/// The codewriter applies the `front::semantic::qualify_type_name_with_imports`
+/// The codewriter applies the
+/// `CallControl::register_macro_impl_helper_trace_fnaddr` qualification
 /// rule — bare types get the module prefix (minus crate
 /// name) prepended, qualified types are kept verbatim — before storing
 /// the canonical `[impl_type_joined, method]` 2-segment CallPath.
 ///
 /// `#[jit_module]::__majit_helper_impl_trace_fnaddrs()` produces this
-/// shape and `analyze_pipeline_from_parsed` feeds it through
+/// shape and `analyze_pipeline_from_module_paths` feeds it through
 /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
 pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 
@@ -439,9 +443,9 @@ pub fn analyze_multiple_pipeline_with_vinfo_factory(
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -481,12 +485,12 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
 ///
 /// `sources` and `module_paths` are parallel slices of equal length:
 /// `module_paths[i]` is the crate-stripped module path of `sources[i]`
-/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  Each file
-/// is parsed via [`parse::parse_source_with_module`], populating
-/// `ParsedInterpreter.{module_path, use_imports}` so the metadata
-/// collectors can record `struct_origins[bare_name] = module_path`
-/// and `qualify_to_canonical_struct` resolves cross-module references
-/// through the use-import table.
+/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  The graph
+/// surface itself comes from the Charon-extracted LLBC set; the
+/// `module_paths` slice drives the workspace LLBC auto-discovery
+/// production fingerprint and stays available for per-file lexical
+/// resolution.  `sources` is retained for the parallel-slice length
+/// contract.
 ///
 /// An empty `module_paths[i]` keeps the simple-name registration of
 /// the bare `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
@@ -506,13 +510,8 @@ pub fn analyze_multiple_pipeline_with_modules(
         module_paths.len(),
         "analyze_multiple_pipeline_with_modules: parallel slices must have equal length",
     );
-    let parsed_files: Vec<_> = sources
-        .iter()
-        .zip(module_paths.iter())
-        .map(|(s, mp)| parse::parse_source_with_module(s, mp))
-        .collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    analyze_pipeline_from_module_paths(
+        module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -536,9 +535,9 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -592,7 +591,7 @@ fn register_function_graph_alias(
 
 /// Compute the full alias spelling set for a free function lifted
 /// from a Rust source.  Mirrors the graph-alias loop in
-/// [`analyze_pipeline_from_parsed`] so call-site lookups that key on
+/// [`analyze_pipeline_from_module_paths`] so call-site lookups that key on
 /// these spellings (function_graphs,
 /// elidable/loopinvariant/cannot_collect/oopspec targets) all see
 /// the same FunctionPath set.  Without this, a module-qualified call
@@ -658,8 +657,8 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     paths
 }
 
-fn analyze_pipeline_from_parsed(
-    parsed_files: &[parse::ParsedInterpreter],
+fn analyze_pipeline_from_module_paths(
+    module_paths: &[&str],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
@@ -686,46 +685,9 @@ fn analyze_pipeline_from_parsed(
         }};
     }
     mark_phase!("entry");
-    // Install the cross-file type-alias floor before any walker pass
-    // runs.  The floor is the union of every parsed file's top-level
-    // `type T = U;` declarations; it stays visible across the per-file
-    // walker calls that happen later in the pipeline (lazy
-    // `Translation::from_rust_*` creation).  Mirrors PyPy
-    // `Bookkeeper`'s whole-program import-resolution map — a struct
-    // field declared as `field: PyObjectRef` in `pyframe.rs` resolves
-    // through the alias declared in `pyobject.rs` regardless of
-    // walker iteration order.
-    let _walker_alias_floor =
-        crate::flowspace::rust_source::register::WalkerAliasFloorGuard::install(
-            parsed_files.iter().map(|p| &p.file),
-        );
-    // `use <path>::*` glob roots are expanded into explicit
-    // `use_imports` entries inside
-    // `build_semantic_program_*_with_options` so the front-end
-    // `Expr::Path` arm resolves glob-imported bare names through the
-    // primary `use_imports` lookup without a separate fallback.
-    // Diagnostic pre-pass — populate
-    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) from each
-    // `parsed_files` entry's top-level structs so
-    // `ClassDesc::_init_classdef` can pre-fill `ClassDef.attrs` *before*
-    // the annotator's narrowing gate at
-    // `flowspace_adapter.rs::derive_subject_inputcells` checks
-    // `attrs_populated`.  Production never drives the walker (only
-    // `extract_unsafe_fn_stubs` is called from `register`), which left
-    // the dict empty for parsed-only structs and forced every
-    // impl-method `self` to carry
-    // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
-    // fixtures) skip; their structs are registered through the bare-
-    // leaf walker path when the fixture explicitly calls
-    // `register_rust_module_at_with_source`.
-    for parsed in parsed_files {
-        if !parsed.module_path.is_empty() {
-            crate::flowspace::rust_source::register::pre_register_struct_fields_from_file(
-                &parsed.file,
-                "",
-            );
-        }
-    }
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` is seeded from the LLBC-sourced
+    // `program.struct_field_attrs` further below, once `program` is
+    // built.
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
@@ -740,7 +702,7 @@ fn analyze_pipeline_from_parsed(
     // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(parsed_files, static_addrs);
+    let program = build_semantic_program_via_active_frontend(module_paths, static_addrs);
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `jit_codewriter` `canonical_struct_name` `path_hash` sites
@@ -750,60 +712,30 @@ fn analyze_pipeline_from_parsed(
     // `front::mir::derive_program_metadata`; any leaf absent from the map
     // still resolves through the runtime's simple-name dual-publish slot.
     majit_ir::descr::register_struct_origins(program.struct_origins.clone());
-    // Tier-3 shadow probe: the syn `pre_register_struct_fields_from_file`
-    // pass above is still the active writer of
-    // `FORCE_ATTRIBUTES_INTO_CLASSES`.  Project the LLBC-sourced
-    // `program.struct_field_attrs` through the same
-    // `valuetype_to_someshell` write-time shelling and diff the two maps
-    // over the shared keys: the cutover is safe only when every shared
-    // qualname carries an identical field→someshell map.  `syn_only`
-    // mirrors the struct-set gap already characterised for
-    // `struct_origins` (cfg(test) / jit-crate structs Charon does not
-    // extract); `ull_only` is the benign crate-type superset.  Summary
-    // only, no panic, so it cannot affect the gate.
+    // Tier-3: seed `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961)
+    // from the LLBC-sourced `program.struct_field_attrs` so
+    // `ClassDesc::_init_classdef` pre-fills `ClassDef.attrs` before the
+    // annotator's `attrs_populated` narrowing gate
+    // (`flowspace_adapter.rs::derive_subject_inputcells`).  Replaces the
+    // syn `pre_register_struct_fields_from_file` walk.
+    // `struct_field_attrs` is the Charon `derive_program_metadata`
+    // projection, keyed by the crate-stripped qualified item path
+    // (`intobject::W_IntObject`).  The consumer reads by `cls.qualname()`
+    // (the bare struct leaf), so register each entry under both the
+    // qualified path and the bare leaf.  Iterate in sorted qualified-key
+    // order so a bare leaf shared by distinct modules (e.g. two
+    // `FrameBlock`s) resolves deterministically across builds —
+    // `register_struct_fields` is last-writer-wins per key.
     {
-        let syn_map = crate::annotator::classdesc::forced_attributes_snapshot();
-        let mut ull_map: std::collections::HashMap<
-            String,
-            indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
-        > = std::collections::HashMap::new();
-        for (qual, rows) in &program.struct_field_attrs {
-            let mut shelled = indexmap::IndexMap::new();
-            for (name, vt) in rows {
-                if let Some(s) = crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
-                {
-                    shelled.insert(name.clone(), s);
-                }
-            }
-            ull_map.insert(qual.clone(), shelled);
-        }
-        let mut mismatch = 0usize;
-        let mut syn_only = 0usize;
-        for (qual, syn_attrs) in &syn_map {
-            match ull_map.get(qual) {
-                Some(u) if u == syn_attrs => {}
-                Some(u) => {
-                    mismatch += 1;
-                    if mismatch <= 20 {
-                        eprintln!(
-                            "TIER3 struct_field_attrs MISMATCH {qual:?}: syn={syn_attrs:?} ull={u:?}"
-                        );
-                    }
-                }
-                None => {
-                    syn_only += 1;
-                    if syn_only <= 20 {
-                        eprintln!("TIER3 struct_field_attrs SYN-ONLY {qual:?}");
-                    }
-                }
+        let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (qualified, fields) in entries {
+            crate::annotator::classdesc::register_struct_fields(qualified, fields);
+            let bare = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
+            if bare != qualified.as_str() {
+                crate::annotator::classdesc::register_struct_fields(bare, fields);
             }
         }
-        let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
-        eprintln!(
-            "TIER3 struct_field_attrs SUMMARY: syn={} ull={} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
-            syn_map.len(),
-            ull_map.len(),
-        );
     }
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
@@ -902,31 +834,6 @@ fn analyze_pipeline_from_parsed(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
-    // Build the `pub use <src>::*` re-export index:
-    // `globbed_source_path -> [importing_module_path, ...]`.  For each
-    // file that does `pub use crate::M::*;`, M (as `::`-joined string)
-    // maps to that file's `module_path`, so a function defined in M
-    // also becomes callable under the importing module's namespace
-    // (and through the full set of crate-alias spellings the alias
-    // generator emits).  Mirrors Rust's resolution of `crate::
-    // ImportingMod::name` through the re-export; without this fan-out
-    // the registry would only carry the original `M::name` aliases
-    // and `crate::ImportingMod::name` would fail to resolve.
-    let mut glob_reexports: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for parsed in parsed_files {
-        if parsed.module_path.is_empty() || parsed.pub_use_globs.is_empty() {
-            continue;
-        }
-        for source_segments in &parsed.pub_use_globs {
-            let source_key = source_segments.join("::");
-            glob_reexports
-                .entry(source_key)
-                .or_default()
-                .push(parsed.module_path.clone());
-        }
-    }
-
     for func in &program.functions {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
@@ -953,40 +860,6 @@ fn analyze_pipeline_from_parsed(
                     &func.name,
                     &graph,
                 );
-            }
-            // Additional alias spellings for `pub use crate::<func
-            // module>::*;` re-exports — without this, a caller that
-            // writes `crate::ImportingMod::func` (resolved through the
-            // Rust-side glob re-export) finds no registered graph
-            // because `free_function_alias_paths` only fans out under
-            // the function's own module.
-            if let Some(importing_modules) = glob_reexports.get(&func.module_path) {
-                // Use just the function's leaf name (without module
-                // prefix) so the re-export aliases mirror what the
-                // alias generator would emit for a function natively
-                // defined in `importing_module`.
-                let leaf = func
-                    .name
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(&func.name)
-                    .to_string();
-                for importing_module in importing_modules {
-                    let synthetic_name = if importing_module.is_empty() {
-                        leaf.clone()
-                    } else {
-                        format!("{importing_module}::{leaf}")
-                    };
-                    for path in free_function_alias_paths(&synthetic_name, importing_module) {
-                        register_function_graph_alias(
-                            &mut canonical_function_graphs,
-                            &mut canonical_function_alias_source,
-                            path,
-                            &func.name,
-                            &graph,
-                        );
-                    }
-                }
             }
         }
     }
@@ -1023,53 +896,17 @@ fn analyze_pipeline_from_parsed(
     // `arraydescrof_concrete` can fold field-level immutability into the
     // shared per-ARRAY descr's `is_pure` flag.
     call_control.recompute_immutable_array_types();
-    // Thread per-source-file `parsed.module_path` + `use_imports`
-    // into CallControl as data carriers (orthodox PyPy
-    // `bookkeeper.position` + `frame.f_globals` lexical-resolution
-    // entry points).
-    // Today's consumers normalise at the runtime path_hash boundary
-    // via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
-    // carriers here let a future per-graph lexical resolver land
-    // without re-plumbing the parsed-source ingress.
-    call_control.parsed_module_paths = parsed_files.iter().map(|p| p.module_path.clone()).collect();
-    // `use_imports` aggregated across all parsed files —
-    // `parse::collect_use_imports` populates per-file map at
-    // `parse_source_with_module`; here we re-collect from the
-    // `ParsedInterpreter` slice the analyzer entry received.
-    let mut use_imports_agg: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for parsed in parsed_files {
-        for (alias, full) in &parsed.use_imports {
-            use_imports_agg
-                .entry((parsed.module_path.clone(), alias.clone()))
-                .or_insert_with(|| full.clone());
-        }
-    }
-    call_control.use_imports = use_imports_agg;
-    // Populate the metadata-only `unsafe_fn_stubs` carrier so the
-    // codewriter's `dual_gate_registry` can register every `unsafe fn`
-    // / unsafe impl-method as a stub-pygraph entry in PyreCallRegistry.
-    // Walks each parsed source file under its crate-stripped
-    // `module_path` prefix, dropping unsafe fns whose return type the
-    // projection cannot represent (see
-    // `flowspace::rust_source::register::simple_return_type_to_lltype`).
-    // Covers the bulk of the "not registered in PyreCallRegistry" Skip
-    // cluster dominated by `pyre_object::is_*` predicates whose body
-    // lowering is intentionally rejected at `build_flow.rs:215`.
-    let mut unsafe_stubs: Vec<(
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-    )> = Vec::new();
-    for parsed in parsed_files {
-        unsafe_stubs.extend(
-            crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
-                &parsed.file,
-                &parsed.module_path,
-            ),
-        );
-    }
-    call_control.unsafe_fn_stubs = unsafe_stubs;
+    // The `unsafe_fn_stubs` carrier lets the codewriter's
+    // `dual_gate_registry` register every `unsafe fn` / unsafe
+    // impl-method as a stub-pygraph entry in PyreCallRegistry, covering
+    // the bulk of the "not registered in PyreCallRegistry" Skip cluster
+    // dominated by `pyre_object::is_*` predicates whose body lowering is
+    // intentionally rejected (raw-pointer access the flowspace adapter
+    // does not model — only a typed signature stub is registered).
+    // Sourced from Charon via
+    // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
+    // SemanticProgram in `build_semantic_program_via_active_frontend`.
+    call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {
