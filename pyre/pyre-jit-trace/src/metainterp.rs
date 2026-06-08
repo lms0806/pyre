@@ -335,6 +335,115 @@ impl PyreMetaInterp {
                     .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
                 // Concrete execution step
                 self.concrete_execute_step();
+                // Fused-compare concrete catch-up. A fused COMPARE+POP_JUMP
+                // (try_fused_compare_goto_if_not) records one branch guard and
+                // advances the symbolic pc PAST the POP_JUMP in a single trace
+                // step, but the concrete_execute_step above ran only the
+                // COMPARE. The inline-frame pc is read from the concrete
+                // frame's next_instr (interpret()), so leaving the concrete
+                // frame at the POP_JUMP re-steps the already-consumed branch
+                // (stack underflow during trace opcode → graceful abort,
+                // blocking inline tracing through the compare). Drive the
+                // concrete frame through the POP_JUMP — its concrete branch
+                // lands at the same `next_target` the fused step chose — until
+                // it reaches the symbolic pc. Trivia is positioned-past as
+                // interpret()'s prelude does (Cache/ExtendedArg/Nop/NotTaken,
+                // NOT Resume); only a real opcode strictly before the target
+                // (the fused POP_JUMP) is executed.
+                //
+                // Gated to NON-recursive inline frames. The catch-up is
+                // correct on its own (a non-recursive inlined callee with a
+                // compare traces cleanly with it), but letting a *recursive*
+                // inline chain proceed past the compare exposes a separate,
+                // pre-existing bug in the recursion-unroll machinery (the
+                // compiled trace fails to terminate). Until that is fixed,
+                // recursive inline frames keep the old behavior — the fused
+                // compare desyncs and the inline trace aborts gracefully, so
+                // recursion still JITs via the CALL_ASSEMBLER self-recursion
+                // path. `jitcode` appearing 2+ times on the framestack marks a
+                // recursive chain.
+                let top_jitcode = self.framestack.last().unwrap().jitcode;
+                let is_recursive_chain = self
+                    .framestack
+                    .iter()
+                    .filter(|f| f.jitcode == top_jitcode)
+                    .count()
+                    >= 2;
+                // Skip the catch-up while any frame in the inline chain is
+                // executing inside an active exception-handler (try) range. A
+                // fused-compare catch-up lets an inlined callee proceed in the
+                // trace; if a later op in that callee raises, the exception
+                // unwinds into a CALLER's inlined except handler, and the
+                // blackhole resume of an inlined-callee raise into a caller
+                // catch-landing is malformed (the catch_exception target skips
+                // the landing's last_exc_value op, so the bound exception value
+                // reads NULL). Until that resume path is fixed, keep the prior
+                // graceful-abort behavior for these: the inline trace aborts,
+                // the callee stays a residual call, and the exception path runs
+                // correctly. Hot loops without active try blocks (the catch-up's
+                // intended target) are unaffected.
+                //
+                // TODO: fix the underlying blackhole/codewriter defect so this
+                // gate can be removed and try-protected callees inline too. When
+                // an inlined callee raises into a caller's inlined except, the
+                // resume catch-landing's `catch_exception` target resolves PAST
+                // the landing's `last_exc_value` op (op 90 never executes), so
+                // the bound exception value reads NULL. RPython sidesteps this
+                // because the raising block carries `exitswitch=c_last_exception`
+                // (its exception edges are non-trivial graph links); pyre models
+                // the catch as a byte-level `catch_exception/L`, NOT a graph
+                // link, so the trivial-link / inline-resume passes skip it. The
+                // proper fix emits/positions `last_exc_value` so the inlined
+                // catch target lands on it, restoring inlining for these.
+                let in_exception_handler = self.framestack.iter().any(|f| {
+                    let Some(ref cf) = f.owned_concrete_frame else {
+                        return false;
+                    };
+                    let ccode = unsafe { &*pyre_interpreter::pyframe_get_pycode(&**cf) };
+                    // A suspended caller's concrete `next_instr` was advanced
+                    // past the CALL before its callee was pushed, so probe the
+                    // saved CALL site (`call_site_pc`) — mirroring
+                    // `finishframe_exception`. Frames with no outstanding inline
+                    // call fall back to `next_instr`. exceptiontable offsets are
+                    // byte offsets; the pc is an instruction-word index (×2).
+                    let lookup_pc = f.call_site_pc.unwrap_or_else(|| cf.next_instr());
+                    let byte_off = (lookup_pc as u32).saturating_mul(2);
+                    pyre_interpreter::exception_table::lookup_exceptiontable(
+                        &ccode.exceptiontable,
+                        byte_off,
+                    )
+                    .is_some()
+                });
+                if !is_recursive_chain && !in_exception_handler {
+                    let mut guard = 0u32;
+                    loop {
+                        let top = self.framestack.last_mut().unwrap();
+                        let target = top.pc;
+                        let Some(cf) = top.owned_concrete_frame.as_mut() else {
+                            break;
+                        };
+                        let ccode = unsafe { &*pyre_interpreter::pyframe_get_pycode(&**cf) };
+                        let mut ni = cf.next_instr();
+                        while ni < target {
+                            match pyre_interpreter::decode_instruction_at(ccode, ni) {
+                                Some((
+                                    Instruction::Cache
+                                    | Instruction::ExtendedArg
+                                    | Instruction::Nop
+                                    | Instruction::NotTaken,
+                                    _,
+                                )) => ni += 1,
+                                _ => break,
+                            }
+                        }
+                        cf.set_last_instr_from_next_instr(ni);
+                        if ni >= target || guard >= 16 {
+                            break;
+                        }
+                        self.concrete_execute_step();
+                        guard += 1;
+                    }
+                }
                 LoopAction::Continue
             }
             super::state::InlineTraceStepAction::Trace(TraceAction::Finish {
