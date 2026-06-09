@@ -910,7 +910,7 @@ class W_Socket(W_Root):
             except OperationError as e:
                 if e.async(space):
                     raise
-                optval = space.bufferstr_w(w_optval)
+                optval = space.bufferstr_w(args_w[2])
                 try:
                     self.sock.setsockopt(level, optname, optval)
                 except SocketError as e:
