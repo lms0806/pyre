@@ -1,6 +1,6 @@
 from rpython.tool.sourcetools import (
     func_renamer, func_with_new_name, rpython_wrapper,
-    getsourcelines, MyStr, newcode_withfilename)
+    getsourcelines, MyStr, newcode_withfilename, compile2)
 
 def test_rename():
     def f(x, y=5):
@@ -90,6 +90,17 @@ def test_getsourcelines_dynamic_function_returns_none():
     exec code in globs
     f = globs['f']
     assert getsourcelines(f) is None
+
+def test_getsourcelines_dynamic_function_compile2_works():
+    # Functions compiled from a string literal compiled with compile2 can
+    # produce a source line (this is the point of compile2, and why we use it
+    # eg in the objspace).
+    import types
+    code = compile2('def f(x): return x', '<string>', 'exec')
+    globs = {}
+    exec code in globs
+    f = globs['f']
+    assert getsourcelines(f) == (['def f(x): return x\n'], 1)
 
 
 def test_getsourcelines_sourceargs_substituted():

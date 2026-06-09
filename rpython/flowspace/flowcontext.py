@@ -8,7 +8,6 @@ import __builtin__
 
 from rpython.tool.error import source_lines
 from rpython.rlib import rstackovf
-from rpython.rtyper.lltypesystem import lltype
 from rpython.flowspace.argument import CallSpec
 from rpython.flowspace.model import (Constant, Variable, Block, Link,
     c_last_exception, const, FSException, SpaceOperation)
