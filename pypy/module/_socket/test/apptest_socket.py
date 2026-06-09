@@ -930,7 +930,7 @@ def test_sendmsg_afalg_aes_cbc():
     _alg_skip_if_unavailable()
     key = bytes.fromhex('06a9214036b8a15b512e03d534120006')
     iv = bytes.fromhex('3dafba429d9eb430b422da802c9fac41')
-    msg = b"single block msg"
+    msg = b"Single block msg"
     ciphertext = bytes.fromhex('e353779c1079aeb82708942dbe77181a')
     msglen = len(msg)
     algo = _alg_create('skcipher', 'cbc(aes)')
