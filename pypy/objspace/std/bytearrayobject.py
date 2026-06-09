@@ -143,8 +143,7 @@ class W_BytearrayObject(W_BufferExporter):
         except OperationError as e:
             if not e.match(space, space.w_TypeError):
                 raise
-        buf = space.buffer_w(w_other, space.BUF_SIMPLE)
-        with buf:
+        with space.buffer_w(w_other, space.BUF_SIMPLE) as buf:
             result = buf.as_str()
         return result
 

@@ -233,8 +233,7 @@ class W_MMap(W_BufferExporter):
             except OperationError as e:
                 if not e.match(space, space.w_TypeError):
                     raise
-                buf = space.buffer_w(w_value, space.BUF_FULL_RO)
-                with buf:
+                with space.buffer_w(w_value, space.BUF_FULL_RO) as buf:
                     value = buf.as_str()
             if len(value) != length:
                 raise oefmt(space.w_ValueError,
