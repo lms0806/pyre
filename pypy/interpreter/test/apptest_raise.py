@@ -78,23 +78,28 @@ def test_revert_exc_info_2():
     assert sys.exc_info() == (None, None, None)
 
 def test_revert_exc_info_2_finally():
-    import sys
-    assert sys.exc_info() == (None, None, None)
-    try:
+    import sys, dis
+
+    def the_test():
+        assert sys.exc_info() == (None, None, None)
         try:
-            raise ValueError
-        finally:
             try:
+                raise ValueError
+            finally:
                 try:
-                    raise IndexError
-                finally:
-                    assert sys.exc_info()[0] is IndexError
-            except IndexError:
-                pass
-            assert sys.exc_info()[0] is ValueError
-    except ValueError:
-        pass
-    assert sys.exc_info() == (None, None, None)
+                    try:
+                        raise IndexError
+                    finally:
+                        assert sys.exc_info()[0] is IndexError
+                except IndexError:
+                    pass
+                assert sys.exc_info()[0] is ValueError
+        except ValueError:
+            pass
+        assert sys.exc_info() == (None, None, None)
+
+    dis.dis(the_test)
+    the_test()
 
 def test_reraise_1():
     with pytest.raises(IndexError):
@@ -196,21 +201,26 @@ def test_with_reraise_1():
         fn()
 
 def test_with_reraise_2():
+    import dis
     class Context:
         def __enter__(self):
             return self
         def __exit__(self, exc_type, exc_value, exc_tb):
             return True
 
-    def fn():
-        try:
-            raise ValueError("foo")
-        except:
-            with Context():
-                raise KeyError("caught")
-            raise
-    with pytest.raises(ValueError):
-        fn()
+    def the_test():
+        def fn():
+            try:
+                raise ValueError("foo")
+            except:
+                with Context():
+                    raise KeyError("caught")
+                raise
+        with pytest.raises(ValueError):
+            fn()
+
+    dis.dis(the_test)
+    the_test()
 
 def test_userclass():
     # new-style classes can't be raised unless they inherit from
@@ -680,3 +690,38 @@ def test_reraise_with_replaced_traceback():
             raise
     except ValueError as err:
         assert err.__traceback__ is othr
+
+def test_bare_except_return_finally_no_context():
+    # return from bare except clears the exception; finally's raise must not
+    # report "During handling of the above exception, another exception occurred"
+    def foo():
+        try:
+            raise Exception("original")
+        except:
+            return
+        finally:
+            raise Exception("in finally")
+
+    try:
+        foo()
+    except Exception as e:
+        assert e.args[0] == "in finally"
+        assert e.__context__ is None, "expected no context, got: %r" % (e.__context__,)
+
+def test_bare_except_return_finally_runs_once():
+    # finally block must execute exactly once when return exits a bare except
+    log = []
+    def foo():
+        try:
+            raise Exception
+        except:
+            return
+        finally:
+            log.append(1)
+            raise Exception("in finally")
+
+    try:
+        foo()
+    except Exception:
+        pass
+    assert log == [1], "finally ran %d times, expected 1" % len(log)

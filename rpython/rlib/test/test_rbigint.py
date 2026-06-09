@@ -32,6 +32,8 @@ from hypothesis import given, strategies, example, settings, assume, HealthCheck
 longs = strategies.builds(
     long, strategies.integers())
 ints = strategies.integers(-sys.maxint-1, sys.maxint)
+_BIG_INT_MAX = 10000 if sys.maxint > 2 ** 32 else 2000
+
 
 def makelong(data):
     numbits = data.draw(strategies.integers(1, 2000))
@@ -628,6 +630,18 @@ class Test_rbigint(object):
             for y in signed_int_vals:
                 result = f1.int_mul(y)
                 assert result.tolong() == x * y
+
+    def test_add_int_int_rbigint_result(self):
+        for x in signed_int_vals:
+            for y in signed_int_vals:
+                result = rbigint.add_int_int_bigint_result(x, y)
+                assert result.tolong() == x + y
+
+    def test_sub_int_int_rbigint_result(self):
+        for x in signed_int_vals:
+            for y in signed_int_vals:
+                result = rbigint.sub_int_int_bigint_result(x, y)
+                assert result.tolong() == x - y
 
     def test_mul_int_int_rbigint_result(self):
         for x in signed_int_vals:
@@ -1870,7 +1884,7 @@ class TestHypothesis(object):
         r1 = rx.abs_rshift_and_mask(r_ulonglong(shift), mask)
         assert r1 == (abs(x) >> shift) & mask
 
-    @given(biglongs, strategies.integers(min_value=1, max_value=10000))
+    @given(biglongs, strategies.integers(min_value=1, max_value=_BIG_INT_MAX))
     def test_str_to_int_big_base10(self, l, limit):
         l = abs(l)
         s = str(l)
@@ -1898,7 +1912,7 @@ class TestHypothesis(object):
             HOLDER.STR2INT_LIMIT = oldval
             HOLDER.MINSIZE_STR2INT = 1
 
-    @given(strategies.integers(min_value=1, max_value=10000), strategies.integers(min_value=1, max_value=10000))
+    @given(strategies.integers(min_value=1, max_value=_BIG_INT_MAX), strategies.integers(min_value=1, max_value=_BIG_INT_MAX))
     @settings(max_examples=10)
     def test_str_to_int_big_w5pow(self, exp, limit):
         mem = {}
@@ -1979,9 +1993,27 @@ class TestHypothesis(object):
         assert lx.isqrt().tolong() == a
 
     @given(ints, ints)
+    def test_add_int_int_rbigint_result(self, a, b):
+        res = rbigint.add_int_int_bigint_result(a, b)
+        assert res.tolong() == a + b
+
+    @given(ints, ints)
+    def test_sub_int_int_rbigint_result(self, a, b):
+        res = rbigint.sub_int_int_bigint_result(a, b)
+        assert res.tolong() == a - b
+
+    @given(ints, ints)
     def test_mul_int_int_rbigint_result(self, a, b):
         res = rbigint.mul_int_int_bigint_result(a, b)
         assert res.tolong() == a * b
+
+    @example(-sys.maxint-1, 5)
+    @example(-1, 10)
+    @example(1, 1071)
+    @given(ints, strategies.integers(0, 2000))
+    def test_lshift_int_int_rbigint_result(self, a, b):
+        res = rbigint.lshift_int_int_bigint_result(a, b)
+        assert res.tolong() == a << b
 
     @given(strategies.data())
     def test_format_lowest_level_divmod_int_results(self, data):

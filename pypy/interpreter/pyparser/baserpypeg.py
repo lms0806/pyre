@@ -271,20 +271,28 @@ class Parser:
         res = meth(self)
         if res is None:
             tok = self.diagnose()
-            if (self.compile_info.flags & consts.PyCF_ALLOW_INCOMPLETE_INPUT and
-                    (self.compile_info.flags & consts.PyCF_DONT_IMPLY_DEDENT or
-                     self.compile_info.mode == "eval")):
-                # bit of a heuristic: if the source does not end with a newline
-                # (PyCF_DONT_IMPLY_DEDENT is set) or we are in eval mode, and
-                # the remaining tokens are ENDMARKER, NEWLINE, DEDENT then more
-                # input could fix things, so we raise "incomplete input"
-                for index in range(self._highwatermark, len(self._tokens)):
-                    typ = self._tokens[index].token_type
-                    if (typ != tokens.ENDMARKER and typ != tokens.NEWLINE and
-                            typ != tokens.DEDENT):
-                        break
-                else:
-                    self.raise_syntax_error_known_location("incomplete input", tok)
+            if self.compile_info.flags & consts.PyCF_ALLOW_INCOMPLETE_INPUT:
+                if self.compile_info.source_ends_with_newline:
+                    # Mirror CPython's _is_end_of_source(): the parser consumed
+                    # all the way to ENDMARKER.  For "@int\n" the decorator rule
+                    # fetches ENDMARKER while looking for a function/class body;
+                    # for "a @\n" the parser fails at the NEWLINE token and never
+                    # reaches ENDMARKER, so "invalid syntax" is raised instead.
+                    if (self._highwatermark >= len(self._tokens) - 1 and
+                            not self._eval_invalid_with_trailing_newline()):
+                        self.raise_syntax_error_known_location("incomplete input", tok)
+                elif (self.compile_info.flags & consts.PyCF_DONT_IMPLY_DEDENT or
+                        self.compile_info.mode == "eval"):
+                    # Source does not end with newline (PyCF_DONT_IMPLY_DEDENT is
+                    # set) or eval mode: check if all remaining tokens are trivial.
+                    for index in range(self._highwatermark, len(self._tokens)):
+                        typ = self._tokens[index].token_type
+                        if (typ != tokens.ENDMARKER and typ != tokens.NEWLINE and
+                                typ != tokens.DEDENT):
+                            break
+                    else:
+                        if not self._eval_invalid_with_trailing_newline():
+                            self.raise_syntax_error_known_location("incomplete input", tok)
             self.reset()
             self.call_invalid_rules = True
             meth(self) # often raises
@@ -405,6 +413,20 @@ class Parser:
         if self._highwatermark >= len(self._tokens):
             self._highwatermark = len(self._tokens) - 1
         return self._tokens[self._highwatermark]
+
+    def _eval_invalid_with_trailing_newline(self):
+        """In eval mode, if the source ended with a newline and the parse
+        consumed at least one token, the input is definitively invalid syntax,
+        not incomplete. Unclosed-bracket cases are already caught by the
+        tokenizer (TokenError) before the parser runs, so no bracket scan is
+        needed here.
+        CPython: compile("9+\\n", "eval", PyCF_ALLOW_INCOMPLETE_INPUT) raises
+        "invalid syntax"; compile("9+", ...) raises "incomplete input".
+        codeop appends "\\n" and retries, so this distinction matters.
+        """
+        return (self.compile_info.source_ends_with_newline and
+                self.compile_info.mode == "eval" and
+                self._highwatermark > 0)
 
     def get_last_non_whitespace_token(self):
         tok = self._tokens[0]
@@ -1017,6 +1039,6 @@ class Parser:
 
     def revdbmetavar(self, num, lineno, col_offset, end_lineno, end_col_offset):
         if not self.space.config.translation.reverse_debugger:
-            self._raise_syntax_error("Unkown character", lineno, col_offset, end_lineno, end_col_offset)
+            self._raise_syntax_error("Unknown character", lineno, col_offset, end_lineno, end_col_offset)
         return ast.RevDBMetaVar(num, lineno, col_offset, end_lineno, end_col_offset)
 
