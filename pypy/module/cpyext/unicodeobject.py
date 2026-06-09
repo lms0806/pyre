@@ -865,8 +865,7 @@ def PyUnicode_FSDecoder(space, w_obj, result):
             space.warn(space.newtext(
                 "path should be %s, not %s" % (allowed_types, tp,)),
                 space.w_DeprecationWarning)
-            buffer = space.buffer_w(w_obj, space.BUF_FULL_RO)
-            with buffer:
+            with space.buffer_w(w_obj, space.BUF_FULL_RO) as buffer:
                 w_output = space.fsdecode(space.newbytes(buffer.as_str()))
     if not space.isinstance_w(w_output, space.w_unicode):
         raise oefmt(space.w_TypeError, "decoder failed to return unicode")

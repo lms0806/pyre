@@ -385,8 +385,7 @@ class W_MemoryView(W_BufferExporter):
             self._check_released(space)
             self.view.setbytes(offset, byteval)
         elif step == 1:
-            value = space.buffer_w(w_obj, space.BUF_CONTIG_RO)
-            with value:
+            with space.buffer_w(w_obj, space.BUF_CONTIG_RO) as value:
                 if value.getlength() != slicelength * itemsize:
                     raise oefmt(space.w_ValueError,
                                 "cannot modify size of memoryview object")
@@ -400,18 +399,17 @@ class W_MemoryView(W_BufferExporter):
             # NOTE we could maybe make use of copy_base, but currently we do not
             itemsize = self.getitemsize()
             data = []
-            src = space.buffer_w(w_obj, space.BUF_CONTIG_RO)
-            dst_strides = self.getstrides()
-            dim = 0
-            dst = SubBuffer(
-                self.view.as_writebuf(),
-                start * itemsize, slicelength * itemsize)
-            src_stride0 = dst_strides[dim]
+            with space.buffer_w(w_obj, space.BUF_CONTIG_RO) as src:
+                dst_strides = self.getstrides()
+                dim = 0
+                dst = SubBuffer(
+                    self.view.as_writebuf(),
+                    start * itemsize, slicelength * itemsize)
+                src_stride0 = dst_strides[dim]
 
-            off = 0
-            src_shape0 = slicelength
-            src_stride0 = src.getstrides()[0]
-            with src:
+                off = 0
+                src_shape0 = slicelength
+                src_stride0 = src.getstrides()[0]
                 for i in range(src_shape0):
                     data.append(src.getbytes(off, itemsize))
                     off += src_stride0
