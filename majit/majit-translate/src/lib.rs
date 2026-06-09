@@ -146,6 +146,11 @@ fn build_semantic_program_via_active_frontend(
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
+            // A present-but-blank override (`PYRE_MIR_FRONTEND_LLBC=`)
+            // collects to an empty vec; treat it as unset so workspace
+            // auto-discovery still runs instead of feeding an empty LLBC
+            // set into the frontend.
+            .filter(|paths: &Vec<String>| !paths.is_empty())
             .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
@@ -720,21 +725,19 @@ fn analyze_pipeline_from_module_paths(
     // syn `pre_register_struct_fields_from_file` walk.
     // `struct_field_attrs` is the Charon `derive_program_metadata`
     // projection, keyed by the crate-stripped qualified item path
-    // (`intobject::W_IntObject`).  The consumer reads by `cls.qualname()`
-    // (the bare struct leaf), so register each entry under both the
-    // qualified path and the bare leaf.  Iterate in sorted qualified-key
-    // order so a bare leaf shared by distinct modules (e.g. two
-    // `FrameBlock`s) resolves deterministically across builds —
-    // `register_struct_fields` is last-writer-wins per key.
+    // (`intobject::W_IntObject`).  Register each entry under that single
+    // canonical key only.  The consumer reads by `cls.qualname()` (the
+    // bare struct leaf) and canonicalises it through the
+    // `STRUCT_ORIGIN_REGISTRY` (`canonical_struct_name`) before lookup,
+    // so no bare-leaf alias is needed — dropping it keeps a leaf shared
+    // by distinct modules (e.g. two `FrameBlock`s with different field
+    // shapes) from clobbering each other.  Iterate in sorted key order
+    // for build determinism.
     {
         let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (qualified, fields) in entries {
             crate::annotator::classdesc::register_struct_fields(qualified, fields);
-            let bare = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
-            if bare != qualified.as_str() {
-                crate::annotator::classdesc::register_struct_fields(bare, fields);
-            }
         }
     }
     mark_phase!("build_semantic_program_from_parsed_files");
@@ -1194,7 +1197,7 @@ fn analyze_pipeline_from_module_paths(
                     continue;
                 }
                 // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
-                // — companion hint emitted by `front::syn_metadata::collect_jit_hints`
+                // — companion hint emitted by `front::llbc_hints::harvest_hints_from_llbcs`
                 // when `#[oopspec(...)]` is paired with a function signature.
                 // Threads the declaration-order parameter names into
                 // `CallControl::oopspec_argnames` so `parse_oopspec`

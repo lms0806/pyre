@@ -1440,8 +1440,8 @@ impl<'a> Transformer<'a> {
             // `cast_float_to_uint` opnames in practice, so these
             // const-fold + residual-helper arms stay dormant.  The
             // wiring is staged for the eventual producer flip;
-            // unsigned parameter classification lives in
-            // `front::syn_metadata::classify_fn_arg_ty`.
+            // unsigned parameter classification lives in the MIR
+            // front-end (`front::mir`).
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -3211,24 +3211,33 @@ impl<'a> Transformer<'a> {
     /// to separate greens from reds) so the caller can fall through to the
     /// regular direct-call handling.
     ///
-    /// Upstream also honours `jitdriver.active` (jtransform.py:1661-1662);
-    /// when `active=False` the marker is dropped. pyre has no `active` flag
-    /// yet — once annotator-level JitDriver config lands it can emit
-    /// `Some(Vec::new())` from this hook to match the `return []` shape.
+    /// Upstream also honours `jitdriver.active` (jtransform.py:1661-1662):
+    /// when `active=False` the marker is dropped (`return []`). The portal
+    /// driver's `active` flag is consulted below before any marker lowering;
+    /// pyre seeds it `true` at `setup_jitdriver` and exposes
+    /// `CallControl::set_jitdriver_active` to toggle it, matching the
+    /// upstream shape.
     fn try_handle_jit_marker(
         &mut self,
         key: JitMarkerKey,
         args: &[crate::flowspace::model::Variable],
     ) -> Option<Vec<SpaceOperation>> {
+        let jitdriver_index = self.portal_jd_index?;
+        // jtransform.py:1661-1662 `if not jitdriver.active: return []` — a
+        // deactivated portal driver drops its markers before dispatch.
+        if let Some(cc) = self.callcontrol.as_deref()
+            && let Some(jd) = cc.jitdriver_sd_from_jitdriver(jitdriver_index)
+            && !jd.active
+        {
+            return Some(Vec::new());
+        }
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
                 // jtransform.py:1723 `handle_jit_marker__can_enter_jit =
                 // handle_jit_marker__loop_header`.
-                let jitdriver_index = self.portal_jd_index?;
                 Some(self.handle_jit_marker__loop_header(jitdriver_index))
             }
             JitMarkerKey::JitMergePoint => {
-                let jitdriver_index = self.portal_jd_index?;
                 let cc = self.callcontrol.as_deref()?;
                 let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
                 let num_greens = jd.greens.len();
@@ -6132,6 +6141,50 @@ mod tests {
             OpKind::LoopHeader { jitdriver_index } => assert_eq!(*jitdriver_index, 2),
             other => panic!("expected LoopHeader, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn try_handle_jit_marker_drops_markers_for_inactive_driver() {
+        // jtransform.py:1661-1662 `if not jitdriver.active: return []`. A
+        // deactivated portal driver dispatches but drops its markers; an
+        // active driver lowers them normally.
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.setup_jitdriver(
+            crate::parse::CallPath::from_segments(["portal"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        cc.set_jitdriver_active(0, false);
+        {
+            let mut transformer = Transformer::new(&config)
+                .with_callcontrol(&mut cc)
+                .with_portal_jd(Some(0));
+            let ops = transformer
+                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+                .expect("inactive driver still dispatches (then drops)");
+            assert!(
+                ops.is_empty(),
+                "inactive driver must drop markers, got {ops:?}"
+            );
+        }
+
+        cc.set_jitdriver_active(0, true);
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+        let ops = transformer
+            .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+            .expect("active driver dispatches");
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::LoopHeader { jitdriver_index: 0 }),
+            "active driver lowers LoopHeader, got {:?}",
+            ops[0].kind
+        );
     }
 
     #[test]

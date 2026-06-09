@@ -949,8 +949,16 @@ impl ClassDesc {
         };
         if need_force_empty {
             let qualname = cls.qualname().to_string();
-            let in_force_map =
-                FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().contains_key(&qualname));
+            let canonical = majit_ir::descr::canonical_struct_name(&qualname);
+            // Prefer the bare `qualname` (the hand-coded exception entries
+            // are registered bare) and consult the canonical struct path
+            // only when it actually differs, so an exception class is not
+            // shadowed by a struct that happens to share its leaf.
+            let in_force_map = FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+                let table = cell.borrow();
+                table.contains_key(&qualname)
+                    || (canonical != qualname && table.contains_key(canonical.as_str()))
+            });
             if !in_force_map {
                 me.borrow_mut().all_enforced_attrs = Some(HashSet::new());
             }
@@ -1211,10 +1219,30 @@ impl ClassDesc {
         // [`FORCE_ATTRIBUTES_INTO_CLASSES`]) and the walker-derived
         // entries written by [`register_struct_fields`] from each
         // `ItemStruct.fields` projection at parse time.
+        // The struct-derived entries are keyed on the canonical
+        // crate-stripped qualified path (`module::Type`); the hand-coded
+        // exception entries (e.g. `EnvironmentError`) are registered bare
+        // and carry no struct origin.  `qualname()` is the bare leaf, so
+        // look it up directly first — that lets a bare exception entry win
+        // over a struct that happens to share its leaf — and only fall
+        // back to the `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it
+        // actually differs.
         let qualname = this.borrow().pyobj.qualname().to_string();
+        let canonical = majit_ir::descr::canonical_struct_name(&qualname);
         let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
-            FORCE_ATTRIBUTES_INTO_CLASSES
-                .with(|cell| cell.borrow().get(qualname.as_str()).cloned());
+            FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+                let table = cell.borrow();
+                table
+                    .get(qualname.as_str())
+                    .or_else(|| {
+                        if canonical != qualname {
+                            table.get(canonical.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned()
+            });
         if let Some(overrides) = overrides {
             for (attr_name, s_value) in &overrides {
                 ClassDef::generalize_attr(&classdef, attr_name, Some(s_value.clone()))?;
@@ -3666,6 +3694,34 @@ mod tests {
         assert!(env.contains_key("errno"));
         assert!(env.contains_key("strerror"));
         assert!(env.contains_key("filename"));
+    }
+
+    #[test]
+    fn register_struct_fields_keeps_same_leaf_distinct_modules_distinct() {
+        // Two structs sharing the leaf `FrameBlock` but defined in
+        // distinct modules with different field shapes must not clobber
+        // each other.  Registration is by the canonical qualified key
+        // only (no bare-leaf alias), so both shapes coexist and no bare
+        // `FrameBlock` key is created.
+        use crate::model::ValueType;
+        let shape_a = vec![("handlerdepth".to_string(), ValueType::Int)];
+        let shape_b = vec![
+            ("valuestackdepth".to_string(), ValueType::Int),
+            ("blockstack".to_string(), ValueType::Int),
+        ];
+        register_struct_fields("pyframe::FrameBlock", &shape_a);
+        register_struct_fields("codewriter::FrameBlock", &shape_b);
+
+        let a = forced_attributes_for("pyframe::FrameBlock")
+            .expect("qualified pyframe::FrameBlock entry present");
+        let b = forced_attributes_for("codewriter::FrameBlock")
+            .expect("qualified codewriter::FrameBlock entry present");
+        assert!(a.contains_key("handlerdepth"));
+        assert!(!a.contains_key("blockstack"));
+        assert!(b.contains_key("blockstack"));
+        assert!(b.contains_key("valuestackdepth"));
+        // No lossy bare-leaf alias is registered.
+        assert!(forced_attributes_for("FrameBlock").is_none());
     }
 
     #[test]

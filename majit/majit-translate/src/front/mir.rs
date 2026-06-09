@@ -1529,9 +1529,8 @@ impl<'a> Lowering<'a> {
                 // `OpKind::FieldRead` carrying the field name and
                 // `owner_root` so downstream consumers (codewriter
                 // inlining + annotator GetAttr dispatch on
-                // cross-procedural callers like
-                // `flowspace/rust_source/build_flow.rs:4770
-                // lower_field`) get a resolvable field/owner_root shape.
+                // cross-procedural callers) get a resolvable
+                // field/owner_root shape.
                 //
                 // Tuple-container `Field` projections split three ways.
                 // A local bound by a positional `Rvalue::Aggregate`
@@ -2750,8 +2749,7 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
-/// Charon-sourced equivalent of the syn
-/// `flowspace::rust_source::register::extract_unsafe_fn_stubs`: collect
+/// Collect, from the lowered MIR,
 /// `(path-segments, Signature, return-lltype)` for every local `unsafe
 /// fn` / unsafe impl-method whose return type projects to `Void` (unit)
 /// or `Bool`.  These callees cannot lower their bodies (raw-pointer
@@ -2770,16 +2768,16 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
 /// alias fan-out (unlike `free_function_alias_paths`), and three-plus-
 /// segment paths are excluded from the `lookup_with_leaf_match`
 /// fallback, so a crate-stripped or module-collapsed key would miss the
-/// nested call site.  An impl method keys as
-/// `[owner-module-segments..., Owner, method]` (the
-/// `impl_method_owner_for_fundecl` qualified owner split on `::`).
-/// Argument names are synthesised `arg{N}` by
-/// `signature.inputs.len()`; the receiver is counted on both sides
-/// (Charon includes `self` in `inputs`, the syn
-/// `extract_argnames_from_sig` emits a `self` entry), so the count
-/// matches.  Return types other than unit / bool surface no entry,
-/// preserving the original "not registered" Skip for those fns —
-/// matches `simple_return_type_to_lltype`'s Void/Bool-only projection.
+/// nested call site.  Free functions and impl-owned functions are both
+/// collected and keyed on `name_path()`: an impl method usually lowers
+/// to `CallTarget::Method` (resolved through the receiver classdef), but
+/// a receiver-less associated function and any impl method reached
+/// through an `FnDef` constant fall back to `CallTarget::FunctionPath {
+/// name_path }`, whose lookup is served only by this registry.  Argument
+/// names come from the Charon body locals, falling back to `arg{N}`.
+/// Return types other than unit / bool surface no entry, preserving the
+/// original "not registered" Skip for those fns — matches
+/// `simple_return_type_to_lltype`'s Void/Bool-only projection.
 pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
@@ -2812,21 +2810,34 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
             "bool" => LowLevelType::Bool,
             _ => continue,
         };
-        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
-            Some((owner_qualified, leaf)) => {
-                let mut segs: Vec<String> = owner_qualified.split("::").map(String::from).collect();
-                segs.push(leaf);
-                segs
-            }
-            None => fd
-                .item_meta
-                .name_path()
-                .split("::")
-                .map(String::from)
-                .collect(),
-        };
+        // Both free functions and impl-owned functions are collected,
+        // keyed on `name_path()` — the segment vector
+        // `call_target_segments` emits for a `CallKind::Fun(Regular)`
+        // (mir.rs:2186).  An impl method usually lowers to
+        // `CallTarget::Method` (resolved via the receiver classdef), but a
+        // receiver-less associated function (`Owner::new() -> ()/bool`) and
+        // any impl method reached through an `FnDef` constant fall back to
+        // `CallTarget::FunctionPath { name_path }` (mir.rs:2082, 3995),
+        // whose lookup is served only by this registry — skipping impl
+        // owners would leave those call sites "not registered".
+        let segments: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(String::from)
+            .collect();
+        // Prefer the Charon body's declared parameter names
+        // (`locals[1..=argc]`, the same source the regular lowering reads
+        // at `local.name`); fall back to positional `arg{N}` when the body
+        // is opaque or a local is unnamed.
+        let body = fd.unstructured();
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
-            .map(|i| format!("arg{i}"))
+            .map(|i| {
+                body.as_ref()
+                    .and_then(|u| u.locals.locals.get(i + 1))
+                    .and_then(|l| l.name.clone())
+                    .unwrap_or_else(|| format!("arg{i}"))
+            })
             .collect();
         out.push((segments, Signature::new(argnames, None, None), lltype));
     }

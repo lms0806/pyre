@@ -520,10 +520,9 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 ///
 /// The frontend desugars `&&` / `||` into
 /// `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`-shaped control flow
-/// before the graph reaches this adapter, mirroring the RPython-parity
-/// `flowspace/rust_source/build_flow.rs:1191 lower_short_circuit`: emit
-/// `bool(lhs)` + `set_branch` fork + 1-arg join carrying `lhs_raw`
-/// (short-circuit) or `rhs_raw` (full eval).
+/// before the graph reaches this adapter: in MIR the short-circuit is
+/// already lowered to a `bool(lhs)` test + branch fork + join over the
+/// boolean operands, so no binary `and`/`or` op survives to here.
 ///
 /// The fail-loud arm below survives for synthetic graphs (test
 /// fixtures, future ad-hoc producers) that inject `OpKind::BinOp {
@@ -1232,6 +1231,17 @@ pub fn translate_op(
                         // `Box::new` — and exception classes sharing a leaf —
                         // cannot be captured by an unrelated user function
                         // with the same leaf.
+                        //
+                        // This is the resting point for the former
+                        // caller-scoped `use`-import resolution: MIR callsites
+                        // carry the fully-qualified crate-relative path, so the
+                        // exact `lookup(&key)` above is the primary binder and
+                        // no per-caller import scope is needed to disambiguate.
+                        // The leaf-scan itself is wrong-bind-safe —
+                        // `lookup_with_leaf_match` returns `Some` only when the
+                        // same-leaf matches converge on a single `host_object`
+                        // identity, otherwise `None` falls through to the hard
+                        // error below.
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
@@ -2947,6 +2957,71 @@ mod tests {
         // `__name__`, mirroring upstream `func.__name__` (the leaf
         // identifier, not the dotted module path).
         assert_eq!(host.qualname(), "b");
+    }
+
+    #[test]
+    fn translate_op_call_function_path_exact_registry_wins_over_leaf_collision() {
+        // Two user fns share the bare leaf `shared_leaf` under different
+        // module paths, so `lookup_with_leaf_match` is ambiguous (distinct
+        // HostObjects → it returns None).  The exact `call_registry.lookup`
+        // runs first in the resolution order, so a FunctionPath spelling
+        // the full `othermod::shared_leaf` path resolves to that exact
+        // entry; were resolution to fall through to the leaf-match
+        // fallback it would error instead.  Locks in the
+        // exact-before-leaf-match precedence the resolver depends on.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(Variable::new()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let registry = empty_call_registry();
+        let other_entry = registry.get_or_register(
+            FunctionPathKey::from_segments(["othermod", "shared_leaf"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        let mymod_entry = registry.get_or_register(
+            FunctionPathKey::from_segments(["mymod", "shared_leaf"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        assert_ne!(
+            other_entry.host_object, mymod_entry.host_object,
+            "colliding-leaf entries must be distinct HostObjects"
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["othermod".into(), "shared_leaf".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("exact FunctionPath must lower");
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = lowered.args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("FunctionPath callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            host, &other_entry.host_object,
+            "exact registry lookup must win over the leaf-match fallback"
+        );
+        assert_ne!(
+            host, &mymod_entry.host_object,
+            "must not resolve to the colliding-leaf sibling"
+        );
     }
 
     #[test]

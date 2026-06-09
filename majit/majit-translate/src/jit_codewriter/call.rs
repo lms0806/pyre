@@ -410,6 +410,12 @@ impl GreenFieldInfoHandle for StaticGreenFieldInfoHandle {
 pub struct JitDriverStaticData {
     /// RPython: `jitdriver_sd.index`
     pub index: usize,
+    /// RPython: `jitdriver.active` (jtransform.py:1661-1662). `True` by
+    /// default; a deactivated jitdriver drops its `jit_marker` ops at
+    /// rewrite time. pyre has no mechanism to deactivate a driver yet, so
+    /// this is seeded `true` at `setup_jitdriver`, but the gate is honoured
+    /// in `try_handle_jit_marker` to match the upstream `return []` shape.
+    pub active: bool,
     /// RPython: `jitdriver.greens` — loop-invariant variable names.
     pub greens: Vec<String>,
     /// RPython: `jitdriver.reds` — loop-variant variable names.
@@ -738,7 +744,7 @@ pub struct CallControl {
     /// `Index(n)` placeholders.  Pyre cannot introspect a function
     /// pointer for argnames; populated by the walker through
     /// `mark_oopspec_argnames` whenever `#[oopspec(...)]` is paired
-    /// with a function signature (`front::syn_metadata::collect_jit_hints`
+    /// with a function signature (`front::llbc_hints::harvest_hints_from_llbcs`
     /// emits a companion `"oopspec_argnames:..."` hint that
     /// `lib.rs:600` consumes alongside `"oopspec:..."`).
     ///
@@ -1504,7 +1510,7 @@ impl CallControl {
     ///      runtime-published `PyreSizeDescr` (publish key = same
     ///      `path_hash(strip_crate(module_path!())::Name)` analyzer
     ///      builds for `owner_root` via `qualify_type_name` +
-    ///      `ParsedInterpreter.module_path`).
+    ///      `SemanticFunction.module_path`).
     ///   2. Walk `size_descr.all_fielddescrs()` matching the bare
     ///      `field_name` against each entry's `fd.field_name()` —
     ///      PyreFieldDescr names follow `"STRUCT.field"` per
@@ -2024,6 +2030,19 @@ impl CallControl {
     /// helper address instead of the symbolic hash fallback.  RPython
     /// `call.py:174-187 getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
+    ///
+    /// NOTE: this `ImplFnAddrBindings` channel is test-only.  Every
+    /// production entry point passes `&[]` for `impl_fnaddr_bindings`, so
+    /// this runs only under the macro tests
+    /// (`majit-macros/tests/jit_module_test.rs`).  Production impl-method
+    /// helpers are registered as flat full-path keys via
+    /// `register_macro_helper_trace_fnaddr`, and `CallTarget::Method`
+    /// lookups resolve through `resolved_path` / the impl-method
+    /// leaf-index — neither consults `impl_type_as_written`.  The macro
+    /// only sees the surface `impl`-header spelling, so this key is
+    /// non-canonical by design (it cannot recover a `use`-aliased owner's
+    /// defining module); do not wire it into a production caller without
+    /// canonicalising the owner root against `front::mir`'s `self_ty_root`.
     pub fn register_macro_impl_helper_trace_fnaddr(
         &mut self,
         module_path_with_crate: &str,
@@ -2163,6 +2182,7 @@ impl CallControl {
         );
         self.jitdrivers_sd.push(JitDriverStaticData {
             index,
+            active: true,
             greens,
             reds,
             virtualizables,
@@ -2173,6 +2193,16 @@ impl CallControl {
             virtualizable_info: None,
             greenfield_info: None,
         });
+    }
+
+    /// Toggle `jitdrivers_sd[index].active` (`jtransform.py:1661-1662`
+    /// `jitdriver.active`).  `setup_jitdriver` seeds drivers `active`; a
+    /// deactivated portal driver makes `try_handle_jit_marker` drop its
+    /// markers (`return []`).  No-op when `index` is out of range.
+    pub fn set_jitdriver_active(&mut self, index: usize, active: bool) {
+        if let Some(jd) = self.jitdrivers_sd.get_mut(index) {
+            jd.active = active;
+        }
     }
 
     /// warmspot.py:528-545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -3935,7 +3965,7 @@ impl CallControl {
     /// match the function's actual parameter declaration order.
     ///
     /// Populated by the walker (`lib.rs:600`) whenever
-    /// `front::syn_metadata::collect_jit_hints` emits the
+    /// `front::llbc_hints::harvest_hints_from_llbcs` emits the
     /// `"oopspec_argnames:..."` companion hint — i.e. when a function
     /// carries `#[oopspec(...)]` AND its signature is available at
     /// hint-collection time.  Programmatic `mark_oopspec` callers
