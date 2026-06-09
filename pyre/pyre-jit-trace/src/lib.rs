@@ -5,6 +5,13 @@
 //! from pyre-jit's eval_loop_jit to prevent MIFrame's monomorphization
 //! of `execute_opcode_step<E>` from bloating the eval loop's codegen.
 
+// Self-alias so include!()'d codegen written for `majit-translate`'s
+// crate name keeps compiling when its source is also `include!`d into
+// this crate's `generated*` modules (jit_trace_gen.rs).  Allows generic
+// bounds like `F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps` to
+// resolve from both sides.
+extern crate self as pyre_jit_trace;
+
 pub mod assembler;
 pub mod callbacks;
 pub mod canonical_bridge;
@@ -24,10 +31,11 @@ pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
 pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
-pub use trace_opcode::{production_blackhole_handles, production_walker_handles};
+pub use trace_opcode::production_walker_handles;
 pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;
+pub mod walker_frame_ops;
 
 // pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
 // exactly one extra red (ec, see `virtualizable_gen.rs:29-31` and
@@ -41,6 +49,15 @@ const _: () = assert!(
     virtualizable_gen::NUM_EXTRA_REDS == 1,
     "pyre's PyFrame virtualizable layout requires exactly one extra red (ec)",
 );
+
+/// `PYRE_PROBE_SUBSCR` env-var gate cached once on first read. The
+/// state.rs/jitcode_dispatch.rs probe sites are on hot paths; sampling
+/// `std::env::var_os` on every cache hit would dominate the cost when
+/// the probe is off.
+pub(crate) fn probe_subscr_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PROBE_SUBSCR").is_some())
+}
 
 /// Auto-generated trace functions from majit-translate.
 #[allow(dead_code, unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]

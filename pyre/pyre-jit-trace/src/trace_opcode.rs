@@ -238,7 +238,6 @@ fn trace_plain_int_payload(
         if is_long(concrete_item) {
             return crate::state::trace_unbox_long_with_resume(
                 frame,
-                ctx,
                 item,
                 &LONG_TYPE as *const _ as i64,
             );
@@ -4959,7 +4958,6 @@ impl MIFrame {
                     } else {
                         crate::state::trace_unbox_float_with_resume(
                             this,
-                            ctx,
                             items[0],
                             &FLOAT_TYPE as *const _ as i64,
                         )
@@ -4969,7 +4967,6 @@ impl MIFrame {
                     } else {
                         crate::state::trace_unbox_float_with_resume(
                             this,
-                            ctx,
                             items[1],
                             &FLOAT_TYPE as *const _ as i64,
                         )
@@ -5432,7 +5429,6 @@ impl MIFrame {
                     }
                     crate::generated_list_setslice_same_len_by_strategy(
                         this,
-                        ctx,
                         obj,
                         value,
                         raw_start,
@@ -5449,10 +5445,9 @@ impl MIFrame {
             }
         }
         // jtransform do_resizable_list_setitem dispatch.
-        let handled: bool = self.with_ctx(|this, ctx| {
+        let handled: bool = self.with_ctx(|this, _ctx| {
             Ok::<_, PyError>(crate::generated_store_subscr_value(
                 this,
-                ctx,
                 obj,
                 key,
                 value,
@@ -6993,6 +6988,108 @@ impl MIFrame {
     /// on the trait path until walker snapshot capture can represent the
     /// full parent-frame chain.
     ///
+    /// PyPy `_opimpl_*` direct-record entry point for opcodes that emit
+    /// IR and produce concrete effects directly from the tracer, bypassing
+    /// the auto-gen arm-jitcode walk.  Mirrors `MetaInterp.interpret`'s
+    /// upstream dispatch shape where `pyjitpl.py:1346+ _opimpl_*` methods
+    /// invoke `metainterp.history.record*` and concrete-execute helpers
+    /// inline rather than walking an intermediate jitcode representation.
+    ///
+    /// Returns `Ok(Some(step_result))` when the opcode was handled here.
+    /// `Ok(None)` falls through to the arm-jitcode walker in
+    /// [`MIFrame::dispatch_via_walker_for_opcode`].  `Err(_)` propagates a
+    /// dispatch-time exception (e.g. `MIFrame::reraise` raising with
+    /// `reraise_lasti` populated).
+    ///
+    /// Each direct-dispatch handler must:
+    ///   1. Update the symbolic stack via `SharedOpcodeHandler::pop_value`
+    ///      / `peek_at` so subsequent walker opcodes see consistent vsd.
+    ///   2. Record any IR for the opcode (via a trait method like
+    ///      `MIFrame::store_subscr_value` or a `_opimpl_*`-style direct
+    ///      `record_op_*` call against `WalkContext`).
+    ///   3. Produce concrete heap effects when the upstream `_opimpl_*`
+    ///      counterpart does (e.g. `bh_execute_store_subscr`-style helper
+    ///      invocation).
+    ///
+    /// This entry point is the natural home for future `_opimpl_*` ports
+    /// — adding a new opcode here is the structural equivalent of writing
+    /// a new `pyjitpl.py:_opimpl_<name>` method.
+    fn try_walker_direct_opcode_dispatch(
+        &mut self,
+        instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
+    ) -> Result<Option<pyre_interpreter::StepResult<FrontendOp>>, PyError> {
+        // Sub-slice 5c step 5.6b — STORE_SUBSCR walker activation via
+        // trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `StoreSubscr` is
+        // `int_copy, residual_call_r_r(bh_execute_store_subscr, frame),
+        // live, ref_return`.  `try_execute_residual_call_via_executor`
+        // matches the `CallR` shape and concrete-executes
+        // `bh_execute_store_subscr(frame)`, which casts the arg to
+        // `*mut PyFrame` and pops 3 values from
+        // `PyFrame.locals_cells_stack_w`.  Walker `LOAD_FAST` /
+        // `LOAD_CONST` / etc. populate only MIFrame's symbolic +
+        // concrete-shadow stacks — not the concrete `PyFrame`'s slots
+        // (`setfield_vable_i(vsd)` advances depth without writing the
+        // slot) — so the pop reads NULL and the helper raises every
+        // iteration, surfacing as `DispatchOutcome::SubRaise`.
+        //
+        // Trait dispatch documents `MIFrame::store_subscr` as
+        // "trace-only, no concrete mutation" (compiled trace handles
+        // real mutations later).  Mirror that here by short-circuiting
+        // the arm walk: pop 3 via `SharedOpcodeHandler::pop_value`
+        // (updates symbolic + concrete-shadow stacks + vsd shadow)
+        // and delegate to the existing `MIFrame::store_subscr_value`
+        // which records the same specialized IR shape
+        // (`guard_class + SETARRAYITEM_GC` family via
+        // `generated_store_subscr_value`, or `Call(jit_setitem, ...)`
+        // fallback via `trace_store_subscr`).  Bypasses the
+        // `apply_walker_stack_effect` post-walk step because
+        // `pop_value` already handles vsd.
+        //
+        // This delegation reuses the trait method intentionally; the
+        // 141 cutover can later replace it with a pure-walker variant
+        // once the walker grows symbolic-stack-aware specialization
+        // primitives.
+        if matches!(instruction, Instruction::StoreSubscr) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
+            let key = SharedOpcodeHandler::pop_value(self)?;
+            let obj = SharedOpcodeHandler::pop_value(self)?;
+            let value = SharedOpcodeHandler::pop_value(self)?;
+            self.store_subscr_value(
+                obj.opref,
+                key.opref,
+                value.opref,
+                obj.concrete.to_pyobj(),
+                key.concrete.to_pyobj(),
+                value.concrete.to_pyobj(),
+            )?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // `pyopcode.py:1348-1376 RERAISE` parity for the walker leg.
+        //
+        // Production walker excluded `Reraise` because the trait path
+        // returns `Err(PyError)` with `reraise_lasti` populated for
+        // `oparg > 0`, while a walker hook returning `StepResult::Continue`
+        // (`Ok`) loses that channel and `trace_code_step` aborts on
+        // `oparg > 0 && reraise_lasti < 0`.  Delegate to the existing
+        // `MIFrame::reraise` impl (which mirrors `pyopcode.py:1357-1376`
+        // verbatim, reading the lasti from `concrete_stack[stack_idx]`
+        // and seeding `err.reraise_lasti`) and propagate its `Err` so
+        // `trace_code_step`'s `step_result.err().map(|e| e.reraise_lasti)`
+        // extraction works the same on either dispatch leg.
+        if let Instruction::Reraise { depth } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::reraise(self, depth.get(op_arg))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        Ok(None)
+    }
+
     /// `is_top_level=false` so the arm's `ref_return/r` terminator
     /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
     /// `Finish` (the outer Python frame's `Finish` is owned by the
@@ -7001,7 +7098,19 @@ impl MIFrame {
     pub(crate) fn dispatch_via_walker_for_opcode(
         &mut self,
         instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+        // PyPy `_opimpl_*` direct-record entry point — opcodes that bypass
+        // the auto-gen arm-jitcode walk and emit IR / produce concrete
+        // effects directly, matching `MetaInterp.interpret`'s upstream
+        // dispatch shape (`pyjitpl.py:1346+ _opimpl_*`).
+        //
+        // Returns `Some(step_result)` when the opcode was handled here.
+        // The arm-jitcode walker below runs only when this returns `None`.
+        if let Some(step_result) = self.try_walker_direct_opcode_dispatch(instruction, op_arg)? {
+            return Ok(step_result);
+        }
+
         let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {
             Some(jc) => jc,
             None => {
@@ -7244,7 +7353,7 @@ impl MIFrame {
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
                 if production_walker_handles(&instruction) && !in_inline_frame {
-                    self.dispatch_via_walker_for_opcode(&instruction)
+                    self.dispatch_via_walker_for_opcode(&instruction, op_arg)
                 } else {
                     let shadow_outcome =
                         crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
@@ -7959,14 +8068,13 @@ unsafe fn trace_check_exc_match_against(
 ///
 /// Subsequent batches grow this set until it covers every Python
 /// opcode.  The remaining wall is execution-side, not recording-side:
-/// `eval.rs:3111` skips `execute_opcode_step` for walker-handled
+/// `eval_loop_jit` skips `execute_opcode_step` for walker-handled
 /// opcodes, which is correct only when the arm body's heap effects ride
-/// `vable_setfield` / `setarrayitem_vable_r`.  Arms with non-elidable
-/// `residual_call`s (e.g. `store_subscr_fn`,
-/// `set_current_exception`) require the Phase 5.B dispatch-unification
-/// path (`production_blackhole_handles` + `dispatch_arm_via_blackhole`)
-/// before they can join this set.  The trait infra is deleted only
-/// after both predicates cover every opcode.
+/// `vable_setfield` / `setarrayitem_vable_r`, or when walker dispatch
+/// concrete-executes any non-elidable `residual_call` through
+/// `try_execute_residual_call_via_executor` (Task #390 sub-slice 3).
+/// The trait infra is deleted only after this predicate covers every
+/// opcode.
 ///
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // The unit-variant fold rewrites `StepResult::Continue` &c. to
@@ -8070,13 +8178,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CopyFreeVars { .. }
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
-            // Instruction::Reraise excluded: `trace_code_step` reads
-            // `reraise_lasti` only from `step_result.err()`
-            // (trace_opcode.rs:6839-6843).  A walker-handled Reraise
-            // returns `StepResult::Continue` (Ok), so reraise_lasti is
-            // always -1 and `Reraise { depth > 0 }` aborts the trace.
-            // Keep on trait dispatch until the walker can propagate the
-            // saved lasti.
+            | Instruction::Reraise { .. } // walker hook in dispatch_via_walker_for_opcode delegates to MIFrame::reraise which returns Err(PyError) with reraise_lasti seeded — `step_result.err().map(|e| e.reraise_lasti)` extraction works the same on either leg
             | Instruction::PopJumpIfNone { .. }
             | Instruction::PopJumpIfNotNone { .. }
             | Instruction::ForIter { .. }
@@ -8087,6 +8189,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
             // walker re-enable is unblocked.
+            | Instruction::StoreSubscr // 5.6b: handled by dispatch_via_walker_for_opcode entry hook
             // Instruction::PopExcept excluded: same bridge-tracing
             // rationale as PushExcInfo below — its arm manages the
             // exception-info stack via impure helper jitcodes the walker
@@ -8123,26 +8226,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // the other pure pushes.
             | Instruction::PushNull
     )
-}
-
-/// Phase 5.B dispatch-unification predicate (companion to
-/// `production_walker_handles`).
-///
-/// Walker-handled opcodes whose arm body contains a non-elidable
-/// `residual_call` (e.g. `store_subscr_fn`, `set_current_exception`)
-/// cannot use the vable-only fast path at `eval.rs:3111`: walker
-/// recording skips concrete execution of impure residual_calls, and
-/// `eval_loop_jit` then skips `execute_opcode_step`, so the heap
-/// mutation never happens.  This predicate names the opcodes for which
-/// `eval_loop_jit` instead runs the arm jitcode through
-/// `BlackholeInterpreter` (`dispatch_arm_via_blackhole`), matching
-/// RPython `pyjitpl.py:_interpret`'s single-interpreter loop.
-///
-/// Returns `false` for every opcode today.  Slice 1 wires the
-/// predicate into `eval.rs` as a structural branch point; subsequent
-/// slices add opcodes once `dispatch_arm_via_blackhole` lands.
-pub fn production_blackhole_handles(_instruction: &Instruction) -> bool {
-    false
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
@@ -8316,6 +8399,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::CallFunctionEx
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
+        // | Instruction::StoreSubscr { .. } // see production_walker_handles for 5.6b root-cause note
         | Instruction::StoreFastStoreFast { .. }
         | Instruction::PushNull => {
             // Non-zero stack delta. The walker arm's

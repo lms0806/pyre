@@ -253,6 +253,69 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     }
 }
 
+/// C-ABI bridge for the `execute_store_subscr` arm helper consumed by the
+/// production walker.  Mirrors RPython's `bh_call_*` calling convention:
+/// a single `*mut PyFrame` arg widened to `i64`, success encoded as a
+/// non-zero `i64`, errors propagated via
+/// `majit_metainterp::blackhole::BH_LAST_EXC_VALUE`.  Required because
+/// `crate::execute_store_subscr` itself returns `Result<StepResult<_>,
+/// PyError>` whose fat-enum payload does not fit the residual_call's
+/// single-register Ref-result slot.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
+    let executor = unsafe { &mut *(executor_ptr as *mut crate::pyframe::PyFrame) };
+    match crate::pyopcode::execute_store_subscr(executor) {
+        Ok(_step_result) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// C-ABI 3-arg `(obj, key, value) → i64` store_subscr helper bound by
+/// `pyre-jit::cpu.store_subscr_fn` (`pyre-jit/src/jit/cpu.rs:151`).
+/// The codewriter emits a `residual_call_r_v(store_subscr_fn, obj,
+/// key, value)` (`codewriter.rs:7042
+/// build_store_subscr_fn_residual_call_r_v_insn`); the runtime
+/// dispatcher calls this thin wrapper to mutate the heap via
+/// `baseobjspace::setitem`.
+///
+/// Sub-slice 5c step 5.5c relocation: previously lived in
+/// `pyre-jit/src/call_jit.rs` as `bh_store_subscr_fn`.  Moved here so
+/// the address can be reached from `pyre-jit-trace` (via
+/// `pyre_interpreter::jit_trace_fnaddrs()`'s build-time registry)
+/// without a cross-crate `pyre-jit-trace → pyre-jit` dep edge — pyre-
+/// jit-trace already depends on pyre-interpreter for the orthodox
+/// recording-time helpers (`jit_setitem`, `jit_getitem`, …).
+///
+/// Returns 1 on success, 0 on raise (exception object stashed in
+/// `BH_LAST_EXC_VALUE`).  The return-code polarity differs from the
+/// trait-side `jit_setitem` which returns 0 on success and panics on
+/// error — `bh_store_subscr_fn` is fail-soft because residual_call
+/// execution is not a panic site.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
+    let obj = obj as pyre_object::PyObjectRef;
+    let key = key as pyre_object::PyObjectRef;
+    let value = value as pyre_object::PyObjectRef;
+    if obj.is_null() || key.is_null() || value.is_null() {
+        let err = crate::PyError::new(
+            crate::PyErrorKind::TypeError,
+            "store subscript on null operand".to_string(),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        return 0;
+    }
+    if let Err(err) = crate::baseobjspace::setitem(obj, key, value) {
+        let exc_obj = err.to_exc_object();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        return 0;
+    }
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

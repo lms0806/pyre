@@ -339,6 +339,41 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::opcode_ops::jit_setattr as *const (),
     );
 
+    // Production walker's `Instruction::StoreSubscr` arm emits a
+    // `residual_call_r_r` whose funcptr resolves at codewriter time
+    // through the bare path `["execute_store_subscr"]` (the dispatch-
+    // table entry at `pyopcode.rs:2909`).  Without a runtime fnaddr
+    // entry the codewriter mints a `symbolic_fnaddr_for_path` hash
+    // that the `runtime_fnaddr_patch` cannot rewrite and sub-slice 4's
+    // 47-bit sanity gate rejects, causing the walker to skip the heap
+    // mutation and SIGBUS on the next read.  `bh_execute_store_subscr`
+    // is the C-ABI bridge over the generic
+    // `execute_store_subscr::<PyFrame>` whose `Result<StepResult<_>,
+    // PyError>` cannot ride the residual_call's single-register Ref
+    // result slot.  Registering the bare path here lets the codewriter
+    // bake the wrapper address directly into `JitCode.constants_i`,
+    // mirroring PyPy's `cpu.bh_call_*` -> linker-resolved C symbol
+    // contract (`pyjitpl.py:1346 _opimpl_residual_call*`).
+    push_fnaddr(
+        &mut entries,
+        "execute_store_subscr",
+        crate::opcode_ops::bh_execute_store_subscr as *const (),
+    );
+
+    // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs:151`)
+    // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`
+    // (relocated from `pyre-jit/src/call_jit.rs` in 5.5c).
+    // Registered here so `pyre-jit-trace`'s walker specialization gate
+    // (`try_walker_store_subscr_specialization`) can recover the
+    // runtime address via `jit_trace_fnaddrs()` lookup without a
+    // cross-crate `pyre-jit-trace → pyre-jit` dependency edge.
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::bh_store_subscr_fn",
+        "pyre_interpreter::bh_store_subscr_fn",
+        crate::opcode_ops::bh_store_subscr_fn as *const (),
+    );
+
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
             push_alias_pair(&mut entries, module_path, root_path, fnptr);
@@ -1052,6 +1087,25 @@ mod tests {
             tuple2
         );
         assert_eq!(bindings["pyre_interpreter::jit_build_tuple_2"], tuple2);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_store_subscr_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let execute_store_subscr =
+            crate::opcode_ops::bh_execute_store_subscr as *const () as usize as i64;
+        assert_eq!(bindings["execute_store_subscr"], execute_store_subscr);
+
+        let store_subscr_fn = crate::opcode_ops::bh_store_subscr_fn as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::opcode_ops::bh_store_subscr_fn"],
+            store_subscr_fn
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::bh_store_subscr_fn"],
+            store_subscr_fn
+        );
     }
 
     /// Negative parity guard: pyre intentionally does NOT publish a

@@ -471,6 +471,25 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
+    /// Sub-slice 5c step 5.5b — runtime address of `bh_store_subscr_fn`
+    /// (pyre-jit's `cpu.store_subscr_fn` binding) used by
+    /// `try_walker_store_subscr_specialization` to recognise the
+    /// 3-arg `residual_call_r_v(store_subscr_fn, obj, key, value)`
+    /// emitted by `codewriter.rs:7042
+    /// build_store_subscr_fn_residual_call_r_v_insn`.
+    ///
+    /// Populated by the production entry caller
+    /// (`MIFrame::dispatch_via_walker_for_opcode` →
+    /// `dispatch_via_miframe_at_opcode_entry`) which reaches the
+    /// address through pyre-jit's `cpu.store_subscr_fn`.  Sub-walks
+    /// inherit the parent's value.  `None` disables the field-based
+    /// specialization gate (test fixtures, default-test entries, or
+    /// production paths where the address hasn't been plumbed yet).
+    ///
+    /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var (step 5.5a) is read
+    /// as the fallback when this field is `None` — the env var keeps
+    /// working for test fixtures and runtime override.
+    pub store_subscr_fn_addr: Option<usize>,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1791,6 +1810,16 @@ pub fn dispatch_via_miframe(
             entry_py_pc,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            // This entry (test/fixture / shadow_walker) hard-codes
+            // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
+            // rather than seeding them from `sym.jitcode` /
+            // `collect_outer_active_boxes` like
+            // `dispatch_via_miframe_at_opcode_entry` does.  A specialized
+            // `generated_store_subscr_value` guard captured via
+            // `walker_capture_snapshot_for_last_guard` would attach
+            // resume data pointing at the wrong frame, so keep
+            // STORE_SUBSCR specialization off on this entry.
+            store_subscr_fn_addr: None,
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -2005,6 +2034,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             entry_py_pc,
             outer_jitcode_index,
             outer_active_boxes,
+            store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -3022,14 +3052,27 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 ///
 /// ★ Task #390 sub-slice 1 — non-elidable concrete-execute inventory.
 ///
-/// PyPy `do_residual_call` (pyjitpl.py:1995-2126) **always** calls
-/// `executor.execute_varargs(opnum, argboxes, descr, exc=can_raise,
-/// pure=is_elidable)` regardless of EI branch.  The recorded opcode
-/// kind selected above is for the IR trace; concrete execution always
-/// happens at trace-record time.  Pyre's walker only concrete-executes
+/// PyPy `do_residual_call` (pyjitpl.py:1995-2126) concrete-executes
+/// the helper at trace-record time across the **forces** /
+/// **loopinvariant** (cache miss) / **elidable** / **default**
+/// branches via `executor.execute_varargs(opnum, argboxes, descr,
+/// exc=can_raise, pure=is_elidable)`.  Two narrower branches sit
+/// outside this uniform call:
+///   * `OS_NOT_IN_TRACE` short-circuits through
+///     `do_not_in_trace_call` (`pyjitpl.py:2003-2006`) and never
+///     reaches `executor.execute_varargs`.
+///   * `is_call_release_gil()` runs the helper through
+///     `do_call_release_gil` (`pyjitpl.py:3671-3681`), invoking
+///     `executor.execute_varargs` directly **before** the recorded
+///     `CALL_RELEASE_GIL_*` op is emitted.
+/// The recorded opcode kind selected above is for the IR trace
+/// only; concrete execution either fired (or was intentionally
+/// skipped via the two narrow branches above) before the trace op
+/// hits the recorder.  Pyre's walker today concrete-executes only
 /// the `CallPure*` branch (via [`try_fold_pure_call_via_executor`]),
-/// so the other three branches surface as the M4 SIGBUS root cause
-/// (memory: M4 walker unactivated taxonomy).
+/// so the forces / loopinvariant-miss / default branches surface
+/// as the M4 SIGBUS root cause (memory: M4 walker unactivated
+/// taxonomy).
 ///
 /// Per-branch concrete-execute status today:
 ///
@@ -3270,42 +3313,16 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
 /// time via [`majit_metainterp::executor::execute_pure_call`] and stamp
 /// `recorded` with the result.
 ///
-/// ★ PyPy parity gap (Phase 5.B replacement candidate):
 /// PyPy `_opimpl_*` methods (e.g. `_opimpl_setitem`,
 /// `_opimpl_setfield_*`) concrete-execute every `do_residual_call`
 /// regardless of `check_is_elidable()` — the EI flag only selects the
 /// recorded opcode kind (`CALL_PURE_*` vs `CALL_*`), not whether the
-/// helper runs.  The result is that `synchronize_virtualizable`'s
-/// in-place PyFrame write at the end of `_opimpl_setfield_vable`
-/// coincides with the side-effecting heap mutation of the
-/// `store_subscr_fn` / `set_current_exception` helper — both happen
-/// at trace-record time on the live frame.
-///
-/// Pyre's walker concrete-executes only the elidable path (this
-/// function); non-elidable helpers like `store_subscr_fn` route
-/// through `select_residual_call_opcode`'s default arm and are
-/// recorded but never executed.  `eval_loop_jit`'s
-/// `walker_dispatched_this_opcode` skip of `execute_opcode_step`
-/// (eval.rs:3111) then leaves the non-vable heap unchanged → SIGBUS
-/// on the next read (memory: M4 walker unactivated taxonomy, 5
-/// STORE_SUBSCR-hot benches).
-///
-/// The Phase 5.B `dispatch_arm_via_blackhole` path is a workaround
-/// that runs the arm jitcode through `BlackholeInterpreter` to
-/// concrete-execute those helpers; the orthodox PyPy alignment is
-/// instead to widen this function (or its successor) to
-/// concrete-execute *every* residual_call with concrete-known args,
-/// mirroring upstream's `executor.execute_varargs(opnum, argboxes,
-/// descr, exc=can_raise, pure=is_elidable)`.  That removes the need
-/// for `production_blackhole_handles` entirely and brings
-/// `_opimpl_setfield_vable` shape into structural parity.
-///
-/// Out-of-scope here (multi-session epic): widening requires can-raise
-/// exception propagation through the walker, a GuardNoException
-/// emission policy that matches PyPy's `do_residual_call(..., exc=
-/// can_raise)`, and audit of every non-elidable helper for trace-
-/// recording-time invariants (no jitdriver re-entry, no thread state
-/// mutation).  See Task #390.
+/// helper runs.  This function covers the elidable arm; the
+/// non-elidable arms (`CallMayForce*`, `CallLoopinvariant*`, `Call*`)
+/// are concrete-executed by [`try_execute_residual_call_via_executor`]
+/// (Task #390 sub-slice 3), with raised exceptions surfaced through
+/// `BH_LAST_EXC_VALUE` so `eval_loop_jit` can route them into the
+/// bytecode exception handler.
 ///
 /// RPython upstream `_record_helper_pure` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
@@ -3464,15 +3481,28 @@ fn try_fold_pure_call_via_executor(
 /// call regardless of EI.
 ///
 /// **Caller contract**:
-/// * `call_opcode` must be one of the non-elidable, non-may-force
-///   residual call shapes: `Call{I,R,F,N}` (the default arm) or
-///   `CallLoopinvariant{I,R,F,N}` (the `EF_LOOPINVARIANT` arm).
+/// * `call_opcode` must be one of the non-elidable residual call shapes:
+///   `Call{I,R,F,N}` (the default arm), `CallLoopinvariant{I,R,F,N}`
+///   (the `EF_LOOPINVARIANT` arm), or `CallMayForce{I,R,F,N}` (the
+///   `forces_virtual_or_virtualizable` arm — only when no active
+///   virtualizable is present, see force-virtual gate below).
 ///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
 ///     job.
-///   * `CallMayForce*` / `CallReleaseGil*` / `CallAssembler*` are
-///     intentionally excluded: their trace-recording-time invariants
-///     (force-virtual audit, GIL transitions, jitdriver re-entry)
-///     need a separate audit (Task #390 sub-slice 4).
+///   * `CallReleaseGil*` / `CallAssembler*` are intentionally excluded:
+///     their trace-recording-time invariants (GIL transitions, jitdriver
+///     re-entry) need a separate audit (Task #390 sub-slice 4).
+///   * **`CallMayForce*` force-virtual gate**: PyPy `do_residual_call`
+///     (`pyjitpl.py:2017-2082`) concrete-executes every `CallMayForce*`
+///     via `executor.execute_varargs` and detects vable escape via the
+///     post-call `vinfo.tracing_after_residual_call(vbox)` heap probe.
+///     Pyre's walker leg lacks the post-call probe today (only the
+///     trait-driven leg has it at `state.rs MIFrame::vable_after_residual_call`,
+///     `trace_opcode.rs:2646`).  Until the walker counterpart lands,
+///     this function only admits `CallMayForce*` when the jitdriver has
+///     no active `standard_virtualizable_box()` — in that case there's
+///     no vable to force, so the after-check would be a no-op.  Active-
+///     vable `CallMayForce*` continues to decline (record-only), matching
+///     the current production behaviour.
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
@@ -3505,7 +3535,7 @@ fn try_execute_residual_call_via_executor(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
 ) -> Option<Result<i64, i64>> {
-    if !matches!(
+    let plain_or_loopinvariant = matches!(
         call_opcode,
         OpCode::CallI
             | OpCode::CallR
@@ -3515,7 +3545,22 @@ fn try_execute_residual_call_via_executor(
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN
-    ) {
+    );
+    // `CallMayForce*` is admitted only when no active virtualizable
+    // exists — otherwise the walker would need to call the missing
+    // `walker_vable_after_residual_call` post-check (see doc above).
+    // Mirrors `pyjitpl.py:2017-2082 do_residual_call`'s outer
+    // `forces_virtual_or_virtualizable` branch: with no vinfo box,
+    // `vable_after_residual_call` early-returns, so executing the
+    // helper here is safe.
+    let may_force_safe = matches!(
+        call_opcode,
+        OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN
+    ) && ctx.trace_ctx.standard_virtualizable_box().is_none();
+    if !plain_or_loopinvariant && !may_force_safe {
         return None;
     }
     if allboxes.is_empty() {
@@ -3587,6 +3632,20 @@ fn try_execute_residual_call_via_executor(
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
     match exec_result {
         Ok(result_i64) => {
+            // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
+            // success arm with `metainterp.clear_exception()` (called
+            // implicitly through `do_residual_call`'s no-raise tail).
+            // Pyre's `ctx.last_exc_value` carries a sticky `OpRef` /
+            // concrete pointer from any prior raising helper in the
+            // same walk; if a later non-raising residual call did not
+            // clear it, downstream consumers (`last_exc_value/>r`,
+            // `reraise/`, `catch_exception/L`) would read the stale
+            // value as if a fresh exception had just landed.  Mirror
+            // `clear_exception()` here so the success arm only
+            // surfaces an active exception when the *current* call
+            // raised.
+            ctx.last_exc_value = None;
+            ctx.last_exc_value_concrete = ConcreteValue::Null;
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
@@ -4128,7 +4187,7 @@ fn collect_outer_active_boxes(
 /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
 /// `rd_resume_position >= 0` and can derive `op.fail_args` from the
 /// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
-fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
+pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
     //
@@ -4456,6 +4515,163 @@ fn direct_call_release_gil(
 ///     callee body slice.  Over-capture is correctness-preserving:
 ///     `store_final_boxes_in_guard` filters dead boxes from the
 ///     snapshot via the optimizer's liveness pass.
+/// Sub-slice 5c step 5.5a — STORE_SUBSCR strategy-aware walker
+/// specialization gate.  Returns `Some(DispatchOutcome::Continue)` if
+/// the residual_call was specialized into the trait-equivalent
+/// `guard_class + guard_list_strategy + setarrayitem-family` shape;
+/// `None` to fall through to the existing blackbox CallN path.
+///
+/// Gates (all must hold):
+/// 1. `dst_bank == 'v'` (STORE_SUBSCR returns void; trait emit is `Void`).
+/// 2. `r_args.len() == 3` (codewriter emits `[obj_reg, key_reg, value_reg]`).
+/// 3. `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var present and parses as
+///    `0x<hex>` matching the runtime funcptr.  Step 5.5b will replace
+///    this with `WalkContext.store_subscr_fn_addr` populated from
+///    `cpu.store_subscr_fn` at dispatch entry.
+/// 4. All 3 concrete shadow slots (`concrete_registers_r[r_args[0..3]]`)
+///    are `ConcreteValue::Ref(_)`.
+/// 5. `generated_store_subscr_value` returns `true` (object is a list
+///    with int key, strategy-detectable value, in-bounds index — see
+///    `codegen.rs:3146-3168 generated_store_subscr_value` for the
+///    detail criteria mirroring `jtransform do_resizable_list_setitem`).
+///
+/// Decline (any gate `false`) → `None` → dispatcher falls through to
+/// `try_execute_residual_call_via_executor` which concrete-executes the
+/// helper and records the blackbox `CallMayForce*` IR.  No-op for
+/// non-STORE_SUBSCR residual calls.
+fn try_walker_store_subscr_specialization(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    dst_bank: char,
+) -> Option<DispatchOutcome> {
+    if dst_bank != 'v' || r_args.len() != 3 {
+        return None;
+    }
+    // Prefer `WalkContext.store_subscr_fn_addr` (step 5.5b — populated
+    // from `cpu.store_subscr_fn` at the production entry); fall back to
+    // `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var (step 5.5a) for test
+    // fixtures and runtime overrides.
+    let expected_fn_addr = if let Some(addr) = ctx.store_subscr_fn_addr {
+        addr
+    } else {
+        let s = std::env::var_os("PYRE_WALKER_STORE_SUBSCR_FNADDR")?;
+        let s = s.to_str()?;
+        parse_hex_or_decimal_usize(s)?
+    };
+    let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n as usize),
+        _ => None,
+    })?;
+    if funcptr_addr != expected_fn_addr {
+        return None;
+    }
+    let r_args_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+    let concrete_obj = match r_args_concrete.first()? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let concrete_key = match r_args_concrete.get(1)? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let concrete_value = match r_args_concrete.get(2)? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let handled = crate::generated_store_subscr_value(
+        ctx,
+        r_args[0],
+        r_args[1],
+        r_args[2],
+        concrete_obj,
+        concrete_key,
+        concrete_value,
+    );
+    if !handled {
+        return None;
+    }
+    // Specialized IR recorded.  Heap mutation: invoke the helper
+    // concretely so the next read of the container sees the updated
+    // value.  `bh_store_subscr_fn(obj, key, value) -> i64` returns 1 on
+    // success, 0 on raise (with the exception object stashed in
+    // `BH_LAST_EXC_VALUE`).
+    let success = unsafe {
+        let store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64 =
+            std::mem::transmute(expected_fn_addr as *const ());
+        store_subscr_fn(
+            concrete_obj as usize as i64,
+            concrete_key as usize as i64,
+            concrete_value as usize as i64,
+        )
+    };
+    if success == 0 {
+        // `pyjitpl.py:2156-2168 handle_possible_exception` parity: drain
+        // the helper's stashed exception into `ctx.last_exc_value*`,
+        // record `GuardException` against the specialized IR, and
+        // surface `SubRaise` so the caller doesn't fall through to the
+        // generic residual-call path (which would re-record a second IR
+        // call against the same opcode position).
+        let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v
+        });
+        if bh_exc != 0 {
+            let exc = ctx.trace_ctx.const_ref(bh_exc);
+            let exc_concrete = ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            ctx.last_exc_value = Some(exc);
+            ctx.last_exc_value_concrete = exc_concrete;
+            walker_record_guard_exception(ctx, op.pc);
+            return Some(DispatchOutcome::SubRaise { exc, exc_concrete });
+        }
+        // Defensive: helper returned 0 but did not stash an exception.
+        // Decline specialization so the generic path's
+        // `execute_residual_call` decides the dispatch.
+        return None;
+    }
+    // pyjitpl.py:2659 `_record_helper_varargs`: STORE_SUBSCR mutates the
+    // heap; the specialized IR shape's setarrayitem_gc ops already
+    // invalidate per-descr via the recorder, so no further explicit
+    // heap-cache invalidation is needed here.
+    Some(DispatchOutcome::Continue)
+}
+
+/// Parse `"0x<hex>"` or `"<decimal>"` into a `usize` address.  Helper
+/// for env-var-driven function-pointer gates (step 5.5a).
+fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        usize::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse::<usize>().ok()
+    }
+}
+
+/// Sub-slice 5c step 5.5c — runtime resolution of
+/// `bh_store_subscr_fn` address via `pyre_interpreter::
+/// jit_trace_fnaddrs()` linear scan (cached in a `OnceLock`).  Returns
+/// `None` if the symbol is unregistered (which would indicate a
+/// jit_fnaddr.rs regression — the path is registered at
+/// `pyre-interpreter/src/jit_fnaddr.rs:362-371`).
+///
+/// Cached on first call.  Linear scan is acceptable because the table
+/// has ~150 entries and the cache miss happens once per process.
+pub(crate) fn bh_store_subscr_fn_addr_cached() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        const PATH: &str = "pyre_interpreter::opcode_ops::bh_store_subscr_fn";
+        for (name, addr) in pyre_interpreter::jit_trace_fnaddrs() {
+            if name == PATH {
+                return Some(addr as usize);
+            }
+        }
+        None
+    })
+}
+
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
@@ -4494,6 +4710,64 @@ fn dispatch_residual_call_iRd_kind(
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
+
+    // Sub-slice 5c step 2 probe — surfaces funcptr + r-bank arg raw addrs for
+    // every iRd-shape residual_call.  The eventual STORE_SUBSCR specialization
+    // hook (steps 3-5) keys on a fn-pointer match against `bh_store_subscr_fn`
+    // and on `r_args.len() == 3` with `dst_bank == 'v'`.  Probe is env-gated so
+    // production paths see zero overhead.  PyObjectRef construction from the
+    // GcRef payload is deferred to step 4 (FrameOps lift), which lands
+    // alongside the specialization branch; this probe stays at the raw-usize
+    // layer to keep the conversion seam single-sourced.
+    if crate::probe_subscr_enabled() {
+        let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+            majit_ir::Value::Int(n) => Some(n as u64),
+            _ => None,
+        });
+        let arg_addrs: Vec<Option<u64>> = r_args
+            .iter()
+            .map(|&op| {
+                ctx.trace_ctx.box_value(op).and_then(|v| match v {
+                    majit_ir::Value::Ref(r) => Some(r.as_usize() as u64),
+                    _ => None,
+                })
+            })
+            .collect();
+        eprintln!(
+            "[PYRE_PROBE_SUBSCR] dispatch_residual_call_iRd_kind pc={} dst_bank={} r_args.len={} funcptr_addr={:?} arg_addrs={:?}",
+            op.pc,
+            dst_bank,
+            r_args.len(),
+            funcptr_addr.map(|a| format!("{:#x}", a)),
+            arg_addrs
+                .iter()
+                .map(|o| o.map(|a| format!("{:#x}", a)))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // Sub-slice 5c step 5.5a: STORE_SUBSCR strategy-aware specialization.
+    // Fires when funcptr matches the registered `store_subscr_fn` address
+    // (= `pyre-jit::call_jit::bh_store_subscr_fn`), r_args carries the
+    // 3-arg `[obj_reg, key_reg, value_reg]` shape codewriter emits
+    // (`codewriter.rs:7042 build_store_subscr_fn_residual_call_r_v_insn`),
+    // dst_bank is `'v'` (STORE_SUBSCR returns void), and all 3 concrete
+    // shadow slots are populated.  On success, records the specialized
+    // IR shape (guard_class + guard_strategy + setarrayitem-family) via
+    // the trait-equivalent `generated_store_subscr_value` helper (now
+    // generic over `WalkerFrameOps`, with `WalkContext` impl).
+    //
+    // Activation env-gated for the rollout: `PYRE_WALKER_STORE_SUBSCR_FNADDR=<hex>`
+    // supplies the expected funcptr address (cross-crate plumbing of the
+    // `bh_store_subscr_fn` symbol from pyre-jit into pyre-jit-trace is
+    // deferred to 5.5b — `WalkContext.store_subscr_fn_addr`).  Without
+    // the env var, gate decays to no-op and dispatcher falls through to
+    // the existing blackbox CallN path.
+    if let Some(outcome) =
+        try_walker_store_subscr_specialization(ctx, code, op, funcptr, &r_args, dst_bank)
+    {
+        return Ok((outcome, op.next_pc));
+    }
 
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
@@ -4647,6 +4921,22 @@ fn dispatch_residual_call_iRd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // `pyjitpl.py:2156-2168 handle_possible_exception` routes
+                // the raising branch through `finishframe_exception()`
+                // immediately after emitting `GUARD_EXCEPTION`, so the
+                // remaining bytes of the arm never run.  Surface the
+                // outcome to `walk_loop` as `SubRaise`: at top-level it
+                // emits the outer `FINISH(exc)` and Terminates the trace;
+                // at sub-walk depth it propagates up to the caller's
+                // `inline_call_*` handler.  Continuing past this point
+                // would record dead arm IR (e.g. the arm's tail
+                // `*_return`) onto an exception path and confuse the
+                // optimizer's guard-fail snapshot.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -4850,6 +5140,15 @@ fn dispatch_residual_call_iIRd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // pyjitpl.py:2156-2168 `handle_possible_exception`
+                // routes the raising branch through
+                // `finishframe_exception()` immediately after emitting
+                // GUARD_EXCEPTION — see iRd_kind for the full rationale.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -5010,6 +5309,15 @@ fn dispatch_residual_call_iIRFd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // pyjitpl.py:2156-2168 `handle_possible_exception`
+                // routes the raising branch through
+                // `finishframe_exception()` immediately after emitting
+                // GUARD_EXCEPTION — see iRd_kind for the full rationale.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -5159,6 +5467,7 @@ fn dispatch_inline_call_dr_kind(
             entry_py_pc: ctx.entry_py_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -5340,6 +5649,7 @@ fn dispatch_inline_call_dir_kind(
             entry_py_pc: ctx.entry_py_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -5516,6 +5826,7 @@ fn dispatch_inline_call_dirf_kind(
             entry_py_pc: ctx.entry_py_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -6545,6 +6856,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -6598,6 +6910,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -6641,6 +6954,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -6803,6 +7117,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -6847,6 +7162,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -6890,6 +7206,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -6942,6 +7259,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -6986,6 +7304,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -7029,6 +7348,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -7167,6 +7487,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -7326,6 +7647,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -7430,6 +7752,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -7528,6 +7851,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -7615,6 +7939,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -7699,6 +8024,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -7764,6 +8090,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -7808,6 +8135,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -7848,6 +8176,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7896,6 +8225,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7953,6 +8283,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -8002,6 +8333,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -8062,6 +8394,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -8115,6 +8448,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -8172,6 +8506,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -8215,6 +8550,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -8261,6 +8597,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8307,6 +8644,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8401,6 +8739,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -8443,6 +8782,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8497,6 +8837,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -8584,6 +8925,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -8653,6 +8995,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -8716,6 +9059,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -8757,6 +9101,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -8861,6 +9206,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8966,6 +9312,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -9022,6 +9369,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9075,6 +9423,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -9119,6 +9468,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -9162,6 +9512,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -9226,6 +9577,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9278,6 +9630,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -9321,6 +9674,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -9363,6 +9717,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -9415,6 +9770,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9595,6 +9951,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
@@ -9719,6 +10076,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9795,6 +10153,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9849,6 +10208,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9928,6 +10288,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9987,6 +10348,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -10029,6 +10391,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -10073,6 +10436,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -10125,6 +10489,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -10169,6 +10534,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -10240,6 +10606,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -10293,6 +10660,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -10362,6 +10730,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -10444,6 +10813,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -10598,6 +10968,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10657,6 +11028,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -10707,6 +11079,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -10752,6 +11125,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10806,6 +11180,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10862,6 +11237,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -10938,6 +11314,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -11003,6 +11380,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -11067,6 +11445,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -11113,6 +11492,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -11197,6 +11577,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -11278,6 +11659,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -11369,6 +11751,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -11490,6 +11873,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -11547,6 +11931,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -11592,6 +11977,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -11661,6 +12047,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -11775,6 +12162,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -11865,6 +12253,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -11954,6 +12343,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -12022,6 +12412,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -12093,6 +12484,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -12162,6 +12554,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -12237,6 +12630,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -12310,6 +12704,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -12371,6 +12766,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12453,6 +12849,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -12513,6 +12910,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -12561,6 +12959,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -12621,6 +13020,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12701,6 +13101,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12771,6 +13172,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -12819,6 +13221,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -12893,6 +13296,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -12950,6 +13354,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -13021,6 +13426,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -13080,6 +13486,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
@@ -13150,6 +13557,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -13450,6 +13858,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
