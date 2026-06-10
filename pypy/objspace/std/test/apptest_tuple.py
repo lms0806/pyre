@@ -293,3 +293,15 @@ def test_subclass_kwarg():
     u = subclass_with_init([1, 2], newarg=3)
     assert u.newarg == 3
 
+def test_hash_cache():
+    ncalled = [0]
+    class A():
+        def __hash__(self):
+            ncalled[0] += 1
+            return 123
+
+    t = (A(), 1, 2, 3)
+    val = hash(t)
+    val2 = hash(t)
+    assert val == val2
+    assert ncalled[0] == 1
