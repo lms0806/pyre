@@ -80,8 +80,8 @@ impl Kind {
     }
 
     /// Dense slot index `0..3` for indexing `[T; 3]` arrays keyed by
-    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>` per
-    /// [[feedback-no-hashmap-ever]] — the RPython `regallocs` dict has
+    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>`: the
+    /// RPython `regallocs` dict has
     /// statically-known keys (`KINDS = ['int', 'ref', 'float']`) so the
     /// Rust analog is position-indexed not hash-keyed.
     pub fn index(self) -> usize {
@@ -110,12 +110,9 @@ pub struct SSARepr {
     /// Pyre-only side-table populated by canonical's
     /// `serialize_op`: for each non-negative `op.offset` (Python PC)
     /// encountered, the FIRST `insns` index where an op with that
-    /// PC was emitted.  Walker maintains the analogous mapping via
-    /// `walker_pc_live_marker_pos` (codewriter.rs:4125) — both
-    /// drive `pc_map` construction at exit-recovery time
-    /// (call_jit.rs:3939).  Empty when filled by the walker path.
-    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc per
-    /// [[feedback-no-hashmap-ever]].
+    /// PC was emitted.  Drives `pc_map` construction at exit-recovery
+    /// time (call_jit.rs:3939).  Sparse `Vec<(py_pc, first_insn_pos)>`
+    /// keyed by py_pc.
     pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
@@ -677,7 +674,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `last_exception` at the catch landing).  Upstream `rclass.py:828
 /// rtype_type` rewrites this to `getfield_gc_r(v, '__class__')` —
 /// pyre's runtime exception model bakes type into per-subclass
-/// `W_TypeObject` (see [[project-exception-per-kind-pytype]]) so the
+/// `W_TypeObject`, so the
 /// `getfield_gc_r` shape is not required.
 ///
 /// `getattr` — emitted by `codewriter.rs::emit_frontend_getattr`
@@ -699,13 +696,13 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
 /// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
 /// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
-/// `StoreAttr` arm (codewriter.rs:8551) pairs it with an inline
+/// `StoreAttr` arm (codewriter.rs:8542) pairs it with an inline
 /// `emit_abort_permanent!`, so the compiled trace bails to the
 /// interpreter at the `abort_permanent` Insn canonical already emits.
 /// A literal `setattr` Insn would be unreachable at runtime and
-/// undispatchable by the assembler.  Upstream `rclass.py rtype_setattr`
-/// rewrites to `setfield_gc(v, descr, w_value)` after rtyping; pyre's
-/// lack of rtyping keeps the HLOp unmodified.
+/// undispatchable by the assembler.  Upstream `rclass.py:859
+/// rtype_setattr` rewrites to `setfield_gc(v, descr, w_value)` after
+/// rtyping; pyre's lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
     matches!(opname, "type" | "getattr" | "setattr")
 }
@@ -1223,7 +1220,7 @@ pub struct GraphFlattener<'a> {
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
-    /// Per [[feedback-no-hashmap-ever]] pyre uses `Vec<BlockRef>` with
+    /// Pyre uses `Vec<BlockRef>` with
     /// linear scan: graph block counts stay in the dozens for production
     /// workloads, so O(N) `.contains()` is acceptable and matches the
     /// upstream dict's "identity membership" semantics without a hash.
@@ -1320,20 +1317,17 @@ impl<'a> GraphFlattener<'a> {
         // under `lowering_ctx` (canonical production path); the
         // non-lowering path keeps upstream passthrough behavior
         // (preserves `graph_flattener_emits_generic_result_op` test
-        // semantics).  See [[project-flatten-graph-canonical-driver-2026-05-17]].
+        // semantics).
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
         // Record FIRST insn position per
         // non-negative `op.offset` (Python PC) into
-        // `ssarepr.pc_first_insn_pos`.  Walker tracks the same mapping
-        // via `walker_pc_live_marker_pos` (codewriter.rs:4125); both
-        // drive `pc_map` construction at exit recovery
-        // (call_jit.rs:3939).  Synthetic ops with `offset = -1`
-        // (insert_renamings ref_copy / overflow trampolines /
-        // catch-landing entries) are skipped — they have no Python
-        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>` per
-        // [[feedback-no-hashmap-ever]].
+        // `ssarepr.pc_first_insn_pos`.  Drives `pc_map` construction at
+        // exit recovery (call_jit.rs:3939).  Synthetic ops with
+        // `offset = -1` (insert_renamings ref_copy / overflow
+        // trampolines / catch-landing entries) are skipped — they have
+        // no Python PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
         if op.offset >= 0 {
             let py_pc = op.offset;
             let already_seen = self
@@ -1711,7 +1705,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
+    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool, block_emit_start: usize) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
             // `flatten.py:181 assert link.exitcase in (None, False, True)`
@@ -1736,6 +1730,36 @@ impl<'a> GraphFlattener<'a> {
                     "flatten.py:181 invariant: single-exit link.exitcase \
                      must be None / False / True, got {other:?}"
                 ),
+            }
+            // Explicit `raise X` inside a try block.  pyre's walker
+            // (`emit_raise!` → `emit_catch_exception!`) wires the raise's
+            // exception edge directly to its catch landing — a single
+            // exit (exitcase=None, `block.canraise()`) — instead of to
+            // `graph.exceptblock` (where `make_link`→`make_exception_link`
+            // would emit `raise link.args[1]`).  The `raise` op itself is
+            // walker-inline-only (no graph SpaceOp), so without this arm
+            // the canonical flatten lowers the block as a plain
+            // `make_link` goto into the landing: the spliced block then
+            // falls into the landing's `last_exception` with no pending
+            // exception, and blackhole `handler_last_exception` reads a
+            // null `exception_last_value`.  Reproduce the inline shape —
+            // `raise <value>` then a byte-adjacent `catch_exception <L>`
+            // dispatch — using the raised value recorded on the link
+            // (`explicit_raise_value`).  `L` is the handler entry placed
+            // right before `make_exception_link`'s `last_exception` /
+            // `last_exc_value` emission, mirroring the canraise arm's
+            // `catch_exception TLabel(normal) … Label(normal) …
+            // make_exception_link` layout (flatten.py:139-180).
+            let explicit_raise_value = link.borrow().explicit_raise_value;
+            if let Some(raised) = explicit_raise_value {
+                let raise_operand = self.getcolor(&raised.into());
+                self.emitline(Insn::op("raise", vec![raise_operand]));
+                let catch_label = self.tlabel_for_link(link);
+                self.emitline(Insn::op("catch_exception", vec![catch_label]));
+                let handler_label = self.label_for_link(link);
+                self.emitline(handler_label);
+                self.make_exception_link(link, handling_ovf);
+                return;
             }
             self.make_link(link, handling_ovf);
             return;
@@ -1814,12 +1838,45 @@ impl<'a> GraphFlattener<'a> {
             // return path that upstream takes for canraise blocks
             // that survived metainterp policy but lack a real
             // raising-op-with-trailing-`-live-` pattern.
-            let last_op_is_live = block
-                .borrow()
-                .operations
-                .last()
-                .map_or(false, |op| op.opname == OPNAME_LIVE);
-            if !self.include_all_exc_links && !last_op_is_live {
+            //
+            // Vable ops are baked into the graph here: upstream
+            // blocks end at `[raising_op, -live-]` because flowspace's
+            // `guessexception` (flowcontext.py:130-156) closes the block at
+            // each can-raise op.  Pyre's walker does NOT split there, so the
+            // raising op's vable-mirror stores (setfield_vable_i /
+            // setarrayitem_vable_r for the post-op frame state) follow the
+            // `-live-` in the SAME block — the block's last op is a vable
+            // store, never `-live-`.  The graph-tail `last_op_is_live` scan
+            // therefore reports `index == -1` for EVERY pyre canraise block
+            // (verified raise_catch_loop: 50/50 blocks), dropping all
+            // `catch_exception` emission and stranding the exception edge.
+            // On the canonical (lowering_ctx) path detect the raising op off
+            // the EMITTED stream instead: `serialize_op` lowers HLOps
+            // (mod/eq/add/simple_call) and residual calls to
+            // `residual_call_*` and appends a trailing `-live-` exactly when
+            // `insn_needs_trailing_live` (calldescr_canraise), so the same
+            // predicate over the block's emitted insns recognises a real
+            // raising op regardless of the trailing vable stores.  Spurious
+            // canraise blocks (empty joinpoints, vable-only, non-raising
+            // residual_call_r_r/r_v) carry no such insn and keep the
+            // early-return.  The block has at most one raising op (verified
+            // raise_catch_loop), so one `catch_exception` at block end —
+            // after the raising op's vable stores, matching the production
+            // walker's per-PC `emit_catch_exception!` placement — is
+            // correct.  Graph CFG is untouched, so regalloc / gate-off
+            // bytes are unchanged.
+            let block_can_raise = if self.lowering_ctx.is_some() {
+                self.ssarepr.insns[block_emit_start..]
+                    .iter()
+                    .any(insn_needs_trailing_live)
+            } else {
+                block
+                    .borrow()
+                    .operations
+                    .last()
+                    .map_or(false, |op| op.opname == OPNAME_LIVE)
+            };
+            if !self.include_all_exc_links && !block_can_raise {
                 self.make_link(&normal_link, false);
                 return;
             }
@@ -2065,7 +2122,7 @@ impl<'a> GraphFlattener<'a> {
         }
         pairs.sort_by_key(|(_, dst)| dst.index);
 
-        // `[T; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+        // `[T; 3]` indexed by `Kind::index()`.
         // Mirrors `rpython/jit/codewriter/flatten.py:306-334 insert_renamings`
         // which keys by kind string in a Python dict.
         let mut renamings: [(Vec<RenameOperand>, Vec<RenameOperand>); 3] = [
@@ -2181,12 +2238,17 @@ impl<'a> GraphFlattener<'a> {
         // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
         // interleaving here was a pyre-only adaptation for runtime
         // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
-        // mechanism remains on the walker side until the T6 epic
-        // retires it, but canonical now matches upstream's structure
-        // exactly.
+        // mechanism remains on the walker side for now, but canonical
+        // now matches upstream's structure exactly.
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
+        // First emitted-insn index of this block's serialized ops, so
+        // `insert_exits` can detect a real raising op off the lowered
+        // stream (a `residual_call_*` whose calldescr can raise) rather
+        // than the graph tail, which pyre's vable-mirror stores push past
+        // the `-live-`.  See the raising-op detection in `insert_exits`.
+        let block_emit_start = self.ssarepr.insns.len();
         for op in &operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
@@ -2207,7 +2269,7 @@ impl<'a> GraphFlattener<'a> {
             }
             self.serialize_op(op);
         }
-        self.insert_exits(&block, handling_ovf);
+        self.insert_exits(&block, handling_ovf, block_emit_start);
     }
 
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
@@ -2316,6 +2378,50 @@ impl<'a> GraphFlattener<'a> {
         regalloc_color(&*self.regallocs, v)
     }
 
+    /// pyre-only: give a distinct fresh color to every Variable referenced
+    /// as a graph-op argument that the regalloc left uncolored.  No
+    /// upstream counterpart — upstream flowgraphs are always well-formed
+    /// (every operand is a block inputarg or an earlier op's result), so
+    /// `make_dependencies`, which registers interference nodes only for
+    /// inputargs and op results, colors every operand.
+    ///
+    /// pyre's walker emits `abort_permanent` for opcodes the JIT does not
+    /// support (`CONTAINS_OP`, `UNPACK_SEQUENCE`, …) and pushes fresh
+    /// symbolic Refs onto the operand stack so the rest of the block's
+    /// symbolic execution stays stack-balanced.  Those Refs have no graph
+    /// producer, so `make_dependencies` never colors them, and a later op
+    /// that consumes one (`bool`, `setarrayitem_vable_r`) would hit the
+    /// `regalloc_color` missing-color panic when this driver serializes
+    /// it.
+    ///
+    /// `abort_permanent` sets `needs_fallthrough = false`, severing the
+    /// block's CFG successor, so any instruction that consumes such a Ref
+    /// sits in the dead region after the bail-out: the compiled trace
+    /// returns to the interpreter before reaching it.  The instruction is
+    /// still serialized to keep the byte stream well-formed, but never
+    /// executes, so its register operand only has to be a *valid* color —
+    /// never a *value-correct* one.  A distinct fresh color satisfies that
+    /// and cannot alias any live value's color.
+    fn color_leaked_arg_variables(&mut self) {
+        let graph: &super::flow::FunctionGraph = self.graph;
+        for block in graph.iterblocks() {
+            let block_borrow = block.borrow();
+            for op in &block_borrow.operations {
+                for arg in &op.args {
+                    for v in arg.variables() {
+                        let kind = v.kind.unwrap_or(Kind::Ref);
+                        let alloc = &mut self.regallocs[kind.index()];
+                        if !alloc.coloring.contains_key(&v.id) {
+                            let color = alloc.num_colors;
+                            alloc.coloring.insert(v.id, color);
+                            alloc.num_colors += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Lower a graph `Constant` to the typed `Operand` the assembler
     /// consumes.  Upstream's `getcolor(v)` passes Constants through
     /// unchanged because Python's untyped flowgraph allows it; pyre's
@@ -2346,9 +2452,8 @@ fn regalloc_color(
     let kind = v.kind.unwrap_or(Kind::Ref);
     let alloc = &regallocs[kind.index()];
     let color = alloc.coloring.get(&v.id).copied().unwrap_or_else(|| {
-        // Surface kind + per-kind coloring size so the
-        // probe (codewriter.rs PYRE_PHASE4_BUILD_CANONICAL) can name
-        // the specific dual-coloring gap without dumping the entire
+        // Surface kind + per-kind coloring size so the panic names
+        // the specific coloring gap without dumping the entire
         // graph.  Sample up to 8 known IDs to make "is the Variable
         // simply skipped or is the kind allocator empty?" obvious at
         // a glance.
@@ -2765,6 +2870,10 @@ pub fn flatten_graph<'a>(
     flattener.include_all_exc_links = include_all_exc_links;
     // `flatten.py:68 flattener.enforce_input_args()`.
     flattener.enforce_input_args();
+    // pyre-only: color leaked `abort_permanent` operand-stack Refs before
+    // serialization (no upstream counterpart — upstream flowgraphs are
+    // always well-formed).  See `color_leaked_arg_variables`.
+    flattener.color_leaked_arg_variables();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form();
     ssarepr
@@ -2972,42 +3081,29 @@ pub struct LoweringContext {
     /// `abort_permanent` instead, so the canonical lowering arm
     /// returns `None` (passthrough) on argc > 3.
     pub build_list_fn_idx: u16,
+    /// `bind(assembler, cpu.build_tuple_fn as *const (),
+    /// CallFlavor::Plain)` descrs-pool index for the production source.
+    /// BUILD_TUPLE (single HLOp opname `newtuple`) lowers to the SAME
+    /// `residual_call_ir_r` shape as `newlist` (the IR builder is
+    /// fn-index agnostic, codewriter.rs:9518-9537), so
+    /// [`lower_new_sequence_hlop_to_insn`] selects this index by opname.
+    /// Same argc ≤ 3 walker contract as `newlist`.
+    pub build_tuple_fn_idx: u16,
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
     /// codewriter.rs:3206-3245 for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
-    /// `residual_call_r_r(call_fn_N_idx, [frame, callable, arg0, ...],
-    /// Descr) → reg`; `simple_call` itself carries only
-    /// `(callable, args...)` and the lowering arm prepends the pyre
-    /// explicit-frame ABI operand.
-    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
-    /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
+    /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
+    /// Descr) → reg`; the lowered ListR is frame-less
+    /// (`jtransform.py:414 rewrite_call`) — the parent frame is
+    /// resolved at runtime inside the call helper, not threaded as a
+    /// leading operand.
+    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`): `[u16; 9]` keeps the
     /// statically-known 0..=8 arity range position-indexed.
     /// `simple_call` HLOps with nargs > 8 are walker non-orthodox
     /// (the walker emits `abort_permanent` instead and skips the
     /// HLOp record), so the lowering arm returns `None`
     /// (passthrough) on nargs > 8.
     pub call_fn_idx_by_nargs: [u16; 9],
-    /// Portal red `frame` Variable — the startblock inputarg appended
-    /// by `graph_entry_inputargs(code, portal_inputs=true)`
-    /// (codewriter.rs:93-101) and exposed via
-    /// `portal_graph_inputvars(code).0` (codewriter.rs:85-91).  Routed
-    /// through `get_register` in `lower_simple_call_hlop_to_insn` so
-    /// the canonical Register index always lands in
-    /// `[0, regallocs[Ref].num_colors)` — matching upstream
-    /// `flatten.py:382-391 GraphFlattener.getcolor(v)` which treats
-    /// every register reference as a colored Variable, never as a raw
-    /// pre-regalloc slot.
-    ///
-    /// `None` indicates an unseeded fixture context —
-    /// `lower_simple_call_hlop_to_insn` asserts `Some(_)` was wired
-    /// before lowering production traces.  Pyre adaptation:
-    /// `bh_call_fn_N(frame, callable, args...)` helpers receive the
-    /// parent frame as the leading ref operand (see call_jit.rs's
-    /// `bh_call_fn_impl_with_frame`); the graph-side `simple_call` HLOp
-    /// itself carries only `(callable, args...)` to match RPython
-    /// `jtransform.py:414 rewrite_call`, so flatten supplies the
-    /// frame from this Variable.
-    pub portal_frame_var: Option<super::flow::Variable>,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3278,8 +3374,8 @@ pub fn build_compare_op_residual_call_ir_r_insn(
 }
 
 /// Construct the LOAD_GLOBAL-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.8 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// load_global_fn_idx, ...)` SSARepr emit at codewriter.rs:5598-5615
 /// with a single direct push of this helper's output.  The matching
 /// graph dual-write at codewriter.rs:5622-5635 stays in place — this
@@ -3508,8 +3604,8 @@ pub fn build_residual_call_r_r_insn_from_operands(
 }
 
 /// Construct the RaiseVarargs-family `residual_call_r_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.14 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// normalize_raise_varargs_fn_idx, ...)` SSARepr emit at
 /// codewriter.rs:6068-6082 with a single direct push of this
 /// helper's output.  No graph dual-write exists for
@@ -3667,8 +3763,8 @@ pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
 }
 
 /// Construct the BuildList-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.13 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// build_list_fn_idx, ...)` SSARepr emit at codewriter.rs:6002-6009
 /// with a single direct push of this helper's output.  No graph
 /// dual-write exists for `build_list_fn` (the graph carries
@@ -3731,11 +3827,10 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
 /// Operand-flexible variant of `build_build_list_fn_residual_call_ir_r_insn`.
 /// Each item slot can be a `Register` (resolved Variable) OR a `Const*`
 /// (lowered Constant via `flatten_arg`'s Constant arm).  Used by the
-/// canonical driver's `lower_newlist_hlop_to_insn` to handle graph
-/// `newlist` HLOps whose items are Constants — upstream RPython's
+/// canonical driver's `lower_new_sequence_hlop_to_insn` to handle graph
+/// `newlist`/`newtuple` HLOps whose items are Constants — upstream RPython's
 /// rtype pass would have pre-loaded these into Variables, but pyre's
-/// graph carries the un-rewritten Constants per
-/// [[project-flatten-graph-canonical-driver-2026-05-17]].
+/// graph carries the un-rewritten Constants.
 pub fn build_build_list_fn_residual_call_ir_r_insn_from_operands(
     build_list_fn_idx: u16,
     argc: usize,
@@ -4069,7 +4164,7 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register, lower_constant) {
+    if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -4080,9 +4175,10 @@ where
 
 /// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
 /// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
-/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([frame, callable,
-/// arg0, ...]), Descr) → reg` Insn.  Mirrors the inline emit at
-/// codewriter.rs:6171-6179 (`build_call_fn_residual_call_r_r_insn`).
+/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
+/// arg0, ...]), Descr) → reg` Insn — frame-less, matching RPython
+/// `jtransform.py:414 rewrite_call` (the lowered ListR shape is
+/// detailed in the body comment below).
 ///
 /// Arity dispatch: nargs = op.args.len() - 1 selects
 /// `ctx.call_fn_idx_by_nargs[nargs]`.  Walker contract: CALL with
@@ -4113,23 +4209,16 @@ where
     if nargs > 8 {
         return None;
     }
-    let frame_var = ctx.portal_frame_var.expect(
-        "lower_simple_call_hlop_to_insn requires LoweringContext::portal_frame_var \
-         to be seeded from portal_graph_inputvars(code).0; simple_call must not \
-         survive canonical lowering",
-    );
-    // First arg is the callable, rest are call arguments.  All Ref.
-    // The lowered ListR is `[portal_frame, callable, args...]` because
-    // `bh_call_fn_N(frame, callable, args...)` receives the parent
-    // frame as the leading ref operand.  The graph-side `simple_call`
-    // HLOp carries only `(callable, args...)` to match RPython
-    // `jtransform.py:414 rewrite_call`; flatten prepends the frame
-    // here.  `get_register(frame_var)` routes through
-    // `regallocs[Ref].getcolor(frame_var)` per upstream
-    // `flatten.py:382-391`, so the Register index always lands in
-    // `[0, num_colors)`.
-    let mut operands: Vec<Operand> = Vec::with_capacity(1 + op.args.len());
-    operands.push(Operand::Register(get_register(frame_var)));
+    // First arg is the callable, rest are call arguments.  All Ref.  The
+    // lowered ListR is `[callable, args...]`, matching RPython
+    // `jtransform.py:414 rewrite_call` and the frame-less residual call
+    // ABI (`bhimpl_residual_call_r_r` → `cpu.bh_call_r(func, None,
+    // args_r, ...)`).  The parent frame is resolved at runtime from the
+    // execution context inside `bh_call_fn_impl`, not threaded as a
+    // leading operand.  `get_register` routes each arg through
+    // `regallocs[Ref].getcolor(v)` per upstream `flatten.py:382-391`, so
+    // every Register index lands in `[0, num_colors)`.
+    let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
     for arg in &op.args {
         let operand = match arg {
             super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
@@ -4154,24 +4243,28 @@ where
     ))
 }
 
-/// Lower a BUILD_LIST-family pre-rtype HLOp `newlist(items)` →
-/// `result: Ref` to the equivalent post-rtype `residual_call_ir_r(
-/// ConstInt(build_list_fn_idx), ListI([argc, dummies]),
-/// ListR([item_regs]), Descr) → reg` Insn.  Mirrors the inline
-/// emit at codewriter.rs:6390-6398
-/// (`push_walker_emit(build_build_list_fn_residual_call_ir_r_insn)`)
-/// which pads unused item slots with `ConstInt(0)`.
+/// Lower a BUILD_LIST / BUILD_TUPLE-family pre-rtype HLOp
+/// `newlist(items)` / `newtuple(items)` → `result: Ref` to the
+/// equivalent post-rtype `residual_call_ir_r(ConstInt(fn_idx),
+/// ListI([argc, dummies]), ListR([item_regs]), Descr) → reg` Insn.
+/// Pads unused item slots with `ConstInt(0)` (the
+/// `build_build_list_fn_residual_call_ir_r_insn` shape).  The fn-pool
+/// index is selected by opname: `newlist` → `build_list_fn_idx`,
+/// `newtuple` → `build_tuple_fn_idx`.  BUILD_TUPLE lowers to the SAME
+/// `residual_call_ir_r` shape as BUILD_LIST — the IR builder is
+/// fn-index agnostic — differing only in the helper fn pointer.
 ///
-/// Walker contract: `emit_frontend_newlist` only fires for argc ≤ 3
-/// (codewriter.rs:6332-6346 — argc > 3 takes the `abort_permanent`
-/// branch which does NOT record a `newlist` HLOp on the graph), so a
-/// graph-side `newlist` with argc > 3 indicates a walker non-orthodoxy;
-/// return `None` (passthrough) rather than asserting, matching the
-/// other lowering arms' "no match → passthrough" pattern.
+/// Walker contract: `emit_frontend_newlist` / `emit_frontend_newtuple`
+/// only fire for argc ≤ 3 (codewriter.rs:6332-6346 / the BuildTuple
+/// arm — argc > 3 takes the `abort_permanent` branch which does NOT
+/// record the HLOp on the graph), so a graph-side `newlist`/`newtuple`
+/// with argc > 3 indicates a walker non-orthodoxy; return `None`
+/// (passthrough) rather than asserting, matching the other lowering
+/// arms' "no match → passthrough" pattern.
 ///
-/// Returns `None` for non-`newlist` opnames so the caller can fall
-/// through to other lowering arms.
-pub fn lower_newlist_hlop_to_insn<F, LC>(
+/// Returns `None` for opnames other than `newlist`/`newtuple` so the
+/// caller can fall through to other lowering arms.
+pub fn lower_new_sequence_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
     get_register: &mut F,
@@ -4181,9 +4274,11 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "newlist" {
-        return None;
-    }
+    let fn_idx = match op.opname.as_str() {
+        "newlist" => ctx.build_list_fn_idx,
+        "newtuple" => ctx.build_tuple_fn_idx,
+        _ => return None,
+    };
     let argc = op.args.len();
     if argc > 3 {
         return None;
@@ -4213,7 +4308,7 @@ where
         _ => return None,
     };
     Some(build_build_list_fn_residual_call_ir_r_insn_from_operands(
-        ctx.build_list_fn_idx,
+        fn_idx,
         argc,
         item_operands,
         dst_reg,
@@ -5350,6 +5445,149 @@ mod tests {
         }
     }
 
+    /// `setattr` is an `is_pyre_canonical_elidable_hlop`: under
+    /// `lowering_ctx` (the canonical production path) `serialize_op` elides
+    /// it (the `StoreAttr` walker arm pairs it with `abort_permanent`, so a
+    /// literal `setattr` Insn would be unreachable and undispatchable);
+    /// without `lowering_ctx` it passes through as a raw `setattr` Insn.
+    #[test]
+    fn serialize_op_elides_setattr_under_lowering_ctx() {
+        let obj = Variable::new(VariableId(0), Kind::Ref);
+        let attr = Variable::new(VariableId(1), Kind::Ref);
+        let val = Variable::new(VariableId(2), Kind::Ref);
+        let make_op = || {
+            SpaceOperation::new(
+                "setattr",
+                vec![obj.into(), attr.into(), val.into()],
+                None,
+                7,
+            )
+        };
+        let make_regallocs = || {
+            let mut ref_coloring = std::collections::HashMap::new();
+            ref_coloring.insert(obj.id, 0u16);
+            ref_coloring.insert(attr.id, 1u16);
+            ref_coloring.insert(val.id, 2u16);
+            [
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: std::collections::HashMap::new(),
+                    num_colors: 0,
+                },
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: ref_coloring,
+                    num_colors: 3,
+                },
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: std::collections::HashMap::new(),
+                    num_colors: 0,
+                },
+            ]
+        };
+        let graph = stub_graph();
+
+        // Without lowering_ctx: raw `setattr` Insn passes through.
+        let mut off = SSARepr::new("setattr_off");
+        let mut off_regallocs = make_regallocs();
+        let mut off_flat = GraphFlattener::new(&graph, &mut off_regallocs, &mut off);
+        off_flat.serialize_op(&make_op());
+        assert!(
+            off.insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "setattr")),
+            "lowering OFF must emit a raw setattr Insn: {:?}",
+            off.insns,
+        );
+
+        // With lowering_ctx: `setattr` is elided (no Insn emitted).
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+        };
+        let mut on = SSARepr::new("setattr_on");
+        let mut on_regallocs = make_regallocs();
+        let mut on_flat =
+            GraphFlattener::new(&graph, &mut on_regallocs, &mut on).with_lowering_ctx(ctx);
+        on_flat.serialize_op(&make_op());
+        assert!(
+            on.insns.is_empty(),
+            "lowering ON must elide setattr (no Insn): {:?}",
+            on.insns,
+        );
+    }
+
+    /// `color_leaked_arg_variables` gives a fresh distinct color to any
+    /// Variable used as a graph-op arg that the regalloc left uncolored —
+    /// the `abort_permanent` operand-stack leak (see the method doc).
+    /// Models a block whose op consumes a Ref Variable that is neither a
+    /// block inputarg nor any op's result, and asserts the pass colors it
+    /// without disturbing an already-colored inputarg.
+    #[test]
+    fn color_leaked_arg_variables_colors_unproduced_ref_arg() {
+        use crate::jit::flow::{Block, FunctionGraph};
+        // `already` (Ref) is a pre-colored inputarg.  `leaked` (Ref) is
+        // referenced by `bool(leaked)` but is never an inputarg nor any
+        // op's result — the shape the walker produces when
+        // `abort_permanent` pushes an operand-stack Ref with no producer.
+        let already = Variable::new(VariableId(0), Kind::Ref);
+        let leaked = Variable::new(VariableId(1), Kind::Ref);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let start = Block::shared(vec![already.into()]);
+        let graph = FunctionGraph::new("leaked_arg", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("bool", vec![leaked.into()], Some(res.into()), 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![already.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        // Ref bank: `already` colored 0 (1 color); `leaked` uncolored.
+        let mut ref_coloring = std::collections::HashMap::new();
+        ref_coloring.insert(already.id, 0u16);
+        let mut regallocs = [
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: ref_coloring,
+                num_colors: 1,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+        ];
+
+        let mut ssarepr = SSARepr::new("leaked_arg");
+        {
+            let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
+            flattener.color_leaked_arg_variables();
+        }
+
+        let ref_alloc = &regallocs[Kind::Ref.index()];
+        // `leaked` now has a fresh color that does not alias the
+        // pre-colored inputarg's color, and the inputarg is untouched.
+        let leaked_color = ref_alloc
+            .coloring
+            .get(&leaked.id)
+            .copied()
+            .expect("leaked arg must be colored");
+        assert_eq!(ref_alloc.coloring.get(&already.id).copied(), Some(0));
+        assert_ne!(leaked_color, 0);
+        assert_eq!(ref_alloc.num_colors, 2);
+    }
+
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
         // a graph carrying one HLOp from each of the four
@@ -5398,8 +5636,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -5516,8 +5754,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -5597,8 +5835,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -5722,8 +5960,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -5892,8 +6130,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -6111,8 +6349,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6196,8 +6434,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6225,8 +6463,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -6322,8 +6560,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6383,8 +6621,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6410,8 +6648,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6444,8 +6682,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6505,8 +6743,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6529,8 +6767,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6567,8 +6805,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6621,8 +6859,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6660,8 +6898,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -6694,8 +6932,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6724,8 +6962,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6754,8 +6992,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6789,8 +7027,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6838,8 +7076,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8128,7 +8366,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 1 — `_ovf` popline rewrite + handling_ovf=true reraise.
+    // `_ovf` popline rewrite + handling_ovf=true reraise.
     //
     // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
     //   * `make_bytecode_block` `_ovf` validity check (lines 120-125)
@@ -8198,8 +8436,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -8351,7 +8589,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_canonical_four_arg_entry_works_without_lowering_ctx() {
-        // Phase 4 — `flatten.py:63-70` orthodox 4-arg entry.  No
+        // `flatten.py:63-70` orthodox 4-arg entry.  No
         // `lowering_ctx` parameter; `cpu=None` so dispatcher is
         // disabled and pre-rtype HLOp opnames passthrough.
         use crate::jit::flow::{Block, FunctionGraph};
@@ -8383,7 +8621,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
-        // Phase 4 — `flatten.py:63-70` orthodox entry.
+        // `flatten.py:63-70` orthodox entry.
         // Build a trivial portal-like graph with a single
         // `loop_header` op (passthrough family — no LoweringContext
         // arm needs to fire) and verify the canonical entry returns a
@@ -8453,12 +8691,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_simple_call_hlop_prepends_portal_frame_register() {
-        // `flatten.py:382-391` simple_call lowering: the residual_call's
-        // first Ref operand is the portal frame (via
-        // `get_register(portal_frame_var)`), not part of the original
-        // graph-side `simple_call(callable, args...)`.
-        let frame_var = Variable::new(VariableId(7), Kind::Ref);
+    fn lower_simple_call_hlop_omits_frame_register() {
+        // `jtransform.py:414 rewrite_call` simple_call lowering: the
+        // residual_call's Ref ListR is `[callable, args...]` with no frame
+        // operand — the parent frame is resolved at runtime from the
+        // execution context inside `bh_call_fn_impl`, matching the
+        // frame-less `bhimpl_residual_call_r_r` ABI.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let mut call_fn_idx_by_nargs = [0u16; 9];
@@ -8469,8 +8707,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs,
-            portal_frame_var: Some(frame_var),
         };
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -8479,10 +8717,6 @@ mod tests {
             0,
         );
         let mut get_register = |var: Variable| match var.id {
-            VariableId(7) => Register {
-                kind: Kind::Ref,
-                index: 100,
-            },
             VariableId(8) => Register {
                 kind: Kind::Ref,
                 index: 101,
@@ -8500,7 +8734,7 @@ mod tests {
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("simple_call lowering must succeed when portal_frame_var is set");
+        .expect("simple_call lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
@@ -8508,21 +8742,25 @@ mod tests {
                 result,
             } => {
                 assert_eq!(opname, "residual_call_r_r");
-                let frame_reg = Register {
-                    kind: Kind::Ref,
-                    index: 100,
-                };
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(
+                            list.content.len(),
+                            1,
+                            "ListR carries only the callable (nargs=0), no frame"
+                        );
                         match &list.content[0] {
                             Operand::Register(r) => {
-                                assert_eq!(r.kind, frame_reg.kind);
-                                assert_eq!(r.index, frame_reg.index);
+                                assert_eq!(r.kind, Kind::Ref);
+                                assert_eq!(
+                                    r.index, 101,
+                                    "leading Ref operand must be the callable, not a frame"
+                                );
                             }
-                            other => panic!(
-                                "portal frame must be the leading Ref operand, got {other:?}"
-                            ),
+                            other => {
+                                panic!("callable must be the leading Ref operand, got {other:?}")
+                            }
                         }
                     }
                     other => panic!("expected ListOfKind Ref, got {other:?}"),
@@ -8538,42 +8776,5 @@ mod tests {
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "portal_frame_var")]
-    fn lower_simple_call_hlop_panics_without_portal_frame_var() {
-        // PyPy's jtransform never leaves a lowered call as raw
-        // `simple_call`.  If pyre lacks the frame operand needed by its
-        // explicit-frame helper ABI, fail loudly instead of passing the
-        // HLOp through to canonical SSARepr.
-        let callable_var = Variable::new(VariableId(8), Kind::Ref);
-        let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
-            portal_frame_var: None,
-        };
-        let op = super::super::flow::SpaceOperation::new(
-            "simple_call",
-            vec![callable_var.into()],
-            Some(result_var.into()),
-            0,
-        );
-        let mut get_register = |_var: Variable| Register {
-            kind: Kind::Ref,
-            index: 0,
-        };
-        let mut lower_constant = |_c: &Constant| unreachable!();
-        let _ = super::lower_simple_call_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        );
     }
 }

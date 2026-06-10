@@ -325,8 +325,9 @@ impl<'a> RegAllocator<'a> {
     /// `find_node_coloring`'s `getnodes` filter would skip a coalesced
     /// surviving node that was never explicitly added — yielding
     /// `None` for `getcolor` and dropping the chain's inputarg from
-    /// the final coloring map.  Pyre's [[always-true-orthodox]]
-    /// endgame retires this adaptation as part of Path 4 (#238).
+    /// the final coloring map.  This defensive `add_node` can be
+    /// dropped once coalesced survivors are always registered via
+    /// `make_dependencies`.
     fn try_coalesce_pin_ids(
         &mut self,
         v_id: super::flow::VariableId,
@@ -354,6 +355,33 @@ impl<'a> RegAllocator<'a> {
             debug_assert_eq!(rep, w0);
             self._depgraph.coalesce(v0, w0);
         }
+    }
+
+    /// Record an interference edge between two frame-local slot
+    /// representatives so the chordal coloring assigns them DISTINCT
+    /// colors, even when their SSA register live ranges are disjoint.
+    ///
+    /// Complement of [`try_coalesce_pin_ids`]: that merges Variables onto
+    /// one color, this forces them apart.  Used by the splice regalloc to
+    /// reproduce the walker's bijective slot→register assignment so the
+    /// per-slot resume reverse map is injective.  Both endpoints are
+    /// projected through `_unionfind.find_rep`, so a slot whose Variables
+    /// were already coalesced into one rep (by the same-slot coalesce
+    /// pairs) contributes a single node; `add_edge` is a no-op for
+    /// self-edges, so two reps that happen to coincide do not trigger a
+    /// phantom interference.  `add_node` registers each rep in
+    /// `_depgraph.all_nodes` so `find_node_coloring`'s `getnodes` filter
+    /// keeps it (matching `try_coalesce_pin_ids`).
+    fn add_interference_pin_ids(
+        &mut self,
+        v_id: super::flow::VariableId,
+        w_id: super::flow::VariableId,
+    ) {
+        let v0 = self._unionfind.find_rep(v_id);
+        let w0 = self._unionfind.find_rep(w_id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
+        self._depgraph.add_edge(v0, w0);
     }
 
     fn find_node_coloring(&mut self) {
@@ -387,8 +415,7 @@ impl<'a> RegAllocator<'a> {
 ///
 /// Invoked from production via `perform_register_allocation_all_kinds`
 /// at `codewriter.rs:transform_graph_to_jitcode`, where its result
-/// feeds `walker_post_walk_insert_renamings` (the walker's port of
-/// `flatten.py:154 self.insert_renamings(link)`).  The pyre-only
+/// feeds the canonical `flatten_graph` splice regalloc.  The pyre-only
 /// SSARepr-side `perform_ssarepr_register_allocation` further down in
 /// this module still runs alongside this CFG allocator because pyre
 /// has two coalesce sources that cover non-overlapping work:
@@ -437,6 +464,33 @@ pub fn perform_register_allocation_with_pairs(
     kind: Kind,
     extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> GraphAllocationResult {
+    perform_register_allocation_with_pairs_and_interference(graph, kind, extra_coalesce_pairs, &[])
+}
+
+/// Splice adaptation: like [`perform_register_allocation_with_pairs`] but
+/// also records an interference edge between the union-find reps named in
+/// each `interference_pairs` entry, forcing those reps onto DISTINCT
+/// colors.
+///
+/// `interference_pairs` is the complement of `extra_coalesce_pairs`:
+/// where the coalesce pairs merge same-slot Variables onto one color, the
+/// interference pairs separate distinct frame-local slots whose SSA
+/// register live ranges happen to be disjoint (each `LOAD_FAST` re-reads
+/// the local, so a local's SSA value dies between reads).  Without this
+/// the chordal coloring is free to give two frame-live locals one color,
+/// and the splice resume reverse map (`pyre_color_for_semantic_local` →
+/// `semantic_ref_slot_for_reg_color`) collapses them onto one slot.
+/// The edges are added after `make_dependencies` (the base liveness graph
+/// must exist) and before `coalesce_variables` (so a cross-slot coalesce
+/// is blocked by the `try_coalesce` `has_edge` guard) and
+/// `find_node_coloring`.  Splice-only — production callers pass `&[]`,
+/// leaving the coloring byte-identical.
+pub fn perform_register_allocation_with_pairs_and_interference(
+    graph: &FlowGraph,
+    kind: Kind,
+    extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> GraphAllocationResult {
     // `rpython/tool/algo/regalloc.py:11-15`:
     //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
     //     regalloc.make_dependencies()
@@ -462,6 +516,13 @@ pub fn perform_register_allocation_with_pairs(
         }
     }
     allocator.make_dependencies();
+    // Record interference between the named slot reps so the
+    // chordal coloring keeps distinct frame-local slots on distinct
+    // colors.  Added after `make_dependencies` so the base graph exists,
+    // before `coalesce_variables`/`find_node_coloring` so both honour it.
+    for &(a_id, b_id) in interference_pairs {
+        allocator.add_interference_pin_ids(a_id, b_id);
+    }
     allocator.coalesce_variables();
     // External pins — re-apply via `try_coalesce_pin_ids` after
     // `make_dependencies` so the surviving rep is explicitly added to
@@ -531,7 +592,7 @@ pub fn perform_register_allocation_with_pairs(
 ///
 /// The resulting `[GraphAllocationResult; 3]` is indexed by
 /// `Kind::index()` (`Int=0, Ref=1, Float=2`).  Upstream uses a Python
-/// dict; pyre uses `[T; 3]` per [[feedback-no-hashmap-ever]] — the
+/// dict; pyre uses `[T; 3]`: the
 /// RPython `KINDS` list has 3 statically-known entries so the dict
 /// degenerates to a position-indexed array in any RPython-orthodox
 /// port.  This is the input shape that the canonical
@@ -553,6 +614,27 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     [
         perform_register_allocation(graph, Kind::Int),
         perform_register_allocation_with_pairs(graph, Kind::Ref, ref_coalesce_pairs),
+        perform_register_allocation(graph, Kind::Float),
+    ]
+}
+
+/// Splice adaptation: like [`perform_register_allocation_all_kinds_with_pairs`]
+/// but threads `ref_interference_pairs` into the `Kind::Ref` allocation so
+/// distinct frame-local slots receive distinct Ref colors.  Int and Float
+/// use the empty path (walker tracks only Ref slots).  Splice-only.
+pub fn perform_register_allocation_all_kinds_with_pairs_and_interference(
+    graph: &FlowGraph,
+    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    ref_interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> [GraphAllocationResult; 3] {
+    [
+        perform_register_allocation(graph, Kind::Int),
+        perform_register_allocation_with_pairs_and_interference(
+            graph,
+            Kind::Ref,
+            ref_coalesce_pairs,
+            ref_interference_pairs,
+        ),
         perform_register_allocation(graph, Kind::Float),
     ]
 }
@@ -580,8 +662,7 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
 pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
     // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
-    // counter in a `[u16; 3]` array indexed by `Kind::index()` per
-    // [[feedback-no-hashmap-ever]].
+    // counter in a `[u16; 3]` array indexed by `Kind::index()`.
     let mut numkinds: [u16; 3] = [0; 3];
     for arg in &inputargs {
         let Some(v) = arg.as_variable() else { continue };
@@ -643,8 +724,8 @@ pub(super) struct ExternalInputs {
 /// Result of `allocate_registers`.
 ///
 /// `rename` carries the per-kind pre→post coloring map applied by
-/// `apply_rename`.  `[Vec<u16>; 3]` indexed by `Kind::index()` per
-/// [[feedback-no-hashmap-ever]] — each inner `Vec<u16>` is indexed by
+/// `apply_rename`.  `[Vec<u16>; 3]` indexed by `Kind::index()`: each
+/// inner `Vec<u16>` is indexed by
 /// the pre-coloring slot and yields the post-coloring color.  Entries
 /// past the vector's length implicitly map to identity (no rename
 /// occurred for that slot).  Mirrors RPython's `(kind, pre) → post`
@@ -654,8 +735,8 @@ pub(super) struct ExternalInputs {
 /// stores in `JitCode.num_regs_*` (codewriter.py:62-67).
 pub(super) struct AllocationResult {
     pub rename: [Vec<u16>; 3],
-    /// Per-kind `max(coloring)+1` indexed by `Kind::index()` per
-    /// [[feedback-no-hashmap-ever]].  Mirrors RPython
+    /// Per-kind `max(coloring)+1` indexed by `Kind::index()`.
+    /// Mirrors RPython
     /// `codewriter.py:62-67 num_regs[kind]` — pyre's `KINDS` array
     /// of 3 statically-known kinds collapses the dict to `[u16; 3]`.
     pub num_regs: [u16; 3],
@@ -694,8 +775,7 @@ pub(super) fn allocate_registers(
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
     //   regallocs[kind] = perform_register_allocation(graph, kind)`.
-    // `[SSAReprRegAllocator; 3]` indexed by `Kind::index()` per
-    // [[feedback-no-hashmap-ever]].
+    // `[SSAReprRegAllocator; 3]` indexed by `Kind::index()`.
     let mut allocators: [SSAReprRegAllocator; 3] =
         std::array::from_fn(|_| SSAReprRegAllocator::new());
     for &kind in &Kind::ALL {
