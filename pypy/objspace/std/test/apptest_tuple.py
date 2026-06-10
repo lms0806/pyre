@@ -294,6 +294,8 @@ def test_subclass_kwarg():
     assert u.newarg == 3
 
 def test_hash_cache():
+    # Test that a tuple's hash is only called once then cached.
+    # This will fail on CPython until 3.14.
     ncalled = [0]
     class A():
         def __hash__(self):
