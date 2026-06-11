@@ -25,16 +25,17 @@ use crate::{Op, OpRef};
 #[derive(Clone, Debug)]
 pub struct PreambleOp {
     /// RPython `PreambleOp.op` — the carried Box (= `self.res` from the
-    /// short_op). For non-invented entries this is the body-visible
-    /// OpRef directly; for invented entries (CompoundOp alternates)
-    /// `op` forwards to the carried Box via `make_equal_to(source, op)`
-    /// so `get_box_replacement(op)` reaches the body-visible OpRef.
-    pub op: OpRef,
+    /// short_op). For non-invented entries this resolves to the
+    /// body-visible position directly; for invented entries (CompoundOp
+    /// alternates) `op` forwards to the carried Box via
+    /// `make_equal_to(source, op)` so resolving `op` reaches the
+    /// body-visible position.
+    pub op: crate::box_ref::BoxRef,
     /// RPython: PreambleOp.invented_name
     pub invented_name: bool,
     /// RPython: PreambleOp.preamble_op — the actual replay operation
     /// for the short preamble. Always present (RPython parity).
-    pub preamble_op: Op,
+    pub preamble_op: crate::resoperation::OpRc,
 }
 
 /// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
@@ -86,7 +87,7 @@ impl FieldEntry {
     pub fn as_seen_opref(&self) -> OpRef {
         match self {
             FieldEntry::Value(opref) => *opref,
-            FieldEntry::Preamble(pop) => pop.op,
+            FieldEntry::Preamble(pop) => pop.op.to_opref(),
         }
     }
 

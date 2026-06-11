@@ -391,7 +391,8 @@ impl CachedField {
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
-            let mut op = Op::with_descr(opcode, &[BoxRef::from_opref(structbox)], descr.clone());
+            let mut op =
+                Op::with_descr(opcode, &[ctx.materialize_box_at(structbox)], descr.clone());
             op.pos.set(cached_val);
             sb.add_heap_op(op);
         }
@@ -630,11 +631,9 @@ impl ArrayCachedItem {
                 .as_array_descr()
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
                 .unwrap_or(OpCode::GetarrayitemGcI);
-            let mut op = Op::with_descr(
-                opcode,
-                &[BoxRef::from_opref(arraybox), BoxRef::from_opref(idx_ref)],
-                descr.clone(),
-            );
+            let arraybox_b = ctx.materialize_box_at(arraybox);
+            let idx_b = ctx.materialize_box_at(idx_ref);
+            let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos.set(cached_val);
             sb.add_heap_op(op);
         }
@@ -2079,13 +2078,9 @@ impl OptHeap {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let mut cmp_op = Op::new(
-                OpCode::IntNe,
-                &[
-                    BoxRef::from_opref(op.pos.get()),
-                    BoxRef::from_opref(zero_ref),
-                ],
-            );
+            let cmp_arg0 = ctx.materialize_box_at(op.pos.get());
+            let cmp_arg1 = ctx.materialize_box_at(zero_ref);
+            let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos.set(cmp_pos);
             ctx.emit(cmp_op);
             // unroll.py:409 parity: synthetic guards inherit
@@ -2093,7 +2088,8 @@ impl OptHeap {
             // running GUARD_FUTURE_CONDITION). Without this, the guard
             // arrives at store_final_boxes_in_guard with -1 and would
             // be silently dropped under the patchguardop-only fallback.
-            let guard_op = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(cmp_pos)]);
+            let guard_arg = ctx.materialize_box_at(cmp_pos);
+            let guard_op = Op::new(OpCode::GuardTrue, &[guard_arg]);
             if let Some(ref patch) = ctx.patchguardop {
                 guard_op
                     .rd_resume_position
@@ -2188,7 +2184,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
+                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2329,7 +2325,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
+                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -3840,9 +3836,9 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
-                    op: source,
+                    op: BoxRef::from_opref(source),
                     invented_name: false,
-                    preamble_op,
+                    preamble_op: std::rc::Rc::new(preamble_op),
                 },
             );
         })
@@ -5034,10 +5030,10 @@ mod tests {
             OpRef::ref_op(100),
             OpRef::ref_op(101),
         ]);
-        // Register input args so produce_arg can resolve them.
-        sb.add_short_input_arg(OpRef::ref_op(100), majit_ir::Type::Ref);
-        sb.add_short_input_arg(OpRef::ref_op(101), majit_ir::Type::Ref);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
+        // Register input args so produce_arg can resolve them.
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(100), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(101), majit_ir::Type::Ref);
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;

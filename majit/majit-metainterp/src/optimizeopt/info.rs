@@ -429,13 +429,18 @@ impl PtrInfoExt for PtrInfo {
                 Value::Void => panic!("alloc_const: ConstVoid not allowed"),
             };
             ctx.seed_constant(pos, value);
-            pos
+            ctx.materialize_box_at(pos)
         };
+        // info.py make_guards receives `op` as a Box object; bind the
+        // caller-resolved producer once. Guard args referencing ops pushed
+        // into `short` itself (lenop / eq_op below) stay position-only —
+        // their producer lives in `short`, not in ctx's registries.
+        let op_b = ctx.materialize_box_at(op);
         match self {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
                 // info.py:120-122: NonNullPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353 InstancePtrInfo.make_guards line-by-line.
@@ -475,16 +480,16 @@ impl PtrInfoExt for PtrInfo {
                     // `cls_of_box()`.
                     let class_ref = alloc_const(ctx, Value::Int(cls));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
-                        short.push(Op::new(OpCode::GuardIsObject, &[BoxRef::from_opref(op)]));
+                        short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                        short.push(Op::new(OpCode::GuardIsObject, &[op_b.clone()]));
                         short.push(Op::new(
                             OpCode::GuardClass,
-                            &[BoxRef::from_opref(op), BoxRef::from_opref(class_ref)],
+                            &[op_b.clone(), class_ref.clone()],
                         ));
                     } else {
                         short.push(Op::new(
                             OpCode::GuardNonnullClass,
-                            &[BoxRef::from_opref(op), BoxRef::from_opref(class_ref)],
+                            &[op_b.clone(), class_ref.clone()],
                         ));
                     }
                 } else if let Some(descr) = &info.descr {
@@ -493,18 +498,18 @@ impl PtrInfoExt for PtrInfo {
                         .map(|sd| sd.vtable() as i64)
                         .unwrap_or(0);
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
-                    short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                    short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardIsObject, &[BoxRef::from_opref(op)]));
+                        short.push(Op::new(OpCode::GuardIsObject, &[op_b.clone()]));
                     }
                     short.push(Op::new(
                         OpCode::GuardSubclass,
-                        &[BoxRef::from_opref(op), BoxRef::from_opref(vtable_const)],
+                        &[op_b.clone(), vtable_const.clone()],
                     ));
                 } else {
                     // info.py:353 fall-through with neither class nor
                     // descr — base NonNullPtrInfo.make_guards.
-                    short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                    short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                 }
             }
             PtrInfo::Struct(info) => {
@@ -519,19 +524,16 @@ impl PtrInfoExt for PtrInfo {
                     .map(|sd| sd.type_id() as i64)
                     .unwrap_or(0);
                 let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                 short.push(Op::new(
                     OpCode::GuardGcType,
-                    &[BoxRef::from_opref(op), BoxRef::from_opref(type_id_const)],
+                    &[op_b.clone(), type_id_const.clone()],
                 ));
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
                 let c = alloc_const(ctx, Value::Ref(*gcref));
-                short.push(Op::new(
-                    OpCode::GuardValue,
-                    &[BoxRef::from_opref(op), BoxRef::from_opref(c)],
-                ));
+                short.push(Op::new(OpCode::GuardValue, &[op_b.clone(), c.clone()]));
             }
             PtrInfo::Array(info) => {
                 // info.py:632-639: ArrayPtrInfo.make_guards.
@@ -541,7 +543,7 @@ impl PtrInfoExt for PtrInfo {
                 //       lenop = ARRAYLEN_GC[op] (descr=self.descr)
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
-                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                 let type_id = info
                     .descr
                     .as_array_descr()
@@ -550,18 +552,15 @@ impl PtrInfoExt for PtrInfo {
                 let type_id_const = alloc_const(ctx, Value::Int(type_id));
                 short.push(Op::new(
                     OpCode::GuardGcType,
-                    &[BoxRef::from_opref(op), BoxRef::from_opref(type_id_const)],
+                    &[op_b.clone(), type_id_const.clone()],
                 ));
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
                 // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
                 // `Option`, so the parity check is on `is_unbounded()`
                 // rather than `is None`.
                 if !info.lenbound.is_unbounded() {
-                    let mut lenop = Op::with_descr(
-                        OpCode::ArraylenGc,
-                        &[BoxRef::from_opref(op)],
-                        info.descr.clone(),
-                    );
+                    let mut lenop =
+                        Op::with_descr(OpCode::ArraylenGc, &[op_b.clone()], info.descr.clone());
                     // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
                     // followed by `lenbound.make_guards(lenop, ...)` — the
                     // `lenop` object is the consumer's box arg via Python
@@ -591,10 +590,7 @@ impl PtrInfoExt for PtrInfo {
             // `RawSlicePtrInfo` (info.py:459) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
                 let zero = alloc_const(ctx, Value::Int(0));
-                let mut eq_op = Op::new(
-                    OpCode::IntEq,
-                    &[BoxRef::from_opref(op), BoxRef::from_opref(zero)],
-                );
+                let mut eq_op = Op::new(OpCode::IntEq, &[op_b.clone(), zero.clone()]);
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
                 eq_op.pos.set(ctx.alloc_op_position_typed(Type::Int));
@@ -604,7 +600,7 @@ impl PtrInfoExt for PtrInfo {
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(op)]));
+                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                 if let Some(ref bound) = sinfo.lenbound {
                     if bound.lower >= 1 {
                         let lenop_code = if sinfo.mode == 0 {
@@ -612,7 +608,7 @@ impl PtrInfoExt for PtrInfo {
                         } else {
                             OpCode::Unicodelen
                         };
-                        let mut lenop = Op::new(lenop_code, &[BoxRef::from_opref(op)]);
+                        let mut lenop = Op::new(lenop_code, &[op_b.clone()]);
                         // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                         // is consumed by `bound.make_guards(lenop, ...)`.
                         // Materialize the producer result before the chain.
@@ -963,10 +959,9 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let mut set_op = Op::new(
-                    OpCode::SetfieldGc,
-                    &[BoxRef::from_opref(alloc_ref), BoxRef::from_opref(value_ref)],
-                );
+                let arg_alloc = ctx.materialize_box_at(alloc_ref);
+                let arg_value = ctx.materialize_box_at(value_ref);
+                let mut set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc, arg_value]);
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
             }
@@ -1011,10 +1006,9 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let mut set_op = Op::new(
-                    OpCode::SetfieldGc,
-                    &[BoxRef::from_opref(alloc_ref), BoxRef::from_opref(value_ref)],
-                );
+                let arg_alloc = ctx.materialize_box_at(alloc_ref);
+                let arg_value = ctx.materialize_box_at(value_ref);
+                let mut set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc, arg_value]);
                 set_op.setdescr(descr);
                 emit_op(ctx, set_op);
             }
@@ -1033,7 +1027,8 @@ fn force_box_impl(
             } else {
                 OpCode::NewArray
             };
-            let mut alloc_op = Op::new(alloc_opcode, &[BoxRef::from_opref(len_ref)]);
+            let arg_len = ctx.materialize_box_at(len_ref);
+            let mut alloc_op = Op::new(alloc_opcode, &[arg_len]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1067,14 +1062,10 @@ fn force_box_impl(
                 }
                 let subbox = force_child(item_ref, ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
-                let mut set_op = Op::new(
-                    OpCode::SetarrayitemGc,
-                    &[
-                        BoxRef::from_opref(alloc_ref),
-                        BoxRef::from_opref(idx_ref),
-                        BoxRef::from_opref(subbox),
-                    ],
-                );
+                let arg_alloc = ctx.materialize_box_at(alloc_ref);
+                let arg_idx = ctx.materialize_box_at(idx_ref);
+                let arg_sub = ctx.materialize_box_at(subbox);
+                let mut set_op = Op::new(OpCode::SetarrayitemGc, &[arg_alloc, arg_idx, arg_sub]);
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
             }
@@ -1093,7 +1084,8 @@ fn force_box_impl(
             ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
-            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[BoxRef::from_opref(len_ref)]);
+            let arg_len = ctx.materialize_box_at(len_ref);
+            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[arg_len]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1127,14 +1119,11 @@ fn force_box_impl(
                         continue;
                     }
                     let subbox = force_child(value_ref, ctx);
-                    let mut set_op = Op::new(
-                        OpCode::SetinteriorfieldGc,
-                        &[
-                            BoxRef::from_opref(alloc_ref),
-                            BoxRef::from_opref(idx_ref),
-                            BoxRef::from_opref(subbox),
-                        ],
-                    );
+                    let arg_alloc = ctx.materialize_box_at(alloc_ref);
+                    let arg_idx = ctx.materialize_box_at(idx_ref);
+                    let arg_sub = ctx.materialize_box_at(subbox);
+                    let mut set_op =
+                        Op::new(OpCode::SetinteriorfieldGc, &[arg_alloc, arg_idx, arg_sub]);
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
                         set_op.setdescr(d);
                     }
@@ -1154,10 +1143,9 @@ fn force_box_impl(
             // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
             let func_ref = ctx.emit_constant_int(func);
             let size_ref = ctx.emit_constant_int(size as i64);
-            let mut call_op = Op::new(
-                OpCode::CallI,
-                &[BoxRef::from_opref(func_ref), BoxRef::from_opref(size_ref)],
-            );
+            let arg_func = ctx.materialize_box_at(func_ref);
+            let arg_size = ctx.materialize_box_at(size_ref);
+            let mut call_op = Op::new(OpCode::CallI, &[arg_func, arg_size]);
             call_op.pos.set(opref);
             if let Some(d) = calldescr {
                 call_op.setdescr(d);
@@ -1174,21 +1162,18 @@ fn force_box_impl(
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
-            let check_op = Op::new(OpCode::CheckMemoryError, &[BoxRef::from_opref(alloc_ref)]);
+            let arg_alloc = ctx.materialize_box_at(alloc_ref);
+            let check_op = Op::new(OpCode::CheckMemoryError, &[arg_alloc]);
             emit_op(ctx, check_op);
 
             // info.py:429-436: emit RAW_STORE for each buffered write
             for (offset, _length, descr, value) in entries {
                 let value_ref = force_child(value, ctx);
                 let offset_ref = ctx.emit_constant_int(offset);
-                let mut store_op = Op::new(
-                    OpCode::RawStore,
-                    &[
-                        BoxRef::from_opref(alloc_ref),
-                        BoxRef::from_opref(offset_ref),
-                        BoxRef::from_opref(value_ref),
-                    ],
-                );
+                let arg_alloc = ctx.materialize_box_at(alloc_ref);
+                let arg_offset = ctx.materialize_box_at(offset_ref);
+                let arg_value = ctx.materialize_box_at(value_ref);
+                let mut store_op = Op::new(OpCode::RawStore, &[arg_alloc, arg_offset, arg_value]);
                 store_op.setdescr(descr);
                 emit_op(ctx, store_op);
             }
@@ -1219,13 +1204,9 @@ fn force_box_impl(
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(slice.parent, ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-            let mut add_op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(parent_forced),
-                    BoxRef::from_opref(offset_ref),
-                ],
-            );
+            let arg_parent = ctx.materialize_box_at(parent_forced);
+            let arg_offset = ctx.materialize_box_at(offset_ref);
+            let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent, arg_offset]);
             add_op.pos.set(opref);
             let new_ref = emit_op(ctx, add_op);
             // Preserve raw-slice identity; mark non-virtual via
@@ -1304,7 +1285,8 @@ fn force_box_impl(
             } else {
                 OpCode::Newstr
             };
-            let mut newstr_op = Op::new(new_opcode, &[BoxRef::from_opref(lengthbox)]);
+            let arg_length = ctx.materialize_box_at(lengthbox);
+            let mut newstr_op = Op::new(new_opcode, &[arg_length]);
             newstr_op.pos.set(opref);
             let newop = emit_op(ctx, newstr_op);
 
@@ -1349,14 +1331,10 @@ fn force_box_impl(
                                 .get_box_replacement_box(*ch_ref)
                                 .map(|b| b.to_opref())
                                 .unwrap_or(*ch_ref);
-                            let setitem_op = Op::new(
-                                set_opcode,
-                                &[
-                                    BoxRef::from_opref(newop),
-                                    BoxRef::from_opref(offset),
-                                    BoxRef::from_opref(ch_resolved),
-                                ],
-                            );
+                            let arg_newop = ctx.materialize_box_at(newop);
+                            let arg_offset = ctx.materialize_box_at(offset);
+                            let arg_ch = ctx.materialize_box_at(ch_resolved);
+                            let setitem_op = Op::new(set_opcode, &[arg_newop, arg_offset, arg_ch]);
                             emit_op(ctx, setitem_op);
                         }
                         offset = crate::optimizeopt::vstring::_int_add(offset, one, ctx);
@@ -1751,9 +1729,9 @@ mod tests {
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
-            op: OpRef::int_op(88),
+            op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: replay,
+            preamble_op: std::rc::Rc::new(replay),
         };
         info.set_preamble_item(1, pop.clone());
 
@@ -1763,7 +1741,7 @@ mod tests {
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
-        assert_eq!(recovered.op, OpRef::int_op(88));
+        assert_eq!(recovered.op.to_opref(), OpRef::int_op(88));
         // After take_preamble_item, slot is Value(NONE)
         assert_eq!(
             info.getitem(1).and_then(|e| e.as_opref()),
@@ -1780,9 +1758,9 @@ mod tests {
             &[BoxRef::from_opref(OpRef::int_op(10))],
         );
         let pop = PreambleOp {
-            op: OpRef::int_op(88),
+            op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: replay,
+            preamble_op: std::rc::Rc::new(replay),
         };
         info.set_preamble_field(3, pop);
 

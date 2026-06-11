@@ -860,7 +860,7 @@ impl VirtualState {
                             .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
                             .and_then(|e| e.as_opref())
-                            .map(|f| ctx.get_box_replacement(f).to_opref())
+                            .map(|f| ctx.get_replacement_opref(f))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect();
@@ -1011,7 +1011,7 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_box_replacement(opref).to_opref();
+                let resolved = ctx.get_replacement_opref(opref);
                 let forced = match ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
@@ -1039,7 +1039,7 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_box_replacement(forced).to_opref();
+                let resolved_for_store = ctx.get_replacement_opref(forced);
                 // virtualstate.py:417 NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -2291,10 +2291,9 @@ impl GuardRequirement {
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(
-                    OpCode::GuardClass,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let class_b = ctx.materialize_box_at(class_const);
+                let mut op = Op::new(OpCode::GuardClass, &[arg_b, class_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2315,10 +2314,9 @@ impl GuardRequirement {
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(
-                    OpCode::GuardNonnullClass,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let class_b = ctx.materialize_box_at(class_const);
+                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b, class_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2334,7 +2332,7 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(arg)]);
+                let mut op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_box_at(arg)]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2363,10 +2361,9 @@ impl GuardRequirement {
                     Value::Ref(r) => ctx.make_constant_ref(*r),
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(val_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let val_b = ctx.materialize_box_at(val_const);
+                let mut op = Op::new(OpCode::GuardValue, &[arg_b, val_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2493,7 +2490,7 @@ fn export_single_value(
     // distinct field-side OpRefs that resolve to the same forwarded box
     // would each receive their own Rc, breaking the dedup invariant
     // `enum_forced_boxes` and RPython matching rely on.
-    let opref = ctx.get_box_replacement(opref).to_opref();
+    let opref = ctx.get_replacement_opref(opref);
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
         return Rc::clone(cached);

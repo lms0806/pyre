@@ -1171,14 +1171,14 @@ impl UnrollOptimizer {
                     // dispatcher, matching optimizer.py:306-319.
                     let resolved_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
+                        .map(|&arg| final_ctx.get_replacement_opref(arg))
                         .collect();
                     for &arg in &resolved_jump_args {
                         let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
+                        .map(|&arg| final_ctx.get_replacement_opref(arg))
                         .collect();
                     let current_vs = crate::optimizeopt::virtualstate::export_state(
                         &forced_jump_args,
@@ -1258,7 +1258,7 @@ impl UnrollOptimizer {
                                 continue;
                             }
                             visited_force.insert(arg);
-                            let resolved = final_ctx.get_box_replacement(arg).to_opref();
+                            let resolved = final_ctx.get_replacement_opref(arg);
                             let needs_force = final_ctx
                                 .potential_extra_ops
                                 .iter()
@@ -1810,9 +1810,7 @@ impl UnrollOptimizer {
     /// unroll.py: _check_no_forwarding(lsts)
     /// Debug assertion: verify no OpRef in the lists has been forwarded.
     pub fn check_no_forwarding(ctx: &crate::optimizeopt::OptContext, oprefs: &[OpRef]) -> bool {
-        oprefs
-            .iter()
-            .all(|&r| ctx.get_box_replacement(r).to_opref() == r)
+        oprefs.iter().all(|&r| ctx.get_replacement_opref(r) == r)
     }
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
@@ -2106,8 +2104,8 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&entry.op, visitor);
-            if let Some(source) = entry.same_as_source.as_mut() {
-                visit_opref(source, visitor);
+            if let Some(source) = entry.same_as_source.as_ref() {
+                source.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2116,8 +2114,8 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&produced.preamble_op, visitor);
-            if let Some(source) = produced.same_as_source.as_mut() {
-                visit_opref(source, visitor);
+            if let Some(source) = produced.same_as_source.as_ref() {
+                source.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2214,8 +2212,8 @@ impl ExportedState {
 
         for preamble_op in &self.exported_short_boxes {
             visit_op(&preamble_op.op, &mut visit);
-            if let Some(source) = preamble_op.same_as_source {
-                visit(source);
+            if let Some(source) = preamble_op.same_as_source.as_ref() {
+                visit(source.to_opref());
             }
         }
 
@@ -2825,7 +2823,7 @@ impl OptUnroll {
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
             original_label_args
                 .iter()
-                .map(|&a| ctx.get_box_replacement(a).to_opref())
+                .map(|&a| ctx.get_replacement_opref(a))
                 .collect()
         });
         // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`
@@ -2853,6 +2851,22 @@ impl OptUnroll {
         }
         let mut short_args = label_args.to_vec();
         short_args.extend(virtuals);
+        // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
+        // label_args + virtuals)` — read the ShortBoxes-derived list off the
+        // ctx channel. The preview pass computed it from the same
+        // `label_args + virtuals` (measured identical across the corpus);
+        // paths that never ran the preview (test ExportedState setups) fall
+        // back to the local recompute.
+        let short_inputargs = if ctx.exported_short_inputargs.is_empty() {
+            short_args.clone()
+        } else {
+            debug_assert_eq!(
+                ctx.exported_short_inputargs, short_args,
+                "preview-pass create_short_inputargs diverged from the \
+                 export-site label_args + virtuals recompute"
+            );
+            ctx.exported_short_inputargs.clone()
+        };
         let exported_short_boxes = ctx.exported_short_boxes.clone();
         // unroll.py:466-473 line-by-line:
         //
@@ -2875,7 +2889,7 @@ impl OptUnroll {
         let short_boxes_for_info =
             crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
                 &label_args,
-                &short_args,
+                &short_inputargs,
                 &exported_short_boxes,
             );
         for (_, produced_op) in &short_boxes_for_info {
@@ -2904,7 +2918,7 @@ impl OptUnroll {
         // unroll.py:458 `end_args = [get_box_replacement(arg) for arg in end_args]`.
         let resolved_next_iteration_args: Vec<OpRef> = end_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a).to_opref())
+            .map(|&a| ctx.get_replacement_opref(a))
             .collect();
         // Phase B B1: `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
@@ -2919,7 +2933,7 @@ impl OptUnroll {
             infos,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
-            short_args,
+            short_inputargs,
         );
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
@@ -3028,7 +3042,7 @@ impl OptUnroll {
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
-        let resolved = ctx.get_box_replacement(arg).to_opref();
+        let resolved = ctx.get_replacement_opref(arg);
         if infos.contains_key(&resolved) {
             // Also store under the original key so import_state can
             // find the info using the unresolved next_iteration_args key.
@@ -3217,7 +3231,7 @@ impl OptUnroll {
             .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
         let mut args: Vec<OpRef> = jump_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a).to_opref())
+            .map(|&a| ctx.get_replacement_opref(a))
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
@@ -3348,7 +3362,7 @@ impl OptUnroll {
                     if force_boxes {
                         args = jump_args
                             .iter()
-                            .map(|&a| ctx.get_box_replacement(a).to_opref())
+                            .map(|&a| ctx.get_replacement_opref(a))
                             .collect();
                         virtual_state = crate::optimizeopt::virtualstate::export_state(&args, ctx);
                     }
@@ -3453,8 +3467,10 @@ impl OptUnroll {
             // unroll.py:357-359: emit JUMP to target
             let mut jump_args = target_args;
             jump_args.extend(extra);
-            let jump_args_box: Vec<BoxRef> =
-                jump_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let mut jump_args_box: Vec<BoxRef> = Vec::with_capacity(jump_args.len());
+            for a in &jump_args {
+                jump_args_box.push(ctx.materialize_box_at(*a));
+            }
             let mut jump = Op::new(OpCode::Jump, &jump_args_box);
             jump.setdescr(target_token.as_jump_target_descr());
             optimizer.send_extra_operation(&jump, ctx);
@@ -3669,7 +3685,19 @@ impl OptUnroll {
                 } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(&arg.to_opref()) {
-                            *arg = BoxRef::from_opref(mapped);
+                            // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0
+                            // fires across check.py corpus + lib tests) —
+                            // only guards carry fail_args and guards take the
+                            // clearfailargs arm above, matching unroll.py:
+                            // 405-414 which has no fail_args handling on the
+                            // non-guard path. Rewrite kept as a release
+                            // safety net.
+                            debug_assert!(
+                                false,
+                                "non-guard short-preamble op carried fail_args: {:?}",
+                                new_op.opcode
+                            );
+                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
                         }
                     }
                 }
@@ -3696,7 +3724,7 @@ impl OptUnroll {
                         } else {
                             *mapping.get(jump_arg).expect("mapping missing jump_arg")
                         };
-                        ctx.get_box_replacement(mapped).to_opref()
+                        ctx.get_replacement_opref(mapped)
                     })
                     .collect();
                 // unroll.py:419-421
@@ -3720,7 +3748,7 @@ impl OptUnroll {
             .iter()
             .map(|&jump_arg| {
                 let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
-                ctx.get_box_replacement(mapped).to_opref()
+                ctx.get_replacement_opref(mapped)
             })
             .collect()
     }
@@ -3790,7 +3818,16 @@ impl OptUnroll {
             let b_source = ctx
                 .get_box_replacement_box(source)
                 .expect("import_state source must have a materialized BoxRef slot");
-            let b_target = ctx.get_box_replacement(*target);
+            // `target` is a Phase-1 next-iteration ref whose producer may not
+            // be carried into this rebuilt context; materialize its canonical
+            // host instead of fabricating a position-only box (`make_equal_to`
+            // would re-materialize the unbound target internally anyway —
+            // resolve-or-materialize here keeps the chain target canonical
+            // from the start).
+            let b_target = match ctx.get_box_replacement_box(*target) {
+                Some(b) => b,
+                None => ctx.materialize_box_at(*target),
+            };
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -3900,6 +3937,17 @@ impl OptUnroll {
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::Guard => None,
             };
             if let Some(result) = result {
+                // shortpreamble.py:327: `self.res` is a Box object that
+                // exists from import time. The freshly allocated
+                // body-visible result slots (the `alloc_op_position_typed`
+                // arms above) have no producer yet; mint their canonical
+                // `SameAs*` stand-in here so a later `get_box_replacement`
+                // resolves them instead of fabricating a position-only box.
+                // Slot-mapped results (`short_args[slot]`) are already bound
+                // inputargs and resolve without minting.
+                if ctx.get_box_replacement_box(result).is_none() {
+                    ctx.mint_box_at(result);
+                }
                 result_map.insert(*source, result);
             }
         }
@@ -3986,7 +4034,7 @@ impl OptUnroll {
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
-        let resolved = ctx.get_box_replacement(opref).to_opref();
+        let resolved = ctx.get_replacement_opref(opref);
         // unroll.py:432-443 `_expand_info` calls `self.optimizer.getinfo(arg)`
         // which itself runs `get_box_replacement` first, so a non-constant
         // OpRef forwarded to a Const surfaces the corresponding constant
@@ -4016,7 +4064,7 @@ impl OptUnroll {
                 return synthesize_const_info(value);
             }
         }
-        // make_constant mirrors optimizer.py:432 as `Forwarded::Box(constbox)`.
+        // make_constant mirrors optimizer.py:432 as `Forwarded::Const(constval)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
         let resolved_box = ctx.get_box_replacement_box(opref);
@@ -4285,10 +4333,7 @@ fn emit_alias_same_as_for_imports(
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
-        let mut op = Op::new(
-            alias.same_as_opcode,
-            &[BoxRef::from_opref(alias.same_as_source)],
-        );
+        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source.clone()]);
         op.pos.set(alias.result);
         result.push(op);
     }
@@ -4358,10 +4403,10 @@ fn assemble_peeled_trace_with_jump_args(
     };
 
     if let Some(start_label_descr) = start_label_descr {
-        let start_label_args_box: Vec<BoxRef> = start_label_args
-            .iter()
-            .map(|a| BoxRef::from_opref(*a))
-            .collect();
+        let mut start_label_args_box: Vec<BoxRef> = Vec::with_capacity(start_label_args.len());
+        for a in start_label_args {
+            start_label_args_box.push(ctx.materialize_box_at(*a));
+        }
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box);
         start_label.pos.set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
@@ -4534,9 +4579,11 @@ fn assemble_peeled_trace_with_jump_args(
                 // Label carries the forwarded Box, but first fall-through
                 // only has the preamble source; pyre's flat OpRef model
                 // needs an explicit SameAs bridge before the Label.
-                if let Some(source) = preamble_defs.iter().copied().find(|&source| {
-                    source != arg && ctx.get_box_replacement(source).to_opref() == arg
-                }) {
+                if let Some(source) = preamble_defs
+                    .iter()
+                    .copied()
+                    .find(|&source| source != arg && ctx.get_replacement_opref(source) == arg)
+                {
                     let tp = ctx
                         .opref_type(arg)
                         .or_else(|| ctx.opref_type(source))
@@ -4551,8 +4598,8 @@ fn assemble_peeled_trace_with_jump_args(
                             )
                         });
                     if tp != Type::Void {
-                        let mut same_as =
-                            Op::new(OpCode::same_as_for_type(tp), &[BoxRef::from_opref(source)]);
+                        let arg_source = ctx.materialize_box_at(source);
+                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
                         same_as.pos.set(arg);
                         fallthrough_aliases.push(same_as);
                     }
@@ -4566,10 +4613,10 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let full_label_args_box: Vec<BoxRef> = full_label_args
-        .iter()
-        .map(|a| BoxRef::from_opref(*a))
-        .collect();
+    let mut full_label_args_box: Vec<BoxRef> = Vec::with_capacity(full_label_args.len());
+    for a in &full_label_args {
+        full_label_args_box.push(ctx.materialize_box_at(*a));
+    }
     let mut label_op = Op::new(OpCode::Label, &full_label_args_box);
     // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
@@ -4658,7 +4705,14 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
                 let b_js = ctx.materialize_box_at(jump_source);
-                let b_ela = ctx.get_box_replacement(extended_label_arg);
+                // Chain target: resolve-or-materialize the canonical host
+                // (make_equal_to materializes an unbound target internally;
+                // doing it here keeps the target off the position-only
+                // fabrication path).
+                let b_ela = match ctx.get_box_replacement_box(extended_label_arg) {
+                    Some(b) => b,
+                    None => ctx.materialize_box_at(extended_label_arg),
+                };
                 ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
@@ -4812,10 +4866,11 @@ fn assemble_peeled_trace_with_jump_args(
                 extended_args.push(mapped_arg);
                 original_args.push(BoxRef::from_opref(source_arg));
             }
-            let extended_args_box: smallvec::SmallVec<[BoxRef; 3]> = extended_args
-                .iter()
-                .map(|a| BoxRef::from_opref(*a))
-                .collect();
+            let mut extended_args_box: smallvec::SmallVec<[BoxRef; 3]> =
+                smallvec::SmallVec::with_capacity(extended_args.len());
+            for a in &extended_args {
+                extended_args_box.push(ctx.materialize_box_at(*a));
+            }
             new_op.initarglist(extended_args_box);
         }
         if new_op.opcode == OpCode::Jump {
@@ -4891,8 +4946,11 @@ fn assemble_peeled_trace_with_jump_args(
                 }
             }
             // unroll.py-style bulk replace: jump arity is finalized here.
-            let jump_args_box: smallvec::SmallVec<[BoxRef; 3]> =
-                jump_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let mut jump_args_box: smallvec::SmallVec<[BoxRef; 3]> =
+                smallvec::SmallVec::with_capacity(jump_args.len());
+            for a in &jump_args {
+                jump_args_box.push(ctx.materialize_box_at(*a));
+            }
             new_op.initarglist(jump_args_box);
         }
         // RPython resume.py parity: fail_args capture guard-point state
@@ -4905,7 +4963,7 @@ fn assemble_peeled_trace_with_jump_args(
                     if seen_body_defs.contains(&a.to_opref())
                         && !visible_before_label.contains(&a.to_opref())
                     {
-                        *a = BoxRef::from_opref(mapped);
+                        *a = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
                     }
                 }
             }
@@ -5094,7 +5152,7 @@ impl OptUnroll {
             if let Some(fa) = peeled.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                        *arg = BoxRef::from_opref(new_ref);
+                        *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(new_ref));
                     }
                 }
             }
@@ -5141,7 +5199,7 @@ impl OptUnroll {
             if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                        *arg = BoxRef::from_opref(new_ref);
+                        *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(new_ref));
                     }
                 }
             }
@@ -5545,7 +5603,7 @@ mod tests {
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
-                same_as_source: Some(old_ref),
+                same_as_source: Some(BoxRef::from_opref(old_ref)),
             }],
             vec![old_ref],
             vec![old_ref],
@@ -5554,9 +5612,12 @@ mod tests {
             old_ref,
             ProducedShortOp {
                 kind: PreambleOpKind::Pure,
-                preamble_op: Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)]),
+                preamble_op: std::rc::Rc::new(Op::new(
+                    OpCode::SameAsR,
+                    &[BoxRef::from_opref(old_ref)],
+                )),
                 invented_name: false,
-                same_as_source: Some(old_ref),
+                same_as_source: Some(BoxRef::from_opref(old_ref)),
             },
         ));
         state.short_box_const_values = short_box_const_values;
@@ -5595,14 +5656,23 @@ mod tests {
         assert_eq!(state.runtime_boxes[0], new_ref);
         assert!(state.exported_infos.get(&new_ref).is_some());
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
-        assert_eq!(state.exported_short_boxes[0].same_as_source, Some(new_ref));
+        assert_eq!(
+            state.exported_short_boxes[0]
+                .same_as_source
+                .as_ref()
+                .map(|b| b.to_opref()),
+            Some(new_ref)
+        );
         let produced = state
             .short_boxes
             .iter()
             .find_map(|(key, produced)| (*key == new_ref).then_some(produced))
             .expect("short_boxes key must be forwarded");
         assert_eq!(produced.preamble_op.arg(0).to_opref(), new_ref);
-        assert_eq!(produced.same_as_source, Some(new_ref));
+        assert_eq!(
+            produced.same_as_source.as_ref().map(|b| b.to_opref()),
+            Some(new_ref)
+        );
         assert_eq!(
             state.short_box_const_values.get(&new_ref),
             Some(&Value::Ref(new))
@@ -6332,7 +6402,7 @@ mod tests {
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
-        assert_eq!(pop.op, OpRef::int_op(11)); // Phase 1 source — pop.op
+        assert_eq!(pop.op.to_opref(), OpRef::int_op(11)); // Phase 1 source — pop.op
         // forwards via make_equal_to to the body-visible OpRef.
         drop(parent);
     }
@@ -6383,20 +6453,19 @@ mod tests {
         // directly.
         let fresh_const = OpRef::const_ptr(ptr);
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
-        assert_eq!(
-            ctx2.imported_short_pure_ops,
-            vec![crate::optimizeopt::ImportedShortPureOp::new(
-                OpCode::GetfieldGcPureI,
-                Some(field_descr.clone()),
-                vec![crate::optimizeopt::ImportedShortPureArg::Const(
-                    Value::Ref(ptr),
-                    fresh_const,
-                )],
-                OpRef::int_op(11),
-                OpRef::int_op(11),
-                false
-            )]
+        let expected = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx2,
+            OpCode::GetfieldGcPureI,
+            Some(field_descr.clone()),
+            vec![crate::optimizeopt::ImportedShortPureArg::Const(
+                Value::Ref(ptr),
+                fresh_const,
+            )],
+            OpRef::int_op(11),
+            OpRef::int_op(11),
+            false,
         );
+        assert_eq!(ctx2.imported_short_pure_ops, vec![expected]);
     }
 
     #[test]
@@ -6542,7 +6611,7 @@ mod tests {
             .produced_short_op(OpRef::int_op(20))
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::int_op(20),
+            op: BoxRef::from_opref(OpRef::int_op(20)),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
@@ -6635,7 +6704,7 @@ mod tests {
         let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
         ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::ref_op(19),
+            op: b_src.clone(),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
@@ -6693,7 +6762,7 @@ mod tests {
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(OpRef::int_op(14)),
+                same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
             });
 
         let exported = export_state(
@@ -6730,7 +6799,7 @@ mod tests {
         let _ = optimizer.force_box(forced, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
         assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].same_as_source, OpRef::int_op(14));
+        assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));
         assert_eq!(aliases[0].same_as_opcode, OpCode::SameAsI);
     }
 
@@ -6772,7 +6841,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -6990,7 +7059,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7151,7 +7220,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),

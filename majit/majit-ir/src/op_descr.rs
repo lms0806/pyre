@@ -173,7 +173,10 @@ impl Op {
     /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
     /// `.into_iter().flatten()` or `.iter()` patterns.
     pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
-        self.fail_args.borrow().clone()
+        self.fail_args
+            .borrow()
+            .as_ref()
+            .map(|fa| fa.iter().map(|o| o.to_boxref()).collect())
     }
 
     /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
@@ -192,7 +195,7 @@ impl Op {
                  fail-loud shape (resoperation.py:492)"
             )
         });
-        fa.iter().cloned().collect()
+        fa.iter().map(|o| o.to_boxref()).collect()
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
@@ -200,7 +203,17 @@ impl Op {
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
     pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        *self.fail_args.borrow_mut() = Some(fail_args);
+        // `GuardResOp._fail_args` holds the Box objects themselves
+        // (resoperation.py:483); shed genuinely-bound boxes to their
+        // live-tracking producer operand, exactly like `Op.args`
+        // (`Operand::from_boxref`). Position-only / Const boxes stay
+        // `Operand::Box` until their writers bind producers.
+        *self.fail_args.borrow_mut() = Some(
+            fail_args
+                .iter()
+                .map(crate::operand::Operand::from_boxref)
+                .collect(),
+        );
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
@@ -211,7 +224,7 @@ impl Op {
     /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(
         &mut self,
-    ) -> Option<&mut smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
+    ) -> Option<&mut smallvec::SmallVec<[crate::operand::Operand; 3]>> {
         self.fail_args.get_mut().as_mut()
     }
 
@@ -261,24 +274,27 @@ impl Op {
         self.fail_arg_types.borrow().is_some()
     }
 
-    /// `resoperation.py:281 AbstractResOp.getarglist` parity — returns
-    /// a `Ref` view into the operand vector.  Subclass mixins (`UnaryOp`,
-    /// `BinaryOp`, ..., `N_aryOp`) implement this differently; pyre
-    /// collapses them into a single SmallVec slot.  The `RefCell` borrow
-    /// guard is required because `args` is interior-mutable so that
-    /// `setarg` / `initarglist` can write through a shared `Op` reached
-    /// via `Rc<Op>` (RPython writes `op._args[i] = ...` on the same
-    /// Python object the trace list, optimizer state, and backend
-    /// observe).
-    pub fn getarglist(&self) -> std::cell::Ref<'_, [crate::box_ref::BoxRef]> {
-        std::cell::Ref::map(self.args.borrow(), |a| a.as_slice())
+    /// `resoperation.py:281 AbstractResOp.getarglist` parity — the operand
+    /// list as `BoxRef`s.  Subclass mixins (`UnaryOp`, `BinaryOp`, ...,
+    /// `N_aryOp`) implement this differently; pyre collapses them into a
+    /// single SmallVec slot.
+    ///
+    /// `#9` operand-union flip: `args` now stores [`Operand`], so this
+    /// materializes an owned `SmallVec` of `BoxRef`s (convert-on-read via
+    /// `Operand::to_boxref`) rather than borrowing the slot — the old `Ref`
+    /// view is no longer expressible. The owned `SmallVec` derefs to
+    /// `&[BoxRef]`, so iterate/index/`&`-coercion callers are unchanged; it
+    /// also drops the `RefCell` borrow at the call boundary, so a caller may
+    /// freely `setarg` afterwards.
+    pub fn getarglist(&self) -> smallvec::SmallVec<[crate::box_ref::BoxRef; 3]> {
+        self.args.borrow().iter().map(|o| o.to_boxref()).collect()
     }
 
     /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
-    /// an owned `SmallVec` clone for the same effect.
+    /// an owned `SmallVec` of `BoxRef`s (convert-on-read).
     pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::box_ref::BoxRef; 3]> {
-        self.args.borrow().clone()
+        self.args.borrow().iter().map(|o| o.to_boxref()).collect()
     }
 
     /// `resoperation.py:277 AbstractResOp.initarglist` parity — bulk
@@ -292,13 +308,16 @@ impl Op {
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
     pub fn initarglist(&self, args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        *self.args.borrow_mut() = args;
+        *self.args.borrow_mut() = args
+            .iter()
+            .map(crate::operand::Operand::from_boxref)
+            .collect();
     }
 
     /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
     /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
     /// or `_args[i]`; pyre indexes the SmallVec directly.
     pub fn setarg(&self, i: usize, box_: crate::box_ref::BoxRef) {
-        self.args.borrow_mut()[i] = box_;
+        self.args.borrow_mut()[i] = crate::operand::Operand::from_boxref(&box_);
     }
 }

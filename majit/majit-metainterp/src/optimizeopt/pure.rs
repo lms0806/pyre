@@ -961,10 +961,8 @@ impl Optimization for OptPure {
                 // ctx.emit() bypasses that optimizer path, so mirror the
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
-                    postponed.setarg(
-                        i,
-                        BoxRef::from_opref(self.force_box(postponed.arg(i).to_opref(), ctx)),
-                    );
+                    let forced = self.force_box(postponed.arg(i).to_opref(), ctx);
+                    postponed.setarg(i, ctx.materialize_box_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
@@ -973,10 +971,8 @@ impl Optimization for OptPure {
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
-                    postponed.setarg(
-                        i,
-                        BoxRef::from_opref(self.force_box(postponed.arg(i).to_opref(), ctx)),
-                    );
+                    let forced = self.force_box(postponed.arg(i).to_opref(), ctx);
+                    postponed.setarg(i, ctx.materialize_box_at(forced));
                 }
                 ctx.emit(postponed);
             }
@@ -1256,16 +1252,12 @@ impl Optimization for OptPure {
                     continue;
                 }
             }
-            let imported_args = entry
-                .args
-                .iter()
-                .map(|a| match a {
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => BoxRef::from_opref(*r),
-                    crate::optimizeopt::ImportedShortPureArg::Const(_v, source) => {
-                        BoxRef::from_opref(*source)
-                    }
-                })
-                .collect::<Vec<BoxRef>>();
+            // The replay `preamble_op` was built by `ImportedShortPureOp::new`
+            // from the same arg list with producer-bound operands
+            // (shortpreamble.py:425 — the replay op carries the same Box
+            // objects); reuse them instead of re-deriving position-only
+            // echoes from the OpRef table.
+            let imported_args = entry.pop.preamble_op.getarglist();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
             imported_op.pos.set(entry.result);
             if let Some(d) = entry.descr.clone() {
@@ -1335,18 +1327,18 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            ctx.set_potential_extra_op(
-                source,
-                crate::optimizeopt::info::PreambleOp {
-                    op: source,
-                    invented_name: false,
-                    preamble_op: {
-                        let mut same_as = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(source)]);
-                        same_as.pos.set(source);
-                        same_as
-                    },
+            // PreambleOp.op carries the Box itself (shortpreamble.py:12).
+            let source_box = ctx.materialize_box_at(source);
+            let pop = crate::optimizeopt::info::PreambleOp {
+                op: source_box.clone(),
+                invented_name: false,
+                preamble_op: {
+                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box]);
+                    same_as.pos.set(source);
+                    std::rc::Rc::new(same_as)
                 },
-            );
+            };
+            ctx.set_potential_extra_op(source, pop);
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;
@@ -1724,6 +1716,12 @@ mod tests {
         // Test that CSE works correctly when OpRef forwarding is involved.
         let mut ctx = OptContext::new(10);
         let mut pass = OptPure::new();
+
+        // Production binds the input operands a, b before the int_add is
+        // processed; bind them canonically here so same_box resolves both
+        // ops' args to one shared box.
+        ctx.materialize_box_at(OpRef::int_op(0));
+        ctx.materialize_box_at(OpRef::int_op(1));
 
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(
@@ -2452,6 +2450,7 @@ mod tests {
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
         let x = OpRef::int_op(7);
+        ctx.materialize_box_at(x);
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(
@@ -2489,8 +2488,9 @@ mod tests {
         let other_arg = OpRef::int_op(9);
         let result = OpRef::int_op(42);
         let b_query = ctx.materialize_box_at(query_arg);
-        let b_canonical = ctx.get_box_replacement(canonical_arg);
+        let b_canonical = ctx.materialize_box_at(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
+        ctx.materialize_box_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
@@ -2521,7 +2521,12 @@ mod tests {
         op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
-        let ctx = OptContext::new(0);
+        let mut ctx = OptContext::new(0);
+        // Bind the operand positions canonically so same_box resolves the
+        // looked-up op's args to the same boxes the cache recorded.
+        for p in [10, 20, 30, 40] {
+            ctx.materialize_box_at(OpRef::int_op(p));
+        }
 
         // Should find it via get_pure_result
         let lookup_op = Op::new(
@@ -2580,7 +2585,10 @@ mod tests {
     #[test]
     fn test_known_result_call_pure_lookup() {
         let mut pass = OptPure::new();
-        let ctx = OptContext::with_num_inputs(4, 0);
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        // Bind the matched call args canonically so same_box resolves them.
+        ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.materialize_box_at(OpRef::int_op(101));
 
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
@@ -2640,21 +2648,22 @@ mod tests {
         // without any const_pool / known_constants bridge.
         let const_opref = OpRef::const_int(7);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
-        ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp::new(
-                OpCode::IntAdd,
-                None,
-                vec![
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
-                    crate::optimizeopt::ImportedShortPureArg::Const(
-                        majit_ir::Value::Int(7),
-                        const_opref,
-                    ),
-                ],
-                OpRef::int_op(2),
-                OpRef::int_op(2),
-                false,
-            ));
+        let imported = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx,
+            OpCode::IntAdd,
+            None,
+            vec![
+                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
+                crate::optimizeopt::ImportedShortPureArg::Const(
+                    majit_ir::Value::Int(7),
+                    const_opref,
+                ),
+            ],
+            OpRef::int_op(2),
+            OpRef::int_op(2),
+            false,
+        );
+        ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
@@ -2679,6 +2688,9 @@ mod tests {
     fn test_imported_short_call_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(8, 0);
+        // Bind the non-const call arg position so same_box resolves the
+        // dispatched op's arg to the same box the imported op recorded.
+        ctx.materialize_box_at(OpRef::int_op(0));
         let const_opref = OpRef::const_int(0x1234);
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
@@ -2692,6 +2704,7 @@ mod tests {
             ),
         );
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx,
             OpCode::CallPureI,
             Some(call_descr.clone()),
             vec![
@@ -2705,7 +2718,11 @@ mod tests {
             OpRef::int_op(1),
             false,
         );
-        initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
+        initialize_imported_short_pure_builder(
+            &mut ctx,
+            (*imported.pop.preamble_op).clone(),
+            Some(1),
+        );
         ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
