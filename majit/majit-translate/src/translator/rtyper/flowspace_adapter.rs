@@ -1287,14 +1287,28 @@ pub fn translate_op(
                     // `StepResult::Continue` vs `JitAction::Continue`)
                     // produce different ClassDescs.  Falls back to the
                     // bare leaf when no owner was recorded (Ok/Err/Some).
-                    let qualname = if owner_path.is_empty() {
-                        name.clone()
+                    // Intern the ctor class by its qualified qualname so
+                    // every site shares one `HostObject` Arc — the
+                    // singleton-class identity `getdesc` dedups on
+                    // (`bookkeeper.rs:1040`, keyed by `Arc::ptr_eq`).
+                    // Without interning each site mints a fresh Arc → a
+                    // fresh `ClassDesc` per occurrence, so a class can
+                    // never be numbered once (its `minid` would differ per
+                    // site) nor instantiated consistently across graphs.
+                    // The bare-leaf fallback (`owner_path` empty, only
+                    // reached when the type failed to resolve) is NOT
+                    // interned: a bare variant name like `Ok` is ambiguous
+                    // across enums, so interning it would conflate distinct
+                    // classes onto one `ClassDesc`.
+                    let host = if owner_path.is_empty() {
+                        HostObject::new_class(name.clone(), Vec::new())
                     } else {
-                        format!("{}.{}", owner_path.join("."), name)
+                        let qualname = format!("{}.{}", owner_path.join("."), name);
+                        call_registry
+                            .bookkeeper()
+                            .intern_class_by_qualname(&qualname)
                     };
-                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_class(qualname, Vec::new()),
-                    )));
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
                     call_args.extend(arg_hls);
@@ -1788,16 +1802,21 @@ fn link_extravar_to_hlvalue(
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
-    // Retained for call-site symmetry with the rtyper entry points; the
-    // receiver's ClassDef is resolved by annotation, not seeded here.
-    _bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+    // Used to seed a `Ref` receiver with its cached, identity-stable
+    // struct-root `ClassDef` via `getuniqueclassdef_for_struct_root`
+    // (see the `OpKind::Input` arm below).  `None` (test fixtures) keeps
+    // every `Ref` classdef-less, narrowed later by annotation.
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_by_result: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
-        HashMap::new();
+    let mut input_by_result: HashMap<
+        crate::flowspace::model::Variable,
+        (&crate::model::ValueType, &Option<String>),
+    > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
-            input_by_result.insert(result.clone(), ty);
+        if let (Some(result), OpKind::Input { ty, class_root, .. }) = (op.result.as_ref(), &op.kind)
+        {
+            input_by_result.insert(result.clone(), (ty, class_root));
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1811,7 +1830,7 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(&ty) = input_by_result.get(var) {
+        if let Some(&(ty, class_root)) = input_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -1821,17 +1840,50 @@ pub(crate) fn derive_subject_inputcells(
                 ))
             })?;
             // A `Ref` inputarg projects to the abstract `SomeInstance(None)`
-            // that `valuetype_to_someshell` yields; its concrete ClassDef is
-            // resolved by call-propagation during annotation, the way RPython
-            // binds a method to the class observed at its call site
-            // (`description.py:283-305 FunctionDesc.pycall`).  An earlier
-            // pass eager-seeded the receiver here from `OpKind::Input
-            // .class_root` via `getuniqueclassdef_for_struct_root`; that
-            // minted a struct-root ClassDef whose identity differed from the
-            // call-propagated one, leaving the annotation fixpoint dependent
-            // on graph-processing (HashMap) order — non-deterministic
-            // classdef-less-`self` getattr.  Receiver narrowing is left to
-            // annotation.
+            // shell from `valuetype_to_someshell`.  When the front-end
+            // resolved the param's struct root (`OpKind::Input.class_root`,
+            // populated from `type_root_ident` at front/ast.rs:2107-2184)
+            // and the struct-field registry knows that root, seed the
+            // receiver with the *cached* `ClassDef` from
+            // `getuniqueclassdef_for_struct_root` (bookkeeper.rs:1522). The
+            // cache makes the classdef identity-stable across repeated
+            // lookups (`Rc::ptr_eq`), so the annotation fixpoint stays
+            // independent of graph-processing order — unlike the earlier
+            // eager seed that minted a fresh struct-root ClassDef per site
+            // (identity divergence → order-dependent fixpoint).  Host structs
+            // with no RPython classdef (e.g. `PyFrame::locals_cells_stack_w:
+            // *mut FixedObjectArray`) are never a call argument, so
+            // call-propagation never narrows them; the seed is the only path
+            // that gives them a populated receiver.  Other `Ref` variants
+            // (no `class_root`, unknown root, or no bookkeeper) keep the
+            // classdef-less shell, narrowed by call-propagation as before
+            // (`description.py:283-305 FunctionDesc.pycall`).
+            if matches!(ty, crate::model::ValueType::Ref(_)) {
+                if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    let known = bk
+                        .pyre_struct_fields
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|reg| reg.fields.contains_key(root));
+                    if known {
+                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                            TyperError::message(format!(
+                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                 ({var:?}) `Ref` receiver root {root:?} failed struct-root \
+                                 ClassDef registration: {e:?}"
+                            ))
+                        })?;
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(cd),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             cells.push(shell);
             continue;
         }
@@ -1849,6 +1901,36 @@ pub(crate) fn derive_subject_inputcells(
         )));
     }
     Ok(cells)
+}
+
+/// `remove_dead_blocks` (`translator/simplify.py`) — the set of blocks
+/// reachable from `startblock` by following `Block.exits`.  The rtyper
+/// only annotates reachable blocks, so the flowspace adapter must drop
+/// everything else.  The monotonic front-end leaves model-unreachable
+/// `on_unwind` cleanup blocks in the graph: `lower_call` / `Drop` /
+/// `Assert` forward past the Rust panic-table unwind edge
+/// (`front::mir`), and the orphan cleanup block is closed by `set_raise`
+/// with fresh, never-defined `etype`/`evalue` placeholders
+/// (`model.rs::set_raise`).  Without this prune those orphan operands
+/// reach [`link_arg_to_hlvalue`] and trip the "undefined operand slot"
+/// invariant even though the block can never execute.  The `Block.dead`
+/// flag covers only the framestate path's explicit marking
+/// (`mir.rs::lower_framestate`); startblock reachability is the general
+/// case the `dead` skip sites below also honour.
+fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![legacy.startblock];
+    while let Some(bid) = stack.pop() {
+        if !seen.insert(bid) {
+            continue;
+        }
+        if let Some(block) = legacy.blocks.get(bid.0) {
+            for link in &block.exits {
+                stack.push(link.target);
+            }
+        }
+    }
+    seen
 }
 
 /// One-way conversion from the legacy `crate::model::FunctionGraph`
@@ -1902,7 +1984,19 @@ pub fn function_graph_to_flowspace(
     let mut constant_hlvalues: HashMap<Variable, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
 
+    // `remove_dead_blocks` reachable set — blocks not reachable from
+    // `startblock` are dropped from every pass below alongside the
+    // explicit `dead` flag.  See [`reachable_block_ids`].
+    let reachable = reachable_block_ids(legacy);
+
     for legacy_block in &legacy.blocks {
+        // Dead / unreachable blocks are pruned from the flowspace
+        // (`remove_dead_blocks` parity), so their const-defines are never
+        // referenced — skip them here too rather than stamp concretetypes
+        // onto orphan cells.
+        if legacy_block.dead || !reachable.contains(&legacy_block.id) {
+            continue;
+        }
         for legacy_op in &legacy_block.operations {
             if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op) {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
@@ -1946,7 +2040,20 @@ pub fn function_graph_to_flowspace(
     let mut block_inputarg_vars: HashMap<BlockId, Vec<(Variable, Variable)>> = HashMap::new();
 
     for legacy_block in &legacy.blocks {
-        if legacy_block.id == legacy.returnblock || legacy_block.id == legacy.exceptblock {
+        // `dead` / unreachable blocks are removed before annotation
+        // (`remove_dead_blocks` parity).  The framestate path marks
+        // model-unreachable orphan `on_unwind` blocks `dead`; the
+        // monotonic path leaves them unmarked but startblock-unreachable,
+        // so `reachable` is what prunes them there.  Skipping Pass 1 alloc
+        // keeps them out of `block_map`, which Pass 2 must mirror (it
+        // indexes `block_map`).  No reachable block can target a pruned
+        // block — a target is reachable by construction — so the mirror
+        // stays consistent.
+        if legacy_block.dead
+            || !reachable.contains(&legacy_block.id)
+            || legacy_block.id == legacy.returnblock
+            || legacy_block.id == legacy.exceptblock
+        {
             continue;
         }
         let mut local_inputs: Vec<(Variable, Variable)> =
@@ -2046,7 +2153,15 @@ pub fn function_graph_to_flowspace(
     // ──────────────────────────────────────────────────────────────
 
     for legacy_block in &legacy.blocks {
-        if legacy_block.id == legacy.returnblock || legacy_block.id == legacy.exceptblock {
+        // Mirror Pass 1's skip set exactly — a `dead` / unreachable block
+        // has no `block_map` entry, so translating it would panic at the
+        // index below.  See the Pass 1 comment for the `remove_dead_blocks`
+        // rationale.
+        if legacy_block.dead
+            || !reachable.contains(&legacy_block.id)
+            || legacy_block.id == legacy.returnblock
+            || legacy_block.id == legacy.exceptblock
+        {
             continue;
         }
         let block_ref = block_map[&legacy_block.id].clone();
@@ -3021,6 +3136,77 @@ mod tests {
         assert_ne!(
             host, &mymod_entry.host_object,
             "must not resolve to the colliding-leaf sibling"
+        );
+    }
+
+    #[test]
+    fn translate_op_call_function_path_simple_call_exc_class_beats_leaf_match() {
+        // Branch 3c (`simple_call(<exc class>)` raise reconstruction)
+        // must win over the leaf-match registry fallback so an exception
+        // class sharing a leaf with a registered user function still
+        // resolves to the builtin class HostObject, not the user fn.
+        // Without the ordering, `["simple_call", "ValueError"]` would be
+        // captured by a registered `[mymod, ValueError]` free fn through
+        // `lookup_with_leaf_match`.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(Variable::new()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let registry = empty_call_registry();
+        // Free-fn-shaped (snake_case module) candidate whose leaf
+        // `ValueError` collides with the exception class name.
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["mymod", "ValueError"]),
+            Signature::new(vec!["msg".into()], None, None),
+        );
+        // Sanity: leaf-match alone would resolve the colliding user fn.
+        let leaf_hit = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments([
+                "simple_call",
+                "ValueError",
+            ]))
+            .expect("leaf-match must find the colliding user fn");
+        assert!(
+            leaf_hit.host_object.is_user_function(),
+            "leaf-match fallback resolves the registered user fn"
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["simple_call".into(), "ValueError".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("simple_call(<exc class>) must lower");
+        assert_eq!(translated.len(), 1);
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert!(
+            !host.is_user_function(),
+            "exc_class branch must resolve the builtin class, not the leaf-match user fn"
+        );
+        let expected = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("bootstrap_builtin_exceptions must register ValueError");
+        assert_eq!(
+            host, &expected,
+            "callable must be the builtin ValueError class HostObject"
         );
     }
 

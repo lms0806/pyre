@@ -200,8 +200,14 @@ fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(1))
 }
 
-/// Unpack a memoryview-or-bytes-like operand to its element value list,
+/// Unpack a memoryview-or-bytes-like operand to its element-value list,
 /// or `None` when it is neither (so `__eq__` can return NotImplemented).
+/// A memoryview unpacks per its own `itemsize` (so a cast view yields the
+/// wider elements); a bytes-like object yields one value per byte.  This
+/// matches `W_MemoryView.descr_eq`, which compares element views/values
+/// rather than raw bytes (`memoryobject.py`), so views whose itemsize or
+/// element count differ compare unequal even when their backing bytes
+/// coincide.
 unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
     if let Some(t) = crate::typedef::r#type(obj) {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
@@ -215,8 +221,12 @@ unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
         }
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
-        return Some(data.iter().map(|&b| b as i64).collect());
+        return Some(
+            unsafe { pyre_object::bytesobject::bytes_like_data(obj) }
+                .iter()
+                .map(|&b| b as i64)
+                .collect(),
+        );
     }
     None
 }
@@ -1031,7 +1041,13 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     }
     if is_long(obj) {
         let val = w_long_get_value(obj);
-        return Ok(val.to_i64().unwrap_or(i64::MAX));
+        // `W_Range` carries `i64` bounds, so a value that overflows is
+        // clamped toward the matching extreme — a negative bound must not
+        // flip to a huge positive one (`range(-10**30)` stays empty).
+        return Ok(val.to_i64().unwrap_or_else(|| match val.sign() {
+            malachite_bigint::Sign::Minus => i64::MIN,
+            _ => i64::MAX,
+        }));
     }
     let type_name = (*(*obj).ob_type).name;
     Err(crate::PyError::type_error(format!(
@@ -4501,6 +4517,21 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
                 .map(hash_value)
                 .collect();
             return _hash_frozenset(&hashes);
+        }
+        if pyre_object::is_w_range(obj) {
+            // functional.py W_Range.descr_hash — hash of the
+            // (length, start, step) tuple, with trailing fields set to
+            // None (hash 0) for empty and single-element ranges.
+            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let len = pyre_object::w_range_len(obj);
+            let hashes = if len == 0 {
+                [_hash_int(0), 0, 0]
+            } else if len == 1 {
+                [_hash_int(1), _hash_int(start), 0]
+            } else {
+                [_hash_int(len), _hash_int(start), _hash_int(step)]
+            };
+            return _hash_tuple_xx(&hashes);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

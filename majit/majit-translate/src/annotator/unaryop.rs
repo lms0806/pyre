@@ -25,7 +25,7 @@ use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
 use super::super::flowspace::model::Hlvalue;
 use super::super::flowspace::operation::{
-    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
+    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation, pure,
     register_single,
 };
 use super::annrpython::RPythonAnnotator;
@@ -170,7 +170,7 @@ fn init_type_register(
         OpKind::Type,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, hl| {
+            apply: pure(|_ann, hl| {
                 // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
                 // Constants are ignored: upstream `type(const)` would
                 // never enter this dispatcher (it lands on the
@@ -206,7 +206,7 @@ fn init_contains_register(
         OpKind::Contains,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Bool(SomeBool::new())),
+            apply: pure(|_ann, _hl| SomeValue::Bool(SomeBool::new())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -216,7 +216,7 @@ fn init_contains_register(
         OpKind::Contains,
         SomeValueTag::None_,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 let mut s = SomeBool::new();
                 s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
                 SomeValue::Bool(s)
@@ -236,7 +236,7 @@ fn init_contains_register(
             OpKind::Contains,
             *tag,
             Specialization {
-                apply: Box::new(|_ann, _hl| panic!("AnnotatorError: number is not iterable")),
+                apply: pure(|_ann, _hl| panic!("AnnotatorError: number is not iterable")),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -265,7 +265,7 @@ fn init_someobject_defaults(
         OpKind::Len,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -276,7 +276,7 @@ fn init_someobject_defaults(
         OpKind::Bool,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
                 let mut r = SomeBool::new();
                 match &s_obj {
@@ -294,7 +294,10 @@ fn init_someobject_defaults(
                             r.base.const_box = Some(Constant::new(ConstValue::Bool(truthy)));
                         } else {
                             let len_op = HLOperation::new(OpKind::Len, vec![hl.args[0].clone()]);
-                            let s_len = len_op.consider(ann).expect("bool: len() dispatch failed");
+                            let s_len = len_op
+                                .consider(ann)
+                                .expect("bool: len() dispatch failed")
+                                .expect("bool: len() is not a void operation");
                             if let Some(ConstValue::Int(n)) = s_len.const_() {
                                 r.base.const_box = Some(Constant::new(ConstValue::Bool(*n > 0)));
                             }
@@ -323,7 +326,7 @@ fn init_someobject_defaults(
         OpKind::Hash,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("AnnotatorError: cannot use hash() in RPython")),
+            apply: pure(|_ann, _hl| panic!("AnnotatorError: cannot use hash() in RPython")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -333,7 +336,7 @@ fn init_someobject_defaults(
         OpKind::Str,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
+            apply: pure(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -343,7 +346,7 @@ fn init_someobject_defaults(
         OpKind::Repr,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
+            apply: pure(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -354,7 +357,7 @@ fn init_someobject_defaults(
             *op,
             SomeValueTag::Object,
             Specialization {
-                apply: Box::new(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
+                apply: pure(|_ann, _hl| SomeValue::String(SomeString::new(false, false))),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -365,7 +368,7 @@ fn init_someobject_defaults(
         OpKind::Id,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 panic!("AnnotatorError: cannot use id() in RPython; see objectmodel.compute_xxx()")
             }),
             can_only_throw: CanOnlyThrow::Absent,
@@ -377,7 +380,7 @@ fn init_someobject_defaults(
         OpKind::Int,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -387,7 +390,7 @@ fn init_someobject_defaults(
         OpKind::Float,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -397,7 +400,7 @@ fn init_someobject_defaults(
         OpKind::GetAttr,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_self = ann.annotation(&hl.args[0]).expect("getattr: self unbound");
                 let s_attr = ann.annotation(&hl.args[1]).expect("getattr: attr unbound");
                 // unaryop.py:280-285 `_getattr_(s_obj, s_attr)` — `if
@@ -465,7 +468,7 @@ fn init_someobject_defaults(
         OpKind::GetAttr,
         SomeValueTag::PBC,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_self = ann
                     .annotation(&hl.args[0])
                     .expect("pbc getattr: self unbound");
@@ -518,13 +521,13 @@ fn init_someobject_defaults(
     );
     // unaryop.py:200-204 — delattr: warning-only. Returns no value
     // (upstream implicit None). Port as a void specialization returning
-    // Impossible.
+    // `None`, so consider binds the result to Impossible without blocking.
     register(
         reg,
         OpKind::DelAttr,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Impossible),
+            apply: Box::new(|_ann, _hl| None),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -566,13 +569,17 @@ fn init_someobject_defaults(
                 // round re-fires once the callable's annotation
                 // populates).
                 let Some(s_func) = ann.annotation(&hl.args[0]) else {
-                    return super::model::s_impossible_value();
+                    return Some(super::model::s_impossible_value());
                 };
                 let args_s: Vec<Option<SomeValue>> =
                     hl.args[1..].iter().map(|a| ann.annotation(a)).collect();
                 let argspec = super::argument::simple_args_opt(args_s);
+                // `s_func.call` returns `Ok(None)` for a void analyser
+                // (a builtin method body that falls off the end); the
+                // None threads straight through to `consider_op`, which
+                // binds Impossible without blocking.
                 match s_func.call(&argspec) {
-                    Ok(s) => s,
+                    Ok(cell) => cell,
                     // Match upstream's substring so the dual-gate
                     // `is_known_unported` Skip classification matches
                     // RPython's `compute_at_fixpoint` failures
@@ -592,7 +599,7 @@ fn init_someobject_defaults(
         OpKind::Hint,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| ann.annotation(&hl.args[0]).expect("hint: self unbound")),
+            apply: pure(|ann, hl| ann.annotation(&hl.args[0]).expect("hint: self unbound")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -603,7 +610,7 @@ fn init_someobject_defaults(
             *op,
             SomeValueTag::Object,
             Specialization {
-                apply: Box::new(|_ann, _hl| s_impossible_value()),
+                apply: pure(|_ann, _hl| s_impossible_value()),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -628,7 +635,7 @@ fn init_someobject_defaults(
             *op,
             SomeValueTag::Object,
             Specialization {
-                apply: Box::new(|_ann, _hl| s_impossible_value()),
+                apply: pure(|_ann, _hl| s_impossible_value()),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -651,7 +658,7 @@ fn init_somefloat_overrides(
         OpKind::Pos,
         SomeValueTag::Float,
         Specialization {
-            apply: Box::new(|ann, hl| ann.annotation(&hl.args[0]).expect("float.pos: unbound")),
+            apply: pure(|ann, hl| ann.annotation(&hl.args[0]).expect("float.pos: unbound")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -662,7 +669,7 @@ fn init_somefloat_overrides(
             *op,
             SomeValueTag::Float,
             Specialization {
-                apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+                apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -673,7 +680,7 @@ fn init_somefloat_overrides(
         OpKind::Bool,
         SomeValueTag::Float,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = ann.annotation(&hl.args[0]).expect("float.bool: unbound");
                 if let SomeValue::Float(f) = &s {
                     if f.is_immutable_constant() {
@@ -699,7 +706,7 @@ fn init_somefloat_overrides(
         OpKind::Len,
         SomeValueTag::Float,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("AnnotatorError: 'float' has no length")),
+            apply: pure(|_ann, _hl| panic!("AnnotatorError: 'float' has no length")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -730,7 +737,7 @@ fn init_someinteger_overrides(
             *op,
             SomeValueTag::Integer,
             Specialization {
-                apply: Box::new(same_kt_int),
+                apply: pure(same_kt_int),
                 can_only_throw: CanOnlyThrow::List(vec![]),
             },
         );
@@ -741,7 +748,7 @@ fn init_someinteger_overrides(
         OpKind::Neg,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(same_kt_int),
+            apply: pure(same_kt_int),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -750,7 +757,7 @@ fn init_someinteger_overrides(
         OpKind::NegOvf,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(same_kt_int),
+            apply: pure(same_kt_int),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -770,7 +777,7 @@ fn init_someinteger_overrides(
         OpKind::Abs,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(abs_int),
+            apply: pure(abs_int),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -779,7 +786,7 @@ fn init_someinteger_overrides(
         OpKind::AbsOvf,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(abs_int),
+            apply: pure(abs_int),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -789,7 +796,7 @@ fn init_someinteger_overrides(
         OpKind::Len,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("AnnotatorError: 'int' has no length")),
+            apply: pure(|_ann, _hl| panic!("AnnotatorError: 'int' has no length")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -811,7 +818,7 @@ fn init_somebool_overrides(
         OpKind::Bool,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(|ann, hl| ann.annotation(&hl.args[0]).expect("bool.bool: unbound")),
+            apply: pure(|ann, hl| ann.annotation(&hl.args[0]).expect("bool.bool: unbound")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -821,7 +828,7 @@ fn init_somebool_overrides(
         OpKind::Invert,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -831,7 +838,7 @@ fn init_somebool_overrides(
         OpKind::Neg,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -840,7 +847,7 @@ fn init_somebool_overrides(
         OpKind::NegOvf,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -855,7 +862,7 @@ fn init_somebool_overrides(
         OpKind::Abs,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(nonneg_int),
+            apply: pure(nonneg_int),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -864,7 +871,7 @@ fn init_somebool_overrides(
         OpKind::AbsOvf,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(nonneg_int),
+            apply: pure(nonneg_int),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -873,7 +880,7 @@ fn init_somebool_overrides(
         OpKind::Pos,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(nonneg_int),
+            apply: pure(nonneg_int),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -882,7 +889,7 @@ fn init_somebool_overrides(
         OpKind::Int,
         SomeValueTag::Bool,
         Specialization {
-            apply: Box::new(nonneg_int),
+            apply: pure(nonneg_int),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -904,7 +911,7 @@ fn init_sometuple_overrides(
         OpKind::Len,
         SomeValueTag::Tuple,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let t = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::Tuple(t)) => t,
                     _ => panic!("tuple.len: arg 0 not SomeTuple"),
@@ -922,7 +929,7 @@ fn init_sometuple_overrides(
         OpKind::Iter,
         SomeValueTag::Tuple,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let sv = ann.annotation(&hl.args[0]).expect("tuple.iter: unbound");
                 SomeValue::Iterator(SomeIterator::new(sv, vec![]))
             }),
@@ -938,7 +945,7 @@ fn init_sometuple_overrides(
         OpKind::GetSlice,
         SomeValueTag::Tuple,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let t = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::Tuple(t)) => t,
                     _ => panic!("tuple.getslice: arg 0 not SomeTuple"),
@@ -1007,7 +1014,7 @@ fn init_somelist_overrides(
         OpKind::Contains,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_list = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::List(s)) => s,
                     _ => panic!("contains(SomeList): arg 0 not SomeList"),
@@ -1031,7 +1038,7 @@ fn init_somelist_overrides(
         OpKind::Len,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_list = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::List(s)) => s,
                     _ => panic!("list.len: arg 0 not SomeList"),
@@ -1057,7 +1064,7 @@ fn init_somelist_overrides(
         OpKind::Iter,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let sv = ann.annotation(&hl.args[0]).expect("list.iter: unbound");
                 SomeValue::Iterator(SomeIterator::new(sv, vec![]))
             }),
@@ -1071,7 +1078,7 @@ fn init_somelist_overrides(
         OpKind::GetSlice,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_list = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::List(s)) => s,
                     _ => panic!("list.getslice: arg 0 not SomeList"),
@@ -1094,6 +1101,7 @@ fn init_somelist_overrides(
     );
     // unaryop.py:425-431 — setslice((self, s_start, s_stop), s_iterable):
     //     check_negative + isinstance(SomeList) + mutate + agree + resize.
+    //     No return → None (void).
     register(
         reg,
         OpKind::SetSlice,
@@ -1124,13 +1132,13 @@ fn init_somelist_overrides(
                     .agree(&ann.bookkeeper, &s_other.listdef)
                     .expect("listdef.agree failed");
                 s_list.listdef.resize().expect("listdef.resize failed");
-                SomeValue::Impossible
+                None
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
     // unaryop.py:433-435 — delslice((self, s_start, s_stop)):
-    //     check_negative + resize.
+    //     check_negative + resize. No return → None (void).
     register(
         reg,
         OpKind::DelSlice,
@@ -1149,7 +1157,7 @@ fn init_somelist_overrides(
                     .expect("list.delslice: stop unbound");
                 check_negative_slice(&s_start, &s_stop, "slicing");
                 s_list.listdef.resize().expect("listdef.resize failed");
-                SomeValue::Impossible
+                None
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
@@ -1196,11 +1204,12 @@ pub fn list_method_append(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:359-361
+) -> Option<SomeValue> {
+    // unaryop.py:357-359 — method_append falls off the end (returns None
+    // = void op), so the call binds Impossible without blocking.
     s_self.listdef.resize().expect("resize");
     s_self.listdef.generalize(s_value).expect("generalize");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1208,8 +1217,8 @@ pub fn list_method_extend(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_iterable: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:363-369
+) -> Option<SomeValue> {
+    // unaryop.py:361-367 — falls off the end (void op).
     s_self.listdef.resize().expect("resize");
     if let SomeValue::List(other) = s_iterable {
         s_self
@@ -1230,13 +1239,17 @@ pub fn list_method_extend(
         let s_item = someiterator_next(ann, &s_iter);
         list_method_append(ann, s_self, &s_item);
     }
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
-pub fn list_method_reverse(_ann: &RPythonAnnotator, s_self: &super::model::SomeList) -> SomeValue {
+pub fn list_method_reverse(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeList,
+) -> Option<SomeValue> {
+    // unaryop.py:369-370 — falls off the end (void op).
     s_self.listdef.mutate().expect("listdef.mutate");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1245,8 +1258,8 @@ pub fn list_method_insert(
     s_self: &super::model::SomeList,
     _s_index: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:374-375 — delegates to method_append.
+) -> Option<SomeValue> {
+    // unaryop.py:372-373 — delegates to method_append (also void).
     list_method_append(ann, s_self, s_value)
 }
 
@@ -1255,11 +1268,11 @@ pub fn list_method_remove(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:377-379 — resize + generalize.
+) -> Option<SomeValue> {
+    // unaryop.py:375-377 — resize + generalize, falls off the end (void).
     s_self.listdef.resize().expect("resize");
     s_self.listdef.generalize(s_value).expect("generalize");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1339,7 +1352,7 @@ fn init_somedict_overrides(
         OpKind::Contains,
         SomeValueTag::Dict,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_dct = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::Dict(d)) => d,
                     _ => panic!("contains(SomeDict): arg 0 not SomeDict"),
@@ -1371,7 +1384,7 @@ fn init_somedict_overrides(
         OpKind::Len,
         SomeValueTag::Dict,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_dct = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::Dict(d)) => d,
                     _ => panic!("dict.len: arg 0 not SomeDict"),
@@ -1394,7 +1407,7 @@ fn init_somedict_overrides(
         OpKind::Iter,
         SomeValueTag::Dict,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let sv = ann.annotation(&hl.args[0]).expect("dict.iter: unbound");
                 SomeValue::Iterator(SomeIterator::new(sv, vec![]))
             }),
@@ -1438,12 +1451,14 @@ pub fn dict_method_update(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_other: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:513-516
+) -> Option<SomeValue> {
+    // unaryop.py:512-515
     //     if s_None.contains(dct2): return SomeImpossibleValue()
     //     dct1.dictdef.union(dct2.dictdef)
+    // The explicit `return SomeImpossibleValue()` blocks; the union path
+    // falls off the end (void op).
     if let SomeValue::None_(_) = s_other {
-        return s_impossible_value();
+        return Some(s_impossible_value());
     }
     let other = match s_other {
         SomeValue::Dict(d) => d,
@@ -1453,7 +1468,7 @@ pub fn dict_method_update(
         .dictdef
         .union_with(&other.dictdef)
         .expect("dictdef.union failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1461,9 +1476,9 @@ pub fn dict_method_prepare_dict_update(
     _ann: &RPythonAnnotator,
     _s_self: &super::model::SomeDict,
     _s_num: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:518-519 — pass.
-    SomeValue::Impossible
+) -> Option<SomeValue> {
+    // unaryop.py:517-518 — pass (void op).
+    None
 }
 
 #[allow(dead_code)]
@@ -1556,9 +1571,12 @@ pub fn dict_method_iteritems_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_clear(_ann: &RPythonAnnotator, _s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:548-549 — pass.
-    SomeValue::Impossible
+pub fn dict_method_clear(
+    _ann: &RPythonAnnotator,
+    _s_self: &super::model::SomeDict,
+) -> Option<SomeValue> {
+    // unaryop.py:547-548 — pass (void op).
+    None
 }
 
 #[allow(dead_code)]
@@ -1609,8 +1627,9 @@ pub fn dict_method_setitem_with_hash(
     s_key: &SomeValue,
     _s_hash: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:567-568.
+) -> Option<SomeValue> {
+    // unaryop.py:566-567 — pair(self, s_key).setitem(s_value), falls off
+    // the end (void op).
     s_self
         .dictdef
         .generalize_key(s_key)
@@ -1619,7 +1638,7 @@ pub fn dict_method_setitem_with_hash(
         .dictdef
         .generalize_value(s_value)
         .expect("generalize_value failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1644,13 +1663,14 @@ pub fn dict_method_delitem_with_hash(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     _s_hash: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:576-577.
+) -> Option<SomeValue> {
+    // unaryop.py:575-576 — pair(self, s_key).delitem(), falls off the end
+    // (void op).
     s_self
         .dictdef
         .generalize_key(s_key)
         .expect("generalize_key failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1659,8 +1679,8 @@ pub fn dict_method_delitem_if_value_is(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:579-581.
+) -> Option<SomeValue> {
+    // unaryop.py:578-580 — setitem + delitem, falls off the end (void op).
     let _ = dict_method_setitem_with_hash(ann, s_self, s_key, &s_impossible_value(), s_value);
     dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
 }
@@ -1671,9 +1691,10 @@ pub fn dict_method_move_to_end(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     s_last: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:588-591 on SomeOrderedDict. Rust collapses SomeDict =
-    // SomeOrderedDict (model.py:416), so the same analyzer lives on SomeDict.
+) -> Option<SomeValue> {
+    // unaryop.py:585-588 on SomeOrderedDict. Rust collapses SomeDict =
+    // SomeOrderedDict (model.py:416), so the same analyzer lives on
+    // SomeDict. assert + delitem, falls off the end (void op).
     assert!(
         s_bool().contains(s_last),
         "AnnotatorError: move_to_end(last) expects SomeBool"
@@ -1700,7 +1721,7 @@ fn init_somestring_overrides(
         OpKind::Contains,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_string = ann
                     .annotation(&hl.args[0])
                     .expect("contains(String): string unbound");
@@ -1732,7 +1753,7 @@ fn init_somestring_overrides(
         OpKind::Iter,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let sv = ann.annotation(&hl.args[0]).expect("string.iter: unbound");
                 SomeValue::Iterator(SomeIterator::new(sv, vec![]))
             }),
@@ -1745,7 +1766,7 @@ fn init_somestring_overrides(
         OpKind::GetSlice,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_self = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::String(s)) => s,
                     _ => panic!("string.getslice: arg 0 not SomeString"),
@@ -1768,7 +1789,7 @@ fn init_somestring_overrides(
         OpKind::Len,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::String(s)) => s,
                     _ => panic!("string.len: arg 0 not SomeString"),
@@ -1801,7 +1822,7 @@ fn init_someunicodestring_overrides(
         OpKind::Contains,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_string = ann
                     .annotation(&hl.args[0])
                     .expect("contains(UnicodeString): string unbound");
@@ -1833,7 +1854,7 @@ fn init_someunicodestring_overrides(
         OpKind::Iter,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let sv = ann.annotation(&hl.args[0]).expect("unicode.iter: unbound");
                 SomeValue::Iterator(SomeIterator::new(sv, vec![]))
             }),
@@ -1846,7 +1867,7 @@ fn init_someunicodestring_overrides(
         OpKind::GetSlice,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_self = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::UnicodeString(s)) => s,
                     _ => panic!("unicode.getslice: arg 0 not SomeUnicodeString"),
@@ -1877,7 +1898,7 @@ fn init_somebytearray_overrides(
         OpKind::GetSlice,
         SomeValueTag::ByteArray,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_start = ann
                     .annotation(&hl.args[1])
                     .expect("bytearray.getslice: start unbound");
@@ -1908,7 +1929,7 @@ fn init_somechar_overrides(
         OpKind::Len,
         SomeValueTag::Char,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 let mut i = SomeInteger::new(true, false);
                 i.base.const_box = Some(Constant::new(ConstValue::Int(1)));
                 SomeValue::Integer(i)
@@ -1922,7 +1943,7 @@ fn init_somechar_overrides(
         OpKind::Ord,
         SomeValueTag::Char,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1940,7 +1961,7 @@ fn init_someunicodecp_overrides(
         OpKind::Len,
         SomeValueTag::UnicodeCodePoint,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 let mut i = SomeInteger::new(true, false);
                 i.base.const_box = Some(Constant::new(ConstValue::Int(1)));
                 SomeValue::Integer(i)
@@ -1954,7 +1975,7 @@ fn init_someunicodecp_overrides(
         OpKind::Ord,
         SomeValueTag::UnicodeCodePoint,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2500,7 +2521,7 @@ pub fn call_builtin_method(
     ann: &RPythonAnnotator,
     method: &SomeBuiltinMethod,
     args: &super::argument::ArgumentsForTranslation,
-) -> Result<SomeValue, AnnotatorError> {
+) -> Result<Option<SomeValue>, AnnotatorError> {
     let (args_s, kwds) = args
         .unpack()
         .map_err(|err| AnnotatorError::new(err.getmsg()))?;
@@ -2524,7 +2545,9 @@ pub fn call_builtin_method(
             let [s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_append(ann, s_self, s_value)
+            // Void analyser (None = no result): early-return the threaded
+            // Option so the simple_call binds Impossible without blocking.
+            return Ok(list_method_append(ann, s_self, s_value));
         }
         "list_method_extend" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2540,7 +2563,7 @@ pub fn call_builtin_method(
             let [s_iterable] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_extend(ann, s_self, s_iterable)
+            return Ok(list_method_extend(ann, s_self, s_iterable));
         }
         "list_method_reverse" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2550,7 +2573,7 @@ pub fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_reverse(ann, s_self)
+            return Ok(list_method_reverse(ann, s_self));
         }
         "list_method_insert" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2566,7 +2589,7 @@ pub fn call_builtin_method(
             let [s_index, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_insert(ann, s_self, s_index, s_value)
+            return Ok(list_method_insert(ann, s_self, s_index, s_value));
         }
         "list_method_remove" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2577,7 +2600,7 @@ pub fn call_builtin_method(
             let [s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_remove(ann, s_self, s_value)
+            return Ok(list_method_remove(ann, s_self, s_value));
         }
         "list_method_pop" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2645,7 +2668,9 @@ pub fn call_builtin_method(
             let [s_other] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_update(ann, s_self, s_other)
+            // Void on the union path, blocks (Some(Impossible)) on the
+            // s_None receiver path — see dict_method_update.
+            return Ok(dict_method_update(ann, s_self, s_other));
         }
         "dict_method_prepare_dict_update" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2656,7 +2681,7 @@ pub fn call_builtin_method(
             let [s_num] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_prepare_dict_update(ann, s_self, s_num)
+            return Ok(dict_method_prepare_dict_update(ann, s_self, s_num));
         }
         "dict_method_keys" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2746,7 +2771,7 @@ pub fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_clear(ann, s_self)
+            return Ok(dict_method_clear(ann, s_self));
         }
         "dict_method_popitem" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2808,7 +2833,9 @@ pub fn call_builtin_method(
             let [s_key, s_hash, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_setitem_with_hash(ann, s_self, s_key, s_hash, s_value)
+            return Ok(dict_method_setitem_with_hash(
+                ann, s_self, s_key, s_hash, s_value,
+            ));
         }
         "dict_method_getitem_with_hash" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2840,7 +2867,7 @@ pub fn call_builtin_method(
             let [s_key, s_hash] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_delitem_with_hash(ann, s_self, s_key, s_hash)
+            return Ok(dict_method_delitem_with_hash(ann, s_self, s_key, s_hash));
         }
         "dict_method_delitem_if_value_is" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2856,7 +2883,7 @@ pub fn call_builtin_method(
             let [s_key, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_delitem_if_value_is(ann, s_self, s_key, s_value)
+            return Ok(dict_method_delitem_if_value_is(ann, s_self, s_key, s_value));
         }
         "dict_method_move_to_end" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2872,7 +2899,7 @@ pub fn call_builtin_method(
             let [s_key, s_last] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_move_to_end(ann, s_self, s_key, s_last)
+            return Ok(dict_method_move_to_end(ann, s_self, s_key, s_last));
         }
         "str_method_startswith" => {
             let scope =
@@ -3158,6 +3185,17 @@ pub fn call_builtin_method(
             };
             char_method_isupper(ann, &method.s_self)
         }
+        // Raw-pointer `p.is_null()` on a classdef-less `SomeInstance`
+        // (pointer-erasure receiver; bound in the SomeInstance.getattr
+        // `is_null` arm).  Zero-arg; the call always yields `SomeBool`,
+        // mirroring lltype `_ptr.is_null`.
+        "ptr_method_is_null" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            super::model::s_bool()
+        }
         _ => {
             return Err(AnnotatorError::new(format!(
                 "SomeBuiltinMethod.call(): unknown analyser {}",
@@ -3165,7 +3203,10 @@ pub fn call_builtin_method(
             )));
         }
     };
-    Ok(result)
+    // Value analysers return a concrete annotation (possibly Bottom =
+    // SomeImpossibleValue when reading an empty container, which blocks);
+    // the void analysers above already early-returned their `None`.
+    Ok(Some(result))
 }
 
 // =====================================================================
@@ -3184,7 +3225,7 @@ fn init_someiterator_overrides(
         OpKind::Iter,
         SomeValueTag::Iterator,
         Specialization {
-            apply: Box::new(|ann, hl| ann.annotation(&hl.args[0]).expect("iterator.iter: unbound")),
+            apply: pure(|ann, hl| ann.annotation(&hl.args[0]).expect("iterator.iter: unbound")),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -3202,7 +3243,7 @@ fn init_someiterator_overrides(
         OpKind::Next,
         SomeValueTag::Iterator,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = ann.annotation(&hl.args[0]).expect("iterator.next: unbound");
                 let it = match s {
                     SomeValue::Iterator(i) => i,
@@ -3357,7 +3398,7 @@ fn init_somepbc_overrides(
         OpKind::SetAttr,
         SomeValueTag::PBC,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 panic!("AnnotatorError: Cannot modify attribute of a pre-built constant")
             }),
             can_only_throw: CanOnlyThrow::Absent,
@@ -3369,7 +3410,7 @@ fn init_somepbc_overrides(
         OpKind::Len,
         SomeValueTag::PBC,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("AnnotatorError: Cannot call len on a pbc")),
+            apply: pure(|_ann, _hl| panic!("AnnotatorError: Cannot call len on a pbc")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -3401,7 +3442,7 @@ fn init_someptr_overrides(
         OpKind::GetAttr,
         SomeValueTag::Ptr,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = ann
                     .annotation(&hl.args[0])
                     .expect("ptr.getattr: self unbound");
@@ -3426,7 +3467,7 @@ fn init_someptr_overrides(
         OpKind::GetAttr,
         SomeValueTag::Address,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_attr = ann
                     .annotation(&hl.args[1])
                     .expect("address.getattr: attr unbound");
@@ -3448,7 +3489,7 @@ fn init_someptr_overrides(
         OpKind::Bool,
         SomeValueTag::Address,
         Specialization {
-            apply: Box::new(|_ann, _hl| {
+            apply: pure(|_ann, _hl| {
                 crate::translator::rtyper::lltypesystem::llmemory::SomeAddress::annotation_bool()
             }),
             can_only_throw: CanOnlyThrow::List(vec![]),
@@ -3459,7 +3500,7 @@ fn init_someptr_overrides(
         OpKind::Len,
         SomeValueTag::Ptr,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = ann.annotation(&hl.args[0]).expect("ptr.len: unbound");
                 with_ptr_like(
                     &s,
@@ -3475,7 +3516,7 @@ fn init_someptr_overrides(
         OpKind::Bool,
         SomeValueTag::Ptr,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s = ann.annotation(&hl.args[0]).expect("ptr.bool: unbound");
                 with_ptr_like(&s, |ptr| ptr.bool(), |ptr| ptr.bool())
             }),
@@ -3487,6 +3528,8 @@ fn init_someptr_overrides(
         OpKind::SetAttr,
         SomeValueTag::Ptr,
         Specialization {
+            // lltype.py:1557-1564 — SomePtr.setattr "just doing checking",
+            // returns None (void).
             apply: Box::new(|ann, hl| {
                 let s = ann
                     .annotation(&hl.args[0])
@@ -3507,7 +3550,8 @@ fn init_someptr_overrides(
                         ptr.setattr(&s_attr, &s_value)
                             .expect("interiorptr.setattr must succeed")
                     },
-                )
+                );
+                None
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
@@ -3530,17 +3574,17 @@ fn init_somenone_overrides(
         OpKind::GetAttr,
         SomeValueTag::None_,
         Specialization {
-            apply: Box::new(|_ann, _hl| s_impossible_value()),
+            apply: pure(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:1008-1009 — setattr: return None (void → SomeImpossible).
+    // unaryop.py:1008-1009 — setattr: return None (void).
     register(
         reg,
         OpKind::SetAttr,
         SomeValueTag::None_,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Impossible),
+            apply: Box::new(|_ann, _hl| None),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -3551,7 +3595,7 @@ fn init_somenone_overrides(
             *op,
             SomeValueTag::None_,
             Specialization {
-                apply: Box::new(|_ann, _hl| s_impossible_value()),
+                apply: pure(|_ann, _hl| s_impossible_value()),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -3562,7 +3606,7 @@ fn init_somenone_overrides(
         OpKind::Len,
         SomeValueTag::None_,
         Specialization {
-            apply: Box::new(|_ann, _hl| s_impossible_value()),
+            apply: pure(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -3593,7 +3637,7 @@ fn init_someinstance_overrides(
         OpKind::GetAttr,
         SomeValueTag::Instance,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s_self = ann
                     .annotation(&hl.args[0])
                     .expect("instance.getattr: self unbound");
@@ -3617,12 +3661,38 @@ fn init_someinstance_overrides(
                             s_attr
                         )
                     });
-                let classdef = inst.classdef.as_ref().unwrap_or_else(|| {
-                    panic!(
-                        "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
-                        attr
-                    )
-                });
+                let classdef = match inst.classdef.as_ref() {
+                    Some(cd) => cd,
+                    None => {
+                        // A classdef-less `SomeInstance` has no RPython analogue
+                        // (`SomeInstance` upstream always carries a classdef).
+                        // It arises only from pyre's pointer erasure:
+                        // `project_pyre_field_type` strips `*mut`/`*const`/`&`
+                        // and resolves the pointee — when the pointee is an
+                        // unregistered host struct the field becomes
+                        // `SomeInstance(classdef=None)`.  A raw-pointer inherent
+                        // method on such an erased receiver is answered the way
+                        // `SomePtr.getattr` would: `is_null` resolves to a bound
+                        // method (lltype `_ptr.is_null`) whose call yields
+                        // `SomeBool`.  The frontend lowers `p.is_null()` as
+                        // `getattr(p, "is_null")` + `simple_call(bound, …)`
+                        // (`flowspace_adapter.rs` CallTarget::Method), so getattr
+                        // must return the callable bound method here — returning a
+                        // bare `SomeBool` would seat a non-callable in the
+                        // simple_call callee slot.  Any other attr stays fail-loud.
+                        if attr == "is_null" {
+                            return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                                "ptr_method_is_null",
+                                s_self.clone(),
+                                "is_null",
+                            ));
+                        }
+                        panic!(
+                            "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
+                            attr
+                        )
+                    }
+                };
                 // unaryop.py:838-839 — `if attr == '__class__':
                 //                          return self.classdef.read_attr__class__()`.
                 if attr == "__class__" {
@@ -3649,6 +3719,137 @@ fn init_someinstance_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
+    // unaryop.py:844-859 — SomeInstance.setattr.
+    //
+    //   def setattr(self, s_attr, s_obj):
+    //       if s_attr.is_constant() and isinstance(s_attr.const, str):
+    //           attr = s_attr.const
+    //           clsdef = self.classdef.locate_attribute(attr)
+    //           attrdef = clsdef.attrs[attr]
+    //           attrdef.modified(clsdef)
+    //           if attrdef.s_value.contains(s_obj):
+    //               return
+    //           clsdef.generalize_attr(attr, s_obj)
+    //           if isinstance(s_obj, SomeList):
+    //               clsdef.classdesc.maybe_return_immutable_list(attr, s_obj)
+    //       else:
+    //           raise AnnotatorError("setattr(instance, variable_attr, value)")
+    //
+    // The success path records the write and falls through with no
+    // return → None (void); a non-constant attr raises. (The base
+    // `SomeObject.setattr` at unaryop.py:231-232 is the one that returns
+    // `s_ImpossibleValue`; this `SomeInstance` override does not.)
+    register(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::Instance,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_self = ann
+                    .annotation(&hl.args[0])
+                    .expect("instance.setattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("instance.setattr: attr unbound");
+                let s_obj = ann
+                    .annotation(&hl.args[2])
+                    .expect("instance.setattr: value unbound");
+                let inst = match &s_self {
+                    SomeValue::Instance(inst) => inst.clone(),
+                    other => panic!(
+                        "AnnotatorError: SomeInstance.setattr dispatched on non-instance: {:?}",
+                        other
+                    ),
+                };
+                // unaryop.py:845,858 — `if s_attr.is_constant() and
+                // isinstance(s_attr.const, str): … else: raise`.
+                let attr = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "AnnotatorError: setattr(instance, variable_attr, value): {:?}",
+                            s_attr
+                        )
+                    });
+                let classdef = match inst.classdef.as_ref() {
+                    Some(cd) => cd.clone(),
+                    None => {
+                        // A classdef-less `SomeInstance` (pyre pointer erasure;
+                        // see the getattr arm above) has no `ClassDef` to record
+                        // the write on.  Stays fail-loud like getattr's non-
+                        // `is_null` arm — a cast-narrowed receiver carries its
+                        // struct-root classdef (front-end pointer-downcast carry),
+                        // so a writable instance reaches here with a populated
+                        // classdef.
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({:?}) on classdef-less instance",
+                            attr
+                        )
+                    }
+                };
+                // unaryop.py:847 — `clsdef = self.classdef.locate_attribute(attr)`.
+                let clsdef = super::classdesc::ClassDef::locate_attribute(&classdef, &attr)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             locate_attribute failed: {err:?}"
+                        )
+                    });
+                // unaryop.py:848-852 — `attrdef = clsdef.attrs[attr];
+                // attrdef.modified(clsdef); if attrdef.s_value.contains(s_obj):
+                // return`.
+                let already_contains = {
+                    let mut clsdef_mut = clsdef.borrow_mut();
+                    let attrdef = clsdef_mut.attrs.get_mut(&attr).unwrap_or_else(|| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             attr absent after locate_attribute"
+                        )
+                    });
+                    attrdef.modified(Some(&clsdef)).unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             modified failed: {err:?}"
+                        )
+                    });
+                    attrdef.s_value.contains(&s_obj)
+                };
+                if !already_contains {
+                    // unaryop.py:854 — `clsdef.generalize_attr(attr, s_obj)`.
+                    super::classdesc::ClassDef::generalize_attr(
+                        &clsdef,
+                        &attr,
+                        Some(s_obj.clone()),
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             generalize_attr failed: {err:?}"
+                        )
+                    });
+                    // unaryop.py:856-857 — `if isinstance(s_obj, SomeList):
+                    // clsdef.classdesc.maybe_return_immutable_list(attr, s_obj)`.
+                    if matches!(s_obj, SomeValue::List(_)) {
+                        let classdesc = clsdef.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::maybe_return_immutable_list(
+                            &classdesc, &attr, &s_obj,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                                 maybe_return_immutable_list failed: {err:?}"
+                            )
+                        });
+                    }
+                }
+                // unaryop.py:844-861 — success path returns None (void).
+                None
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 // =====================================================================
@@ -3669,7 +3870,7 @@ fn init_someweakref_overrides(
         OpKind::SimpleCall,
         SomeValueTag::WeakRef,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let wr = match ann.annotation(&hl.args[0]) {
                     Some(SomeValue::WeakRef(w)) => w,
                     _ => panic!("weakref.simple_call: arg 0 not SomeWeakRef"),
@@ -4210,7 +4411,7 @@ mod tests {
             ],
         );
 
-        let result = hl.consider(&ann).expect("getattr must succeed");
+        let result = hl.consider(&ann).expect("getattr must succeed").unwrap();
 
         let SomeValue::BuiltinMethod(method) = result else {
             panic!("expected SomeBuiltinMethod");
@@ -4470,7 +4671,7 @@ mod tests {
     fn consider_someobject_len_returns_nonneg_integer() {
         // unaryop.py:158-159 — default len returns SomeInteger(nonneg=True).
         let (hl, ann) = hl1(OpKind::Len, SomeValue::object());
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg, "nonneg not set"),
             other => panic!("got {:?}", other),
@@ -4480,14 +4681,14 @@ mod tests {
     #[test]
     fn consider_somefloat_neg_returns_somefloat() {
         let (hl, ann) = hl1(OpKind::Neg, SomeValue::Float(SomeFloat::new()));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_somefloat_pos_returns_self() {
         let (hl, ann) = hl1(OpKind::Pos, SomeValue::Float(SomeFloat::new()));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
@@ -4497,7 +4698,7 @@ mod tests {
             OpKind::Bool,
             SomeValue::None_(super::super::model::SomeNone::new()),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -4510,7 +4711,7 @@ mod tests {
         let mut v = Variable::named("maybe_s");
         ann.setbinding(&mut v, SomeValue::String(SomeString::new(true, false)));
         let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v.clone())]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -4528,7 +4729,7 @@ mod tests {
     #[test]
     fn consider_someobject_bool_uses_constant_len_when_available() {
         let (hl, ann) = hl1(OpKind::Bool, SomeValue::Tuple(SomeTuple::new(vec![])));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -4538,7 +4739,7 @@ mod tests {
     #[test]
     fn consider_someinteger_abs_is_nonneg() {
         let (hl, ann) = hl1(OpKind::Abs, SomeValue::Integer(SomeInteger::default()));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg),
             other => panic!("got {:?}", other),
@@ -4548,7 +4749,7 @@ mod tests {
     #[test]
     fn consider_somebool_bool_returns_self() {
         let (hl, ann) = hl1(OpKind::Bool, SomeValue::Bool(SomeBool::new()));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -4578,7 +4779,7 @@ mod tests {
         let mut v = Variable::named("p");
         ann.setbinding(&mut v, SomeValue::Ptr(s_ptr));
         let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -4603,7 +4804,7 @@ mod tests {
         ann.setbinding(&mut v, SomeValue::Ptr(s_ptr));
         let hl = HLOperation::new(OpKind::Len, vec![Hlvalue::Variable(v)]);
 
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Integer(i) = r else {
             panic!("expected SomeInteger");
         };
@@ -4630,7 +4831,7 @@ mod tests {
             })),
         );
         let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -4704,7 +4905,7 @@ mod tests {
     #[test]
     fn consider_somebool_invert_returns_someinteger() {
         let (hl, ann) = hl1(OpKind::Invert, SomeValue::Bool(SomeBool::new()));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -4733,7 +4934,7 @@ mod tests {
                 SomeValue::Bool(SomeBool::new()),
             ])),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -4746,21 +4947,21 @@ mod tests {
     #[test]
     fn consider_sometuple_iter_returns_someiterator() {
         let (hl, ann) = hl1(OpKind::Iter, SomeValue::Tuple(SomeTuple::new(vec![])));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_someobject_str_returns_somestring() {
         let (hl, ann) = hl1(OpKind::Str, SomeValue::object());
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_someobject_hex_returns_somestring() {
         let (hl, ann) = hl1(OpKind::Hex, SomeValue::object());
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -4768,7 +4969,7 @@ mod tests {
     fn consider_someobject_pos_returns_impossible() {
         // unaryop.py:252-254 — default pos returns s_ImpossibleValue.
         let (hl, ann) = hl1(OpKind::Pos, SomeValue::object());
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -4797,7 +4998,7 @@ mod tests {
             OpKind::Contains,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -4807,7 +5008,7 @@ mod tests {
             OpKind::Iter,
             SomeValue::List(mk_list_of(SomeValue::Integer(SomeInteger::default()))),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -4826,7 +5027,7 @@ mod tests {
         let mut v = Variable::named("d");
         ann.setbinding(&mut v, SomeValue::Dict(s_dict));
         let hl = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -4836,7 +5037,7 @@ mod tests {
         let mut s = SomeString::new(false, false);
         s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("abc")));
         let (hl, ann) = hl1(OpKind::Len, SomeValue::String(s));
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -4853,7 +5054,7 @@ mod tests {
             OpKind::Len,
             SomeValue::Char(super::super::model::SomeChar::new(false)),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -4869,7 +5070,7 @@ mod tests {
             OpKind::Ord,
             SomeValue::Char(super::super::model::SomeChar::new(false)),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg),
             other => panic!("got {:?}", other),
@@ -4884,7 +5085,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -4901,7 +5102,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -4919,7 +5120,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Tuple(t) = r else {
             panic!("expected SomeTuple");
         };
@@ -4941,7 +5142,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)));
     }
 
@@ -4953,7 +5154,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Char(_)), "got {:?}", r);
     }
 
@@ -4967,7 +5168,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
     }
 
@@ -4977,7 +5178,7 @@ mod tests {
             OpKind::GetAttr,
             SomeValue::None_(super::super::model::SomeNone::new()),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -4999,7 +5200,7 @@ mod tests {
                 Hlvalue::Constant(Constant::new(ConstValue::byte_str("__name__"))),
             ],
         );
-        let r = hl.consider(&ann).expect("class __name__ getattr");
+        let r = hl.consider(&ann).expect("class __name__ getattr").unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -5025,7 +5226,10 @@ mod tests {
                 Hlvalue::Constant(Constant::new(ConstValue::byte_str("N"))),
             ],
         );
-        let r = hl.consider(&ann).expect("class const attr getattr");
+        let r = hl
+            .consider(&ann)
+            .expect("class const attr getattr")
+            .unwrap();
         assert!(
             matches!(r.const_(), Some(ConstValue::Int(42))),
             "got {:?}",
@@ -5039,7 +5243,7 @@ mod tests {
             OpKind::Len,
             SomeValue::None_(super::super::model::SomeNone::new()),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -5049,7 +5253,7 @@ mod tests {
             OpKind::Iter,
             SomeValue::String(SomeString::new(false, false)),
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -5072,7 +5276,7 @@ mod tests {
                 Hlvalue::Variable(v_char),
             ],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -5106,7 +5310,7 @@ mod tests {
                 Hlvalue::Variable(v_char),
             ],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         let SomeValue::Bool(b) = r else {
             panic!("expected SomeBool");
         };
@@ -5143,7 +5347,7 @@ mod tests {
             OpKind::Contains,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -5155,7 +5359,7 @@ mod tests {
             SomeInteger::default(),
         )]));
         let result = list_method_extend(&ann, &s_list, &s_iterable);
-        assert!(matches!(result, SomeValue::Impossible));
+        assert!(result.is_none(), "method_extend is a void analyser → None");
         assert!(matches!(
             s_list.listdef.read_item(None),
             SomeValue::Integer(_)
@@ -5179,7 +5383,7 @@ mod tests {
             None,
         );
         let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
-        assert!(matches!(result, SomeValue::Integer(_)));
+        assert!(matches!(result, Some(SomeValue::Integer(_))));
     }
 
     #[test]
@@ -5205,6 +5409,26 @@ mod tests {
             panic!("str.split must be recognized");
         };
         assert_eq!(str_split.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn classdef_less_instance_is_null_bound_method_calls_to_bool() {
+        // `p.is_null()` on a pointer-erased (classdef-less) `SomeInstance`
+        // lowers as `getattr(p, "is_null")` + `simple_call(bound, …)`
+        // (CallTarget::Method).  The bound method's call must yield
+        // `SomeBool`, so the callee slot holds a callable rather than a
+        // bare bool.
+        let ann = mk_ann();
+        let instance = SomeValue::Instance(super::super::model::SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let method = SomeBuiltinMethod::new("ptr_method_is_null", instance, "is_null");
+        let args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+        let result =
+            call_builtin_method(&ann, &method, &args).expect("is_null bound method must call");
+        assert!(matches!(result, Some(SomeValue::Bool(_))));
     }
 
     #[test]
@@ -5335,6 +5559,6 @@ mod tests {
             None,
         );
         let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
-        assert!(matches!(result, SomeValue::Bool(_)));
+        assert!(matches!(result, Some(SomeValue::Bool(_))));
     }
 }

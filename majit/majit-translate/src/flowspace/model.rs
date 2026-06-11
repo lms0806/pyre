@@ -2063,12 +2063,43 @@ impl HostEnv {
             HostObject::new_builtin_callable("core.ptr.null_mut"),
         );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
+        // `std::ptr::eq` re-exports `core::ptr::eq`; MIR lowering normalises
+        // the call to the canonical `["core", "ptr", "eq"]` FunctionPath
+        // (e.g. `py_type_check`'s `std::ptr::eq((*obj).ob_type, …)`).  Bind
+        // the `core.ptr` spelling to the same `std.ptr.eq` callable so it
+        // reuses the existing `std_ptr_eq` analyzer — the SAME instance,
+        // not a fresh same-qualname one: `BUILTIN_TYPER` is keyed by
+        // `HostObject` Arc identity.
+        core_ptr.module_set(
+            "eq",
+            std_ptr.module_get("eq").expect("std.ptr.eq bound above"),
+        );
         // `std.ptr` was already created above with `null_mut` / `eq` /
         // `copy_nonoverlapping`; extend that same module with `null`
         // instead of re-creating it.  A fresh `new_module` here would
         // shadow the earlier binding and drop its `eq` /
         // `copy_nonoverlapping` members before the `mods.insert` below.
         std_ptr.module_set("null", HostObject::new_builtin_callable("std.ptr.null"));
+
+        // `pub const PY_NULL: PyObjectRef = std::ptr::null_mut()`
+        // (`pyre_object::pyobject::PY_NULL`).  Charon emits the const
+        // read as a Global place; `front::mir` lowers an unknown global
+        // to a 0-arg `Call FunctionPath ["pyre_object", "pyobject",
+        // "PY_NULL"]`, which Branch 3b resolves through this module.
+        // Bind the attr to the canonical `core.ptr.null_mut` callable so
+        // the read shares the null-pointer analyzer with spelled-out
+        // `null_mut()` callsites.  Reuse the `core.ptr` attr instance —
+        // `BUILTIN_TYPER` is keyed by `HostObject` Arc identity
+        // (`rbuiltin.rs lookup_typer`), so a fresh
+        // `new_builtin_callable` with the same qualname would miss the
+        // registered typer.
+        let pyre_object_pyobject = HostObject::new_module("pyre_object.pyobject");
+        pyre_object_pyobject.module_set(
+            "PY_NULL",
+            core_ptr
+                .module_get("null_mut")
+                .expect("core.ptr.null_mut bound above"),
+        );
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
@@ -2100,6 +2131,7 @@ impl HostEnv {
         mods.insert("FrameDebugData".into(), frame_debug_data);
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
+        mods.insert("pyre_object.pyobject".into(), pyre_object_pyobject);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

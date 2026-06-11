@@ -1045,6 +1045,19 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     )))
 }
 
+/// Read the `i64` value of an `int` or `bool` object.  `is_int` reports
+/// `True` for `bool` (a subtype of `int`), but `bool` stores its payload
+/// in a distinct struct layout, so the value must be read through the
+/// matching accessor rather than `w_int_get_value`.
+#[inline]
+unsafe fn int_or_bool_value(obj: PyObjectRef) -> i64 {
+    if is_bool(obj) {
+        w_bool_get_value(obj) as i64
+    } else {
+        w_int_get_value(obj)
+    }
+}
+
 #[inline(never)]
 /// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
@@ -1053,7 +1066,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
     let len = pyre_object::w_range_len(obj);
     if is_int(index) {
-        return match pyre_object::w_range_getitem(obj, w_int_get_value(index)) {
+        return match pyre_object::w_range_getitem(obj, int_or_bool_value(index)) {
             Some(v) => Ok(w_int_new(v)),
             None => Err(PyError::new(
                 PyErrorKind::IndexError,
@@ -1086,13 +1099,14 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
         let (start, _stop, step) = pyre_object::w_range_fields(obj);
         let len = pyre_object::w_range_len(obj);
         if is_int(needle) {
-            let v = w_int_get_value(needle);
+            let v = int_or_bool_value(needle);
             if pyre_object::w_range_contains_int(obj, v) {
                 return Ok(w_int_new((v - start) / step));
             }
-            return Err(PyError::value_error(
-                "range.index(x): x not in range".to_string(),
-            ));
+            return Err(PyError::value_error(format!(
+                "{} is not in range",
+                crate::display::py_repr(needle)
+            )));
         }
         for i in 0..len {
             if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
@@ -1121,6 +1135,33 @@ fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
         let last = start + (len - 1) * step;
         Ok(pyre_object::w_range_iter_new(last, start - step, -step))
     }
+}
+
+/// `range.__reduce__()` — `functional.py W_Range.descr_reduce`:
+/// `(type(self), (start, stop, step))`.
+fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
+    let range_type =
+        crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE).unwrap_or(PY_NULL);
+    let state = w_tuple_new(vec![w_int_new(start), w_int_new(stop), w_int_new(step)]);
+    Ok(w_tuple_new(vec![range_type, state]))
+}
+
+/// `range.__hash__()` — `functional.py W_Range.descr_hash`: hashes the
+/// `(length, start, step)` tuple, collapsing trailing fields to `None`
+/// for empty (`(len, None, None)`) and single-element (`(len, start,
+/// None)`) ranges so equal ranges hash equal.
+fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
+    let (start, _stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
+    let len = unsafe { pyre_object::w_range_len(args[0]) };
+    let items = if len == 0 {
+        vec![w_int_new(0), w_none(), w_none()]
+    } else if len == 1 {
+        vec![w_int_new(1), w_int_new(start), w_none()]
+    } else {
+        vec![w_int_new(len), w_int_new(start), w_int_new(step)]
+    };
+    Ok(w_int_new(hash_w_strict(w_tuple_new(items))?))
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
@@ -1917,6 +1958,10 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -1956,6 +2001,8 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 "index" => Some((range_index_method, "index", 2)),
                 "__iter__" => Some((range_iter_method, "__iter__", 1)),
                 "__reversed__" => Some((range_reversed_method, "__reversed__", 1)),
+                "__reduce__" => Some((range_reduce_method, "__reduce__", 1)),
+                "__hash__" => Some((range_hash_method, "__hash__", 1)),
                 _ => None,
             };
             if let Some((func, sname, arity)) = entry {
@@ -3825,6 +3872,7 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     }
     None
 }
+
 /// Determine what `self` value to bind for a super-resolved attribute.
 ///
 /// Walks the MRO of `self_obj` starting after `super_type`, finds the
@@ -6177,6 +6225,40 @@ pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// the same checks `iter()` uses (null-check, type-tag check) and
 /// never reads through a dangling pointer beyond what existing pyre
 /// type-tag helpers guarantee.
+/// baseobjspace.py:1316-1323 `ismapping_w`.
+///
+/// ```python
+/// def ismapping_w(self, w_obj):
+///     flag = self.type(w_obj).flag_map_or_seq
+///     if flag == 'M':
+///         return True
+///     elif flag == 'S':
+///         return False
+///     else:
+///         return self.lookup(w_obj, '__getitem__') is not None
+/// ```
+///
+/// The `is_dict` arm short-circuits the builtin mapping whose
+/// `W_TypeObject` flag may not be reachable through `typedef::r#type`;
+/// heap types (dict subclasses included) carry the inherited flag via
+/// `inherit_flag_map_or_seq`.
+pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if is_dict(w_obj) {
+            return true;
+        }
+        let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+        let flag = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type);
+        if flag == b'M' {
+            return true;
+        }
+        if flag == b'S' {
+            return false;
+        }
+        lookup(w_obj, "__getitem__").is_some()
+    }
+}
+
 pub fn is_iterable(w_obj: PyObjectRef) -> bool {
     let obj = unwrap_cell(w_obj);
     if obj.is_null() {
@@ -6194,6 +6276,10 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::generatorobject::is_generator(obj)
             || pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             return true;
         }
@@ -6337,10 +6423,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // itertools.count / itertools.repeat — iter_w returns self.
-        // PyPy: W_Count.iter_w / W_Repeat.iter_w
+        // itertools native iterators — iter_w returns self.
+        // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
+        // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             return Ok(obj);
         }
@@ -6553,6 +6644,110 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
         }
+        // itertools.takewhile — interp_itertools.py W_TakeWhile.next_w
+        //
+        //     def next_w(self):
+        //         if self.stopped:
+        //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
+        //         w_obj = self.space.next(self.w_iterable)  # may raise a w_StopIteration
+        //         w_bool = self.space.call_function(self.w_predicate, w_obj)
+        //         if not self.space.is_true(w_bool):
+        //             self.stopped = True
+        //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_takewhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_TakeWhile);
+            if it.stopped {
+                return Err(PyError::stop_iteration());
+            }
+            let w_obj = next(it.w_iterable)?;
+            let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+            if !is_true(w_bool) {
+                it.stopped = true;
+                return Err(PyError::stop_iteration());
+            }
+            return Ok(w_obj);
+        }
+        // itertools.dropwhile — interp_itertools.py W_DropWhile.next_w
+        //
+        //     def next_w(self):
+        //         if self.started:
+        //             w_obj = self.space.next(self.w_iterable)  # may raise w_StopIter
+        //         else:
+        //             while True:
+        //                 w_obj = self.space.next(self.w_iterable)  # may raise w_StopIter
+        //                 w_bool = self.space.call_function(self.w_predicate, w_obj)
+        //                 if not self.space.is_true(w_bool):
+        //                     self.started = True
+        //                     break
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_dropwhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_DropWhile);
+            let w_obj = if it.started {
+                next(it.w_iterable)?
+            } else {
+                loop {
+                    let w_obj = next(it.w_iterable)?;
+                    let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    if !is_true(w_bool) {
+                        it.started = true;
+                        break w_obj;
+                    }
+                }
+            };
+            return Ok(w_obj);
+        }
+        // itertools.filterfalse — W_Filter.next_w (functional.py:930) with
+        // reverse=True; the trailing _filter_jitdriver loop applies the
+        // same predicate test until an element passes.
+        //
+        //     def next_w(self):
+        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
+        //         if self.w_predicate is None:
+        //             pred = self.space.is_true(w_obj)
+        //         else:
+        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
+        //             pred = self.space.is_true(w_pred)
+        //         if pred ^ self.reverse:
+        //             return w_obj
+        if pyre_object::itertoolsmodule::is_filterfalse(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_FilterFalse);
+            loop {
+                let w_obj = next(it.w_iterable)?;
+                let pred = if it.w_predicate.is_null() {
+                    is_true(w_obj)
+                } else {
+                    let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    is_true(w_pred)
+                };
+                if !pred {
+                    return Ok(w_obj);
+                }
+            }
+        }
+        // itertools.pairwise — interp_itertools.py W_Pairwise.next_w
+        //
+        //     def next_w(self):
+        //         space = self.space
+        //         w_prev = self.w_prev
+        //         if w_prev is None:
+        //             w_prev = space.next(self.w_iterator)
+        //             self.w_prev = w_prev  # set before fetching w_next to handle reentrancy
+        //         w_next = space.next(self.w_iterator)
+        //         self.w_prev = w_next
+        //         return space.newtuple2(w_prev, w_next)
+        if pyre_object::itertoolsmodule::is_pairwise(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Pairwise);
+            let mut w_prev = it.w_prev;
+            if w_prev.is_null() {
+                w_prev = next(it.w_iterator)?;
+                // set before fetching w_next to handle reentrancy
+                it.w_prev = w_prev;
+            }
+            let w_next = next(it.w_iterator)?;
+            it.w_prev = w_next;
+            return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
+        }
         // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`
         // line-by-line — two parity-mandated checks:
         //
@@ -6651,21 +6846,35 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_item is None:
         //             w_item = space.next(self.w_iter_or_list)
         //         return space.newtuple2(w_index, w_item)
-        // `iter(callable, sentinel)` product (`Objects/iterobject.c`
-        // `calliter_iternext`): invoke the zero-arg callable; stop when
-        // the result equals the sentinel.  Once exhausted, `callable` is
-        // latched to `PY_NULL` so further `next()` keeps raising.
+        // `iter(callable, sentinel)` product
+        // (`__builtin__/operation.py:128 _CallableIterator.__next__`):
+        // invoke the zero-arg callable; stop when the result equals the
+        // sentinel.  Once exhausted, `callable` is latched to `PY_NULL`
+        // so further `next()` keeps raising.  The latch is also set when
+        // the callable itself raises `StopIteration`, and a re-entrant
+        // call that exhausts the iterator during `callable()` discards
+        // this call's result.
         if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             use pyre_object::callableiteratorobject as ci;
             let callable = ci::w_callable_iterator_get_callable(obj);
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let result = crate::call::call_function_impl_result(callable, &[])?;
-            // `calliter_iternext` re-checks `it_callable` after the call: the
-            // callable may have re-entered `next()` on this same iterator and
-            // latched it to `PY_NULL`, exhausting it; discard the result and
-            // stay stopped rather than comparing a stale value to the sentinel.
+            let result = match crate::call::call_function_impl_result(callable, &[]) {
+                Ok(r) => r,
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                    // `calliter_iternext`: when the callable itself raises
+                    // `StopIteration`, latch `it_callable` to `PY_NULL` so
+                    // further `next()` stays stopped, then re-raise.
+                    ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            // Re-check `it_callable` after the call: the callable may have
+            // re-entered `next()` on this same iterator and latched it to
+            // `PY_NULL`, exhausting it; discard the result and stay stopped
+            // rather than comparing a stale value to the sentinel.
             if ci::w_callable_iterator_get_callable(obj).is_null() {
                 return Err(PyError::stop_iteration());
             }
@@ -7443,7 +7652,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             if is_int(needle) {
                 return Ok(pyre_object::w_range_contains_int(
                     haystack,
-                    w_int_get_value(needle),
+                    int_or_bool_value(needle),
                 ));
             }
             let (start, _stop, step) = pyre_object::w_range_fields(haystack);

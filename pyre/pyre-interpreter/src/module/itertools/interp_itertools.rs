@@ -422,4 +422,74 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
+    // takewhile(predicate, iterable) — W_TakeWhile.__init__: store the
+    // predicate and `space.iter(w_iterable)`; elements are pulled lazily
+    // by W_TakeWhile.next_w (baseobjspace::next).
+    crate::dict_storage_store(
+        ns,
+        "takewhile",
+        crate::make_builtin_function_with_arity(
+            "takewhile",
+            |args| {
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                Ok(pyre_object::itertoolsmodule::w_takewhile_new(
+                    args[0], iterator,
+                ))
+            },
+            2,
+        ),
+    );
+    // dropwhile(predicate, iterable) — W_DropWhile.__init__: store the
+    // predicate and `space.iter(w_iterable)`; the drop phase runs lazily
+    // inside W_DropWhile.next_w (baseobjspace::next).
+    crate::dict_storage_store(
+        ns,
+        "dropwhile",
+        crate::make_builtin_function_with_arity(
+            "dropwhile",
+            |args| {
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                Ok(pyre_object::itertoolsmodule::w_dropwhile_new(
+                    args[0], iterator,
+                ))
+            },
+            2,
+        ),
+    );
+    // filterfalse(predicate, iterable) — W_FilterFalse (W_Filter with
+    // reverse=True).  W_Filter.__init__ normalizes a None predicate to
+    // null; elements are filtered lazily in next_w (baseobjspace::next).
+    crate::dict_storage_store(
+        ns,
+        "filterfalse",
+        crate::make_builtin_function_with_arity(
+            "filterfalse",
+            |args| {
+                let predicate = if unsafe { pyre_object::is_none(args[0]) } {
+                    pyre_object::PY_NULL
+                } else {
+                    args[0]
+                };
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                Ok(pyre_object::itertoolsmodule::w_filterfalse_new(
+                    predicate, iterator,
+                ))
+            },
+            2,
+        ),
+    );
+    // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
+    // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).
+    crate::dict_storage_store(
+        ns,
+        "pairwise",
+        crate::make_builtin_function_with_arity(
+            "pairwise",
+            |args| {
+                let iterator = crate::baseobjspace::iter(args[0])?;
+                Ok(pyre_object::itertoolsmodule::w_pairwise_new(iterator))
+            },
+            1,
+        ),
+    );
 }

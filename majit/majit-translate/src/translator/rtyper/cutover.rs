@@ -624,6 +624,18 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // the remaining producer is the rtyper-side `bindingrepr`
         // gap on synthesized `current_sp`-like graphs.
         || msg.contains("KeyError: no binding for arg")
+        // `cast_ptr_to_int` reached the typer with a non-`Ptr`
+        // operand — the front-end could not lower a real pointer for
+        // the source of an `expr as i64` cast.  The canonical hitter
+        // is `stack_check::current_sp` (`&probe as *const usize as
+        // usize`): taking the address of a stack local is a
+        // target-specific raw-SP read that `front::mir` lowers with
+        // the local's *value* (`Int(0)`) rather than its address, so
+        // `rtype_cast_ptr_to_int`'s late `InstanceRepr→PtrRepr` swap
+        // fallback finds `Signed` where it needs `Ptr(...)`.  The
+        // legacy walker handles these graphs; skip until the
+        // address-of-local lowering lands a typed pointer operand.
+        || msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
         // exceptions uncaught and `annrpython.py:643` lets
@@ -860,6 +872,40 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
             continue;
+        }
+        // `@jit.dont_look_inside` (`rlib/jit.py:142`) callees: the JIT
+        // pipeline never builds a jitcode for the body
+        // (`policy.py:48-84 look_inside_graph` returns False, so
+        // `codewriter.py find_all_graphs` excludes the graph and the
+        // callsite residualizes).  Pyre's annotator exists solely to
+        // feed that jitcode pipeline, so lifting the body here is
+        // upstream-dead work — and bodies marked opaque are typically
+        // unliftable host plumbing (`OnceLock` init walks etc.) whose
+        // lift failure would poison every caller.  Prefill the same
+        // signature-only stub pygraph `register_unsafe_fn_stubs` uses
+        // (the `ExtRegistryEntry.compute_result_annotation` shape) so
+        // callers annotate the declared unit/bool result and the
+        // codewriter emits the residual call via the fn's registered
+        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-unit/bool returns
+        // fall through to the normal lift — no current marker needs
+        // them, and the stub builder's scalar coverage is unaudited
+        // for that case.
+        if graph.hints.iter().any(|h| h == "dont_look_inside") {
+            let return_lltype = match graph.return_type.as_deref() {
+                None | Some("()") => Some(LowLevelType::Void),
+                Some("bool") => Some(LowLevelType::Bool),
+                _ => None,
+            };
+            if let Some(return_lltype) = return_lltype
+                && let Some(stub) = build_stub_pygraph_for_unsafe_fn(
+                    graph.name.clone(),
+                    signature_for_graph(graph),
+                    return_lltype,
+                )
+            {
+                entry.prefill_default_cache(stub);
+                continue;
+            }
         }
         match lift_callee_to_pygraph(graph, signature_for_graph(graph), registry) {
             Ok(pygraph) => entry.prefill_default_cache(pygraph),
@@ -1344,6 +1390,15 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // blocks into the shared annotator; subsequent
     // `specialize_more_blocks` rtype only the newly-added blocks.
     let (annotator, rtyper) = call_registry.ensure_session()?;
+    // Scope an `added_blocks` tracker over this subject's drive of the
+    // shared annotator so the post-drain blocked-annotation guard
+    // (`raise_if_subject_blocked` below) can see exactly the blocks
+    // seeded for this subject and roll them back if any stays in the
+    // `None` (False) sentinel state. Mirrors `complete_helpers`'s
+    // `saved = self.added_blocks; self.added_blocks = {}` prologue
+    // (annrpython.py:113-114); the guard restores the previous tracker
+    // when this function returns.
+    let _subject_block_scope = annotator.enter_added_blocks_scope();
     // Queue `graph.startblock` onto the orthodox `addpendingblock`
     // queue, mirroring how callees enter through
     // `pycall -> recursivecall -> addpendingblock`
@@ -1444,6 +1499,18 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     annotator
         .complete_pending_blocks()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
+    // Orthodox `complete()` blocked-annotation guard
+    // (annrpython.py:243-255): a block that stayed in the `None` (False)
+    // sentinel state after the fixpoint drain is permanently
+    // `BlockedInference`. Upstream `complete()` raises here, before
+    // `simplify`/`compute_at_fixpoint`. The dual-gate calls
+    // `complete_pending_blocks` (the bare drain) instead of
+    // `complete()`, so the guard is replicated here; the error reuses
+    // the "complete_pending_blocks failed" prefix already recognised by
+    // `is_known_unported`, routing the subject to the legacy walker.
+    annotator
+        .raise_if_subject_blocked()
+        .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
 
     // Populate per-callsite call-family / calltable state
     // by walking the seeded blocks' call_ops.  `compute_at_fixpoint`
@@ -1525,6 +1592,12 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
         lowleveltype_to_concrete(lltype)?;
     }
 
+    // The subject specialized cleanly — keep its blocks in the shared
+    // annotator (they are now `already_seen`). Every earlier `?` exit
+    // above leaves `_subject_block_scope` uncommitted, so a Skipped
+    // subject's partially-annotated blocks are evicted on drop and never
+    // poison a later subject's session-global `specialize_more_blocks`.
+    _subject_block_scope.commit();
     Ok((value_to_var, constant_concretetypes))
 }
 

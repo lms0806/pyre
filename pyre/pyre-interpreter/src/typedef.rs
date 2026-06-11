@@ -594,6 +594,22 @@ pub fn init_typeobjects() {
             &pyre_object::itertoolsmodule::REPEAT_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
         );
+        reg.insert(
+            &pyre_object::itertoolsmodule::TAKEWHILE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.takewhile", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::DROPWHILE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.dropwhile", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::FILTERFALSE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.filterfalse", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::PAIRWISE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
+        );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -7179,10 +7195,28 @@ fn init_object_type(ns: &mut DictStorage) {
         "__reduce_ex__",
         make_builtin_function_with_arity("__reduce_ex__", |_| Ok(pyre_object::w_none()), 2),
     );
+    // typeobject.py descr___init_subclass__ — the default accepts no
+    // keywords; class-definition keywords reaching it via the builtin
+    // kwargs ABI are an error, not silently dropped.
     dict_storage_store(
         ns,
         "__init_subclass__",
-        make_builtin_function("__init_subclass__", |_| Ok(pyre_object::w_none())),
+        make_builtin_function("__init_subclass__", |args| {
+            let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if let Some(kw) = kwargs {
+                let has_real_kw = unsafe {
+                    pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                        pyre_object::is_str(k) && pyre_object::w_str_get_value(k) != "__pyre_kw__"
+                    })
+                };
+                if has_real_kw {
+                    return Err(crate::PyError::type_error(
+                        "__init_subclass__() takes no keyword arguments",
+                    ));
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
     );
     dict_storage_store(
         ns,

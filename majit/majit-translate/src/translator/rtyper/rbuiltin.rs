@@ -432,6 +432,16 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ),
         // rbuiltin.py:744 — `@typer_for(weakref.ref)`
         ("weakref", "ref", rtype_weakref_create),
+        // `lltype.nullptr` analog for the Rust null-pointer builtins;
+        // same four spellings as the `ptr_null_constant` analyzer
+        // (annotator/builtin.rs).
+        ("core.ptr", "null_mut", rtype_ptr_null),
+        ("std.ptr", "null_mut", rtype_ptr_null),
+        ("core.ptr", "null", rtype_ptr_null),
+        ("std.ptr", "null", rtype_ptr_null),
+        // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
+        // one entry covers both spellings.
+        ("std.ptr", "eq", rtype_ptr_eq),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -2828,6 +2838,40 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
     let _ = hop.genop("track_alloc_stop", vlist, GenopResult::Void);
     // upstream has no `return` — implicit `None`.
     Ok(None)
+}
+
+/// `std::ptr::eq(a, b)` — the Rust spelling of `a is b` over wrapped
+/// objects (`baseobjspace::is_w`).  Identity comparison routes through
+/// the generic pointer `rtype_is_` body (rmodel.py:300-318
+/// `pair_repr_repr_rtype_is_`), which emits `ptr_eq` with a Bool
+/// result and constant-folds when the annotator proved the answer.
+fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r0 = arg_repr(hop, 0)?;
+    let r1 = arg_repr(hop, 1)?;
+    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
+        .map(Some)
+}
+
+/// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
+/// analog (rbuiltin.py:412-418) for the `{core,std}.ptr.{null_mut,null}`
+/// host builtins.  Upstream routes nullptr through `rtype_const_result`
+/// because its annotation is a constant SomePtr; the pyre analyzer
+/// (`ptr_null_constant`) instead returns a non-constant classdef-less
+/// `SomeInstance(can_be_None=True)` so the value stays joinable with
+/// typed receivers, and the null value is recovered here from the
+/// callable's definition: `convert_const(None)` on the result repr is
+/// `null_instance()` (rclass.py:474 `convert_const` None arm).
+fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let r_result_borrow = hop.r_result.borrow();
+    let r_result = r_result_borrow
+        .as_ref()
+        .ok_or_else(|| TyperError::message("rtype_ptr_null: r_result missing".to_string()))?;
+    let c = crate::translator::rtyper::rmodel::inputconst(r_result.as_ref(), &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(c)))
 }
 
 /// RPython `@typer_for(lltype.typeOf)` / `@typer_for(lltype.nullptr)` /

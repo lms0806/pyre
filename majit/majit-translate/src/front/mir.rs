@@ -94,8 +94,8 @@ use majit_charon_reader::{
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, OpKind,
-    SpaceOperation, ValueType,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph, Link,
+    LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
@@ -506,6 +506,31 @@ fn derive_program_metadata(
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
+                // Register the enum as a flat class in `struct_fields`:
+                // the synthetic `__discriminant` tag plus the union of
+                // all variant payload fields.  `Rvalue::Discriminant`
+                // lowers to `FieldRead("__discriminant")` and payload
+                // projections emit `owner_root` = the enum LEAF (not the
+                // variant — `resolve_adt_field`), so every enum attr
+                // read lands on this one class.  First-writer-wins on a
+                // field name shared by several variants; the row only
+                // feeds the annotation-stage attr shell
+                // (`getuniqueclassdef_for_struct_root` pass 2), which
+                // RPython grows by generalization anyway.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                seen.insert("__discriminant".to_string());
+                let mut rows: Vec<(String, String)> =
+                    vec![("__discriminant".to_string(), "i64".to_string())];
+                for v in variants {
+                    for (i, f) in v.fields.iter().enumerate() {
+                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        if seen.insert(fname.clone()) {
+                            rows.push((fname, tyref_to_ast_string(&f.ty, llbc)));
+                        }
+                    }
+                }
+                struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields.fields.insert(leaf.clone(), rows);
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
                 // extractor can resolve by either spelling.
@@ -561,6 +586,26 @@ pub fn lower_fun_decl_with_static_addrs(
         ))
     })?;
     let name = fd.item_meta.name_path();
+    // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
+    // path that threads locals as block inputargs / phis).  Default
+    // (flag unset) keeps the monotonic lowering so the gate stays green
+    // while the new path is validated.  On a framestate failure the body
+    // falls back to the monotonic path — so flag-on is never worse than
+    // flag-off — unless `PYRE_MIR_FRAMESTATE_STRICT` is set, which
+    // propagates the error for debugging.
+    if std::env::var_os("PYRE_MIR_FRAMESTATE").is_some() {
+        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
+        if lo.mir_model_is_acyclic() {
+            match lo.lower_framestate() {
+                Ok(()) => return Ok(lo.graph),
+                Err(e) => {
+                    if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
     let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => Ok(lo.graph),
@@ -719,12 +764,19 @@ impl<'a> Lowering<'a> {
             graph.name_value_var(&var, name.clone());
             local_var[i] = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
+            // `class_root` carries the param's named-ADT leaf so
+            // `derive_subject_inputcells` can seed the receiver's
+            // `ClassDef`; only `Ref`-typed params consume it there.
+            let class_root = match &ty {
+                ValueType::Ref(_) => tyref_class_root(&local.ty, llbc),
+                _ => None,
+            };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
                     name,
                     ty,
-                    class_root: None,
+                    class_root,
                 },
             });
             startblock_args.push(var);
@@ -886,6 +938,480 @@ impl<'a> Lowering<'a> {
             }
         }
         order
+    }
+
+    // -----------------------------------------------------------------------
+    // Framestate-threaded lowering (acyclic GAP-B path)
+    // -----------------------------------------------------------------------
+
+    /// Snapshot the current `local_var` table as a [`FrameState`].  Only
+    /// the locals projection is populated — MIR has no value stack /
+    /// pending exception / block-stack, so those stay at the `Default`
+    /// (empty) shape.  `entries` is indexed by MIR local index; every
+    /// framestate produced in this lowering uses the same indexing, so
+    /// [`FrameState::union`] / [`FrameState::getvariables`] /
+    /// [`FrameState::getoutputargs`] — all purely positional over
+    /// `entries` / `locals_w` — line up across predecessors and merge
+    /// targets without consulting any external slot table.
+    fn getstate(&self) -> FrameState {
+        FrameState {
+            entries: self.local_var.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Restore `local_var` from a [`FrameState`] produced by
+    /// [`Self::getstate`] or [`FrameState::union`].  Slots are sized to
+    /// the fixed local count; a `None` slot marks a local undefined on at
+    /// least one predecessor path (union None-kill), so a later read
+    /// fails-loud through [`Self::resolve_place`] as "uninitialised
+    /// local" — the same use-before-def signal the monotonic path emits.
+    fn setstate(&mut self, fs: &FrameState) {
+        let n = self.local_var.len();
+        self.local_var = (0..n)
+            .map(|i| fs.entries.get(i).cloned().flatten())
+            .collect();
+    }
+
+    /// Successor MIR blocks along the edges [`Self::lower_terminator`]
+    /// actually materialises in the model graph.  This EXCLUDES
+    /// `on_unwind` (dropped by `lower_call` and the `Assert` / `Drop`
+    /// arms): the reachability / acyclicity / RPO that drive framestate
+    /// threading must follow only the edges that exist in the produced
+    /// `FunctionGraph`, otherwise an orphan cleanup chain would appear as
+    /// a live merge predecessor.
+    fn model_succs(&self, mir_bb: usize) -> Vec<usize> {
+        let n = self.body.body.len();
+        let Ok(term) = self.body.body[mir_bb].term() else {
+            return vec![];
+        };
+        let raw: Vec<u64> = match term {
+            TermKind::Goto { target } => vec![target],
+            TermKind::Call { target, .. }
+            | TermKind::Assert { target, .. }
+            | TermKind::Drop { target, .. } => vec![target],
+            TermKind::Switch { targets, .. } => match targets {
+                SwitchTargets::If(a, b) => vec![a, b],
+                SwitchTargets::SwitchInt(_, arms, default) => {
+                    let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                    if !self.switch_default_targets_panic_abort(default) {
+                        v.push(default);
+                    }
+                    v
+                }
+            },
+            TermKind::Return | TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {
+                vec![]
+            }
+        };
+        raw.into_iter()
+            .map(|t| t as usize)
+            .filter(|&t| t < n)
+            .collect()
+    }
+
+    /// True when MIR block `bb`'s terminator is a panic/abort stub
+    /// (`Abort` / `UnwindResume`).  rustc lowers the out-of-range
+    /// `default` arm of an enum-discriminant `SwitchInt` to such a block
+    /// — an unreachable UB stub with no flowgraph analogue.  Excluding it
+    /// from the switch's successors keeps the orphan `set_raise`
+    /// cleanup chain (with its undefined etype/evalue) out of the produced
+    /// graph instead of leaving it as a live, undefined-operand block.
+    fn switch_default_targets_panic_abort(&self, bb: u64) -> bool {
+        matches!(
+            self.body.body.get(bb as usize).and_then(|b| b.term().ok()),
+            Some(TermKind::Abort(_)) | Some(TermKind::UnwindResume)
+        )
+    }
+
+    /// Blocks reachable from bb0 over [`Self::model_succs`].
+    fn mir_model_reachable(&self) -> Vec<bool> {
+        let n = self.body.body.len();
+        let mut reached = vec![false; n];
+        if n == 0 {
+            return reached;
+        }
+        reached[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(bb) = stack.pop() {
+            for s in self.model_succs(bb) {
+                if !reached[s] {
+                    reached[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        reached
+    }
+
+    /// `true` iff the model-reachable component (from bb0 over
+    /// [`Self::model_succs`]) contains no back-edge.  The framestate path
+    /// handles only acyclic bodies; cyclic ones fall back to the
+    /// monotonic lowering (they are not in the acyclic GAP-B skip set
+    /// this path drains, and a loop header needs a real fixpoint rather
+    /// than the two-pass acyclic threading).  3-colour DFS: a successor
+    /// still on the DFS stack (grey) is a back-edge.
+    fn mir_model_is_acyclic(&self) -> bool {
+        let n = self.body.body.len();
+        if n == 0 {
+            return true;
+        }
+        // 0 = white, 1 = grey (on stack), 2 = black (done).
+        let mut state = vec![0u8; n];
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some(&(node, idx)) = stack.last() {
+            let succs = self.model_succs(node);
+            if idx < succs.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let nxt = succs[idx];
+                match state[nxt] {
+                    0 => {
+                        state[nxt] = 1;
+                        stack.push((nxt, 0));
+                    }
+                    1 => return false, // grey successor ⇒ back-edge ⇒ cyclic
+                    _ => {}
+                }
+            } else {
+                state[node] = 2;
+                stack.pop();
+            }
+        }
+        true
+    }
+
+    /// Reverse-postorder of the model-reachable component over
+    /// [`Self::model_succs`].  Only blocks reachable from bb0 appear;
+    /// unreachable blocks are handled separately as dead stubs.  In an
+    /// acyclic graph RPO visits every predecessor of a block before the
+    /// block itself, which is exactly the order the two-pass framestate
+    /// threading relies on.
+    fn model_rpo(&self) -> Vec<usize> {
+        let n = self.body.body.len();
+        if n == 0 {
+            return vec![];
+        }
+        let mut state = vec![0u8; n];
+        let mut postorder: Vec<usize> = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some(&(node, idx)) = stack.last() {
+            let succs = self.model_succs(node);
+            if idx < succs.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let nxt = succs[idx];
+                if state[nxt] == 0 {
+                    state[nxt] = 1;
+                    stack.push((nxt, 0));
+                }
+            } else {
+                state[node] = 2;
+                postorder.push(node);
+                stack.pop();
+            }
+        }
+        postorder.into_iter().rev().collect()
+    }
+
+    /// Lower the body threading locals as block inputargs / phis via
+    /// per-block [`FrameState`]s, instead of the function-wide monotonic
+    /// `local_var` table.  Restricted to acyclic bodies (the caller gates
+    /// on [`Self::mir_model_is_acyclic`]); this drains the GAP-B
+    /// "undefined operand" census skips where a reassigned local reaches
+    /// a merge with path-dependent values the monotonic single-slot
+    /// scheme cannot represent.
+    ///
+    /// Two passes over the model-reachable blocks in reverse-postorder:
+    ///
+    ///   Pass 1 — for each block, `setstate` to its accumulated entry
+    ///   framestate, set its (non-startblock) inputargs to the entry
+    ///   framestate's variables, lower its statements + terminator
+    ///   (reusing the monotonic per-op lowering, which closes
+    ///   return / raise correctly and emits placeholder empty-args
+    ///   goto / branch links because every successor still has empty
+    ///   inputargs at close time), snapshot the exit framestate, and
+    ///   union that exit into each model successor's entry framestate.
+    ///
+    ///   Pass 2 — re-argument each goto / branch link from the
+    ///   predecessor exit / target entry framestates via `getoutputargs`,
+    ///   preserving the link's target, exitcase, and the block's
+    ///   `exitswitch`.
+    ///
+    /// Model-unreachable blocks (orphan `on_unwind` cleanup chains) are
+    /// stubbed as dead raises so the graph stays complete without
+    /// threading dead state — leaving their original content would
+    /// reference the monotonic carry-on `local_var`.  bb0 (the
+    /// startblock) is never a merge target in an acyclic body, so it
+    /// keeps its `OpKind::Input`-paired parameter inputargs untouched —
+    /// the opcode-dispatch arm extractor depends on that shape.
+    fn lower_framestate(&mut self) -> Result<(), LowerError> {
+        let n = self.body.body.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let reachable = self.mir_model_reachable();
+        let rpo = self.model_rpo();
+        let returnblock = self.graph.returnblock;
+        let exceptblock = self.graph.exceptblock;
+
+        // BlockId → MIR bb inverse.  returnblock / exceptblock (and any
+        // non-MIR block) map to `usize::MAX` — they are merge sinks the
+        // accumulation skips.
+        let mut block_to_mir = vec![usize::MAX; self.graph.blocks.len()];
+        for (mir, bid) in self.block_id.iter().enumerate() {
+            block_to_mir[bid.0] = mir;
+        }
+
+        let mut entry_state: Vec<Option<FrameState>> = vec![None; n];
+        let mut exit_state: Vec<Option<FrameState>> = vec![None; n];
+        // bb0 enters with the parameter bindings established in `new`.
+        entry_state[0] = Some(self.getstate());
+
+        // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
+        for &bb in &rpo {
+            let st = entry_state[bb].clone().ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "framestate: reachable bb{bb} has no entry state (RPO/union bug)"
+                ))
+            })?;
+            self.setstate(&st);
+            let bb_id = self.block_id[bb];
+            // The startblock keeps its parameter inputargs + Input ops;
+            // it is never a merge target in an acyclic body.
+            if bb != 0 {
+                let inputargs = st.getvariables(&self.graph);
+                self.graph.block_mut(bb_id).inputargs = inputargs;
+                // Anchor the block body to the framestate locals.
+                // `lower_block` reloads `self.local_var` from
+                // `block_entry_local_var[bb]` (the construction-time
+                // per-block-entry Variables), so without this the body
+                // would bind locals to those construction identities
+                // while the inputargs above (and the `getoutputargs`
+                // link args in Pass 2) carry the union-minted framestate
+                // identities.  The mismatch leaves the body's operand
+                // Variables defined as neither an inputarg nor an op
+                // result, so `perform_register_allocation` assigns them
+                // no colour and `assembler::lookup_coloring` aborts.
+                // `self.local_var` here is exactly `setstate(&st)`'s
+                // positional projection of the framestate entries, whose
+                // Variable cells are the same identities `getvariables`
+                // threaded into `inputargs`.
+                self.block_entry_local_var[bb] = self.local_var.clone();
+            }
+            self.lower_block(bb)?;
+            let ex = self.getstate();
+            exit_state[bb] = Some(ex.clone());
+            // Union this exit into each model successor's entry state.
+            // Successors are read off the just-closed exits (the model
+            // edges), skipping the return / except sinks and any
+            // non-MIR target.
+            let succ_targets: Vec<BlockId> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .map(|l| l.target)
+                .collect();
+            for tgt in succ_targets {
+                if tgt == returnblock || tgt == exceptblock {
+                    continue;
+                }
+                let tmir = block_to_mir[tgt.0];
+                if tmir == usize::MAX {
+                    continue;
+                }
+                let merged = match entry_state[tmir].take() {
+                    None => ex.clone(),
+                    Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "framestate: union of predecessors failed at bb{tmir}"
+                        ))
+                    })?,
+                };
+                entry_state[tmir] = Some(merged);
+            }
+        }
+
+        // Model-unreachable blocks: orphan `on_unwind` cleanup chains that
+        // no lowered exit targets — `lower_terminator` strips every unwind
+        // edge (Goto / Assert / Drop / Call all forward to the success
+        // continuation only), so `model_succs` is exactly the set of
+        // lowered exits and an unreachable block here is genuinely
+        // unreferenced.  Mark them `dead` and stub a bare raise so the
+        // graph stays closed for the legacy fallback path, which consumes
+        // this same `FunctionGraph`.  The real path's
+        // `function_graph_to_flowspace` prunes `dead` blocks outright
+        // (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
+        // never reach the rtyper as undefined operands.
+        for bb in 0..n {
+            if reachable[bb] {
+                continue;
+            }
+            let bb_id = self.block_id[bb];
+            let blk = self.graph.block_mut(bb_id);
+            blk.operations.clear();
+            blk.exits.clear();
+            blk.exitswitch = None;
+            self.graph.set_raise(bb_id, "mir-dead");
+            self.graph.block_mut(bb_id).dead = true;
+        }
+
+        // Pass 2 — re-argument the goto / branch links from framestates.
+        for &bb in &rpo {
+            let bb_id = self.block_id[bb];
+            let ex = exit_state[bb].clone().ok_or_else(|| {
+                LowerError::Unsupported(format!("framestate: bb{bb} missing exit state in pass 2"))
+            })?;
+            let exits_meta: Vec<(usize, BlockId)> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.target))
+                .collect();
+            for (idx, tgt) in exits_meta {
+                if tgt == returnblock || tgt == exceptblock {
+                    continue;
+                }
+                let tmir = block_to_mir[tgt.0];
+                if tmir == usize::MAX {
+                    continue;
+                }
+                let tgt_state = entry_state[tmir].clone().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "framestate: bb{tmir} missing entry state in pass 2"
+                    ))
+                })?;
+                let outputargs = ex.getoutputargs(&tgt_state, &self.graph);
+                // Self-validation: every output arg is an exit-state cell
+                // of `bb`, hence must be defined in `bb_id` (as an
+                // inputarg or op result).  If the threading would emit a
+                // Link.arg undefined at its source block, bail to the
+                // monotonic path rather than hand a malformed graph to
+                // the downstream rtyper / legacy fallback (which both
+                // consume this same graph and would fault on the
+                // undefined operand).  This is the `flowspace_adapter`
+                // "every referenced operand must be defined as a block
+                // inputarg or op result" invariant, checked at the
+                // threading site.
+                for arg in &outputargs {
+                    if let LinkArg::Value(var) = arg {
+                        if !self.graph.variable_defined_in_block(bb_id, var) {
+                            if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                                self.debug_dump_undefined_link_arg(
+                                    bb, bb_id, tgt, tmir, var, &ex, &tgt_state,
+                                );
+                            }
+                            return Err(LowerError::Unsupported(format!(
+                                "framestate: threaded Link.arg (var id={}) undefined in source \
+                                 bb{bb} (BlockId {:?}) for edge -> bb{tmir} (BlockId {:?}) \
+                                 in graph {:?}",
+                                var.id(),
+                                bb_id,
+                                tgt,
+                                self.graph.name,
+                            )));
+                        }
+                    }
+                }
+                self.graph.block_mut(bb_id).exits[idx].args = outputargs;
+            }
+        }
+
+        // Final adapter-rejection guard.  The real-path `flowspace_adapter`
+        // rejects a graph if any non-dead block has a `Link.args` operand
+        // that is not defined in its source block (an inputarg or op
+        // result).  A model-reachable raise lowers to `set_raise`, whose
+        // orphan etype/evalue are exactly such operands, so the graph is a
+        // guaranteed real-path Skip — Pass 2 leaves those exceptblock /
+        // returnblock links untouched, so scan every reachable block's
+        // links here.  Threading framestate phis into a graph that will
+        // Skip buys no census drain (it cannot Match) and hands the phis to
+        // the legacy fallback, which cannot type non-startblock inputargs
+        // and miscolours them `GcRef` (assembler Ref/Int mismatch).
+        // Decline such graphs to the monotonic lowering, which the legacy
+        // path consumes exactly as today; the decline is drain-neutral
+        // because a Match is impossible while the orphan operand stands.
+        for &bb in &rpo {
+            let bb_id = self.block_id[bb];
+            if self.graph.block(bb_id).dead {
+                continue;
+            }
+            let undefined: Option<u64> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .flat_map(|l| l.args.iter())
+                .find_map(|arg| match arg {
+                    LinkArg::Value(var) if !self.graph.variable_defined_in_block(bb_id, var) => {
+                        Some(var.id())
+                    }
+                    _ => None,
+                });
+            if let Some(id) = undefined {
+                return Err(LowerError::Unsupported(format!(
+                    "framestate: declines graph {:?} — reachable bb{bb} (BlockId {:?}) has a \
+                     Link.args operand (var id={id}) undefined at its source (real-path adapter \
+                     would Skip; monotonic lowering is legacy-safe)",
+                    self.graph.name, bb_id,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Diagnostic dump for a framestate threading that would emit a
+    /// `Link.arg` undefined at its source block.  Gated behind
+    /// `PYRE_MIR_FRAMESTATE_DEBUG`.  Prints the source / target block
+    /// shapes and both framestates so the alignment bug can be located.
+    #[allow(clippy::too_many_arguments)]
+    fn debug_dump_undefined_link_arg(
+        &self,
+        bb: usize,
+        bb_id: BlockId,
+        tgt: BlockId,
+        tmir: usize,
+        var: &Variable,
+        ex: &FrameState,
+        tgt_state: &FrameState,
+    ) {
+        let id_list = |entries: &[Option<Variable>]| -> String {
+            entries
+                .iter()
+                .map(|e| match e {
+                    Some(v) => v.id().to_string(),
+                    None => "_".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let src = self.graph.block(bb_id);
+        let src_inputargs: Vec<u64> = src.inputargs.iter().map(|v| v.id()).collect();
+        let src_op_results: Vec<u64> = src
+            .operations
+            .iter()
+            .filter_map(|op| op.result.as_ref().map(|v| v.id()))
+            .collect();
+        eprintln!(
+            "[FRAMESTATE undefined-link-arg] graph={:?}\n  edge bb{bb}({:?}) -> bb{tmir}({:?})\n  \
+             undefined var id={}\n  src.inputargs ids=[{:?}]\n  src.op_result ids=[{:?}]\n  \
+             ex.entries ids=[{}]\n  tgt_state.entries ids=[{}]\n  \
+             tgt_state.locals_w.len={} ex.locals_w.len={}",
+            self.graph.name,
+            bb_id,
+            tgt,
+            var.id(),
+            src_inputargs,
+            src_op_results,
+            id_list(&ex.entries),
+            id_list(&tgt_state.entries),
+            tgt_state.locals_w.len(),
+            ex.locals_w.len(),
+        );
     }
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
@@ -1125,12 +1651,20 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // f64 arithmetic stays in the Float bank (`float_add`/
+                // `float_mod`...); everything else — comparisons (bool),
+                // integer math, and checked-arithmetic `(int, bool)`
+                // tuple destinations — is Int.
+                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                    ValueType::Float => ValueType::Float,
+                    _ => ValueType::Int,
+                };
                 Ok((
                     Some(OpKind::BinOp {
                         op: op_label,
                         lhs: lhs_v,
                         rhs: rhs_v,
-                        result_ty: ValueType::Int,
+                        result_ty,
                     }),
                     res,
                 ))
@@ -1199,11 +1733,19 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // `Neg` on f64 stays in the Float bank (`float_neg`);
+                // everything else is Int.  A hardcoded Int here mistyped
+                // float negation and produced cross-bank link renamings
+                // downstream.
+                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                    ValueType::Float => ValueType::Float,
+                    _ => ValueType::Int,
+                };
                 Ok((
                     Some(OpKind::UnaryOp {
                         op: op_label,
                         operand: arg,
-                        result_ty: ValueType::Int,
+                        result_ty,
                     }),
                     res,
                 ))
@@ -1551,12 +2093,18 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, field_ty)) =
+                    && let Some((owner_root, field_name, _field_ty)) =
                         self.resolve_adt_field(field_payload)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
-                    let ty = tyref_to_value_type(&field_ty, self.llbc);
+                    // The projected place's own `ty` is the field type
+                    // AFTER generic substitution; the TypeDecl's field ty
+                    // (`_field_ty`) is the declaration-side generic param
+                    // for generic ADTs (`Result<i64, E>`'s Ok payload
+                    // declares `T`), which `tyref_to_value_type` can only
+                    // degrade to `Ref(None)` — mistyping scalar payloads.
+                    let ty = tyref_to_value_type(&place_ty, self.llbc);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -1796,7 +2344,18 @@ impl<'a> Lowering<'a> {
         kind: &serde_json::Value,
     ) -> Option<(Vec<String>, String, Vec<String>)> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
-        let type_id = adt.first()?.as_u64()?;
+        // The first element is a Charon type body
+        // `{"id": {"Adt": <def_id>} | "Tuple" | {"Builtin": …}, "generics": …}`.
+        // The ADT `def_id` is nested at `[0]["id"]["Adt"]`; a `"Tuple"`
+        // / builtin atom `id` has no user-defined class and falls
+        // through to `None` (the Tuple/Array placeholder).
+        let type_id = adt
+            .first()?
+            .as_object()?
+            .get("id")?
+            .as_object()?
+            .get("Adt")?
+            .as_u64()?;
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
@@ -2281,15 +2840,43 @@ impl<'a> Lowering<'a> {
             NameSeg::Other(v) => v.as_object()?.get("Impl")?,
             _ => return None,
         };
-        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_payload)?;
-        let td = self.llbc.type_by_id(adt_def_id)?;
-        let owner_leaf = td
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
+            Some(adt_def_id) => {
+                let td = self.llbc.type_by_id(adt_def_id)?;
+                td.item_meta
+                    .name_path()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            }
+            // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
+            // the impl owner type unresolved, so the ADT table has no entry.
+            // Fall back to the module Ident immediately preceding the `Impl`
+            // NameSeg, which Charon names after the primitive's impl module
+            // (`core::ptr::mut_ptr::<Impl>::is_null` → `mut_ptr`).  Restricted
+            // to `(module, method)` pairs that have a classdef-less analyzer
+            // reachable through the `getattr` → bound-method path
+            // (`unaryop.rs::ptr_method_is_null`); analyzer-less primitive
+            // methods stay on the `FunctionPath` form so they do not surface a
+            // new panicking `SomeInstance.getattr`.
+            None => {
+                if last_idx < 2 {
+                    return None;
+                }
+                let module_leaf = match &segs[last_idx - 2] {
+                    NameSeg::Ident { ident: (s, _) } => s.as_str(),
+                    _ => return None,
+                };
+                if !NON_ADT_OWNER_METHOD_ALLOWLIST
+                    .iter()
+                    .any(|&(m, f)| m == module_leaf && f == leaf)
+                {
+                    return None;
+                }
+                module_leaf.to_string()
+            }
+        };
         if owner_leaf.is_empty() {
             return None;
         }
@@ -2413,16 +3000,18 @@ impl<'a> Lowering<'a> {
                         .with_llexitcase_from_exitcase(),
                     );
                 }
-                let default_args = self.edge_args(mir_bb, default as usize)?;
-                links.push(
-                    Link::from_variables(
-                        &self.graph,
-                        default_args,
-                        self.block_id[default as usize],
-                        Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
-                    )
-                    .with_prevblock(bb_id),
-                );
+                if !self.switch_default_targets_panic_abort(default) {
+                    let default_args = self.edge_args(mir_bb, default as usize)?;
+                    links.push(
+                        Link::from_variables(
+                            &self.graph,
+                            default_args,
+                            self.block_id[default as usize],
+                            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+                        )
+                        .with_prevblock(bb_id),
+                    );
+                }
                 self.graph.block_mut(bb_id).exitswitch = Some(ExitSwitch::Value(discr_var));
                 self.graph.closeblock(bb_id, links);
                 Ok(())
@@ -2901,13 +3490,21 @@ fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .and_then(serde_json::Value::as_u64)?;
     let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
     let ti = trait_impls.get(trait_impl_id as usize)?;
+    // `impl_trait` is a TraitDeclRef; its trait-decl id field is `id`.
     let trait_id = ti
         .as_object()?
         .get("impl_trait")?
         .as_object()?
-        .get("trait_id")?
+        .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
+    // Only source-local traits participate: std/core trait impls
+    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
+    // are host machinery, not translated-program classes, and keep
+    // their inherent classification.
+    if !td.item_meta.is_local {
+        return None;
+    }
     let trait_leaf = td
         .item_meta
         .name_path()
@@ -3107,10 +3704,15 @@ fn canonical_binop_label(tag: &str, subkind: Option<&str>) -> String {
         ("Mul" | "MulChecked" | "MulWrap", _) => "mul".into(),
         ("Div", _) => "floordiv".into(),
         ("Rem", _) => "mod".into(),
-        // Bitwise.
-        ("BitAnd", _) => "and".into(),
-        ("BitOr", _) => "or".into(),
-        ("BitXor", _) => "xor".into(),
+        // Bitwise.  The canonical pyre labels carry the `bit` prefix so
+        // `jit_codewriter::jtransform` (`bitand`/`bitor`/`bitxor` arm) and
+        // the rtyper adapter `normalize_binop_name` (`bitand`->`and_`,
+        // `bitor`->`or_`, `bitxor`->`xor`) recognise them.  Bare `and`/`or`
+        // are reserved for short-circuit control flow, which never reaches
+        // here: rustc lowers `&&`/`||` to branches before charon.
+        ("BitAnd", _) => "bitand".into(),
+        ("BitOr", _) => "bitor".into(),
+        ("BitXor", _) => "bitxor".into(),
         // Shifts.
         ("Shl" | "ShlChecked" | "ShlWrap", _) => "lshift".into(),
         ("Shr" | "ShrChecked" | "ShrWrap", _) => "rshift".into(),
@@ -3362,6 +3964,64 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         }
     }
     ValueType::Ref(None)
+}
+
+/// The bare leaf name of `ty`'s named-ADT root, after stripping
+/// reference wrappers (`&T` / `&mut T` → `T`, the same contract as
+/// [`tyref_to_ast_string`]).  This is the value `OpKind::Input.class_root`
+/// carries so `derive_subject_inputcells`
+/// (`flowspace_adapter.rs:1860-1885`) can seed a `Ref` parameter with
+/// its cached struct-root `ClassDef` instead of the classdef-less
+/// `SomeInstance` shell.
+///
+/// Returns `None` for:
+///   - primitives / tuples / builtin containers (no class root);
+///   - raw pointers (`*const T` / `*mut T`) — a raw-pointer receiver
+///     answers `is_null` through the classdef-less bound-method arm
+///     (`unaryop.rs:3683`), which a seeded classdef would bypass;
+///   - generic ADT instantiations (`Arg<u32>`) — the registry rows for
+///     a generic decl carry unresolved type-variable field strings, so
+///     a seeded classdef would project bogus attr shells.
+fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let mut node = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        // `{"Ref": [region, ty, kind]}` — strip the reference.
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            node = arr.get(1)?;
+            continue;
+        }
+        let adt = obj.get("Adt")?.as_object()?;
+        let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+        let has_type_args = adt
+            .get("generics")
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| !t.is_empty());
+        if has_type_args {
+            return None;
+        }
+        let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+        return Some(name.rsplit("::").next().unwrap_or(&name).to_string());
+    }
+    None
 }
 
 /// True when `ty` is a non-unit tuple `(A, B, ...)` — Charon's
@@ -3834,6 +4494,16 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
     }
     "field".into()
 }
+
+/// `(module_leaf, method_leaf)` pairs whose primitive/raw-pointer impl
+/// method has a classdef-less analyzer reachable through the `getattr` →
+/// bound-method path, so [`Lowering::impl_method_owner`] may route them as
+/// `CallTarget::Method` even though Charon leaves the `Self` type unresolved
+/// (non-ADT, no entry in the type table).  `mut_ptr::is_null` resolves to
+/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`).  Pairs absent
+/// here keep the `FunctionPath` form rather than surface a new panicking
+/// `SomeInstance.getattr`.
+const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] = &[("mut_ptr", "is_null")];
 
 /// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
 /// raw `NameSeg` vec ends in two consecutive `Ident` segments — the

@@ -291,13 +291,99 @@ impl<'a> Drop for PolicyGuard<'a> {
 
 /// RAII guard for `self.added_blocks = {}; ...; finally:
 /// self.added_blocks = saved` in `complete_helpers()`.
-struct AddedBlocksGuard<'a> {
+///
+/// In the dual-gate per-subject driver the guard additionally enforces
+/// session isolation: a subject that fails (and is Skipped to the legacy
+/// walker) must leave the shared annotator exactly as it found it.
+/// `annotated_at_entry` snapshots the `annotated` keyset at scope open;
+/// unless [`commit`](Self::commit) marks the drive successful, the drop
+/// evicts every block this subject added from `annotated` / `all_blocks`
+/// / `blocked_blocks` and prunes the matching `genpendingblocks` entries.
+/// Without this, a half-annotated leftover poisons every later subject's
+/// session-global `specialize_more_blocks` walk: a `None` (False)
+/// sentinel crashes `specialize_block` (rtyper.rs:1656), and a processed
+/// block carrying an unbound op result raises `KeyError: no binding for
+/// arg`.  `raise_if_subject_blocked` only covers the blocked-on-drain
+/// path; this covers the `compute_at_fixpoint` / late-step / panic-unwind
+/// failure paths that bypass it.
+pub(crate) struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
+    annotated_at_entry: std::collections::HashSet<BlockKey>,
+    committed: std::cell::Cell<bool>,
+}
+
+impl<'a> AddedBlocksGuard<'a> {
+    /// Mark this subject's annotator drive successful so its blocks
+    /// persist (they are `already_seen` after specialize and may back
+    /// later subjects' cross-graph calls). Call right before returning a
+    /// successful result; any earlier `?`/panic exit leaves the guard
+    /// uncommitted and rolls the subject's blocks back out.
+    pub(crate) fn commit(&self) {
+        self.committed.set(true);
+    }
 }
 
 impl<'a> Drop for AddedBlocksGuard<'a> {
     fn drop(&mut self) {
+        if !self.committed.get() {
+            // Best-effort eviction under `try_borrow_mut`: a panic that
+            // unwinds while one of these maps is borrowed degrades to a
+            // leak rather than an abort-during-unwind double-borrow.
+            if let (Ok(mut annotated), Ok(mut all_blocks), Ok(mut blocked_blocks)) = (
+                self.ann.annotated.try_borrow_mut(),
+                self.ann.all_blocks.try_borrow_mut(),
+                self.ann.blocked_blocks.try_borrow_mut(),
+            ) {
+                let new_keys: Vec<BlockKey> = annotated
+                    .keys()
+                    .filter(|k| !self.annotated_at_entry.contains(*k))
+                    .cloned()
+                    .collect();
+                for k in &new_keys {
+                    annotated.shift_remove(k);
+                    blocked_blocks.shift_remove(k);
+                    // Revert each evicted block to a pristine
+                    // "never annotated" state by clearing the
+                    // annotation on every Variable it DEFINES
+                    // (inputargs + operation results).  Dropping the
+                    // block from `annotated` without this leaves a
+                    // half-state: a later subject reaching the same
+                    // (session-shared) block sees `seen_before ==
+                    // false` in `addpendingblock`, takes the
+                    // `bindinputargs` initial-seed path, and calls
+                    // `setbinding` with the caller's (possibly
+                    // narrower) cell over the Variable's retained
+                    // annotation — tripping the monotonicity assert
+                    // `setbinding: new value does not contain old`.
+                    // Mirrors the dual-gate Skip arm's graph-wide
+                    // `var.annotation = None` reset
+                    // (codewriter.rs::dual_gate_type_state).
+                    if let Some(block) = all_blocks.shift_remove(k) {
+                        if let Ok(blk) = block.try_borrow() {
+                            let vars = blk
+                                .inputargs
+                                .iter()
+                                .chain(blk.operations.iter().map(|op| &op.result));
+                            for v in vars {
+                                if let Hlvalue::Variable(var) = v {
+                                    if let Ok(mut slot) = var.annotation.try_borrow_mut() {
+                                        *slot = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !new_keys.is_empty() {
+                    if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
+                        for g in pending.iter_mut() {
+                            g.retain(|k, _| self.annotated_at_entry.contains(k));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(saved) = self.saved.take() {
             *self.ann.added_blocks.borrow_mut() = saved;
         }
@@ -716,9 +802,16 @@ impl RPythonAnnotator {
     /// ```
     pub fn complete_helpers(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        // `complete_helpers` is the RPython helper-graph drive: its
+        // `finally` only restores `added_blocks` (annrpython.py:113-119),
+        // never evicting blocks.  Pre-commit so the guard's
+        // subject-isolation eviction (used by the dual-gate driver) stays
+        // inert here.
         let _guard = AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
+            annotated_at_entry: std::collections::HashSet::new(),
+            committed: std::cell::Cell::new(true),
         };
         self.complete()?;
         // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
@@ -1178,17 +1271,7 @@ impl RPythonAnnotator {
         }
 
         if got_blocked {
-            // Upstream: flip every blocked graph's flag and construct
-            // the multi-line error string via
-            // `format_blocked_annotation_error`.
-            let mut bg = self.blocked_graphs.borrow_mut();
-            for (_k, (_g, flag)) in bg.iter_mut() {
-                *flag = true;
-            }
-            drop(bg);
-            let blocked_blocks = self.blocked_blocks.borrow();
-            let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
-            return Err(crate::annotator::model::AnnotatorError::new(text));
+            return Err(self.blocked_annotation_error());
         }
 
         // Force every return-var annotation to exist.
@@ -1231,6 +1314,84 @@ impl RPythonAnnotator {
             }
         }
         Ok(())
+    }
+
+    /// Construct the orthodox `complete()` blocked-annotation error
+    /// (annrpython.py:248-255): flip every blocked graph's flag and
+    /// render the multi-line "Blocked block" report through
+    /// `format_blocked_annotation_error`.
+    fn blocked_annotation_error(&self) -> crate::annotator::model::AnnotatorError {
+        let mut bg = self.blocked_graphs.borrow_mut();
+        for (_k, (_g, flag)) in bg.iter_mut() {
+            *flag = true;
+        }
+        drop(bg);
+        let blocked_blocks = self.blocked_blocks.borrow();
+        let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
+        crate::annotator::model::AnnotatorError::new(text)
+    }
+
+    /// Open a scoped `added_blocks` tracker around an external drive of
+    /// the pending queue, returning the RAII guard that restores the
+    /// previous tracker on drop. Mirrors the `saved = self.added_blocks;
+    /// self.added_blocks = {}` prologue of `complete_helpers`
+    /// (annrpython.py:113-114) for callers — e.g. the dual-gate
+    /// per-subject driver — that drain via `complete_pending_blocks`
+    /// directly rather than through `complete()`.
+    pub(crate) fn enter_added_blocks_scope(&self) -> AddedBlocksGuard<'_> {
+        let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        let annotated_at_entry: std::collections::HashSet<BlockKey> =
+            self.annotated.borrow().keys().cloned().collect();
+        AddedBlocksGuard {
+            ann: self,
+            saved: Some(saved),
+            annotated_at_entry,
+            committed: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Replicate `complete()`'s blocked-annotation guard
+    /// (annrpython.py:243-255) for callers that drain the pending queue
+    /// via `complete_pending_blocks` instead of `complete()`. When any
+    /// block added in the current `added_blocks` scope stayed in the
+    /// `None` (False) sentinel state — a permanently `BlockedInference`
+    /// block — raise the blocked-annotation error.
+    ///
+    /// Upstream lets the error abort the whole translation; the pyre
+    /// dual-gate instead catches it and skips the subject to the legacy
+    /// walker, then reuses the session-shared annotator for the next
+    /// subject. The subject's blocks are therefore rolled back out of
+    /// the shared maps — otherwise the surviving `None` sentinel crashes
+    /// a later `specialize_block` (rtyper.rs:1656), and a surviving
+    /// `Some` block could insert a link conversion against an evicted
+    /// sentinel successor.
+    pub(crate) fn raise_if_subject_blocked(
+        &self,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
+        let (added_keys, any_blocked): (Vec<BlockKey>, bool) = {
+            let added = self.added_blocks.borrow();
+            let Some(added_set) = added.as_ref() else {
+                return Ok(());
+            };
+            let annotated = self.annotated.borrow();
+            let any_blocked = added_set
+                .keys()
+                .any(|bkey| matches!(annotated.get(bkey), Some(None)));
+            (added_set.keys().cloned().collect(), any_blocked)
+        };
+        if !any_blocked {
+            return Ok(());
+        }
+        let err = self.blocked_annotation_error();
+        let mut annotated = self.annotated.borrow_mut();
+        let mut all_blocks = self.all_blocks.borrow_mut();
+        let mut blocked_blocks = self.blocked_blocks.borrow_mut();
+        for bkey in &added_keys {
+            annotated.shift_remove(bkey);
+            all_blocks.shift_remove(bkey);
+            blocked_blocks.shift_remove(bkey);
+        }
+        Err(err)
     }
 
     // ======================================================================
@@ -1736,7 +1897,11 @@ impl RPythonAnnotator {
     /// `PositionKey` now carries `Weak<FunctionGraph>` + `Weak<Block>`;
     /// if either has been dropped since the position was recorded the
     /// reflow is silently skipped (the block's owner graph is already
-    /// gone).
+    /// gone). The reflow is likewise skipped when the block upgrades but
+    /// is no longer in `annotated`: `raise_if_subject_blocked` (q.v.)
+    /// evicts a Skipped subject's blocks from `annotated` without pruning
+    /// the shared `notify` map, leaving a position whose `Weak<Block>`
+    /// still upgrades against a session-retained `Rc`.
     pub fn reflowfromposition(&self, position_key: &PositionKey) {
         // upstream: `graph, block, index = position_key`
         let Some(graph) = position_key.graph() else {
@@ -1745,6 +1910,16 @@ impl RPythonAnnotator {
         let Some(block) = position_key.block() else {
             return;
         };
+        // A `notify` position may target a block that left `annotated`
+        // via the `raise_if_subject_blocked` rollback. Such a target is
+        // no longer scheduled, so skip the reflow — restoring the
+        // invariant (annrpython.py:392/418) that a reflow target is
+        // present in `annotated`. `reflowpendingblock`'s assert is
+        // intentionally left intact for genuine in-session ordering
+        // violations.
+        if !self.annotated.borrow().contains_key(&BlockKey::of(&block)) {
+            return;
+        }
         self.reflowpendingblock(&graph, &block);
     }
 
@@ -1928,11 +2103,21 @@ impl RPythonAnnotator {
         // upstream `resultcell = op.consider(self)`; AnnotatorError
         // raised inside get_specialization / registered handlers
         // propagates as `FlowinError::Annotator` via the `?`.
-        let resultcell = hlop.consider(self)?;
-        // upstream: None → s_ImpossibleValue; s_ImpossibleValue → block.
-        if matches!(resultcell, SomeValue::Impossible) {
-            return Err(BlockedInference::new(self, hlop.clone(), None).into());
-        }
+        //
+        // upstream annrpython.py:654-657 distinguishes a handler that
+        // returns Python `None` (a void op such as `setattr`) from one
+        // that returns `s_ImpossibleValue`:
+        //   if resultcell is None:                # void → bind impossible, no block
+        //       resultcell = s_ImpossibleValue
+        //   elif resultcell == s_ImpossibleValue: # the operation cannot succeed
+        //       raise BlockedInference(self, op, -1)
+        let resultcell = match hlop.consider(self)? {
+            None => SomeValue::Impossible,
+            Some(SomeValue::Impossible) => {
+                return Err(BlockedInference::new(self, hlop.clone(), None).into());
+            }
+            Some(cell) => cell,
+        };
         Ok(resultcell)
     }
 
@@ -2012,6 +2197,41 @@ impl RPythonAnnotator {
             // upgrade them back (reflowfromposition consumes these).
             let pk = super::bookkeeper::PositionKey::from_refs(graph, block, i);
             let _pg = self.bookkeeper.at_position(Some(pk));
+
+            // `same_as` — pyre's front-end cast lowering
+            // (`front/ast.rs::lower_value_cast`) emits the rtyper
+            // renaming op (`rtyper.py:478-481`) directly into the flow
+            // graph to carry an identity / source-type-unknown
+            // `Expr::Cast`'s target `result_ty` down to
+            // `rbuiltin::rtype_same_as`.  RPython's `operation.py` never
+            // registers `same_as` (it is rtyper-generated), so
+            // `OpKind::from_opname` declines it and the canonical
+            // dispatch below would fall into the "Unknown op → skip"
+            // branch, leaving the result Variable unbound — the next
+            // operation that reads it then raises an unbound-argument
+            // `AnnotatorError`.  At the annotation level the cast is a
+            // pure identity: the operand's `SomeValue` is unchanged (the
+            // lltype retype is applied later by `rtype_same_as`), so bind
+            // the result to the operand's binding, matching upstream
+            // `setbinding(op.result, binding(op.args[0]))`.
+            {
+                let is_same_as = {
+                    let blk = block.borrow();
+                    let sp = &blk.operations[i];
+                    sp.opname == "same_as" && sp.args.len() == 1
+                };
+                if is_same_as {
+                    let arg = block.borrow().operations[i].args[0].clone();
+                    if let Some(s_arg) = self.annotation(&arg) {
+                        let mut blk = block.borrow_mut();
+                        if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
+                            self.setbinding(v, s_arg);
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
 
             // Reify `SpaceOperation` (Block storage) into an
             // `HLOperation` the dispatcher can consume. Upstream
@@ -2933,6 +3153,55 @@ mod tests {
         assert!(blocked.contains_key(&bkey));
     }
 
+    #[test]
+    fn reflowfromposition_skips_block_evicted_from_annotated() {
+        // `raise_if_subject_blocked` evicts a Skipped subject's blocks
+        // from `annotated` but leaves the shared `notify` map untouched;
+        // the block's session-retained `Rc` keeps the position's
+        // `Weak<Block>` upgradeable. A later notify reflow must silently
+        // skip such a dangling position instead of asserting in
+        // `reflowpendingblock`.
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let caller = mk_graph("caller", 0);
+        let callee = mk_graph("callee", 1);
+        let caller_startblock = caller.borrow().startblock.clone();
+        let whence = Some((Rc::clone(&caller), Rc::clone(&caller_startblock), 0));
+        ann.recursivecall(
+            &callee,
+            whence,
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
+        );
+
+        // Annotate the caller block, then evict it (mirroring the
+        // rollback in `raise_if_subject_blocked`) while notify still
+        // points at it.
+        let bkey = BlockKey::of(&caller_startblock);
+        ann.annotated
+            .borrow_mut()
+            .insert(bkey.clone(), Some(Rc::clone(&caller)));
+        ann.annotated.borrow_mut().shift_remove(&bkey);
+        assert!(!ann.annotated.borrow().contains_key(&bkey));
+
+        // Fire the stale notify position — must not panic.
+        let returnblock = callee.borrow().returnblock.clone();
+        let positions: Vec<_> = ann
+            .notify
+            .borrow()
+            .get(&BlockKey::of(&returnblock))
+            .cloned()
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default();
+        assert_eq!(positions.len(), 1);
+        for position in &positions {
+            ann.reflowfromposition(position);
+        }
+
+        // The evicted block was neither re-scheduled nor re-blocked.
+        assert!(!ann.annotated.borrow().contains_key(&bkey));
+        assert!(!ann.blocked_blocks.borrow().contains_key(&bkey));
+    }
+
     // ------------------------------------------------------------------
     // Dispatch::None consider() — upstream operation.py:534-565.
     // ------------------------------------------------------------------
@@ -2960,7 +3229,7 @@ mod tests {
         let args = blk.inputargs.clone();
         drop(blk);
         let hlop = HLOperation::new(OpKind::NewTuple, args);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         if let SomeValue::Tuple(t) = got {
             assert_eq!(t.items.len(), 2);
             assert!(matches!(t.items[0], SomeValue::Integer(_)));
@@ -2987,7 +3256,7 @@ mod tests {
         }
         let args = startblock.borrow().inputargs.clone();
         let hlop = HLOperation::new(OpKind::NewList, args);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         if let SomeValue::List(list) = got {
             assert!(matches!(list.listdef.s_value(), SomeValue::Integer(_)));
         } else {
@@ -3002,7 +3271,7 @@ mod tests {
         use super::super::super::flowspace::operation::{HLOperation, OpKind};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let hlop = HLOperation::new(OpKind::NewDict, vec![]);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         assert!(matches!(got, SomeValue::Dict(_)));
     }
 
