@@ -277,10 +277,12 @@ pub unsafe fn w_range_fields(obj: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyO
 /// `obj` must be a valid int, long, or bool object.
 pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
-        if is_int(obj) {
-            BigInt::from(crate::intobject::w_int_get_value(obj))
-        } else if is_bool(obj) {
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first;
+        // a bool reads through `w_bool_get_value`, not the int accessor.
+        if is_bool(obj) {
             BigInt::from(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else if is_int(obj) {
+            BigInt::from(crate::intobject::w_int_get_value(obj))
         } else {
             crate::longobject::w_long_get_value(obj).clone()
         }
@@ -302,10 +304,11 @@ pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
 /// `obj` must be a valid int/long/bool object.
 pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
     unsafe {
-        if is_int(obj) {
-            Some(crate::intobject::w_int_get_value(obj))
-        } else if is_bool(obj) {
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+        if is_bool(obj) {
             Some(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else if is_int(obj) {
+            Some(crate::intobject::w_int_get_value(obj))
         } else {
             use num_traits::ToPrimitive;
             crate::longobject::w_long_get_value(obj).to_i64()
@@ -564,16 +567,17 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 // ── Long range iterator ──
 //
 // `objspace/std/iterobject.py W_LongRangeIterator` — the cursor `iter()`
-// produces for a range whose bounds exceed a machine word.  `start`,
-// `step` and `len` stay wrapped (set once at construction); only the
-// machine-int `index` advances, so no GC pointer field is ever mutated.
+// produces for a range whose bounds exceed a machine word.  `start`, `step`
+// and `len` are set once at construction; `index` is a wrapped integer that
+// advances by one each step (`self.w_index`), so the cursor keeps arbitrary
+// precision and never overflows for a range longer than a machine word.
 
-#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+#[pyre_class("range_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
 pub struct W_LongRangeIterator {
     pub start: PyObjectRef,
     pub step: PyObjectRef,
     pub len: PyObjectRef,
-    pub index: i64,
+    pub index: PyObjectRef,
 }
 
 /// Allocate a `W_LongRangeIterator`.
@@ -586,6 +590,8 @@ pub fn w_long_range_iter_new(
     crate::gc_roots::pin_root(start);
     crate::gc_roots::pin_root(step);
     crate::gc_roots::pin_root(len);
+    let index = crate::intobject::w_int_new(0);
+    crate::gc_roots::pin_root(index);
     W_LongRangeIterator::allocate(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -594,7 +600,7 @@ pub fn w_long_range_iter_new(
         start,
         step,
         len,
-        index: 0,
+        index,
     })
 }
 
@@ -613,7 +619,7 @@ pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
     unsafe {
         let it = obj as *const W_LongRangeIterator;
         let len = range_obj_to_bigint((*it).len);
-        let rem = len - BigInt::from((*it).index);
+        let rem = len - range_obj_to_bigint((*it).index);
         if rem < BigInt::from(0) {
             BigInt::from(0)
         } else {
@@ -629,7 +635,7 @@ pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
 pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
     unsafe {
         let it = obj as *const W_LongRangeIterator;
-        BigInt::from((*it).index) < range_obj_to_bigint((*it).len)
+        range_obj_to_bigint((*it).index) < range_obj_to_bigint((*it).len)
     }
 }
 
@@ -641,17 +647,20 @@ pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
 pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
         let it = obj as *mut W_LongRangeIterator;
-        let index = (*it).index;
+        let index = range_obj_to_bigint((*it).index);
         let len = range_obj_to_bigint((*it).len);
-        if BigInt::from(index) >= len {
+        if index >= len {
             return None;
         }
         let start = range_obj_to_bigint((*it).start);
         let step = range_obj_to_bigint((*it).step);
-        let value = start + BigInt::from(index) * step;
-        // Only the machine-int index is mutated; the wrapped fields stay
-        // immutable, so no GC pointer field is overwritten.
-        (*it).index = index + 1;
+        // `w_result = self.w_index * self.w_step + self.w_start`, then
+        // `self.w_index = self.w_index + 1` (wrapped, arbitrary precision).
+        let value = start + index.clone() * step;
+        let _roots = crate::gc_roots::push_roots();
+        let next_index = range_bigint_to_obj(index + BigInt::from(1));
+        crate::gc_roots::pin_root(next_index);
+        (*it).index = next_index;
         Some(range_bigint_to_obj(value))
     }
 }
