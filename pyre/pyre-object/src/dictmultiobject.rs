@@ -92,15 +92,6 @@ impl PartialEq for ObjectKey {
 
 impl Eq for ObjectKey {}
 
-/// `dictmultiobject.py:1209-1212 r_dict(_, hash_w, ...)` —
-/// `space.hash_w(obj)` precomputed for bucket placement.  When the
-/// `dict_eq_hook::HASH_W_HOOK` trampoline isn't installed (pyre-object
-/// lib tests, snapshot builds before init) we fall back to a structural
-/// hash that mirrors `dict_keys_equal`'s built-in type ladder so the
-/// `Hash` ⇔ `Eq` contract holds for the builtin-keyed dicts that the
-/// crate's unit tests exercise (str, int, bool, bytes, tuple, frozenset).
-/// Unknown types still pointer-hash — sufficient because their
-/// `dict_keys_equal` arm short-circuits on `std::ptr::eq` first.
 /// View a key as `&str` only when it is a str whose backing is valid UTF-8.
 /// A lone-surrogate str returns `None` so the `&str`-keyed proxy fast paths
 /// (which cannot represent it) fall through to the generic object-keyed path.
@@ -113,9 +104,17 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
     }
 }
 
+/// `dictmultiobject.py:1209-1212 r_dict(_, hash_w, ...)` —
+/// `space.hash_w(obj)` precomputed for bucket placement.  There is a
+/// single hashing path: the `dict_eq_hook::HASH_W_HOOK` trampoline,
+/// installed at boot before any dict is built (production) or per test
+/// thread (`#[cfg(test)]`).  A missing hook is a setup bug, not a
+/// recoverable state, so [`missing_hash_hook`](crate::dict_eq_hook::missing_hash_hook)
+/// fails loud rather than substituting a divergent structural hash.
 #[inline]
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
-    let hash = crate::dict_eq_hook::try_hash_w(obj).unwrap_or_else(|| builtin_structural_hash(obj));
+    let hash = crate::dict_eq_hook::try_hash_w(obj)
+        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error().is_some() {
         // Infallible path: swallow the error and use structural hash.
         // Checked callers should use `object_key_for_checked` instead.
@@ -129,7 +128,8 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
 /// error from the interpreter-side error slot.
 #[inline]
 pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, DictKeyError> {
-    let hash = crate::dict_eq_hook::try_hash_w(obj).unwrap_or_else(|| builtin_structural_hash(obj));
+    let hash = crate::dict_eq_hook::try_hash_w(obj)
+        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error().is_some() {
         return Err(DictKeyError);
     }
@@ -175,12 +175,14 @@ unsafe fn _never_equal_to_int(key: PyObjectRef) -> bool {
 #[derive(Debug)]
 pub struct DictKeyError;
 
-/// Content-based fallback for `object_key_for` when the hash_w hook
-/// isn't installed.  Walks the same type ladder as `dict_keys_equal`
-/// (`:1207-1260`) so that two PyObjectRefs which compare equal via
-/// content hash to the same bucket.  Used only when no `HASH_W_HOOK`
-/// trampoline is registered — under a live pyre-jit init this is
-/// shadowed by `space.hash_w` per `baseobjspace.py:840-845`.
+/// Test-only structural hash hook.  Walks the same built-in type ladder
+/// as `dict_keys_equal` (`:1207-1260`) so equal keys land in the same
+/// bucket, giving `#[cfg(test)]` dict tests a single deterministic hash
+/// path without reaching into `pyre-interpreter`'s `space.hash_w` (which
+/// lives in a crate above this one).  Installed via `register_hash_w_hook`
+/// by the test harness; never a production code path — production hashes
+/// exclusively through `space.hash_w` (`baseobjspace.py:840-845`).
+#[cfg(test)]
 unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
     if obj.is_null() {
         return 0;
@@ -1260,6 +1262,58 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
         }
     }
     None
+}
+
+/// GC root walk over a `W_ModuleDictObject`'s movable references.
+///
+/// A module dict's authoritative storage is reached only behind raw
+/// pointers — the `dstorage` cell map, the post-`switch_to_object_strategy`
+/// `object_storage`, and the `mstrategy.caches` cell registry — none of
+/// which are inline `gc_ptr_offsets`.  The W_ModuleDictObject is
+/// currently `malloc_typed` (Box-immortal), so its registered
+/// `module_dict_object_custom_trace` never fires; without an explicit
+/// walk, `LOAD_GLOBAL` (`w_module_dict_getitem_str`, which reads the
+/// authoritative `dstorage` cell map ahead of the proxy back-mirror)
+/// would observe relocated values through never-forwarded slots.
+/// `walk_pyframe_roots` calls this for every live frame's globals and
+/// builtins so the real storage stays forwarded across collection.
+/// No-op for non-module dicts.
+///
+/// `visitor` receives each movable value slot; `walk_module_value_slot`
+/// unwraps `MutableCell`s (themselves Box-immortal) to forward the inner
+/// `w_value` rather than the stable cell pointer.
+///
+/// # Safety
+/// `obj` must be a valid `PyObjectRef` (null tolerated).  `visitor` must
+/// tolerate being called on every movable slot reachable here.
+pub unsafe fn w_module_dict_walk_gc_cells(
+    obj: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    if obj.is_null() || !is_module_dict(obj) {
+        return;
+    }
+    let md = &mut *(obj as *mut W_ModuleDictObject);
+    if !md.dstorage.is_null() {
+        let storage = &mut *md.dstorage;
+        for value in storage.iter_values_mut() {
+            crate::celldict::walk_module_value_slot(value, visitor);
+        }
+    }
+    if !md.object_storage.is_null() {
+        let object_storage = &mut *md.object_storage;
+        for (key, value) in object_storage.iter_mut() {
+            // ObjectKey.hash is precomputed and identity-stable across GC
+            // moves, so writing through the raw obj slot does not desync
+            // the IndexMap bucket index.
+            let key_ptr = key as *const ObjectKey as *mut ObjectKey;
+            visitor(&mut (*key_ptr).obj);
+            crate::celldict::walk_module_value_slot(value, visitor);
+        }
+    }
+    if !md.mstrategy.is_null() {
+        (*md.mstrategy).walk_cache_cells(visitor);
+    }
 }
 
 /// `celldict.py:106-126 delitem` (str path).
@@ -3142,6 +3196,15 @@ mod tests {
     use crate::intobject::{w_int_get_value, w_int_new};
     use crate::w_str_new;
 
+    /// Install the single hash path on this test thread.  pyre-object
+    /// cannot reach `pyre-interpreter`'s `space.hash_w`, so its own dict
+    /// tests register the deterministic builtin structural hash; the
+    /// `register_hash_w_hook` cell is thread-local and libtest spawns a
+    /// fresh thread per `#[test]`, so each dict-building test installs it.
+    fn install_test_hash_hook() {
+        crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
+    }
+
     #[test]
     fn test_dict_int_key() {
         let dict = w_dict_new();
@@ -3154,6 +3217,7 @@ mod tests {
 
     #[test]
     fn test_dict_str_key() {
+        install_test_hash_hook();
         let dict = w_dict_new();
         unsafe {
             w_dict_setitem_str(dict, "hello", w_int_new(42));
@@ -3167,6 +3231,7 @@ mod tests {
 
     #[test]
     fn test_dict_pyobj_key() {
+        install_test_hash_hook();
         let dict = w_dict_new();
         let key = crate::w_str_new("test");
         unsafe {
@@ -3215,6 +3280,9 @@ mod tests {
     /// process — the assertion is therefore stable here.
     #[test]
     fn test_w_dict_proxied_hookless_falls_back_to_entries_vec() {
+        // "hookless" here means the dict_storage *items* hook is absent;
+        // the hash hook is still required to bucket str keys.
+        install_test_hash_hook();
         let dict = w_dict_new();
         unsafe {
             // Non-null sentinel; the hook never fires because no hook

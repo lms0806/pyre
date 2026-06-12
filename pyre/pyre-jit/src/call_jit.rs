@@ -2748,41 +2748,57 @@ fn bh_call_self_recursive_portal(
 /// blackhole.py bhimpl_residual_call parity: variable-arity call helper.
 ///
 /// Convention: residual_call_r_r dispatches with
-/// args=[callable, arg0, ..., argN].  RPython `bhimpl_residual_call_r_r`
-/// (blackhole.py:1227) carries no frame — `cpu.bh_call_r(func, None,
-/// args_r, ...)`; `bh_call_fn_impl` resolves the parent frame from the
-/// execution context's top frame instead of a threaded operand.
+/// args=[callable, null_or_self, arg0, ..., argN].  RPython
+/// `bhimpl_residual_call_r_r` (blackhole.py:1227) carries no frame —
+/// `cpu.bh_call_r(func, None, args_r, ...)`; `bh_call_fn_impl` resolves
+/// the parent frame from the execution context's top frame instead of a
+/// threaded operand.  `null_or_self` is the CALL opcode's self slot
+/// (eval.rs:3216-3226): non-null means a method receiver to prepend as
+/// arg0, NULL means a plain call.
 ///
-/// For nargs=0: fn(callable) → 1 arg
-/// For nargs=1: fn(callable, arg0) → 2 args
-/// For nargs=2: fn(callable, arg0, arg1) → 3 args
-/// For nargs=3: fn(callable, arg0, arg1, arg2) → 4 args
+/// For nargs=0: fn(callable, null_or_self) → 2 args
+/// For nargs=1: fn(callable, null_or_self, arg0) → 3 args
+/// For nargs=2: fn(callable, null_or_self, arg0, arg1) → 4 args
 /// etc.
-pub extern "C" fn bh_call_fn(callable: i64, arg0: i64) -> i64 {
-    bh_call_fn_impl(callable as PyObjectRef, &[arg0 as PyObjectRef])
-}
-
-pub extern "C" fn bh_call_fn_0(callable: i64) -> i64 {
-    bh_call_fn_impl(callable as PyObjectRef, &[])
-}
-
-pub extern "C" fn bh_call_fn_2(callable: i64, arg0: i64, arg1: i64) -> i64 {
+pub extern "C" fn bh_call_fn(callable: i64, null_or_self: i64, arg0: i64) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
+        &[arg0 as PyObjectRef],
+    )
+}
+
+pub extern "C" fn bh_call_fn_0(callable: i64, null_or_self: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, null_or_self as PyObjectRef, &[])
+}
+
+pub extern "C" fn bh_call_fn_2(callable: i64, null_or_self: i64, arg0: i64, arg1: i64) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[arg0 as PyObjectRef, arg1 as PyObjectRef],
     )
 }
 
-pub extern "C" fn bh_call_fn_3(callable: i64, a0: i64, a1: i64, a2: i64) -> i64 {
+pub extern "C" fn bh_call_fn_3(callable: i64, null_or_self: i64, a0: i64, a1: i64, a2: i64) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[a0 as PyObjectRef, a1 as PyObjectRef, a2 as PyObjectRef],
     )
 }
 
-pub extern "C" fn bh_call_fn_4(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+pub extern "C" fn bh_call_fn_4(
+    callable: i64,
+    null_or_self: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[
             a0 as PyObjectRef,
             a1 as PyObjectRef,
@@ -2792,9 +2808,18 @@ pub extern "C" fn bh_call_fn_4(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64
     )
 }
 
-pub extern "C" fn bh_call_fn_5(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+pub extern "C" fn bh_call_fn_5(
+    callable: i64,
+    null_or_self: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[
             a0 as PyObjectRef,
             a1 as PyObjectRef,
@@ -2807,6 +2832,7 @@ pub extern "C" fn bh_call_fn_5(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64
 
 pub extern "C" fn bh_call_fn_6(
     callable: i64,
+    null_or_self: i64,
     a0: i64,
     a1: i64,
     a2: i64,
@@ -2816,6 +2842,7 @@ pub extern "C" fn bh_call_fn_6(
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[
             a0 as PyObjectRef,
             a1 as PyObjectRef,
@@ -2829,6 +2856,7 @@ pub extern "C" fn bh_call_fn_6(
 
 pub extern "C" fn bh_call_fn_7(
     callable: i64,
+    null_or_self: i64,
     a0: i64,
     a1: i64,
     a2: i64,
@@ -2839,6 +2867,7 @@ pub extern "C" fn bh_call_fn_7(
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[
             a0 as PyObjectRef,
             a1 as PyObjectRef,
@@ -2853,6 +2882,7 @@ pub extern "C" fn bh_call_fn_7(
 
 pub extern "C" fn bh_call_fn_8(
     callable: i64,
+    null_or_self: i64,
     a0: i64,
     a1: i64,
     a2: i64,
@@ -2864,6 +2894,7 @@ pub extern "C" fn bh_call_fn_8(
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
+        null_or_self as PyObjectRef,
         &[
             a0 as PyObjectRef,
             a1 as PyObjectRef,
@@ -2889,7 +2920,20 @@ pub extern "C" fn bh_call_fn_8(
 /// walks the caller chain, so the parent frame is resolved here from the
 /// execution context's top frame (`space.getexecutioncontext()
 /// .gettopframe()`), matching the upstream frame-less ABI.
-fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+    // eval.rs:3216-3226 — a non-null null_or_self is the method receiver
+    // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
+    // as `callable(null_or_self, *args)`.
+    let full_args;
+    let args = if null_or_self.is_null() {
+        args
+    } else {
+        let mut v = Vec::with_capacity(1 + args.len());
+        v.push(null_or_self);
+        v.extend_from_slice(args);
+        full_args = v;
+        &full_args
+    };
     // `space.getexecutioncontext()` (call.rs:198 → TLS-pinned EC the eval
     // loop stamps on entry) `.gettopframe()` is the active caller frame —
     // `executioncontext.py:85-89 enter` / `:91-109 leave` keep
@@ -3068,6 +3112,41 @@ pub extern "C" fn bh_load_global_fn(
     let exc_obj = err.to_exc_object();
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
     0
+}
+
+/// `LOAD_ATTR` / method-form `LOAD_ATTR` residual for the standalone
+/// (blackhole / deopt) per-CodeObject jitcode.  pyre's codewriter cannot
+/// rtype `getattr` into `getfield_gc` (`rclass.py:838 rtype_getattr`
+/// rewrites `getattr` → `getfield_gc` after rtyping; pyre has no rtyper),
+/// so the per-CodeObject jitcode lowers `LOAD_ATTR` to this residual call
+/// rather than `abort_permanent`.  `LOAD_ATTR` is walker-skipped during
+/// trace recording (`trace_opcode.rs` `walker_skip_opcodes`), so this
+/// helper runs ONLY on the blackhole resume / deopt path — the optimized
+/// trace records `jit_getattr` via the trait leg instead.
+///
+/// Mirrors the interpreter `eval.rs` `load_attr` / `load_method` getattr
+/// fallback (`baseobjspace::getattr_str`): returns the (possibly bound)
+/// attribute.  For the method form the codewriter pushes the result plus
+/// a `PY_NULL` self-slot; the bound method already carries `self`, so the
+/// following `CALL` (`eval.rs:3180-3190`) invokes it with `null_or_self ==
+/// NULL`, producing the same call as the unbound `[w_descr, self]` fast
+/// path.  On `AttributeError` it sets `BH_LAST_EXC_VALUE` and returns 0,
+/// matching `bh_load_global_fn`'s NameError path.  `w_name` is the
+/// interned immortal str constant the flatten driver lowers the getattr
+/// HLOp's name operand to (`flatten_constant_operand` → `box_str_constant`),
+/// the same interned-name ABI as `_pure_lookup_where_with_method_cache`.
+pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    let res = pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name);
+    match res {
+        Ok(w_value) => w_value as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
 }
 
 /// Load a constant from the code object.

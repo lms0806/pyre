@@ -980,6 +980,18 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_load_attr(self, name)
     }
 
+    /// LOAD_ATTR non-method branch threaded with the bytecode `nameindex` for
+    /// the interpreter mapdict attribute cache (pyopcode.py:1024-1027). The
+    /// default ignores `nameindex` and runs the uncached path, so MIFrame and
+    /// the JIT tracer keep identical behavior; PyFrame overrides it to consult
+    /// `pycode._mapdict_caches[nameindex]` (only under `not we_are_jitted()`).
+    fn load_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        OpcodeStepExecutor::load_attr(self, name)
+    }
+
     /// LOAD_ATTR with is_method=true. Default: push [attr, NULL].
     ///
     /// PyFrame overrides this to push [attr, self] for instance method
@@ -1001,6 +1013,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler,
     {
         opcode_store_attr(self, name)
+    }
+
+    /// STORE_ATTR threaded with the bytecode `nameindex` for the interpreter
+    /// mapdict attribute cache (pyopcode.py:917-926). The default ignores
+    /// `nameindex` and runs the uncached path; PyFrame overrides it to consult
+    /// `pycode._mapdict_caches[nameindex]` (only under `not we_are_jitted()`).
+    fn store_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        OpcodeStepExecutor::store_attr(self, name)
     }
 
     fn get_iter(&mut self) -> Result<(), PyError>
@@ -2686,7 +2709,7 @@ pub fn execute_store_attr<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let name_idx = u32_as_usize(namei.get(op_arg));
-    OpcodeStepExecutor::store_attr(executor, code.names[name_idx].as_ref())?;
+    executor.store_attr_cached(code.names[name_idx].as_ref(), name_idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -2736,7 +2759,7 @@ where
     if attr.is_method() {
         executor.load_method(name)?;
     } else {
-        OpcodeStepExecutor::load_attr(executor, name)?;
+        executor.load_attr_cached(name, name_idx)?;
     }
     Ok(StepResult::Continue)
 }

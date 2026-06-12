@@ -258,6 +258,12 @@ pub struct MiniMarkGC {
     /// incminimark.py:315-317: log2(card_page_indices).
     /// 0 if card marking is disabled.
     card_page_shift: u32,
+    /// When true, `alloc_with_type` forces a full collection before every
+    /// allocation (see the `gc_stress` cargo feature). Off by default; opted in
+    /// per instance via [`MiniMarkGC::set_stress_collect`]. Exists only under
+    /// the feature so the default build carries no extra field or branch.
+    #[cfg(feature = "gc_stress")]
+    stress_collect: bool,
 }
 
 impl MiniMarkGC {
@@ -293,6 +299,11 @@ impl MiniMarkGC {
             _infobits_offset_plus: 0,
             _T_IS_RPYTHON_INSTANCE_BYTE: 0,
             card_page_shift: 0,
+            // gc.py:603-617 has no analogue; seeded from the `MAJIT_GC_STRESS`
+            // env var so a whole binary can be stressed without code edits,
+            // while individual tests use `set_stress_collect`.
+            #[cfg(feature = "gc_stress")]
+            stress_collect: std::env::var_os("MAJIT_GC_STRESS").is_some(),
         };
         // incminimark.py:314-317
         if gc.config.card_page_indices > 0 {
@@ -435,6 +446,21 @@ impl MiniMarkGC {
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
     /// Returns a GcRef pointing to the object payload (after the header).
     pub fn alloc_with_type(&mut self, type_id: u32, payload_size: usize) -> GcRef {
+        // gc_stress: force a full collection *before* allocating so that any
+        // object live at this allocation point but unreachable from a
+        // registered root or custom-trace path is moved/swept deterministically
+        // — turning a latent dangling pointer into an immediate failure. The
+        // collection runs before reserving the new object so the returned
+        // pointer is never itself moved. Gated on both the `gc_stress` feature
+        // (so default/release builds compile no branch) and the per-instance
+        // `stress_collect` flag (so an opted-in GC stresses only the allocations
+        // it owns, leaving unrelated suites — and their `minor_collections == 0`
+        // assertions — untouched).
+        #[cfg(feature = "gc_stress")]
+        if self.stress_collect {
+            self.do_collect_full();
+        }
+
         let total_size = GcHeader::SIZE + payload_size;
 
         // Large objects go directly to old gen.
@@ -1382,6 +1408,14 @@ impl MiniMarkGC {
     /// Set the per-step marking budget in bytes.
     pub fn set_mark_budget(&mut self, budget: usize) {
         self.incr_state.mark_budget_per_step = budget;
+    }
+
+    /// Enable or disable `gc_stress` forced-collection-per-allocation for this
+    /// instance. Only present under the `gc_stress` feature; callers gate use
+    /// with `#[cfg(feature = "gc_stress")]`.
+    #[cfg(feature = "gc_stress")]
+    pub fn set_stress_collect(&mut self, on: bool) {
+        self.stress_collect = on;
     }
 
     /// Perform a full (major) mark-sweep collection.
@@ -3746,6 +3780,68 @@ mod tests {
         assert_eq!(frame[3], 0xBEEF);
 
         gc.roots.clear();
+    }
+
+    /// With `set_stress_collect(true)`, `alloc_with_type` forces a full
+    /// collection on every allocation. A large nursery is used so that no
+    /// collection would fire naturally across these allocations — the
+    /// collection counter therefore isolates the flag's effect. A rooted
+    /// nursery object must be forwarded out of the nursery and stay valid.
+    #[test]
+    #[cfg(feature = "gc_stress")]
+    fn test_gc_stress_forces_collection_per_alloc() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1 << 20); // 1 MiB nursery: no natural collection here.
+        gc.set_stress_collect(true);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let obj = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj.0 as *mut GcRef) = GcRef::NULL;
+        }
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root as *mut GcRef);
+        }
+
+        let before = gc.minor_collections;
+        for _ in 0..5 {
+            let _ = gc.alloc_with_type(tid, ptr_size);
+        }
+        assert!(
+            gc.minor_collections >= before + 5,
+            "stress_collect must force a collection on every allocation"
+        );
+
+        // The rooted object was forwarded; the root slot must now hold a
+        // valid, non-nursery address.
+        assert!(!root.is_null());
+        assert!(
+            !gc.is_in_nursery(root.0),
+            "rooted object should have been promoted out of the nursery"
+        );
+
+        gc.roots.clear();
+    }
+
+    /// Isolation guarantee: with the `gc_stress` feature compiled in but
+    /// `stress_collect` left off (the default), a large-nursery GC performs no
+    /// forced collection — so suites that assert `minor_collections == 0` are
+    /// unaffected even when the feature is enabled workspace-wide.
+    #[test]
+    #[cfg(feature = "gc_stress")]
+    fn test_gc_stress_off_by_default() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1 << 20);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        for _ in 0..5 {
+            let _ = gc.alloc_with_type(tid, ptr_size);
+        }
+        assert_eq!(
+            gc.minor_collections, 0,
+            "stress_collect defaults off: no collection without opt-in"
+        );
     }
 
     #[test]

@@ -31,25 +31,38 @@ pub struct Weakref {
 /// `sizeof_weakref = llmemory.sizeof(WEAKREF)` (gctypelayout.py:589).
 pub const SIZEOF_WEAKREF: usize = std::mem::size_of::<Weakref>();
 
-/// Allocate a new WEAKREF GcStruct via the active GC and initialise
-/// its single `weakptr` slot to `target`. Returns null when no GC
-/// hook is installed on this thread (test environments that did not
-/// wire `pyre-jit`).
+impl crate::lltype::GcType for Weakref {
+    fn type_id() -> u32 {
+        WEAKREF_GC_TYPE_ID
+    }
+    const SIZE: usize = SIZEOF_WEAKREF;
+}
+
+/// Allocate a new WEAKREF GcStruct via the active GC and initialise its single
+/// `weakptr` slot to `target`. Always returns a non-null, usable weakref:
+/// `weakref.ref(...)` never fails in PyPy, and under
+/// `translation.rweakref=False` it is implemented as a strong reference
+/// (rweakref.py:11-16). When no GC hook is installed yet (pre-build bootstrap,
+/// e.g. a module-level `class B(A)` evaluated before the JIT GC is wired) or the
+/// GC reports OOM, fall back to a Box-immortal `Weakref`: a never-collected slot
+/// whose `weakptr` stays valid — exactly the rweakref-off strong-ref mode.
 ///
 /// # Safety
 ///
 /// Caller must ensure `target` outlives the weakref or accept that a
-/// subsequent collection will null the slot.
+/// subsequent collection will null the slot (GC-allocated path only; the
+/// Box-immortal bootstrap slot is never cleared).
 pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
-    let Some(payload) = try_gc_alloc(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF) else {
-        return std::ptr::null_mut();
-    };
-    if payload.is_null() {
-        return std::ptr::null_mut();
+    if let Some(payload) = try_gc_alloc(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF) {
+        if payload.is_null() {
+            // GC OOM — fall through to the immortal bootstrap below.
+        } else {
+            let wref = payload as *mut Weakref;
+            unsafe { (*wref).weakptr = target };
+            return wref;
+        }
     }
-    let wref = payload as *mut Weakref;
-    unsafe { (*wref).weakptr = target };
-    wref
+    crate::lltype::malloc_typed(Weakref { weakptr: target })
 }
 
 /// `ll_weakref_deref(wref)` (gctypelayout.py:594-596). Reads the
@@ -188,4 +201,24 @@ pub unsafe fn w_gc_weakref_or_strong_deref(slot: PyObjectRef) -> PyObjectRef {
         return unsafe { w_gc_weakref_deref(slot) };
     }
     slot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w_weakref_new_pre_gc_returns_strong_immortal_ref() {
+        // No GC hook is wired in a bare pyre-object unit test, so try_gc_alloc
+        // returns None. w_weakref_new must still hand back a usable, non-null
+        // weakref whose deref yields the target — PyPy's weakref.ref never
+        // fails (a strong reference under translation.rweakref=False). Before
+        // the bootstrap fallback this returned null, which a module-level
+        // `class B(A)` recorded into the base's weak_subclasses, dropping the
+        // subclass from mutated()/get_subclasses().
+        let target = 0xdead_beef_usize as PyObjectRef;
+        let wref = unsafe { w_weakref_new(target) };
+        assert!(!wref.is_null());
+        assert_eq!(unsafe { w_weakref_deref(wref) }, target);
+    }
 }

@@ -26,20 +26,23 @@
 #[derive(Debug)]
 pub struct Cpu {
     /// `bhimpl_residual_call` general entry point.
-    /// `(callable, arg0) → result`.
-    pub call_fn: extern "C" fn(i64, i64) -> i64,
+    /// `(callable, null_or_self, arg0) → result`.
+    pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Per-arity `bhimpl_residual_call_<n>` helpers
-    /// (`call_fn_0(callable)` ... `call_fn_8(callable, a0..a7)`).  RPython
+    /// (`call_fn_0(callable, null_or_self)` ...
+    /// `call_fn_8(callable, null_or_self, a0..a7)`).  RPython
     /// `bhimpl_residual_call_r_r` carries no frame; the parent frame is
-    /// resolved from the execution context inside `bh_call_fn_impl`.
-    pub call_fn_0: extern "C" fn(i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    /// resolved from the execution context inside `bh_call_fn_impl`.  A
+    /// non-null `null_or_self` is the method receiver — the helper
+    /// prepends it as arg0 (eval.rs:3216-3226).
+    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
+    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
@@ -54,6 +57,11 @@ pub struct Cpu {
     pub load_const_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_store_subscr` — obj[key] = value.
     pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bhimpl_getattr` — `getattr(obj, w_name)`.
+    /// `(obj: Ref, w_name: Ref) → Ref` with `w_name` an interned str
+    /// constant.  Blackhole/deopt lowering of `LOAD_ATTR`
+    /// (`rclass.py:838 rtype_getattr`).
+    pub getattr_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
     pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_build_tuple` — (argc, item0, item1, item2) → new tuple.
@@ -155,6 +163,7 @@ impl Cpu {
             truth_fn: crate::call_jit::bh_truth_fn,
             load_const_fn: crate::call_jit::bh_load_const_fn,
             store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
+            getattr_fn: crate::call_jit::bh_getattr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
             build_tuple_fn: crate::call_jit::bh_build_tuple_fn,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,

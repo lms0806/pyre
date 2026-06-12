@@ -1612,6 +1612,7 @@ dependencies = [
  "pyre-interpreter",
  "pyre-jit-trace",
  "pyre-object",
+ "rustpython-wtf8",
  "vecset",
 ]
 

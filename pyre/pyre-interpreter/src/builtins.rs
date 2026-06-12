@@ -3991,16 +3991,12 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     }
                 }
             }
-            // Plus any legacy ATTR_TABLE entries (slot values stored via Member
-            // descriptors before the live-dict path existed).
-            crate::baseobjspace::ATTR_TABLE.with(|table| {
-                if let Some(attrs) = table.borrow().get(&(obj as usize)) {
-                    for (name, _) in attrs {
-                        names.push(name.clone());
-                    }
-                }
-            });
-            // Plus the type's own namespace.
+            // Plus the type's own namespace — `_classdir` walks the MRO
+            // and unions each class's `__dict__` keys, which is where
+            // `__slots__` Member descriptor names live, so every slot is
+            // listed regardless of whether it currently holds a value.
+            // The instance mapdict above is the sole instance attribute
+            // store; no ATTR_TABLE walk is needed.
             let w_type = pyre_object::w_instance_get_type(obj);
             if !w_type.is_null() && pyre_object::is_type(w_type) {
                 let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);

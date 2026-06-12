@@ -130,6 +130,24 @@ pub unsafe fn try_hash_w(obj: PyObjectRef) -> Option<i64> {
     HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }))
 }
 
+/// Diagnostic panic for the single-hash contract.  Every dict key is
+/// hashed through the installed `hash_w` trampoline; there is no second,
+/// structural hashing path (`dictmultiobject.py:1210
+/// r_dict(space.eq_w, space.hash_w, force_non_null=True)`).  Production
+/// installs the hook at boot (`pyre-jit::eval::init_jit_hooks`, before the
+/// first statement); `#[cfg(test)]` modules install it per test thread.  A
+/// `None` from [`try_hash_w`] at a key-construction site therefore means a
+/// dict was built before the hook was registered (or on a thread that
+/// never registered it) — a setup bug, not a recoverable condition.
+#[cold]
+#[inline(never)]
+pub fn missing_hash_hook() -> ! {
+    panic!(
+        "dict key hashing requires the hash_w hook; register it via \
+         register_hash_w_hook before constructing object/str-keyed dicts"
+    );
+}
+
 /// Install the `compares_by_identity` callback for this thread.
 /// Called from `pyre-jit::eval`'s init alongside the other
 /// thread-local hooks.

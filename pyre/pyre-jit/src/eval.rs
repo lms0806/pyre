@@ -194,25 +194,53 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 
 /// Custom trace for `W_TypeObject`.
 ///
-/// `W_TypeObject` carries one inline `PyObjectRef` field
-/// (`bases`) plus a `weak_subclasses: *mut Vec<*mut Weakref>`
-/// out-of-line list populated by `w_type_ready` / `add_subclass`
-/// at class-creation time (`typeobject.py:373-377` and
-/// `:640-662`).  Each slot is a strong root to the WEAKREF
-/// GcStruct itself — its `weakptr` payload is invalidated
-/// separately by the collector's
-/// `invalidate_young_weakrefs` / `invalidate_old_weakrefs`
-/// (incminimark.py:3058-3126), so passing the slot to `f` here
-/// keeps the WEAKREF alive without forcing the target alive.
+/// Forwards every GC-reachable edge a heap type owns so that, once heap
+/// types are GC-managed, a type kept live by reachability keeps its own
+/// children live (`typeobject.py:176-180` `_immutable_fields_` lists
+/// `'mro_w?[*]'`, `'bases_w?[*]'`, the namespace `dict_w`, `terminator`):
+///
+///   * `ob_header.w_class` — the metaclass, the type's own class edge
+///     (the inline header word, same as `instance_object_custom_trace`).
+///   * `bases` — the movable bases tuple.
+///   * `mro_w` — the out-of-line MRO type list.
+///   * `weak_subclasses` — the out-of-line list populated by
+///     `w_type_ready` / `add_subclass` (`typeobject.py:373-377`,
+///     `:640-662`).  Each slot is a strong root to the WEAKREF GcStruct
+///     itself — its `weakptr` payload is invalidated separately by the
+///     collector's `invalidate_young_weakrefs` / `invalidate_old_weakrefs`
+///     (incminimark.py:3058-3126), so passing the slot to `f` keeps the
+///     WEAKREF alive without forcing the target alive.
+///   * the off-GC namespace `DictStorage` values (methods, class
+///     attributes, getset descriptor copies) via the interpreter helper,
+///     mirroring `instance_object_custom_trace`'s off-GC storage walk.
+///
+/// Inert while heap types remain `malloc_typed` Box-immortal (the
+/// collector never fires this trace for an immortal object, and the
+/// visitor's `is_in_nursery` / `is_managed_heap_object` guard skips
+/// non-managed children); it replaces the `walk_type_dicts_gc` band-aid
+/// root walk once `w_type_new` is GC-managed.
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
+    f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    if !t.mro_w.is_null() {
+        let mro = unsafe { &mut *t.mro_w };
+        for slot in mro.iter_mut() {
+            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+    }
     if !t.weak_subclasses.is_null() {
         let subs = unsafe { &mut *t.weak_subclasses };
         for slot in subs.iter_mut() {
             f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
+    pyre_interpreter::eval::type_walk_namespace_values(
+        obj_addr as pyre_object::PyObjectRef,
+        &mut |slot: &mut pyre_object::PyObjectRef| {
+            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        },
+    );
 }
 
 /// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
@@ -254,6 +282,40 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
+/// Custom trace for `W_InstanceObject` (instance `map`+`storage`,
+/// `mapdict.py:907-910`).  The `storage` list is an off-GC
+/// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
+/// reaches the off-GC dict entries — this forwards each boxed
+/// attribute-value slot in place via `instance_walk_boxed_storage`,
+/// which consults the map to skip erased unboxed (`Vec<i64>`) slots
+/// (`mapdict.py:438/447` boxed `erase_item` vs `:601/612`
+/// `erase_unboxed`).  The off-GC `Vec` stays put; only its
+/// `PyObjectRef` contents are relocated.
+///
+/// `ob_header.w_class` is the instance's class reachability edge — the
+/// equivalent of PyPy reaching the class through the traced
+/// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
+/// Pyre stores the class in the inline header word
+/// (`instanceobject.rs:24`, `typeptr` in `rclass.py`), so it must be
+/// forwarded here or an instance whose class is reachable only through
+/// it would have that class reclaimed once heap types become
+/// GC-managed.  Inert while heap types remain `malloc_typed`
+/// Box-immortal — the visitor's `is_in_nursery` / `is_managed_heap_object`
+/// guard skips the non-managed type pointer — exactly as
+/// `generator_object_custom_trace` forwards `pycode` ahead of the
+/// code-object migration.
+unsafe fn instance_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::instanceobject::W_InstanceObject) };
+    f(&mut inst.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+        obj,
+        &mut |slot: *mut pyre_object::PyObjectRef| {
+            f(slot as *mut majit_ir::GcRef);
+        },
+    );
+}
+
 /// Custom trace for `W_ModuleDictObject`
 /// (`dictmultiobject.py:328 W_ModuleDictObject`).
 ///
@@ -278,61 +340,19 @@ unsafe fn module_dict_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
-    let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
-    if !md.dstorage.is_null() {
-        let storage = unsafe { &mut *md.dstorage };
-        for value in storage.iter_values_mut() {
-            f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        }
-    }
-    if !md.object_storage.is_null() {
-        let object_storage = unsafe { &mut *md.object_storage };
-        for (key, value) in object_storage.iter_mut() {
-            // See `dictmultiobject::w_dict_walk_entries_mut` — ObjectKey.hash
-            // is precomputed and identity-stable across GC moves, so writing
-            // through the raw obj slot does not desync the IndexMap bucket
-            // index.
-            let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
-                as *mut pyre_object::dictmultiobject::ObjectKey;
-            let obj_slot = unsafe { &raw mut (*key_ptr).obj };
-            f(obj_slot as *mut majit_ir::GcRef);
-            f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        }
-    }
-    if !md.mstrategy.is_null() {
-        let strategy = unsafe { &mut *md.mstrategy };
-        if let Some(caches) = strategy.caches.as_mut() {
-            for cache in caches.values() {
-                unsafe { trace_global_cache(cache, f) };
-            }
-        }
-    }
-}
-
-/// `celldict.py:261-277 GlobalCache`: walk both `cell` and the chained
-/// `builtincache` so the GC follows every live `PyObjectRef` reachable
-/// through the cache graph.  Under pyre's honor__builtins__=True
-/// equivalence `builtincache` is currently always `None`
-/// (`ModuleDictStrategy::get_global_cache` skips the install per
-/// `celldict.py:224`), but the trace mirrors the PyPy object graph
-/// shape so a future flip to honor=False — or a non-pyre embedder
-/// supplying its own `space.builtin.w_dict` — keeps every nested
-/// cell visible to the GC without further tracer edits.
-unsafe fn trace_global_cache(
-    cache: &std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>,
-    f: &mut dyn FnMut(*mut majit_ir::GcRef),
-) {
-    let mut c = cache.borrow_mut();
-    if let Some(cell) = c.cell.as_mut() {
-        f(cell as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    }
-    if let Some(builtincache) = c.builtincache.clone() {
-        // Drop the outer borrow before recursing — `borrow_mut` on the
-        // same RefCell would panic, but `builtincache` always points
-        // at a DIFFERENT GlobalCache instance per `celldict.py:236
-        // builtin_strategy.get_global_cache(w_builtin_dict, key)`.
-        drop(c);
-        unsafe { trace_global_cache(&builtincache, f) };
+    // Delegate to the shared module-dict walk so this (GC-managed dict)
+    // path and `walk_pyframe_roots`' Box-immortal path forward exactly
+    // the same movable slots — including unwrapping the Box-immortal
+    // MutableCells to reach the inner `w_value`, which a bare cell-pointer
+    // visit (the slot itself never moves) would miss.
+    let mut forward = |slot: &mut pyre_object::PyObjectRef| {
+        f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut forward,
+        );
     }
 }
 
@@ -1319,14 +1339,16 @@ thread_local! {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
             w_code_tid,
         );
-        // W_InstanceObject is intentionally NOT pre-registered: its
-        // PyType (`INSTANCE_TYPE`) is the `object` root, already
-        // covered by `object_tid` (`OBJECT_GC_TYPE_ID = 0`). Adding
-        // a separate tid for the same conceptual root would corrupt
-        // the preorder-range hierarchy (`subclass_range` would yield
-        // disjoint sub-ranges for the same root, breaking
-        // `object ⊇ int` and friends — see eval::tests
-        // ::test_subclass_range_preorder_bounds).
+        // W_InstanceObject's PyType (`INSTANCE_TYPE`) stays bound to
+        // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
+        // it is the `object` root, and giving the *vtable* a separate
+        // preorder id would corrupt the `subclass_range` hierarchy
+        // (disjoint sub-ranges for one root, breaking `object ⊇ int` —
+        // see eval::tests::test_subclass_range_preorder_bounds). The
+        // dedicated `W_INSTANCE_GC_TYPE_ID` registered above is a GC
+        // *header* id (size + custom trace), an independent axis that
+        // the collector reads off the header `w_instance_new` stamps;
+        // it is deliberately absent from `pytype_to_tid`.
         // Walk every remaining built-in PyType and register one
         // `TypeInfo::object_subclass` per class, mirroring how
         // `assign_inheritance_ids` (normalizecalls.py:373-389) walks
@@ -1489,6 +1511,26 @@ thread_local! {
         pytype_to_tid.insert(
             &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
             w_gc_weakref_tid,
+        );
+        // `W_InstanceObject` keeps its attributes in an off-GC
+        // `Box<Vec<PyObjectRef>>` `storage` list reachable only via a
+        // custom trace (instance map+storage, `mapdict.py:907-910`).
+        // Register a dedicated GC type id — stamped into the GC header
+        // by `w_instance_new` — so a collection traces those value
+        // slots (and reclaims dead instances; the storage `Vec` itself
+        // forwards in place). `INSTANCE_TYPE` stays bound to `object_tid`
+        // (above) for isinstance / `subclass_range`: the GC header id
+        // (read by the collector for size + custom trace) and the
+        // vtable preorder id are independent axes, so this id is NOT
+        // inserted into `pytype_to_tid` and gets no `register_vtable`.
+        let w_instance_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE,
+            object_tid,
+            instance_object_custom_trace,
+        ));
+        debug_assert_eq!(
+            w_instance_tid,
+            pyre_object::instanceobject::W_INSTANCE_GC_TYPE_ID,
         );
         // `#[pyre_class]`-emitted typed-payload registrations.  Each
         // entry is one line consuming the macro-generated
@@ -2640,6 +2682,23 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
 pub fn init_jit_hooks() {
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
+    // trampolines here, at boot, before any user statement runs. They are
+    // also registered inside the `JIT_DRIVER` initializer for the
+    // standalone/test path that touches `driver_pair()` without going
+    // through `main_entry`; doing it here too makes them live before the
+    // first `{}` literal is filled. Otherwise a str-keyed dict built at
+    // module level hashes its keys through `object_key_for`'s structural
+    // fallback (dictmultiobject.py:95-101), and once the real hook installs
+    // on the first JIT entry every later lookup recomputes the siphash and
+    // misses its bucket. The trampolines only call interpreter-side
+    // `eq_w`/`try_hash_value`/`compares_by_identity`, so they need neither
+    // the GC allocator nor the JIT driver — safe to install this early.
+    pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
+    pyre_object::dict_eq_hook::register_hash_w_hook(pyre_object_hash_w_trampoline);
+    pyre_object::dict_eq_hook::register_compares_by_identity_hook(
+        pyre_object_compares_by_identity_trampoline,
+    );
 }
 
 thread_local! {

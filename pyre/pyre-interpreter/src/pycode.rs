@@ -67,6 +67,20 @@ pub struct W_CodeObject {
     /// is null or unaligned (test fixtures, gateway builtins).
     pub globals_caches:
         *mut Vec<Option<std::rc::Weak<std::cell::RefCell<pyre_object::celldict::GlobalCache>>>>,
+    /// `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
+    /// len(co_names_w)`.
+    ///
+    /// Per-name slot for the `LOAD_ATTR_caching` / `STORE_ATTR_caching` inline
+    /// attribute cache (`mapdict.py:1480/1574`).  A `None` slot is PyPy's
+    /// `INVALID_CACHE_ENTRY` (mapdict.py:1452); a `Some` holds the immortal map
+    /// node + attribute node + `version_tag` last resolved for this slot, so a
+    /// monomorphic re-read skips the type lookup + map walk.  Holds no movable
+    /// reference (see [`crate::objspace::std::mapdict::MapdictCacheEntry`]), so —
+    /// like `globals_caches` — it carries no GC roots and is never walked.
+    ///
+    /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
+    /// never resized; `null` when `code_ptr` is null or unaligned.
+    pub mapdict_caches: *mut Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
@@ -189,6 +203,18 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(v))
     };
+    // `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
+    // len(co_names_w)` — `None` is `INVALID_CACHE_ENTRY`.
+    let mapdict_caches = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+        std::ptr::null_mut()
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        let names_len = code_ref.names.len();
+        let mut v: Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>> =
+            Vec::with_capacity(names_len);
+        v.resize_with(names_len, || None);
+        Box::into_raw(Box::new(v))
+    };
     let obj = Box::new(W_CodeObject {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -199,6 +225,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         hidden_applevel,
         fast_natural_arity,
         globals_caches,
+        mapdict_caches,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -482,6 +509,71 @@ pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
         return 0;
     }
     unsafe { (*code.globals_caches).len() }
+}
+
+/// `mapdict.py:1483/1546/1575 entry = pycode._mapdict_caches[nameindex]` — read
+/// slot `nameindex`, returning `None` (PyPy `INVALID_CACHE_ENTRY`) when the slot
+/// is unset, out of range, or `code_ptr` is invalid.  The entry is `Copy`, so a
+/// value is returned (no aliasing of the slot).
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_mapdict_caches_get(
+    obj: PyObjectRef,
+    nameindex: usize,
+) -> Option<crate::objspace::std::mapdict::MapdictCacheEntry> {
+    if obj.is_null() {
+        return None;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.mapdict_caches.is_null() {
+        return None;
+    }
+    let vec = unsafe { &*code.mapdict_caches };
+    vec.get(nameindex).copied().flatten()
+}
+
+/// `mapdict.py:1467-1475 pycode._mapdict_caches[nameindex] = entry` — store the
+/// filled entry in slot `nameindex`.  No-op when `code_ptr` is invalid or
+/// `nameindex` is out of range.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_mapdict_caches_set(
+    obj: PyObjectRef,
+    nameindex: usize,
+    entry: crate::objspace::std::mapdict::MapdictCacheEntry,
+) {
+    if obj.is_null() {
+        return;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.mapdict_caches.is_null() {
+        return;
+    }
+    let vec = unsafe { &mut *code.mapdict_caches };
+    if let Some(slot) = vec.get_mut(nameindex) {
+        *slot = Some(entry);
+    }
+}
+
+/// Number of `_mapdict_caches` slots — equals `len(co_names_w)` at construction
+/// time.  Returns 0 for code objects built from null or unaligned `code_ptr`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject` (or be null).
+#[inline]
+pub unsafe fn w_code_mapdict_caches_len(obj: PyObjectRef) -> usize {
+    if obj.is_null() {
+        return 0;
+    }
+    let code = unsafe { &*(obj as *const W_CodeObject) };
+    if code.mapdict_caches.is_null() {
+        return 0;
+    }
+    unsafe { (*code.mapdict_caches).len() }
 }
 
 /// Check if an object is a code object.

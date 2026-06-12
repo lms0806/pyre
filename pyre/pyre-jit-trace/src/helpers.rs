@@ -167,6 +167,64 @@ pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
     Value::Ref(GcRef(result as usize))
 }
 
+/// `typeobject.py:516 _pure_lookup_where_with_method_cache` residual: the
+/// `@elidable` method-cache lookup keyed on `(w_type, w_name, version_tag)`,
+/// recorded as a foldable `CALL_PURE_R` so repeated same-key lookups in a
+/// hot loop collapse to a constant `w_descr` pointer (null = `None`).  The
+/// promoted `version_tag` and interned immortal `w_name`
+/// (`box_str_constant`) are the green tokens the trace folds on.
+///
+/// A plain `extern "C"` i64-ABI wrapper, like `jit_namespace_cell_lookup`:
+/// the `#[elidable]` macro cannot emit a trampoline for the
+/// `PyObjectRef`-aliased signature (it recognises only literal pointer /
+/// primitive types), so the recordable surface is this wrapper, recorded
+/// with an explicit `ElidableCannotRaise` effect — the raw-pointer return
+/// (null = `None`) genuinely cannot raise.  Null on a null `w_type` /
+/// `w_name`; callers (the front door) already guarded `is_type` /
+/// `version_tag == 0`.
+pub extern "C" fn jit_lookup_where_with_method_cache(
+    w_type: i64,
+    w_name: i64,
+    version_tag: i64,
+) -> i64 {
+    let w_type = w_type as PyObjectRef;
+    let w_name = w_name as PyObjectRef;
+    if w_type.is_null() || w_name.is_null() {
+        return PY_NULL as i64;
+    }
+    let w_descr = unsafe {
+        pyre_interpreter::_pure_lookup_where_with_method_cache(w_type, w_name, version_tag as u64)
+    };
+    w_descr as i64
+}
+
+/// `mapdict.py:846-847 getdictvalue` residual: the instance-dict shadowing
+/// read the `LOAD_METHOD` fast path performs after the type lookup
+/// (`callmethod.py:66 w_value = w_obj.getdictvalue(space, name)`), to make
+/// sure no instance attribute shadows the class method.  Returns the
+/// shadowing value or `PY_NULL` when the attribute is absent from the
+/// instance dict.
+///
+/// A plain `extern "C"` i64-ABI wrapper (like [`jit_namespace_cell_lookup`]),
+/// recorded as a normal residual call — NOT pure: the instance dict mutates,
+/// so the result is guarded `null` per iteration rather than folded.  `w_name`
+/// is the interned immortal name pointer; the body reads it back via
+/// `w_str_get_value`, mirroring [`jit_lookup_where_with_method_cache`].  Null
+/// on a null receiver / name or a non-instance receiver (the fast path
+/// already pinned the receiver type with `guard_class`).
+pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
+    let w_obj = w_obj as PyObjectRef;
+    let w_name = w_name as PyObjectRef;
+    if w_obj.is_null() || w_name.is_null() || !unsafe { is_instance(w_obj) } {
+        return PY_NULL as i64;
+    }
+    let name = unsafe { w_str_get_value(w_name) };
+    let w_value = unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue(w_obj, name)
+    };
+    w_value.unwrap_or(PY_NULL) as i64
+}
+
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
     ctx.call_void(helper, args);
 }

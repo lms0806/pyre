@@ -56,6 +56,13 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_MemberDescr)).w_cls
 }
 
+/// typedef.py:446 `Member.index` — the slot index (`base_nslots + position`),
+/// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
+/// index` attrkind (mapdict.py:1520).
+pub unsafe fn w_member_get_index(obj: PyObjectRef) -> u32 {
+    (*(obj as *const W_MemberDescr)).index
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

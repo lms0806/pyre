@@ -2547,11 +2547,13 @@ fn emit_frontend_simple_call(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     callable: super::flow::FlowValue,
+    null_or_self: super::flow::FlowValue,
     args: Vec<super::flow::FlowValue>,
     offset: i64,
 ) -> super::flow::Variable {
-    let mut op_args = Vec::with_capacity(args.len() + 1);
+    let mut op_args = Vec::with_capacity(args.len() + 2);
     op_args.push(callable.into());
+    op_args.push(null_or_self.into());
     op_args.extend(args.into_iter().map(Into::into));
     emit_graph_op_with_result(graph, block, "simple_call", op_args, Kind::Ref, offset)
 }
@@ -2985,6 +2987,7 @@ struct FnPtrIndices {
     truth_fn: HelperHandle,
     load_const_fn: HelperHandle,
     store_subscr_fn: HelperHandle,
+    getattr_fn: HelperHandle,
     build_list_fn: HelperHandle,
     build_tuple_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
@@ -3184,6 +3187,15 @@ fn register_helper_fn_pointers(
         cpu.unpack_item_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_getattr_fn` performs `getattr_str` (can raise `AttributeError`)
+    // and is emitted only into the blackhole/deopt jitcode — `LOAD_ATTR`
+    // is walker-skipped during recording, so this residual call never
+    // executes while a virtualizable is live.  Stands in for the rtyped
+    // `getfield_gc` (`rclass.py:838 rtype_getattr`); classified
+    // `CallFlavor::Plain` (can-raise, no virtual-force) like
+    // `load_global_fn`.  Bound after the existing fn_ptrs to preserve
+    // their indices.
+    let getattr_fn = bind(assembler, cpu.getattr_fn as *const (), CallFlavor::Plain);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3193,6 +3205,7 @@ fn register_helper_fn_pointers(
         truth_fn,
         load_const_fn,
         store_subscr_fn,
+        getattr_fn,
         build_list_fn,
         build_tuple_fn,
         unpack_sequence_fn,
@@ -3987,6 +4000,11 @@ impl CodeWriter {
                     idx: store_subscr_fn_idx,
                     flavor: _store_subscr_fn_flavor,
                 },
+            getattr_fn:
+                HelperHandle {
+                    idx: getattr_fn_idx,
+                    flavor: _getattr_fn_flavor,
+                },
             build_list_fn:
                 HelperHandle {
                     idx: build_list_fn_idx,
@@ -4107,6 +4125,7 @@ impl CodeWriter {
                 compare_op_fn_idx: compare_fn_idx,
                 truth_fn_idx,
                 store_subscr_fn_idx,
+                getattr_fn_idx,
                 build_list_fn_idx,
                 build_tuple_fn_idx,
                 // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
@@ -6151,8 +6170,12 @@ impl CodeWriter {
                             // level. Keep that graph shape; the residual helper
                             // below is walker/backend adaptation only.
                             let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let null_offset: u16 = if raw_namei & 1 != 0 { 1 } else { 0 };
-                            let loaded_dst_reg = stack_base + current_depth + null_offset;
+                            // The global lands at the deeper slot; the
+                            // `raw_namei & 1` NULL sentinel is pushed ON TOP
+                            // afterwards, matching the interpreter
+                            // `[callable, null_or_self]` order (eval.rs:3141,
+                            // shared_opcode.rs opcode_call).
+                            let loaded_dst_reg = stack_base + current_depth;
                             if is_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
@@ -6165,12 +6188,17 @@ impl CodeWriter {
                             if let super::flow::FlowValue::Variable(v) = &result_value {
                                 pin!(Some(*v), loaded_dst_reg);
                             }
-                            // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
-                            // const-source pushvalue writes the constant directly to
-                            // the stack TOS register and (in portal case) to the
-                            // vable slot via setarrayitem_vable_r_const, leaving
-                            // the scratch regs untouched for the trailing
-                            // `emit_pushvalue_ref!(loaded_dst_reg)`.
+                            current_state.stack.push(result_value.clone());
+                            // `loaded_dst_reg == stack_base + current_depth`
+                            // here, so the trailing `emit_ref_copy(stack_base +
+                            // current_depth, loaded_dst_reg)` inside
+                            // `emit_pushvalue_ref!` is the identity copy
+                            // elided by `emit_ref_copy`'s `dst != src` guard.
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
+                            // LOAD_GLOBAL with raw_namei & 1: the NULL sentinel
+                            // goes ON TOP of the global (eval.rs load_global
+                            // push order; CPython 3.13+ pushes NULL after the
+                            // global).
                             if raw_namei & 1 != 0 {
                                 current_state.stack.push(null_stack_sentinel());
                                 emit_pushvalue_ref_const!(
@@ -6179,13 +6207,6 @@ impl CodeWriter {
                                     py_pc
                                 );
                             }
-                            current_state.stack.push(result_value.clone());
-                            // `loaded_dst_reg == stack_base + current_depth` here
-                            // (computed before the optional NULL push that bumps
-                            // current_depth by `null_offset`), so the residual
-                            // already wrote the result into the slot the trailing
-                            // `emit_pushvalue_ref!` pushes — no stack move needed.
-                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
                         }
 
                         // RPython jtransform.py: rewrite_op_direct_call →
@@ -6202,7 +6223,6 @@ impl CodeWriter {
                         // Pop in reverse: args, null_or_self, callable.
                         Instruction::Call { argc } => {
                             let nargs = argc.get(op_arg) as usize;
-                            let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(nargs);
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
                                 let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -6210,26 +6230,43 @@ impl CodeWriter {
                                 if let super::flow::FlowValue::Variable(v) = &arg_value {
                                     pin!(Some(*v), arg_reg);
                                 }
-                                arg_regs_rev.push(arg_reg);
                                 graph_arg_values_rev.push(arg_value);
                             }
-                            // Args were popped in reverse stack order; reverse to
-                            // match the call site's positional order (arg0 first).
-                            let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
-                            let arg_values: Vec<super::flow::FlowValue> =
-                                graph_arg_values_rev.iter().rev().cloned().collect();
+                            // shared_opcode.rs:56 opcode_call pops null_or_self
+                            // BEFORE callable — the callable sits at the deeper
+                            // slot.  Resume restores tracer-recorded stack slots
+                            // into these registers, so the pop order here must
+                            // mirror the interpreter exactly or a pre-call
+                            // resume reads the null slot as the callable.
+                            let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let null_or_self_value =
+                                match pop_ref_or_fresh(&mut current_state, &mut graph) {
+                                    super::flow::FlowValue::Variable(v) => {
+                                        pin!(Some(v), null_or_self_reg);
+                                        v
+                                    }
+                                    _ => {
+                                        // The LoadAttr/LoadGlobal arms push the
+                                        // null sentinel as a graph Constant, but it
+                                        // must NOT const-fold to ConstRef(0): a
+                                        // pre-call resume seeds this stack register
+                                        // from the tracer, which may hold a real
+                                        // receiver (load_method_fast_path pushes
+                                        // `[w_descr, w_obj]`, callmethod.py:60-68).
+                                        // Read the register instead — the pure
+                                        // blackhole path physically writes PY_NULL
+                                        // into it via emit_pushvalue_ref_const!.
+                                        let v = graph.fresh_variable(Kind::Ref);
+                                        pin!(Some(v), null_or_self_reg);
+                                        v
+                                    }
+                                };
                             let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _ = emit_popvalue_ref!(current_depth, py_pc); // NULL (discard)
-                            let _null_or_self = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &callable_value {
+                                pin!(Some(*v), callable_reg);
+                            }
 
-                            // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
-                            // call_fn(frame, callable, arg0, ...) → result
-                            // Parent frame is passed explicitly as the leading
-                            // ref operand; no thread-local indirection.
-                            // The flatten.rs helper consumes `callable_reg` and
-                            // `&arg_regs` directly; no intermediate Vec needed.
-                            // Select the correct arity-specific call helper.
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
                             // extern "C" fn with that many i64 parameters.
@@ -6237,19 +6274,29 @@ impl CodeWriter {
                             let call_result_value = if nargs > 8 {
                                 fresh_ref_value(&mut graph)
                             } else {
-                                // Graph-side `simple_call(callable, args...)`
-                                // carries the RPython rewrite_call shape
-                                // (jtransform.py:414 — no frame arg).  The
-                                // residual call ABI matches upstream
+                                // Graph-side `simple_call(callable,
+                                // null_or_self, args...)` carries the RPython
+                                // rewrite_call shape (jtransform.py:414 — no
+                                // frame arg).  The canonical driver's
+                                // `lower_simple_call_hlop_to_insn` arm lowers
+                                // it to `residual_call_r_r(
+                                // ConstInt(call_fn_<nargs>_idx),
+                                // ListR([Reg(callable), Reg(null_or_self),
+                                // Reg(arg0), ...]), Descr) → Reg(dst)` with
+                                // `CallFlavor::MayForce` (every `call_fn_N` is
+                                // bound MayForce).  The ABI matches upstream
                                 // `bhimpl_residual_call_r_r` (no frame); the
                                 // parent frame is resolved at runtime from the
-                                // execution context inside `bh_call_fn_impl`.
+                                // execution context inside `bh_call_fn_impl`,
+                                // which also prepends a non-null null_or_self
+                                // as arg0 (eval.rs:3216-3226).
                                 let graph_call_args: Vec<super::flow::FlowValue> =
                                     graph_arg_values_rev.iter().rev().cloned().collect();
                                 let result = emit_frontend_simple_call(
                                     &mut graph,
                                     &current_block.block(),
-                                    callable_value.clone(),
+                                    callable_value,
+                                    null_or_self_value.into(),
                                     graph_call_args,
                                     py_pc as i64,
                                 );
@@ -6258,84 +6305,6 @@ impl CodeWriter {
                             };
                             if nargs > 8 {
                                 emit_abort_permanent!();
-                            } else {
-                                let _ = match nargs {
-                                    0 => call_fn_0_idx,
-                                    1 => call_fn_idx,
-                                    2 => call_fn_2_idx,
-                                    3 => call_fn_3_idx,
-                                    4 => call_fn_4_idx,
-                                    5 => call_fn_5_idx,
-                                    6 => call_fn_6_idx,
-                                    7 => call_fn_7_idx,
-                                    _ => call_fn_8_idx,
-                                };
-                                // CALL family
-                                // factor refactor.  The prior
-                                // `emit_residual_call(call_fn_N_idx, ...)`
-                                // call is replaced by a single direct push
-                                // of `build_call_fn_residual_call_r_r_insn`,
-                                // which produces the same `residual_call_r_r(
-                                // ConstInt(fn_idx), ListR([Reg(frame),
-                                // Reg(callable), Reg(arg0), ...,
-                                // Reg(arg_{N-1})]), Descr) → Reg(dst)`
-                                // Insn shape
-                                // `emit_residual_call_shape` would have
-                                // produced (no leading `ListI` because
-                                // `args_i` is empty for all-Ref call_args).
-                                // CALL has no frontend HLOp with the same
-                                // shape (the graph carries `simple_call`
-                                // pre-rtype HLOp recorded by
-                                // `emit_frontend_simple_call`); the matching
-                                // graph dual-write below is retained, feeding
-                                // the eventual `flatten_graph(graph, regallocs)`
-                                // path.  Helper hardcodes
-                                // `CallFlavor::MayForce` matching the
-                                // production source at codewriter.rs:2175
-                                // and 2238-2245 (every `call_fn_N` is
-                                // bound MayForce).
-                                // Map (FlowValue, register) → Operand: Constant
-                                // null sentinels lower to ConstRef(0) (matches
-                                // canonical's `lower_simple_call_hlop_to_insn`
-                                // routing Constant args through `lower_constant`,
-                                // which routes `(None, Ref)` to `ConstRef(0)` per
-                                // `flatten_constant_operand`).  Variable values
-                                // emit Register operands as before.  Walker prior
-                                // to this lowering always emitted Registers and
-                                // produced byte-divergence at the CALL site for
-                                // graphs whose `simple_call` carried a Constant
-                                // null arg (e.g. list_reverse, list_pop_append
-                                // after LOAD_ATTR(method) pushes the sentinel).
-                                let to_operand =
-                                |value: &super::flow::FlowValue, reg: u16| -> super::flatten::Operand {
-                                    if let super::flow::FlowValue::Constant(c) = value {
-                                        if matches!(c.value, super::flow::ConstantValue::None) {
-                                            return super::flatten::Operand::ConstRef(0);
-                                        }
-                                    }
-                                    super::flatten::Operand::Register(
-                                        super::flatten::Register::new(
-                                            super::flatten::Kind::Ref,
-                                            reg,
-                                        ),
-                                    )
-                                };
-                                let mut ref_operands: Vec<super::flatten::Operand> =
-                                    Vec::with_capacity(1 + arg_regs.len());
-                                ref_operands.push(to_operand(&callable_value, callable_reg));
-                                for (value, reg) in arg_values.iter().zip(arg_regs.iter()) {
-                                    ref_operands.push(to_operand(value, *reg));
-                                }
-                                // Graph-side residual_call_r_r dual-write
-                                // retired — replaced by canonical driver's
-                                // `lower_simple_call_hlop_to_insn` arm
-                                // which lowers the `simple_call` HLOp
-                                // recorded above into the same
-                                // `residual_call_r_r` Insn shape.  Matches
-                                // upstream RPython where `simple_call` IS the
-                                // graph form and `residual_call_r_r` only
-                                // appears post-flatten.
-                                let _ = (callable_value, graph_arg_values_rev);
                             }
                             push_and_bump!(call_result_value, py_pc);
                         }
@@ -7013,6 +6982,10 @@ impl CodeWriter {
                             let name_idx = attr.name_idx() as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
+                            // Pop the receiver; the graph-side `getattr` HLOp
+                            // carries `obj_value`, so the vacated slot index is
+                            // not consumed here.
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
@@ -7021,10 +6994,43 @@ impl CodeWriter {
                                 attr_name.into(),
                                 py_pc as i64,
                             );
-                            emit_abort_permanent!();
-                            current_state.stack.push(result_value.into());
+                            // The call shape is `[callable (lower), self_or_null
+                            // (top)]` (eval.rs load_method, shared_opcode.rs
+                            // opcode_call).  The method form lands the (bound)
+                            // attribute at the deeper slot and a `PY_NULL`
+                            // self-slot on top of it, mirroring the `LoadGlobal`
+                            // push-null variant; the bound attribute already
+                            // carries `self`, so the top slot is a bare null.
+                            let loaded_dst_reg = stack_base + current_depth;
+                            pin!(Some(result_value), loaded_dst_reg);
+                            // Runnable residual lowering for the blackhole/deopt
+                            // path: `rclass.py:838 rtype_getattr` rewrites
+                            // `getattr` → `getfield_gc` after rtyping; pyre has
+                            // no rtyper, so the `getattr` HLOp recorded by
+                            // `emit_frontend_getattr` above lowers to a
+                            // `bh_getattr_fn(obj, w_name)` residual call in the
+                            // canonical flatten driver
+                            // (`flatten::lower_getattr_hlop_to_insn`); the name
+                            // Constant lowers to its interned immortal str
+                            // pointer (`box_str_constant`).  LOAD_ATTR is
+                            // walker-skipped during recording
+                            // (`trace_opcode.rs walker_skip_opcodes`), so this
+                            // call never runs while a virtualizable is live; the
+                            // optimized trace records `jit_getattr` via the
+                            // trait leg.
+                            let result_fv: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(result_fv.clone());
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
+                            // Method form: push the `PY_NULL` self-slot on top
+                            // of the attribute (callable), matching the
+                            // interpreter `load_method` push order.
                             if attr.is_method() {
-                                push_and_bump!(null_stack_sentinel(), py_pc);
+                                current_state.stack.push(null_stack_sentinel());
+                                emit_pushvalue_ref_const!(
+                                    current_depth,
+                                    pyre_object::PY_NULL as i64,
+                                    py_pc
+                                );
                             }
                         }
 
@@ -8921,14 +8927,16 @@ pub fn register_portal_jitdriver(
 ///     does not surface.  Fully retiring the register-form `ns`/`frame`
 ///     reads requires separating the walker path from the blackhole
 ///     path — a structural prerequisite not yet in place.
-///   * `bh_call_fn` / `bh_call_fn_N(callable, args...)` — frame-less
-///     residual call ABI matching RPython `bhimpl_residual_call_r_r`
-///     (`cpu.bh_call_r(func, None, args_r, ...)`).  The parent frame for
-///     `bh_call_self_recursive_portal`, `set_last_exec_ctx`, and
-///     `call_user_function_plain(parent_frame, ...)` is resolved at runtime
-///     from `getexecutioncontext().gettopframe()` inside `bh_call_fn_impl`,
+///   * `bh_call_fn` / `bh_call_fn_N(callable, null_or_self, args...)` —
+///     frame-less residual call ABI matching RPython
+///     `bhimpl_residual_call_r_r` (`cpu.bh_call_r(func, None, args_r,
+///     ...)`).  The parent frame for `bh_call_self_recursive_portal`,
+///     `set_last_exec_ctx`, and `call_user_function_plain(parent_frame,
+///     ...)` is resolved at runtime from
+///     `getexecutioncontext().gettopframe()` inside `bh_call_fn_impl`,
 ///     so the CALL ListR carries no frame operand (portal and non-portal
-///     callees share the same shape).
+///     callees share the same shape).  A non-null `null_or_self` is the
+///     method receiver the helper prepends as arg0 (eval.rs:3216-3226).
 ///   * `bh_normalize_raise_varargs_with_frame(frame_ptr, exc, cause)` —
 ///     `frame_ptr` non-null asserted; pins
 ///     `(*parent_frame_ptr).execution_context` for the normalization
@@ -9725,10 +9733,11 @@ mod tests {
     }
 
     #[test]
-    fn emit_frontend_simple_call_records_callable_then_args() {
+    fn emit_frontend_simple_call_records_callable_null_or_self_then_args() {
         let start = Block::shared(Vec::new());
         let mut graph = FunctionGraph::new("simple_call", start.clone(), None);
         let callable = Variable::new(VariableId(60), Kind::Ref);
+        let null_or_self = Variable::new(VariableId(62), Kind::Ref);
         let arg0 = Variable::new(VariableId(61), Kind::Ref);
         let arg1 = Constant::signed(9);
 
@@ -9736,6 +9745,7 @@ mod tests {
             &mut graph,
             &start,
             callable.into(),
+            null_or_self.into(),
             vec![arg0.into(), arg1.clone().into()],
             88,
         );
@@ -9747,7 +9757,15 @@ mod tests {
             .expect("simple_call op should be recorded");
         assert_eq!(op.opname, "simple_call");
         assert_eq!(op.offset, 88);
-        assert_eq!(op.args, vec![callable.into(), arg0.into(), arg1.into()]);
+        assert_eq!(
+            op.args,
+            vec![
+                callable.into(),
+                null_or_self.into(),
+                arg0.into(),
+                arg1.into()
+            ]
+        );
         assert_eq!(op.result, Some(result.into()));
     }
 

@@ -3485,24 +3485,11 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 mod dict_method_tests {
     use super::*;
 
+    use crate::test_hooks::install_hash_hook;
+
     fn assert_type_error(result: Result<PyObjectRef, crate::PyError>) {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-    }
-
-    unsafe fn test_hash_w(obj: PyObjectRef) -> i64 {
-        match crate::builtins::try_hash_value(obj) {
-            Ok(h) => h,
-            Err(e) => {
-                crate::baseobjspace::set_pending_hash_error(e);
-                pyre_object::dict_eq_hook::signal_hash_error(obj);
-                0
-            }
-        }
-    }
-
-    fn install_hash_hook() {
-        pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
     }
 
     #[test]

@@ -291,10 +291,26 @@ impl MetaInterpStaticData {
                 .iter()
                 .position(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key);
             if let Some(pos) = existing_pos {
-                let index = self.jitcodes[pos].index;
-                Self::stamp_payload_index(index, &payload);
-                self.jitcodes[pos].code = payload.w_code;
-                self.jitcodes[pos].payload = payload;
+                // warmspot.py:281-282 stable-jitcodes invariant:
+                // `make_jitcodes()` populates each CodeObject's JitCode
+                // exactly once, so existing frame pointers and jitcode
+                // payloads never move. Pyre reaches this drain boundary
+                // lazily and can re-drain the same CodeObject (a later
+                // primary compile re-queues an inlined callee's graph),
+                // producing a payload whose `-live-`/pc_map layout differs
+                // from the first drain. Replacing an already-populated
+                // entry would shift the liveness offsets out from under
+                // resume data already captured against the first payload,
+                // desyncing the rd_numb per-section cursor at blackhole
+                // resume (`resume.py:1339-1341`). Only fill a not-yet-
+                // populated slot (skeleton or portal-bridge placeholder);
+                // once drained the entry is frozen.
+                if !self.jitcodes[pos].payload.is_populated() {
+                    let index = self.jitcodes[pos].index;
+                    Self::stamp_payload_index(index, &payload);
+                    self.jitcodes[pos].code = payload.w_code;
+                    self.jitcodes[pos].payload = payload;
+                }
             } else {
                 let index = self.jitcodes.len() as i32;
                 Self::stamp_payload_index(index, &payload);
@@ -368,10 +384,19 @@ impl MetaInterpStaticData {
         let raw_key = Self::canonical_code_key_opt(code).unwrap_or(0);
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             if let Some(payload) = supplied {
-                let index = self.jitcodes[pos].index;
-                Self::stamp_payload_index(index, &payload);
-                self.jitcodes[pos].code = payload.w_code;
-                self.jitcodes[pos].payload = payload;
+                // Stable-jitcodes invariant (see
+                // `set_jitcodes_from_make_result`): only fill a not-yet-
+                // populated slot (skeleton or portal-bridge placeholder).
+                // Once a CodeObject's JitCode is populated it is frozen,
+                // so resume data captured against it stays consistent
+                // with the liveness/pc_map the blackhole reader resolves
+                // at resume time.
+                if !self.jitcodes[pos].payload.is_populated() {
+                    let index = self.jitcodes[pos].index;
+                    Self::stamp_payload_index(index, &payload);
+                    self.jitcodes[pos].code = payload.w_code;
+                    self.jitcodes[pos].payload = payload;
+                }
             }
             return &*self.jitcodes[pos] as *const JitCode;
         }
@@ -7949,6 +7974,25 @@ mod tests {
         });
     }
 
+    /// Install the real `hash_w` on this test thread so object/str-keyed
+    /// dicts built while running interpreted Python bucket through the
+    /// single hash path (`baseobjspace.py:840-845`).  These tests don't go
+    /// through `init_jit_hooks`, which installs the hook at boot for the
+    /// pyrex binary; the thread-local cell must be set on the test thread.
+    fn install_test_hash_hook() {
+        unsafe fn test_hash_w(obj: pyre_object::PyObjectRef) -> i64 {
+            match pyre_interpreter::builtins::try_hash_value(obj) {
+                Ok(h) => h,
+                Err(e) => {
+                    pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+                    pyre_object::dict_eq_hook::signal_hash_error(obj);
+                    0
+                }
+            }
+        }
+        pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
+    }
+
     /// Install a populated `PyJitCode` for `code_ref` so a subsequent
     /// `jitcode_for(code_ref)` returns a valid SD entry. The trace-side
     /// `MetaInterpStaticData.jitcodes` list is now populated only by
@@ -9228,6 +9272,7 @@ mod tests {
 
     #[test]
     fn test_load_method_accepts_plain_python_instance_method() {
+        install_test_hash_hook();
         let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
             .expect("compile failed");
         let mut frame = pyre_interpreter::PyFrame::new(code.clone());

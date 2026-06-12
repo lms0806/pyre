@@ -44,6 +44,12 @@ pub enum StrategyKind {
     Identity,
     Kwargs,
     Module,
+    /// `pypy/objspace/std/mapdict.py:1123 MapDictStrategy` — the strategy a
+    /// user instance's `__dict__` adopts, routing get/set/del through the
+    /// instance's mapdict map+storage.  Implemented in pyre-interpreter
+    /// (`objspace::std::mapdict::MapDictStrategy`) because the map-node layer
+    /// lives there; this variant lets `strategy_is` discriminate it.
+    Map,
 }
 
 pub trait DictStrategy {

@@ -428,6 +428,38 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     });
 }
 
+/// GC root walk over every loaded module's dict storage.
+///
+/// Modules (`malloc_typed`) and their `W_ModuleDictObject`s are
+/// Box-immortal, so the collector cannot reach a module dict's
+/// authoritative `dstorage` / `object_storage` / cell registry
+/// transitively (a Box-immortal object is never relocated and never
+/// has its custom trace fired).  A movable value bound at module scope
+/// — e.g. `gc.collect` reached through `gc.__dict__`, or any
+/// module-level list / instance — would otherwise be read back stale
+/// after a collection relocates it.  Treat each loaded module's dict as
+/// a pinned root source so those slots stay forwarded.  This complements
+/// the per-frame `w_globals_obj` walk in `eval::walk_pyframe_roots`,
+/// which additionally covers `exec`/`eval` globals dicts that are not
+/// registered in `sys.modules`.
+///
+/// # Safety
+/// `visitor` must tolerate being called on every movable module-dict
+/// value slot reachable here.
+pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    SYS_MODULES.with(|m| {
+        for &module in m.borrow().values() {
+            if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+                continue;
+            }
+            unsafe {
+                let w_dict = pyre_object::w_module_get_w_dict(module);
+                pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
+            }
+        }
+    });
+}
+
 /// Set the Python-visible sys.modules dict reference. Called during sys
 /// module initialization so subsequent set_sys_module calls keep it in sync.
 /// Also copies all previously cached modules into the dict.

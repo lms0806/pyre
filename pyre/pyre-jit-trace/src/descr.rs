@@ -1751,6 +1751,28 @@ pub fn w_list_size_descr() -> DescrRef {
     W_LIST_DESCR_GROUP.size_descr.clone()
 }
 
+/// `typeobject.py:162 _version_tag` — the method-cache version (`u64`, 8
+/// bytes, unsigned) on `W_TypeObject`. The `LOAD_METHOD` fast path reads it
+/// LIVE and `guard_value`s it (`promote(self.version_tag())`,
+/// typeobject.py:506) so the `_pure_lookup_where_with_method_cache`
+/// `CALL_PURE_R` folds on a green version. Mutable (not immutable /
+/// quasi-immutable): `mutated()` (typeobject.py:285-286) bumps it on any
+/// type-dict change, and the per-iteration `guard_value` re-checks it.
+///
+/// Upstream `_version_tag?` is quasi-immutable, so the JIT folds the read
+/// away and relies on the write barrier to invalidate dependent traces; the
+/// convergence path here is a `QUASIIMMUT_FIELD` once pyre wires that write
+/// barrier into `mutated()`. Until then a live read + `guard_value` is the
+/// sound interim.
+pub fn type_version_tag_descr() -> DescrRef {
+    make_field_descr(
+        core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag),
+        8,
+        Type::Int,
+        false,
+    )
+}
+
 /// rlist.py:116 `l.length` — live length of a list under the Object
 /// strategy. Under Integer/Float strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.

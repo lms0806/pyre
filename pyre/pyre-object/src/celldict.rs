@@ -210,6 +210,40 @@ pub unsafe fn unwrap_cell(w_value: PyObjectRef) -> PyObjectRef {
     w_value
 }
 
+/// Forward the single movable `PyObjectRef` reachable through a module
+/// dict value slot during a GC root walk.
+///
+/// A module dict entry (and a `GlobalCache.cell`) is either a raw
+/// `w_value` or a `MutableCell` wrapping it (`typeobject.py:48-51
+/// unwrap_cell`).  `MutableCell`s are `malloc_typed`
+/// (`w_object_mutable_cell_new` / `w_int_mutable_cell_new`), so the
+/// collector never relocates the cell itself and never recurses into
+/// it; for an `ObjectMutableCell` the inner `w_value` is the movable
+/// reference that must be forwarded in place, while an `IntMutableCell`
+/// holds an unboxed `i64` with no reference to forward.  A non-cell slot
+/// holds the movable value directly and is forwarded as-is.
+///
+/// # Safety
+/// `slot` must point to a valid `PyObjectRef` (null tolerated).
+pub unsafe fn walk_module_value_slot(
+    slot: &mut PyObjectRef,
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let w_value = *slot;
+    if w_value.is_null() {
+        return;
+    }
+    let tp = (*w_value).ob_type;
+    if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
+        let cell = &mut *(w_value as *mut W_ObjectMutableCell);
+        visitor(&mut cell.w_value);
+    } else if std::ptr::eq(tp, &INT_MUTABLE_CELL_TYPE as *const PyType) {
+        // IntMutableCell carries an unboxed i64; no GC reference.
+    } else {
+        visitor(slot);
+    }
+}
+
 /// `typeobject.py:53-71 write_cell`:
 ///
 /// ```python
@@ -437,6 +471,34 @@ impl GlobalCache {
     #[inline]
     pub unsafe fn getvalue(&self) -> Option<PyObjectRef> {
         self.cell.map(|c| unwrap_cell(c))
+    }
+}
+
+/// GC root walk over a single `GlobalCache` and its chained
+/// `builtincache`, forwarding the movable value each `cell` holds.
+///
+/// Mirrors the `GlobalCache` object graph shape (`celldict.py:261-277`):
+/// `cell` plus the nested `builtincache`, which always points at a
+/// DIFFERENT `GlobalCache` instance (`celldict.py:236
+/// builtin_strategy.get_global_cache(...)`), so the outer borrow is
+/// dropped before recursing.  The cached `cell` duplicates the storage
+/// entry it was installed from, so a collection that relocates that
+/// value must rewrite the cache copy too or the next cached
+/// `LOAD_GLOBAL` reads a stale pointer.
+///
+/// # Safety
+/// `cache.cell`, when present, must be a valid `PyObjectRef`.
+unsafe fn walk_one_global_cache(
+    cache: &std::rc::Rc<std::cell::RefCell<GlobalCache>>,
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let mut c = cache.borrow_mut();
+    if let Some(slot) = c.cell.as_mut() {
+        walk_module_value_slot(slot, visitor);
+    }
+    if let Some(builtincache) = c.builtincache.clone() {
+        drop(c);
+        walk_one_global_cache(&builtincache, visitor);
     }
 }
 
@@ -808,6 +870,21 @@ impl ModuleDictStrategy {
         // promoted cell objects would leak into user space and break
         // identity comparisons against the previously-stored value.
         storage.entries.values().map(|v| unsafe { unwrap_cell(*v) })
+    }
+
+    /// GC root walk over every live `GlobalCache.cell` reachable through
+    /// this strategy's `caches` registry (`celldict.py:214
+    /// get_global_cache`), forwarding the movable value each cell holds.
+    ///
+    /// # Safety
+    /// Each cached `GlobalCache.cell`, when present, must be a valid
+    /// `PyObjectRef`.
+    pub unsafe fn walk_cache_cells(&self, visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+        if let Some(caches) = self.caches.as_ref() {
+            for cache in caches.values() {
+                walk_one_global_cache(cache, visitor);
+            }
+        }
     }
 }
 

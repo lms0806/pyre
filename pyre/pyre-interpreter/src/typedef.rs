@@ -783,6 +783,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
             newslotnames: vec![],
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true, // object has __new__
+            typedef_hasdict: false,         // object typedef declares no __dict__
         });
         pyre_object::w_type_set_layout(type_obj, layout);
         // object: hasdict=False, weakrefable=False (bare object() has no __dict__)
@@ -845,6 +846,11 @@ fn new_typeobject_with_base_and_layout(
                 newslotnames: vec![],
                 base_layout: parent_layout,
                 acceptable_as_base_class: has_new,
+                // Distinct-typedef builtins reuse INSTANCE_TYPE here, so no
+                // reachable instance carries this Layout's typedef; the
+                // dict-managing typedefs (module/function/...) get their true
+                // flag only with the distinct-TypeDef convergence.
+                typedef_hasdict: false,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);

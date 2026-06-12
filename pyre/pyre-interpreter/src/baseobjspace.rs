@@ -2286,23 +2286,16 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 
             // `pypy/objspace/descroperation.py descr__getattribute__`
             // dispatches through the receiver type's `__getattribute__`
-            // slot before running the default descriptor protocol.
-            // Users routinely override this to customise *all* attribute
-            // access (e.g. lazy proxies, validating wrappers).  Detect a
-            // non-default override by comparing against the canonical
-            // `object.__getattribute__` registered at type init.
+            // slot before running the default descriptor protocol
+            // (objspace.py:663-666).  Users routinely override this to
+            // customise *all* attribute access (e.g. lazy proxies,
+            // validating wrappers).  `getattribute_if_not_from_object`
+            // returns a non-default override or `None`, memoizing the
+            // default in `uses_object_getattribute`.
             if name != "__getattribute__" {
-                if let Some(slot) = lookup_in_type(w_type, "__getattribute__") {
-                    let default_slot =
-                        lookup_in_type(crate::typedef::w_object(), "__getattribute__");
-                    let is_default = match default_slot {
-                        Some(d) => std::ptr::eq(slot, d),
-                        None => false,
-                    };
-                    if !is_default {
-                        let name_obj = w_str_new(name);
-                        return crate::call::call_function_impl_result(slot, &[obj, name_obj]);
-                    }
+                if let Some(slot) = getattribute_if_not_from_object(w_type) {
+                    let name_obj = w_str_new(name);
+                    return crate::call::call_function_impl_result(slot, &[obj, name_obj]);
                 }
             }
 
@@ -2318,24 +2311,16 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 }
             }
 
-            // Step 3: instance dict
-            // First check the Python dict (INSTANCE_DICT) for live-view semantics,
-            // then ATTR_TABLE for slot values and legacy attributes.
+            // Step 3: instance dict — the mapdict map+storage is the sole
+            // authority for instance attributes.  `getdict` returns the
+            // MapDictStrategy view whose getitem_str reads the map
+            // (getdictvalue, mapdict.py:846-847; MapDictStrategy.getitem_str
+            // delegates there, mapdict.py:1168-1175).
             let w_dict = getdict(obj);
             if !w_dict.is_null() {
                 if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
                     return Ok(value);
                 }
-            }
-            // Fallback: ATTR_TABLE (slot values via Member descriptor side-store)
-            let found = ATTR_TABLE.with(|table| {
-                let table = table.borrow();
-                table
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get(name).copied())
-            });
-            if let Some(value) = found {
-                return Ok(value);
             }
 
             // Step 4: non-data descriptor
@@ -2650,20 +2635,14 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
                     }
                 }
             }
+            // Instance dict is the sole authority for instance attributes
+            // (mapdict map+storage via the MapDictStrategy view); no
+            // ATTR_TABLE fallback (mapdict.py:846-847, 1168-1175).
             let w_dict = getdict(obj);
             if !w_dict.is_null() {
                 if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
                     return Ok(value);
                 }
-            }
-            let found = ATTR_TABLE.with(|table| {
-                let table = table.borrow();
-                table
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get(name).copied())
-            });
-            if let Some(value) = found {
-                return Ok(value);
             }
             if let Some(descr) = w_descr {
                 if let Some(result) = get(descr, obj, w_type)? {
@@ -3873,10 +3852,10 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
 /// `key` is either the mutated attribute name or `None` for a
 /// generic invalidation; `compares_by_identity_status` reset is
 /// gated on the key being `__eq__` / `__hash__` per PyPy line 279.
-/// `_version_tag` and the other slots PyPy bumps here are not yet
-/// ported, so this function currently only manages the
-/// compares_by_identity cache — additional slots will hook in here
-/// as the JIT-side caches land.
+/// The `uses_object_getattribute` / `uses_object_setattr` flags
+/// (typeobject.py:275-276) and the `_version_tag` bump
+/// (typeobject.py:285-286) are reset here; the remaining slot PyPy
+/// resets (`w_new_function`) hooks in once that cache lands.
 ///
 /// # Safety
 /// `w_type` must be a valid `PyObjectRef` pointing at a
@@ -3885,6 +3864,10 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     if w_type.is_null() || !is_type(w_type) {
         return;
     }
+    // typeobject.py:275-276 — conservative default; the attribute fast
+    // paths re-confirm the flag on the next lookup.
+    pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, false);
+    pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, false);
     // typeobject.py:279 — `if (key is None or key == '__eq__' or
     // key == '__hash__'): self.compares_by_identity_status =
     // UNKNOWN`.
@@ -3898,6 +3881,15 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
             pyre_object::typeobject::COMPARES_BY_IDENTITY_UNKNOWN,
         );
     }
+    // typeobject.py:285-286 — `if self._version_tag is not None:
+    // self._version_tag = VersionTag()`. A fresh identity invalidates every
+    // cache keyed on the old tag; a 0 (None) tag stays uncacheable.
+    if pyre_object::typeobject::w_type_get_version_tag(w_type) != 0 {
+        pyre_object::typeobject::w_type_set_version_tag(
+            w_type,
+            pyre_object::typeobject::new_version_tag(),
+        );
+    }
     // typeobject.py:288-291 — walk direct subclasses recursively.
     let subs = pyre_object::typeobject::w_type_get_subclasses(w_type);
     for w_sub in subs {
@@ -3907,9 +3899,11 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
 
 /// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`,
 /// returning the MRO class that defines `key` together with the found descriptor.
-/// NOTE: PyPy's elidable wrapper (_pure_lookup_where_with_method_cache) takes
-/// a version_tag argument to invalidate on type mutation. Until pyre has
-/// version tags, this raw lookup must NOT be marked elidable.
+/// The interpreter reaches this through the `MethodCache` front door
+/// (`lookup_in_type_where`); the elidable wrapper
+/// `_pure_lookup_where_with_method_cache(name, version_tag)` that lets the JIT
+/// constant-fold lookups on a promoted `version_tag` is the remaining slice —
+/// this raw walk stays non-elidable until then.
 pub(crate) unsafe fn lookup_where(
     w_type: PyObjectRef,
     name: &str,
@@ -3945,7 +3939,9 @@ pub(crate) unsafe fn lookup_where(
 
 /// `lookup_in_type` / `lookup_in_type_where` descriptor-only projection of
 /// [`lookup_where`], for the callers that do not need the defining class.
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// The raw walk underneath the method cache; also the JIT path (no
+/// thread-local state) so the trace can lower it directly.
+unsafe fn lookup_in_type_where_uncached(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
@@ -3982,6 +3978,338 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
                 }
             }
         }
+    }
+    None
+}
+
+/// `typeobject.py:76-101 MethodCache` — the per-space method-lookup
+/// cache.  `space.fromcache(MethodCache)` returns one instance per
+/// space; pyre is single-space, so a thread-local singleton stands in
+/// (the role the dict-strategy `space.fromcache` singletons already
+/// play).  `versions[h]` is the `version_tag()` the slot was filled
+/// under (`0` = empty), `names[h]` the looked-up name, `values[h]` the
+/// cached result.  PyPy caches the `lookup_where` tuple `(w_class,
+/// w_value)`; `lookup_in_type_where` is value-only (no caller consumes
+/// the `w_class` half), so only `w_value` is materialised — a null
+/// `values[h]` on a valid `(version, name)` entry is the cached negative
+/// result (`_lookup_where_all_typeobjects` returned not-found).
+struct MethodCache {
+    versions: Vec<u64>,
+    names: Vec<Option<String>>,
+    values: Vec<PyObjectRef>,
+}
+
+/// `space.config.objspace.std.methodcachesizeexp` default.
+const METHOD_CACHE_SIZE_EXP: u32 = 11;
+const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
+
+thread_local! {
+    static METHOD_CACHE: std::cell::RefCell<MethodCache> = std::cell::RefCell::new(MethodCache {
+        versions: vec![0u64; METHOD_CACHE_SIZE],
+        names: vec![None; METHOD_CACHE_SIZE],
+        values: vec![std::ptr::null_mut(); METHOD_CACHE_SIZE],
+    });
+}
+
+/// `typeobject.py:520-535` method-hash.  `version_tag` is pyre's u64
+/// version token directly (PyPy hashes `current_object_addr_as_int(
+/// version_tag)`; the u64 is its own address-stable surrogate).
+/// `name_hash` only needs to be deterministic — the slot's validity is
+/// the exact `(version, name)` match, not the hash — so an FNV-1a over
+/// the bytes stands in for `compute_hash(name)`.
+fn method_hash(version_tag: u64, name: &str) -> usize {
+    let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        name_hash ^= *b as u64;
+        name_hash = name_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    const SHIFT2: u32 = 64 - METHOD_CACHE_SIZE_EXP;
+    const SHIFT1: u32 = SHIFT2 - 5;
+    let product = version_tag.wrapping_mul(name_hash);
+    let h = (product ^ (product << SHIFT1)) >> SHIFT2;
+    (h as usize) & (METHOD_CACHE_SIZE - 1)
+}
+
+/// typeobject.py:299-301 `_pure_version_tag` — the `@elidable_promote`
+/// half of `version_tag()`.  The body is the raw `_version_tag` field
+/// read; the macro renames it to the hidden elidable original and
+/// `_pure_version_tag` becomes the promoting wrapper (mirrors
+/// `function.rs::_get_immutable_code`).  For a prebuilt (non-heap) type
+/// the tag never changes, so promoting it lets the trace fold every
+/// `version_tag`-keyed lookup to a constant.
+#[majit_macros::elidable_promote]
+#[inline]
+pub unsafe fn _pure_version_tag(w_type: PyObjectRef) -> u64 {
+    unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) }
+}
+
+/// typeobject.py:293-297 `version_tag()` — the cache-version reader.
+/// In the interpreter, and for a heap type whose tag can still change,
+/// it reads the live `_version_tag` field; under the JIT for a prebuilt
+/// type it goes through the `@elidable_promote` `_pure_version_tag` so
+/// the value folds away on the trace.  Mirrors the nesting of
+/// `function.rs::getcode`.
+#[inline]
+pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
+    if majit_metainterp::jit::we_are_jitted() {
+        if pyre_object::typeobject::w_type_is_heaptype(w_type) {
+            // Heap types can still be mutated; read the live field (the
+            // caller promotes the result).
+            return pyre_object::typeobject::w_type_get_version_tag(w_type);
+        }
+        // Prebuilt objects cannot get their version_tag changed.
+        return _pure_version_tag(w_type);
+    }
+    pyre_object::typeobject::w_type_get_version_tag(w_type)
+}
+
+/// `typeobject.py:516-552 _pure_lookup_where_with_method_cache` — the
+/// `@elidable` lookup keyed on `(version_tag, name)`.  Consults the
+/// `MethodCache`; on a miss it runs the raw MRO walk and fills the slot
+/// (`typeobject.py:545-549`).  `@elidable`: the result depends only on
+/// `(w_type, name, version_tag)`, so the trace records a `CALL_PURE_R`
+/// and folds repeated same-key lookups; the `MethodCache` mutation is
+/// the idempotent memo side-effect the elidable contract tolerates
+/// (typeobject.py:546 `_side_effects_ok()`).  Being a residual call, the
+/// thread-local / `String` machinery stays off the trace surface, as the
+/// former `dont_look_inside` ensured.
+///
+/// `name` arrives as `w_name`, an interned immortal str object
+/// (`box_str_constant`), because the elidable call ABI cannot pass a
+/// `&str` and an interned pointer is the green token the trace folds on;
+/// the body reads it back via `w_str_get_value`.  The result is a raw
+/// pointer — null is the cached negative result (`None`), since the call
+/// ABI cannot carry `Option`.  The `is_type` / `version_tag == 0` guards
+/// live in the front door, so this is only ever entered with a valid
+/// promoted `version_tag`.
+#[majit_macros::elidable]
+pub unsafe fn _pure_lookup_where_with_method_cache(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+    version_tag: u64,
+) -> PyObjectRef {
+    let name = pyre_object::strobject::w_str_get_value(w_name);
+    let h = method_hash(version_tag, name);
+    // Probe without holding the borrow across the MRO walk below.
+    let hit = METHOD_CACHE.with(|c| {
+        let cache = c.borrow();
+        if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
+            // A valid entry with a null value is the cached negative result.
+            Some(cache.values[h])
+        } else {
+            None
+        }
+    });
+    if let Some(v) = hit {
+        return v;
+    }
+    let v = lookup_in_type_where_uncached(w_type, name).unwrap_or(std::ptr::null_mut());
+    METHOD_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.versions[h] = version_tag;
+        cache.names[h] = Some(name.to_string());
+        cache.values[h] = v;
+    });
+    v
+}
+
+/// Forward every cached `values[h]` slot during collection — the
+/// faithful equivalent of RPython's GC tracing `MethodCache.lookup_where`
+/// (which holds live `(w_class, w_value)` refs).
+///
+/// Every cached value is an MRO type's namespace-dict resident (or a
+/// Box-immortal builtin descriptor), so it is already kept *reachable* by
+/// `walk_type_dicts_gc` — this walk is therefore not load-bearing for
+/// reclamation in the current model, and old-gen residents are not
+/// relocated by a collection, so it forwards no slot in practice today.
+/// It becomes load-bearing once those values become movable (the
+/// movable-object GC phases): `version_tag` is bumped only by `mutated()`,
+/// never by a relocating move, so the cache's *own* copy of each pointer
+/// must be forwarded here or a later hit would read a stale address.
+pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    METHOD_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        for slot in cache.values.iter_mut() {
+            if slot.is_null() {
+                // Empty / negative-cache slot: nothing to forward.
+            } else {
+                forward(slot);
+            }
+        }
+    });
+}
+
+/// `typeobject.py:503-514 lookup_where_with_method_cache` — the method
+/// cache front door.  One path for interpreter and JIT (PyPy branches
+/// only on `version_tag is None`, never on `we_are_jitted()`): promote
+/// the type and its `version_tag`, then route through the `@elidable`
+/// `_pure_lookup_where_with_method_cache` so the trace folds the
+/// `(version_tag, name)`-keyed lookup to a constant while the interpreter
+/// consults the `MethodCache`.
+pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return lookup_in_type_where_uncached(w_type, name);
+    }
+    // typeobject.py:505 — `promote(self)`.
+    let _ = majit_metainterp::jit::promote(w_type);
+    // typeobject.py:506 — `version_tag = promote(self.version_tag())`;
+    // `w_type_version_tag` routes a prebuilt type through the
+    // `elidable_promote` `_pure_version_tag`, so the tag folds on the trace.
+    let version_tag = w_type_version_tag(w_type);
+    if version_tag == 0 {
+        // typeobject.py:507-509 — no version tag: uncacheable.
+        return lookup_in_type_where_uncached(w_type, name);
+    }
+    // The elidable takes the name as an interned, immortal str object
+    // (`box_str_constant`: content-keyed, never freed).  The elidable call
+    // ABI cannot pass a `&str`, and the interned pointer is the green token
+    // the trace folds the lookup on (PyPy's `name` is already an interned
+    // W_StringObject green constant from the bytecode).
+    let w_name = pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    // typeobject.py:510 — `_pure_lookup_where_with_method_cache(name, version_tag)`.
+    let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
+    if v.is_null() { None } else { Some(v) }
+}
+
+/// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the
+/// interpreter (`eval::load_method`) and the JIT tracer
+/// (`trace_opcode::try_load_method_fast_path`) so both produce the
+/// identical `[w_descr, w_obj]` stack shape — the tracer otherwise records
+/// a `[descr, self]` shape while the concrete frame keeps the `getattr`
+/// `[bound_method, null]` shape, and the two desync at the following
+/// `CALL`.
+///
+/// Returns `Some((w_type, version_tag, w_descr))` for the
+/// plain-instance-method case the fast path binds `self` for
+/// (callmethod.py:55-68); `None` (fall back to `getattr`) for every other
+/// receiver / descriptor shape.  Mirror of `callmethod.py`:
+/// `has_object_getattribute()` (line 33), `version_tag()` (line 56),
+/// `_pure_lookup_where_with_method_cache` (line 59),
+/// `flag_method_descriptor` (line 65, here a plain `FUNCTION_TYPE`
+/// function), and the instance-dict shadowing check (line 66).
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn load_method_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() || !is_instance(w_obj) {
+        return None;
+    }
+    let w_type = w_instance_get_type(w_obj);
+    if w_type.is_null() {
+        return None;
+    }
+    // typeobject.py:56-58 `version_tag = self.version_tag()`; `None`
+    // (uncacheable) is `0` here.
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    // callmethod.py:33 `w_type.has_object_getattribute()` — only the default
+    // `__getattribute__` is sound to bypass (typeobject.py:303-326).  The
+    // memo is primed by the interpreter `getattr` (baseobjspace.rs:2137).
+    if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+        return None;
+    }
+    // callmethod.py:59 `_pure_lookup_where_with_method_cache(name, vt)`.
+    let w_descr = lookup_in_type(w_type, name)?;
+    // callmethod.py:65 `space.type(w_descr).flag_method_descriptor`: only a
+    // plain `FUNCTION_TYPE` function binds `self` here (builtin functions
+    // have no `__get__`; staticmethod / classmethod / property / member /
+    // type descriptors are not plain method descriptors).
+    if !crate::is_function(w_descr)
+        || !std::ptr::eq(
+            (*w_descr).ob_type,
+            &crate::FUNCTION_TYPE as *const pyre_object::PyType,
+        )
+    {
+        return None;
+    }
+    // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`: a
+    // shadowing instance attribute means the method is not bound.
+    if crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, name).is_some() {
+        return None;
+    }
+    Some((w_type, version_tag, w_descr))
+}
+
+/// descroperation.py:12-15 `object_getattribute(space)` — the canonical
+/// `object.__getattribute__` descriptor used as the identity anchor for
+/// the `uses_object_getattribute` fast path.  Returns true iff `w_descr`
+/// is that descriptor.
+unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
+    match lookup_in_type_where(crate::typedef::w_object(), "__getattribute__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
+}
+
+/// descroperation.py:17-20 `object_setattr(space)` — the canonical
+/// `object.__setattr__` descriptor anchor (see
+/// [`is_object_getattribute_descr`]).
+unsafe fn is_object_setattr_descr(w_descr: PyObjectRef) -> bool {
+    match lookup_in_type_where(crate::typedef::w_object(), "__setattr__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
+}
+
+/// typeobject.py:303-326 `getattribute_if_not_from_object` — returns the
+/// app-level `__getattribute__` if it is NOT `object.__getattribute__`,
+/// otherwise `None`.  In the interpreter the negative result is memoized
+/// in `uses_object_getattribute` so repeat accesses skip the MRO walk +
+/// identity compare; under the JIT the lookup is left raw and folded away
+/// by the type's `version_tag`.
+pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
+    if majit_metainterp::jit::we_are_jitted() {
+        // typeobject.py:319-323 — just a lookup, folded by version_tag.
+        if let Some(w_descr) = lookup_in_type_where(w_type, "__getattribute__") {
+            if is_object_getattribute_descr(w_descr) {
+                return None;
+            }
+            return Some(w_descr);
+        }
+        return None;
+    }
+    // typeobject.py:308 — fast path once the default is confirmed.
+    if pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+        return None;
+    }
+    if let Some(w_descr) = lookup_in_type_where(w_type, "__getattribute__") {
+        if is_object_getattribute_descr(w_descr) {
+            // typeobject.py:313-315 — remember the default (`_side_effects_ok()`
+            // is true in normal builds).
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            return None;
+        }
+        return Some(w_descr);
+    }
+    None
+}
+
+/// typeobject.py:328-348 `setattr_if_not_from_object` — the `__setattr__`
+/// companion of [`getattribute_if_not_from_object`].
+pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
+    if majit_metainterp::jit::we_are_jitted() {
+        if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
+            if is_object_setattr_descr(w_descr) {
+                return None;
+            }
+            return Some(w_descr);
+        }
+        return None;
+    }
+    if pyre_object::typeobject::w_type_get_uses_object_setattr(w_type) {
+        return None;
+    }
+    if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
+        if is_object_setattr_descr(w_descr) {
+            pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
+            return None;
+        }
+        return Some(w_descr);
     }
     None
 }
@@ -4228,7 +4556,7 @@ pub fn descr_call_mismatch(
     ))
 }
 
-unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
+pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -4567,7 +4895,12 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
                 pyre_object::w_type_get_name(w_newcls),
             )));
         }
-        // objectobject.py:150 — w_obj.setclass(space, w_newcls)
+        // objectobject.py:150 — w_obj.setclass(space, w_newcls).  For a mapdict
+        // instance this re-roots the map chain onto the new class's terminator
+        // (mapdict.py:754-756); pyre then keeps w_class authoritative for type().
+        if pyre_object::is_instance(w_obj) {
+            crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
+        }
         (*w_obj).w_class = w_newcls;
     }
     Ok(w_none())
@@ -4581,7 +4914,12 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
+            // objspace.py:721-723 — dispatch only to a non-default
+            // `__setattr__`; the object default falls through to the
+            // inlined `object_setattr` fast path (the default slot is
+            // `object.__setattr__` → `object_setattr`, typedef.rs:7030,
+            // so skipping the descriptor call is equivalent).
+            if let Some(sa) = setattr_if_not_from_object(w_type) {
                 let w_name = w_str_new(name);
                 return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
                     .map(|_| w_none());
@@ -4949,6 +5287,11 @@ fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
     if w_dict.is_null() {
         return false;
     }
+    // For a user instance, `getdict` returns the MapDictStrategy view, so this
+    // `setitem_str` routes straight to the instance map+storage
+    // (MapDictStrategy.setitem_str → setdictvalue → map.write DICT,
+    // mapdict.py:849-850). The earlier C1 explicit `instance_node_setdictvalue`
+    // dual-write is now subsumed by that routing and removed.
     unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
     true
 }
@@ -7428,6 +7771,44 @@ mod tests {
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
+    }
+
+    /// typeobject.py:293-301 — under the interpreter (`we_are_jitted()`
+    /// is false in tests) the `version_tag()` gate and the
+    /// `@elidable_promote` `_pure_version_tag` both read the live
+    /// `_version_tag` field, matching the raw accessor.
+    #[test]
+    fn version_tag_gate_and_pure_read_the_field() {
+        let t =
+            pyre_object::w_type_new("VersionTagGate", pyre_object::PY_NULL, std::ptr::null_mut());
+        unsafe {
+            let raw = pyre_object::typeobject::w_type_get_version_tag(t);
+            assert_ne!(raw, 0);
+            assert_eq!(w_type_version_tag(t), raw);
+            assert_eq!(_pure_version_tag(t), raw);
+        }
+    }
+
+    /// typeobject.py:308/333 — once `uses_object_getattribute` /
+    /// `uses_object_setattr` is set, the `*_if_not_from_object` fast path
+    /// returns `None` (the object default) without an MRO walk;
+    /// `mutated()` clears both flags (typeobject.py:275-276).
+    #[test]
+    fn if_not_from_object_respects_flag_and_mutated_reset() {
+        // `make_builtin_type` reads the base type's layout, so the type system
+        // must be bootstrapped first (matches `make_user_instance`); otherwise
+        // the test aborts when run in isolation.
+        crate::typedef::init_typeobjects();
+        let t = crate::typedef::make_builtin_type("IfNotFromObject", |_| {});
+        unsafe {
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(t, true);
+            pyre_object::typeobject::w_type_set_uses_object_setattr(t, true);
+            assert!(getattribute_if_not_from_object(t).is_none());
+            assert!(setattr_if_not_from_object(t).is_none());
+            mutated(t, None);
+            assert!(!pyre_object::typeobject::w_type_get_uses_object_getattribute(t));
+            assert!(!pyre_object::typeobject::w_type_get_uses_object_setattr(t));
+        }
     }
 
     #[test]

@@ -3024,4 +3024,72 @@ mod tests {
             Some(&majit_ir::Value::Int(42))
         );
     }
+
+    /// REF analog of `test_cond_call_value_uses_call_pure_results_*` /
+    /// the Int `test_call_pure_results`: a `CALL_PURE_R` whose all-const
+    /// args (funcptr + Ref) hit a seeded `call_pure_results` entry must
+    /// be removed by OptPure and its result made a Ref constant.
+    ///
+    /// pure.py:230-234 `optimize_CALL_PURE_R` → start_index=0 (the
+    /// funcptr is part of the lookup key).  `_can_optimize_call_pure`
+    /// (optimizer.py:215-226) reads `get_constant_box(arg)` per arg →
+    /// `Value::Ref(ConstPtr)` for the Ref arg — value equality, so the
+    /// 2nd identical call collapses to the 1st's stored result.
+    ///
+    /// resoperation.py:638 `RefOp.type = 'r'`: the folded constant must
+    /// be `Value::Ref` (history.py:314 ConstPtr), NOT `Value::Int`
+    /// (history.py:220 ConstInt) of the same numeric value.
+    #[test]
+    fn test_call_pure_r_results_folds_second_identical_call() {
+        let func_const = OpRef::const_int(0xCAFE);
+        let ref_arg_const = OpRef::const_ptr(GcRef(0x4242));
+        let result_ptr = GcRef(0xDEAD_BEEF);
+
+        let mut ops = vec![Op::new(
+            OpCode::CallPureR,
+            &[
+                BoxRef::from_opref(func_const),
+                BoxRef::from_opref(ref_arg_const),
+            ],
+        )];
+        assign_positions(&mut ops);
+        // `assign_positions` types op.pos via result_type() → CallPureR
+        // gives a Ref-typed position OpRef.
+        assert_eq!(
+            ops[0].pos.get().ty(),
+            Some(Type::Ref),
+            "CallPureR position must be Ref-typed (resoperation.py:638)"
+        );
+
+        let mut opt = Optimizer::new();
+        // Seed the cross-call result keyed on [funcptr, ref_arg] (Ref
+        // value), as record_result_of_call_pure does at trace time.
+        opt.record_call_pure_result(
+            vec![Value::Int(0xCAFE), Value::Ref(GcRef(0x4242))],
+            Value::Ref(result_ptr),
+        );
+        opt.add_pass(Box::new(OptPure::new()));
+
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+
+        // The 2nd identical CallPureR collapses to the cached constant —
+        // the op is removed entirely.
+        assert!(
+            result.is_empty(),
+            "identical-const-args CallPureR must be removed by call_pure_results fold; got {result:?}"
+        );
+        let folded = constants.get(&ops[0].pos.get().raw());
+        // The folded constant must be Ref-typed, value == result_ptr.
+        assert_eq!(
+            folded,
+            Some(&Value::Ref(result_ptr)),
+            "CallPureR fold must yield ConstPtr(result_ptr), got {folded:?}"
+        );
+        // Critically: NOT a ConstInt of the same numeric value.
+        assert!(
+            !matches!(folded, Some(Value::Int(_))),
+            "folded CallPureR constant aliased to Value::Int — ConstPtr/ConstInt distinction lost"
+        );
+    }
 }

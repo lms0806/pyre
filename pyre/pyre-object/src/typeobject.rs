@@ -31,6 +31,18 @@ pub struct Layout {
     /// but need different acceptable_as_base_class values.
     /// Convergence: introduce a Rust TypeDef struct, move this field there.
     pub acceptable_as_base_class: bool,
+    /// typedef.py:40 — `hasdict = '__dict__' in rawdict`: whether the
+    /// low-level typedef already manages its own instance dict (so mapdict
+    /// must NOT add a second one, typeobject.py:255-257).
+    /// TODO: like `acceptable_as_base_class`, this belongs on a Rust TypeDef
+    /// struct (`layout.typedef.hasdict`). It is parked on Layout because
+    /// `typedef` is only a `*const PyType` tag. On the current shared-Layout
+    /// model every reachable instance layout reuses INSTANCE_TYPE's Layout
+    /// (whose typedef declares no `__dict__`), so this is `false` everywhere;
+    /// populating it `true` for the dict-managing typedefs (module/function/
+    /// staticmethod/classmethod) needs the distinct-TypeDef convergence and is
+    /// deferred with it.
+    pub typedef_hasdict: bool,
 }
 
 impl Layout {
@@ -143,6 +155,43 @@ pub struct W_TypeObject {
     /// each `Weakref` struct alive across collections (`pyre-jit
     /// ::eval`).  Null when no subclasses have been registered.
     pub weak_subclasses: *mut Vec<*mut crate::weakref::Weakref>,
+    /// typeobject.py:179 `terminator` — the root of this type's mapdict
+    /// attribute map (a `DictTerminator` when `hasdict`, else
+    /// `NoDictTerminator`), created once per type (typeobject.py:251-260).
+    /// Erased `*const MapNode` (the map node layer lives in the
+    /// `pyre-interpreter` crate, which `pyre-object` must not depend on; the
+    /// interpreter side casts it back). Null until installed by the mapdict
+    /// layer. Mirrors `W_InstanceObject.map`.
+    pub terminator: *const u8,
+    /// typeobject.py:162 `_version_tag` — bumped to a fresh identity whenever
+    /// the content of `dict_w` of any type in the MRO changes (`mutated()`,
+    /// typeobject.py:285-286), so caches keyed on it (method cache, LOAD_ATTR
+    /// inline cache) invalidate. PyPy uses an opaque `VersionTag()` object whose
+    /// identity is the version; pyre uses a monotonic `u64` (minted by
+    /// `new_version_tag`), with `0` meaning `None` (uncacheable). Equality of
+    /// the token is the only observable property, so the `u64` surrogate is
+    /// faithful and needs no GC edge.
+    pub version_tag: std::sync::atomic::AtomicU64,
+    /// typeobject.py:183-185 `uses_object_getattribute` — `True` once a
+    /// lookup has confirmed this type uses the object-default
+    /// `__getattribute__` (so the attribute fast paths can skip the
+    /// `__getattribute__` MRO lookup + `is`-compare).  `False` is the
+    /// conservative default (typeobject.py:185, 275); `mutated()` resets
+    /// it on every type-dict change.
+    pub uses_object_getattribute: std::sync::atomic::AtomicBool,
+    /// typeobject.py:186 `uses_object_setattr` — the `__setattr__`
+    /// companion of [`uses_object_getattribute`].
+    pub uses_object_setattr: std::sync::atomic::AtomicBool,
+}
+
+/// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
+/// `0` is reserved for `None`, so the counter starts at `1`.
+static NEXT_VERSION_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Mint a fresh, never-reused version-tag identity (typeobject.py:73-74
+/// `VersionTag()`). Never returns `0` (which means `None`/uncacheable).
+pub fn new_version_tag() -> u64 {
+    NEXT_VERSION_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// GC type id assigned to `W_TypeObject` at JitDriver init time.
@@ -163,6 +212,39 @@ pub fn leak_layout(layout: Layout) -> *const Layout {
     crate::lltype::malloc_raw(layout)
 }
 
+thread_local! {
+    /// Heap type objects (`w_type_new` — user `class` statements and
+    /// `type(name, bases, dict)`) are `malloc_typed` Box-immortal, so the
+    /// collector never fires their `W_TYPE_GC_TYPE_ID` custom trace and
+    /// therefore never reaches the movable values bound in a type's
+    /// namespace dict (methods, class attributes, the per-type
+    /// `__dict__`/`__weakref__` getset copies) nor the `bases` tuple.
+    /// This registry lets the interpreter root every heap type's namespace
+    /// as a pinned root source on each collection — the same shape
+    /// `walk_module_dicts_gc` uses for Box-immortal module dicts.
+    ///
+    /// Builtin types (`w_type_new_builtin`) are created before the GC is
+    /// built and only ever hold Box-immortal values, so they are not
+    /// registered.  Append-only interim: heap types are themselves immortal,
+    /// so a recorded address stays valid for the process lifetime (unlike a
+    /// GC-managed object, an immortal type is never freed, so no stale-address
+    /// pruning is needed).  Convergence path: GC-manage `W_TypeObject` so its
+    /// custom trace fires and this walk is deleted.
+    static HEAP_TYPE_REGISTRY: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Record a heap type for the collection-time namespace root walk.
+fn register_heap_type(addr: usize) {
+    HEAP_TYPE_REGISTRY.with(|reg| reg.borrow_mut().push(addr));
+}
+
+/// Snapshot the registered heap-type addresses for the root walker
+/// (`pyre_interpreter::eval::walk_type_dicts_gc`).
+pub fn snapshot_heap_types() -> Vec<usize> {
+    HEAP_TYPE_REGISTRY.with(|reg| reg.borrow().clone())
+}
+
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.
 ///
 /// typeobject.py:174 `__init__(..., is_heaptype=True)`.
@@ -174,7 +256,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(bases);
 
-    crate::lltype::malloc_typed(W_TypeObject {
+    let w_type = crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
@@ -190,7 +272,20 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
-    }) as PyObjectRef
+        // typeobject.py:251-260: terminator installed by the interpreter's
+        // mapdict layer after construction; null until then.
+        terminator: std::ptr::null(),
+        // typeobject.py:244-250: a fresh version tag at construction. (The
+        // is_mro_purely_of_types gate that leaves it None is a deferred
+        // refinement; pyre MROs are purely types in practice.)
+        version_tag: std::sync::atomic::AtomicU64::new(new_version_tag()),
+        // typeobject.py:185-186: conservative `False` default, fixed during
+        // real usage by the attribute fast paths.
+        uses_object_getattribute: std::sync::atomic::AtomicBool::new(false),
+        uses_object_setattr: std::sync::atomic::AtomicBool::new(false),
+    }) as PyObjectRef;
+    register_heap_type(w_type as usize);
+    w_type
 }
 
 /// typeobject.py:1507-1508 in setup_user_defined_type — copy
@@ -261,6 +356,14 @@ pub fn w_type_new_builtin(
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
+        // typeobject.py:251-260: terminator installed by the interpreter's
+        // mapdict layer after construction; null until then.
+        terminator: std::ptr::null(),
+        // typeobject.py:244-250: a fresh version tag at construction.
+        version_tag: std::sync::atomic::AtomicU64::new(new_version_tag()),
+        // typeobject.py:185-186: conservative `False` default.
+        uses_object_getattribute: std::sync::atomic::AtomicBool::new(false),
+        uses_object_setattr: std::sync::atomic::AtomicBool::new(false),
     }) as PyObjectRef
 }
 
@@ -392,6 +495,75 @@ pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
 }
 
+/// typeobject.py:295 `self._version_tag` — the raw cache-version field
+/// (`0` = `None`/uncacheable).  This is the direct field read; the
+/// `we_are_jitted()` / `_pure_version_tag` (`@elidable_promote`) split of
+/// `version_tag()` (typeobject.py:293-301) lives in the interpreter layer
+/// (`baseobjspace::w_type_version_tag`), which has the JIT intrinsics.
+pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
+    (*(obj as *const W_TypeObject))
+        .version_tag
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+/// Store a new version-tag identity (typeobject.py:286 `mutated`).
+pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
+    (*(obj as *const W_TypeObject))
+        .version_tag
+        .store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
+/// conservative `false` for a null / non-type pointer (matches the class
+/// default before any lookup confirms the flag).
+pub unsafe fn w_type_get_uses_object_getattribute(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !is_type(obj) {
+        return false;
+    }
+    (*(obj as *const W_TypeObject))
+        .uses_object_getattribute
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+/// Write-side companion to [`w_type_get_uses_object_getattribute`]
+/// (typeobject.py:275, 315).
+pub unsafe fn w_type_set_uses_object_getattribute(obj: PyObjectRef, v: bool) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    (*(obj as *const W_TypeObject))
+        .uses_object_getattribute
+        .store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// typeobject.py:186 `uses_object_setattr` reader (see
+/// [`w_type_get_uses_object_getattribute`]).
+pub unsafe fn w_type_get_uses_object_setattr(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !is_type(obj) {
+        return false;
+    }
+    (*(obj as *const W_TypeObject))
+        .uses_object_setattr
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+/// Write-side companion to [`w_type_get_uses_object_setattr`]
+/// (typeobject.py:276, 340).
+pub unsafe fn w_type_set_uses_object_setattr(obj: PyObjectRef, v: bool) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    (*(obj as *const W_TypeObject))
+        .uses_object_setattr
+        .store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// typeobject.py:179 `terminator` getter/setter. The stored value is an
+/// erased `*const MapNode`; the `pyre-interpreter` mapdict layer casts it.
+pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> *const u8 {
+    (*(obj as *const W_TypeObject)).terminator
+}
+pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: *const u8) {
+    (*(obj as *mut W_TypeObject)).terminator = terminator;
+}
+
 /// typeobject.py:181 `weakrefable` getter/setter.
 pub unsafe fn w_type_get_weakrefable(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).weakrefable
@@ -457,6 +629,17 @@ pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
         (*layout).acceptable_as_base_class
     }
 }
+
+/// typedef.py:40 `hasdict` — read from Layout level.
+/// typeobject.py:255 `typedef = self.layout.typedef; ... not typedef.hasdict`.
+pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
+    let layout = (*(obj as *const W_TypeObject)).layout;
+    if layout.is_null() {
+        false
+    } else {
+        (*layout).typedef_hasdict
+    }
+}
 /// Override acceptable_as_base_class by cloning the Layout.
 /// typedef.py:742,765,664 explicit overrides after initial creation.
 /// Layouts may be shared (reused from parent), so we clone to avoid
@@ -477,6 +660,7 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
         newslotnames: old.newslotnames.clone(),
         base_layout: old.base_layout,
         acceptable_as_base_class: v,
+        typedef_hasdict: old.typedef_hasdict,
     });
     (*(obj as *mut W_TypeObject)).layout = new_layout;
 }
@@ -486,13 +670,13 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
 /// `typeobject.py:640-662 W_TypeObject.add_subclass`.
 ///
 /// Records `w_subclass` in `w_parent.weak_subclasses` if not
-/// already present.  In PyPy this stores `weakref.ref(w_subclass)`
-/// so subclass GC isn't blocked; under `not rweakref` PyPy
-/// degrades to a strong-ref list and warns "ALL CLASSES LEAK"
-/// (`:642-650`).  Pyre follows the strong-ref fallback because
-/// `W_TypeObject` has no weakref wiring yet — a future weakref
-/// port can switch this to a weak ref without changing call
-/// sites.
+/// already present.  Stores `weakref.ref(w_subclass)` via
+/// `w_weakref_new` so subclass GC isn't blocked (`:642-650`); each
+/// entry is a `try_gc_alloc` WEAKREF GcStruct, so the off-GC
+/// `weak_subclasses` list is the WEAKREF's only strong root and must
+/// be walked by the collector (`walk_type_dicts_gc` while heap types
+/// stay Box-immortal, the `W_TYPE_GC_TYPE_ID` custom trace once they
+/// are GC-managed).
 ///
 /// # Safety
 /// `w_parent` must point at a valid `W_TypeObject`.  `w_subclass`
@@ -643,6 +827,7 @@ mod tests {
             newslotnames: vec![],
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true,
+            typedef_hasdict: false,
         });
         let child = leak_layout(Layout {
             typedef: &INSTANCE_TYPE,
@@ -650,6 +835,7 @@ mod tests {
             newslotnames: vec!["x".to_string()],
             base_layout: root,
             acceptable_as_base_class: true,
+            typedef_hasdict: false,
         });
         unsafe {
             assert!((*child).issublayout(root));
@@ -666,6 +852,7 @@ mod tests {
             newslotnames: vec!["x".to_string()],
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true,
+            typedef_hasdict: false,
         });
         // Same Layout pointer → equal
         assert!(Layout::expands_equal(root, true, true, root, true, true));
@@ -684,5 +871,47 @@ mod tests {
             <W_TypeObject as crate::lltype::GcType>::SIZE,
             W_TYPE_OBJECT_SIZE
         );
+    }
+
+    #[test]
+    fn new_version_tag_is_distinct_and_nonzero() {
+        let a = new_version_tag();
+        let b = new_version_tag();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn fresh_type_carries_version_tag_with_round_trip() {
+        let obj = w_type_new("Foo", PY_NULL, std::ptr::null_mut());
+        unsafe {
+            // typeobject.py:250 — a fresh type is minted with a non-None tag.
+            assert_ne!(w_type_get_version_tag(obj), 0);
+            // typeobject.py:286 — mutated() stores a fresh tag.
+            let fresh = new_version_tag();
+            w_type_set_version_tag(obj, fresh);
+            assert_eq!(w_type_get_version_tag(obj), fresh);
+        }
+    }
+
+    #[test]
+    fn fresh_type_uses_object_flags_default_false_with_round_trip() {
+        let obj = w_type_new("Bar", PY_NULL, std::ptr::null_mut());
+        unsafe {
+            // typeobject.py:185-186 — conservative `False` default.
+            assert!(!w_type_get_uses_object_getattribute(obj));
+            assert!(!w_type_get_uses_object_setattr(obj));
+            // typeobject.py:315/340 — confirmed-default lookup sets the flag.
+            w_type_set_uses_object_getattribute(obj, true);
+            w_type_set_uses_object_setattr(obj, true);
+            assert!(w_type_get_uses_object_getattribute(obj));
+            assert!(w_type_get_uses_object_setattr(obj));
+        }
+        // null / non-type tolerated, reads the conservative default.
+        unsafe {
+            assert!(!w_type_get_uses_object_getattribute(PY_NULL));
+            assert!(!w_type_get_uses_object_setattr(PY_NULL));
+        }
     }
 }

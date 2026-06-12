@@ -48,6 +48,39 @@ pub mod module;
 pub mod objspace;
 pub mod pyframe;
 
+/// Test-only hash-hook installer shared across the crate's `#[cfg(test)]`
+/// modules.  Production installs `space.hash_w` at boot
+/// (`pyre-jit::eval::init_jit_hooks`, before the first user statement);
+/// unit tests that build object- or str-keyed dicts must install the same
+/// single hash path on their own thread, because
+/// `pyre_object::dict_eq_hook` stores the hook thread-locally and libtest
+/// runs each `#[test]` on a fresh thread.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use pyre_object::PyObjectRef;
+
+    /// `baseobjspace.py:840-845 hash_w` — the single hash entry point,
+    /// mirrored for tests via `builtins::try_hash_value`.  On error it
+    /// records the pending exception the same way the production
+    /// trampoline does (`pyre-jit::eval`'s `pyre_object_hash_w_trampoline`).
+    unsafe fn test_hash_w(obj: PyObjectRef) -> i64 {
+        match crate::builtins::try_hash_value(obj) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::baseobjspace::set_pending_hash_error(e);
+                pyre_object::dict_eq_hook::signal_hash_error(obj);
+                0
+            }
+        }
+    }
+
+    /// Install the real `hash_w` on the current test thread.  Call at the
+    /// top of any `#[test]` that constructs an object/str-keyed dict.
+    pub(crate) fn install_hash_hook() {
+        pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
+    }
+}
+
 // ── Declarative builtin-module registration ──
 //
 // `pypy/module/<name>/moduledef.py` declares its surface as a dict

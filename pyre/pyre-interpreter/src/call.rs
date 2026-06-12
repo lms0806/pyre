@@ -1565,6 +1565,16 @@ pub fn call_with_kwargs(
         } else {
             pyre_object::w_instance_new(callable)
         };
+        // `instance` is a movable nursery object held only as a Rust local
+        // across the `__init__` dispatch below, which runs arbitrary
+        // allocating code and can relocate it during a minor collection.
+        // Pin it on the shadow stack and reload the (possibly forwarded)
+        // pointer afterwards — the manual equivalent of the translator's
+        // shadowstack save/restore around a collecting call
+        // (framework.py:853-856).
+        let _instance_roots = pyre_object::gc_roots::push_roots();
+        let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(instance);
         // Step 2: __init__(self, *args, **kwargs) with full kwargs support.
         if let Some(w_insttype) = type_call_init_type(instance, callable) {
             if let Some(init_fn) =
@@ -1581,7 +1591,7 @@ pub fn call_with_kwargs(
                 check_init_returned_none(init_result)?;
             }
         }
-        return Ok(instance);
+        return Ok(pyre_object::gc_roots::shadow_stack_get(instance_slot));
     }
 
     // For methods: unwrap and retry
@@ -3111,6 +3121,13 @@ pub unsafe fn create_all_slots(
                 newslotnames,
                 base_layout,
                 acceptable_as_base_class: true,
+                // typedef.py:51-53: inherit typedef.hasdict along the base
+                // layout chain (terminates at object's Layout = false).
+                typedef_hasdict: if base_layout.is_null() {
+                    false
+                } else {
+                    (*base_layout).typedef_hasdict
+                },
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);

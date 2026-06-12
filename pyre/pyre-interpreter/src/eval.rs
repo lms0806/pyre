@@ -184,6 +184,144 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
+/// Mark the GC-reachable children of a `getset_descriptor`
+/// (`W_GetSetProperty`).  The descriptor itself is Box-immortal
+/// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
+/// custom trace never fires.  Its `fget`/`fset`/`fdel` getters are
+/// GC-managed `try_gc_alloc_stable` functions — non-moving but still
+/// *collectable* — so when a descriptor's only holder is a Box-immortal
+/// type dict, nothing marks the getters reachable and the collector frees
+/// them, leaving `descr.fget` dangling (a fresh `obj.__dict__` after a
+/// collection then calls a freed getter → SIGSEGV).  Visit every
+/// `PyObjectRef` field and recurse into the getter functions, the same
+/// shape `walk_raw_function_roots` uses for Box-held function children.
+/// No-op for non-descriptor values.
+unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        // Positive predicate: the annotator cannot lower `!` over a
+        // cross-crate bool result (`UnaryNotUnknownOperand`), so guard with
+        // a positive `if` rather than negating `is_getset_property`.
+        if pyre_object::getsetproperty::is_getset_property(value) {
+            let d = &mut *(value as *mut pyre_object::getsetproperty::W_GetSetProperty);
+            visitor(&mut *(&mut d.fget as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.fset as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.fdel as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.doc as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.reqcls as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.name as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visitor(&mut *(&mut d.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
+            // The getters are functions whose own children (code / globals /
+            // defaults) must stay reachable as well.
+            walk_raw_function_roots(d.fget, visitor);
+            walk_raw_function_roots(d.fset, visitor);
+            walk_raw_function_roots(d.fdel, visitor);
+        }
+    }
+}
+
+/// Forward every `PyObjectRef` value bound in a heap type's namespace
+/// `DictStorage` in place — the class attributes, methods, and the
+/// per-type `__dict__`/`__weakref__` getset descriptor copies.  Keys are
+/// Rust `String`s (not GC objects); only the `PyObjectRef` values relocate.
+/// Snapshot the value slots first (same shape as the globals proxy walk)
+/// so `forward` cannot re-borrow the storage.  Shared by `walk_type_dicts_gc`
+/// (the Box-immortal-type band-aid root walk) and the `W_TYPE_GC_TYPE_ID`
+/// custom trace, so a GC-managed heap type reaches its own namespace values
+/// directly once its trace fires.
+pub unsafe fn type_walk_namespace_values(
+    w_type: PyObjectRef,
+    forward: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    unsafe {
+        if w_type.is_null() {
+            return;
+        }
+        // Positive predicate (see `walk_raw_getset_roots`): `!is_type` over
+        // a cross-crate bool is `UnaryNotUnknownOperand` to the annotator,
+        // so guard with a positive `if`.
+        if pyre_object::is_type(w_type) {
+            let dict_ptr = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
+            if dict_ptr.is_null() {
+                // No namespace storage installed yet.
+            } else {
+                let value_slots: Vec<*mut PyObjectRef> = (*dict_ptr)
+                    .values_mut()
+                    .iter_mut()
+                    .map(|value| value as *mut PyObjectRef)
+                    .collect();
+                for slot in value_slots {
+                    forward(&mut *slot);
+                }
+            }
+        }
+    }
+}
+
+/// Box-immortal heap types (`w_type_new`) never have their
+/// `W_TYPE_GC_TYPE_ID` custom trace fired, so the movable values bound in
+/// each type's namespace `DictStorage` (methods, class attributes, the
+/// per-type `__dict__`/`__weakref__` getset copies), the `bases` tuple, and
+/// the `weak_subclasses` WEAKREF list are unreachable by the collector.
+/// Walk every registered heap type's namespace values + `bases` +
+/// `weak_subclasses` as pinned roots so a relocated class attribute /
+/// method / descriptor — or a reclaimed subclass weakref — is not read back
+/// stale after a collection; the same shape `walk_module_dicts_gc` uses for
+/// module dicts.  PRE-EXISTING-ADAPTATION: PyPy GC-manages type objects and
+/// traces `dict_w`/`bases`/`weak_subclasses` for free; convergence is to
+/// GC-manage `W_TypeObject` (then its custom trace fires and this walk is
+/// deleted), mirroring the deferred instance Path-B keystone.
+unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    unsafe {
+        for addr in pyre_object::typeobject::snapshot_heap_types() {
+            let w_type = addr as PyObjectRef;
+            if w_type.is_null() {
+                continue;
+            }
+            // Positive predicate (see `walk_raw_getset_roots`): `!is_type`
+            // over a cross-crate bool is `UnaryNotUnknownOperand` to the
+            // annotator, so guard with a positive `if`.
+            if pyre_object::is_type(w_type) {
+                // `bases` is a movable tuple created at class definition and
+                // held only by the Box-immortal type; forward it in place.
+                let bases_slot =
+                    &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
+                forward(bases_slot);
+                // Namespace `dict_w` values: the class attributes, methods,
+                // and getset descriptor copies — the same walk the
+                // `W_TYPE_GC_TYPE_ID` custom trace performs once a heap type
+                // is GC-managed.
+                type_walk_namespace_values(w_type, forward);
+                // `weak_subclasses` holds `w_weakref_new` (`try_gc_alloc`)
+                // young WEAKREF GcStructs whose only strong root is this
+                // off-GC list; forward each slot in place so the WEAKREF
+                // survives collection (its `weakptr` payload is invalidated
+                // separately by the collector's weakref scan).  Without this,
+                // the first collection reclaims the weakref and the base's
+                // `weak_subclasses[i]` dangles — a UAF on the next
+                // `mutated()` / `w_type_get_subclasses` deref.  The
+                // `W_TYPE_GC_TYPE_ID` custom trace performs the same walk once
+                // a heap type is GC-managed.
+                let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
+                if t.weak_subclasses.is_null() {
+                    // No subclasses recorded.
+                } else {
+                    let subs = &mut *t.weak_subclasses;
+                    for slot in subs.iter_mut() {
+                        forward(
+                            &mut *(slot as *mut *mut pyre_object::weakref::Weakref
+                                as *mut PyObjectRef),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     CURRENT_FRAME.with(|cf| {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
@@ -320,6 +458,35 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                         (&mut *globals_ptr).set_mirror_target(live_obj);
                     }
                 }
+                // The proxy mirror above only covers the back-mirror
+                // DictStorage.  For a W_ModuleDictObject the LOAD_GLOBAL
+                // read path (`w_module_dict_getitem_str`) consults the
+                // authoritative `dstorage` cell map / `object_storage` /
+                // strategy caches ahead of the proxy, none of which the
+                // proxy walk reaches; the module dict is Box-immortal so
+                // its own custom trace never fires.  Forward those movable
+                // values here so a relocated global is not read back stale.
+                // No-op for non-module dicts.  The picked builtin Module's
+                // dict is consulted on a globals miss (`_load_global`
+                // fallback), so forward it too.
+                {
+                    let mut forward = |slot: &mut PyObjectRef| {
+                        visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                        walk_raw_function_roots(*slot, visitor);
+                    };
+                    pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
+                        live_obj,
+                        &mut forward,
+                    );
+                    let w_builtin = (*frame).w_builtin;
+                    if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                        let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+                        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
+                            w_builtin_dict,
+                            &mut forward,
+                        );
+                    }
+                }
                 let f = &*frame;
                 let next_frame = (*frame).f_backref;
                 if f.locals_cells_stack_w.is_null() {
@@ -341,6 +508,33 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 }
             }
             frame = next_frame;
+        }
+        // Box-immortal modules (and their Box-immortal dicts) are not
+        // reachable transitively by the collector, so walk every loaded
+        // module's dict storage as a pinned root source.  This covers
+        // module-scope movable values bound in modules other than the
+        // running frame's globals — e.g. `gc.collect` reached through
+        // `gc.__dict__` on a fresh `LOAD_METHOD` after a collection.
+        unsafe {
+            let mut forward = |slot: &mut PyObjectRef| {
+                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                walk_raw_function_roots(*slot, visitor);
+                // getset descriptors are Box-immortal (custom trace never
+                // fires), so their collectable `fget`/`fset`/`fdel`
+                // functions must be marked reachable here or the getter
+                // dangles after a collection.
+                walk_raw_getset_roots(*slot, visitor);
+            };
+            crate::importing::walk_module_dicts_gc(&mut forward);
+            // Box-immortal heap types' namespace dicts hold movable
+            // methods / class attributes / descriptor copies that no
+            // custom trace reaches; root them the same way.
+            walk_type_dicts_gc(&mut forward);
+            // The interpreter method cache (`baseobjspace::MethodCache`)
+            // keeps a second pointer to each looked-up method that the
+            // namespace-dict walk above does not reach; forward those so
+            // a cache hit after a moving collection is not stale.
+            crate::baseobjspace::walk_method_cache_gc(&mut forward);
         }
     });
 }
@@ -2797,6 +2991,19 @@ impl OpcodeStepExecutor for PyFrame {
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
+        // callmethod.py:60-78 fast method path: a plain method descriptor in
+        // the class, nothing shadowing it in the instance, on a type that uses
+        // the default __getattribute__.  Pushes [w_descr, w_obj] (the unbound
+        // function + receiver) so CALL_METHOD binds self without allocating a
+        // Method wrapper.  Shared with the JIT tracer (trace_opcode.rs) so the
+        // concrete and symbolic frames produce the identical stack shape.
+        if let Some((_, _, w_descr)) =
+            unsafe { crate::baseobjspace::load_method_fast_path(obj, name) }
+        {
+            self.push(w_descr);
+            self.push(obj);
+            return Ok(());
+        }
         let attr = crate::baseobjspace::getattr_str(obj, name)?;
         if unsafe { pyre_object::is_method(attr) } {
             self.push(attr);
@@ -2818,9 +3025,17 @@ impl OpcodeStepExecutor for PyFrame {
         //  - builtin type method (list.append etc.) → bind instance
         let bound = unsafe {
             if pyre_object::is_instance(obj) {
+                // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`:
+                // a shadowing instance attribute is what getattr returned for
+                // every non-data descriptor — never bind self for it.  (Data
+                // descriptors that win over the instance dict — property /
+                // member — resolve to PY_NULL either way.)
+                let shadowed =
+                    crate::objspace::std::mapdict::instance_node_getdictvalue(obj, name).is_some();
                 let w_type = pyre_object::w_instance_get_type(obj);
                 let raw = crate::baseobjspace::lookup_in_type(w_type, name);
                 match raw {
+                    _ if shadowed => PY_NULL,
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
@@ -2900,6 +3115,59 @@ impl OpcodeStepExecutor for PyFrame {
         };
         self.push(bound);
         Ok(())
+    }
+
+    /// pyopcode.py:1024-1027 `LOAD_ATTR` — the interpreter consults the mapdict
+    /// attribute cache only off-trace; under the JIT it does the plain
+    /// `space.getattr`, which the trace folds via the type's `version_tag`.
+    fn load_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+        // pyopcode.py:1024 `if not jit.we_are_jitted():` — positive form keeps
+        // the annotator off the bare-`!` hazard. The cache path's helpers are
+        // `dont_look_inside`, so the JIT never traces into them.
+        if majit_metainterp::jit::we_are_jitted() {
+            return OpcodeStepExecutor::load_attr(self, name);
+        }
+        // Graceful underflow (shared_opcode.rs:167 `opcode_load_attr` →
+        // `pop_value()?`): a corrupted concrete-execution stack during
+        // trace recording (e.g. a residual call the inline executor
+        // could not perform) aborts the trace instead of panicking the
+        // hard-asserting `pop()`.
+        let obj = self.pop_value()?;
+        let w_value = unsafe {
+            crate::objspace::std::mapdict::load_attr_caching(
+                self.pycode as PyObjectRef,
+                obj,
+                nameindex,
+                name,
+            )
+        }?;
+        self.push(w_value);
+        Ok(())
+    }
+
+    /// pyopcode.py:917-926 `STORE_ATTR` — consults the mapdict attribute cache
+    /// only off-trace; under the JIT it does the plain `space.setattr`, folded
+    /// by the type's `version_tag`.
+    fn store_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+        // pyopcode.py:920 `if not jit.we_are_jitted():` — positive form.
+        if majit_metainterp::jit::we_are_jitted() {
+            return OpcodeStepExecutor::store_attr(self, name);
+        }
+        // pyopcode.py:918-919 — obj is the top of stack, value below it.
+        // Graceful underflow like `opcode_store_attr` (shared_opcode.rs:176)
+        // so a corrupted trace-recording stack aborts the trace instead of
+        // panicking the hard-asserting `pop()`.
+        let obj = self.pop_value()?;
+        let value = self.pop_value()?;
+        unsafe {
+            crate::objspace::std::mapdict::store_attr_caching(
+                self.pycode as PyObjectRef,
+                obj,
+                nameindex,
+                name,
+                value,
+            )
+        }
     }
 
     // ── call ──
@@ -3565,6 +3833,7 @@ mod tests {
         // so MAKE_CELL must leave the pre-installed cell alone; a
         // cell-of-cell would make zero-arg super() resolve an inner cell
         // instead of the class.
+        crate::test_hooks::install_hash_hook();
         let (_result, frame) = run_exec_frame(
             "class A:\n    def f(self):\n        return 1\nclass B(A):\n    def f(self):\n        return 10 + super().f()\nresult = B().f()",
         );
@@ -4604,6 +4873,7 @@ result = factorial(5)";
 
     #[test]
     fn test_store_load_attr() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 def f():
     pass
@@ -4618,6 +4888,7 @@ result = f.x";
 
     #[test]
     fn test_store_load_multiple_attrs() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 def f():
     pass
@@ -4633,6 +4904,7 @@ result = f.a + f.b";
 
     #[test]
     fn test_attr_overwrite() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 def f():
     pass
@@ -4648,6 +4920,7 @@ result = f.x";
 
     #[test]
     fn test_attr_on_different_objects() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 def f():
     pass
@@ -5372,6 +5645,7 @@ result = C.snap['y'] + globals()['x']";
 
     #[test]
     fn test_bound_method_materialized_by_attribute_access() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 class C:
     def add(self, x):
@@ -5389,6 +5663,7 @@ result = m(41)";
 
     #[test]
     fn test_bound_method_lookup_materializes_method_object() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 class C:
     def add(self, x):
@@ -5653,6 +5928,7 @@ except TypeError as e:
 
     #[test]
     fn test_metaclass_method_materialized_by_attribute_access() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 class Meta(type):
     def pick(cls):
@@ -5670,6 +5946,7 @@ result = bound()";
 
     #[test]
     fn test_staticmethod_prepare_is_called_with_bound_lookup() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 class Meta(type):
     @staticmethod
@@ -5688,6 +5965,7 @@ result = C.value";
 
     #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
+        crate::test_hooks::install_hash_hook();
         let source = "\
 x = 7
 def f(a, *, b=3):

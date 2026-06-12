@@ -18,12 +18,14 @@
 //! exc=False, pure=True)` + `pyjitpl.py:3553-3579 record_result_of_call_pure`
 //! still work when driven from a production helper.
 
-use majit_ir::{OpCode, OpRef, Type, Value};
+use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{BackEdgeAction, MetaInterp};
 use pyre_jit_trace::helpers::{
     __majit_call_policy_jit_int_in_small_cache_range,
     __majit_call_target_jit_int_in_small_cache_range,
-    emit_trace_call_int_typed_elidable_cannot_raise,
+    emit_trace_call_int_typed_elidable_cannot_raise, emit_trace_call_ref_typed,
+    emit_trace_call_ref_typed_elidable_cannot_raise, jit_instance_getdictvalue,
+    jit_lookup_where_with_method_cache,
 };
 use pyre_object::{__majit_call_policy_int_bit_count, __majit_call_target_int_bit_count};
 
@@ -240,5 +242,359 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
         ctx.constants_get_value(resbox),
         Some(Value::Int(concrete_result)),
         "all-const fold must return ConstInt(concrete_result)",
+    );
+}
+
+// ── Epic G (getattr-inline) G0 canary ──────────────────────────────────
+//
+// Proves the PRODUCTION Ref emitter
+// `emit_trace_call_ref_typed_elidable_cannot_raise` records `CallPureR`
+// for the exact `(Ref, Ref, Int) -> Ref` argument shape of
+// `_pure_lookup_where_with_method_cache` (baseobjspace.rs:3631, `@elidable`
+// — parity with typeobject.py:516).  The metainterp-side
+// `elidable_ref_canary_test.rs` proved the generic Ref fold via
+// `call_typed_with_effect_pure` directly with a one-Int-arg helper; this
+// goes further and exercises the production wrapper G2 will call from
+// `trace_load_attr` / `MIFrame::load_method`, with the real two-Ref-args +
+// one-Int-arg shape.
+//
+// The recorder records but does not execute the call (pyjitpl.py:1941-1958
+// `MIFrame.execute_varargs`), using the supplied `concrete_result`, so a
+// synthetic same-shape `extern "C"` pointer stands in for the still-private
+// real lookup helper; G2 wires the real one.
+
+/// `(w_type, w_name, version_tag) -> w_descr`-shaped synthetic helper.
+extern "C" fn lookup_where_shape_canary(_w_type: i64, _w_name: i64, _version_tag: i64) -> i64 {
+    0x5EED_1000
+}
+
+#[test]
+fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
+    // The hot-loop fold promotes w_type so all three args become const and
+    // the call folds entirely (next test).  Before the version_tag guard
+    // hoists it, w_type is a live (non-const) Ref — that is the shape that
+    // exercises the CALL_R -> CALL_PURE_R patch
+    // (record_result_of_call_pure, pyjitpl.py:3553-3579).
+    let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
+
+    // Seed a live Ref inputarg in slot 0 = w_type (the receiver type).
+    let live_type: usize = 0x710E_0000;
+    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
+    assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+    let func_ptr = lookup_where_shape_canary as *const ();
+    let w_name: usize = 0x4A3E_0000;
+    let version_tag: i64 = 0x5234;
+    let concrete_result = lookup_where_shape_canary(live_type as i64, w_name as i64, version_tag);
+
+    let w_type_arg = OpRef::input_arg_ref(0);
+    let (w_name_arg, version_arg) = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        (ctx.const_ref(w_name as i64), ctx.const_int(version_tag))
+    };
+
+    let resbox = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        emit_trace_call_ref_typed_elidable_cannot_raise(
+            ctx,
+            func_ptr,
+            &[w_type_arg, w_name_arg, version_arg],
+            &[Type::Ref, Type::Ref, Type::Int],
+            // _build_allboxes (pyjitpl.py:1960-1993): funcbox concrete value
+            // first (the raw fn pointer, always Int), then per-arg concretes.
+            &[
+                Value::Int(func_ptr as usize as i64),
+                Value::Ref(GcRef(live_type)),
+                Value::Ref(GcRef(w_name)),
+                Value::Int(version_tag),
+            ],
+            Value::Ref(GcRef(concrete_result as usize)),
+        )
+    };
+
+    let ctx = meta.trace_ctx().expect("active trace");
+    let ops = ctx.ops();
+    let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
+    assert!(
+        ops.iter().any(|op| op.opcode == OpCode::CallPureR),
+        "production Ref emitter must record CallPureR for the (Ref,Ref,Int) lookup shape; got {opcodes:?}",
+    );
+    assert!(
+        ops.iter().all(|op| op.opcode != OpCode::CallR),
+        "original CallR must be cut, not coexist with CallPureR; got {opcodes:?}",
+    );
+    assert!(
+        ctx.constants_get_value(resbox).is_none(),
+        "non-all-const path must keep a live Ref OpRef result",
+    );
+}
+
+#[test]
+fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
+    // Hot-loop shape: w_type promoted, w_name interned, version_tag guarded
+    // -> all three args const -> the call is fully cut and the result folds
+    // to a ConstPtr (Value::Ref), NOT a ConstInt of the same bits
+    // (history.rs:3150 aliasing hazard).  This is the cross-iteration fold
+    // STEP 5 / Epic G deliver.
+    let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
+    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+    let func_ptr = lookup_where_shape_canary as *const ();
+    let w_type: usize = 0x710E_1111;
+    let w_name: usize = 0x4A3E_1111;
+    let version_tag: i64 = 0x5235;
+    let concrete_result = lookup_where_shape_canary(w_type as i64, w_name as i64, version_tag);
+
+    let (w_type_arg, w_name_arg, version_arg) = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        (
+            ctx.const_ref(w_type as i64),
+            ctx.const_ref(w_name as i64),
+            ctx.const_int(version_tag),
+        )
+    };
+
+    let resbox = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        emit_trace_call_ref_typed_elidable_cannot_raise(
+            ctx,
+            func_ptr,
+            &[w_type_arg, w_name_arg, version_arg],
+            &[Type::Ref, Type::Ref, Type::Int],
+            &[
+                Value::Int(func_ptr as usize as i64),
+                Value::Ref(GcRef(w_type)),
+                Value::Ref(GcRef(w_name)),
+                Value::Int(version_tag),
+            ],
+            Value::Ref(GcRef(concrete_result as usize)),
+        )
+    };
+
+    let ctx = meta.trace_ctx().expect("active trace");
+    let ops = ctx.ops();
+    assert!(
+        ops.iter()
+            .all(|op| op.opcode != OpCode::CallR && op.opcode != OpCode::CallPureR),
+        "all-const elidable lookup call must be fully cut; got {:?}",
+        ops.iter().map(|op| op.opcode).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ctx.constants_get_value(resbox),
+        Some(Value::Ref(GcRef(concrete_result as usize))),
+        "all-const fold must return ConstPtr(concrete_result), not ConstInt",
+    );
+}
+
+// ── Epic G (getattr-inline) G1 — REAL lookup helper, recordable wrapper ──
+//
+// G0 (above) proved the fold mechanism for the `(Ref, Ref, Int) -> Ref`
+// shape with a synthetic same-shape pointer.  G1 wires the REAL recordable
+// surface for the lookup: `jit_lookup_where_with_method_cache`
+// (helpers.rs), a plain `extern "C"` i64-ABI wrapper — like
+// `jit_namespace_cell_lookup` — that calls the now-`pub`
+// `_pure_lookup_where_with_method_cache` (baseobjspace.rs:3631, `@elidable`,
+// typeobject.py:516).
+//
+// The `#[elidable]` macro does NOT emit a usable trampoline for that helper:
+// its `PyObjectRef`-aliased args are not recognised as pointers by the
+// macro's type matcher (helper_arg_from_i64), so the policy degrades to
+// UNSUPPORTED.  As with every other pyre trace helper, the foldable surface
+// is therefore this i64 wrapper, recorded with an explicit
+// `ElidableCannotRaise` effect (the raw-ptr return genuinely cannot raise).
+// G2 records it from `trace_load_attr` / `MIFrame::load_method` behind a
+// promoted-`version_tag` guard, with `jit_getattr` as the deopt fallback.
+//
+// The recorder records but does not execute the call (pyjitpl.py:1941-1958),
+// so a synthetic concrete result stands in — the real wrapper would
+// dereference `w_name` and walk the MRO, which needs a live objspace.
+
+#[test]
+fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
+    let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
+
+    // Live (non-const) w_type Ref in slot 0 — the shape before the
+    // version_tag guard promotes the receiver type to a constant.
+    let live_type: usize = 0x710E_2222;
+    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
+    assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+    let func_ptr = jit_lookup_where_with_method_cache as *const ();
+    let w_name: usize = 0x4A3E_2222;
+    let version_tag: i64 = 0x5236;
+    // Synthetic descriptor pointer; the wrapper is NOT invoked here.
+    let concrete_result: usize = 0xDE5C_2222;
+
+    let w_type_arg = OpRef::input_arg_ref(0);
+    let (w_name_arg, version_arg) = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        (ctx.const_ref(w_name as i64), ctx.const_int(version_tag))
+    };
+
+    let resbox = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        emit_trace_call_ref_typed_elidable_cannot_raise(
+            ctx,
+            func_ptr,
+            &[w_type_arg, w_name_arg, version_arg],
+            &[Type::Ref, Type::Ref, Type::Int],
+            &[
+                Value::Int(func_ptr as usize as i64),
+                Value::Ref(GcRef(live_type)),
+                Value::Ref(GcRef(w_name)),
+                Value::Int(version_tag),
+            ],
+            Value::Ref(GcRef(concrete_result)),
+        )
+    };
+
+    let ctx = meta.trace_ctx().expect("active trace");
+    let ops = ctx.ops();
+    let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
+    assert!(
+        ops.iter().any(|op| op.opcode == OpCode::CallPureR),
+        "real lookup wrapper must record CallPureR; got {opcodes:?}",
+    );
+    assert!(
+        ops.iter().all(|op| op.opcode != OpCode::CallR),
+        "original CallR must be cut; got {opcodes:?}",
+    );
+    assert!(
+        ctx.constants_get_value(resbox).is_none(),
+        "non-all-const path keeps a live Ref OpRef result",
+    );
+}
+
+#[test]
+fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
+    // Hot-loop shape: w_type promoted, w_name interned, version_tag guarded
+    // -> all three args const -> the lookup call is fully cut and folds to a
+    // ConstPtr (Value::Ref), the cross-iteration fold STEP 5 / Epic G deliver.
+    let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
+    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+    let func_ptr = jit_lookup_where_with_method_cache as *const ();
+    let w_type: usize = 0x710E_3333;
+    let w_name: usize = 0x4A3E_3333;
+    let version_tag: i64 = 0x5237;
+    let concrete_result: usize = 0xDE5C_3333;
+
+    let (w_type_arg, w_name_arg, version_arg) = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        (
+            ctx.const_ref(w_type as i64),
+            ctx.const_ref(w_name as i64),
+            ctx.const_int(version_tag),
+        )
+    };
+
+    let resbox = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        emit_trace_call_ref_typed_elidable_cannot_raise(
+            ctx,
+            func_ptr,
+            &[w_type_arg, w_name_arg, version_arg],
+            &[Type::Ref, Type::Ref, Type::Int],
+            &[
+                Value::Int(func_ptr as usize as i64),
+                Value::Ref(GcRef(w_type)),
+                Value::Ref(GcRef(w_name)),
+                Value::Int(version_tag),
+            ],
+            Value::Ref(GcRef(concrete_result)),
+        )
+    };
+
+    let ctx = meta.trace_ctx().expect("active trace");
+    let ops = ctx.ops();
+    assert!(
+        ops.iter()
+            .all(|op| op.opcode != OpCode::CallR && op.opcode != OpCode::CallPureR),
+        "all-const lookup call must be fully cut; got {:?}",
+        ops.iter().map(|op| op.opcode).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ctx.constants_get_value(resbox),
+        Some(Value::Ref(GcRef(concrete_result))),
+        "all-const fold must return ConstPtr(concrete_result), not ConstInt",
+    );
+}
+
+// ── Epic G (getattr-inline) G2a — instance-dict shadow read residual ─────
+//
+// `jit_instance_getdictvalue` (helpers.rs) wraps `instance_node_getdictvalue`
+// (mapdict.rs:361, `getdictvalue` mapdict.py:846-847).  The LOAD_METHOD fast
+// path (callmethod.py:66) reads it after the type lookup to confirm no
+// instance attribute shadows the class method.  Unlike the type lookup, it is
+// NOT pure — the instance dict mutates — so it is recorded as a normal
+// residual `CallR` (emit_trace_call_ref_typed, default_effect_info), guarded
+// `null` per iteration rather than folded across iterations.  These two tests
+// pin (1) the null-guard ABI contract and (2) that the residual call survives
+// even with all-const args (the contrast with the foldable lookup above).
+
+#[test]
+fn instance_getdictvalue_wrapper_null_receiver_returns_py_null() {
+    // ABI contract: a null receiver / name returns PY_NULL (no deref).
+    assert_eq!(
+        jit_instance_getdictvalue(0, 0),
+        pyre_object::PY_NULL as i64,
+        "null receiver must short-circuit to PY_NULL",
+    );
+    assert_eq!(
+        jit_instance_getdictvalue(0, 0x4A3E_4444),
+        pyre_object::PY_NULL as i64,
+        "null receiver must short-circuit to PY_NULL even with a non-null name",
+    );
+}
+
+#[test]
+fn instance_getdictvalue_records_residual_call_r_not_pure() {
+    // Even with all-const args the instance-dict read stays a live residual
+    // CallR (NOT CallPureR, NOT folded to a Const) — the per-iteration
+    // shadowing check the LOAD_METHOD fast path needs.
+    let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
+    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+    let func_ptr = jit_instance_getdictvalue as *const ();
+    let w_obj: usize = 0x1457_5555;
+    let w_name: usize = 0x4A3E_5555;
+
+    let (w_obj_arg, w_name_arg) = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        (ctx.const_ref(w_obj as i64), ctx.const_ref(w_name as i64))
+    };
+
+    let resbox = {
+        let ctx = meta.trace_ctx().expect("active trace");
+        emit_trace_call_ref_typed(
+            ctx,
+            func_ptr,
+            &[w_obj_arg, w_name_arg],
+            &[Type::Ref, Type::Ref],
+        )
+    };
+
+    let ctx = meta.trace_ctx().expect("active trace");
+    let ops = ctx.ops();
+    let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
+    assert!(
+        ops.iter().any(|op| op.opcode == OpCode::CallR),
+        "instance-dict read must record a residual CallR; got {opcodes:?}",
+    );
+    assert!(
+        ops.iter().all(|op| op.opcode != OpCode::CallPureR),
+        "instance-dict read must NOT be a foldable CallPureR; got {opcodes:?}",
+    );
+    assert!(
+        ctx.constants_get_value(resbox).is_none(),
+        "residual call result must stay a live OpRef even with all-const args",
     );
 }

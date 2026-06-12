@@ -6,5 +6,19 @@ license.workspace = true
 repository.workspace = true
 description = "Garbage collector for majit JIT runtime"
 
+[features]
+# Deterministic GC stress mode. Compiles in a per-instance `stress_collect`
+# flag (off by default; opt in with `MiniMarkGC::set_stress_collect(true)` or
+# the `MAJIT_GC_STRESS` env var) that forces a full collection at the start of
+# every `alloc_with_type`. This is the deterministic equivalent of running with
+# a minimal `PYPY_GC_NURSERY`: it exposes any live object not reachable from a
+# registered root or custom-trace path by moving/sweeping it on the next
+# allocation rather than letting it survive by luck. Test-only; the default and
+# release builds compile neither the field nor the branch, so production
+# allocation cost is unchanged. Because the flag is per-instance, enabling the
+# feature workspace-wide leaves suites that assert `minor_collections == 0`
+# untouched — only an opted-in GC stresses its own allocations.
+gc_stress = []
+
 [dependencies]
 majit-ir = { workspace = true }

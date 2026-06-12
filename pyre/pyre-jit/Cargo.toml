@@ -17,6 +17,10 @@ dynasm = ["jit", "majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-tr
 # validation runs check.py with this enabled and
 # PYRE_MIR_FRONTEND_LLBC pointing at an extracted .ullbc.
 mir-frontend = ["majit-translate/mir-frontend"]
+# Collect on every allocation so instance / container GC tracing is
+# exercised eagerly. majit-gc is compiled once per build, so this single
+# edge enables the stress mode for the whole pyre-jit dependency closure.
+gc_stress = ["majit-gc/gc_stress"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -33,9 +37,12 @@ pyre-jit-trace = { workspace = true }
 majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 vecset = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 majit-backend-wasm = { workspace = true }
 
 [dev-dependencies]
 pyre-jit-trace = { workspace = true, features = ["test-support"] }
+pyre-object = { workspace = true }
+pyre-interpreter = { workspace = true }

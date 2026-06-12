@@ -2093,6 +2093,7 @@ mod tests {
     /// dict expansion fills parallel name/value buffers.
     #[test]
     fn combine_starstarargs_wrapped_dict_expansion() {
+        crate::test_hooks::install_hash_hook();
         let mut names: Vec<PyObjectRef> = vec![];
         let mut values: Vec<PyObjectRef> = vec![];
         let dict = pyre_object::dictmultiobject::w_dict_new();
@@ -2129,6 +2130,7 @@ mod tests {
     /// through `combine_starstarargs_wrapped`).
     #[test]
     fn new_with_w_starstararg_fills_kwargs() {
+        crate::test_hooks::install_hash_hook();
         let pos = [pyre_object::w_int_new(1)];
         let dict = pyre_object::dictmultiobject::w_dict_new();
         unsafe {
@@ -2340,6 +2342,7 @@ mod tests {
     /// arguments_w through newtuple + newdict.
     #[test]
     fn topacked_round_trips() {
+        crate::test_hooks::install_hash_hook();
         let pos = [pyre_object::w_int_new(1), pyre_object::w_int_new(2)];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(99)];

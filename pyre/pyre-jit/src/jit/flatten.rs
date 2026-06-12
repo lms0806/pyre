@@ -677,21 +677,12 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `W_TypeObject`, so the
 /// `getfield_gc_r` shape is not required.
 ///
-/// `getattr` — emitted by `codewriter.rs::emit_frontend_getattr`
-/// mirroring `flowcontext.py:862-867 op.getattr(w_obj, w_attributename)`.
-/// Pyre's walker pairs every `emit_frontend_getattr` callsite with an
-/// inline `emit_abort_permanent!` (see codewriter.rs:6867 LoadAttr
-/// arm) because pyre's runtime cannot compile attribute lookups; the
-/// trace bails out to the interpreter before any consumer reads the
-/// HLOp's result Variable.  After the `emit_abort_permanent!` graph
-/// dual-write (codewriter.rs:3756), canonical's per-block iteration
-/// already emits the `abort_permanent` Insn that terminates the
-/// compiled trace — emitting a literal `getattr` Insn would be both
-/// unreachable at runtime AND undispatchable by the assembler.
-/// Upstream `rclass.py:838 rtype_getattr` would rewrite this to
-/// `getfield_gc_X(v, descr)` after rtyping; pyre's lack of rtyping
-/// keeps the HLOp unmodified, so eliding it under lowering_ctx is the
-/// production-safe path.
+/// `getattr` is NOT elided (no longer in this list): the LoadAttr arm
+/// production-flipped from `emit_abort_permanent!` to a runnable
+/// residual lowering, so the `getattr` HLOp recorded by
+/// `emit_frontend_getattr` now routes through
+/// [`lower_getattr_hlop_to_insn`] (the `residual_call_r_r` →
+/// `bh_getattr_fn` shape) in the retired-family dispatcher.
 ///
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
 /// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
@@ -704,7 +695,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// rtype_setattr` rewrites to `setfield_gc(v, descr, w_value)` after
 /// rtyping; pyre's lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
-    matches!(opname, "type" | "getattr" | "setattr")
+    matches!(opname, "type" | "setattr")
 }
 
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
@@ -2654,15 +2645,14 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         // Pre-rtype Python string constant.  Upstream RPython's
         // `rtyper:specialize` substep interns the string into the static
         // data section and rewrites the Constant to a
-        // `(Signed(addr), Kind::Ref)` post-rtype shape.  Pyre lacks the
-        // rtyper today, so the lowered Insn carries a placeholder
-        // `ConstRef(0)`.  Production callers route LOAD_ATTR /
-        // STORE_ATTR through `emit_abort_permanent!` (codewriter.rs
-        // ~6735, ~6756), so the placeholder is never executed.  When
-        // pyre's string-intern infrastructure lands and LOAD_ATTR
-        // production-flips, swap this arm for `Operand::ConstRef
-        // (intern_pool.resolve(s) as i64)`.
-        (ConstantValue::Str(_), Some(Kind::Ref)) => Operand::ConstRef(0),
+        // `(Signed(addr), Kind::Ref)` post-rtype shape.  Pyre's
+        // equivalent is `box_str_constant` (content-keyed immortal
+        // `W_StrObject`, never freed), so the lowered Insn carries the
+        // interned pointer directly — the runtime reads the name back
+        // via `w_str_get_value` (e.g. `bh_getattr_fn`).
+        (ConstantValue::Str(s), Some(Kind::Ref)) => Operand::ConstRef(
+            pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(s.as_str())) as i64,
+        ),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
             panic!(
                 "GraphFlattener: opaque ref constants must be resolved \
@@ -3070,6 +3060,12 @@ pub struct LoweringContext {
     /// so the residual_call Insn has no result Register and no
     /// `ListI` (no scalar Int args).
     pub store_subscr_fn_idx: u16,
+    /// `getattr_fn` descrs-pool index.  LOAD_ATTR family (single HLOp
+    /// opname `getattr`, the `flowcontext.py:862-867 op.getattr` shape)
+    /// lowers to `residual_call_r_r` (two Ref inputs `[obj, w_name]`,
+    /// Ref result) via [`lower_getattr_hlop_to_insn`] — the no-rtyper
+    /// stand-in for `rclass.py:838 rtype_getattr → getfield_gc`.
+    pub getattr_fn_idx: u16,
     /// `build_list_fn` descrs-pool index — see codewriter.rs:2401
     /// (`bind(assembler, cpu.build_list_fn as *const (),
     /// CallFlavor::Plain)`) for the production source.  BUILD_LIST
@@ -3496,6 +3492,50 @@ fn build_load_global_fn_insn_from_operands(
         ],
         Register::new(Kind::Ref, dst_reg),
     )
+}
+
+/// Lower a `LOAD_ATTR` pre-rtype HLOp `getattr(w_obj, w_attributename)`
+/// → `result: Ref` (the `flowcontext.py:862-867 op.getattr` shape
+/// recorded by `emit_frontend_getattr`) to the post-rtype
+/// `residual_call_r_r(ConstInt(getattr_fn_idx), ListR([obj, w_name]),
+/// Descr) → reg` Insn — the no-rtyper stand-in for `rclass.py:838
+/// rtype_getattr → getfield_gc`.  `bh_getattr_fn(obj: Ref, w_name: Ref)
+/// → Ref` runs `getattr_str(obj, name)`; the name Constant lowers to
+/// the interned immortal str pointer via `lower_constant`
+/// ([`flatten_constant_operand`]'s `Str` arm → `box_str_constant`).
+/// `LOAD_ATTR` is walker-skipped during recording (the optimizer
+/// matches the `jit_getattr` trait-leg op, not this), so there is no
+/// known-result-cache constraint and the receiver lowers as a plain
+/// register operand.  `CallFlavor::Plain` (can-raise `AttributeError`,
+/// no virtual-force).
+pub fn lower_getattr_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "getattr" {
+        return None;
+    }
+    if op.args.len() != 2 {
+        return None;
+    }
+    let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.getattr_fn_idx,
+        vec![obj_operand, name_operand],
+        CallFlavor::Plain,
+        dst_reg,
+    ))
 }
 
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
@@ -4164,6 +4204,9 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_getattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -4202,22 +4245,25 @@ where
     if op.opname != "simple_call" {
         return None;
     }
-    if op.args.is_empty() {
+    if op.args.len() < 2 {
         return None;
     }
-    let nargs = op.args.len() - 1;
+    let nargs = op.args.len() - 2;
     if nargs > 8 {
         return None;
     }
-    // First arg is the callable, rest are call arguments.  All Ref.  The
-    // lowered ListR is `[callable, args...]`, matching RPython
+    // First arg is the callable, second the CALL opcode's null_or_self
+    // slot, rest are call arguments.  All Ref.  The lowered ListR is
+    // `[callable, null_or_self, args...]`, matching RPython
     // `jtransform.py:414 rewrite_call` and the frame-less residual call
     // ABI (`bhimpl_residual_call_r_r` → `cpu.bh_call_r(func, None,
     // args_r, ...)`).  The parent frame is resolved at runtime from the
     // execution context inside `bh_call_fn_impl`, not threaded as a
-    // leading operand.  `get_register` routes each arg through
-    // `regallocs[Ref].getcolor(v)` per upstream `flatten.py:382-391`, so
-    // every Register index lands in `[0, num_colors)`.
+    // leading operand; a non-null null_or_self is the method receiver the
+    // helper prepends as arg0 (eval.rs:3216-3226).  `get_register` routes
+    // each arg through `regallocs[Ref].getcolor(v)` per upstream
+    // `flatten.py:382-391`, so every Register index lands in
+    // `[0, num_colors)`.
     let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
     for arg in &op.args {
         let operand = match arg {
@@ -5504,6 +5550,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -5635,6 +5682,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -5753,6 +5801,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -5834,6 +5883,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -5959,6 +6009,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6129,6 +6180,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6348,6 +6400,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6433,6 +6486,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6462,6 +6516,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6559,6 +6614,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6620,6 +6676,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6647,6 +6704,7 @@ mod tests {
             compare_op_fn_idx: 17,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6681,6 +6739,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6742,6 +6801,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6766,6 +6826,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6804,6 +6865,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6858,6 +6920,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6897,6 +6960,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6931,6 +6995,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6961,6 +7026,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6991,6 +7057,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7026,6 +7093,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7075,6 +7143,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -8435,6 +8504,7 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -8706,13 +8776,15 @@ mod tests {
             compare_op_fn_idx: 0,
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs,
         };
+        let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
-            vec![callable_var.into()],
+            vec![callable_var.into(), null_or_self_var.into()],
             Some(result_var.into()),
             0,
         );
@@ -8724,6 +8796,10 @@ mod tests {
             VariableId(9) => Register {
                 kind: Kind::Ref,
                 index: 102,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
             },
             _ => panic!("unexpected var id {:?}", var.id),
         };
@@ -8747,8 +8823,8 @@ mod tests {
                         assert_eq!(list.kind, Kind::Ref);
                         assert_eq!(
                             list.content.len(),
-                            1,
-                            "ListR carries only the callable (nargs=0), no frame"
+                            2,
+                            "ListR carries callable + null_or_self (nargs=0), no frame"
                         );
                         match &list.content[0] {
                             Operand::Register(r) => {
@@ -8761,6 +8837,13 @@ mod tests {
                             other => {
                                 panic!("callable must be the leading Ref operand, got {other:?}")
                             }
+                        }
+                        match &list.content[1] {
+                            Operand::Register(r) => {
+                                assert_eq!(r.kind, Kind::Ref);
+                                assert_eq!(r.index, 103, "second Ref operand must be null_or_self");
+                            }
+                            other => panic!("null_or_self must be a Register, got {other:?}"),
                         }
                     }
                     other => panic!("expected ListOfKind Ref, got {other:?}"),
