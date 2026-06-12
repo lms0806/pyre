@@ -30,27 +30,28 @@ fn default_poll_events() -> i16 {
 #[cfg(all(unix, feature = "host_env"))]
 pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
     unsafe {
-        let fd_val = if pyre_object::is_int(w_fd) {
-            pyre_object::w_int_get_value(w_fd)
+        // A real int (or int subclass / bignum) is taken directly; otherwise
+        // `fileno()` is called.  An object with only `__int__` is rejected.
+        let w_int = if pyre_object::is_int_or_long(w_fd) {
+            w_fd
         } else {
             let fileno = crate::baseobjspace::getattr_str(w_fd, "fileno").map_err(|_| {
-                crate::PyError::type_error("argument must be an int, or have a fileno() method")
+                crate::PyError::type_error("argument must be an int, or have a fileno() method.")
             })?;
             let res = crate::call::call_function_impl_result(fileno, &[])?;
-            if !pyre_object::is_int(res) {
-                return Err(crate::PyError::type_error("fileno() must return an integer"));
+            if !pyre_object::is_int_or_long(res) {
+                return Err(crate::PyError::type_error("fileno() returned a non-integer"));
             }
-            pyre_object::w_int_get_value(res)
+            res
         };
-        if fd_val < 0 {
-            return Err(crate::PyError::value_error(
-                "file descriptor cannot be a negative integer",
-            ));
+        // `c_int_w` — OverflowError if it does not fit a 32-bit int.
+        let fd = crate::baseobjspace::c_int_w(w_int)?;
+        if fd < 0 {
+            return Err(crate::PyError::value_error(format!(
+                "file descriptor cannot be a negative integer ({fd})"
+            )));
         }
-        if fd_val > i32::MAX as i64 {
-            return Err(crate::PyError::overflow_error("file descriptor out of range"));
-        }
-        Ok(fd_val as i32)
+        Ok(fd)
     }
 }
 
@@ -256,36 +257,17 @@ pub fn register_module(ns: &mut DictStorage) {
                     let items = crate::baseobjspace::unpackiterable(seq, -1)?;
                     let mut out = Vec::with_capacity(items.len());
                     for item in items {
-                        let fd_val = unsafe {
-                            if pyre_object::is_int(item) {
-                                pyre_object::w_int_get_value(item)
-                            } else {
-                                let fileno =
-                                    crate::baseobjspace::getattr_str(item, "fileno").map_err(|_| {
-                                        crate::PyError::type_error(
-                                            "argument must be an int, or have a fileno() method",
-                                        )
-                                    })?;
-                                let res = crate::call::call_function_impl_result(fileno, &[])?;
-                                if !pyre_object::is_int(res) {
-                                    return Err(crate::PyError::type_error(
-                                        "fileno() must return an integer",
-                                    ));
-                                }
-                                pyre_object::w_int_get_value(res)
-                            }
-                        };
-                        if fd_val < 0 {
+                        // `interp_select.py:132 _build_fd_set` — each item is
+                        // resolved through `space.c_filedescriptor_w`.
+                        let fd = filedescriptor_w(item)?;
+                        // `fd >= FD_SETSIZE` is rejected: `FD_SET` on such an
+                        // fd writes outside the `fd_set` bitmap.
+                        if fd >= libc::FD_SETSIZE as i32 {
                             return Err(crate::PyError::value_error(
-                                "file descriptor cannot be a negative integer",
+                                "file descriptor out of range in select()",
                             ));
                         }
-                        if fd_val > i32::MAX as i64 {
-                            return Err(crate::PyError::overflow_error(
-                                "file descriptor out of range",
-                            ));
-                        }
-                        out.push((item, fd_val as i32));
+                        out.push((item, fd));
                     }
                     Ok(out)
                 }
@@ -303,23 +285,14 @@ pub fn register_module(ns: &mut DictStorage) {
                     }
                 }
 
-                // `interp_select.py:227-235` — `None` blocks forever, else a
-                // non-negative float second count.
+                // `interp_select.py:230-235` — `None` blocks forever, else
+                // `space.float_w` (applies `__float__`); a negative count is
+                // a ValueError.
                 let timeout_secs: Option<f64> = match args.get(3) {
                     None => None,
                     Some(&t) if unsafe { pyre_object::is_none(t) } => None,
                     Some(&t) => {
-                        let secs = unsafe {
-                            if pyre_object::is_float(t) {
-                                pyre_object::w_float_get_value(t)
-                            } else if pyre_object::is_int(t) {
-                                pyre_object::w_int_get_value(t) as f64
-                            } else {
-                                return Err(crate::PyError::type_error(
-                                    "timeout must be a float or None",
-                                ));
-                            }
-                        };
+                        let secs = crate::baseobjspace::float_w(t)?;
                         if secs < 0.0 {
                             return Err(crate::PyError::value_error(
                                 "timeout must be non-negative",
@@ -332,8 +305,20 @@ pub fn register_module(ns: &mut DictStorage) {
                 // `interp_select.py:166` — EINTR retry, recomputing the
                 // remaining timeout each pass and rebuilding the fd sets
                 // (select() clobbers them on every call).
-                let deadline = timeout_secs
-                    .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
+                // `Duration::from_secs_f64` panics on a NaN/inf/overflowing
+                // timeout; `float_w` lets such a value through, so convert it
+                // into a `ValueError` instead of aborting the host process.
+                let deadline = match timeout_secs {
+                    None => None,
+                    Some(s) => Some(
+                        std::time::Duration::try_from_secs_f64(s)
+                            .ok()
+                            .and_then(|d| std::time::Instant::now().checked_add(d))
+                            .ok_or_else(|| {
+                                crate::PyError::value_error("timeout is too large")
+                            })?,
+                    ),
+                };
                 let mut rset = host_select::FdSet::new();
                 let mut wset = host_select::FdSet::new();
                 let mut xset = host_select::FdSet::new();

@@ -583,6 +583,10 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
         );
         reg.insert(
+            &pyre_object::rangeobject::LONG_RANGE_ITER_TYPE as *const PyType as usize,
+            new_typeobject_with_base("longrange_iterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
             &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
             new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
@@ -9308,6 +9312,16 @@ fn invalid_byte_2_of_3(ch1: u8, ch2: u8) -> bool {
 /// rutf8.py:345-348
 fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
     invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
+}
+
+/// interp_locale.py:42-46 `charp2uni` — decode a C string the way
+/// `str(bytes, 'utf-8', 'surrogateescape')` does: valid UTF-8 passes
+/// through and any other byte becomes a lone `0xDC00 + byte` surrogate.
+/// `surrogateescape` rescues every byte, so the decode never fails.
+pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
+    let decoded = decode_utf8_with_errors(data, "surrogateescape")
+        .expect("surrogateescape rescues every byte, so the decode never fails");
+    pyre_object::w_str_from_wtf8(decoded)
 }
 
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath

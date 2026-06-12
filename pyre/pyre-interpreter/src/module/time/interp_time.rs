@@ -85,42 +85,74 @@ pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `std::thread::sleep` otherwise.
 pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "sleep() takes exactly one argument");
-    // `timeutils.py:20-38 timestamp_w` — a float rejects NaN; everything
-    // else goes through `space.bigint_w`, so bools are accepted (int
-    // subclass) and any other type raises TypeError.
-    let secs = unsafe {
+    // `timeutils.py:20-38 timestamp_w` — reduce the argument to an integer
+    // number of nanoseconds. A float scales then `math.ceil`s, with an
+    // `ovfcheck_float_to_longlong` overflow guard and a NaN ValueError; an
+    // int (or bool, an int subclass) takes `bigint_w().tolonglong()` and
+    // multiplies by 10**9 under the same overflow guard; anything else is a
+    // TypeError.
+    const SECS_TO_NS: i64 = 1_000_000_000;
+    let timeout_ns: i64 = unsafe {
+        let overflow = || {
+            crate::PyError::overflow_error(format!(
+                "timestamp {} too large to convert to C _PyTime_t",
+                crate::py_repr(args[0])
+            ))
+        };
         if is_float(args[0]) {
-            let s = floatobject::w_float_get_value(args[0]);
-            if s.is_nan() {
+            let secs = floatobject::w_float_get_value(args[0]);
+            if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
-            s
-        } else if is_int(args[0]) {
-            w_int_get_value(args[0]) as f64
-        } else if is_bool(args[0]) {
-            if boolobject::w_bool_get_value(args[0]) {
-                1.0
-            } else {
-                0.0
+            // `rarithmetic.ovfcheck_float_to_longlong` bounds.
+            let result_float = (secs * SECS_TO_NS as f64).ceil();
+            if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
+                return Err(overflow());
             }
+            result_float as i64
         } else {
-            let name = crate::typedef::r#type(args[0])
-                .map(|tp| w_type_get_name(tp).to_string())
-                .unwrap_or_else(|| "object".to_string());
-            return Err(crate::PyError::type_error(format!(
-                "'{name}' object cannot be interpreted as an integer"
-            )));
+            let sec = if is_int(args[0]) {
+                w_int_get_value(args[0])
+            } else if pyre_object::pyobject::is_long(args[0]) {
+                let big = pyre_object::longobject::w_long_get_value(args[0]);
+                i64::try_from(big).map_err(|_| overflow())?
+            } else if is_bool(args[0]) {
+                boolobject::w_bool_get_value(args[0]) as i64
+            } else {
+                // `timeutils.py:31` — `space.bigint_w(w_secs)` applies
+                // `space.int`, so an object with `__int__` / `__index__` is
+                // accepted and reduced to a longlong.
+                let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
+                    || crate::baseobjspace::lookup(args[0], "__index__").is_some();
+                if !has_int {
+                    let name = crate::typedef::r#type(args[0])
+                        .map(|tp| w_type_get_name(tp).to_string())
+                        .unwrap_or_else(|| "object".to_string());
+                    return Err(crate::PyError::type_error(format!(
+                        "'{name}' object cannot be interpreted as an integer"
+                    )));
+                }
+                let w_int = crate::baseobjspace::space_int(args[0])?;
+                if is_int(w_int) {
+                    w_int_get_value(w_int)
+                } else {
+                    i64::try_from(pyre_object::longobject::w_long_get_value(w_int))
+                        .map_err(|_| overflow())?
+                }
+            };
+            sec.checked_mul(SECS_TO_NS).ok_or_else(|| overflow())?
         }
     };
-    if secs < 0.0 {
+    // `interp_time.py:624` — `if not (timeout >= 0)`.
+    if timeout_ns < 0 {
         return Err(crate::PyError::value_error(
             "sleep length must be non-negative",
         ));
     }
-    if secs == 0.0 {
+    if timeout_ns == 0 {
         return Ok(w_none());
     }
-    let dur = std::time::Duration::from_secs_f64(secs);
+    let dur = std::time::Duration::from_nanos(timeout_ns as u64);
     #[cfg(all(unix, feature = "host_env"))]
     {
         // `interp_time.py:622-710 time_sleep` — sleep toward a monotonic
@@ -665,56 +697,73 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         ));
     };
 
+    // `interp_time.py:801` — `space.fixedview(w_tup)` accepts any sequence
+    // (tuple, list, struct_time), not only an exact tuple.
+    let tup_w = crate::baseobjspace::fixedview(tup, -1)?;
+    let len = tup_w.len();
     unsafe {
-        let len = w_tuple_len(tup);
         if len < 9 {
             return Err(crate::PyError::type_error(format!(
                 "argument must be sequence of at least length 9, not {len}"
             )));
         }
-        let get = |i: usize| -> i32 {
-            let item = w_tuple_getitem(tup, i as i64).unwrap();
-            if is_int(item) {
-                w_int_get_value(item) as i32
-            } else if is_float(item) {
-                floatobject::w_float_get_value(item) as i32
-            } else {
-                0
-            }
-        };
+        // `baseobjspace.py:1976 c_int_w` — int_w with a 32-bit range check;
+        // floats and non-integers raise rather than being truncated.
+        let c_int_w =
+            |i: usize| -> Result<i32, crate::PyError> { crate::baseobjspace::c_int_w(tup_w[i]) };
+        let y = c_int_w(0)?;
+        // A zero month / day / yday is normalized to 1 before the C-struct
+        // adjustment below.
+        let mut tm_mon = c_int_w(1)?;
+        if tm_mon == 0 {
+            tm_mon = 1;
+        }
+        let mut tm_mday = c_int_w(2)?;
+        if tm_mday == 0 {
+            tm_mday = 1;
+        }
+        let mut tm_yday = c_int_w(7)?;
+        if tm_yday == 0 {
+            tm_yday = 1;
+        }
+        let tm_hour = c_int_w(3)?;
+        let tm_min = c_int_w(4)?;
+        let tm_sec = c_int_w(5)?;
+        let tm_wday = c_int_w(6)?;
+        let tm_isdst = c_int_w(8)?;
         let mut tm = c_tm {
-            tm_sec: 0,
-            tm_min: 0,
-            tm_hour: 0,
-            tm_mday: 0,
-            tm_mon: 0,
+            tm_sec,
+            tm_min,
+            tm_hour,
+            tm_mday,
+            tm_mon,
             tm_year: 0,
-            tm_wday: 0,
-            tm_yday: 0,
-            tm_isdst: 0,
+            tm_wday,
+            tm_yday,
+            tm_isdst,
             tm_gmtoff: 0,
             tm_zone: String::new(),
         };
-        tm.tm_year = get(0) - 1900;
-        tm.tm_mon = get(1) - 1;
-        tm.tm_mday = get(2);
-        tm.tm_hour = get(3);
-        tm.tm_min = get(4);
-        tm.tm_sec = get(5);
-        tm.tm_wday = (get(6) + 1) % 7; // Python Monday=0 → C Sunday=0
-        tm.tm_yday = get(7) - 1;
-        tm.tm_isdst = get(8);
         // interp_time.py:830-841 — a sequence of length >=10 supplies
-        // `tm_zone` (idx 9) and length >=11 supplies `tm_gmtoff` (idx 10).
+        // `tm_zone` (idx 9, via `utf8_w`) and length >=11 supplies
+        // `tm_gmtoff` (idx 10).
         if len >= 10 {
-            let item = w_tuple_getitem(tup, 9).unwrap();
-            if is_str(item) {
-                tm.tm_zone = w_str_get_value(item).to_string();
-            }
+            tm.tm_zone = crate::baseobjspace::utf8_w(tup_w[9])?.to_string();
         }
         if len >= 11 {
-            tm.tm_gmtoff = get(10) as i64;
+            tm.tm_gmtoff = c_int_w(10)? as i64;
         }
+        // Bounds checked before the final field adjustments.
+        if (y as i64) < i32::MIN as i64 + 1900 {
+            return Err(crate::PyError::overflow_error("year out of range"));
+        }
+        if tm_wday < -1 {
+            return Err(crate::PyError::value_error("day of week out of range"));
+        }
+        tm.tm_year = y - 1900;
+        tm.tm_mon = tm_mon - 1;
+        tm.tm_wday = (tm_wday + 1) % 7; // Python Monday=0 → C Sunday=0
+        tm.tm_yday = tm_yday - 1;
         Ok(tm)
     }
 }
@@ -733,6 +782,32 @@ pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(_tm_to_tuple(&tm))
 }
 
+/// interp_time.py:861-879 `_checktm` — guard the C-adjusted `struct tm`
+/// fields that strftime()/asctime() index, so a bad value raises a
+/// ValueError instead of letting libc index out of bounds.  Year and
+/// wday are already handled in `_gettmarg`.
+fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
+    if !(0..=11).contains(&tm.tm_mon) {
+        return Err(crate::PyError::value_error("month out of range"));
+    }
+    if !(1..=31).contains(&tm.tm_mday) {
+        return Err(crate::PyError::value_error("day of month out of range"));
+    }
+    if !(0..=23).contains(&tm.tm_hour) {
+        return Err(crate::PyError::value_error("hour out of range"));
+    }
+    if !(0..=59).contains(&tm.tm_min) {
+        return Err(crate::PyError::value_error("minute out of range"));
+    }
+    if !(0..=61).contains(&tm.tm_sec) {
+        return Err(crate::PyError::value_error("seconds out of range"));
+    }
+    if !(0..=365).contains(&tm.tm_yday) {
+        return Err(crate::PyError::value_error("day of year out of range"));
+    }
+    Ok(())
+}
+
 /// time.strftime(format[, tuple]) — interp_time.strftime
 pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let fmt = args
@@ -741,6 +816,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .ok_or_else(|| crate::PyError::type_error("strftime() requires at least one argument"))?;
 
     let tm = _gettmarg(&args[1..], true)?;
+    _checktm(&tm)?;
 
     let fmt_str = unsafe {
         if !is_str(fmt) {
@@ -858,6 +934,7 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// time.asctime([tuple]) — interp_time.asctime
 pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tm = _gettmarg(args, true)?;
+    _checktm(&tm)?;
     _asctime_from_tm(&tm)
 }
 
