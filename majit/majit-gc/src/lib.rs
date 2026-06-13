@@ -7,7 +7,7 @@
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-use majit_ir::{GcRef, Op, Type, VecAssoc};
+use majit_ir::{Const, GcRef, Op, VecAssoc};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
@@ -519,8 +519,9 @@ pub trait GcRewriter: Send {
     /// Rewrite a list of operations, inserting GC-aware code.
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op>;
     /// Rewrite with access to the constant pool.
-    /// Returns (rewritten ops, merged constants, type annotations for
-    /// constants minted by the rewriter).
+    /// Returns (rewritten ops, merged constants). Each `Const` box carries
+    /// its own type via `Const::get_type`, so a separate type side-table is
+    /// no longer threaded through the return.
     ///
     /// The default impl forwards to `rewrite_for_gc` and preserves the
     /// caller's constants verbatim. `rewrite_for_gc` may leave `Const*`
@@ -529,9 +530,9 @@ pub trait GcRewriter: Send {
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
-        constants: &VecAssoc<u32, i64>,
-    ) -> (Vec<Op>, VecAssoc<u32, i64>, VecAssoc<u32, Type>) {
-        (self.rewrite_for_gc(ops), constants.clone(), VecAssoc::new())
+        constants: &VecAssoc<u32, Const>,
+    ) -> (Vec<Op>, VecAssoc<u32, Const>) {
+        (self.rewrite_for_gc(ops), constants.clone())
     }
 }
 

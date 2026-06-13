@@ -714,10 +714,11 @@ pub struct DynasmBackend {
     next_trace_id: u64,
     /// Next header PC (green key).
     next_header_pc: u64,
-    /// Constants for the next compilation.
-    constants: majit_ir::VecAssoc<u32, i64>,
-    /// Constant type annotations for GC rewriter.
-    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
+    /// Constant pool for the next compilation, keyed by OpRef raw index.
+    /// Each `Const` carries its value (read via `as_raw_i64()`) and type
+    /// (read via `get_type()` for the GC rewriter's `v.type` check), so
+    /// there is no separate type side-table.
+    constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -746,15 +747,13 @@ impl DynasmBackend {
     /// Legacy test-only entry point.  Production code routes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
-    /// `VecAssoc<u32, i64>` literals by hand.
+    /// `VecAssoc<u32, i64>` literals by hand. Each raw value is wrapped
+    /// as a `ConstInt` — the only constant kind these fixtures build.
     pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Legacy test-only entry point — counterpart to `set_constants`
-    /// above; production callers route through `set_constants_pool`.
-    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
+        self.constants = constants
+            .iter()
+            .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
+            .collect();
     }
 
     #[inline]
@@ -819,7 +818,6 @@ impl DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
             constants: majit_ir::VecAssoc::new(),
-            constant_types: majit_ir::VecAssoc::new(),
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
@@ -1090,13 +1088,12 @@ impl DynasmBackend {
             .collect();
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
         inject_builtin_string_descrs(&mut normalized);
-        // Clone so self.constant_types remains populated for later
-        // backend calls. rewrite.py:930 `v.type` — RPython Box carries
-        // its type on the object itself, so InputArg / ResOperation /
-        // Const all return the same `.type` attribute. Pyre's flat
-        // `OpRef` stores types in side maps keyed by the raw u32;
-        // `constant_types` already carries op-position and constant
-        // types (disjoint key spaces via `OpRef::CONST_BIT = 1 << 31`).
+        // rewrite.py:930 `v.type` — RPython Box carries its type on the
+        // object itself, so InputArg / ResOperation / Const all return
+        // the same `.type` attribute. Pyre's flat `OpRef` stores types
+        // in side maps keyed by the raw u32; each `Const` carries its
+        // own `get_type()` (disjoint key spaces via
+        // `OpRef::CONST_BIT = 1 << 31`), projected here for the rewriter.
         //
         // Each InputArg's raw OpRef value lives at `InputArg.index`:
         // top-level loops occupy `[0, num_inputs)`, while Phase E.2b
@@ -1107,24 +1104,25 @@ impl DynasmBackend {
         // Box identity here, pyre's line-by-line analog is `arg.0 ==
         // inputargs[i].index`. Mirrors the Cranelift backend's
         // `constant_types_with_inputargs` build at compiler.rs:7042.
-        let mut constant_types = self.constant_types.clone();
+        let mut constant_types: majit_ir::VecAssoc<u32, Type> = self
+            .constants
+            .iter()
+            .map(|(&k, c)| (k, c.get_type()))
+            .collect();
         for ia in inputargs.iter() {
             constant_types.entry(ia.index).or_insert_with(|| ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
-            let (result, new_constants, new_constant_types) =
+            // The rewriter takes the typed `Const` pool directly; each box
+            // variant carries its own type (`Const::get_type`).
+            let (result, new_constants) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
-            for (k, v) in new_constants {
-                self.constants.entry(k).or_insert_with(|| v);
-            }
-            for (k, tp) in new_constant_types {
-                // rewrite.py creates fresh ConstInt boxes for sizes, offsets
-                // and helper addresses. RPython stores the type on each
-                // ConstInt object; pyre imports the rewriter's explicit
-                // side-channel type entry instead of guessing from the raw
-                // constant key.
-                self.constant_types.entry(k).or_insert_with(|| tp);
+            // rewrite.py creates fresh ConstInt boxes for sizes, offsets
+            // and helper addresses; `new_constants` is the full typed pool.
+            // Pre-existing keys `or_insert`-no-op.
+            for (k, c) in new_constants {
+                self.constants.entry(k).or_insert(c);
             }
             result
         } else {
@@ -1718,8 +1716,9 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants = std::mem::take(&mut self.constants);
-        let constant_types = std::mem::take(&mut self.constant_types);
+        // The assembler stores the typed `Const` pool directly; each box
+        // variant carries its own type (`Const::get_type`).
+        let const_pool = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
@@ -1742,7 +1741,7 @@ impl Backend for DynasmBackend {
         let mut asm = Asm::new(
             trace_id,
             header_pc,
-            constants,
+            const_pool,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1754,7 +1753,6 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop()?;
 
@@ -1826,12 +1824,7 @@ impl Backend for DynasmBackend {
     }
 
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
-        self.constants.clear();
-        self.constant_types.clear();
-        for (&k, c) in constants.iter() {
-            self.constants.insert(k, c.as_raw_i64());
-            self.constant_types.insert(k, c.get_type());
-        }
+        self.constants = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -1942,8 +1935,13 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants = std::mem::take(&mut self.constants);
-        let constant_types = std::mem::take(&mut self.constant_types);
+        // format_trace reads raw `i64` values; the assembler stores the
+        // typed `Const` pool directly (type rides on `Const::get_type`).
+        let const_pool = std::mem::take(&mut self.constants);
+        let constants: majit_ir::VecAssoc<u32, i64> = const_pool
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
         if crate::majit_log_enabled() && trace_id == 2 {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
@@ -1974,7 +1972,7 @@ impl Backend for DynasmBackend {
         let mut asm = Asm::new(
             trace_id,
             0,
-            constants,
+            const_pool,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1986,7 +1984,6 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);

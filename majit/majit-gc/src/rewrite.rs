@@ -14,7 +14,7 @@ use majit_ir::box_ref::BoxRef;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRef};
-use majit_ir::{Value, VecAssoc, VecSet};
+use majit_ir::{Const, Value, VecAssoc, VecSet};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -379,12 +379,9 @@ struct RewriteState {
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
-    /// Constant pool (from optimizer) — maps OpRef key → i64 value.
-    constants: VecAssoc<u32, i64>,
-    /// Type annotations for constants minted by this rewrite pass. RPython
-    /// gets this from each `ConstInt` object's `.type`; pyre must return the
-    /// side-channel entry together with the constant pool entry.
-    new_constant_types: VecAssoc<u32, Type>,
+    /// Constant pool (from optimizer) — maps OpRef key → typed `Const`
+    /// value. Each box variant carries its own type (`Const::get_type`).
+    constants: VecAssoc<u32, Const>,
     /// rewrite.py:930 parity — structural equivalent of Box.type.
     /// Maps OpRef.0 → Type for all known values (both op results and
     /// constants). In RPython each Box carries its own `.type` attribute;
@@ -491,7 +488,6 @@ impl RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
             constants: VecAssoc::new(),
-            new_constant_types: VecAssoc::new(),
             result_types: VecAssoc::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
@@ -511,7 +507,7 @@ impl RewriteState {
         }
     }
 
-    fn with_constants(hint: usize, next_pos: u32, constants: VecAssoc<u32, i64>) -> Self {
+    fn with_constants(hint: usize, next_pos: u32, constants: VecAssoc<u32, Const>) -> Self {
         // P3 category E — `constants` is an index-keyed constant pool
         // (raw u32 key), not a Box-identity dict.  Bit-helpers replace
         // the `OpRef::from_raw(k).is_constant()` round-trip that would
@@ -545,7 +541,10 @@ impl RewriteState {
         match b.const_value() {
             Some(Value::Int(v)) => Some(v),
             Some(_) => None,
-            None => self.constants.get(&b.to_opref().raw()).copied(),
+            None => self
+                .constants
+                .get(&b.to_opref().raw())
+                .map(|c| c.as_raw_i64()),
         }
     }
 
@@ -2784,8 +2783,8 @@ impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
-        constants: &VecAssoc<u32, i64>,
-    ) -> (Vec<Op>, VecAssoc<u32, i64>, VecAssoc<u32, Type>) {
+        constants: &VecAssoc<u32, Const>,
+    ) -> (Vec<Op>, VecAssoc<u32, Const>) {
         // rewrite.py:988-1001 remove_bridge_exception: strip a
         // SaveExcClass+SaveException+RestoreException prefix that is
         // a no-op (common in bridges).
@@ -3013,7 +3012,7 @@ impl GcRewriter for GcRewriterImpl {
         // re-minting happens here. A follow-up slice flips the trait
         // to `Vec<OpRc>` and removes this clone.
         let out: Vec<Op> = st.out.iter().map(|rc| (**rc).clone()).collect();
-        (out, st.constants, st.new_constant_types)
+        (out, st.constants)
     }
 }
 
@@ -3285,8 +3284,7 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![Op::with_descr(OpCode::New, &[], size_descr(32, 7))];
 
-        let (result, constants, constant_types) =
-            rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect: CallMallocNursery, GcStore (tid)
         assert_eq!(result.len(), 2);
@@ -3321,10 +3319,10 @@ mod tests {
              oldgen TRACK_YOUNG_PTRS in the upper 32 bits is preserved"
         );
 
-        for key in constants.keys() {
+        for (_key, c) in &constants {
             assert_eq!(
-                constant_types.get(key),
-                Some(&Type::Int),
+                c.get_type(),
+                Type::Int,
                 "GC rewriter must return the RPython ConstInt.type equivalent \
                  for each constant it mints"
             );
@@ -3371,8 +3369,8 @@ mod tests {
         // array_descr_ref: base_size=8, item_size=8 →
         //   total = 8 + 8*512 = 4104; gen_malloc_nursery sees
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
-        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
-        constants.insert(10_000, 512_i64);
+        let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+        constants.insert(10_000, Const::Int(512));
         let new_array = Op::with_descr(
             OpCode::NewArray,
             &[BoxRef::from_opref(len_ref)],
@@ -3381,7 +3379,7 @@ mod tests {
         new_array.pos.set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         assert!(
             !result
@@ -3562,7 +3560,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, _consts) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Allocation header stores only (CallMallocNursery + tid GcStore) + Jump.
         // No delayed-zero NULL-pointer stores must be emitted because
@@ -3594,7 +3592,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Collect the NULL-pointer stores emitted by the pending-zero flush.
         let mut seen_offsets: Vec<i64> = result
@@ -3640,7 +3638,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, _consts) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         let null_offsets: Vec<i64> = result
             .iter()
@@ -3695,7 +3693,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
         ];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
         assert!(
@@ -3867,7 +3865,7 @@ mod tests {
             vtable_descr(48, 3, 0xDEAD),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // CallMallocNursery + GcStore(tid) + GcStore(vtable)
         assert_eq!(result.len(), 3);
@@ -4128,7 +4126,7 @@ mod tests {
         guard.store_final_boxes(vec![BoxRef::from_opref(OpRef::int_op(2))]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         let same = result
             .iter()
@@ -4158,7 +4156,7 @@ mod tests {
         ]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert!(
             result.iter().all(|o| o.opcode != OpCode::GuardAlwaysFails),
@@ -4228,8 +4226,8 @@ mod tests {
 
     /// Helper: build a constants map mapping `key` → `value` for tests
     /// that need the rewriter's resolve_constant to find a length.
-    fn const_pool(entries: &[(u32, i64)]) -> VecAssoc<u32, i64> {
-        entries.iter().copied().collect()
+    fn const_pool(entries: &[(u32, i64)]) -> VecAssoc<u32, Const> {
+        entries.iter().map(|&(k, v)| (k, Const::Int(v))).collect()
     }
 
     #[test]
@@ -4286,7 +4284,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, out_consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, _out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         // All indices were SET, so the in-place ZERO_ARRAY is rewritten
         // to byte_length 0 — backend treats it as a no-op.
@@ -4344,7 +4342,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, out_consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, _out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         let zeros: Vec<_> = result
             .iter()
@@ -4410,7 +4408,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, out_consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, _out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         // The ZERO_ARRAY should appear before the guard.
         let zero_idx = result.iter().position(|o| o.opcode == OpCode::ZeroArray);
@@ -4494,7 +4492,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, out_consts, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let (result, _out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         let zeros: Vec<_> = result
             .iter()
@@ -4612,8 +4610,8 @@ mod tests {
         for &num_elem in &[10_i64, 200_i64] {
             let rw = make_rewriter_with_cards();
             let len_ref = OpRef::int_op(10_000);
-            let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
-            constants.insert(10_000, num_elem);
+            let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+            constants.insert(10_000, Const::Int(num_elem));
             let new_array = Op::with_descr(
                 OpCode::NewArrayClear,
                 &[BoxRef::from_opref(len_ref)],
@@ -4633,7 +4631,7 @@ mod tests {
                 ),
                 Op::new(OpCode::Finish, &[]),
             ];
-            let (result, _, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+            let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
             let wb = result
                 .iter()
                 .filter(|o| o.opcode == OpCode::CondCallGcWb)
@@ -4772,7 +4770,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert_eq!(
             result.len(),
@@ -4849,7 +4847,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect: LEA, LEA, INT_LSHIFT(i_len, 2), CALL_N
         assert_eq!(result.len(), 4);
@@ -4911,7 +4909,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect (itemscale=0 so no INT_LSHIFT):
         //   i2b = int_add(p0, i0)
@@ -4978,7 +4976,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect (itemscale=2):
         //   i0s = int_lshift(i0, 2)

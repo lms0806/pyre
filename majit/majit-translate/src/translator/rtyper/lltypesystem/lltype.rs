@@ -461,8 +461,7 @@ impl _address {
     /// The other two arms of `__sub__` are not reachable through `op_adr_delta`
     /// (`opimpl.py:551-553` passes two checked addresses): the
     /// `isinstance(other, AddressOffset)` arm (`self + (-other)`) belongs to
-    /// `op_adr_sub` and stays blocked on the object-returning
-    /// `_parentstructure()` walk that `AddressOffset.ref` needs.
+    /// `op_adr_sub`, and the integer arm is rejected upstream.
     pub fn _delta(&self, other: &_address) -> Result<i64, String> {
         if self._eq(other) {
             Ok(0)

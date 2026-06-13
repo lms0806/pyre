@@ -669,10 +669,10 @@ pub struct Assembler386<'a> {
     /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
     /// Mirrors `OpTypeIndex::op_pos`.
     op_pos: Vec<u32>,
-    /// Constants: OpRef index (>= 10000) → i64 value.
-    constants: majit_ir::VecAssoc<u32, i64>,
-    /// Constant type annotations for float immediates and fail args.
-    constant_types: majit_ir::VecAssoc<u32, Type>,
+    /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
+    /// variant carries its own type (`Const::get_type`), subsuming the
+    /// legacy `constant_types` side table.
+    constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -836,7 +836,7 @@ pub struct CompiledCode {
 impl<'a> Assembler386<'a> {
     /// rpython/jit/metainterp/history.py:220 `box.type` parity.
     /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
-    /// inputargs, `constant_types` for constants.
+    /// inputargs, the `Const` variant tag for constants.
     #[inline]
     fn opref_type(&self, opref: OpRef) -> Option<Type> {
         self.opref_type_at(opref, None)
@@ -859,7 +859,7 @@ impl<'a> Assembler386<'a> {
     pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
-        constants: majit_ir::VecAssoc<u32, i64>,
+        constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: VecAssoc<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
@@ -888,7 +888,6 @@ impl<'a> Assembler386<'a> {
             inputarg_pos,
             op_pos,
             constants,
-            constant_types: majit_ir::VecAssoc::new(),
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: VecAssoc::new(),
@@ -998,7 +997,7 @@ impl<'a> Assembler386<'a> {
         // history.py:227/268/314 — inline-Const variants carry value inline.
         if let Some(val) = opref
             .inline_const_bits()
-            .or_else(|| self.constants.get(&opref.raw()).copied())
+            .or_else(|| self.constants.get(&opref.raw()).map(|c| c.as_raw_i64()))
         {
             return ResolvedArg::Const(val);
         }
@@ -2598,12 +2597,19 @@ impl<'a> Assembler386<'a> {
             eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
 
-        let mut ra = RegAlloc::new(
-            self.constants.clone(),
-            self.constant_types.clone(),
-            inputargs,
-            ops,
-        );
+        // RegAlloc keeps the raw `i64` value map and the `Type` map as
+        // separate views; project them from the typed pool at this boundary.
+        let ra_constants: majit_ir::VecAssoc<u32, i64> = self
+            .constants
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
+        let ra_constant_types: majit_ir::VecAssoc<u32, Type> = self
+            .constants
+            .iter()
+            .map(|(&k, c)| (k, c.get_type()))
+            .collect();
+        let mut ra = RegAlloc::new(ra_constants, ra_constant_types, inputargs, ops);
         let is_bridge = self.bridge_input_locs.is_some();
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(arglocs);
@@ -5777,9 +5783,12 @@ impl<'a> Assembler386<'a> {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
             } else if arg_ref.is_constant() {
-                let val = arg_ref
-                    .inline_const_bits()
-                    .unwrap_or_else(|| self.constants.get(&arg_ref.raw()).copied().unwrap_or(0));
+                let val = arg_ref.inline_const_bits().unwrap_or_else(|| {
+                    self.constants
+                        .get(&arg_ref.raw())
+                        .map(|c| c.as_raw_i64())
+                        .unwrap_or(0)
+                });
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val as i64 ; push rax);
             } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref) {
                 let src = Self::slot_offset(old_slot);
@@ -7406,13 +7415,13 @@ impl<'a> Assembler386<'a> {
             }
             return val != 0;
         }
-        if let Some(tp) = self.constant_types.get(&value.raw()) {
-            if *tp != Type::Ref {
+        if let Some(tp) = self.constants.get(&value.raw()).map(|c| c.get_type()) {
+            if tp != Type::Ref {
                 return false;
             }
         }
-        if let Some(&constant) = self.constants.get(&value.raw()) {
-            return constant != 0;
+        if let Some(constant) = self.constants.get(&value.raw()) {
+            return constant.as_raw_i64() != 0;
         }
         !matches!(value_loc, Loc::Immed(i) if i.value == 0)
     }
@@ -7627,7 +7636,7 @@ impl<'a> Assembler386<'a> {
         let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
             self.constants
                 .get(&size_ref.raw())
-                .copied()
+                .map(|c| c.as_raw_i64())
                 .unwrap_or(size_ref.raw() as i64)
         });
         let gc_header_size = majit_gc::header::GcHeader::SIZE as i64;
@@ -8554,20 +8563,5 @@ impl<'a> Assembler386<'a> {
         }
 
         self.store_rax_to_result(op.pos.get());
-    }
-
-    // ----------------------------------------------------------------
-    // Public: set constants from external source
-    // ----------------------------------------------------------------
-
-    /// Populate the constants map. Called by the frontend before assembly
-    /// if constant OpRefs are used (OpRef.0 >= 10000).
-    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
     }
 }

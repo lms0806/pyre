@@ -4202,7 +4202,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 fn validate_oprefs_for_compile(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Const>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
@@ -7313,11 +7313,12 @@ pub struct CraneliftBackend {
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     module: JITModule,
     func_ctx: FunctionBuilderContext,
-    constants: majit_ir::VecAssoc<u32, i64>,
-    /// rewrite.py:930 parity — type annotations for constant OpRefs.
-    /// Set by `set_constant_types` before each compile call; used by
-    /// the GC rewriter to check `v.type == 'r'` on constant values.
-    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
+    /// Constant pool keyed by OpRef raw index. Each `Const` carries its
+    /// own value and type (`rewrite.py:930` `v.type`), so codegen reads
+    /// the raw `i64` via `as_raw_i64()` and the GC rewriter reads the
+    /// `v.type == 'r'` discriminant via `get_type()` — no separate
+    /// type side-table.
+    constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
     /// compile.py: self.metainterp_sd.callinfocollection — used by
     /// recovery_layout building for VStr/VUni Concat/Slice func ptr
     /// lookups (resume.py:1143-1188).
@@ -7346,15 +7347,13 @@ impl CraneliftBackend {
     /// Legacy test-only entry point.  Production code passes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
-    /// `VecAssoc<u32, i64>` literals by hand.
+    /// `VecAssoc<u32, i64>` literals by hand. Each raw value is wrapped
+    /// as a `ConstInt` — the only constant kind these fixtures build.
     pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Legacy test-only entry point — counterpart to `set_constants`
-    /// above; production callers route through `set_constants_pool`.
-    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
+        self.constants = constants
+            .iter()
+            .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
+            .collect();
     }
 
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
@@ -7525,7 +7524,6 @@ impl CraneliftBackend {
             module,
             func_ctx,
             constants: majit_ir::VecAssoc::new(),
-            constant_types: majit_ir::VecAssoc::new(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -7665,10 +7663,10 @@ impl CraneliftBackend {
         majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
     }
 
-    // `set_constants`, `set_constant_types`, `set_next_trace_id`,
-    // `set_next_header_pc` are provided via the `Backend` trait impl
-    // below so `compile_tmp_callback` and other backend-agnostic
-    // consumers can reach them through `&mut dyn Backend`.
+    // `set_constants_pool`, `set_next_trace_id`, `set_next_header_pc`
+    // are provided via the `Backend` trait impl below so
+    // `compile_tmp_callback` and other backend-agnostic consumers can
+    // reach them through `&mut dyn Backend`.
 
     fn gc_rewriter(
         &self,
@@ -7791,42 +7789,39 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        constants: &majit_ir::VecAssoc<u32, i64>,
-        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
+        constants: &majit_ir::VecAssoc<u32, majit_ir::Const>,
     ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
         // rewrite.py:930 `v.type` — RPython Box carries its type on the
         // object itself, so InputArg / ResOperation / Const all return
         // the same `.type` attribute.  Pyre's flat `OpRef` stores types
-        // in side maps keyed by the raw u32; `constant_types` already
-        // carries op-position and constant types (disjoint key spaces
-        // via `OpRef::CONST_BIT = 1 << 31`).  Each InputArg's raw OpRef
+        // in side maps keyed by the raw u32; each `Const` carries its
+        // own `get_type()` (disjoint key spaces via
+        // `OpRef::CONST_BIT = 1 << 31`).  Each InputArg's raw OpRef
         // value lives at `InputArg.index`: top-level loops occupy
         // `[0, num_inputs)`, while Phase E.2b bridges occupy
         // `[bridge_inputarg_base..)`. Key the merged map by the actual
         // `ia.index` so the rewriter's `v.type` lookup matches the OpRef
         // values that ops reference, regardless of namespace.
-        let mut constant_types_with_inputargs = constant_types.clone();
+        let mut constant_types_with_inputargs: majit_ir::VecAssoc<u32, majit_ir::Type> =
+            constants.iter().map(|(&k, c)| (k, c.get_type())).collect();
         for ia in inputargs.iter() {
             constant_types_with_inputargs
                 .entry(ia.index)
                 .or_insert_with(|| ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
-            let (result, new_constants, new_constant_types) =
+            // The rewriter takes the typed `Const` pool directly; each box
+            // variant carries its own type (`Const::get_type`).
+            let (result, new_constants) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
-            // Merge GC rewriter's new constants into self.constants
-            for (k, v) in new_constants {
-                self.constants.entry(k).or_insert_with(|| v);
-            }
-            for (k, tp) in new_constant_types {
-                // rewrite.py creates fresh ConstInt boxes for sizes, offsets
-                // and helper addresses. RPython stores the type on each
-                // ConstInt object; pyre imports the rewriter's explicit
-                // side-channel type entry instead of guessing from the raw
-                // constant key.
-                self.constant_types.entry(k).or_insert_with(|| tp);
+            // rewrite.py creates fresh ConstInt boxes for sizes, offsets
+            // and helper addresses; `new_constants` is the full typed pool.
+            // Pre-existing keys `or_insert`-no-op, keeping their original
+            // `Const`.
+            for (k, c) in new_constants {
+                self.constants.entry(k).or_insert(c);
             }
             result
         } else {
@@ -8022,12 +8017,7 @@ impl CraneliftBackend {
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let prepared_ops = self.prepare_ops_for_compile(
-            inputargs,
-            ops,
-            &self.constants.clone(),
-            &self.constant_types.clone(),
-        );
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
         let ops = prepared_ops.as_slice();
         // RPython parity: regalloc asserts that every Box used as an
         // argument or in fail_args is bound to a register or stack
@@ -8105,6 +8095,13 @@ impl CraneliftBackend {
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
         let attached_descrs = self.attached_descr_ptrs();
+        // Guard fail-arg resolution emits `iconst` from constant values,
+        // so it reads the raw `i64` projection of the pool.
+        let constants_i64: majit_ir::VecAssoc<u32, i64> = self
+            .constants
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
         collect_guards(
             ops,
             inputargs,
@@ -8117,7 +8114,7 @@ impl CraneliftBackend {
             header_pc,
             source_guard,
             caller_layout,
-            &self.constants,
+            &constants_i64,
             attached_descrs,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
@@ -8209,8 +8206,13 @@ impl CraneliftBackend {
         // `std::mem::take(&mut self.constants)` so `&self` is available.
         let propagate_exception_descr_ptr = self.attached_descr_ptrs().propagate_exception_descr;
 
-        // Take constants out of self to avoid borrow conflicts with func_ctx
-        let constants = std::mem::take(&mut self.constants);
+        // Take constants out of self to avoid borrow conflicts with func_ctx.
+        // SSA emission reads raw `i64` values (`iconst`), so project the
+        // typed pool to its `as_raw_i64()` view for the rest of codegen.
+        let constants: majit_ir::VecAssoc<u32, i64> = std::mem::take(&mut self.constants)
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
 
         // Recursive tracing/bridge compilation can re-enter backend compilation
         // before an outer compile has restored its frontend context. Mirror the
@@ -14682,12 +14684,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
-        self.constants.clear();
-        self.constant_types.clear();
-        for (&k, c) in constants.iter() {
-            self.constants.insert(k, c.as_raw_i64());
-            self.constant_types.insert(k, c.get_type());
-        }
+        self.constants = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
