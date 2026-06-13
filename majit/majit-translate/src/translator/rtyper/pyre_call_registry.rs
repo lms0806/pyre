@@ -219,6 +219,77 @@ impl PyreCallRegistry {
         self.bookkeeper.set_pyre_struct_fields(registry);
     }
 
+    /// Thread the trait → unique-concrete-impl-owner map into the
+    /// shared bookkeeper so `derive_subject_inputcells` can resolve a
+    /// generic receiver's bound-trait `class_root` to the impl type's
+    /// `ClassDef`.  Called once from `dual_gate_registry` with
+    /// `CallControl::trait_unique_impls().clone()`.
+    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
+        self.bookkeeper.set_pyre_trait_unique_impls(map);
+    }
+
+    /// Seed each struct-root class `HostObject`'s dict with its
+    /// registered impl-method function hosts.
+    ///
+    /// classdesc.py:606-618 — a class's methods live in its class
+    /// `__dict__`, so `SomeInstance.getattr(method)` resolves through
+    /// `check_missing_attribute_update` → `find_source_for` →
+    /// `s_get_value` (Constant function arm) → `bind_callables_under`
+    /// to a bound-`MethodDesc` `SomePBC`.  Pyre's struct-root classes
+    /// are interned from the field registry with an empty dict, so a
+    /// method getattr found no source and the block stayed blocked
+    /// forever.  Walk the registered entries: every path
+    /// `[.., Owner, method]` whose `Owner` is a struct-field-registry
+    /// root names a method of that class — install the entry's
+    /// function `HostObject` (Arc-identical to the one
+    /// `bookkeeper.descs` already keys, so `getdesc` resolves to the
+    /// same `FunctionDesc`/cachedgraph) under the method name on the
+    /// interned class object.  Free functions register as
+    /// `[module, fn]` with a lowercase module segment that is never a
+    /// registry root, so the membership gate filters them out.
+    ///
+    /// Called once from `dual_gate_registry` after
+    /// `populate_call_registry_from_call_graphs`.
+    pub fn seed_struct_root_method_members(&self) {
+        let guard = self.bookkeeper.pyre_struct_fields.borrow();
+        let Some(reg) = guard.as_ref() else {
+            return;
+        };
+        // Leaf owners naming more than one qualified struct are
+        // ambiguous for METHOD seeding even when their bare field
+        // alias survived `harden_duplicate_leaf_metadata` (identical
+        // field rows keep the alias, but the duplicate structs'
+        // method sets may differ).  Seeding would pool both origins'
+        // methods onto the one leaf-interned class, so a getattr
+        // could bind a wrong-origin method silently.  Skip those
+        // owners — the dispatch stays blocked (census-visible)
+        // until per-origin class interning lands.
+        let mut leaf_struct_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for key in reg.fields.keys() {
+            if let Some((_, leaf)) = key.rsplit_once("::") {
+                *leaf_struct_counts.entry(leaf).or_default() += 1;
+            }
+        }
+        for (key, entry) in self.entries.borrow().iter() {
+            let segs = key.segments();
+            let [.., owner, method] = segs else {
+                continue;
+            };
+            if !reg.fields.contains_key(owner) {
+                continue;
+            }
+            if leaf_struct_counts.get(owner.as_str()).copied().unwrap_or(0) > 1 {
+                continue;
+            }
+            let class_host = self.bookkeeper.intern_class_by_qualname(owner);
+            class_host.class_set(
+                method.clone(),
+                ConstValue::HostObject(entry.host_object.clone()),
+            );
+        }
+    }
+
     /// Get-or-construct the shared `(annotator, rtyper)` pair.
     ///
     /// First call constructs both from `self.bookkeeper`; subsequent
@@ -345,6 +416,49 @@ impl PyreCallRegistry {
         }
         let canonical = self.aliases.borrow().get(key).cloned()?;
         self.entries.borrow().get(&canonical).cloned()
+    }
+
+    /// The already-started session pair, without creating one.
+    /// `None` until the first [`Self::ensure_session`] call.
+    pub fn session_if_started(
+        &self,
+    ) -> Option<(
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+    )> {
+        self.session.borrow().clone()
+    }
+
+    /// Find the canonical entry whose `FunctionDesc.cache` holds a
+    /// `PyGraph` wrapping exactly `graph` (flowspace graph identity).
+    /// Used by the failed-subject-scope repair in `cutover` to map a
+    /// poisoned shared callee graph back to its registry entry.
+    pub fn find_entry_with_cached_graph(
+        &self,
+        graph: &crate::flowspace::model::GraphRef,
+    ) -> Option<(FunctionPathKey, Rc<PyreFunctionEntry>)> {
+        for (key, entry) in self.entries.borrow().iter() {
+            let fd = entry.function_desc.borrow();
+            let cache = fd.cache.borrow();
+            if cache.values().any(|pg| Rc::ptr_eq(&pg.graph, graph)) {
+                return Some((key.clone(), entry.clone()));
+            }
+        }
+        None
+    }
+
+    /// Every key resolving to `canonical`'s entry: the canonical key
+    /// itself plus all registered aliases pointing at it.
+    pub fn keys_for_entry(&self, canonical: &FunctionPathKey) -> Vec<FunctionPathKey> {
+        let mut keys = vec![canonical.clone()];
+        keys.extend(
+            self.aliases
+                .borrow()
+                .iter()
+                .filter(|(_, c)| *c == canonical)
+                .map(|(a, _)| a.clone()),
+        );
+        keys
     }
 
     /// Same as [`Self::lookup`] with a narrowly-scoped cross-module
@@ -917,5 +1031,66 @@ mod tests {
             "free-fn-shape query must NOT silently latch onto an impl-method \
              candidate sharing the leaf identifier"
         );
+    }
+
+    fn make_pygraph(name: &str, sig: Signature) -> Rc<PyGraph> {
+        use crate::flowspace::model::{ConstValue, FunctionGraph};
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(FunctionGraph::new(name, startblock))),
+            func,
+            signature: RefCell::new(sig),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn find_entry_with_cached_graph_resolves_by_graph_identity() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["m", "f"]);
+        let pygraph = make_pygraph("f", signature(&["x"]));
+        registry.register_callee(key.clone(), signature(&["x"]), pygraph.clone());
+        let other = make_pygraph("g", signature(&["x"]));
+        registry.register_callee(
+            FunctionPathKey::from_segments(["m", "g"]),
+            signature(&["x"]),
+            other,
+        );
+        let (found_key, found_entry) = registry
+            .find_entry_with_cached_graph(&pygraph.graph)
+            .expect("entry holding the cached graph must resolve");
+        assert_eq!(found_key, key);
+        assert!(
+            found_entry
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .values()
+                .any(|pg| Rc::ptr_eq(&pg.graph, &pygraph.graph))
+        );
+        let unknown = make_pygraph("h", signature(&["x"]));
+        assert!(
+            registry
+                .find_entry_with_cached_graph(&unknown.graph)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keys_for_entry_includes_canonical_and_aliases() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let canonical = FunctionPathKey::from_segments(["m", "f"]);
+        registry.get_or_register(canonical.clone(), signature(&["x"]));
+        let alias = FunctionPathKey::from_segments(["crate", "m", "f"]);
+        registry.alias(alias.clone(), &canonical);
+        let keys = registry.keys_for_entry(&canonical);
+        assert!(keys.contains(&canonical));
+        assert!(keys.contains(&alias));
+        assert_eq!(keys.len(), 2);
     }
 }

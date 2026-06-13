@@ -57,7 +57,8 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
     build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
     build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
-    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph,
+    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph, const_str_cache_llstr,
+    null_str_ptr,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
@@ -144,6 +145,30 @@ impl Repr for StringRepr {
 
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
         super::pairtype::ReprClassId::StringRepr
+    }
+
+    /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`):
+    /// `None` → `nullptr(self.lowleveltype.TO)`, a `str` value → the
+    /// prebuilt ll string (`self.ll.llstr(value)`, cached in
+    /// `CONST_STR_CACHE`).  The cache exists upstream so one host
+    /// string maps to one prebuilt container identity; pyre's
+    /// `CONST_STR_CACHE` mirror keys the interned `_ptr` by the byte
+    /// payload.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        match value {
+            ConstValue::None => Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(null_str_ptr())),
+                self.lltype.clone(),
+            )),
+            ConstValue::ByteStr(s) => {
+                let p = const_str_cache_llstr(s).map_err(TyperError::message)?;
+                Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(p)),
+                    self.lltype.clone(),
+                ))
+            }
+            other => Err(TyperError::message(format!("not a str: {other:?}"))),
+        }
     }
 
     /// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py:119-122`).

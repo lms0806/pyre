@@ -259,6 +259,18 @@ thread_local! {
         map.insert("EnvironmentError".to_string(), env_error);
         map
     });
+
+    /// Keys written by [`register_struct_fields`] — the struct-derived
+    /// subset of [`FORCE_ATTRIBUTES_INTO_CLASSES`].  The dotted-qualname
+    /// projection in `_init_classdef`
+    /// (`struct_force_key_from_dotted_qualname`) may only land on these
+    /// rows: a constructor-minted spelling names a struct, never a
+    /// hand-coded exception entry, so without the gate a dotted
+    /// qualname whose leaf collides with a bare exception key (e.g.
+    /// `pkg.EnvironmentError` → `EnvironmentError`) would force the
+    /// exception attributes onto an unrelated class.
+    static STRUCT_FORCE_KEYS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Walker-time writer to [`FORCE_ATTRIBUTES_INTO_CLASSES`]: project a
@@ -272,6 +284,9 @@ thread_local! {
 /// replaces the prior field set.  Matches PyPy where re-assignment
 /// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
 pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
+    STRUCT_FORCE_KEYS.with(|cell| {
+        cell.borrow_mut().insert(qualname.to_string());
+    });
     FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
         let mut table = cell.borrow_mut();
         let entry = table.entry(qualname.to_string()).or_default();
@@ -284,6 +299,25 @@ pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::V
             entry.insert(name.clone(), s_value);
         }
     });
+}
+
+/// Project a constructor-minted host-class qualname — dot-joined and
+/// crate-included, e.g. `"pyre_interpreter.pyframe.FrameBlock"`
+/// (flowspace_adapter `SyntheticTransparentCtor` arm) — onto the
+/// crate-stripped `module::Type` convention the struct-derived
+/// [`FORCE_ATTRIBUTES_INTO_CLASSES`] keys use (mir.rs
+/// `strip_crate_prefix`).  Returns `None` for undotted qualnames (bare
+/// exception entries, test fixtures), which already match the table
+/// keys directly.  Duplicate leaves stay distinct here: the projection
+/// keeps the defining module, so each `FrameBlock` reaches its own row.
+fn struct_force_key_from_dotted_qualname(qualname: &str) -> Option<String> {
+    let mut segments = qualname.split('.');
+    let _crate_segment = segments.next()?;
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.join("::"))
 }
 
 /// Snapshot the forced-attribute map for `qualname`, cloned out of
@@ -1222,13 +1256,21 @@ impl ClassDesc {
         // The struct-derived entries are keyed on the canonical
         // crate-stripped qualified path (`module::Type`); the hand-coded
         // exception entries (e.g. `EnvironmentError`) are registered bare
-        // and carry no struct origin.  `qualname()` is the bare leaf, so
-        // look it up directly first — that lets a bare exception entry win
-        // over a struct that happens to share its leaf — and only fall
-        // back to the `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it
-        // actually differs.
+        // and carry no struct origin.  `qualname()` arrives in one of
+        // two spellings: bare (hand-coded exception classes, test
+        // fixtures) or dot-joined crate-included (constructor-minted
+        // struct classes, flowspace_adapter `SyntheticTransparentCtor`
+        // qualname `"pyre_interpreter.pyframe.FrameBlock"`).  Look the
+        // raw qualname up first — a bare exception entry wins over a
+        // struct that happens to share its leaf — then the
+        // `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it differs,
+        // then the dotted ctor spelling projected onto the
+        // crate-stripped `module::Type` key convention (dotted strings
+        // contain no `::`, so `canonical_struct_name` passes them
+        // through and only this projection can reach the struct rows).
         let qualname = this.borrow().pyobj.qualname().to_string();
         let canonical = majit_ir::descr::canonical_struct_name(&qualname);
+        let dotted_key = struct_force_key_from_dotted_qualname(&qualname);
         let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
             FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
                 let table = cell.borrow();
@@ -1240,6 +1282,18 @@ impl ClassDesc {
                         } else {
                             None
                         }
+                    })
+                    .or_else(|| {
+                        // The dotted projection names a struct row; gate
+                        // it on the struct-derived key set so a leaf
+                        // collision with a hand-coded exception entry
+                        // (`pkg.EnvironmentError` → `EnvironmentError`)
+                        // cannot force exception attributes onto an
+                        // unrelated constructor-minted class.
+                        dotted_key
+                            .as_deref()
+                            .filter(|k| STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k)))
+                            .and_then(|k| table.get(k))
                     })
                     .cloned()
             });
@@ -2445,7 +2499,12 @@ impl ClassDef {
                 // upstream: if attrdef.s_value != s_prev_value:
                 //     self.bookkeeper.update_attr(cdef, attrdef)
                 if s_new != s_prev {
-                    if let Some(bk) = cdef.borrow().bookkeeper.upgrade() {
+                    // Hoist the upgrade so the `cdef.borrow()` guard is
+                    // dropped before `update_attr` re-borrows the same
+                    // classdef mutably (an if-let scrutinee temporary
+                    // lives for the whole body).
+                    let bk = cdef.borrow().bookkeeper.upgrade();
+                    if let Some(bk) = bk {
                         bk.update_attr(&cdef, attr)?;
                     }
                 }
@@ -2480,7 +2539,9 @@ impl ClassDef {
                         s_ref.attrs.get(attr).unwrap().s_value.clone()
                     };
                     if s_new != s_prev {
-                        if let Some(bk) = subdef.borrow().bookkeeper.upgrade() {
+                        // Same borrow-hoist as the getmro arm above.
+                        let bk = subdef.borrow().bookkeeper.upgrade();
+                        if let Some(bk) = bk {
                             bk.update_attr(&subdef, attr)?;
                         }
                     }
@@ -3733,6 +3794,25 @@ mod tests {
         assert!(b.contains_key("valuestackdepth"));
         // No lossy bare-leaf alias is registered.
         assert!(forced_attributes_for("FrameBlock").is_none());
+    }
+
+    #[test]
+    fn struct_force_key_projects_dotted_ctor_qualname() {
+        // Constructor-minted spelling: dot-joined, crate-included.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("pyre_interpreter.pyframe.FrameBlock").as_deref(),
+            Some("pyframe::FrameBlock")
+        );
+        // Crate-root struct: projection lands on the bare convention.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("pyre_object.W_IntObject").as_deref(),
+            Some("W_IntObject")
+        );
+        // Bare names (exception entries, test fixtures) do not project.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("EnvironmentError"),
+            None
+        );
     }
 
     #[test]

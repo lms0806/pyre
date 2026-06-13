@@ -302,6 +302,30 @@ pub struct Bookkeeper {
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    /// TODO: no upstream equivalent.  Qualified trait path → owner
+    /// root of its only concrete impl in the analyzed LLBC world
+    /// (computed in `lib.rs` from `concrete_trait_methods`; multi-impl
+    /// traits are absent).  The key is the trait's full `name_path()`
+    /// so leaf-name collisions between distinct traits cannot pool
+    /// impl owners.  `derive_subject_inputcells` consults this when a
+    /// `Ref` parameter's `class_root` is a bound-trait path (generic
+    /// receiver) — the unique impl's struct root then seeds the
+    /// receiver's `ClassDef` through
+    /// [`Self::getuniqueclassdef_for_struct_root`].
+    /// RPython's annotator never needs this: it sees the concrete
+    /// receiver class at every call site (`classdesc.py:749 lookup`).
+    pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
+    /// TODO: no upstream equivalent.  Struct names first interned by
+    /// [`Self::project_pyre_field_type`]'s bare-name arm whose
+    /// registry rows have not been projected yet — drained at the end
+    /// of [`Self::getuniqueclassdef_for_struct_root`] so a class
+    /// never exposes its untyped FORCE shells to subject flow (a
+    /// later projection would be a non-monotonic attr flip).
+    pub(crate) pending_struct_row_projection: RefCell<Vec<String>>,
+    /// Canonical struct names whose rows [`Self::project_struct_rows`]
+    /// already projected (dedups the pending drain and the bare-name
+    /// arm's first-sight detection).
+    pub(crate) projected_struct_rows: RefCell<std::collections::HashSet<String>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -475,6 +499,9 @@ impl Bookkeeper {
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             pyre_struct_fields: RefCell::new(None),
             pyre_struct_root_classes: RefCell::new(HashMap::new()),
+            pyre_trait_unique_impls: RefCell::new(HashMap::new()),
+            pending_struct_row_projection: RefCell::new(Vec::new()),
+            projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -491,6 +518,14 @@ impl Bookkeeper {
     /// overwrites the previous registry.
     pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.pyre_struct_fields.borrow_mut() = Some(registry);
+    }
+
+    /// TODO: no upstream equivalent.  Wire the trait →
+    /// unique-concrete-impl-owner map (see
+    /// [`Self::pyre_trait_unique_impls`]).  Idempotent: a second call
+    /// overwrites the previous map.
+    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
+        *self.pyre_trait_unique_impls.borrow_mut() = map;
     }
 
     /// TODO: no upstream equivalent.  The full set of struct type-root
@@ -1507,32 +1542,84 @@ impl Bookkeeper {
         // attrs already set (RPython grows class attrs as annotation
         // proceeds).
         for n in &graph {
-            let fields: Option<Vec<(String, String)>> = {
-                let guard = self.pyre_struct_fields.borrow();
-                guard.as_ref().and_then(|r| r.fields.get(n).cloned())
-            };
-            let Some(fields) = fields else {
-                continue;
-            };
-            let host = self.intern_class_by_qualname(n);
-            let classdef = self.getuniqueclassdef(&host)?;
-            for (field_name, field_ty) in &fields {
-                if field_name == "__class__" {
-                    continue;
-                }
-                let s_value = self.project_pyre_field_type(field_ty);
-                let mut classdef_mut = classdef.borrow_mut();
-                let attr = classdef_mut
-                    .attrs
-                    .entry(field_name.clone())
-                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
-                if matches!(attr.s_value, SomeValue::Impossible) {
-                    attr.s_value = s_value;
-                }
-            }
+            self.project_struct_rows(n)?;
+        }
+        // Drain structs first interned by `project_pyre_field_type`'s
+        // bare-name arm during the loop above.  Pass-1's
+        // `collect_referenced_struct_names` string parser and the
+        // projector resolve type strings independently; a name only
+        // the projector reaches would otherwise keep its untyped
+        // FORCE shells until a LATER root intern projects it — a
+        // non-monotonic mid-session attr flip for any block that
+        // already read the shell (`setbinding: new value does not
+        // contain old`).  Projecting here closes the window: rows
+        // land before this struct_root call returns, i.e. before any
+        // subject flow can read the class's attrs.
+        loop {
+            let next = self.pending_struct_row_projection.borrow_mut().pop();
+            let Some(n) = next else { break };
+            self.project_struct_rows(&n)?;
         }
         let host = self.intern_class_by_qualname(root);
         self.getuniqueclassdef(&host)
+    }
+
+    /// Project one struct's registry rows into its `ClassDef.attrs`
+    /// — the pass-2 body of [`Self::getuniqueclassdef_for_struct_root`].
+    fn project_struct_rows(self: &Rc<Self>, n: &str) -> Result<(), AnnotatorError> {
+        let fields: Option<Vec<(String, String)>> = {
+            let guard = self.pyre_struct_fields.borrow();
+            guard.as_ref().and_then(|r| r.fields.get(n).cloned())
+        };
+        let Some(fields) = fields else {
+            return Ok(());
+        };
+        // Bare and qualified spellings of one struct intern to the
+        // same canonical class — project its rows once.
+        let canonical = majit_ir::descr::canonical_struct_name(n);
+        if !self.projected_struct_rows.borrow_mut().insert(canonical) {
+            return Ok(());
+        }
+        let host = self.intern_class_by_qualname(n);
+        let classdef = self.getuniqueclassdef(&host)?;
+        for (field_name, field_ty) in &fields {
+            if field_name == "__class__" {
+                continue;
+            }
+            let s_value = self.project_pyre_field_type(field_ty);
+            let mut classdef_mut = classdef.borrow_mut();
+            let attr = classdef_mut
+                .attrs
+                .entry(field_name.clone())
+                .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
+            // The slot may also hold the untyped FORCE_ATTRIBUTES
+            // shell: `register_struct_fields` seeds Ref-typed rows
+            // through `valuetype_to_someshell`, which renders every
+            // `ValueType::Ref(_)` as the bare
+            // `SomeInstance(classdef=None)` before this projection
+            // runs (`_init_classdef` applies the force list
+            // eagerly).  That shell carries strictly less
+            // information than this registry projection (typed
+            // lists, dicts, strings, classed instances), so
+            // replace it the same way the `Impossible` placeholder
+            // is filled — but ONLY that exact shell; any other
+            // value was produced by real annotation flow and stays
+            // (RPython grows class attrs monotonically).
+            let is_untyped_force_shell = matches!(
+                &attr.s_value,
+                SomeValue::Instance(inst)
+                    if inst.classdef.is_none()
+                        && !inst.can_be_none
+                        && inst.flags.is_empty()
+                        && inst.base.const_box.is_none()
+            );
+            if matches!(attr.s_value, SomeValue::Impossible)
+                || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
+            {
+                attr.s_value = s_value;
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a struct type-root name to its canonical host class
@@ -1542,14 +1629,28 @@ impl Bookkeeper {
     /// `getuniqueclassdef` return the SAME `ClassDef` for repeated
     /// lookups of one type-root — the pyre analog of resolving a type
     /// name to one class object before `getuniqueclassdef(cls)`.
+    ///
+    /// A bare leaf is first resolved to its canonical `module::Leaf`
+    /// spelling through `canonical_struct_name`, so the bare and
+    /// qualified spellings of one struct intern to one `HostObject` —
+    /// name strings are a resolution input, never the identity itself
+    /// (`getuniqueclassdef(cls)` keys by class object, bookkeeper.py:339).
+    /// A duplicate leaf whose origin was tombstoned by
+    /// `harden_duplicate_leaf_metadata` passes through unresolved; its
+    /// classdef stays attrs-empty because the field registry withdrew
+    /// the bare alias, so no struct's fields can be misattributed.
+    /// Dotted qualnames (transparent-ctor classes) pass through
+    /// `canonical_struct_name` unchanged, so qualname callers intern
+    /// by their full spelling.
     pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
-        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(name) {
+        let key = majit_ir::descr::canonical_struct_name(name);
+        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
-        let host = crate::flowspace::model::HostObject::new_class(name.to_string(), Vec::new());
+        let host = crate::flowspace::model::HostObject::new_class(key.clone(), Vec::new());
         self.pyre_struct_root_classes
             .borrow_mut()
-            .insert(name.to_string(), host.clone());
+            .insert(key, host.clone());
         host
     }
 
@@ -1697,6 +1798,20 @@ impl Bookkeeper {
         // `getuniqueclassdef_for_struct_root` registers it on.  Pass-1 of
         // that method has already registered every reachable struct, so this
         // returns the same `ClassDef` Rc whose `attrs` pass-2 fills in place.
+        //
+        // Pass-1's string parser may MISS a name this arm resolves
+        // (the two walk type strings independently); queue such a
+        // first-sight struct so the enclosing struct_root call's
+        // pending drain projects its rows before any subject flow can
+        // read the class's untyped FORCE shells.
+        {
+            let canonical = majit_ir::descr::canonical_struct_name(stripped);
+            if !self.projected_struct_rows.borrow().contains(&canonical) {
+                self.pending_struct_row_projection
+                    .borrow_mut()
+                    .push(stripped.to_string());
+            }
+        }
         let host = self.intern_class_by_qualname(stripped);
         match self.getuniqueclassdef(&host) {
             Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
@@ -2330,10 +2445,19 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::LLAddress(_) => {
+                // `isinstance(x, llmemory.fakeaddress)` arm of
+                // `bookkeeper.py immutablevalue` — a prebuilt address
+                // constant annotates as `SomeAddress()`; the const_box
+                // keeps the concrete address so `is_null_address` and
+                // constant folding can read it back.
+                let mut s = super::model::SomeAddress::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Address(s))
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)
-            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
@@ -4723,5 +4847,45 @@ mod tests {
             .expect("empty annotator state must not error");
         assert!(!ann.bookkeeper.position_entered.get());
         assert!(ann.bookkeeper.emulated_pbc_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn struct_root_pass2_replaces_untyped_force_shell() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        // Production order (lib.rs registration): the FORCE table is
+        // populated from ValueType rows BEFORE any classdef exists, so
+        // `_init_classdef` seeds `varnames` with the classdef-less
+        // `SomeInstance` shell (`valuetype_to_someshell(Ref)`).  Pass-2
+        // of `getuniqueclassdef_for_struct_root` must replace that
+        // shell with the registry-string projection (`Box<[String]>`
+        // -> SomeList), not skip it as already-filled.
+        crate::annotator::classdesc::register_struct_fields(
+            "CodeObject",
+            &[("varnames".to_string(), crate::model::ValueType::Ref(None))],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "PyFrame".to_string(),
+            vec![("code".to_string(), "CodeObject".to_string())],
+        );
+        reg.fields.insert(
+            "CodeObject".to_string(),
+            vec![("varnames".to_string(), "Box<[String]>".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+        let _root = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame registers");
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("CodeObject")
+            .expect("CodeObject registered");
+        let g = cd.borrow();
+        let varnames = g.attrs.get("varnames").expect("varnames attr present");
+        assert!(
+            matches!(varnames.s_value, SomeValue::List(_)),
+            "varnames must project to SomeList, got {:?}",
+            varnames.s_value
+        );
     }
 }

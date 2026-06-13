@@ -123,8 +123,8 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 /// inputarg coercion primitive, or `Repr` trait extension) before the
 /// per-typer body can land:
 ///
-///   * rbuiltin.py:234-255 — `min` / `max` (need `ll_min` / `ll_max`
-///     helper-graph registration via `gendirectcall`)
+///   * rbuiltin.py:234-255 — `min` / `max` landed (`ll_min` / `ll_max`
+///     helper graphs keyed per argument lltype).
 ///   * rbuiltin.py:258-261 — `reversed` (need `Repr::newiter` trait
 ///     method + iterator repr family)
 ///   * rbuiltin.py:264-305 — `object.__init__` is trivial and landed.
@@ -209,6 +209,10 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("bytearray", rtype_builtin_bytearray),
         // rbuiltin.py:209-211
         ("list", rtype_builtin_list),
+        // rbuiltin.py:234-238
+        ("min", rtype_builtin_min),
+        // rbuiltin.py:246-250
+        ("max", rtype_builtin_max),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -1243,6 +1247,63 @@ fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
     arg_repr(hop, 0)?.rtype_bltn_list(hop)
 }
 
+/// RPython `@typer_for(min) def rtype_builtin_min(hop)`
+/// (rbuiltin.py:234-238).
+///
+/// ```python
+/// @typer_for(min)
+/// def rtype_builtin_min(hop):
+///     v1, v2 = hop.inputargs(hop.r_result, hop.r_result)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(ll_min, v1, v2)
+/// ```
+fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    rtype_builtin_min_max(hop, "ll_min")
+}
+
+/// RPython `@typer_for(max) def rtype_builtin_max(hop)`
+/// (rbuiltin.py:246-250).
+///
+/// ```python
+/// @typer_for(max)
+/// def rtype_builtin_max(hop):
+///     v1, v2 = hop.inputargs(hop.r_result, hop.r_result)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(ll_max, v1, v2)
+/// ```
+fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    rtype_builtin_min_max(hop, "ll_max")
+}
+
+/// Shared body of `rtype_builtin_min` / `rtype_builtin_max` — the two
+/// upstream functions differ only in the `ll_min` / `ll_max` helper
+/// they `gendirectcall`.
+fn rtype_builtin_min_max(hop: &HighLevelOp, helper_name: &str) -> RTypeResult {
+    if hop.nb_args() != 2 {
+        return Err(TyperError::message(format!(
+            "{helper_name}: expected nb_args == 2, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_result = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| TyperError::message(format!("{helper_name}: r_result missing")))?
+    };
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r_result.as_ref()),
+        ConvertedTo::Repr(r_result.as_ref()),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let llt = r_result.lowleveltype().clone();
+    let llfunc =
+        hop.rtyper
+            .lowlevel_helper_function(helper_name, vec![llt.clone(), llt.clone()], llt)?;
+    hop.gendirectcall(&llfunc, vlist)
+}
+
 /// RPython `@typer_for(rarithmetic.intmask) def rtype_intmask(hop)`
 /// (rbuiltin.py:220-225).
 ///
@@ -1441,10 +1502,18 @@ fn rtype_cast_pointer_typer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
         }
     }
     let r_arg1 = arg_repr(hop, 1)?;
-    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`
-    if !matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr) {
+    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`.
+    // Pyre also accepts `InstanceRepr`: a typed receiver lifts to the
+    // instance lattice rather than `SomePtr`, and the instance flavour
+    // of the same downcast emits the identical `cast_pointer` genop
+    // (`pairtype(InstanceRepr, InstanceRepr).convert_from_to`,
+    // rclass.py:1035-1055).
+    if !matches!(
+        r_arg1.repr_class_id(),
+        ReprClassId::PtrRepr | ReprClassId::InstanceRepr
+    ) {
         return Err(TyperError::message(format!(
-            "rtype_cast_pointer: hop.args_r[1] must be PtrRepr, got {:?}",
+            "rtype_cast_pointer: hop.args_r[1] must be PtrRepr or InstanceRepr, got {:?}",
             r_arg1.repr_class_id()
         )));
     }
@@ -2842,15 +2911,17 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 
 /// `std::ptr::eq(a, b)` — the Rust spelling of `a is b` over wrapped
 /// objects (`baseobjspace::is_w`).  Identity comparison routes through
-/// the generic pointer `rtype_is_` body (rmodel.py:300-318
-/// `pair_repr_repr_rtype_is_`), which emits `ptr_eq` with a Bool
-/// result and constant-folds when the annotator proved the answer.
+/// the full pairtype `rtype_is_` dispatch, exactly like an upstream
+/// `is` operation: instance pairs of different classes take the
+/// `pairtype(InstanceRepr, InstanceRepr)` common-base arm
+/// (rclass.py:1057-1068) before the generic pointer body
+/// (rmodel.py:300-318) emits `ptr_eq` with a Bool result and
+/// constant-folds when the annotator proved the answer.
 fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     let r0 = arg_repr(hop, 0)?;
     let r1 = arg_repr(hop, 1)?;
-    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
-        .map(Some)
+    crate::translator::rtyper::pairtype::pair_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
 }
 
 /// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
@@ -3694,6 +3765,8 @@ mod tests {
             "unicode",
             "bytearray",
             "list",
+            "min",
+            "max",
             "hasattr",
         ] {
             let host = HOST_ENV

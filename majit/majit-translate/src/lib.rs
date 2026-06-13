@@ -64,11 +64,6 @@ pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineRe
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::translator::rtyper::legacy_annotator as annotate;
-#[cfg(test)]
-use crate::translator::rtyper::legacy_resolve as rtype;
-
 /// Configuration for the canonical graph/pipeline analyzer.
 ///
 /// Consumers supply graph-rewrite metadata such as virtualizable
@@ -100,11 +95,6 @@ pub struct MethodInfo {
     /// RPython: function-level JIT hints (elidable, close_stack, etc.).
     #[serde(default)]
     pub hints: Vec<String>,
-}
-
-/// Canonical single-file analysis entry point.
-pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
-    analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
 /// Feature-gated SemanticProgram builder.
@@ -231,11 +221,11 @@ fn build_semantic_program_via_active_frontend(
 ///
 /// The two gates together match the production fingerprint:
 /// `pyre-jit-trace/build.rs` calls
-/// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
-/// per-file `module_path`.  Tests via
-/// `analyze_multiple_pipeline_with_config` pass empty module
-/// paths and stay below the floor, so auto-discovery does not
-/// silently swap their front-end.
+/// `analyze_multiple_pipeline_with_modules` with ≈100 per-file
+/// `module_path`s.  Non-production callers (test fixtures and the
+/// 5-module `generated::PYRE_JIT_GRAPH_MODULES` manifest) stay below
+/// the floor, so auto-discovery does not silently swap their
+/// front-end.
 ///
 /// The workspace root is anchored at compile time via
 /// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
@@ -327,64 +317,6 @@ fn merge_hints_from_llbcs(
     }
 }
 
-/// Configurable canonical single-file analysis entry point.
-pub fn analyze_pipeline_with_config(
-    source: &str,
-    config: &AnalyzeConfig,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_config(&[source], config)
-}
-
-/// Canonical multi-file analysis entry point.
-///
-/// This returns only the graph/pipeline result and is the preferred API for
-/// RPython-like translator consumers.
-pub fn analyze_multiple_pipeline(sources: &[&str]) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_config(sources, &AnalyzeConfig::default())
-}
-
-/// Configurable canonical multi-file analysis entry point.
-///
-/// This is the canonical graph/pipeline translator entry point.
-/// Uses `HeuristicLayoutProvider` for struct layouts (type-string approximation).
-pub fn analyze_multiple_pipeline_with_config(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        None,
-        &|_, _| None,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with explicit layout provider.
-///
-/// RPython equivalent: the translator resolves struct layouts via
-/// `symbolic.get_field_token()` / `symbolic.get_size()`. The layout
-/// provider supplies these values. Pass `None` to use the heuristic default.
-pub fn analyze_multiple_pipeline_with_layout(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: &dyn layout::LayoutProvider,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        Some(layout_provider),
-        &|_, _| None,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
 /// `make_virtualizable_infos` constructor closure type — mirrors the
 /// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py:543).
 /// `(jd_idx, vtypeptr_token) -> Option<handle>`.  Hosts that own a
@@ -437,72 +369,20 @@ pub struct HostStaticAddrs<'a> {
     pub refs: &'a [(&'a str, i64)],
 }
 
-/// Multi-file analysis with explicit layout provider AND a
-/// `VirtualizableInfo` factory wired into
-/// `CallControl::make_virtualizable_infos` (warmspot.py:516).  The
-/// factory delegates the runtime constructor call from the codewriter
-/// (which sits below metainterp in the crate graph) back to the host.
-pub fn analyze_multiple_pipeline_with_vinfo_factory(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        layout_provider,
-        vinfo_factory,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with explicit layout provider, optional
-/// `VirtualizableInfo` factory, and host-supplied compiled helper
-/// addresses.
-///
-/// This is the line-by-line `getfunctionptr(graph)` adapter for source-only
-/// codewriter consumers: pass the output of
-/// `#[jit_module]::__majit_helper_trace_fnaddrs()` here so `JitCode.fnaddr`
-/// and residual-call lowering use the real helper surface instead of the
-/// symbolic fallback.
-pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
-        sources,
-        config,
-        layout_provider,
-        vinfo_factory,
-        fnaddr_bindings,
-        &[],
-    )
-}
-
 /// Multi-file analysis with explicit per-source module paths.
 ///
-/// `sources` and `module_paths` are parallel slices of equal length:
-/// `module_paths[i]` is the crate-stripped module path of `sources[i]`
-/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  The graph
-/// surface itself comes from the Charon-extracted LLBC set; the
-/// `module_paths` slice drives the workspace LLBC auto-discovery
-/// production fingerprint and stays available for per-file lexical
-/// resolution.  `sources` is retained for the parallel-slice length
-/// contract.
+/// `module_paths[i]` is the crate-stripped module path of the i-th
+/// analyzed source file (e.g. `"intobject"` for
+/// `pyre_object/src/intobject.rs`).  The graph surface itself comes
+/// from the Charon-extracted LLBC set; the `module_paths` slice drives
+/// the workspace LLBC auto-discovery production fingerprint and stays
+/// available for per-file lexical resolution.  Source text is not
+/// consumed — callers pass paths only.
 ///
-/// An empty `module_paths[i]` keeps the simple-name registration of
-/// the bare `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
-/// entry — runtime convergence is then handled solely by the
+/// An empty `module_paths[i]` keeps simple-name registration only —
+/// runtime convergence is then handled solely by the
 /// `build_object_descr_group_with_def_path` dual-publish.
 pub fn analyze_multiple_pipeline_with_modules(
-    sources: &[&str],
     module_paths: &[&str],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
@@ -510,11 +390,6 @@ pub fn analyze_multiple_pipeline_with_modules(
     fnaddr_bindings: &FnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    assert_eq!(
-        sources.len(),
-        module_paths.len(),
-        "analyze_multiple_pipeline_with_modules: parallel slices must have equal length",
-    );
     analyze_pipeline_from_module_paths(
         module_paths,
         config,
@@ -523,49 +398,6 @@ pub fn analyze_multiple_pipeline_with_modules(
         fnaddr_bindings,
         &[],
         static_addrs,
-    )
-}
-
-/// Like `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings` but
-/// additionally accepts an `impl_fnaddr_bindings` table produced by the
-/// macro's `__majit_helper_impl_trace_fnaddrs()` registry. Entries bind
-/// impl-method helpers via `register_macro_impl_helper_trace_fnaddr`,
-/// resolving the structural `[impl_type_joined, method]` CallPath that
-/// the string-split helper entry point cannot express.
-pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-    impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        layout_provider,
-        vinfo_factory,
-        fnaddr_bindings,
-        impl_fnaddr_bindings,
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with compiled helper fnaddr bindings but without a
-/// virtualizable-info factory.
-pub fn analyze_multiple_pipeline_with_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
-        sources,
-        config,
-        layout_provider,
-        &|_, _| None,
-        fnaddr_bindings,
     )
 }
 
@@ -743,11 +575,21 @@ fn analyze_pipeline_from_module_paths(
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
-    // `(trait_leaf, method_name, owner, return_type, hints)` for every
-    // concrete trait-impl method — input to the single-impl
-    // devirtualization pass below.
-    let mut concrete_trait_methods: Vec<(String, String, String, Option<String>, Vec<String>)> =
-        Vec::new();
+    // `(trait_leaf, trait_qualified, method_name, owner, return_type,
+    // hints)` for every concrete trait-impl method — input to the
+    // single-impl devirtualization pass below.  `trait_qualified` is
+    // the trait's full `name_path()`; the leaf keys the
+    // direct-path-binding bookkeeping (matching `canonical_trait_impls`
+    // spelling), the qualified path keys the unique-impl map.
+    #[allow(clippy::type_complexity)]
+    let mut concrete_trait_methods: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+    )> = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
     // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
@@ -804,6 +646,9 @@ fn analyze_pipeline_from_module_paths(
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
                     trait_leaf.clone(),
+                    func.trait_qualified
+                        .clone()
+                        .unwrap_or_else(|| trait_leaf.clone()),
                     func.name.clone(),
                     owner.clone(),
                     func.return_type.clone(),
@@ -1141,12 +986,63 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    for (trait_leaf, method_name, _, _, _) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _, _, _) in &concrete_trait_methods {
         *concrete_impl_counts
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
     }
-    for (trait_leaf, method_name, owner, return_type, hints) in &concrete_trait_methods {
+    // Trait → owner of its only concrete impl, for the dual-gate
+    // bookkeeper's generic-receiver classdef seeding
+    // (`derive_subject_inputcells` resolves a bound-trait `class_root`
+    // through this map).  Unlike the direct-path registration below,
+    // this is annotation-only metadata — it pulls no graph bodies into
+    // callers.
+    let mut trait_impl_owners: std::collections::HashMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = std::collections::HashMap::new();
+    for (_, trait_qualified, _, owner, _, _) in &concrete_trait_methods {
+        // Keyed by the trait's qualified `name_path()` — two distinct
+        // traits sharing a leaf name must not pool their impl owners
+        // (`tyref_generic_trait_bound_root` resolves bound-trait
+        // receivers through this map by the same qualified path).
+        trait_impl_owners
+            .entry(trait_qualified.clone())
+            .or_default()
+            .insert(owner.clone());
+    }
+    // Leaf names shared by more than one qualified struct in the
+    // field registry: a unique-impl entry whose owner collapses to
+    // such a leaf could seed the receiver with the OTHER same-named
+    // struct's classdef, so those entries are dropped (fail-safe: the
+    // receiver keeps the classdef-less shell and the block stays
+    // census-visible).
+    let mut struct_leaf_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for key in program.struct_fields.fields.keys() {
+        if let Some((_, leaf)) = key.rsplit_once("::") {
+            *struct_leaf_counts.entry(leaf).or_default() += 1;
+        }
+    }
+    let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
+        .into_iter()
+        .filter_map(|(trait_qualified, owners)| {
+            if owners.len() != 1 {
+                return None;
+            }
+            let owner = owners.into_iter().next().unwrap();
+            // `self_ty_root` may be module-qualified
+            // (`pyframe::PyFrame`); the struct-field registry and
+            // `getuniqueclassdef_for_struct_root` key on the leaf.
+            let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
+            if struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1 {
+                return None;
+            }
+            Some((trait_qualified, leaf))
+        })
+        .collect();
+    call_control.set_trait_unique_impls(trait_unique_impls);
+    for (trait_leaf, _, method_name, owner, return_type, hints) in &concrete_trait_methods {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;
@@ -1336,7 +1232,7 @@ fn analyze_pipeline_from_module_paths(
     // `warmspot.py::portal_runner` and the single graph seeded into
     // `find_all_graphs(portal, policy)` at `call.py:57`. When the graph
     // set does not include pyre-jit/src/eval.rs (e.g. compact test
-    // inputs whose PYRE_JIT_GRAPH_SOURCES stops at pyre-interpreter),
+    // inputs whose PYRE_JIT_GRAPH_MODULES stops at pyre-interpreter),
     // fall back to `execute_opcode_step` so those tests retain a portal
     // target. `execute_opcode_step` itself is a handler reached from the
     // real portal's match arm, so seeding BFS from it treats a handler

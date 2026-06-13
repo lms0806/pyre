@@ -338,27 +338,12 @@ pub fn build_value_to_hlvalue_map(
                     );
                 }
                 OpKind::ConstRefNull => {
-                    map.insert(
-                        result,
-                        Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::LLAddress(
-                                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
-                            ),
-                            LowLevelType::Address,
-                        )),
-                    );
+                    map.insert(result, Hlvalue::Constant(const_ref_gcref_constant(None)));
                 }
                 OpKind::ConstRefAddr(addr) => {
                     map.insert(
                         result,
-                        Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::LLAddress(
-                                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(
-                                    *addr,
-                                ),
-                            ),
-                            LowLevelType::Address,
-                        )),
+                        Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))),
                     );
                 }
                 _ => {}
@@ -366,6 +351,32 @@ pub fn build_value_to_hlvalue_map(
         }
     }
     map
+}
+
+/// Fold a `ConstRefAddr` / `ConstRefNull` opkind to its constant.
+///
+/// Both opkinds carry a `PyObjectRef` (object-space singleton address
+/// from `static_addrs.refs`, or the `PY_NULL` null reference) — a GC
+/// reference in the walker's kind system.  The constant is a
+/// `GCREF`-typed `_ptr` (`Ptr(GcOpaque("GCREF"))`, the lltype of
+/// erased GC references) carrying the raw address as
+/// `_ptr_obj::IntCast`, so `SomePtr(GCREF)` annotation and `PtrRepr`
+/// rtyping give the slot its GcRef kind.  Folding to
+/// `LLAddress`/`Address` instead made every graph returning such a
+/// constant diverge at the dual-gate (`legacy=GcRef, real=Signed`):
+/// `llmemory.Address` is int-kinded.  `cast_int_to_ptr` is not usable
+/// here — it asserts odd (tagged) integers (lltype.py:2372-2377) and
+/// host addresses are even — so the `_ptr` is built directly.
+fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
+    use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF, LowLevelType};
+    let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+        panic!("GCREF must be a Ptr lowleveltype");
+    };
+    let p = match addr {
+        None | Some(0) => _ptr::new(*gcref_t, Ok(None)),
+        Some(a) => _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(a))), true),
+    };
+    Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone())
 }
 
 /// Look up the `Hlvalue` for a slot operand. Surfaces a
@@ -514,25 +525,19 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 /// RPython (`add`, `sub`, `mul`, `mod`, `lshift`, `rshift`, `lt`, ...)
 /// pass through unchanged.
 ///
-/// Pyre's short-circuit `and` / `or` (Rust `&&` / `||`) are NOT
-/// flowspace operations — Python's `and`/`or` are control flow and
-/// `operation.py:475-510` does not register them as binary operators.
-///
-/// The frontend desugars `&&` / `||` into
-/// `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`-shaped control flow
-/// before the graph reaches this adapter: in MIR the short-circuit is
-/// already lowered to a `bool(lhs)` test + branch fork + join over the
-/// boolean operands, so no binary `and`/`or` op survives to here.
-///
-/// The fail-loud arm below survives for synthetic graphs (test
-/// fixtures, future ad-hoc producers) that inject `OpKind::BinOp {
-/// op: "and"/"or", .. }` directly without going through the
-/// frontend, plus any future RPython binop opnames that have not yet
-/// been ported.
+/// A bare `and` / `or` arriving here is always the *bitwise* operator:
+/// `front::mir::binop_label` maps Charon `BitAnd` / `BitOr` to
+/// `"and"` / `"or"` (matching the trace pipeline's blackhole handler
+/// vocabulary), and rustc lowers the short-circuit `&&` / `||` forms
+/// into MIR branch forks before Charon ever sees them — Python's
+/// short-circuit `and`/`or` are likewise control flow upstream
+/// (`operation.py:475-510` registers no such binary operator), so the
+/// keyword-suffixed `and_` / `or_` names below are unambiguously the
+/// bitwise registrations.
 fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
     let normalized = match pyre_name {
-        "bitand" => "and_",
-        "bitor" => "or_",
+        "and" | "bitand" => "and_",
+        "or" | "bitor" => "or_",
         "bitxor" => "xor",
         "add_assign" => "inplace_add",
         "sub_assign" => "inplace_sub",
@@ -544,15 +549,6 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
         "bitxor_assign" => "inplace_xor",
         "lshift_assign" => "inplace_lshift",
         "rshift_assign" => "inplace_rshift",
-        "and" | "or" => {
-            return Err(TyperError::missing_rtype_operation(format!(
-                "normalize_binop_name: pyre BinOp `{pyre_name}` has no \
-                 flowspace counterpart (operation.py:475-510 does not \
-                 register short-circuit `and`/`or` as binary operators; \
-                 they are control flow). Frontend must desugar `&&`/`||` \
-                 to short-circuit blocks before reaching the rtyper."
-            )));
-        }
         other => other,
     };
     Ok(normalized.to_string())
@@ -606,6 +602,25 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     false
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic string-literal
+/// define-op (`Call(["__str_const", <text>])`, `mir.rs:1576`).
+/// Upstream flowspace carries a string literal as a bare
+/// `Constant('text')` SSA value, so the pre-pass
+/// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
+/// [`translate_op`] emits nothing; a Constant is not an operation and
+/// raises nothing, so [`op_canraise`] is false — same contract as the
+/// unit-variant ctor elision above.
+fn is_str_const_define(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const"
+    )
+}
+
 /// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
 /// non-empty `canraise` (`operation.py`).
 ///
@@ -645,6 +660,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::SyntheticTransparentCtor { .. },
             ..
         } => !is_elided_unit_variant_ctor(kind),
+        // A string-literal define-op pre-folds to `Constant('text')`
+        // and emits no op — a Constant raises nothing.  Matched before
+        // the general `Call` arm, same as the unit-variant elision.
+        kind if is_str_const_define(kind) => false,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -715,6 +734,12 @@ pub fn translate_op(
     // FlowspaceOp).  `op_canraise` consults the same predicate, so it
     // reports these — and only these — transparent ctors as non-raising.
     if is_elided_unit_variant_ctor(&op.kind) {
+        return Ok(Vec::new());
+    }
+    // String-literal define-ops pre-fold to `Constant('text')` the same
+    // way (see `is_str_const_define`); the pre-pass owns the slot's
+    // `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
+    if is_str_const_define(&op.kind) {
         return Ok(Vec::new());
     }
     match &op.kind {
@@ -1120,6 +1145,96 @@ pub fn translate_op(
                         })?;
                         return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
                     }
+                    // `core` method spellings of upstream operations:
+                    // pyre source writes `a.min(b)` /
+                    // `a != b`-via-`PartialEq::ne` / `v.len()` /
+                    // `x.wrapping_mul(y)` where upstream Python
+                    // writes `min(a, b)` / the flowspace ops `ne` /
+                    // `len` / `mul` (flowspace/operation.py tables;
+                    // lltype `int_mul` wraps, so `wrapping_mul` is
+                    // the Rust spelling of upstream's plain `*` —
+                    // e.g. the `x * 1000003` green-key hash).
+                    // front::mir records the monomorphized core path
+                    // when the call survives as a trait/inherent
+                    // method call (primitive BinOps lower to
+                    // `OpKind::BinOp` and never reach here); map the
+                    // path back to the upstream spelling so the
+                    // chain reaches unaryop.py / binaryop.py /
+                    // rbuiltin.py instead of failing FunctionPath
+                    // resolution.
+                    if segments.len() >= 3 && segments[0] == "core" {
+                        let family = segments[1].as_str();
+                        let leaf = segments[segments.len() - 1].as_str();
+                        match (family, leaf) {
+                            ("cmp", "eq" | "ne" | "lt" | "le" | "gt" | "ge")
+                                if arg_hls.len() == 2 =>
+                            {
+                                return Ok(vec![FlowspaceOp::new(leaf, arg_hls, result)]);
+                            }
+                            ("slice", "len") if arg_hls.len() == 1 => {
+                                return Ok(vec![FlowspaceOp::new("len", arg_hls, result)]);
+                            }
+                            ("slice", "iter") if arg_hls.len() == 1 => {
+                                return Ok(vec![FlowspaceOp::new("iter", arg_hls, result)]);
+                            }
+                            ("num", "wrapping_mul") if arg_hls.len() == 2 => {
+                                return Ok(vec![FlowspaceOp::new("mul", arg_hls, result)]);
+                            }
+                            ("cmp", "min" | "max") if arg_hls.len() == 2 => {
+                                let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
+                                    TyperError::message(format!(
+                                        "builtin `{leaf}` missing from HOST_ENV"
+                                    ))
+                                })?;
+                                let callable = Hlvalue::Constant(Constant::new(
+                                    ConstValue::HostObject(builtin),
+                                ));
+                                let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                                call_args.push(callable);
+                                call_args.extend(arg_hls);
+                                return Ok(vec![FlowspaceOp::new(
+                                    "simple_call",
+                                    call_args,
+                                    result,
+                                )]);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // `__cast_pointer/<Root>` marker (`front::mir`
+                    // `cast_pointer_marker_op`) — pyre's carrier for the
+                    // upstream `cast_pointer(PTRTYPE, ptr)` downcast
+                    // (lltype.py:964-968).  Same path-encoded-constant
+                    // reconstruction as the `simple_call(<exc class>)`
+                    // raise marker (Branch 3c below): rebuild the 2-arg
+                    // upstream shape with the target class as the
+                    // constant first argument.  The class is interned by
+                    // qualname so every cast site shares one `HostObject`
+                    // Arc (`getdesc` dedups on Arc identity — fresh Arcs
+                    // would mint one ClassDesc per cast site).
+                    if segments.len() == 2 && segments[0] == "__cast_pointer" && arg_hls.len() == 1
+                    {
+                        let callable_host = HOST_ENV
+                            .import_module("rpython.rtyper.lltypesystem.lltype")
+                            .and_then(|m| m.module_get("cast_pointer"))
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "HOST_ENV lltype module must expose cast_pointer".to_string(),
+                                )
+                            })?;
+                        let class_host = call_registry
+                            .bookkeeper()
+                            .intern_class_by_qualname(&segments[1]);
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        ))));
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            class_host,
+                        ))));
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -1299,9 +1414,26 @@ pub fn translate_op(
                     // reached when the type failed to resolve) is NOT
                     // interned: a bare variant name like `Ok` is ambiguous
                     // across enums, so interning it would conflate distinct
-                    // classes onto one `ClassDesc`.
+                    // classes onto one `ClassDesc`.  Exception: the fixed
+                    // aggregate-kind placeholder tags (`Adt` for tuples /
+                    // unresolved ADTs, `Array`, `Closure` — see
+                    // `front::mir::aggregate_ctor_name`) are not variant
+                    // names, and the construction-side FieldWrite chain
+                    // shares the same tag as `owner_root` with the
+                    // field-projection side (which resolves it through
+                    // `getuniqueclassdef_for_struct_root` →
+                    // `intern_class_by_qualname`).  Minting a fresh Arc
+                    // per site here splits the placeholder into one
+                    // `ClassDef` per occurrence, so the value's classdef
+                    // can never match the field repr's interned classdef
+                    // (rtyper convert_from_to has no common base → typer
+                    // error).
                     let host = if owner_path.is_empty() {
-                        HostObject::new_class(name.clone(), Vec::new())
+                        if matches!(name.as_str(), "Adt" | "Array" | "Closure") {
+                            call_registry.bookkeeper().intern_class_by_qualname(name)
+                        } else {
+                            HostObject::new_class(name.clone(), Vec::new())
+                        }
                     } else {
                         let qualname = format!("{}.{}", owner_path.join("."), name);
                         call_registry
@@ -1620,16 +1752,35 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             ConstValue::Float(*bits),
             LowLevelType::Float,
         ))),
-        OpKind::ConstRefNull => Some(Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null),
-            LowLevelType::Address,
-        ))),
-        OpKind::ConstRefAddr(addr) => Some(Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::LLAddress(
-                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(*addr),
-            ),
-            LowLevelType::Address,
-        ))),
+        OpKind::ConstRefNull => Some(Hlvalue::Constant(const_ref_gcref_constant(None))),
+        OpKind::ConstRefAddr(addr) => {
+            Some(Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))))
+        }
+        // String-literal constant.  Upstream flowspace carries a string
+        // literal as a bare `Constant('text')` SSA value (annotated
+        // `SomeString` by `immutablevalue`); `front::mir` has no
+        // ConstStr opkind and synthesises a 0-arg
+        // `Call(["__str_const", <text>])` instead (`mir.rs:1576`).
+        // Re-fold that define-op to the upstream Constant shape here.
+        // The stamped lltype is `Ptr(STR)` — fixed for every string
+        // constant, same as the primitive arms above (the rtyper's
+        // `StringRepr.convert_const` re-derives the same `Ptr(STR)`
+        // per use; `inputconst` always converts from `c.value`, so
+        // the ByteStr payload is never read through this stamp).
+        // Without the stamp the define-result Variable has no kind,
+        // and the dual-gate projection reports the slot as a
+        // `legacy=GcRef, real=Unknown` divergence on every graph
+        // containing a string literal.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
+            Some(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::ByteStr(segments[1].clone().into_bytes()),
+                crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+            )))
+        }
         // RPython parity: unit-variant ctors (`StepResult::Continue`,
         // `LoopResult::Done`, …) are pre-built singleton instances at
         // the rtyper layer (`rclass.InstanceRepr.
@@ -1808,7 +1959,18 @@ pub(crate) fn derive_subject_inputcells(
     // every `Ref` classdef-less, narrowed later by annotation.
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
-    let startblock = &legacy.blocks[legacy.startblock.0];
+    // Id-keyed lookup, not the dense `blocks[id.0]` projection — block
+    // ids need not be index-aligned (see `reachable_block_ids`).
+    let startblock = legacy
+        .blocks
+        .iter()
+        .find(|b| b.id == legacy.startblock)
+        .ok_or_else(|| {
+            TyperError::message(format!(
+                "derive_subject_inputcells: startblock {:?} not present in graph blocks",
+                legacy.startblock
+            ))
+        })?;
     let mut input_by_result: HashMap<
         crate::flowspace::model::Variable,
         (&crate::model::ValueType, &Option<String>),
@@ -1860,6 +2022,21 @@ pub(crate) fn derive_subject_inputcells(
             // (`description.py:283-305 FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    // A generic param (`&T` where `T: Trait`, incl. a
+                    // trait default body's `&Self`) carries the bound
+                    // trait's qualified path as `class_root`
+                    // (`tyref_generic_trait_bound_root`).  When the
+                    // analyzed world has exactly one concrete impl of
+                    // that trait, the receiver's only possible shape is
+                    // that impl type — substitute its struct root and
+                    // seed below as if the param were typed concretely.
+                    let root = bk
+                        .pyre_trait_unique_impls
+                        .borrow()
+                        .get(root)
+                        .cloned()
+                        .unwrap_or_else(|| root.clone());
+                    let root = &root;
                     let known = bk
                         .pyre_struct_fields
                         .borrow()
@@ -1918,15 +2095,19 @@ pub(crate) fn derive_subject_inputcells(
 /// (`mir.rs::lower_framestate`); startblock reachability is the general
 /// case the `dead` skip sites below also honour.
 fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
+    // Index lookup instead of `FunctionGraph::block` (a dense
+    // `blocks[id.0]` projection): final blocks reached as link targets
+    // need no `Block` entry of their own (test fixtures omit them), and
+    // a final block contributes no exits anyway.  Mirrors `iterblocks`'
+    // `exits[::-1]` stack order.
+    let by_id: HashMap<BlockId, &crate::model::Block> =
+        legacy.blocks.iter().map(|b| (b.id, b)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![legacy.startblock];
-    while let Some(bid) = stack.pop() {
-        if !seen.insert(bid) {
-            continue;
-        }
-        if let Some(block) = legacy.blocks.get(bid.0) {
-            for link in &block.exits {
-                stack.push(link.target);
+    while let Some(id) = stack.pop() {
+        if seen.insert(id) {
+            if let Some(block) = by_id.get(&id) {
+                stack.extend(block.exits.iter().rev().map(|e| e.target));
             }
         }
     }
@@ -2028,12 +2209,28 @@ pub fn function_graph_to_flowspace(
         }
     }
 
+    // A flowspace graph contains only blocks reachable from
+    // `startblock`: upstream builds graphs by abstract interpretation,
+    // so an unreachable block cannot exist, and every downstream
+    // consumer (checkgraph / annotator / rtyper) walks `iterblocks()`
+    // — a reachability DFS (`flowspace/model.rs:4011`, model.py).  The
+    // legacy MIR graph, by contrast, keeps lowered-but-unreachable
+    // blocks: every `on_unwind` edge is dropped at lowering while the
+    // `UnwindResume`/`Abort` terminator still lowers via `set_raise`,
+    // leaving a predecessor-less block whose orphan `[etype, evalue]`
+    // Link.args are defined by no inputarg and no op result.  Convert
+    // only the reachable closure — the same `reachable` set the const
+    // prepass above filtered on, so a block is translated iff its
+    // const-defines were seeded.  A *reachable* block with the same
+    // orphan shape still fails the operand-definedness check in
+    // `link_arg_to_hlvalue` — SSA-definedness is not relaxed.
+
     // ──────────────────────────────────────────────────────────────
     // Pass 1 — allocate fresh `flowspace::BlockRef` for every legacy
-    // non-final block. The legacy `returnblock` and `exceptblock` are
-    // skipped here; `FunctionGraph::with_return_var` allocates the
-    // canonical flowspace finals, and the block_map is populated with
-    // those after graph construction.
+    // reachable non-final block. The legacy `returnblock` and
+    // `exceptblock` are skipped here; `FunctionGraph::with_return_var`
+    // allocates the canonical flowspace finals, and the block_map is
+    // populated with those after graph construction.
     // ──────────────────────────────────────────────────────────────
 
     let mut block_map: HashMap<BlockId, BlockRef> = HashMap::new();
@@ -2146,9 +2343,9 @@ pub fn function_graph_to_flowspace(
     block_map.insert(legacy.exceptblock, exceptblock_ref);
 
     // ──────────────────────────────────────────────────────────────
-    // Pass 2 — fill operations + exits + exitswitch for each non-final
-    // legacy block. Final blocks (returnblock / exceptblock) are
-    // already terminal in flowspace — `mark_final()` was set by
+    // Pass 2 — fill operations + exits + exitswitch for each reachable
+    // non-final legacy block. Final blocks (returnblock / exceptblock)
+    // are already terminal in flowspace — `mark_final()` was set by
     // `FunctionGraph::with_return_var`.
     // ──────────────────────────────────────────────────────────────
 
@@ -3354,6 +3551,67 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_cast_pointer_marker_rebuilds_two_arg_upstream_call() {
+        // `__cast_pointer/<Root>` marker (front::mir
+        // `cast_pointer_marker_op`) reconstructs the upstream 2-arg
+        // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py:964-968):
+        // constant callable + constant interned target class, then the
+        // pointer operand.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        let operand = Variable::new();
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(operand.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__cast_pointer".into(), "W_CastTarget".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Ref(Some("W_CastTarget".into())),
+            },
+        };
+        let registry = empty_call_registry();
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("__cast_pointer marker must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        assert_eq!(lowered.args.len(), 3);
+        let Hlvalue::Constant(ref callable) = lowered.args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("cast_pointer callable must be ConstValue::HostObject");
+        };
+        let expected = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("cast_pointer"))
+            .expect("populate_host_env must register lltype.cast_pointer");
+        assert_eq!(host, &expected);
+        let Hlvalue::Constant(ref class_const) = lowered.args[1] else {
+            panic!("target class must be a Constant");
+        };
+        let ConstValue::HostObject(ref class_host) = class_const.value else {
+            panic!("target class must be ConstValue::HostObject");
+        };
+        // Interned by qualname — every cast site shares one HostObject
+        // identity, so `getdesc` resolves them to one ClassDesc.
+        let interned = registry
+            .bookkeeper()
+            .intern_class_by_qualname("W_CastTarget");
+        assert_eq!(class_host, &interned);
+        assert!(matches!(lowered.args[2], Hlvalue::Variable(ref v) if *v == operand));
+    }
+
+    #[test]
     fn translate_op_call_synthetic_transparent_ctor_lowers_to_simple_call() {
         // Call::SyntheticTransparentCtor mirrors Rust's `Class { fields }`
         // ctor — flowspace receives a `simple_call(class_const, fields)`
@@ -4216,6 +4474,86 @@ mod tests {
         assert!(
             msg.contains("Indirect") && msg.contains("rclass"),
             "unported-op error must propagate translate_op's fail-loud message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_skips_unreachable_raise_block() {
+        // A predecessor-less unwind block carrying `set_raise`'s orphan
+        // `[etype, evalue]` Link.args — the MIR lowering shape left
+        // behind when every inbound `on_unwind` edge is dropped — must
+        // not reject the graph: only the reachable closure is
+        // converted, mirroring upstream `iterblocks` (a flowspace
+        // graph cannot contain unreachable blocks at all).
+        let mut legacy = legacy_minimal_identity_return_graph();
+        legacy.set_next_value(9);
+        let orphan_etype = legacy.must_variable_at(7);
+        let orphan_evalue = legacy.must_variable_at(8);
+        let exceptblock = legacy.exceptblock;
+        legacy.blocks.push(Block {
+            id: BlockId(3),
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(orphan_etype), LinkArg::Value(orphan_evalue)],
+                exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        });
+
+        let output = function_graph_to_flowspace(&legacy, &empty_call_registry())
+            .expect("unreachable raise block must not reject the graph");
+        // start → return only; the orphan block was never converted.
+        assert_eq!(
+            output.graph.borrow().iterblocks().len(),
+            2,
+            "converted graph must contain exactly the reachable closure"
+        );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_rejects_reachable_orphan_raise_args() {
+        // A *reachable* block whose exception-link args are defined by
+        // no inputarg and no op result must still fail loud — the
+        // reachable-closure conversion does not relax SSA-definedness.
+        let mut legacy = LegacyGraph::new("reachable_orphan_raise");
+        legacy.set_next_value(9);
+        let orphan_etype = legacy.must_variable_at(7);
+        let orphan_evalue = legacy.must_variable_at(8);
+        let exceptblock = legacy.exceptblock;
+        let startblock = Block {
+            id: legacy.startblock,
+            inputargs: block_inputargs(&mut legacy, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(orphan_etype), LinkArg::Value(orphan_evalue)],
+                exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: legacy.returnblock,
+            inputargs: block_inputargs(&mut legacy, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        legacy.blocks = vec![startblock, returnblock];
+
+        let err = function_graph_to_flowspace(&legacy, &empty_call_registry())
+            .expect_err("reachable orphan raise args must stay fail-loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("undefined operand slot"),
+            "reachable orphan must keep the operand-definedness error, got: {msg}"
         );
     }
 

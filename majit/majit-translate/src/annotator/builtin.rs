@@ -306,6 +306,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
+    // `lltype.cast_pointer` (ann_cast_pointer, lltype.py:970-974) —
+    // keyed under the `HostObject::new_builtin_callable` qualname the
+    // lltype HOST_ENV module assigns (`flowspace/model.rs:1795`).
+    analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
@@ -1240,9 +1244,16 @@ pub fn std_ptr_eq(
 /// nullability bit.
 pub fn ptr_null_constant(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
-    _kwds: &HashMap<String, Option<SomeValue>>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
+    // `ptr::null()` / `ptr::null_mut()` are zero-arg; a call site
+    // carrying arguments is a malformed lowering, not a null constant.
+    if !args_s.is_empty() || !kwds.is_empty() {
+        return Err(AnnotatorError::new(
+            "ptr::null()/ptr::null_mut() take no arguments",
+        ));
+    }
     Ok(SomeValue::Instance(super::model::SomeInstance::new(
         None,
         true,
@@ -1458,6 +1469,64 @@ pub fn robjmodel_instantiate(
     Ok(SomeValue::Instance(SomeInstance::new(
         Some(cdef),
         false,
+        Default::default(),
+    )))
+}
+
+/// `ann_cast_pointer(PtrT, s_p)` (lltype.py:970-974): the result of
+/// `cast_pointer(PTRTYPE, ptr)` is annotated from the constant target
+/// type, independent of the operand's annotation.  Pyre's
+/// instance-classed world resolves the constant target class to its
+/// unique classdef; the operand's nullability survives the cast (a
+/// downcast of a possibly-null pointer stays possibly-null — upstream
+/// `SomePtr` does not track null, pyre's `SomeInstance.can_be_none`
+/// does).
+pub fn lltype_cast_pointer(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "cast_pointer() expects (PTRTYPE, ptr) positional arguments",
+        ));
+    }
+    let s_clspbc_v = arg_at(args_s, 0, "lltype_cast_pointer");
+    let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
+        return Err(AnnotatorError::new(
+            "cast_pointer() expected a constant class PBC as first argument",
+        ));
+    };
+    // upstream `assert s_CURTYPE.is_constant()` — a multi-desc PBC is
+    // not a constant target type.
+    let mut descs = s_clspbc.descriptions.values();
+    let (Some(DescEntry::Class(class_desc)), None) = (descs.next(), descs.next()) else {
+        return Err(AnnotatorError::new(
+            "cast_pointer() target must be a single constant class",
+        ));
+    };
+    let cdef = ClassDesc::getuniqueclassdef(class_desc)?;
+    // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — the operand
+    // must be a pointer carrier.  Pyre's carriers are `SomePtr` and
+    // `SomeInstance` (classed cast targets and classdef-less erased
+    // pointers); anything else is a non-pointer cast.
+    let can_be_none = match arg_at(args_s, 1, "lltype_cast_pointer") {
+        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::Ptr(_) => false,
+        // A constant-None operand is a null pointer.  Upstream null
+        // constants annotate as SomePtr and pass the lltype.py:971
+        // assert; pyre carries them as SomeNone, and the downcast of
+        // a null pointer stays null.
+        SomeValue::None_(_) => true,
+        other => {
+            return Err(AnnotatorError::new(format!(
+                "cast_pointer(): casting of non-pointer: {other:?}"
+            )));
+        }
+    };
+    Ok(SomeValue::Instance(SomeInstance::new(
+        Some(cdef),
+        can_be_none,
         Default::default(),
     )))
 }
@@ -1846,6 +1915,84 @@ mod tests {
     fn registry_rejects_unknown_qualname() {
         assert!(!is_registered("completely.made.up.name"));
         assert!(lookup("completely.made.up.name").is_none());
+    }
+
+    #[test]
+    fn lltype_cast_pointer_types_result_from_constant_target_class() {
+        // `ann_cast_pointer` (lltype.py:970-974): result annotated from
+        // the constant target class; operand nullability survives.
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("W_CastTarget");
+        let s_cls = bk.immutablevalue(&ConstValue::HostObject(host)).unwrap();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let result = lltype_cast_pointer(&bk, &[Some(s_cls), Some(s_ptr)], &no_kwds()).unwrap();
+        match result {
+            SomeValue::Instance(inst) => {
+                assert!(
+                    inst.can_be_none,
+                    "operand nullability must survive the cast"
+                );
+                let cdef = inst
+                    .classdef
+                    .expect("result must carry the target class's unique classdef");
+                assert_eq!(cdef.borrow().name, "W_CastTarget");
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_rejects_non_class_target() {
+        // upstream `assert s_CURTYPE.is_constant()` — a non-PBC first
+        // argument is not a constant target type.
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(1)).unwrap();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let err = lltype_cast_pointer(&bk, &[Some(s_int), Some(s_ptr)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("constant class PBC"),
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_rejects_non_pointer_operand() {
+        // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — a
+        // non-pointer second argument is rejected, not silently
+        // annotated as the target class.
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("W_CastTarget");
+        let s_cls = bk.immutablevalue(&ConstValue::HostObject(host)).unwrap();
+        let s_int = bk.immutablevalue(&ConstValue::Int(1)).unwrap();
+        let err = lltype_cast_pointer(&bk, &[Some(s_cls), Some(s_int)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("casting of non-pointer"),
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_accepts_constant_none_as_null() {
+        // A constant-None operand is a null pointer (upstream null
+        // constants are SomePtr and pass the lltype.py:971 assert);
+        // the result is the target class, can_be_none=true.
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("W_CastTarget");
+        let s_cls = bk.immutablevalue(&ConstValue::HostObject(host)).unwrap();
+        let s_none = bk.immutablevalue(&ConstValue::None).unwrap();
+        let result = lltype_cast_pointer(&bk, &[Some(s_cls), Some(s_none)], &no_kwds()).unwrap();
+        match result {
+            SomeValue::Instance(inst) => {
+                assert!(inst.can_be_none, "null downcast stays nullable");
+                let cdef = inst.classdef.expect("target classdef");
+                assert_eq!(cdef.borrow().name, "W_CastTarget");
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
     }
 
     #[test]

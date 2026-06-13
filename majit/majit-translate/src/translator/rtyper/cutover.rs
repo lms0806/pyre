@@ -59,8 +59,6 @@ use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-#[cfg(test)]
-use crate::front;
 use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -275,15 +273,26 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
     // `FunctionGraph::set_concretetype_of_inline`, so the graph cells
     // carry the kind view this comparison reads.
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    let reachable_vars = reachable_defined_vars(legacy_graph);
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        // Legacy-only slots: see `reachable_defined_vars`.
+        if !legacy_graph
+            .variable_at(idx)
+            .is_some_and(|v| reachable_vars.contains(v))
+        {
             continue;
         }
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             divergences.push(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -293,8 +302,11 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
         let legacy_kind = legacy_graph.concretetype_at(*idx);
         if legacy_kind == ConcreteType::Unknown {
             divergences.push(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, *idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -403,18 +415,29 @@ pub(crate) enum DualGateOutcome {
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
+    lift_sources: &crate::jit_codewriter::call::GraphStore,
 ) -> Result<DualGateOutcome, String> {
     // Same panic-catch contract as `dual_gate_check` — the rtyper's
     // internal `genop`/`level` asserts surface as diagnostic panics
     // for unported pyre-front idioms; the gate uniformly returns a
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
+    //
+    // Snapshot the session's `fixed_graphs` keys so the failure arms
+    // below can identify the shared callee graphs this subject fixed
+    // (and partially LL-rewrote) before it failed — see
+    // `unpoison_failed_subject_callees`.
+    let fixed_at_entry: HashSet<crate::flowspace::model::GraphKey> = call_registry
+        .session_if_started()
+        .map(|(ann, _)| ann.fixed_graphs.borrow().keys().cloned().collect())
+        .unwrap_or_default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
     let (real_value_to_var, real_constants) = match result {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
+            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
             let msg = format!("{e}");
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
@@ -422,6 +445,7 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path failed: {msg}"));
         }
         Err(payload) => {
+            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                 (*s).to_string()
             } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -464,6 +488,128 @@ pub(crate) fn dual_gate_check_with_registry(
     Ok(DualGateOutcome::Match { real_value_to_var })
 }
 
+/// Repair shared callee state poisoned by a failed subject scope.
+///
+/// `specialize_more_blocks` mutates callee graphs in place: it
+/// registers each graph in `annotator.fixed_graphs` at its first
+/// specialized block (rtyper.py:268) and rewrites block operations to
+/// LL form. When the subject then fails, `AddedBlocksGuard` evicts the
+/// scope's blocks and clears their annotations — but the callee's
+/// `FunctionDesc.cache` (and any calltable row built during the scope)
+/// still holds the fixed + LL-rewritten + annotation-cleared graph.
+/// Every later subject calling the same callee then dies at
+/// `addpendingblock`'s fixed-graph safety check (annrpython.py:181
+/// reads `arg.annotation`), or at `flowin`'s "unimplemented operation"
+/// on the LL ops.
+///
+/// Upstream has no counterpart: RPython's `specialize()` runs once per
+/// Translator and any failure is fatal. Pyre's per-subject dual-gate
+/// continues past failed subjects, so a failed scope must leave shared
+/// callee state as if the subject never ran. Each graph newly fixed
+/// during the scope is swapped for a fresh re-lift from its
+/// `GraphStore` source, and the rtyper/annotator records keyed to the
+/// stale graph are dropped:
+///
+/// - `annotator.fixed_graphs` row (graph identity)
+/// - `rtyper.already_seen` rows for the stale graph's blocks
+/// - `translator.graphs` entry (appended on `cachedgraph` hit)
+/// - `FunctionDesc.cache` values (patched to the fresh `PyGraph`)
+/// - calltable rows holding the same `Rc<PyGraph>` (patched in place
+///   so `total_calltable_size` and `get_concrete_calltable`'s size
+///   invariant hold; the family's cached concrete calltable is
+///   dropped so it rebuilds against the fresh graph)
+fn unpoison_failed_subject_callees(
+    call_registry: &PyreCallRegistry,
+    fixed_at_entry: &HashSet<crate::flowspace::model::GraphKey>,
+    lift_sources: &crate::jit_codewriter::call::GraphStore,
+) {
+    let Some((annotator, rtyper)) = call_registry.session_if_started() else {
+        return;
+    };
+    let newly_fixed: Vec<(
+        crate::flowspace::model::GraphKey,
+        crate::flowspace::model::GraphRef,
+    )> = annotator
+        .fixed_graphs
+        .borrow()
+        .iter()
+        .filter(|(k, _)| !fixed_at_entry.contains(*k))
+        .map(|(k, g)| (k.clone(), g.clone()))
+        .collect();
+    for (gkey, stale) in newly_fixed {
+        annotator.fixed_graphs.borrow_mut().shift_remove(&gkey);
+        for block in stale.borrow().iterblocks() {
+            rtyper
+                .already_seen
+                .borrow_mut()
+                .remove(&crate::flowspace::model::BlockKey::of(&block));
+        }
+        annotator
+            .translator
+            .graphs
+            .borrow_mut()
+            .retain(|g| !Rc::ptr_eq(g, &stale));
+        let Some((key, entry)) = call_registry.find_entry_with_cached_graph(&stale) else {
+            // The subject graph itself (lifted through the adapter, not
+            // a registry callee) — the shared-map cleanup above is all
+            // it needs.
+            continue;
+        };
+        let fresh = call_registry
+            .keys_for_entry(&key)
+            .iter()
+            .find_map(|k| {
+                lift_sources.get(&crate::parse::CallPath::from_segments(
+                    k.segments().iter().cloned(),
+                ))
+            })
+            .and_then(|source| {
+                lift_callee_to_pygraph(source, signature_for_graph(source), call_registry).ok()
+            });
+        match fresh {
+            Some(fresh) => {
+                let fd = entry.function_desc.borrow();
+                for pg in fd.cache.borrow_mut().values_mut() {
+                    if Rc::ptr_eq(&pg.graph, &stale) {
+                        *pg = fresh.clone();
+                    }
+                }
+                if let Ok(family) = fd.base.getcallfamily() {
+                    for table in family.borrow_mut().calltables.values_mut() {
+                        for row in table.iter_mut() {
+                            for pg in row.values_mut() {
+                                if Rc::ptr_eq(&pg.graph, &stale) {
+                                    *pg = fresh.clone();
+                                }
+                            }
+                        }
+                    }
+                    rtyper
+                        .concrete_calltables
+                        .borrow_mut()
+                        .remove(&(Rc::as_ptr(&family) as usize));
+                }
+            }
+            None => {
+                // No re-lift source — drop the poisoned cache rows and
+                // record the condition so later callers surface a lift
+                // error (Skip-classified) instead of the fixed-graph
+                // safety panic.
+                entry
+                    .function_desc
+                    .borrow()
+                    .cache
+                    .borrow_mut()
+                    .retain(|_, pg| !Rc::ptr_eq(&pg.graph, &stale));
+                entry.record_lift_error(
+                    "callee graph poisoned by a failed subject scope; no re-lift source"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
 /// Local projection of `value_to_var` Variables' concretetype cells
 /// into a `BTreeMap<usize, ConcreteType>` keyed by the dense slot
 /// index.  Errors from unsupported lltypes are silently treated as
@@ -476,6 +622,102 @@ pub(crate) fn dual_gate_check_with_registry(
 /// Used by both [`dual_gate_check_with_registry`] and the
 /// [`dual_gate_check`] anchor-test helper to diff the real path against
 /// the legacy walker.
+/// Best-effort label for a diverging slot: the variable name plus the
+/// `OpKind` (or inputarg position) defining it.  Divergence messages
+/// name anonymous temps (`v2332`) -- without the defining op the
+/// report cannot be acted on short of a graph dump.  Runs only on the
+/// divergence path.
+fn divergence_slot_label(graph: &LegacyGraph, idx: usize) -> String {
+    let Some(var) = graph.variable_at(idx) else {
+        return "<no var>".to_string();
+    };
+    for block in graph.iter_blocks() {
+        for op in &block.operations {
+            if op.result.as_ref() == Some(var) {
+                let mut kind = format!("{:?}", op.kind);
+                if kind.len() > 120 {
+                    // `String::truncate` panics off a char boundary;
+                    // ConstRef payloads can embed multibyte string
+                    // literals, so floor the cut to a boundary.
+                    let mut cut = 120;
+                    while !kind.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    kind.truncate(cut);
+                }
+                return format!("{} <- {}", var.name(), kind);
+            }
+        }
+        if block.inputargs.iter().any(|ia| ia == var) {
+            return format!("{} <- inputarg of block {:?}", var.name(), block.id);
+        }
+    }
+    // Not defined by any op or inputarg — report where it is *used*
+    // (exitswitch / outgoing Link.args), the only remaining places a
+    // slot-table variable can appear; an undefined-but-used variable
+    // is itself the diagnosis.
+    for block in graph.iter_blocks() {
+        if let Some(crate::model::ExitSwitch::Value(sw)) = &block.exitswitch
+            && sw == var
+        {
+            return format!(
+                "{} <- exitswitch of block {:?} (no def)",
+                var.name(),
+                block.id
+            );
+        }
+        for link in &block.exits {
+            if link
+                .args
+                .iter()
+                .any(|a| matches!(a, crate::model::LinkArg::Value(v) if v == var))
+            {
+                return format!(
+                    "{} <- Link.args out of block {:?} (no def)",
+                    var.name(),
+                    block.id
+                );
+            }
+        }
+    }
+    format!("{} (in no reachable block)", var.name())
+}
+
+/// Variables defined (inputarg or op result) in the reachable block
+/// closure (DFS from `startblock` over `Block.exits`).  The real path
+/// converts exactly this closure (flowspace `iterblocks()` parity —
+/// an unreachable block cannot exist upstream), while legacy
+/// `resolve_types` types every lowered block — including pruned
+/// `SwitchInt` abort-default arms and the orphan `set_raise`
+/// `[etype, evalue]` Link.args they carry.  A variable defined only
+/// outside the closure is legacy-only by construction; diffing it
+/// against the real path is a guaranteed false `real=Unknown`.
+fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![graph.startblock];
+    let mut vars = std::collections::HashSet::new();
+    while let Some(bid) = stack.pop() {
+        if !seen.insert(bid.0) {
+            continue;
+        }
+        let Some(block) = graph.blocks.get(bid.0) else {
+            continue;
+        };
+        for ia in &block.inputargs {
+            vars.insert(ia.clone());
+        }
+        for op in &block.operations {
+            if let Some(r) = &op.result {
+                vars.insert(r.clone());
+            }
+        }
+        for link in &block.exits {
+            stack.push(link.target);
+        }
+    }
+    vars
+}
+
 fn project_value_to_var_to_map(
     value_to_var: &LegacyToTyped,
     constant_concretetypes: &HashMap<Variable, LowLevelType>,
@@ -519,15 +761,26 @@ fn compare_real_against_legacy(
 ) -> Option<String> {
     let real_state = project_value_to_var_to_map(value_to_var, constants, legacy_graph);
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    let reachable_vars = reachable_defined_vars(legacy_graph);
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        // Legacy-only slots: see `reachable_defined_vars`.
+        if !legacy_graph
+            .variable_at(idx)
+            .is_some_and(|v| reachable_vars.contains(v))
+        {
             continue;
         }
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             return Some(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -535,8 +788,11 @@ fn compare_real_against_legacy(
         let legacy_kind = legacy_graph.concretetype_at(*idx);
         if legacy_kind == ConcreteType::Unknown {
             return Some(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, *idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -582,11 +838,12 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
             && msg.contains(" used before definition")
         // `normalize_unary_op_name: pyre UnaryOp` and
         // `normalize_binop_name: pyre BinOp` are not Skip-classified:
-        // the `not` / `deref` / `same_as` / `and` / `or` / `invert`
-        // surfaces are desugared by the MIR front-end — rustc lowers
-        // `!`/`*` and the `&&`/`||` short-circuits into MIR
-        // branches/calls before lowering.  Synthetic
-        // graphs that inject these ops (anchor tests in
+        // the `not` / `deref` / `same_as` / `invert` surfaces are
+        // desugared by the MIR front-end (rustc lowers `!`/`*` and the
+        // `&&`/`||` short-circuits into MIR branches/calls before
+        // lowering), and the bitwise `and` / `or` labels normalize to
+        // the flowspace `and_` / `or_` registrations.  Synthetic
+        // graphs that inject unported ops (anchor tests in
         // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
         // `specialize_legacy_graph` directly and never reach
         // `is_known_unported`, so the absence of these substring
@@ -636,6 +893,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // legacy walker handles these graphs; skip until the
         // address-of-local lowering lands a typed pointer operand.
         || msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr")
+        // Unported per-annotation Repr families.  `rmodel.rs`
+        // `rtyper_makerepr` fail-louds with this message shape for the
+        // SomeValue kinds whose upstream Repr port has not landed
+        // (rlist.py ListRepr, rdict.py DictRepr, rrange.py iterator
+        // reprs, rbytearray.py, robject.py, rproperty.py).  Reached
+        // once a graph annotates a list/dict-typed value past the
+        // exc-edge and classdef walls; the legacy walker keeps
+        // handling these graphs until each Repr is ported.
+        || msg.contains("rtyper_makerepr — port")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
         // exceptions uncaught and `annrpython.py:643` lets
@@ -658,6 +924,70 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("complete_pending_blocks failed")
         || msg.contains("Cannot find attribute ")
         || msg.contains("AnnotatorError:")
+        // `rtyper.py:810-823 convertvar` — no conversion path between
+        // the two reprs.  The production hitter is the generic-ADT
+        // payload attribute (`core.result.Result.Ok.__pos_0` etc.):
+        // pyre collapses every `Result<T, E>` instantiation onto ONE
+        // classdef, so the attribute's merged annotation unions
+        // unrelated payload classes (unit-tuple placeholder `Adt`,
+        // `core.option.Option.None`, …) and `pairtype(InstanceRepr,
+        // InstanceRepr).convert_from_to` (rclass.py:1035-1055)
+        // correctly finds no common base.  Upstream never faces this
+        // shape — RPython has no generics, so each class attribute
+        // carries a single annotated type.  Skip until
+        // per-instantiation classdef specialization lands.
+        || msg.contains("don't know how to convert from")
+        // Annotation-stage flavour of the convertvar entry above
+        // (`annrpython.py:432 mergeinputargs` → `UnionError`): two
+        // `SomeInstance`s with no common base meet at a block merge
+        // because pyre collapses every generic-ADT instantiation onto
+        // one classdef, so unrelated payload classes union at the phi.
+        // Upstream propagates the UnionError uncaught; the dual gate
+        // skips to the legacy walker until per-instantiation classdef
+        // specialization lands.
+        || msg.contains("cannot unify instances with no common base class")
+        // `model.rs:3061` subset-gap marker — the union pair has no
+        // ported `pair(s1, s2).union()` handler.  Upstream degenerates
+        // such pairs to `SomeObject` (`annmodel` pair(SomeObject,
+        // SomeObject).union, binaryop.py:64-72) instead of erroring,
+        // so any hit here is by construction an unported handler, not
+        // a divergence.  Skip to the legacy walker until the pair is
+        // ported.
+        || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
+        // `InstanceRepr.getfield` walking the `rbase` chain before the
+        // repr's deferred `setup()` ran (upstream drains pending
+        // setups via `call_all_setups`, rtyper.py:198, after every
+        // specialized block; pyre's per-subject dual-gate can reach a
+        // getfield on a freshly minted inner repr first).  Skip until
+        // the setup-ordering port lands.
+        || msg.contains("rbase missing")
+        // `rpbc` calltable row lookup miss at rtype time — the
+        // method-PBC came from the struct-root class-dict seeding
+        // (`seed_struct_root_method_members`), whose `simple_call`
+        // sites do not yet register call shapes into the CallFamily
+        // the way `bookkeeper.pbc_call` does for ordinary descs
+        // (pbc_call → getcallfamily row, bookkeeper.py:553-571).
+        // Skip until the seeded-method family registration lands.
+        || msg.contains("calltable row not found in CallFamily")
+        // A non-instance constant (e.g. a string literal) reaching
+        // `InstanceRepr.convert_const` — the receiver field was typed
+        // by the untyped FORCE_ATTRIBUTES shell (classdef-less
+        // SomeInstance) because no registry-row projection covered
+        // it, so a String-valued field rtypes as an instance (hitter:
+        // PyError.msg via the type_error raise stubs).  Skip until
+        // the typed-Ref field projection covers the remaining rows.
+        || msg.contains("InstanceRepr.convert_const: expected HostObject or None")
+        // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
+        // comparison where one side is not a pointer repr.  The
+        // production hitter is `py_type_check`'s `(*obj).ob_type ==
+        // tp` chain when `tp` flowed from a `&STATIC` host address:
+        // `HostStaticAddrs` annotates the static's address as a
+        // constant `SomeInteger`, so the comparison pairs
+        // `InstanceRepr` with `IntegerRepr`.  Upstream never faces
+        // this — a prebuilt instance constant stays `SomeInstance`.
+        // Skip until host static addresses annotate as typed
+        // instance pointers.
+        || msg.contains("is of instances of the non-pointers")
         // `dyn Trait` dispatch still enters the real-rtyper flowspace
         // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
         // some registry-prefill paths.  The production codewriter's
@@ -1191,123 +1521,6 @@ pub(crate) fn register_unsafe_fn_stubs(
         }
         registry.register_callee(key, signature.clone(), stub_pygraph);
     }
-}
-
-/// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
-///
-/// Inverts the front-end's call-target canonicalisation: what an
-/// `OpKind::Call::FunctionPath`
-/// callsite emits is what we register the callee under.
-///
-/// Both `func.name` (e.g. `"a::helper"`, module-qualified by `front::mir`
-/// from Charon's `name_path()`) and
-/// `func.self_ty_root` (e.g. `"a::Foo"`, the impl owner `front::mir`
-/// records from Charon's `name_path()`) carry `::`-joined module-qualified
-/// strings.  Each
-/// `::`-separated component is one `FunctionPathKey` segment — the
-/// `OpKind::Call::FunctionPath` callsite produces `["a", "helper"]`
-/// (multi-segment, no `::` in any segment), so the registered key
-/// must split each `::` boundary too.  Without the split, registry
-/// entry `["a::helper"]` (single segment containing `::`) would never
-/// match callsite lookup `["a", "helper"]`.
-///
-/// PyPy's `Bookkeeper.getdesc(<function object>)` (`bookkeeper.py:353-409`)
-/// keys on Python function-object identity rather than path strings,
-/// so the upstream chain has no segment-shape divergence to worry
-/// about.  Pyre's segment-key approach is a stand-in for that
-/// identity until host callable identity is available; aligning the
-/// segment shape both sides of the registry is a prerequisite for
-/// that stand-in to function correctly.
-#[cfg(test)]
-fn function_path_key_for(func: &front::SemanticFunction) -> FunctionPathKey {
-    let mut segments: Vec<String> = Vec::new();
-    if let Some(t) = &func.self_ty_root {
-        segments.extend(t.split("::").map(str::to_string));
-    }
-    segments.extend(func.name.split("::").map(str::to_string));
-    FunctionPathKey::from_segments(segments)
-}
-
-/// Derive the parameter `Signature` for a `SemanticFunction` from
-/// the startblock's input arg names.
-///
-/// Mirrors upstream `bookkeeper.py:418
-/// cpython_code_signature(pyfunc.__code__)`: the parameter names
-/// come from the function's declared parameter list.  Pyre carries
-/// these as `value_name(inputarg)` on the startblock; missing names
-/// fall back to `arg{N}` to keep the `FunctionDesc.signature.argnames`
-/// length matched to the actual parameter count.
-#[cfg(test)]
-fn signature_for(func: &front::SemanticFunction) -> Signature {
-    let graph = &func.graph;
-    let startblock = graph.block(graph.startblock);
-    let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
-        .enumerate()
-        .map(|(idx, var)| {
-            graph
-                .value_name_for(var)
-                .unwrap_or_else(|| format!("arg{idx}"))
-        })
-        .collect();
-    Signature::new(argnames, None, None)
-}
-
-/// Walk a `SemanticProgram` and pre-register every
-/// reachable `SemanticFunction` in the call registry.
-///
-/// Production callers
-/// with `OpKind::Call::FunctionPath` ops cannot proceed through the
-/// real-rtyper path without the registry pre-populated, because
-/// pyre's surface DSL has no Python callable object for the
-/// upstream `Constant(<function>) -> getdesc -> FunctionDesc` chain
-/// (`bookkeeper.py:353-409`).  This walker registers each
-/// `SemanticFunction` so any `simple_call` the adapter emits later
-/// finds a matching entry.
-///
-/// Two passes are required because the per-function lift
-/// (`lift_callee_to_pygraph`) calls
-/// `function_graph_to_flowspace`, which runs the
-/// `OpKind::Call::FunctionPath` arm in `translate_op` and expects
-/// every callee path the body references to already be registered.
-/// Pass 1 installs `(HostObject, FunctionDesc)` for every program
-/// function (signature only, no PyGraph cache).  Pass 2 lifts each
-/// function's body and prefills its `FunctionDesc.cache` so the
-/// rtyper's `cachedgraph` (`description.rs:1037-1039`) hits at
-/// `direct_call` time.
-///
-/// Annotation seeding lives inside [`function_graph_to_flowspace`]
-/// inside `function_graph_to_flowspace`; this walker plumbs only the program + registry.
-#[cfg(test)]
-pub(crate) fn populate_call_registry_from_program(
-    program: &front::SemanticProgram,
-    registry: &PyreCallRegistry,
-) -> Result<(), TyperError> {
-    // Pass 1 — register every function with its signature; the
-    // FunctionDesc.cache stays cold until Pass 2.
-    let mut pending: Vec<(
-        FunctionPathKey,
-        &front::SemanticFunction,
-        Rc<PyreFunctionEntry>,
-    )> = Vec::with_capacity(program.functions.len());
-    for func in &program.functions {
-        let key = function_path_key_for(func);
-        let signature = signature_for(func);
-        let entry = registry.get_or_register(key.clone(), signature);
-        pending.push((key, func, entry));
-    }
-    // Pass 2 — lift each function's body using the now-populated
-    // registry, then prefill its FunctionDesc.cache.  Lift order is
-    // independent of function topology: every callsite's
-    // `simple_call` resolves through `registry.lookup` against the
-    // Pass-1-installed HostObjects, regardless of whether the
-    // callee's own body has been lifted yet.
-    for (_key, func, entry) in pending {
-        let pygraph = lift_callee_to_pygraph(&func.graph, signature_for(func), registry)?;
-        entry.prefill_default_cache(pygraph);
-    }
-    Ok(())
 }
 
 /// Restricted entry: only graphs without `OpKind::Call::FunctionPath`

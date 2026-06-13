@@ -146,6 +146,10 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_pyre_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        // Trait → unique-impl owner map for the generic-receiver seed
+        // path (`derive_subject_inputcells` resolves a bound-trait
+        // `class_root` through it before the struct-root lookup).
+        registry.set_pyre_trait_unique_impls(callcontrol.trait_unique_impls().clone());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
         // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
         // mirrors that propagation by routing the populate `TyperError`
@@ -189,6 +193,13 @@ impl CodeWriter {
             &registry,
             &callcontrol.unsafe_fn_stubs,
         );
+        // Mirror classdesc.py:606-618 — methods live in the class
+        // `__dict__`.  Install each registered `[.., Owner, method]`
+        // entry's function host on the interned `Owner` class object so
+        // `SomeInstance.getattr(method)` resolves to a bound MethodDesc
+        // instead of blocking.  AFTER populate + unsafe stubs so the
+        // entry set is complete.
+        registry.seed_struct_root_method_members();
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py:69-83`) construct
         // exactly one annotator and one rtyper per Translator and assert
@@ -291,7 +302,11 @@ impl CodeWriter {
     ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
-            crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
+            crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+                graph,
+                &registry,
+                callcontrol.function_graphs(),
+            )
         }));
         let outcome = match dual_gate_outcome {
             Ok(result) => result,

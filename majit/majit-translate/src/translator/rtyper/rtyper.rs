@@ -981,8 +981,37 @@ impl RPythonTyper {
         }
         // First time seeing this key: upstream pre-inserts None as the
         // recursion sentinel, then materialises the Repr.
+        //
+        // Upstream leaves the sentinel behind when `rtyper_makerepr`
+        // raises — harmless there because any makerepr failure kills
+        // the whole translation.  Pyre's dual-gate continues past a
+        // failed subject on the SAME shared rtyper session, so a
+        // leaked `None` would make every later subject touching the
+        // same key die on the recursion assert above instead of
+        // surfacing the original makerepr error.  Drop the sentinel on
+        // the error path (and on a panic unwinding through makerepr)
+        // so later subjects re-derive the same failure cleanly.
+        struct SentinelCleanup<'a> {
+            reprs: &'a RefCell<HashMap<ReprKey, Option<Arc<dyn Repr>>>>,
+            key: Option<ReprKey>,
+        }
+        impl Drop for SentinelCleanup<'_> {
+            fn drop(&mut self) {
+                if let Some(key) = self.key.take()
+                    && let Ok(mut reprs) = self.reprs.try_borrow_mut()
+                    && matches!(reprs.get(&key), Some(None))
+                {
+                    reprs.remove(&key);
+                }
+            }
+        }
         self.reprs.borrow_mut().insert(key.clone(), None);
+        let mut cleanup = SentinelCleanup {
+            reprs: &self.reprs,
+            key: Some(key.clone()),
+        };
         let result = rtyper_makerepr(s_obj, self)?;
+        cleanup.key = None;
         self.reprs.borrow_mut().insert(key, Some(result.clone()));
         self.add_pendingsetup(result.clone());
         Ok(result)
@@ -2750,6 +2779,8 @@ fn lowlevel_helper_graph(
     match name {
         "ll_check_chr" => lowlevel_range_check_helper_graph(name, args, result, 255),
         "ll_check_unichr" => lowlevel_range_check_helper_graph(name, args, result, 0x10ffff),
+        "ll_min" => lowlevel_min_max_helper_graph(name, args, result, false),
+        "ll_max" => lowlevel_min_max_helper_graph(name, args, result, true),
         "ll_int_abs_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_abs"),
         "ll_int_neg_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_neg"),
         "ll_int_lshift_ovf" => lowlevel_int_lshift_ovf_helper_graph(name, args, result),
@@ -2939,6 +2970,7 @@ fn lowlevel_helper_graph(
             LowLevelType::SignedLongLongLong,
             "lllong_eq",
         ),
+        "ll_both_none" => lowlevel_both_none_helper_graph(name, args, result),
         "ll_issubclass" => lowlevel_issubclass_helper_graph(name, args, result),
         "ll_isinstance" => lowlevel_isinstance_helper_graph(rtyper, name, args, result),
         "ll_type" => lowlevel_type_helper_graph(name, args, result),
@@ -2974,6 +3006,74 @@ pub(crate) fn helper_pygraph_from_graph(
 
 pub(crate) fn void_field_const(name: &str) -> Hlvalue {
     constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
+}
+
+/// `ll_both_none(ins1, ins2)` (rclass.py:1180-1181): `not ins1 and
+/// not ins2` — the mixed-gcflavor `is` comparison can only be true
+/// when both pointers are null.  The two argument pointer types
+/// differ (one gc, one raw common repr), so the shape is validated
+/// structurally rather than against fixed lltypes.
+fn lowlevel_both_none_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args.len() != 2
+        || !args.iter().all(|a| matches!(a, LowLevelType::Ptr(_)))
+        || result != &LowLevelType::Bool
+    {
+        return Err(TyperError::message(format!(
+            "{name} expects (Ptr, Ptr) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let ins1 = variable_with_lltype("arg0", args[0].clone());
+    let ins2 = variable_with_lltype("arg1", args[1].clone());
+    let z1 = variable_with_lltype("z1", LowLevelType::Bool);
+    let z2 = variable_with_lltype("z2", LowLevelType::Bool);
+    let both = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ins1.clone()),
+        Hlvalue::Variable(ins2.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(ins1)],
+        Hlvalue::Variable(z1.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(ins2)],
+        Hlvalue::Variable(z2.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_and",
+        vec![Hlvalue::Variable(z1), Hlvalue::Variable(z2)],
+        Hlvalue::Variable(both.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(both)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
 fn lowlevel_issubclass_helper_graph(
@@ -3683,6 +3783,148 @@ fn lowlevel_range_check_helper_graph(
         Link::new(
             exc_args,
             Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// RPython `ll_min` / `ll_max` (rbuiltin.py:240-243 / 252-255):
+///
+/// ```python
+/// def ll_min(i1, i2):
+///     if i1 < i2:
+///         return i1
+///     return i2
+///
+/// def ll_max(i1, i2):
+///     if i1 > i2:
+///         return i1
+///     return i2
+/// ```
+///
+/// Upstream's helper is polymorphic over the argument lltype (the
+/// rtyper specializes it per call shape via `gendirectcall`); the
+/// graph here picks the comparison opname from the lltype the
+/// `(name, args, result)` cache key carries.
+fn lowlevel_min_max_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    is_max: bool,
+) -> Result<PyGraph, TyperError> {
+    let llt = match args {
+        [a, b] if a == b && a == result => a.clone(),
+        _ => {
+            return Err(TyperError::message(format!(
+                "{name} expects (T, T) -> T, got ({args:?}) -> {result:?}"
+            )));
+        }
+    };
+    let cmp_op = match (&llt, is_max) {
+        (LowLevelType::Signed, false) => "int_lt",
+        (LowLevelType::Signed, true) => "int_gt",
+        // `BoolRepr(IntegerRepr)` compares through `as_int =
+        // signed_repr` (rbool.py:10-16; `_rtype_compare_template`
+        // picks `repr.opprefix + func` via `.as_int`, rint.py:605-614)
+        // — so `min(bool, bool)` lowers to the Signed comparison.
+        (LowLevelType::Bool, false) => "int_lt",
+        (LowLevelType::Bool, true) => "int_gt",
+        (LowLevelType::Unsigned, false) => "uint_lt",
+        (LowLevelType::Unsigned, true) => "uint_gt",
+        (LowLevelType::SignedLongLong, false) => "llong_lt",
+        (LowLevelType::SignedLongLong, true) => "llong_gt",
+        (LowLevelType::UnsignedLongLong, false) => "ullong_lt",
+        (LowLevelType::UnsignedLongLong, true) => "ullong_gt",
+        (LowLevelType::SignedLongLongLong, false) => "lllong_lt",
+        (LowLevelType::SignedLongLongLong, true) => "lllong_gt",
+        (LowLevelType::UnsignedLongLongLong, false) => "ulllong_lt",
+        (LowLevelType::UnsignedLongLongLong, true) => "ulllong_gt",
+        (LowLevelType::Float, false) => "float_lt",
+        (LowLevelType::Float, true) => "float_gt",
+        // `pairtype(AbstractCharRepr, AbstractCharRepr)` ordering goes
+        // through `_rtype_compare_template` → `char_<func>`
+        // (rstr.py:740-753).
+        (LowLevelType::Char, false) => "char_lt",
+        (LowLevelType::Char, true) => "char_gt",
+        // `pairtype(AbstractUniCharRepr, AbstractUniCharRepr)` ordering
+        // goes through `_rtype_unchr_compare_template_ord`
+        // (rstr.py:779-800): both operands are cast via
+        // `cast_unichar_to_int` and compared with `int_<func>`.  The
+        // casts are emitted below.
+        (LowLevelType::UniChar, false) => "int_lt",
+        (LowLevelType::UniChar, true) => "int_gt",
+        _ => {
+            return Err(TyperError::message(format!(
+                "{name}: unsupported argument lltype {llt:?}"
+            )));
+        }
+    };
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let i1 = variable_with_lltype("arg0", llt.clone());
+    let i2 = variable_with_lltype("arg1", llt.clone());
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", llt.clone());
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(i1.clone()),
+        Hlvalue::Variable(i2.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let (cmp1, cmp2) = if llt == LowLevelType::UniChar {
+        // rstr.py:795-799 `_rtype_unchr_compare_template_ord` — cast
+        // each operand to Signed before the `int_<func>` comparison.
+        let ord1 = variable_with_lltype("ord0", LowLevelType::Signed);
+        let ord2 = variable_with_lltype("ord1", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_unichar_to_int",
+            vec![Hlvalue::Variable(i1.clone())],
+            Hlvalue::Variable(ord1.clone()),
+        ));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_unichar_to_int",
+            vec![Hlvalue::Variable(i2.clone())],
+            Hlvalue::Variable(ord2.clone()),
+        ));
+        (ord1, ord2)
+    } else {
+        (i1.clone(), i2.clone())
+    };
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        cmp_op,
+        vec![Hlvalue::Variable(cmp1), Hlvalue::Variable(cmp2)],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(i1)],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(i2)],
+            Some(graph.returnblock.clone()),
             Some(constant_with_lltype(
                 ConstValue::Bool(false),
                 LowLevelType::Bool,
@@ -7639,6 +7881,114 @@ mod tests {
         assert!(
             !rendered.contains("\n.. <no graph>"),
             "setup_block_entry error must NOT be wrapped by gottypererror: {rendered}",
+        );
+    }
+
+    #[test]
+    fn min_max_helper_graph_picks_cmp_op_by_lltype() {
+        // rbuiltin.py:240-243 / 252-255 — `ll_min` / `ll_max` compare
+        // with the lltype-specific lt/gt op and return the winning arg
+        // on the true/false links.
+        for (llt, is_max, expected_op) in [
+            (LowLevelType::Signed, false, "int_lt"),
+            (LowLevelType::Signed, true, "int_gt"),
+            // BoolRepr compares via `as_int = signed_repr`
+            // (rbool.py:10-16) — the Signed opnames.
+            (LowLevelType::Bool, false, "int_lt"),
+            (LowLevelType::Bool, true, "int_gt"),
+            (LowLevelType::Unsigned, false, "uint_lt"),
+            (LowLevelType::Unsigned, true, "uint_gt"),
+            (LowLevelType::SignedLongLong, false, "llong_lt"),
+            (LowLevelType::SignedLongLong, true, "llong_gt"),
+            (LowLevelType::UnsignedLongLong, false, "ullong_lt"),
+            (LowLevelType::UnsignedLongLong, true, "ullong_gt"),
+            (LowLevelType::SignedLongLongLong, false, "lllong_lt"),
+            (LowLevelType::SignedLongLongLong, true, "lllong_gt"),
+            (LowLevelType::UnsignedLongLongLong, false, "ulllong_lt"),
+            (LowLevelType::UnsignedLongLongLong, true, "ulllong_gt"),
+            (LowLevelType::Float, false, "float_lt"),
+            (LowLevelType::Float, true, "float_gt"),
+            // CharRepr ordering via `_rtype_compare_template` →
+            // `char_<func>` (rstr.py:740-753).
+            (LowLevelType::Char, false, "char_lt"),
+            (LowLevelType::Char, true, "char_gt"),
+        ] {
+            let name = if is_max { "ll_max" } else { "ll_min" };
+            let pygraph =
+                lowlevel_min_max_helper_graph(name, &[llt.clone(), llt.clone()], &llt, is_max)
+                    .unwrap_or_else(|e| panic!("{name}({llt:?}) must build: {e}"));
+            assert_eq!(
+                pygraph.signature.borrow().argnames,
+                vec!["arg0".to_string(), "arg1".to_string()],
+                "{name}({llt:?}) argnames"
+            );
+            let graph = pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            assert_eq!(start.operations.len(), 1, "{name}({llt:?}) op count");
+            assert_eq!(
+                start.operations[0].opname, expected_op,
+                "{name}({llt:?}) cmp op"
+            );
+            assert_eq!(start.exits.len(), 2, "{name}({llt:?}) two return links");
+            for link in &start.exits {
+                let link = link.borrow();
+                assert!(
+                    link.target
+                        .as_ref()
+                        .is_some_and(|t| Rc::ptr_eq(t, &graph.returnblock)),
+                    "{name}({llt:?}) links must lead to returnblock"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn min_max_helper_graph_unichar_casts_then_compares_signed() {
+        // UniCharRepr ordering via `_rtype_unchr_compare_template_ord`
+        // (rstr.py:779-800): `cast_unichar_to_int` on both operands,
+        // then `int_lt` / `int_gt`; the links still return the
+        // original UniChar args.
+        for (is_max, expected_cmp) in [(false, "int_lt"), (true, "int_gt")] {
+            let name = if is_max { "ll_max" } else { "ll_min" };
+            let llt = LowLevelType::UniChar;
+            let pygraph =
+                lowlevel_min_max_helper_graph(name, &[llt.clone(), llt.clone()], &llt, is_max)
+                    .unwrap_or_else(|e| panic!("{name}(UniChar) must build: {e}"));
+            let graph = pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            assert_eq!(start.operations.len(), 3, "{name}(UniChar) op count");
+            assert_eq!(start.operations[0].opname, "cast_unichar_to_int");
+            assert_eq!(start.operations[1].opname, "cast_unichar_to_int");
+            assert_eq!(start.operations[2].opname, expected_cmp);
+        }
+    }
+
+    #[test]
+    fn min_max_helper_graph_rejects_unsupported_and_mismatched_lltypes() {
+        // Void has no ordering ops in any repr.
+        let err = lowlevel_min_max_helper_graph(
+            "ll_min",
+            &[LowLevelType::Void, LowLevelType::Void],
+            &LowLevelType::Void,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported argument lltype"),
+            "Void must be rejected: {err}"
+        );
+        // (Signed, Float) -> Signed violates the (T, T) -> T cache-key
+        // contract.
+        let err = lowlevel_min_max_helper_graph(
+            "ll_max",
+            &[LowLevelType::Signed, LowLevelType::Float],
+            &LowLevelType::Signed,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expects (T, T) -> T"),
+            "mixed arg lltypes must be rejected: {err}"
         );
     }
 }

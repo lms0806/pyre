@@ -53,11 +53,11 @@ pub struct SemanticFunction {
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
-    /// Module path of the defining file, as supplied to
-    /// `parse_source_with_module` (e.g. `"pyframe"` for
-    /// `pyre-interpreter/src/pyframe.rs`).  Empty when the caller did not
-    /// supply a module path — top-level items remain at simple-name
-    /// registration.
+    /// Module path of the defining file, crate-stripped (e.g.
+    /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
+    /// `front::mir` from the module portion of Charon's `name_path()`.
+    /// Empty when the producer did not supply a module path — top-level
+    /// items remain at simple-name registration.
     ///
     /// Used by `lib.rs` registration so a free function's call sites that
     /// were qualified by `canonical_call_target:7494-7502` (single-segment
@@ -91,6 +91,14 @@ pub struct SemanticFunction {
     /// (which need `register_trait_method`) from inherent methods
     /// (which need `register_function_graph`).
     pub trait_root: Option<String>,
+    /// Fully-qualified `name_path()` of the trait when this function
+    /// is an `impl Trait for Type {…}` method, otherwise `None`.
+    /// Distinguishes traits whose leaf names collide — the unique-impl
+    /// map (`pyre_trait_unique_impls`) keys on this, not `trait_root`.
+    /// Trait default bodies leave it `None`: Charon names them with
+    /// only the trait leaf segment, and they never feed the
+    /// unique-impl map.
+    pub trait_qualified: Option<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -403,6 +411,7 @@ mod tests {
             hints: Vec::new(),
             access_directly: false,
             trait_root: None,
+            trait_qualified: None,
         }
     }
 

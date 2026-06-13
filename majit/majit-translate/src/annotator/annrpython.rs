@@ -341,39 +341,12 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                     .cloned()
                     .collect();
                 for k in &new_keys {
-                    annotated.shift_remove(k);
-                    blocked_blocks.shift_remove(k);
-                    // Revert each evicted block to a pristine
-                    // "never annotated" state by clearing the
-                    // annotation on every Variable it DEFINES
-                    // (inputargs + operation results).  Dropping the
-                    // block from `annotated` without this leaves a
-                    // half-state: a later subject reaching the same
-                    // (session-shared) block sees `seen_before ==
-                    // false` in `addpendingblock`, takes the
-                    // `bindinputargs` initial-seed path, and calls
-                    // `setbinding` with the caller's (possibly
-                    // narrower) cell over the Variable's retained
-                    // annotation — tripping the monotonicity assert
-                    // `setbinding: new value does not contain old`.
-                    // Mirrors the dual-gate Skip arm's graph-wide
-                    // `var.annotation = None` reset
-                    // (codewriter.rs::dual_gate_type_state).
-                    if let Some(block) = all_blocks.shift_remove(k) {
-                        if let Ok(blk) = block.try_borrow() {
-                            let vars = blk
-                                .inputargs
-                                .iter()
-                                .chain(blk.operations.iter().map(|op| &op.result));
-                            for v in vars {
-                                if let Hlvalue::Variable(var) = v {
-                                    if let Ok(mut slot) = var.annotation.try_borrow_mut() {
-                                        *slot = None;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    evict_block_and_clear_annotations(
+                        &mut annotated,
+                        &mut all_blocks,
+                        &mut blocked_blocks,
+                        k,
+                    );
                 }
                 if !new_keys.is_empty() {
                     if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
@@ -386,6 +359,49 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
         }
         if let Some(saved) = self.saved.take() {
             *self.ann.added_blocks.borrow_mut() = saved;
+        }
+    }
+}
+
+/// Evict one block from the session-shared tracking maps AND revert it
+/// to a pristine "never annotated" state by clearing the annotation on
+/// every Variable it DEFINES (inputargs + operation results).
+///
+/// Dropping the block from `annotated` without the clearing leaves a
+/// half-state: a later subject reaching the same (session-shared) block
+/// sees `seen_before == false` in `addpendingblock`, takes the
+/// `bindinputargs` initial-seed path, and calls `setbinding` with the
+/// caller's (possibly narrower) cell over the Variable's retained
+/// annotation — tripping the monotonicity assert `setbinding: new value
+/// does not contain old`.  Mirrors the dual-gate Skip arm's graph-wide
+/// `var.annotation = None` reset (codewriter.rs::dual_gate_type_state).
+/// Used by both eviction paths: the uncommitted [`AddedBlocksGuard`]
+/// drop and [`RPythonAnnotator::raise_if_subject_blocked`].
+///
+/// Lenient `try_borrow` on the block / annotation slots: the guard path
+/// can run during panic-unwind where a slot may still be borrowed —
+/// degrade to a leak rather than an abort-during-unwind double-borrow.
+fn evict_block_and_clear_annotations(
+    annotated: &mut IndexMap<BlockKey, Option<GraphRef>>,
+    all_blocks: &mut IndexMap<BlockKey, BlockRef>,
+    blocked_blocks: &mut IndexMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>,
+    k: &BlockKey,
+) {
+    annotated.shift_remove(k);
+    blocked_blocks.shift_remove(k);
+    if let Some(block) = all_blocks.shift_remove(k) {
+        if let Ok(blk) = block.try_borrow() {
+            let vars = blk
+                .inputargs
+                .iter()
+                .chain(blk.operations.iter().map(|op| &op.result));
+            for v in vars {
+                if let Hlvalue::Variable(var) = v {
+                    if let Ok(mut slot) = var.annotation.try_borrow_mut() {
+                        *slot = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -1386,10 +1402,30 @@ impl RPythonAnnotator {
         let mut annotated = self.annotated.borrow_mut();
         let mut all_blocks = self.all_blocks.borrow_mut();
         let mut blocked_blocks = self.blocked_blocks.borrow_mut();
+        // `evict_block_and_clear_annotations` (not bare `shift_remove`):
+        // this eviction runs BEFORE the subject's `AddedBlocksGuard`
+        // drops, so the guard's `new_keys` sweep no longer sees these
+        // blocks — the Variable annotations must be cleared here or
+        // they leak into the next subject's `bindinputargs`.
         for bkey in &added_keys {
-            annotated.shift_remove(bkey);
-            all_blocks.shift_remove(bkey);
-            blocked_blocks.shift_remove(bkey);
+            evict_block_and_clear_annotations(
+                &mut annotated,
+                &mut all_blocks,
+                &mut blocked_blocks,
+                bkey,
+            );
+        }
+        // Prune the evicted blocks' pending rows too (the guard's Drop
+        // sweep can no longer see these keys in its `annotated` diff).
+        // The drain preceding this call normally leaves the queue
+        // empty, so this only matters when a blocked subject re-queued
+        // a block after its generation was processed.
+        {
+            let evicted: std::collections::HashSet<&BlockKey> = added_keys.iter().collect();
+            let mut pending = self.genpendingblocks.borrow_mut();
+            for g in pending.iter_mut() {
+                g.retain(|k, _| !evicted.contains(k));
+            }
         }
         Err(err)
     }
@@ -1436,7 +1472,14 @@ impl RPythonAnnotator {
                     .borrow()
                     .as_ref()
                     .map(|rc| (**rc).clone())
-                    .expect("addpendingblock: fixed graph's inputarg lacks annotation");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "addpendingblock: fixed graph's inputarg lacks annotation \
+                             (graph {}, inputarg {})",
+                            graph.borrow().name,
+                            v.name(),
+                        )
+                    });
                 // Upstream `cells` carries SomeObject — None never
                 // reaches the fixed-graph safety check.  Panic loud
                 // rather than silently ignoring late-stage unbound
@@ -2222,7 +2265,13 @@ impl RPythonAnnotator {
                 };
                 if is_same_as {
                     let arg = block.borrow().operations[i].args[0].clone();
-                    if let Some(s_arg) = self.annotation(&arg) {
+                    // `binding` (not `annotation`): an unbound operand
+                    // mid-block is upstream's `KeyError` raise
+                    // (`binding(op.args[0])`) — completing the op with
+                    // the result unbound would only move the same
+                    // failure onto the next reader of the result.
+                    let s_arg = self.binding(&arg);
+                    {
                         let mut blk = block.borrow_mut();
                         if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
                             self.setbinding(v, s_arg);

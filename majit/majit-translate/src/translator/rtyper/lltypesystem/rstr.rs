@@ -117,6 +117,121 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
     }))
 });
 
+/// RPython `llstr(s)` (`annlowlevel.py:469-475` via
+/// `rstr.py:1230-1235 mallocstr`): build the prebuilt `Ptr(STR)`
+/// container for a host string constant — `mallocstr(len(s))` plus a
+/// per-index `chars[i] = s[i]` fill.  `hash` keeps malloc's `Signed`
+/// default `0` (upstream computes it lazily through `ll_strhash`).
+/// The container is immortal: prebuilt string constants live for the
+/// whole translation, exactly like upstream's `CONST_STR_CACHE`
+/// entries.
+pub fn llstr(s: &[u8]) -> Result<_ptr, String> {
+    let LowLevelType::ForwardReference(fwd) = STR.clone() else {
+        return Err("STR must be a ForwardReference".to_string());
+    };
+    let str_struct = fwd
+        .resolved()
+        .ok_or_else(|| "STR forward reference unresolved".to_string())?;
+    let p = malloc(str_struct, Some(s.len()), MallocFlavor::Gc, true)?;
+    let obj = p
+        ._obj0
+        .as_ref()
+        .map_err(|_| "llstr: malloc returned a delayed pointer".to_string())?
+        .as_ref()
+        .ok_or_else(|| "llstr: malloc returned a null pointer".to_string())?;
+    let _ptr_obj::Struct(st) = obj else {
+        return Err("llstr: malloc(STR) must produce a struct container".to_string());
+    };
+    let fields = st._fields.lock().unwrap();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return Err("llstr: rpy_string container lacks a chars array".to_string());
+    };
+    for (i, b) in s.iter().enumerate() {
+        // Py2 `str` chars are bytes; `u8 as char` is the Latin-1
+        // embedding, which round-trips every byte value.
+        if !chars.setitem(i, LowLevelValue::Char(*b as char)) {
+            return Err(format!("llstr: chars[{i}] write out of bounds"));
+        }
+    }
+    drop(fields);
+    Ok(p)
+}
+
+/// `_hash_string(s)` (objectmodel.py:596-618): the modified-FNV hash
+/// behind `compute_hash()` — `x = ord(s[0]) << 7`, then
+/// `x = intmask((1000003*x) ^ ord(s[i]))` per char, `x ^= length`,
+/// empty string → `-1`.  `intmask` is machine-word wraparound, hence
+/// `wrapping_mul` on the `Signed` width.  Byte chars hash by their
+/// Latin-1 ord, matching the `Char` element embedding in [`llstr`].
+pub(crate) fn hash_string_bytes(s: &[u8]) -> i64 {
+    let Some(&first) = s.first() else {
+        return -1;
+    };
+    let mut x = (first as i64) << 7;
+    for &c in s {
+        x = 1000003i64.wrapping_mul(x) ^ c as i64;
+    }
+    x ^ s.len() as i64
+}
+
+/// `_ll_strhash(s)` value computation (rstr.py:405-414): malloc
+/// zero-fills the `hash` slot, so `0` is reserved as the
+/// not-computed-yet marker — a real hash of `0` is replaced with
+/// `29872897` (the same fixup the runtime helper graph
+/// `build_ll_strhash_internal_helper_graph` applies).
+pub(crate) fn ll_strhash_value(s: &[u8]) -> i64 {
+    let x = hash_string_bytes(s);
+    if x == 0 { 29872897 } else { x }
+}
+
+thread_local! {
+    /// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py:1226` /
+    /// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
+    /// one prebuilt container identity, so repeated `convert_const` calls
+    /// on the same literal return the same `_ptr` (prebuilt-constant
+    /// `is`-identity upstream relies on).  Thread-lifetime strong
+    /// cache; upstream's weak semantics only matter for memory, not
+    /// identity.  Upstream is module-global because one translation owns
+    /// the process; translation sessions here are single-threaded, so
+    /// thread_local confines the cache to one session at a time (the
+    /// same convention as `classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`) —
+    /// cached `_ptr`s carry a mutable `hash` slot written back by
+    /// `build_ll_strhash_internal_helper_graph`, which must not be shared
+    /// across concurrently-running sessions.  Sequential sessions on one
+    /// thread DO share entries, which is sound: the value is determined
+    /// by the key bytes alone ([`llstr`] container + [`ll_strhash_value`]
+    /// fill), and the only mutation is that idempotent hash fill.
+    static CONST_STR_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, _ptr>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`).
+pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
+    CONST_STR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(p) = cache.get(s) {
+            return Ok(p.clone());
+        }
+        let mut p = llstr(s)?;
+        // `p.hash = 0; self.ll.ll_strhash(p)` (rstr.py:199-200):
+        // precompute the hash before caching the container, so every
+        // prebuilt string constant ships with its hash slot filled.
+        p.setattr("hash", LowLevelValue::Signed(ll_strhash_value(s)))?;
+        cache.insert(s.to_vec(), p.clone());
+        Ok(p)
+    })
+}
+
+/// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:192-193`).
+pub fn null_str_ptr() -> _ptr {
+    let LowLevelType::Ptr(ptr_t) = STRPTR.clone() else {
+        panic!("STRPTR must be a Ptr lowleveltype");
+    };
+    _ptr::new(*ptr_t, Ok(None))
+}
+
 /// RPython `UNICODE = GcForwardReference()` resolved via
 /// `UNICODE.become(GcStruct('rpy_unicode', ('hash', Signed), ('chars',
 /// Array(UniChar, hints={'immutable': True})), hints={'remove_hash':
@@ -176,42 +291,12 @@ pub static UNICODEPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 ///     return rstr.string_repr.convert_const(name)
 /// ```
 ///
-/// Materialises an immortal `_ptr` to a `STR` GcStruct carrying the
-/// class name. This is the narrow `StringRepr.convert_const(str)` slice
-/// needed by `OBJECT_VTABLE.name`: allocate `STR` with a chars array of
-/// `name.len()`, fill the byte chars, and initialise `hash` to 0. The
-/// full `StringRepr` hash precomputation and adtmeth table stay in the
-/// future full rstr port.
+/// Delegates to the `convert_const` slice
+/// ([`const_str_cache_llstr`]), so class-name STRs share the prebuilt
+/// constant cache (same-name → same container identity) and the hash
+/// precompute.  The adtmeth table stays in the future full rstr port.
 pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
-    let str_body = match STR.clone() {
-        LowLevelType::ForwardReference(fwd) => fwd
-            .resolved()
-            .ok_or_else(|| "alloc_array_name: STR ForwardReference is not resolved".to_string())?,
-        other => other,
-    };
-    let byte_len = name.len();
-    let mut ptr = malloc(str_body, Some(byte_len), MallocFlavor::Gc, true)?;
-    ptr.setattr("hash", LowLevelValue::Signed(0))?;
-    let Some(obj) = ptr
-        ._obj0
-        .as_mut()
-        .map_err(|_| "alloc_array_name: delayed STR pointer cannot be initialised".to_string())?
-    else {
-        return Err("alloc_array_name: malloc returned null STR pointer".to_string());
-    };
-    let _ptr_obj::Struct(s) = obj else {
-        return Err("alloc_array_name: STR pointer does not target a Struct".to_string());
-    };
-    let chars_value = s
-        ._getattr("chars")
-        .ok_or_else(|| "alloc_array_name: STR struct has no chars field".to_string())?;
-    let LowLevelValue::Array(chars) = chars_value else {
-        return Err("alloc_array_name: STR struct chars field is not an Array".to_string());
-    };
-    for (i, byte) in name.bytes().enumerate() {
-        chars.setitem(i, LowLevelValue::Char(byte as char));
-    }
-    Ok(ptr)
+    const_str_cache_llstr(name.as_bytes())
 }
 
 /// `unicode_repr.convert_const(value)` mirror of [`alloc_array_name`]
@@ -8536,9 +8621,12 @@ mod tests {
     fn alloc_array_name_returns_live_str_with_chars() {
         let p = alloc_array_name("Foo").expect("alloc_array_name");
         assert!(p.nonzero());
-        let LowLevelValue::Signed(0) = p.getattr("hash").unwrap() else {
-            panic!("hash field must be Signed(0)");
+        // convert_const precomputes the hash (rstr.py:199-200).
+        let LowLevelValue::Signed(h) = p.getattr("hash").unwrap() else {
+            panic!("hash field must be Signed");
         };
+        assert_eq!(h, ll_strhash_value(b"Foo"));
+        assert_ne!(h, 0);
         let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
             panic!("STR pointer must be live");
         };
@@ -8553,6 +8641,79 @@ mod tests {
         assert_eq!(chars.getitem(0), Some(LowLevelValue::Char('F')));
         assert_eq!(chars.getitem(1), Some(LowLevelValue::Char('o')));
         assert_eq!(chars.getitem(2), Some(LowLevelValue::Char('o')));
+    }
+
+    /// `llstr` fills `chars[i]` with the Latin-1 embedding of each
+    /// byte (`mallocstr` + per-index store, annlowlevel.py:469-475);
+    /// every byte value must round-trip.
+    #[test]
+    fn llstr_preserves_byte_contents() {
+        let bytes: &[u8] = &[b'a', 0x00, 0xFF, b'z'];
+        let p = llstr(bytes).expect("llstr");
+        assert!(p.nonzero());
+        let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
+            panic!("llstr pointer must be live");
+        };
+        let _ptr_obj::Struct(s) = obj else {
+            panic!("llstr pointer must target a Struct");
+        };
+        let LowLevelValue::Array(chars) = s._getattr("chars").expect("chars field") else {
+            panic!("chars field must be an Array");
+        };
+        assert_eq!(chars.getlength(), bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            assert_eq!(
+                chars.getitem(i),
+                Some(LowLevelValue::Char(*b as char)),
+                "chars[{i}] must round-trip byte {b:#x}"
+            );
+        }
+    }
+
+    /// `_hash_string` (objectmodel.py:596-618) reproduces CPython
+    /// 2.7's non-randomized 64-bit string hash; spot-check known
+    /// values plus the empty-string `-1` and the `_ll_strhash`
+    /// zero-fixup passthrough (a `-1` hash is not zero, so the
+    /// 29872897 substitute must not fire).
+    #[test]
+    fn hash_string_bytes_matches_cpython2_values() {
+        assert_eq!(hash_string_bytes(b""), -1);
+        assert_eq!(hash_string_bytes(b"abc"), 1453079729188098211);
+        assert_eq!(hash_string_bytes(b"Foo"), -5036909580522842981);
+        assert_eq!(ll_strhash_value(b""), -1);
+    }
+
+    /// `CONST_STR_CACHE` (rstr.py:187 / `StringRepr.CACHE`): repeated
+    /// `convert_const` of the same literal must return the SAME
+    /// prebuilt container (`is`-identity upstream), while distinct
+    /// literals get distinct containers.
+    #[test]
+    fn const_str_cache_llstr_returns_same_container_identity() {
+        let p1 = const_str_cache_llstr(b"cache-identity-probe").expect("first lookup");
+        let p2 = const_str_cache_llstr(b"cache-identity-probe").expect("second lookup");
+        // `_struct` PartialEq keys off `_identity`
+        // (`fresh_low_level_container_identity`), so `==` here is the
+        // upstream `is` check on the container.
+        assert_eq!(p1, p2, "same literal must reuse the cached container");
+        let p3 = const_str_cache_llstr(b"cache-identity-probe-other").expect("other literal");
+        assert_ne!(p1, p3, "distinct literals must not share a container");
+        // An uncached `llstr` of the same bytes mints a fresh container.
+        let fresh = llstr(b"cache-identity-probe").expect("uncached llstr");
+        assert_ne!(p1, fresh, "llstr must not consult the cache");
+    }
+
+    /// `nullptr(self.lowleveltype.TO)` arm of
+    /// `BaseLLStringRepr.convert_const` (lltypesystem/rstr.py:192-193):
+    /// a typed null `Ptr(STR)`.
+    #[test]
+    fn null_str_ptr_is_typed_null_strptr() {
+        let p = null_str_ptr();
+        assert!(!p.nonzero(), "null_str_ptr must be null");
+        assert!(matches!(&p._obj0, Ok(None)));
+        let LowLevelType::Ptr(expected) = STRPTR.clone() else {
+            panic!("STRPTR must be Ptr");
+        };
+        assert_eq!(p._TYPE, *expected, "null must carry the STRPTR type");
     }
 
     /// `UNICODE` resolves to a GcStruct named `rpy_unicode` with

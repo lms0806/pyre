@@ -116,6 +116,8 @@ pub enum ReprClassId {
     MethodsPBCRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
+    /// `rclass.py:467 InstanceRepr(Repr)`.
+    InstanceRepr,
     /// `rtuple.py:129 TupleRepr`.
     TupleRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
@@ -179,6 +181,7 @@ impl ReprClassId {
             MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
             MethodsPBCRepr => &[MethodsPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
+            InstanceRepr => &[InstanceRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
@@ -260,6 +263,13 @@ fn dispatch_convert_from_to(
         // than lowleveltype equality: upstream checks `__dict__` equality.
         (InteriorPtrRepr, InteriorPtrRepr) => {
             same_interior_ptr_dict_convert_from_to(r_from, r_to, v)
+        }
+        // rclass.py:1035-1055 — pairtype(InstanceRepr,
+        // InstanceRepr).convert_from_to: cast_pointer along the
+        // subclass/superclass axis when one classdef is a base of the
+        // other.
+        (InstanceRepr, InstanceRepr) => {
+            super::rclass::pair_instance_instance_convert_from_to(r_from, r_to, v, llops)
         }
         // rbool.py:49-84 — bool participates in IntegerRepr's MRO but
         // carries explicit primitive casts for the common Bool edges.
@@ -1083,6 +1093,13 @@ fn dispatch_rtype_is_(
         // and the rtyper rejects it eagerly so callers cannot route a
         // tuple through ptr_eq via the generic `(Repr, Repr)` arm below.
         (TupleRepr, TupleRepr) => super::rtuple::pair_tuple_tuple_rtype_is_(r1, r2, hop),
+        // rclass.py:1057-1068 — `pairtype(InstanceRepr, InstanceRepr)
+        // .rtype_is_`: convert both sides to the common-base instance
+        // repr (cast_pointer upcast), then pointer identity via the
+        // generic `(Repr, Repr)` arm.
+        (InstanceRepr, InstanceRepr) => {
+            super::rclass::pair_instance_instance_rtype_is_(r1, r2, hop)
+        }
         // rmodel.py:300-318 — generic identity comparison for pointer
         // low-level values, with Void adopting the opposite repr.
         (Repr, Repr) => pair_repr_repr_rtype_is_(r1, r2, hop).map(Some),
