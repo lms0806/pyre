@@ -1066,6 +1066,27 @@ impl MIFrame {
         unsafe { &mut *self.sym }
     }
 
+    /// #143 frame-advance gate: mark this trace as having performed a concrete
+    /// heap mutation during tracing. Called exactly where the concrete
+    /// mutation is a certainty: the BUILTIN-form list dispatch arms
+    /// (append/pop/pop-at/reverse — the trait impl's `call_callable` executed
+    /// the builtin concretely before dispatch) and the LIST_APPEND opcode hook
+    /// (the eval loop's `execute_opcode_step` / inline-frame
+    /// `concrete_execute_step` performs the write).
+    ///
+    /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
+    /// loop performs the write exactly once, nbody/fannkuch), non-mutating
+    /// calls, and the W_MethodObject method-form arms (`m = xs.pop; m(0)`) —
+    /// the trait impl only executes `is_function` callables concretely, so no
+    /// during-trace mutation happens on that path and marking it would
+    /// wrongly advance past an iteration whose mutation only exists as
+    /// deferred IR. (Those traces currently always abort before CloseLoop;
+    /// unmarked-deferred stays correct if they ever close.)
+    #[inline]
+    pub(crate) fn dm143_mark_heap_mutated(&mut self) {
+        self.sym_mut().dm143_heap_mutated = true;
+    }
+
     pub(crate) fn frame(&self) -> OpRef {
         self.sym().frame
     }
@@ -2065,6 +2086,42 @@ impl MIFrame {
         args_len: usize,
     ) -> Result<(), PyError> {
         for _ in 0..(2 + args_len) {
+            let _ = self.pop_value(ctx)?;
+        }
+        self.sym_mut().pending_next_instr = None;
+        Ok(())
+    }
+
+    /// Variant of `push_call_replay_stack` for the resolved-builtin call
+    /// shape where the receiver already occupies `args[0]` (the
+    /// `null_or_self` slot was non-null and the CALL handler folded it into
+    /// the arg list). Replays the exact CALL operand stack
+    /// `[callable, args...]` with no synthesised null sentinel.
+    fn push_call_replay_stack_self_in_args(
+        &mut self,
+        ctx: &mut TraceCtx,
+        callable: OpRef,
+        callable_concrete: ConcreteValue,
+        args: &[OpRef],
+        call_pc: usize,
+    ) {
+        // The callable carries its real concrete (a Const unbound function
+        // for resolved-builtin calls). A Const operand is numbered as
+        // TAGCONST from its concrete value at guard-failure resume, so a
+        // `ConcreteValue::Null` here would reconstruct a null callable.
+        self.push_value(ctx, callable, callable_concrete);
+        for &arg in args {
+            self.push_value(ctx, arg, ConcreteValue::Null);
+        }
+        self.sym_mut().pending_next_instr = Some(call_pc);
+    }
+
+    fn pop_call_replay_stack_self_in_args(
+        &mut self,
+        ctx: &mut TraceCtx,
+        args_len: usize,
+    ) -> Result<(), PyError> {
+        for _ in 0..(1 + args_len) {
             let _ = self.pop_value(ctx)?;
         }
         self.sym_mut().pending_next_instr = None;
@@ -3883,6 +3940,55 @@ impl MIFrame {
         types
     }
 
+    /// Append `self.parent_frames` onto an innermost-first `lead` frame
+    /// list and reverse the whole vector to the outermost-first order
+    /// required by `recorder.rs:54` ("Frames in the snapshot, outermost
+    /// first") and `resume.rs:252`.  Extracted so both the ordinary
+    /// `build_framestack_snapshot` (lead = `[top]`) and the issue #143
+    /// synthetic-callee path (lead = `[helper, self-as-parent]`) share one
+    /// parent-collection + reverse seam.
+    fn build_framestack_frames(
+        &mut self,
+        ctx: &mut TraceCtx,
+        mut lead: Vec<majit_metainterp::recorder::SnapshotFrame>,
+    ) -> Vec<majit_metainterp::recorder::SnapshotFrame> {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        // opencoder.py:806: parent frames keep their original pc.
+        // Snapshot boxes = active boxes only (skip scalar inputarg header).
+        for parent in self.parent_frames.clone() {
+            let (parent_types_full, parent_jitcode_index, parent_active) =
+                self.materialize_parent_snapshot_state(ctx, parent);
+            let parent_types: &[Type] = if parent_types_full.len() > n {
+                &parent_types_full[n..]
+            } else {
+                &[]
+            };
+            // Parent frames never carry the after-residual-call marker, so
+            // their raw resume pc must leave bit 14 free or decode would
+            // mis-read it as marked (resumedata.rs:48-62).
+            assert!(
+                (parent.resume_pc as usize)
+                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
+                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                 function too large for bit-14 resume encoding",
+                parent.resume_pc
+            );
+            lead.push(majit_metainterp::recorder::SnapshotFrame {
+                jitcode_index: parent_jitcode_index,
+                pc: parent.resume_pc as u32,
+                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
+            });
+        }
+        // opencoder.py:217 `SnapshotIterator.__init__` calls
+        // `self.framestack.reverse()` so the numbering loop at
+        // `resume.py:249-253` iterates outermost-first.  pyre builds the
+        // frame list innermost-first (`[top, immediate_caller, ...,
+        // outermost]`); reverse so `Snapshot.frames[0]` is outermost,
+        // matching `recorder.rs:54` / `resume.rs:252`.
+        lead.reverse();
+        lead
+    }
+
     /// Build the full framestack `Snapshot` — top (callee) frame
     /// followed by every parent frame in `self.parent_frames` — plus
     /// virtualizable and virtualref boxes.  Mirrors opencoder.py:819-832
@@ -3905,7 +4011,7 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-        let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
+        let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc as u32,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -3913,44 +4019,8 @@ impl MIFrame {
                 top_snapshot_types,
                 ctx,
             ),
-        }];
-        // opencoder.py:806: parent frames keep their original pc.
-        // Snapshot boxes = active boxes only (skip scalar inputarg header).
-        for parent in self.parent_frames.clone() {
-            let (parent_types_full, parent_jitcode_index, parent_active) =
-                self.materialize_parent_snapshot_state(ctx, parent);
-            let parent_types: &[Type] = if parent_types_full.len() > n {
-                &parent_types_full[n..]
-            } else {
-                &[]
-            };
-            // Parent frames never carry the after-residual-call marker, so
-            // their raw resume pc must leave bit 14 free or decode would
-            // mis-read it as marked (resumedata.rs:48-62).
-            assert!(
-                (parent.resume_pc as usize)
-                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
-                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                 function too large for bit-14 resume encoding",
-                parent.resume_pc
-            );
-            frames.push(majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index: parent_jitcode_index,
-                pc: parent.resume_pc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
-            });
-        }
-        // opencoder.py:217 `SnapshotIterator.__init__` calls
-        // `self.framestack.reverse()` so the numbering loop at
-        // `resume.py:249-253` iterates outermost-first.  Pyre's
-        // encoder builds `frames` innermost-first
-        // (`[top, immediate_caller, ..., outermost]`); reverse here
-        // so `Snapshot.frames[0]` is outermost-first, matching the
-        // documented contract on `recorder.rs:54` "Frames in the
-        // snapshot, outermost first" and `resume.rs:252`
-        // "Input tuples for this factory follow the same caller-first
-        // order".
-        frames.reverse();
+        };
+        let frames = self.build_framestack_frames(ctx, vec![top_frame]);
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         // PHASE 1.4 candidate D probe: detect snapshot-time divergence
@@ -4001,6 +4071,246 @@ impl MIFrame {
             vable_boxes,
             vref_boxes,
         }
+    }
+
+    /// Issue #143 core: synthesize a framestack whose innermost frame is a
+    /// Rust runtime-helper jitcode (the folded `list.append`/`pop` body),
+    /// not a Python frame.  Because `PyreMetaInterp::interpret`
+    /// (metainterp.rs:88) can only decode a `W_CodeObject` jitcode, the
+    /// helper callee can never be *traced*; instead the resize `GuardTrue`
+    /// captures a snapshot in which the helper is the top/callee frame and
+    /// the current Python frame is demoted to its immediate caller.  On
+    /// guard failure the blackhole resumes into the helper at `helper_pc`
+    /// (an identity-`pc_map` byte offset registered by
+    /// `register_runtime_helper_jitcode`, M-core1), runs the generic
+    /// append+realloc, returns its result into the caller's pending slot,
+    /// and the caller resumes at the post-CALL `fallthrough_pc` — instead
+    /// of re-executing the method-shape `CALL` and rebuilding a NULL
+    /// callable.
+    ///
+    /// `boxes` is the hand-built `[list, value]` carried into the helper.
+    /// It has NO scalar-inputarg header (the helper has no virtualizable
+    /// Python frame), so its types are computed 1:1 and passed UNSLICED.
+    /// `result_stack_idx` / `result_type` are the caller's pending call
+    /// result slot (relative to `nlocals`) and kind; they MUST be `Some`
+    /// in production so the demoted caller's `get_list_of_active_boxes`
+    /// (`in_a_call`, trace_opcode.rs:1538) nulls the undefined result slot
+    /// rather than capturing a stale box.  Returns frames outermost-first
+    /// (`[...outer parents, self, helper]`).
+    #[allow(dead_code)]
+    fn build_synthetic_callee_frames(
+        &mut self,
+        ctx: &mut TraceCtx,
+        helper_jitcode_index: u32,
+        helper_pc: usize,
+        boxes: &[OpRef],
+        result_stack_idx: Option<usize>,
+        result_type: Option<Type>,
+    ) -> Vec<majit_metainterp::recorder::SnapshotFrame> {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+
+        // Synthetic Rust-helper callee (new innermost/top frame). Its boxes
+        // are hand-built with NO 8-entry scalar-inputarg header, so
+        // `helper_types` matches `boxes` 1:1 and is passed UNSLICED. Each
+        // box keeps its intrinsic kind via `value_type` (list -> Ref, an
+        // unboxed int value -> Int) so resume `_number_boxes` tags it
+        // correctly.
+        let helper_types: Vec<Type> = boxes.iter().map(|&op| self.value_type(op)).collect();
+        let helper_frame = majit_metainterp::recorder::SnapshotFrame {
+            jitcode_index: helper_jitcode_index,
+            pc: helper_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(boxes, &helper_types, ctx),
+        };
+
+        // Demote `self` (the Python frame doing the append) to the helper's
+        // immediate caller, resuming at the post-CALL fallthrough. Routing
+        // self through the SAME parent path as real parents is borrow-safe:
+        // `materialize_parent_snapshot_state` reads nothing from `self`
+        // (trace_opcode.rs:3925) — it rebuilds a fresh MIFrame from the raw
+        // `sym` pointer — so at most one `&mut PyreSym` is ever live, even
+        // when `parent.sym == self.sym`. `self.sym` / `concrete_frame_addr`
+        // / `fallthrough_pc` are Copy and read into the struct literal
+        // before the `&mut self` call. The pending result slot is carried
+        // so the caller's undefined call result is nulled at snapshot time.
+        let self_as_parent = ResumeFrameState {
+            sym: self.sym,
+            concrete_frame_addr: self.concrete_frame_addr,
+            resume_pc: self.fallthrough_pc,
+            pending_result_stack_idx: result_stack_idx,
+            pending_result_type: result_type,
+        };
+        let (self_types_full, self_jitcode_index, self_active) =
+            self.materialize_parent_snapshot_state(ctx, self_as_parent);
+        let self_types: &[Type] = if self_types_full.len() > n {
+            &self_types_full[n..]
+        } else {
+            &[]
+        };
+        let self_frame = majit_metainterp::recorder::SnapshotFrame {
+            jitcode_index: self_jitcode_index,
+            pc: self.fallthrough_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(&self_active, self_types, ctx),
+        };
+
+        // Innermost-first lead = [helper(top), self(first parent)]; append
+        // self.parent_frames and reverse -> outermost-first
+        // [...outer parents, self, helper] (synthetic callee = frames[len-1]).
+        self.build_framestack_frames(ctx, vec![helper_frame, self_frame])
+    }
+
+    /// Full M-core2 `Snapshot` for the issue #143 resize guard: the
+    /// synthetic-callee framestack from `build_synthetic_callee_frames`
+    /// plus the one-shot virtualizable + virtualref boxes, both sourced
+    /// from the REAL Python frame's `sym` (the helper has none) exactly as
+    /// `build_framestack_snapshot` does.
+    ///
+    /// Like `build_framestack_snapshot`, this does NOT swap `self.orgpc`
+    /// or save/restore the vable scalars; the M-core3 caller must do that
+    /// around this call (mirroring `capture_resumedata`,
+    /// trace_opcode.rs:3742-3771) since `list_of_boxes_virtualizable`
+    /// derives the vable `last_instr`/`valuestackdepth` from `self.orgpc`.
+    #[allow(dead_code)]
+    fn build_framestack_snapshot_with_synthetic_callee(
+        &mut self,
+        ctx: &mut TraceCtx,
+        helper_jitcode_index: u32,
+        helper_pc: usize,
+        boxes: &[OpRef],
+        result_stack_idx: Option<usize>,
+        result_type: Option<Type>,
+    ) -> majit_metainterp::recorder::Snapshot {
+        let frames = self.build_synthetic_callee_frames(
+            ctx,
+            helper_jitcode_index,
+            helper_pc,
+            boxes,
+            result_stack_idx,
+            result_type,
+        );
+        let vable_boxes = self.list_of_boxes_virtualizable(ctx);
+        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
+        majit_metainterp::recorder::Snapshot {
+            frames,
+            vable_boxes,
+            vref_boxes,
+        }
+    }
+
+    /// Issue #143 M-core3: emit the `list.append`/`list.pop` resize
+    /// `GuardTrue` whose resume captures a synthetic-callee framestack —
+    /// the runtime-helper jitcode (folded `jit_list_append`) as the
+    /// innermost/top frame, the current Python frame demoted to its
+    /// immediate caller resuming at the post-CALL `fallthrough_pc`.
+    ///
+    /// On guard failure the blackhole runs the helper (a residual
+    /// `jit_list_append(list, value)` that performs the generic
+    /// append+realloc and returns `w_none()`), threads the result into the
+    /// caller's pending slot via `setup_return_value_r`, and the Python
+    /// frame continues *after* the method-shape `CALL` — never
+    /// re-executing it and rebuilding a NULL callable (the issue #143 bug).
+    ///
+    /// Mirrors `generate_guard` / `generate_guard_core` (const-skip →
+    /// flush_guard_not_invalidated → record_guard_typed → capture) but
+    /// swaps the snapshot builder for
+    /// `build_framestack_snapshot_with_synthetic_callee` and the resume pc
+    /// for `fallthrough_pc`.  The orgpc swap + vable scalar save/restore
+    /// around the build mirrors `capture_resumedata` (trace_opcode.rs:
+    /// 3742-3771): `list_of_boxes_virtualizable` re-derives
+    /// `last_instr`/`valuestackdepth` from `self.orgpc`
+    /// (trace_opcode.rs:4256-4264), so it must read `fallthrough_pc` to
+    /// encode the demoted caller's post-CALL state.
+    ///
+    /// `list` / `value` are the helper boxes (`[list, value]`).  The gate
+    /// at the call site (`guard_append_without_resize`) routes here only
+    /// when `value` is a `Ref` (a real `PyObjectRef`), matching the
+    /// helper's `live live_r=[0,1]` declaration — an unboxed `Int` value
+    /// would mis-number on resume.
+    pub(crate) fn generate_guard_with_synthetic_callee(
+        &mut self,
+        ctx: &mut TraceCtx,
+        opcode: OpCode,
+        args: &[OpRef],
+        list: OpRef,
+        value: OpRef,
+    ) {
+        // pyjitpl.py:2558-2560: a const guard operand needs no guard.
+        if let Some(&first) = args.first() {
+            if first.is_constant() {
+                return;
+            }
+        }
+        // pyjitpl.py:1087: flush a pending guard_not_invalidated first.
+        if opcode != OpCode::GuardNotInvalidated {
+            self.flush_guard_not_invalidated(ctx);
+        }
+
+        let helper_index = crate::state::ensure_list_append_resize_helper_index() as u32;
+        // helper resumes at byte 0: `live` → `residual_call jit_list_append`
+        // → `ref_return w_none()` (identity pc_map, M-core1).
+        let helper_pc = 0usize;
+        let boxes = [list, value];
+        let result_type = Type::Ref;
+
+        // The CALL handler already popped the callable + args, so the
+        // append result (None) lands at the current top of self's value
+        // stack: `result_stack_idx` is that slot relative to nlocals. The
+        // demoted-caller snapshot nulls it (get_list_of_active_boxes
+        // in_a_call, trace_opcode.rs:1538) so no stale box is captured
+        // where `setup_return_value_r` will write the helper's return.
+        let result_stack_idx = {
+            let s = self.sym();
+            s.valuestackdepth.saturating_sub(s.nlocals)
+        };
+
+        // fail_arg_types in snapshot box order [helper(1:1, no header),
+        // self(sliced), ...parents(sliced)] — mirrors generate_guard's
+        // extend_types_with_parents.  These are an overwritten fallback:
+        // store_final_boxes_in_guard (optimizeopt/mod.rs:3200) repopulates
+        // op.fail_args from the snapshot below.
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let helper_types: Vec<Type> = boxes.iter().map(|&op| self.value_type(op)).collect();
+        let mut types = helper_types;
+        let self_as_parent = crate::state::ResumeFrameState {
+            sym: self.sym,
+            concrete_frame_addr: self.concrete_frame_addr,
+            resume_pc: self.fallthrough_pc,
+            pending_result_stack_idx: Some(result_stack_idx),
+            pending_result_type: Some(result_type),
+        };
+        let (self_types_full, _) = self.materialize_parent_frame_state(ctx, self_as_parent);
+        if self_types_full.len() > n {
+            types.extend_from_slice(&self_types_full[n..]);
+        }
+        let types = self.extend_types_with_parents(ctx, types);
+        ctx.record_guard_typed(opcode, args, types);
+
+        // capture_resumedata parity (trace_opcode.rs:3742-3771): swap orgpc
+        // to the post-CALL fallthrough so the demoted caller's vable
+        // scalars encode the resume state, then restore.
+        let saved_orgpc = self.orgpc;
+        let saved_ni = self.sym().vable_last_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
+        self.orgpc = self.fallthrough_pc;
+
+        let snapshot = self.build_framestack_snapshot_with_synthetic_callee(
+            ctx,
+            helper_index,
+            helper_pc,
+            &boxes,
+            Some(result_stack_idx),
+            Some(result_type),
+        );
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+        ctx.set_last_guard_resume_position(snapshot_id);
+
+        self.orgpc = saved_orgpc;
+        let s = self.sym_mut();
+        s.vable_last_instr = saved_ni;
+        s.vable_valuestackdepth = saved_vsd;
+
+        // pyjitpl.py:2581 profiler.count_ops parity.
+        ctx.profiler()
+            .count_ops(opcode, majit_metainterp::counters::GUARDS);
     }
 
     fn materialize_parent_frame_state(
@@ -5383,6 +5693,25 @@ impl MIFrame {
         concrete_key: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
+        // STORE_SUBSCR is deferred: the emitted IR performs the heap write in
+        // the compiled loop (exactly once), and no concrete write happens
+        // during trace. So it must NOT mark the loop as heap-mutated — a
+        // pure-STORE_SUBSCR loop (nbody / fannkuch) is not advanced, keeping
+        // its single deferred write. Only the concrete-during-trace method
+        // mutations (append / pop / reverse) drive `dm143_advance_live_locals`.
+        self.store_subscr_value_emit(obj, key, value, concrete_obj, concrete_key, concrete_value)?;
+        Ok(())
+    }
+
+    fn store_subscr_value_emit(
+        &mut self,
+        obj: OpRef,
+        key: OpRef,
+        value: OpRef,
+        concrete_obj: PyObjectRef,
+        concrete_key: PyObjectRef,
+        concrete_value: PyObjectRef,
+    ) -> Result<(), PyError> {
         if let Some((raw_start, raw_stop, start, stop, step_is_none)) =
             const_step_one_slice_bounds(concrete_obj, concrete_key, concrete_value)
         {
@@ -5589,6 +5918,117 @@ impl MIFrame {
         Ok(result)
     }
 
+    /// Direct trace path for `list.pop(index)` (front / indexed pop).
+    ///
+    /// `ll_pop_zero` (`oopspec = 'list.pop(l, 0)'`) / `ll_pop_nonneg`
+    /// (`'list.pop(l, index)'`). The O(n) element shift is performed by the
+    /// `jit_list_pop_at` residual (an escaped, non-virtual list lowers the
+    /// oopspec to a residual call upstream too), but the residual is opaque:
+    /// `default_effect_info` only invalidates the list's cached length, so
+    /// the compiled loop would track a stale length and a later `append`
+    /// would write past the live elements (issue #143, the dominant len
+    /// error). Mirror the already-correct end-pop
+    /// (`generated_list_pop_by_strategy`): overlay an inline
+    /// `SetfieldGc(new_len)` so the post-pop length is a known,
+    /// resume-reconstructible value. The inline write is idempotent with the
+    /// residual's own decrement (both leave `length == len - 1`).
+    pub(crate) fn list_pop_at_value(
+        &mut self,
+        callable: OpRef,
+        list: OpRef,
+        index: OpRef,
+        concrete_list: PyObjectRef,
+        concrete_index: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        // Pick the strategy-specific length field so the inline length update
+        // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
+        // receiver has no known length field, so fall back to the generic
+        // residual on the method object.
+        let strategy = unsafe {
+            if concrete_list.is_null() || !is_list(concrete_list) {
+                None
+            } else if w_list_uses_object_storage(concrete_list) {
+                Some((0i64, crate::descr::list_length_descr()))
+            } else if w_list_uses_int_storage(concrete_list) {
+                Some((1i64, crate::descr::list_int_items_len_descr()))
+            } else if w_list_uses_float_storage(concrete_list) {
+                Some((2i64, crate::descr::list_float_items_len_descr()))
+            } else {
+                None
+            }
+        };
+        let Some((strategy_id, len_descr)) = strategy else {
+            // The method-form generic call shape is `callable(index)`.
+            return self.trace_call_callable(callable, &[index]);
+        };
+        // The `jit_list_pop_at` residual panics on an out-of-range index
+        // instead of raising IndexError, so the fast path may only be taken
+        // with a trace-time in-range proof plus matching runtime guards
+        // (emitted by `trace_dynamic_list_index` below). A non-W_IntObject
+        // index or an out-of-range concrete index (IndexError at runtime)
+        // falls back to the generic call.
+        let concrete_key = unsafe {
+            if pyre_object::pyobject::py_type_check(concrete_index, &INT_TYPE) {
+                Some(pyre_object::w_int_get_value(concrete_index))
+            } else {
+                None
+            }
+        };
+        let Some(concrete_key) = concrete_key else {
+            return self.trace_call_callable(callable, &[index]);
+        };
+        let concrete_len = unsafe { w_list_len(concrete_list) } as i64;
+        let normalized_key = if concrete_key < 0 {
+            concrete_key + concrete_len
+        } else {
+            concrete_key
+        };
+        if normalized_key < 0 || normalized_key >= concrete_len {
+            return self.trace_call_callable(callable, &[index]);
+        }
+        let len_descr_idx = len_descr.index();
+        let result = self.with_ctx(|this, ctx| {
+            this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
+            this.guard_list_strategy(ctx, list, strategy_id);
+            // Pre-pop length (cached); `new_len = len - 1` is the
+            // reconstructible post-pop length.
+            let len = opimpl_getfield_gc_i(ctx, list, len_descr.clone());
+            // `descr_pop` shape: unbox the index, normalize a negative one
+            // against `len`, and guard `0 <= idx < len`, so the residual's
+            // out-of-range panic is unreachable from compiled code.
+            let idx_int = this.trace_dynamic_list_index(ctx, index, len, concrete_key);
+            // The residual does the real heap mutation (read + O(n) shift +
+            // length decrement + tail clear) in compiled code.
+            let res = crate::helpers::emit_trace_call_ref_typed(
+                ctx,
+                pyre_object::listobject::jit_list_pop_at as *const (),
+                &[list, idx_int],
+                &[Type::Ref, Type::Int],
+            );
+            // Load-bearing #143 fix: publish the post-pop length as a known
+            // value the optimizer/heapcache can carry forward and resume can
+            // replay (SetfieldGc lands in pending_fields).
+            let one = ctx.const_int(1);
+            let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
+            let new_len_value = ctx
+                .heapcache_getfield_cached(list, len_descr_idx)
+                .and_then(|b| match ctx.box_value(b)? {
+                    Value::Int(n) => Some(n),
+                    _ => None,
+                })
+                .map(|n| Value::Int(n.wrapping_sub(1)))
+                .unwrap_or(Value::Void);
+            if !matches!(new_len_value, Value::Void) {
+                ctx.set_opref_concrete(new_len, new_len_value);
+            }
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr.clone());
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
+            res
+        });
+        self.trace_record_no_exception_guard();
+        Ok(result)
+    }
+
     pub(crate) fn concrete_iter_continues(
         &self,
         concrete_iter: PyObjectRef,
@@ -5783,11 +6223,13 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
-                    if let Some(existing) =
-                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
-                    {
-                        return existing;
-                    }
+                    // Pin the callable identity before any specialization:
+                    // the receiver opref alone does not tie the trace to the
+                    // builtin method — the bound method (or the local it was
+                    // stored in) can be rebound between loop entries while
+                    // the receiver still passes its class/strategy guards.
+                    // The method object is freshly allocated per iteration
+                    // but its `w_function` slot is stable, so guard on that.
                     this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
                         let func_ref = ctx.record_op_with_descr(
@@ -5796,6 +6238,13 @@ impl MIFrame {
                             crate::descr::method_w_function_descr(),
                         );
                         this.implement_guard_value(ctx, func_ref, inner_func as i64);
+                    });
+                    if let Some(existing) =
+                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
+                    {
+                        return existing;
+                    }
+                    this.with_ctx(|this, ctx| {
                         ctx.record_op_with_descr(
                             majit_ir::OpCode::GetfieldGcR,
                             &[callable],
@@ -5804,24 +6253,44 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    // Do not replace this with `list_append_value` until
-                    // guard-failure blackhole resume is complete.  A direct
-                    // trace-visible append/pop port looks closer to PyPy, but
-                    // currently corrupts semantics: `python3 pyre/check.py
-                    // --synthetic-only --synthetic-pattern list_append_pop.py`
-                    // reports wrong output on both dynasm and cranelift when
-                    // these aborts are removed.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
-                    ));
+                    // Issue #143: the folded fast path's resize guard routes
+                    // through a synthetic-callee snapshot
+                    // (`generate_guard_with_synthetic_callee`) so a
+                    // realloc-driven failure resumes into the `jit_list_append`
+                    // helper jitcode and the Python frame continues *after* the
+                    // CALL. No CALL re-execution, so the prior
+                    // `push_call_replay_stack` workaround (which reconstructed a
+                    // NULL method callable on resume) is removed.
+                    let self_ref = recover_self(self);
+                    self.list_append_value(self_ref, args[0], inner_self, concrete_args[0])?;
+                    let none_ref =
+                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
+                    return Ok(none_ref);
+                }
+                if args.len() == 1 && canonical_list_method("pop") == Some(inner_func) {
+                    // Indexed pop `xs.pop(i)`: recorded inline by
+                    // `list_pop_at_value` (residual shift + reconstructible
+                    // length overlay). Called directly like the append arm — no
+                    // replay scaffolding.
+                    let self_ref = recover_self(self);
+                    return self.list_pop_at_value(
+                        callable,
+                        self_ref,
+                        args[0],
+                        inner_self,
+                        concrete_args[0],
+                    );
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
-                    // Keep in sync with the append guard above. Removing this
-                    // abort caused `synth/list_append_pop` correctness
-                    // failures during the PyPy-parity audit.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
-                    ));
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack(ctx, callable, args, call_pc)
+                    });
+                    let self_ref = recover_self(self);
+                    let concrete_len = unsafe { w_list_len(inner_self) };
+                    let res = self.list_pop_value(callable, self_ref, inner_self, concrete_len);
+                    self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
+                    return res;
                 }
                 if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
                     let self_ref = recover_self(self);
@@ -5864,38 +6333,105 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    // Do not replace this with `list_append_value` until
-                    // guard-failure blackhole resume is complete.  A direct
-                    // trace-visible append/pop port looks closer to PyPy, but
-                    // currently corrupts semantics: `python3 pyre/check.py
-                    // --synthetic-only --synthetic-pattern list_append_pop.py`
-                    // reports wrong output on both dynasm and cranelift when
-                    // these aborts are removed.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
-                    ));
+                    // Issue #143: the folded fast path's resize guard routes
+                    // through a synthetic-callee snapshot
+                    // (`generate_guard_with_synthetic_callee`), so a
+                    // realloc-driven failure resumes into the `jit_list_append`
+                    // helper jitcode and the Python frame continues *after* the
+                    // CALL. No CALL re-execution, so the prior
+                    // `push_call_replay_stack` workaround — which reconstructed a
+                    // NULL callable on resume and inflated `valuestackdepth`,
+                    // skewing the synthetic guard's `result_stack_idx` — is
+                    // removed.
+                    //
+                    // Builtin-form arms mark the heap mutation here: the trait
+                    // impl's `call_callable` already executed the builtin
+                    // concretely before dispatch, so the mutation is a
+                    // certainty. The W_Method method-form arms above do NOT
+                    // mark — no concrete execution happens on that path.
+                    self.dm143_mark_heap_mutated();
+                    // Pin the callable identity (as the reverse arm below):
+                    // the receiver's class/strategy guards alone do not keep
+                    // the trace from running the builtin append after the
+                    // callable has been rebound.
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
+                    let none_ref =
+                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
+                    return Ok(none_ref);
+                }
+                if args.len() == 2
+                    && canonical_list_method("pop") == Some(concrete_callable)
+                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
+                    && is_list(concrete_args[0])
+                {
+                    // Builtin-form indexed pop `list.pop(xs, i)`: recorded
+                    // inline by `list_pop_at_value` (residual shift +
+                    // reconstructible length overlay), called directly like the
+                    // append arm — no replay scaffolding.
+                    self.dm143_mark_heap_mutated();
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    return self.list_pop_at_value(
+                        callable,
+                        args[0],
+                        args[1],
+                        concrete_args[0],
+                        concrete_args[1],
+                    );
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    // Keep in sync with the append guard above. Removing this
-                    // abort caused `synth/list_append_pop` correctness
-                    // failures during the PyPy-parity audit.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
-                    ));
+                    self.dm143_mark_heap_mutated();
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack_self_in_args(
+                            ctx,
+                            callable,
+                            ConcreteValue::Ref(concrete_callable),
+                            args,
+                            call_pc,
+                        )
+                    });
+                    let concrete_len = w_list_len(concrete_args[0]);
+                    let res =
+                        self.list_pop_value(callable, args[0], concrete_args[0], concrete_len);
+                    self.with_ctx(|this, ctx| {
+                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
+                    })?;
+                    return res;
                 }
                 if args.len() == 1
                     && canonical_list_method("reverse") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
+                    self.dm143_mark_heap_mutated();
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64);
+                        this.push_call_replay_stack_self_in_args(
+                            ctx,
+                            callable,
+                            ConcreteValue::Ref(concrete_callable),
+                            args,
+                            call_pc,
+                        );
                     });
-                    return self.list_reverse_value(callable, args[0], concrete_args[0]);
+                    let res = self.list_reverse_value(callable, args[0], concrete_args[0]);
+                    self.with_ctx(|this, ctx| {
+                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
+                    })?;
+                    return res;
                 }
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
@@ -7346,6 +7882,43 @@ impl MIFrame {
         }
     }
 
+    /// True for the method-form `LOAD_ATTR` of a foldable builtin list
+    /// method (`append` / `pop` / `reverse`) on a concrete list receiver
+    /// at TOS.  The dispatch gate routes exactly this shape OFF the
+    /// walker leg so `MIFrame::load_method` can resolve it to a
+    /// class-guarded Const unbound function instead of the walker arm's
+    /// residual getattr (which materialises a fresh bound method every
+    /// iteration and resolves to a null callable on blackhole CALL
+    /// re-execution).
+    fn is_foldable_list_method_load_attr(
+        &self,
+        instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
+    ) -> bool {
+        let Instruction::LoadAttr { namei } = instruction else {
+            return false;
+        };
+        let attr = namei.get(op_arg);
+        if !attr.is_method() {
+            return false;
+        }
+        let Some(name) = code.names.get(attr.name_idx() as usize) else {
+            return false;
+        };
+        if !matches!(name.as_ref(), "append" | "pop" | "reverse") {
+            return false;
+        }
+        let s = self.sym();
+        let Some(stack_idx) = s.valuestackdepth.checked_sub(s.nlocals + 1) else {
+            return false;
+        };
+        matches!(
+            s.concrete_stack.get(stack_idx),
+            Some(ConcreteValue::Ref(obj)) if !obj.is_null() && unsafe { is_list(*obj) }
+        )
+    }
+
     pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
             if majit_metainterp::majit_log_enabled() {
@@ -7460,7 +8033,12 @@ impl MIFrame {
                 // multi_frame_with_vable_vref`), fall back to trait
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
-                if production_walker_handles(&instruction) && !in_inline_frame {
+                let foldable_list_load_attr =
+                    self.is_foldable_list_method_load_attr(&instruction, op_arg, code);
+                if production_walker_handles(&instruction)
+                    && !in_inline_frame
+                    && !foldable_list_load_attr
+                {
                     self.dispatch_via_walker_for_opcode(&instruction, op_arg)
                 } else {
                     let shadow_outcome =
@@ -8292,6 +8870,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ForIter { .. }
             | Instruction::CallKw { .. }
             | Instruction::CallFunctionEx
+            // Instruction::LoadAttr is walker-routed EXCEPT the foldable
+            // builtin list-method form (append/pop/reverse on a list
+            // receiver), which the dispatch gate carves out to the trait
+            // leg so MIFrame::load_method can resolve it to a
+            // class-guarded Const unbound function (the list
+            // specialization); see is_foldable_list_method_load_attr.
             | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
             // Instruction::StoreFastStoreFast excluded: routed off the
@@ -8976,6 +9560,40 @@ impl OpcodeStepExecutor for MIFrame {
         // below for every other receiver / descriptor shape.
         if self.try_load_method_fast_path(obj, concrete_obj, name)? {
             return Ok(());
+        }
+
+        // Resolve the foldable builtin list methods (append/pop/reverse) to
+        // a Const unbound function guarded by class, with self in the
+        // receiver slot, instead of a residual `jit_getattr` that
+        // materialises a fresh bound `W_MethodObject` every iteration. A
+        // Const callable is trivially reconstructed at guard-failure resume
+        // (a residual bound method is not — it resolves to a null callable
+        // on the blackhole CALL re-execution) and routes the following CALL
+        // through the resolved-builtin folding shape (`call_callable_value`).
+        if !concrete_obj.is_null()
+            && matches!(name, "append" | "pop" | "reverse")
+            && unsafe { is_list(concrete_obj) }
+        {
+            let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
+            if let Some(unbound) = unsafe { pyre_interpreter::lookup_in_type(list_type, name) } {
+                if unsafe { is_function(unbound) }
+                    && unsafe {
+                        is_builtin_code(
+                            pyre_interpreter::getcode(unbound) as pyre_object::PyObjectRef
+                        )
+                    }
+                {
+                    let method_op = self.with_ctx(|this, ctx| {
+                        this.guard_class(ctx, obj.opref, &LIST_TYPE as *const PyType);
+                        ctx.const_ref(unbound as i64)
+                    });
+                    <Self as SharedOpcodeHandler>::push_value(
+                        self,
+                        FrontendOp::new(method_op, ConcreteValue::Ref(unbound)),
+                    )?;
+                    return <Self as SharedOpcodeHandler>::push_value(self, obj);
+                }
+            }
         }
 
         let attr = <Self as SharedOpcodeHandler>::load_attr(self, obj, name)?;
@@ -9984,6 +10602,122 @@ mod tests {
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
         assert_eq!(active, vec![stack0]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+    }
+
+    /// Issue #143 M-core2: the resize guard synthesizes a 2-frame snapshot
+    /// whose innermost frame is the Rust runtime-helper callee (top) and
+    /// whose outer frame is the demoted Python caller resuming at its
+    /// post-CALL fallthrough.  Frames come back outermost-first
+    /// (`recorder.rs:56`), so `frames[0]` is the caller and `frames[1]` the
+    /// synthetic helper.  Exercises `build_synthetic_callee_frames` (the
+    /// frame-chain novelty) — NOT the full `_with_synthetic_callee` wrapper,
+    /// whose vable/vref tail would deref a skeleton helper's null code.
+    #[test]
+    fn build_synthetic_callee_frames_synthesizes_self_caller_and_helper_top() {
+        use majit_ir::VecAssoc;
+        use majit_metainterp::recorder::SnapshotTagged;
+        use std::sync::Arc;
+
+        // Empty liveness banks at offset 0: the demoted caller resumes at
+        // fallthrough_pc=3 with no live boxes.
+        let all_liveness = vec![0u8, 0, 0];
+        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        // Outer (caller) jitcode: BC_LIVE at byte 0 and byte 3.  Identity
+        // pc_map so resume_jitcode_pc_for(fallthrough_pc=3) == Some(3)
+        // (the M-core1 sibling-test pattern); the operand bytes [4],[5]=0,0
+        // select liveness offset 0 -> empty banks.
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new("synth_callee_outer");
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![
+                    majit_metainterp::jitcode::insns::BC_LIVE,
+                    0,
+                    0,
+                    majit_metainterp::jitcode::insns::BC_LIVE,
+                    0,
+                    0,
+                ],
+                c_num_regs_r: 1,
+                startpoints: Some([0_usize, 3_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.pc_map = (0..6).collect();
+        const OUTER_INDEX: i32 = 4;
+        let inner_jc = crate::state::JitCode {
+            code: std::ptr::null(),
+            index: OUTER_INDEX,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 0;
+        sym.valuestackdepth = 0;
+        // registers_r left empty: no live boxes for the caller frame.
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 3,
+            parent_frames: Vec::new(), // empty -> exactly 2 frames out
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 3,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        // Synthetic helper boxes: list = Ref op, value = unboxed Int op.
+        let list = OpRef::ref_op(20);
+        let value = OpRef::int_op(21);
+        const HELPER_INDEX: u32 = 7;
+        const GUARD_PC: usize = 99; // guard byte offset (identity pc_map)
+
+        let frames = frame.build_synthetic_callee_frames(
+            &mut ctx,
+            HELPER_INDEX,
+            GUARD_PC,
+            &[list, value],
+            None,
+            None,
+        );
+
+        // Outermost-first: [caller (demoted self), helper (innermost/top)].
+        assert_eq!(frames.len(), 2);
+
+        // frames[0] = self demoted to caller, resuming at fallthrough_pc.
+        assert_eq!(frames[0].jitcode_index, OUTER_INDEX as u32);
+        assert_eq!(frames[0].pc, 3); // self.fallthrough_pc
+        assert!(frames[0].boxes.is_empty()); // empty liveness, header sliced
+
+        // frames[1] = synthetic Rust-helper callee (new innermost/top frame).
+        assert_eq!(frames[1].jitcode_index, HELPER_INDEX);
+        assert_eq!(frames[1].pc, GUARD_PC as u32); // guard byte offset, raw
+        assert_eq!(
+            frames[1].boxes,
+            vec![
+                SnapshotTagged::Box(list, majit_ir::Type::Ref), // list -> Ref
+                SnapshotTagged::Box(value, majit_ir::Type::Int), // value -> Int (no header)
+            ]
+        );
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);

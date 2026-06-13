@@ -138,6 +138,15 @@ struct MetaInterpStaticData {
     /// `state::bytecode_for_address`) and from future callers that
     /// hold a `&mut MetaInterpStaticData` directly.
     canonical: majit_metainterp::MetaInterpStaticData,
+    /// Issue #143: memoized index of the folded `list.append` resize
+    /// helper jitcode (`build_list_append_resize_helper_payload`) inside
+    /// `jitcodes`. Registered lazily on the first guard that needs it and
+    /// reused thereafter. Stored ON the SD (not a process-global) so it is
+    /// reset-safe: it lives and dies with this `jitcodes` table. The index
+    /// stays valid because `set_jitcodes_from_make_result` only updates
+    /// W_CodeObject-keyed entries (the helper carries a null `w_code`) and
+    /// appends new ones, never shifting an existing index.
+    list_append_resize_helper_index: Option<i32>,
 }
 
 #[allow(dead_code)]
@@ -156,7 +165,33 @@ impl MetaInterpStaticData {
             op_float_return: u8::MAX,
             op_void_return: u8::MAX,
             canonical: majit_metainterp::MetaInterpStaticData::new(),
+            list_append_resize_helper_index: None,
         }
+    }
+
+    /// Issue #143: return the `jitcodes` index of the folded `list.append`
+    /// resize helper, registering it on first use.
+    ///
+    /// The helper has no backing `W_CodeObject`; it is built by
+    /// [`build_list_append_resize_helper_payload`] and registered through
+    /// [`Self::register_runtime_helper_jitcode`] with an identity
+    /// `pc_map`. The resulting index is cached on the SD and reused, so the
+    /// helper is registered exactly once per `jitcodes` table.
+    /// Register a pre-built `list.append` resize helper payload and cache
+    /// its index. The payload is built by the caller OUTSIDE the
+    /// `METAINTERP_SD` borrow because `build_list_append_resize_helper_payload`
+    /// interns the helper's liveness via `intern_liveness`, which itself
+    /// borrows `METAINTERP_SD` (a nested borrow would panic).
+    fn register_list_append_resize_helper(
+        &mut self,
+        payload: std::sync::Arc<crate::PyJitCode>,
+    ) -> i32 {
+        if let Some(index) = self.list_append_resize_helper_index {
+            return index;
+        }
+        let index = self.register_runtime_helper_jitcode(payload);
+        self.list_append_resize_helper_index = Some(index);
+        index
     }
 
     /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
@@ -421,6 +456,69 @@ impl MetaInterpStaticData {
         ptr
     }
 
+    /// Register a Rust runtime-helper `PyJitCode` (no backing
+    /// `W_CodeObject`) into the runtime `jitcodes` table and return its
+    /// index.
+    ///
+    /// This is the resume-side counterpart of [`Self::jitcode_for`] /
+    /// [`Self::portal_bridge_jitcode_for`] for jitcodes that are NOT
+    /// lifted from a Python `CodeObject` — e.g. a folded `list.append`
+    /// callee body that owns the resize guard. `build_framestack_snapshot`
+    /// stores this index in resume data; the resume-side
+    /// `resolve_jitcode` resolves it back through
+    /// [`pyjitcode_for_jitcode_index`].
+    ///
+    /// The caller is responsible for building the payload with an
+    /// *identity* `metadata.pc_map` (`pc_map[i] == i`): a helper frame's
+    /// resume pc is a jitcode byte offset, not a Python bytecode PC, so
+    /// `resume_jitcode_pc_for(offset)` must map the offset to itself
+    /// rather than translate through a per-Python-PC map. With an
+    /// identity map the existing `resolve_jitcode` path needs no change.
+    ///
+    /// `code` is `null` because a helper has no `W_CodeObject`; this also
+    /// means `raw_code()` returns `null` for the entry, so the
+    /// `raw_code`-keyed `compiled_jitcode_lookup` / `jitcode_for` paths
+    /// never alias it with a real Python code (whose `raw_code()` is
+    /// non-null). Resolution of a helper is by index only.
+    ///
+    /// Currently exercised only by the index/resolve seam test; the
+    /// production `list.append` callee-frame wiring (M-core2/M-core3) is
+    /// the first runtime caller.
+    #[allow(dead_code)]
+    fn register_runtime_helper_jitcode(
+        &mut self,
+        payload: std::sync::Arc<crate::PyJitCode>,
+    ) -> i32 {
+        assert!(
+            payload.w_code.is_null(),
+            "runtime-helper jitcode must not carry a W_CodeObject"
+        );
+        assert!(
+            !payload.is_skeleton(),
+            "runtime-helper jitcode must be populated (identity pc_map) before registration"
+        );
+        // Helper frames store jitcode byte offsets, not Python PCs, so
+        // `resume_jitcode_pc_for` must pass every offset through unchanged.
+        assert!(
+            payload.metadata.pc_map.len() == payload.jitcode.body().code.len()
+                && payload
+                    .metadata
+                    .pc_map
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &pc)| pc == i),
+            "runtime-helper jitcode must carry an identity pc_map"
+        );
+        let index = self.jitcodes.len() as i32;
+        Self::stamp_payload_index(index, &payload);
+        self.jitcodes.push(Box::new(JitCode {
+            code: std::ptr::null(),
+            index,
+            payload,
+        }));
+        index
+    }
+
     /// Return the installed SD entry for a `W_CodeObject`.
     /// RPython's runtime lookup never compiles and never creates a
     /// skeleton here: every entry must already have arrived through
@@ -433,6 +531,101 @@ impl MetaInterpStaticData {
             .filter(|jitcode| !jitcode.payload.is_skeleton())
             .map(|jitcode| &**jitcode as *const JitCode)
     }
+}
+
+/// Build the runtime-helper `PyJitCode` for issue #143's folded
+/// `list.append` resize fallback.
+///
+/// A JIT-folded `list.append` checks capacity inline and stores the new
+/// element directly; the resize guard fails when the backing store is
+/// full. The blackhole then resumes into this helper jitcode, whose body
+/// re-runs the full append (allocating realloc included) as a residual
+/// call and returns `None` — exactly the value a Python `list.append`
+/// call leaves on the caller's stack.
+///
+/// The helper takes two ref registers — `r0` = the list, `r1` = the
+/// value being appended — matching the snapshot boxes
+/// `build_synthetic_callee_frames` records for the callee frame
+/// (M-core2). Body (identity `pc_map`; a helper frame resumes on a
+/// jitcode byte offset, not a Python PC):
+///
+/// ```text
+///   live              live_r=[r0, r1]
+///   residual_call_r_v jit_list_append(r0, r1)   ; arg_classes "rr", void
+///   ref_return        None
+/// ```
+///
+/// The `residual_call` is void, mirroring the trace-side emission in
+/// `helpers.rs::trace_list_append`: [`jit_list_append`] performs the
+/// append purely for its side effect and returns a sentinel `0`, so the
+/// helper must NOT thread that raw `0` as a ref result. It returns
+/// [`w_none`] (a real boxed `None` pointer) instead.
+#[allow(dead_code)]
+fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode> {
+    use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
+    use majit_translate::jitcode::BhCallDescr;
+
+    let mut builder = JitCodeBuilder::new();
+
+    // live live_r=[r0, r1] — emit `live/` + a placeholder 2-byte offset,
+    // patched below to the GLOBAL `all_liveness` position. The resume path
+    // (`consume_one_section` → `get_live_vars_info`) decodes this offset
+    // against `liveness_info_snapshot()` (the global table), so the helper's
+    // liveness MUST be interned there via `intern_liveness`. Interning into a
+    // throwaway local `Assembler` (as `builder.live(asm, ..)` would) leaves
+    // the offset pointing into a table the resume reader never sees, so the
+    // helper frame mis-decodes its live register set and writes the snapshot
+    // boxes to the wrong registers.
+    let live_patch = builder.live_placeholder_with_triple(&[], &[0, 1], &[]);
+    // residual_call_r_v jit_list_append(r0=list, r1=value) -> void
+    builder.residual_call_void_canonical_typed_args(
+        pyre_object::listobject::jit_list_append as *const () as i64,
+        &[JitCallArg::reference(0), JitCallArg::reference(1)],
+        BhCallDescr::from_arg_classes(
+            "rr".to_string(),
+            'v',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        ),
+    );
+    // ref_return None
+    builder.ref_return_const(pyre_object::noneobject::w_none() as i64);
+
+    // Patch the `live/` offset to the global `all_liveness` position.
+    let live_off = intern_liveness(&[], &[0, 1], &[])
+        .expect("list.append resize helper liveness offset fits in u16");
+    builder.patch_live_offset(live_patch, live_off);
+
+    let runtime = std::sync::Arc::new(builder.finish());
+    let code_len = runtime.body().code.len();
+
+    // Identity pc_map: a helper frame's resume pc IS its jitcode byte
+    // offset, so `resume_jitcode_pc_for(offset)` must map it to itself
+    // (see `register_runtime_helper_jitcode`).
+    let metadata = crate::PyJitCodeMetadata {
+        pc_map: (0..code_len).collect(),
+        // Identity pc_map ⇒ identity inverse: each jitcode byte offset is
+        // its own containing-opcode coordinate for a helper frame.
+        first_jit_pc_by_py_pc: (0..code_len).collect(),
+        depth_at_py_pc: vec![0; code_len],
+        // The helper's residual_call (jit_list_append) sits outside any
+        // try-block, so no pc lands on an after-residual-call catch.
+        after_residual_call_resume_pc: vec![None; code_len],
+        portal_frame_reg: u16::MAX,
+        portal_ec_reg: u16::MAX,
+        // Runtime helper, not a portal body.
+        built_as_portal: false,
+        stack_base: 0,
+        stack_slot_color_map: Vec::new(),
+        pyre_color_for_semantic_local: Vec::new(),
+    };
+    std::sync::Arc::new(crate::PyJitCode::from_parts(
+        runtime,
+        metadata,
+        std::ptr::null(),
+        std::ptr::null(),
+        false,
+        None,
+    ))
 }
 
 /// RPython assembler.py:234-248 `Assembler._encode_liveness` parity:
@@ -765,6 +958,28 @@ pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObjec
         let idx = jitcode_index as usize;
         sd.jitcodes.get(idx).map(|jc| unsafe { jc.raw_code() })
     })
+}
+
+/// Issue #143: register (once) the folded `list.append` resize helper
+/// jitcode in the thread-local `METAINTERP_SD` and return its stable
+/// `jitcodes` index. The synthetic callee-frame snapshot a failing resize
+/// guard records (`build_synthetic_callee_frames`) stores this index so
+/// the blackhole can resume into the helper.
+#[allow(dead_code)]
+pub(crate) fn ensure_list_append_resize_helper_index() -> i32 {
+    ensure_finish_setup();
+    // Fast path: already registered. The borrow is released before any
+    // build so the slow path below can intern liveness (which re-borrows
+    // METAINTERP_SD).
+    if let Some(index) = METAINTERP_SD.with(|r| r.borrow().list_append_resize_helper_index) {
+        return index;
+    }
+    // Build OUTSIDE the SD borrow: `build_list_append_resize_helper_payload`
+    // interns the helper's liveness triple into the global `all_liveness`
+    // via `intern_liveness`, which borrows METAINTERP_SD — building inside
+    // a held borrow would panic with a nested borrow_mut.
+    let payload = build_list_append_resize_helper_payload();
+    METAINTERP_SD.with(|r| r.borrow_mut().register_list_append_resize_helper(payload))
 }
 
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the same
@@ -1750,6 +1965,13 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
+    /// #143 frame-advance gate: set true when a concrete heap mutation
+    /// (a concrete STORE_SUBSCR store or any concrete CALL) runs during this
+    /// trace. `dm143_advance_live_locals` advances the live frame only when
+    /// this is set — a mutation-free loop never needs the advance (re-running
+    /// its traced iteration has no heap side effect), and advancing it would
+    /// desync the guard-failure resume path (`set_membership`).
+    pub(crate) dm143_heap_mutated: bool,
     /// pyjitpl.py:74: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
@@ -3339,6 +3561,7 @@ impl PyreSym {
             is_active_vable_owner: false,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
+            dm143_heap_mutated: false,
             // jitcode and concrete_namespace initialized below
             jitcode: null_jitcode() as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
@@ -3533,6 +3756,8 @@ impl PyreSym {
     /// frames set symbolic state manually in perform_call
     /// (trace_opcode.rs:3323-3424) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
+        // #143: reset the per-trace heap-mutation gate at root-frame setup.
+        self.dm143_heap_mutated = false;
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_metainterp::majit_log_enabled() {
@@ -3802,6 +4027,31 @@ impl PyreSym {
     pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
         self.concrete_value_at_opt(abs_idx)
             .unwrap_or(ConcreteValue::Null)
+    }
+
+    /// #143 frame-advance: number of local slots whose post-trace concrete
+    /// state is tracked (`min(concrete_locals.len(), nlocals)`).
+    pub fn tracked_local_count(&self) -> usize {
+        self.concrete_locals.len().min(self.nlocals)
+    }
+
+    /// #143 frame-advance: materialize local slot `i`'s post-trace concrete
+    /// value as a boxed `PyObjectRef` (lazy `Int`/`Float` allocated via
+    /// `w_int_new`/`w_float_new`; `Ref` returned as-is). `None` for a `Null`
+    /// (dead/uninitialized) slot. The caller must root the returned box
+    /// before the next allocation.
+    pub fn materialize_local(&self, i: usize) -> Option<PyObjectRef> {
+        let cv = *self.concrete_locals.get(i)?;
+        if cv.is_null() {
+            None
+        } else {
+            Some(cv.to_pyobj())
+        }
+    }
+
+    /// #143 frame-advance gate predicate — see the `dm143_heap_mutated` field.
+    pub fn dm143_heap_mutated(&self) -> bool {
+        self.dm143_heap_mutated
     }
 }
 
@@ -11072,6 +11322,32 @@ pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -
     unsafe { pyre_object::is_plain_int1(value) }
 }
 
+/// Test-only RAII guard: swap a `MetaInterpStaticData` into the
+/// thread-local `METAINTERP_SD` and restore the previous value on drop,
+/// so tests sharing a thread (`--test-threads=1`) do not observe each
+/// other's registrations.
+#[cfg(test)]
+pub(crate) struct MetainterpSdGuard {
+    prev: Option<MetaInterpStaticData>,
+}
+
+#[cfg(test)]
+impl MetainterpSdGuard {
+    pub(crate) fn swap(sd: MetaInterpStaticData) -> Self {
+        let prev = METAINTERP_SD.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), sd));
+        Self { prev: Some(prev) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetainterpSdGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            METAINTERP_SD.with(|slot| *slot.borrow_mut() = prev);
+        }
+    }
+}
+
 #[cfg(test)]
 mod indirectcalltargets_tests {
     //! Line-by-line parity tests for `pyjitpl.py:2248-2249` and
@@ -11079,7 +11355,10 @@ mod indirectcalltargets_tests {
     //! `MetaInterpStaticData` methods directly — independent of the
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
-    use super::{METAINTERP_SD, MetaInterpStaticData, raw_code_for_jitcode_index};
+    use super::{
+        MetaInterpStaticData, MetainterpSdGuard, pyjitcode_for_jitcode_index,
+        raw_code_for_jitcode_index,
+    };
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
     use pyre_interpreter::bytecode::CodeObject;
     use std::sync::Arc;
@@ -11206,12 +11485,266 @@ mod indirectcalltargets_tests {
         let mut sd = MetaInterpStaticData::new();
         let (code, expected_raw) = make_code("x = 1\n");
         sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw, code)]);
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
         assert_eq!(hit, expected_raw);
+    }
+
+    /// Issue #143 core seam: a Rust runtime-helper jitcode (no backing
+    /// `W_CodeObject`) registered via `register_runtime_helper_jitcode`
+    /// must acquire a valid index that the production resume lookup
+    /// `pyjitcode_for_jitcode_index` resolves, and its identity `pc_map`
+    /// must pass a jitcode byte offset through `resume_jitcode_pc_for`
+    /// unchanged. Helper frames store byte offsets, not Python PCs, so an
+    /// identity map lets the existing `resolve_jitcode` (call_jit.rs)
+    /// resume into the helper with no production change. This is the
+    /// load-bearing index/resolve gap for resuming a guard inside a
+    /// folded `list.append` callee through the blackhole.
+    #[test]
+    fn register_runtime_helper_jitcode_resolves_by_index_with_identity_pc() {
+        use majit_metainterp::jitcode::insns::BC_LIVE;
+
+        // Hand-build a tiny populated helper body. Content is irrelevant
+        // here (it never runs); it only has to be non-skeleton so the
+        // resume-side discriminators classify it as a normal populated
+        // jitcode. The guard/resume offset lives at byte 3.
+        const GUARD_OFFSET: usize = 3;
+        let mut runtime = JitCodeBuilder::default().finish();
+        runtime.body_mut().code = vec![BC_LIVE, 0, 0, BC_LIVE, 0, 0];
+        runtime.body_mut().c_num_regs_i = 1;
+        runtime.body_mut().startpoints = Some([0_usize, GUARD_OFFSET].into_iter().collect());
+        let code_len = runtime.body().code.len();
+        let runtime = Arc::new(runtime);
+
+        // Identity pc_map: the resume pc IS the jitcode byte offset.
+        let metadata = crate::PyJitCodeMetadata {
+            pc_map: (0..code_len).collect(),
+            first_jit_pc_by_py_pc: (0..code_len).collect(),
+            depth_at_py_pc: vec![0; code_len],
+            after_residual_call_resume_pc: vec![None; code_len],
+            portal_frame_reg: u16::MAX,
+            portal_ec_reg: u16::MAX,
+            built_as_portal: false,
+            stack_base: 0,
+            stack_slot_color_map: Vec::new(),
+            pyre_color_for_semantic_local: Vec::new(),
+        };
+        let payload = Arc::new(crate::PyJitCode::from_parts(
+            runtime,
+            metadata,
+            std::ptr::null(),
+            std::ptr::null(),
+            false,
+            None,
+        ));
+
+        let mut sd = MetaInterpStaticData::new();
+        let index = sd.register_runtime_helper_jitcode(payload.clone());
+        assert_eq!(index, 0, "first registration takes slot 0");
+        // The inner runtime JitCode index must be stamped so
+        // `build_framestack_snapshot`'s `(*sym().jitcode).index` read is
+        // valid for the helper callee frame.
+        assert_eq!(payload.jitcode.index(), index as usize);
+
+        // Resume-side discriminators: a populated, non-portal,
+        // non-skeleton jitcode with no abort opcode, so `resolve_jitcode`
+        // does not bail.
+        assert!(payload.is_populated());
+        assert!(!payload.is_portal_bridge());
+        assert!(!payload.is_skeleton());
+        assert!(!payload.has_abort_opcode());
+
+        // Identity pc_map passes a byte offset through unchanged.
+        assert_eq!(
+            payload.resume_jitcode_pc_for(GUARD_OFFSET),
+            Some(GUARD_OFFSET)
+        );
+
+        // The production resume lookup resolves the helper by index.
+        let _sd_guard = MetainterpSdGuard::swap(sd);
+        let resolved = pyjitcode_for_jitcode_index(index)
+            .expect("registered runtime helper must resolve by index");
+        assert!(Arc::ptr_eq(&resolved, &payload));
+    }
+
+    /// Issue #143 M-core3 increment 1: the folded `list.append` resize
+    /// helper jitcode, driven through the production blackhole, must
+    /// actually perform the append (including the heap realloc that the
+    /// inline guard could not) and return `None` as a
+    /// `DoneWithThisFrameRef`.
+    ///
+    /// This proves the residual-call body executes end-to-end — not just
+    /// that a frame chain can be built (the resume-side seam test only
+    /// covers chain construction). The list starts at the inline-array
+    /// capacity boundary so the helper's append must reallocate, exactly
+    /// the path the runtime guard fails into.
+    ///
+    /// Requires a backend feature: the residual call dispatches through
+    /// `cpu.bh_call_v`, which only performs the real C call when a
+    /// concrete backend is wired (`build_pyre_production_bh_builder` sets
+    /// `builder.cpu` under `dynasm`/`cranelift`). Without one the cpu is
+    /// `None` and the residual handler's `cpu()` would panic.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    #[test]
+    fn list_append_resize_helper_appends_and_returns_none_through_blackhole() {
+        use majit_metainterp::blackhole::run_forever;
+        use majit_metainterp::jitexc::JitException;
+        use pyre_object::{
+            w_int_new, w_list_can_append_without_realloc, w_list_len, w_list_new, w_none,
+        };
+
+        let payload = super::build_list_append_resize_helper_payload();
+
+        // Pin the heap objects: `run` roots `registers_r` for the residual
+        // call itself, but the list/value must survive any collection
+        // between construction here and the blackhole entry below.
+        let _roots = pyre_object::gc_roots::push_roots();
+        // listobject `IntArray` inlines up to `INT_ARRAY_INLINE_CAP` (8)
+        // ints; a list filled to exactly that boundary has zero spare
+        // capacity, so the next append must reallocate.
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        let item = w_int_new(99);
+        pyre_object::gc_roots::pin_root(list);
+        pyre_object::gc_roots::pin_root(item);
+
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 8, "list must start at the inline boundary");
+        assert!(
+            !unsafe { w_list_can_append_without_realloc(list) },
+            "the next append must require a realloc (the guard-failure path)",
+        );
+
+        let mut builder = crate::jitcode_runtime::build_pyre_production_bh_builder();
+        let mut bh = builder.acquire_interp();
+        bh.setposition(payload.jitcode.clone(), 0);
+        // r0 = list, r1 = appended value (the callee-frame snapshot boxes).
+        bh.setarg_r(0, list as i64);
+        bh.setarg_r(1, item as i64);
+
+        let exc = run_forever(&mut builder, bh, 0);
+        match exc {
+            JitException::DoneWithThisFrameRef(r) => assert_eq!(
+                r.0,
+                w_none() as usize,
+                "helper must return None (a real boxed pointer), not the \
+                 raw 0 sentinel jit_list_append returns",
+            ),
+            other => panic!("expected DoneWithThisFrameRef(None), got {other:?}"),
+        }
+
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "the residual call must have appended exactly one element",
+        );
+    }
+
+    /// Issue #143 M-core3 increment 2: the load-bearing return-threading
+    /// convention. When the folded `list.append` callee frame returns
+    /// through the blackhole, `setup_return_value_r` must write the
+    /// callee's `None` into the CALLER frame's
+    /// `registers_r[code[position-1]]` — the post-CALL result register.
+    ///
+    /// This isolates that convention with a 2-frame chain (a hand-built
+    /// stub caller + the real resize helper) WITHOUT pyre's full Python
+    /// CALL bytecode layout: the caller's `code[position-1]` byte names the
+    /// result register, and resuming the caller at `position` runs
+    /// `ref_return` on it, surfacing the threaded value. The real Python
+    /// fallthrough layout is exercised end-to-end by increment 6.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    #[test]
+    fn list_append_resize_helper_threads_none_into_caller_result_register() {
+        use majit_metainterp::blackhole::run_forever;
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        use majit_metainterp::jitcode::insns::BC_REF_RETURN;
+        use majit_metainterp::jitexc::JitException;
+        use pyre_object::{w_int_new, w_list_len, w_list_new, w_none};
+
+        let helper = super::build_list_append_resize_helper_payload();
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        let item = w_int_new(99);
+        pyre_object::gc_roots::pin_root(list);
+        pyre_object::gc_roots::pin_root(item);
+        let len_before = unsafe { w_list_len(list) };
+
+        // Stub caller jitcode. `code[0]` is the post-CALL result-register
+        // index (r0) that `setup_return_value_r` reads from
+        // `code[position-1]`; resuming at position 1 runs `ref_return r0`,
+        // surfacing whatever the callee threaded into r0.
+        let mut caller = JitCodeBuilder::default().finish();
+        caller.body_mut().code = vec![0x00, BC_REF_RETURN, 0x00];
+        caller.body_mut().c_num_regs_r = 1;
+        caller.body_mut().startpoints = Some([1_usize].into_iter().collect());
+        let caller = std::sync::Arc::new(caller);
+
+        let mut builder = crate::jitcode_runtime::build_pyre_production_bh_builder();
+
+        // Chain: helper (callee, runs first) → caller (its
+        // `nextblackholeinterp`, resumed with the threaded return).
+        let mut caller_bh = builder.acquire_interp();
+        caller_bh.setposition(caller, 1);
+
+        let mut helper_bh = builder.acquire_interp();
+        helper_bh.setposition(helper.jitcode.clone(), 0);
+        helper_bh.setarg_r(0, list as i64);
+        helper_bh.setarg_r(1, item as i64);
+        helper_bh.nextblackholeinterp = Some(Box::new(caller_bh));
+
+        let exc = run_forever(&mut builder, helper_bh, 0);
+        match exc {
+            JitException::DoneWithThisFrameRef(r) => assert_eq!(
+                r.0,
+                w_none() as usize,
+                "the caller must surface the None the callee returned, \
+                 threaded via setup_return_value_r into code[position-1]'s \
+                 register",
+            ),
+            other => panic!("expected DoneWithThisFrameRef(None), got {other:?}"),
+        }
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "the callee frame must still have performed the append",
+        );
+    }
+
+    /// Issue #143 M-core3 increment 3: the resize helper is registered in
+    /// the production `METAINTERP_SD` exactly once and resolves back by its
+    /// memoized index. A second `ensure` returns the same index (no
+    /// duplicate registration), and the index resolves to a populated,
+    /// non-skeleton runtime-helper payload (null `w_code`) whose identity
+    /// `pc_map` passes a byte offset through unchanged.
+    #[test]
+    fn ensure_list_append_resize_helper_index_is_stable_and_resolves() {
+        use super::{
+            MetaInterpStaticData, MetainterpSdGuard, ensure_list_append_resize_helper_index,
+            pyjitcode_for_jitcode_index,
+        };
+
+        // Isolate from any helper a prior test on this thread registered.
+        let _sd_guard = MetainterpSdGuard::swap(MetaInterpStaticData::new());
+
+        let idx = ensure_list_append_resize_helper_index();
+        assert_eq!(
+            ensure_list_append_resize_helper_index(),
+            idx,
+            "ensure must memoize — a second call registers nothing new",
+        );
+
+        let payload =
+            pyjitcode_for_jitcode_index(idx).expect("helper index must resolve to a payload");
+        assert!(
+            payload.w_code.is_null(),
+            "runtime-helper payload carries no W_CodeObject",
+        );
+        assert!(payload.is_populated());
+        assert!(!payload.is_skeleton());
+        assert!(!payload.has_abort_opcode());
+        // Identity pc_map: a helper byte offset maps to itself.
+        assert_eq!(payload.resume_jitcode_pc_for(0), Some(0));
     }
 }
 
@@ -11230,7 +11763,7 @@ pub struct ResumeFrameState {
 
 #[cfg(test)]
 mod finish_setup_tests {
-    use super::{METAINTERP_SD, MetaInterpStaticData, blackhole_control_opcodes};
+    use super::{MetaInterpStaticData, MetainterpSdGuard, blackhole_control_opcodes};
     use crate::assembler::publish_state;
 
     #[test]
@@ -11272,9 +11805,7 @@ mod finish_setup_tests {
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);
         sd.finish_setup_if_needed(&insns, Vec::new());
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         assert_eq!(blackhole_control_opcodes(), (88, 89, 91));
     }
@@ -11284,9 +11815,7 @@ mod finish_setup_tests {
         let mut sd = MetaInterpStaticData::new();
         let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let mut insns = majit_ir::VecAssoc::new();
         insns.insert("live/".to_string(), 88u8);
