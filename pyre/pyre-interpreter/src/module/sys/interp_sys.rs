@@ -554,32 +554,31 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     dict_storage_store(ns, "platlibdir", w_str_new("lib"));
-    // sys.exit(code=0) — raise SystemExit
+    // `sys/app.py:114-126 exit(exitcode=None)` — raise SystemExit(exitcode),
+    // de-tupelizing a tuple argument so `exit((a, b))` becomes
+    // `SystemExit(a, b)` (the extra de-tupelizing normalize_exception does
+    // for `raise SystemExit, exitcode`).  A bare `exit()` defaults exitcode
+    // to None, so the instance carries `code = None` / `args = (None,)`.
+    // Interpreting the code (None → 0, int() coercion,
+    // print-non-integral-and-exit-1) is the launcher's job
+    // (`app_main.py:114-129 handle_sys_exit`).
     dict_storage_store(
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
-            let code = if args.is_empty() {
-                0i64
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error("exit() takes at most 1 argument"));
+            }
+            let cls = crate::builtins::lookup_exc_class("SystemExit")
+                .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
+            let exitcode = args.first().copied().unwrap_or_else(w_none);
+            let ctor_args = if unsafe { is_tuple(exitcode) } {
+                unsafe { w_tuple_items_copy_as_vec(exitcode) }
             } else {
-                unsafe {
-                    if pyre_object::is_none(args[0]) {
-                        0
-                    } else if pyre_object::is_int(args[0]) || pyre_object::is_bool(args[0]) {
-                        pyre_object::w_int_get_value(args[0])
-                    } else {
-                        // Non-integer arg: print it to stderr and exit 1
-                        0
-                    }
-                }
+                vec![exitcode]
             };
-            Err(crate::PyError {
-                kind: crate::PyErrorKind::SystemExit,
-                message: code.to_string(),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
-            })
+            let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
+            Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );
     // sys.abiflags

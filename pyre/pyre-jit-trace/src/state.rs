@@ -1657,6 +1657,12 @@ pub struct PyreSym {
     /// unconditional `__context__ = ec.sys_exc_value` chaining that is
     /// valid only for a freshly constructed exception (w_context still
     /// null, self-cycle impossible).
+    ///
+    /// The entry is dropped as soon as freshness can no longer be proven:
+    /// `RAISE_VARARGS` consumes it (a re-raise of the same object must
+    /// take the residual path — its `w_context` is set by then), and
+    /// `box_value_for_python_helper` removes any value escaping into a
+    /// python-helper residual call (which may mutate the exception).
     pub(crate) trace_built_exc: majit_ir::VecAssoc<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
@@ -1979,7 +1985,15 @@ pub(crate) fn box_value_for_python_helper(
     match state.value_type(value) {
         Type::Int => wrapint(ctx, value),
         Type::Float => wrapfloat(ctx, value),
-        Type::Ref | Type::Void => value,
+        Type::Ref | Type::Void => {
+            // A trace-built exception escaping into a python-helper
+            // residual is no longer provably fresh (the callee may set
+            // `__context__` or other state); drop it so a later
+            // RAISE_VARARGS takes the residual path, whose runtime
+            // `attach_raise_cause` chaining is conditional.
+            state.sym_mut().trace_built_exc.remove(&value);
+            value
+        }
     }
 }
 
@@ -8858,9 +8872,16 @@ mod tests {
         // get/set_current_exception read/write `(*ec).sys_exc_value` on the
         // thread's current EC; production establishes it via
         // `set_last_exec_ctx(frame.execution_context)` (eval.rs:841). Mirror
-        // that here so the save/restore round-trips like a real frame, and
-        // restore the prior ctx at the end to avoid leaking into sibling tests.
-        let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        // that here so the save/restore round-trips like a real frame.  The
+        // prior ctx is restored on Drop so an assert failure mid-test still
+        // unwinds without leaking the frame's EC into sibling tests.
+        struct ExecCtxRestore(*const pyre_interpreter::PyExecutionContext);
+        impl Drop for ExecCtxRestore {
+            fn drop(&mut self) {
+                pyre_interpreter::call::set_last_exec_ctx(self.0);
+            }
+        }
+        let _saved_ctx = ExecCtxRestore(pyre_interpreter::call::take_last_exec_ctx());
         pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
 
         let mut ctx = TraceCtx::for_test(1);
@@ -8915,7 +8936,6 @@ mod tests {
         assert_eq!(state.sym().current_exc_box, restored_prev.opref);
         assert_eq!(pyre_interpreter::eval::get_current_exception(), prev_exc);
         pyre_interpreter::eval::set_current_exception(PY_NULL);
-        pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     }
 
     #[test]

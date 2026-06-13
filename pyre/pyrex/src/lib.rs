@@ -262,9 +262,8 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
         Err(e) => {
             if e.kind == PyErrorKind::SystemExit {
-                let code: i32 = e.message.parse().unwrap_or(0);
                 maybe_print_jit_stats();
-                std::process::exit(code);
+                std::process::exit(system_exit_code(&e));
             }
             maybe_print_jit_stats();
             pyre_interpreter::eprint_exception(&e, true);
@@ -272,4 +271,33 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
     }
     maybe_print_jit_stats();
+}
+
+/// app_main.py:114-129 `handle_sys_exit` — `exitcode = e.code`; None
+/// exits 0; otherwise `int(exitcode)` and a value `int()` rejects is
+/// printed to stderr with exit status 1.  `e.code` itself is `args[0]`
+/// for a 1-arg raise and the whole args tuple otherwise
+/// (interp_exceptions.py:993-998 `W_SystemExit.descr_init`).
+fn system_exit_code(e: &pyre_interpreter::PyError) -> i32 {
+    let exc = e.exc_object;
+    if exc.is_null() {
+        // No object-backed SystemExit means no `code` attribute (the
+        // class default None), i.e. a success exit.
+        return 0;
+    }
+    let code = match pyre_interpreter::getattr(exc, pyre_object::w_str_new("code")) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if unsafe { pyre_object::is_none(code) } {
+        return 0;
+    }
+    match pyre_interpreter::builtins::builtin_int(&[code]) {
+        Ok(w_int) => unsafe { pyre_object::w_int_get_value(w_int) as i32 },
+        Err(_) => {
+            // app_main.py:124-125 `print(exitcode, file=sys.stderr)`.
+            eprintln!("{}", unsafe { pyre_interpreter::display::py_str(code) });
+            1
+        }
+    }
 }
