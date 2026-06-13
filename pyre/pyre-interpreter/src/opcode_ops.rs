@@ -217,7 +217,15 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
-        Err(err) => panic!("getitem failed in JIT: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: publish the exception into
+            // the backend pos_exception cells so the GuardNoException recorded
+            // after BINARY_SUBSCR (instruction_may_raise) deopts and re-raises
+            // through the blackhole resume instead of crashing.  Return null —
+            // the guard fires before the result ref is used.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -229,7 +237,15 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
         value as PyObjectRef,
     ) {
         Ok(_) => 0,
-        Err(err) => panic!("setitem failed in JIT: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: publish the exception into
+            // the backend pos_exception cells so the GuardNoException recorded
+            // after STORE_SUBSCR (instruction_may_raise) deopts and re-raises
+            // through the blackhole resume instead of crashing.  Return garbage
+            // — the guard fires before the result is used.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -239,7 +255,15 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::getattr_str(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
-        Err(err) => panic!("getattr failed in JIT: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: publish the exception into
+            // the backend pos_exception cells so the GuardNoException recorded
+            // after LOAD_ATTR (instruction_may_raise) deopts and re-raises
+            // through the blackhole resume instead of crashing.  Return null —
+            // the guard fires before the result ref is used.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -249,7 +273,15 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::setattr_str(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
-        Err(err) => panic!("setattr failed in JIT: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: publish the exception into
+            // the backend pos_exception cells so the GuardNoException recorded
+            // after STORE_ATTR (instruction_may_raise) deopts and re-raises
+            // through the blackhole resume instead of crashing.  Return garbage
+            // — the guard fires before the result is used.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 

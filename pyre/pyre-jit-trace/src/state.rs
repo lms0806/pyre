@@ -2135,6 +2135,13 @@ pub struct MIFrame {
     pub pending_result_stack_idx: Option<usize>,
     pub pending_result_type: Option<Type>,
     pub pending_inline_frame: Option<PendingInlineFrame>,
+    /// For an `in_a_call` parent frame snapshotted by
+    /// `get_list_of_active_boxes`, the Python pc of the CALL whose
+    /// post-residual-call `-live-`/`catch_exception` this frame must read
+    /// liveness at (so encode and the marker-routed blackhole resume share
+    /// the one `-live-` the way `pyjitpl.py:194-195 pc=self.pc` does).
+    /// `None` keeps the legacy `fallthrough_pc` liveness.
+    pub residual_call_pc: Option<usize>,
 }
 
 pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
@@ -8935,6 +8942,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -8984,6 +8992,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9026,6 +9035,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9058,6 +9068,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9085,6 +9096,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9120,6 +9132,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9165,6 +9178,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9210,6 +9224,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
@@ -9247,6 +9262,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9290,6 +9306,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9392,6 +9409,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
@@ -9452,6 +9470,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
@@ -9724,6 +9743,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9763,6 +9783,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -9817,6 +9838,7 @@ mod tests {
                 pending_result_stack_idx: None,
                 pending_result_type: None,
                 pending_inline_frame: None,
+                residual_call_pc: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
@@ -9871,6 +9893,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
@@ -10244,6 +10267,7 @@ mod tests {
                 pending_result_stack_idx: None,
                 pending_result_type: None,
                 pending_inline_frame: None,
+                residual_call_pc: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
@@ -10296,6 +10320,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10337,6 +10362,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10393,6 +10419,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10468,6 +10495,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10557,6 +10585,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10652,6 +10681,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -11034,6 +11064,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -11117,6 +11148,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
             pre_opcode_registers_r: None,
@@ -11817,6 +11849,16 @@ pub struct ResumeFrameState {
     pub sym: *mut PyreSym,
     pub concrete_frame_addr: usize,
     pub resume_pc: usize,
+    /// Python pc of the CALL whose residual call this frame is the caller
+    /// of (the call still on this frame's stack when the callee was
+    /// inlined).  When that call sits in a try-block the jitcode emits a
+    /// post-call `-live-`/`catch_exception` keyed by this pc
+    /// (`after_residual_call_resume_pc`); on a guard that deopts mid-callee
+    /// the blackhole must resume this frame AT that catch
+    /// (`blackhole.py:396-410 handle_exception_in_frame`,
+    /// `pyjitpl.py:2601-2602`).  `None` for frames whose call has no catch
+    /// marker.
+    pub call_pc: Option<usize>,
     /// pyjitpl.py:181-193 `get_list_of_active_boxes(in_a_call=True)`.
     /// Non-top frames clear the caller's pending result slot before
     /// snapshotting liveness so the undefined call result does not leak

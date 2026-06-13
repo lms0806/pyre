@@ -1632,6 +1632,9 @@ static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
 > = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
+/// The trailing `i64` is `cpu.grab_exc_value(deadframe)` (llmodel.py:240):
+/// the callee's `jf_guard_exc` slot, forwarded so the blackhole resume can
+/// seed `_prepare_resume_from_failure` (blackhole.py:1647).
 pub fn register_call_assembler_blackhole(
     f: fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>,
 ) {
@@ -2644,12 +2647,9 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
     }
 
     let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
-    // llmodel.py:240 grab_exc_value: the must_save_exception recovery
-    // stub staged the pending exception into jf_guard_exc.
-    let guard_exc = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
-        .map_or(0, |jf| jf.grab_exc_value().0 as i64);
+    let guard_exc = grab_exc_value_from_deadframe(&frame)
+        .map(|g| g.0 as i64)
+        .unwrap_or(0);
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     let cell = majit_ir::FailDescrCell::wrap(fail_descr_arc);
     let descr_addr = Arc::as_ptr(&cell) as *const () as usize;
@@ -2816,6 +2816,18 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.grab_exc_value())
+}
+
+/// `cpu.grab_exc_value(deadframe)` (llmodel.py:240) for a raw JitFrame
+/// address: read `jf_guard_exc` without clearing, matching
+/// `JitFrameDeadFrame::grab_exc_value`.  Returns 0 when the guard exit
+/// stored no exception (the common non-`GUARD_EXCEPTION` case).
+#[inline]
+fn grab_exc_value_from_jf_ptr(jf_ptr: usize) -> i64 {
+    if jf_ptr == 0 {
+        return 0;
+    }
+    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *const usize) as i64 }
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -3178,16 +3190,14 @@ fn call_assembler_guard_failure_inner(
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let raw_num = fail_descr.fail_arg_types().len();
+        let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
             outputs_ptr,
             raw_num,
             outputs_ptr,
             raw_num,
-            // This leg exits through the CLIF outputs array, not a
-            // jitframe deadframe, so there is no `jf_guard_exc` slot to
-            // grab (`llmodel.py:240`) — no pending exception crosses.
-            0,
+            guard_exc,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
             // e.result as-is. warmspot.py:982: ContinueRunningNormally
@@ -3347,16 +3357,14 @@ fn call_assembler_fast_path_heap(
             raw_num,
         );
         let num_outputs = bh_outputs.len();
+        let guard_exc = grab_exc_value_from_jf_ptr(exec.jf_gcref.0);
         let bh_result = bh_fn(
             descr_addr,
             bh_outputs.as_ptr(),
             num_outputs,
             raw_outputs.as_ptr(),
             raw_num,
-            // This leg exits through the CLIF outputs array, not a
-            // jitframe deadframe, so there is no `jf_guard_exc` slot to
-            // grab (`llmodel.py:240`) — no pending exception crosses.
-            0,
+            guard_exc,
         );
         drop(bh_cell);
         if let Some(result) = bh_result {
@@ -3515,12 +3523,9 @@ fn call_assembler_shim_inner(
                 target.fail_descrs.len()
             );
         };
-        // llmodel.py:240 grab_exc_value: the must_save_exception
-        // recovery stub staged the pending exception into jf_guard_exc.
-        let guard_exc = frame
-            .data
-            .downcast_ref::<JitFrameDeadFrame>()
-            .map_or(0, |jf| jf.grab_exc_value().0 as i64);
+        let guard_exc = grab_exc_value_from_deadframe(&frame)
+            .map(|g| g.0 as i64)
+            .unwrap_or(0);
         if let Some(result) = bh_fn(
             descr_addr,
             bh_outputs.as_ptr(),

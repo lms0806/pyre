@@ -528,3 +528,50 @@ pub fn rebuild_from_numbering(
     }
     (num_failargs, vable_values, vref_values, frames)
 }
+
+#[cfg(test)]
+mod after_residual_call_pc_tests {
+    use super::{AFTER_RESIDUAL_CALL_PC_FLAG, decode_resume_pc, encode_after_residual_call_pc};
+
+    #[test]
+    fn marker_roundtrips_in_range() {
+        // Every Python PC below the marker bit round-trips intact as a
+        // marked resume pc.
+        for pc in [0, 1, 100, AFTER_RESIDUAL_CALL_PC_FLAG - 1] {
+            let encoded = encode_after_residual_call_pc(pc);
+            assert_eq!(decode_resume_pc(encoded), (pc, true));
+        }
+    }
+
+    #[test]
+    fn unmarked_pc_below_flag_decodes_unmarked() {
+        // An unmarked resume pc that leaves bit 14 free decodes as itself.
+        for pc in [0, 1, 100, AFTER_RESIDUAL_CALL_PC_FLAG - 1] {
+            assert_eq!(decode_resume_pc(pc), (pc, false));
+        }
+    }
+
+    #[test]
+    fn negative_sentinel_passes_through_unmarked() {
+        // resume.rs uses negative pcs as sentinels; they must not read as
+        // marked (decode_resume_pc:74-83).
+        assert_eq!(decode_resume_pc(-1), (-1, false));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range for marker bit")]
+    fn encode_rejects_pc_at_flag_boundary() {
+        // A pc >= 1 << 14 cannot carry the marker; encoding must reject it
+        // in release builds too (the bound is `assert!`, not debug-only)
+        // rather than silently aliasing a smaller pc on decode.
+        let _ = encode_after_residual_call_pc(AFTER_RESIDUAL_CALL_PC_FLAG);
+    }
+
+    #[test]
+    fn raw_pc_at_flag_aliases_a_marked_pc() {
+        // Documents WHY the capture-site asserts bound every *unmarked* pc:
+        // a raw pc with bit 14 set is indistinguishable from a marked pc at
+        // decode, so an unmarked stored pc >= the flag would be mis-read.
+        assert_eq!(decode_resume_pc(AFTER_RESIDUAL_CALL_PC_FLAG), (0, true));
+    }
+}

@@ -254,6 +254,9 @@ pub fn trace_bytecode(
                 sym: parent_sym,
                 concrete_frame_addr: parent_cf_addr,
                 resume_pc: parent_pc,
+                // Bridge-reconstructed parents keep the legacy fallthrough
+                // resume (no recorded CALL pc to key the catch marker on).
+                call_pc: None,
                 pending_result_stack_idx: None,
                 pending_result_type: None,
             }];

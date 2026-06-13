@@ -1870,8 +1870,74 @@ impl<'a> GraphFlattener<'a> {
                 self.make_link(&normal_link, false);
                 return;
             }
+            // RPython flowspace (`flowcontext.py:130-156 guessexception`)
+            // closes a canraise block at the raising op, so its post-call
+            // `-live-` is the block's last insn and `catch_exception` lands
+            // directly after it — the adjacency `handle_exception_in_frame`
+            // (`blackhole.py:396`) and `derive_after_call_indices_from_sparse`
+            // (the after-residual-call resume anchor) both require.  Pyre
+            // does not split there, so the raising op's post-op vable-mirror
+            // stores (`setfield_vable_i` / `setarrayitem_vable_r` for the
+            // post-op frame state) were serialized into THIS block after the
+            // `-live-`.  Hoist `catch_exception` to directly follow that
+            // `-live-` and move the trailing stores after it; `catch_exception`
+            // is a no-op on the normal fall-through (`bhimpl_catch_exception`),
+            // so the stores still execute there, while the exception path now
+            // finds the catch one op past the resume `-live-`.
+            let hoisted_tail: Vec<Insn> = {
+                let raising_rel = self.ssarepr.insns[block_emit_start..]
+                    .iter()
+                    .rposition(insn_needs_trailing_live);
+                match raising_rel {
+                    Some(rel) => {
+                        let live_idx = block_emit_start + rel + 1;
+                        let has_trailing_stores = live_idx + 1 < self.ssarepr.insns.len();
+                        if self.ssarepr.insns.get(live_idx).is_some_and(Insn::is_live)
+                            && has_trailing_stores
+                        {
+                            // Inserting one `catch_exception` before the moved
+                            // stores shifts their positions by one; keep the
+                            // sparse `pc_first_insn_pos` anchors aligned.
+                            for (_pc, pos) in self.ssarepr.pc_first_insn_pos.iter_mut() {
+                                if *pos > live_idx {
+                                    *pos += 1;
+                                }
+                            }
+                            self.ssarepr.insns.split_off(live_idx + 1)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
             let catch_label = self.tlabel_for_link(&normal_link);
             self.emitline(Insn::op("catch_exception", vec![catch_label]));
+            // flatten.py:206-220 statically guarantees `catch_exception`
+            // directly follows the raising op's trailing `-live-` (the block is
+            // closed at the canraise op, then the trailing-`-live-` walk-back
+            // places the catch right after it).  Pyre rebuilds that adjacency
+            // via the hoist above rather than by block-splitting, so the
+            // invariant is not structural — enforce it here.  Both
+            // `handle_exception_in_frame` (blackhole.py:396, skip one `-live-`
+            // then expect the catch) and `derive_after_call_indices_from_sparse`
+            // (resume anchor keyed on `insns[catch-1].is_live()`) silently
+            // mis-resume if a vable-mirror store serialized between the two.
+            debug_assert!(
+                !block_can_raise
+                    || self
+                        .ssarepr
+                        .insns
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .is_some_and(Insn::is_live),
+                "catch_exception must directly follow the raising op's -live- \
+                 (block_emit_start={block_emit_start})",
+            );
+            for insn in hoisted_tail {
+                self.emitline(insn);
+            }
             self.make_link(&normal_link, false);
             let normal_label = self.label_for_link(&normal_link);
             self.emitline(normal_label);

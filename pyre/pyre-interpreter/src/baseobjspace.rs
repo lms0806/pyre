@@ -2510,9 +2510,12 @@ unsafe fn setattr_surrogate(
     unsafe { object_setattr_surrogate(obj, w_name, name, value) }
 }
 
-/// `object.__setattr__` terminal for a lone-surrogate name — generic
-/// module / instance `__dict__` store.  A surrogate cannot name a data
-/// descriptor, type attribute, or special slot (all valid identifiers).
+/// `object.__setattr__` terminal for a lone-surrogate name — mirrors
+/// `object_setattr`: a data descriptor's `__set__` takes priority, then
+/// the module / type / instance `__dict__` store.  A surrogate name can
+/// legitimately reach a data descriptor (`setattr(cls, '\udc80', descr)`),
+/// so the descriptor walk runs the same as for an identifier name, just
+/// keyed through the WTF-8 MRO view.
 pub(crate) unsafe fn object_setattr_surrogate(
     obj: PyObjectRef,
     w_name: PyObjectRef,
@@ -2522,21 +2525,49 @@ pub(crate) unsafe fn object_setattr_surrogate(
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     unsafe {
-        if is_module(obj) {
-            let w_dict = pyre_object::w_module_get_w_dict(obj);
-            if !w_dict.is_null() {
-                setitem(w_dict, w_name, value)?;
-                return Ok(w_none());
+        // descroperation.py:114-123 — a data descriptor's `__set__` takes
+        // priority over the dict store.  Walk `space.type(obj)` (the
+        // metaclass for a type receiver, mirroring object_setattr:4483-4493)
+        // comparing WTF-8 keys so a surrogate-named descriptor is found.
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        };
+        if !w_type.is_null() {
+            if let Some(descr) = lookup_in_type_wtf8(w_type, name) {
+                if set(descr, obj, value)? {
+                    return Ok(w_none());
+                }
+                // descroperation.py:124-126 — `__delete__` but no `__set__`
+                // is a read-only data descriptor; reject rather than shadow
+                // it with the namespace store.
+                if descr_has_delete(descr) {
+                    return Err(descr_not_settable_error(descr));
+                }
             }
         }
         // Type objects: store into the type's own WTF-8 keyed namespace
         // and reset the method caches — `typeobject.py type.__setattr__`
-        // → `w_type.dict_w[name] = w_value; self.mutated(name)`.
+        // → `w_type.dict_w[name] = w_value; self.mutated(name)`.  A lone
+        // surrogate has no `&str` form, so the precise key is unavailable
+        // and `mutated` falls back to the conservative whole-cache reset
+        // (correct: a surrogate can never name `__eq__`/`__hash__`).
         if is_type(obj) {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store_wtf8(&mut *dict_ptr, name, value);
-                mutated(obj, None);
+                mutated(obj, name.as_str().ok());
+                return Ok(w_none());
+            }
+        }
+        // Module namespace store at the `setdictvalue` position — after the
+        // data-descriptor walk so a surrogate-named data descriptor on the
+        // module's type fires first (`descr__setattr__` order).
+        if is_module(obj) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                setitem(w_dict, w_name, value)?;
                 return Ok(w_none());
             }
         }
@@ -2572,6 +2603,25 @@ pub(crate) unsafe fn object_delattr_surrogate(
 ) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     unsafe {
+        // descroperation.py:131-137 — a data descriptor's `__delete__`
+        // takes priority over the dict removal.  Mirror object_delattr,
+        // comparing WTF-8 keys so a surrogate-named descriptor is found,
+        // and run before the module/type/instance dict removal so a
+        // surrogate-named descriptor on the module's/metaclass's type is
+        // not shadowed by the namespace delete.
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        };
+        if !w_type.is_null() {
+            if let Some(descr) = lookup_in_type_wtf8(w_type, name) {
+                if is_data_descr(descr) {
+                    delete(descr, obj)?;
+                    return Ok(w_none());
+                }
+            }
+        }
         if is_module(obj) {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
@@ -2582,7 +2632,10 @@ pub(crate) unsafe fn object_delattr_surrogate(
         if is_type(obj) {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() && crate::dict_storage_delete_wtf8(&mut *dict_ptr, name) {
-                mutated(obj, None);
+                // A lone surrogate has no `&str` form, so `mutated` falls
+                // back to the conservative whole-cache reset (correct: a
+                // surrogate can never name `__eq__`/`__hash__`).
+                mutated(obj, name.as_str().ok());
                 return Ok(w_none());
             }
             return Err(attr_error_wtf8(obj, name));
@@ -2595,8 +2648,11 @@ pub(crate) unsafe fn object_delattr_surrogate(
     }
 }
 
-/// `raiseattrerror` for a lone-surrogate name; the message renders the
-/// name lossily (a surrogate has no `&str` form).
+/// `raiseattrerror` for a lone-surrogate name.  descroperation.py:58-64
+/// renders the name with `%R` (its repr), so a lone surrogate prints as
+/// `\udcXX` rather than a lossy replacement char.  The repr already
+/// supplies the surrounding quotes (`format_wtf8_repr`), matching the
+/// `%R` substitution in `"'%T' object has no attribute %R"`.
 fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
     let tp_name = unsafe {
         match crate::typedef::r#type(obj) {
@@ -2604,19 +2660,10 @@ fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
             None => (*(*obj).ob_type).name.to_string(),
         }
     };
-    let display = match name.as_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            let mut out = String::new();
-            for cp in name.code_points() {
-                out.push(cp.to_char().unwrap_or('\u{FFFD}'));
-            }
-            out
-        }
-    };
+    let name_repr = crate::display::format_wtf8_repr(name);
     PyError::new(
         PyErrorKind::AttributeError,
-        format!("'{tp_name}' object has no attribute '{display}'"),
+        format!("'{tp_name}' object has no attribute {name_repr}"),
     )
 }
 
@@ -4622,6 +4669,40 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     false
 }
 
+/// `space.lookup(w_descr, '__delete__') is not None` — whether the
+/// descriptor exposes a `__delete__`.  `setattr` consults this after a
+/// failed `__set__` lookup to reject a data descriptor that has a deleter
+/// but no setter (descroperation.py:124-126).
+unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
+    if descr.is_null() {
+        return false;
+    }
+    if is_property(descr)
+        || pyre_object::is_member(descr)
+        || pyre_object::getsetproperty::is_getset_property(descr)
+    {
+        return true;
+    }
+    if let Some(descr_type) = crate::typedef::r#type(descr) {
+        return lookup_in_type_where(descr_type, "__delete__").is_some();
+    }
+    false
+}
+
+/// descroperation.py:124-126 — a data descriptor exposing `__delete__`
+/// but no `__set__` rejects assignment with this AttributeError.  `%T`
+/// renders the descriptor's type name.
+unsafe fn descr_not_settable_error(descr: PyObjectRef) -> crate::PyError {
+    let tp_name = match crate::typedef::r#type(descr) {
+        Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+        None => (*(*descr).ob_type).name.to_string(),
+    };
+    crate::PyError::new(
+        crate::PyErrorKind::AttributeError,
+        format!("'{tp_name}' object is not a descriptor with set"),
+    )
+}
+
 /// Call a descriptor's __get__ method.
 ///
 /// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
@@ -4984,30 +5065,6 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
-    // Module objects: PyPy `module.py:Module` does not override
-    // `descr__setattr__`, so the call falls through to W_Root's
-    // `setdictvalue` (`baseobjspace.py:51-56`):
-    //
-    //     w_dict = self.getdict(space)
-    //     if w_dict is not None:
-    //         space.setitem_str(w_dict, attr, w_value)
-    //
-    // `space.setitem_str` is the generic dispatch: for an exact
-    // `W_DictMultiObject` it goes direct, but for a dict subclass
-    // (`moduledef.py:102-103` user-supplied `__builtins__`) it
-    // dispatches through the subclass's `__setitem__`.  pyre's
-    // `setitem` mirrors that — `is_dict(obj)` writes
-    // entries+storage in lock-step, `is_instance(obj)` looks up
-    // `__setitem__` in the MRO and calls it.
-    unsafe {
-        if is_module(obj) {
-            let w_dict = pyre_object::w_module_get_w_dict(obj);
-            if !w_dict.is_null() {
-                setitem(w_dict, w_str_new(name), value)?;
-                return Ok(w_none());
-            }
-        }
-    }
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
@@ -5027,6 +5084,12 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             if let Some(descr) = lookup_in_type_where(w_type, name) {
                 if set(descr, obj, value)? {
                     return Ok(w_none());
+                }
+                // descroperation.py:124-126 — `__delete__` but no `__set__`
+                // is a read-only data descriptor; reject rather than shadow
+                // it with an instance/type dict store.
+                if descr_has_delete(descr) {
+                    return Err(descr_not_settable_error(descr));
                 }
             }
         }
@@ -5067,8 +5130,29 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     //             return
     //         raiseattrerror(space, w_obj, name, w_descr)
     //
-    // The descriptor + type/module short-circuits above already handle the
+    // The descriptor + type short-circuits above already handle the
     // first half of this. What remains is `setdictvalue` + raiseattrerror.
+    //
+    // Module objects: PyPy `module.py:Module` does not override
+    // `descr__setattr__`, so the call reaches `setdictvalue` (`W_Root.
+    // setdictvalue` → `Module.getdict` → `self.w_dict`) only after the
+    // data-descriptor walk above.  pyre's `getdict` does not surface the
+    // module dict, so store it explicitly here at the `setdictvalue`
+    // position — never before the descriptor walk, or a data descriptor
+    // on the module's type (e.g. the read-only `__dict__` getset) would
+    // be shadowed by the namespace store.  `setitem` is the generic
+    // dispatch: an exact `W_DictMultiObject` goes direct, a dict subclass
+    // (`moduledef.py:102-103` user-supplied `__builtins__`) routes through
+    // its `__setitem__`.
+    unsafe {
+        if is_module(obj) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                setitem(w_dict, w_str_new(name), value)?;
+                return Ok(w_none());
+            }
+        }
+    }
     if setdictvalue(obj, name, value) {
         return Ok(w_none());
     }
@@ -5354,15 +5438,23 @@ fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
 ///                     "'%T' object attribute '%s' is read-only", w_obj, name)
 /// ```
 fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
-    let tp_name = unsafe {
-        match crate::typedef::r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => (*(*obj).ob_type).name.to_string(),
+    // descroperation.py:58-64 — a type receiver reports its own name through
+    // the `type object '%N'` form; every other object reports its type's name
+    // through the `'%T' object` form.
+    let subject = unsafe {
+        if is_type(obj) {
+            format!("type object '{}'", pyre_object::w_type_get_name(obj))
+        } else {
+            let tp_name = match crate::typedef::r#type(obj) {
+                Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                None => (*(*obj).ob_type).name.to_string(),
+            };
+            format!("'{}' object", tp_name)
         }
     };
     PyError::new(
         PyErrorKind::AttributeError,
-        format!("'{}' object has no attribute '{}'", tp_name, name),
+        format!("{} has no attribute '{}'", subject, name),
     )
 }
 
@@ -5388,6 +5480,28 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    // descroperation.py:131-140 descr__delattr__: a data descriptor's
+    // `__delete__` takes priority over the namespace delete. PyPy walks
+    // `space.type(obj)`, so the lookup must run for any object whose type
+    // pyre can resolve — not just W_InstanceObject — and before the
+    // module/type/instance dict removal below.
+    unsafe {
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else if is_type(obj) {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        };
+        if !w_type.is_null() {
+            if let Some(descr) = lookup_in_type_where(w_type, name) {
+                if is_data_descr(descr) {
+                    delete(descr, obj)?;
+                    return Ok(w_none());
+                }
+            }
+        }
+    }
     // Module objects: PyPy `module.py:Module` does not override
     // `descr__delattr__`, so the call falls through to W_Root's
     // `deldictvalue` (`baseobjspace.py:58-67`):
@@ -5447,26 +5561,6 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
                 return Err(raiseattrerror(obj, name));
-            }
-        }
-    }
-    // descroperation.py descr__delattr__: data descriptor __delete__ takes
-    // priority. PyPy walks `space.type(obj)`, so the lookup must run for
-    // any object whose type pyre can resolve — not just W_InstanceObject.
-    unsafe {
-        let w_type = if is_instance(obj) {
-            w_instance_get_type(obj)
-        } else if is_type(obj) {
-            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
-        } else {
-            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
-        };
-        if !w_type.is_null() {
-            if let Some(descr) = lookup_in_type_where(w_type, name) {
-                if is_data_descr(descr) {
-                    delete(descr, obj)?;
-                    return Ok(w_none());
-                }
             }
         }
     }

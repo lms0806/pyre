@@ -955,6 +955,7 @@ impl MIFrame {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
         }
     }
 
@@ -1349,6 +1350,28 @@ impl MIFrame {
         }
 
         let jitcode_ptr_pre = self.sym().jitcode;
+        // `pyjitpl.py:194-198`: a single `pc` drives both the result-box
+        // clear and the liveness decode.  Resolve the resume jitcode pc once
+        // here so the lazy-load preamble fills exactly the registers the
+        // snapshot below reads.  Marker-aware for an `in_a_call` parent whose
+        // CALL sits in a try-block: `after_residual_call_resume_pc_for` routes
+        // to the post-call `-live-`/catch.  Splitting the two — preamble at
+        // the fallthrough `-live-`, snapshot at the post-call `-live-` —
+        // would leave a post-call-only live register NONE in the resume data.
+        let resume_jit_pc: Option<usize> = unsafe {
+            let jc = &*jitcode_ptr_pre;
+            if jc.payload.metadata.pc_map.is_empty() {
+                None
+            } else {
+                Some(
+                    self.residual_call_pc
+                        .filter(|_| in_a_call)
+                        .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
+                        .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
+                        .expect("pc_map non-empty: resume pc lookup hits"),
+                )
+            }
+        };
         let live_regs_for_banks: Vec<(LiveBank, usize)> = unsafe {
             let jc = &*jitcode_ptr_pre;
             // Skeleton payload (no `pc_map` yet) → skip the lazy-load
@@ -1393,10 +1416,8 @@ impl MIFrame {
                 // stack can hold an OpRef before the kind bank has been
                 // populated, so collect every listed bank/index and complete
                 // the matching bank immediately before the direct snapshot.
-                let jit_pc = jc
-                    .payload
-                    .resume_jitcode_pc_for(live_pc)
-                    .expect("pc_map non-empty branch above ensures lookup hits");
+                let jit_pc =
+                    resume_jit_pc.expect("pc_map non-empty branch above ensures lookup hits");
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
                 let all_liveness = crate::state::liveness_info_snapshot();
@@ -1849,16 +1870,24 @@ impl MIFrame {
         // 201`). Register indices snapshot into `registers_r` in
         // int → ref → float bank order to match the encoder/decoder
         // contract (`all_liveness` byte layout).
-        let jit_pc = jc
-            .payload
-            .resume_jitcode_pc_for(live_pc)
-            .unwrap_or_else(|| {
-                panic!(
-                    "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
-                    live_pc,
-                    jc.payload.metadata.pc_map.len()
-                )
-            });
+        // Mirror RPython `pyjitpl.py:194-195 pc=self.pc`: an `in_a_call`
+        // parent whose CALL sits in a try-block reads liveness at that call's
+        // post-residual-call `-live-`/catch, so the encoded box count and
+        // bank layout match the blackhole's marker-routed resume position
+        // (`build_framestack_snapshot` folds the same marker into this
+        // frame's snapshot pc).  The pyre split between a narrowed
+        // fallthrough `-live-` and the un-narrowed post-call `-live-`
+        // otherwise crosses the two markers — the post-call `-live-` keeps
+        // the CALL result ref the next opcode pops, so the decoder reads one
+        // more ref than the encoder wrote.  Without a catch marker, use the
+        // plain fallthrough `-live-` via `pc_map`.
+        let jit_pc = resume_jit_pc.unwrap_or_else(|| {
+            panic!(
+                "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
+                live_pc,
+                jc.payload.metadata.pc_map.len()
+            )
+        });
         let op_live = crate::state::op_live();
         let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
         let all_liveness = crate::state::liveness_info_snapshot();
@@ -3817,12 +3846,12 @@ impl MIFrame {
                 self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
 
             // snapshot.pc must match the liveness PC used for active boxes
-            // (get_list_of_active_boxes uses fallthrough_pc when after_residual_call).
-            let callee_live_pc = if after_residual_call {
-                self.fallthrough_pc
-            } else {
-                self.orgpc
-            };
+            // (get_list_of_active_boxes uses fallthrough_pc when
+            // after_residual_call), and folds in the after-residual-call
+            // marker so an inlined frame's try-block residual call resumes
+            // at its OWN catch_exception — the single-frame path
+            // (capture_resumedata) applies the same fold.
+            let callee_live_pc = self.marker_aware_resume_pc(self.orgpc, after_residual_call);
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
             let snapshot = self.build_framestack_snapshot(
                 ctx,
@@ -3927,6 +3956,104 @@ impl MIFrame {
     /// `capture_resumedata(framestack, virtualizable_boxes,
     /// virtualref_boxes, after_residual_call=False)` which walks the full
     /// `self.framestack` to build one SnapshotFrame per live frame.
+    /// Resolve a top-frame snapshot pc, folding in the after-residual-call
+    /// marker when the residual call at `call_pc` sits inside a try-block.
+    ///
+    /// `call_pc` is the CALL opcode pc (the frame's pc before it was
+    /// advanced to the resume target).  Used by BOTH the single-frame
+    /// `capture_resumedata` and the multi-frame guard path so a residual
+    /// call resumes at its OWN catch_exception even when the calling frame
+    /// was inlined (`pyjitpl.py:2582 capture_resumedata` applies the
+    /// `after_residual_call` resume consistently to the top frame).
+    ///
+    /// The marker bit (1 << 14) steals the top bit of the i16 pc word
+    /// `resumecode::append_int` allows.  A *marked* pc ORs the bit onto a
+    /// value gated `< 1 << 14`; an *unmarked* pc (no try-block catch, or
+    /// the non-after_residual_call path) must independently leave bit 14
+    /// free, or `decode_resume_pc` mis-reads it as marked.  A function with
+    /// >= 16384 trace-bytecode units exceeds this and cannot be encoded
+    /// under the bit-14 scheme — fail loudly rather than corrupt decode
+    /// silently at resume time (resumedata.rs:48-62).  The panic is caught
+    /// by the recording-loop `catch_unwind` (pyjitpl/dispatch.rs:1419) and
+    /// converted to `AbortPermanent`, so an oversized function falls back
+    /// to the interpreter rather than crashing — consistent with
+    /// `resumecode::append_int`'s i16 assert on the same recording path.
+    fn marker_aware_resume_pc(&self, call_pc: usize, after_residual_call: bool) -> usize {
+        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
+        let wants_marker = after_residual_call && {
+            let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
+            crate::state::pyjitcode_for_jitcode_index(jitcode_index)
+                .and_then(|pj| pj.after_residual_call_resume_pc_for(call_pc))
+                .is_some()
+        };
+        if wants_marker {
+            // A residual call in a try-block must resume at its OWN catch,
+            // routed by the bit-14 marker.  If `call_pc` cannot fit under the
+            // marker, downgrading to an unmarked pc would silently mis-resume
+            // (decode routes through `pc_map` re-execution instead of
+            // `after_residual_call_resume_pc_for`), so fail loudly here too —
+            // caught by the recording `catch_unwind` → interpreter fallback.
+            assert!(
+                call_pc < flag,
+                "after-residual-call resume pc {call_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
+                 function too large for bit-14 resume encoding"
+            );
+            majit_ir::resumedata::encode_after_residual_call_pc(call_pc as i32) as usize
+        } else {
+            let raw = if after_residual_call {
+                self.fallthrough_pc
+            } else {
+                call_pc
+            };
+            assert!(
+                raw < flag,
+                "resume pc {raw} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
+                 function too large for bit-14 resume encoding"
+            );
+            raw
+        }
+    }
+
+    /// Parent-frame analogue of [`Self::marker_aware_resume_pc`].  A parent
+    /// (`in_a_call`) frame whose CALL sits in a try-block must resume at that
+    /// call's OWN `catch_exception` when a guard deopts inside the callee and
+    /// the exception unwinds to a handler here (`pyjitpl.py:2601-2602`;
+    /// `blackhole.py:396-410 handle_exception_in_frame`).  Fold the bit-14
+    /// marker onto the CALL pc so the decoder routes through
+    /// `after_residual_call_resume_pc` (its catch) rather than `pc_map` (the
+    /// next opcode).  Without a catch marker, keep the plain `return_point_pc`
+    /// (fallthrough) — the exception then propagates out of this frame.  The
+    /// liveness encoded for this frame (`get_list_of_active_boxes` →
+    /// `materialize_parent_snapshot_state`) is keyed on the same marker, so
+    /// encode and decode read the one `-live-`.
+    fn marker_aware_parent_resume_pc(
+        parent_jitcode_index: u32,
+        call_pc: Option<usize>,
+        return_point_pc: usize,
+    ) -> usize {
+        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
+        let marked_call_pc = call_pc.filter(|&cp| {
+            crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
+                .and_then(|pj| pj.after_residual_call_resume_pc_for(cp))
+                .is_some()
+        });
+        if let Some(cp) = marked_call_pc {
+            assert!(
+                cp < flag,
+                "after-residual-call parent resume pc {cp} >= AFTER_RESIDUAL_CALL_PC_FLAG \
+                 ({flag}); function too large for bit-14 resume encoding"
+            );
+            majit_ir::resumedata::encode_after_residual_call_pc(cp as i32) as usize
+        } else {
+            assert!(
+                return_point_pc < flag,
+                "parent resume pc {return_point_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
+                 function too large for bit-14 resume encoding"
+            );
+            return_point_pc
+        }
+    }
+
     fn capture_resumedata(
         &mut self,
         ctx: &mut TraceCtx,
@@ -3961,37 +4088,7 @@ impl MIFrame {
         // (`pyjitpl.py:2610-2624`) and lets `handle_exception_in_frame`
         // decide catch-vs-propagate; pyre only emits that marker for
         // try-block calls, so the non-try case falls back here.
-        // The marker bit (1 << 14) steals the top bit of the i16 pc word
-        // `resumecode::append_int` allows.  A *marked* pc ORs the bit onto
-        // a value gated `< 1 << 14`; an *unmarked* pc (no try-block catch,
-        // or the non-after_residual_call path) must independently leave
-        // bit 14 free, or `decode_resume_pc` mis-reads it as marked.  A
-        // function with >= 16384 trace-bytecode units exceeds this and
-        // cannot be encoded under the bit-14 scheme — fail loudly here
-        // rather than corrupt decode silently at resume time
-        // (resumedata.rs:48-62).
-        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-        let marked = after_residual_call && {
-            let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
-            crate::state::pyjitcode_for_jitcode_index(jitcode_index)
-                .and_then(|pj| pj.after_residual_call_resume_pc_for(saved_orgpc))
-                .is_some()
-        };
-        let snapshot_live_pc = if marked && saved_orgpc < flag {
-            majit_ir::resumedata::encode_after_residual_call_pc(saved_orgpc as i32) as usize
-        } else {
-            let raw = if after_residual_call {
-                self.fallthrough_pc
-            } else {
-                self.orgpc
-            };
-            assert!(
-                raw < flag,
-                "resume pc {raw} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
-                 function too large for bit-14 resume encoding"
-            );
-            raw
-        };
+        let snapshot_live_pc = self.marker_aware_resume_pc(saved_orgpc, after_residual_call);
 
         // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
         //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
@@ -4066,19 +4163,20 @@ impl MIFrame {
             } else {
                 &[]
             };
-            // Parent frames never carry the after-residual-call marker, so
-            // their raw resume pc must leave bit 14 free or decode would
-            // mis-read it as marked (resumedata.rs:48-62).
-            assert!(
-                (parent.resume_pc as usize)
-                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
-                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                 function too large for bit-14 resume encoding",
-                parent.resume_pc
+            // A parent whose CALL is in a try-block resumes at that call's
+            // own catch (bit-14 marker on the CALL pc); otherwise the raw
+            // return_point_pc, which must leave bit 14 free or decode would
+            // mis-read it as marked (resumedata.rs:48-62).  The marker gate
+            // matches the catch-vs-fallthrough liveness chosen for
+            // `parent_active` in `materialize_parent_snapshot_state`.
+            let parent_pc = Self::marker_aware_parent_resume_pc(
+                parent_jitcode_index,
+                parent.call_pc,
+                parent.resume_pc,
             );
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
-                pc: parent.resume_pc as u32,
+                pc: parent_pc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
@@ -4241,6 +4339,9 @@ impl MIFrame {
             resume_pc: self.fallthrough_pc,
             pending_result_stack_idx: result_stack_idx,
             pending_result_type: result_type,
+            // Helper caller resumes at the post-CALL fallthrough, not a
+            // try-block catch, so it carries no marker call pc.
+            call_pc: None,
         };
         let (self_types_full, self_jitcode_index, self_active) =
             self.materialize_parent_snapshot_state(ctx, self_as_parent);
@@ -4379,6 +4480,9 @@ impl MIFrame {
             resume_pc: self.fallthrough_pc,
             pending_result_stack_idx: Some(result_stack_idx),
             pending_result_type: Some(result_type),
+            // Helper caller resumes at the post-CALL fallthrough, not a
+            // try-block catch, so it carries no marker call pc.
+            call_pc: None,
         };
         let (self_types_full, _) = self.materialize_parent_frame_state(ctx, self_as_parent);
         if self_types_full.len() > n {
@@ -4457,6 +4561,12 @@ impl MIFrame {
         );
         parent_frame.pending_result_stack_idx = parent.pending_result_stack_idx;
         parent_frame.pending_result_type = parent.pending_result_type;
+        // When the parent's CALL sits in a try-block, read this frame's
+        // liveness at the call's post-residual-call `-live-`/catch (mirroring
+        // `pyjitpl.py:194-195 pc=self.pc`) so the encoded box count matches
+        // the blackhole's marker-routed resume position (`build_framestack_
+        // snapshot` folds the same marker into this parent's snapshot pc).
+        parent_frame.residual_call_pc = parent.call_pc;
         let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false);
         let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
         let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
@@ -4975,6 +5085,15 @@ impl MIFrame {
         // use the same other_target adaptation — the callee frame's resume
         // pc points past POP_JUMP_IF_* (not at it), while parent frames
         // keep their original return_point pc.
+        //
+        // A branch guard never carries the after-residual-call marker, so its
+        // plain top-frame resume pc must leave bit 14 free or `decode_resume_pc`
+        // mis-reads it as marked (resumedata.rs:48-62) — fail loudly otherwise.
+        assert!(
+            resume_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
+            "branch-guard resume pc {resume_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+             function too large for bit-14 resume encoding"
+        );
         let snapshot = self.build_framestack_snapshot(
             ctx,
             resume_pc,
@@ -7422,6 +7541,12 @@ impl MIFrame {
             sym: self.sym,
             concrete_frame_addr: self.concrete_frame_addr,
             resume_pc: return_point_pc,
+            // The caller's CALL pc — its post-call `-live-`/`catch_exception`
+            // (keyed by this pc in `after_residual_call_resume_pc`) is where
+            // the blackhole must resume this frame if a guard deopts inside
+            // the callee and the exception unwinds to a handler here
+            // (`pyjitpl.py:2601-2602`).  `orgpc` is the CALL opcode start.
+            call_pc: Some(self.orgpc),
             // `metainterp::push_inline_frame` overwrites this with the
             // caller's just-computed result stack idx (`pyjitpl.py:181-193`
             // parity).
@@ -8411,6 +8536,17 @@ impl MIFrame {
 
                 // capture_resumedata parity: full framestack snapshot.
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
+                //
+                // The post-call exception is carried to blackhole resume via
+                // `jf_guard_exc` (the guard_exc channel), not the bit-14 resume
+                // marker, so the top-frame resume pc stays a plain `fallthrough_pc`
+                // and must leave bit 14 free or `decode_resume_pc` mis-reads it
+                // as marked (resumedata.rs:48-62) — fail loudly otherwise.
+                assert!(
+                    resume_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
+                    "exception-guard resume pc {resume_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                     function too large for bit-14 resume encoding"
+                );
                 let snapshot =
                     this.build_framestack_snapshot(ctx, resume_pc, &active_boxes, &fail_arg_types);
                 // Snapshot is the source of truth —
@@ -10644,6 +10780,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10798,6 +10935,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10873,6 +11011,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
@@ -10958,6 +11097,7 @@ mod tests {
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
+            residual_call_pc: None,
             orgpc: 3,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,

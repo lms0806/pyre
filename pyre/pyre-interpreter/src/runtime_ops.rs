@@ -192,7 +192,7 @@ pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
 /// machinery runs and would bypass try/except. The call helpers return
 /// garbage on Err; resume data hands control to the except block.
 #[inline]
-fn jit_publish_exception(exc_obj: PyObjectRef) {
+pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
     if exc_obj != PY_NULL {
         if let Some(raiser) = JIT_EXC_RAISER.get() {
             raiser(exc_obj as i64);

@@ -110,7 +110,7 @@ pub(crate) fn format_float_repr(val: f64) -> String {
 /// quote, common whitespace, and control characters.  Lone surrogate code
 /// points are escaped via `char_escape_helper` (`rutf8.py:647`) as
 /// `\uXXXX`.  Non-control scalar values pass through verbatim.
-fn format_wtf8_repr(s: &Wtf8) -> String {
+pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
     let bytes = s.as_bytes();
     let has_single = bytes.contains(&b'\'');
     let has_double = bytes.contains(&b'"');

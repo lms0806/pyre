@@ -677,7 +677,10 @@ fn handle_fail_resume_guard(
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
     // descr is the sole identity carrier; the receiver derives green_key /
     // trace_id / fail_index from it via `fail_descr_arc_from_addr` and
-    // `descr_owning_jct`.
+    // `descr_owning_jct`.  The `guard_exc` grabbed above is seeded as the
+    // resume exception (`blackhole.py:1647` `_prepare_resume_from_failure`,
+    // consumed at `blackhole.py:1794`); re-reading `jf_guard_exc` here would
+    // observe the post-`grab_exc_value` null and drop the exception.
     if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
         if let Some(bh_result) = blackhole(
             descr_raw,

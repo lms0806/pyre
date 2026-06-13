@@ -4740,8 +4740,9 @@ fn init_type_type(ns: &mut DictStorage) {
                     unsafe { pyre_object::w_type_get_name(w_type) }
                 )));
             }
-            // typeobject.py:1050 — value must be a str.
-            if !unsafe { pyre_object::is_str(w_value) } {
+            // typeobject.py:1050 — `space.isinstance_w(w_value, space.w_text)`
+            // accepts str and any str subclass, not only the exact type.
+            if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
                 return Err(crate::PyError::type_error(format!(
                     "can only assign string to {}.__name__, not '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
