@@ -81,7 +81,7 @@ pub fn copy_str_content(
     mode: u8,
     need_next_offset: bool,
 ) -> OpRef {
-    let srcbox = ctx.get_box_replacement(srcbox).to_opref();
+    let srcbox = ctx.get_replacement_opref(srcbox);
     let (set_opcode, copy_opcode, get_opcode) = if mode != 0 {
         (
             OpCode::Unicodesetitem,
@@ -278,7 +278,7 @@ pub fn string_copy_parts(
             let one = ctx.emit_constant_int(1);
             for ch in &chars {
                 if let Some(ch_ref) = ch {
-                    let ch_resolved = ctx.get_box_replacement(*ch_ref).to_opref();
+                    let ch_resolved = ctx.get_replacement_opref(*ch_ref);
                     let arg_target = ctx.materialize_box_at(targetbox);
                     let arg_offset = ctx.materialize_box_at(offset);
                     let arg_char = ctx.materialize_box_at(ch_resolved);
@@ -315,13 +315,14 @@ pub fn string_copy_parts(
 /// Force a string-typed OpRef if it's virtual. Used by string_copy_parts
 /// base class path (vstring.py:138: srcbox = self.force_box(op, optstring)).
 fn force_child_for_string(opref: OpRef, ctx: &mut OptContext) -> OpRef {
-    let resolved = ctx.get_box_replacement(opref).to_opref();
+    // One chain walk; the position view falls back to the source.
     let resolved_box = ctx.get_box_replacement_box(opref);
+    let resolved = resolved_box.as_ref().map_or(opref, |b| b.to_opref());
     if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
         let resolved_box = resolved_box.expect("recorder-populated");
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
         let forced = info.force_box(resolved_box, ctx);
-        return ctx.get_box_replacement(forced).to_opref();
+        return ctx.get_replacement_opref(forced);
     }
     resolved
 }
@@ -421,13 +422,14 @@ impl OptString {
 
     /// vstring.py:76-103 StrPtrInfo.force_box — delegate to PtrInfo::force_box.
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref).to_opref();
+        // One chain walk; the position view falls back to the source.
         let resolved_box = ctx.get_box_replacement_box(opref);
+        let resolved = resolved_box.as_ref().map_or(opref, |b| b.to_opref());
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved_box, ctx);
-            return ctx.get_box_replacement(forced).to_opref();
+            return ctx.get_replacement_opref(forced);
         }
         resolved
     }
@@ -565,7 +567,8 @@ impl OptString {
             }
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // NEWSTR/NEWUNICODE produce the string object directly; use the
+        // bound result box as the PtrInfo host.
         let op_box = BoxRef::from_bound_op(op_rc);
         ctx.make_nonnull_str(&op_box, mode);
         // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
@@ -584,7 +587,7 @@ impl OptString {
         let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         let idx_ref = op.arg(1).to_opref();
         let char_ref = op.arg(2).to_opref();
-        let char_resolved = ctx.get_box_replacement(char_ref).to_opref();
+        let char_resolved = ctx.get_replacement_opref(char_ref);
 
         if let Some(idx) = ctx
             .get_box_replacement_box(idx_ref)
@@ -718,7 +721,7 @@ impl OptString {
                 for index in 0..length {
                     let char_ref =
                         if let Some(ch_ref) = self.strgetitem(src_ref, src_start + index, ctx) {
-                            ctx.get_box_replacement(ch_ref).to_opref()
+                            ctx.get_replacement_opref(ch_ref)
                         } else {
                             // vstring.py:580-581 → _strgetitem → emit_extra
                             let index_ref = ctx.make_constant_int(src_start + index);
@@ -812,7 +815,7 @@ impl OptString {
         } else {
             1u8
         };
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // STRLEN postprocess updates PtrInfo on the resolved receiver box.
         if let Some(arg0_box) = ctx.resolve_box_box_opt(&op.arg(0)) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
@@ -890,7 +893,7 @@ impl OptString {
         if op.num_args() >= 3 {
             let vleft = ctx.resolve_box_box(&op.arg(1)).to_opref();
             let vright = ctx.resolve_box_box(&op.arg(2)).to_opref();
-            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            // The resolved string boxes are the PtrInfo hosts for the concat.
             if let Some(vleft_box) = ctx.get_box_replacement_box(vleft) {
                 ctx.make_nonnull_str(&vleft_box, mode);
             }
@@ -930,7 +933,8 @@ impl OptString {
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
             let mut s = ctx.resolve_box_box(&op.arg(1)).to_opref();
-            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            // Mark the resolved source string as non-null before creating
+            // the virtual slice info.
             if let Some(s_box) = ctx.get_box_replacement_box(s) {
                 ctx.make_nonnull_str(&s_box, mode);
             }
@@ -1068,7 +1072,7 @@ impl OptString {
                 // vstring.py:744-755: len-0 check
                 if self.is_known_nonnull(arg1, ctx) {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
-                    // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+                    // Preserve the non-null string fact on the resolved box.
                     if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
                         ctx.make_nonnull_str(&arg1_box, mode);
                     }
@@ -1108,7 +1112,7 @@ impl OptString {
                     }
                 }
                 // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
-                let resolved1 = ctx.get_box_replacement(arg1).to_opref();
+                let resolved1 = ctx.get_replacement_opref(arg1);
                 if let Some(info) = self.get_slice_info(resolved1, ctx) {
                     let source = info.s;
                     let start = info.start;
@@ -1186,7 +1190,7 @@ impl OptString {
             }
         }
         // vstring.py:807-813: if arg1 is a virtual slice
-        let resolved1 = ctx.get_box_replacement(arg1).to_opref();
+        let resolved1 = ctx.get_replacement_opref(arg1);
         if let Some(info) = self.get_slice_info(resolved1, ctx) {
             let source = info.s;
             let start = info.start;
