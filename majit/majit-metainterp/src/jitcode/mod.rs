@@ -718,16 +718,15 @@ mod tests {
     /// Tasks #94c (abort/*) and #94b' (state_*) seeded the
     /// `pyre_extension_insns()` quarantine with the 8 keys arising from
     /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
-    /// state addressing (6).  Subsequent slices added 4 more pyre-only
+    /// state addressing (6).  Subsequent slices added 3 more pyre-only
     /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
     /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
-    /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
-    /// reification), and `getarrayitem_gc_r/rrd>r` (Ref-indexed GC array
-    /// read; RPython only has the int-indexed `rid` shape) — so the
-    /// `pyre_extension_insns()` table now holds 12 entries total.
-    /// `wellknown_bh_insns()` is a strict subset of RPython's canonical
-    /// opname universe; `insn_byte` merges both tables so build-time
-    /// `write_insn(...)` callers continue to resolve unchanged.
+    /// `abort/`), and `vtable_method_ptr/rd>i` (dyn-trait method-pointer
+    /// reification) — so the `pyre_extension_insns()` table now holds 11
+    /// entries total.  `wellknown_bh_insns()` is a strict subset of
+    /// RPython's canonical opname universe; `insn_byte` merges both tables
+    /// so build-time `write_insn(...)` callers continue to resolve
+    /// unchanged.
     #[test]
     fn pyre_extension_insns_quarantines_pyre_only_keys_out_of_wellknown() {
         let wellknown = wellknown_bh_insns();
@@ -752,12 +751,6 @@ mod tests {
             (
                 "vtable_method_ptr/rd>i",
                 majit_translate::insns::BC_VTABLE_METHOD_PTR,
-            ),
-            // Ref-indexed GC array read (RPython only has the int-indexed
-            // `rid` shape).
-            (
-                "getarrayitem_gc_r/rrd>r",
-                majit_translate::insns::BC_GETARRAYITEM_GC_R_RRD,
             ),
         ];
 

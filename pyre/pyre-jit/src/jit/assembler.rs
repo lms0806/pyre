@@ -1176,7 +1176,9 @@ fn dispatch_op(
         }
         // Heap GC-array primitives, canonical shapes
         // `new_array_clear/id>r` (blackhole.py `bhimpl_new_array_clear`)
-        // and `setarrayitem_gc_r/rird` (`bhimpl_setarrayitem_gc_r`).
+        // and `setarrayitem_gc_r/rird` (`bhimpl_setarrayitem_gc_r`),
+        // plus their `c`-argcode forms `cd>r`/`rcrd` for small ConstInt
+        // operands (USE_C_FORM).
         // The descr operand arrives as an already-materialised
         // `DescrOperand::Bh(BhDescr::Array { .. })` and registers onto
         // the builder's shared descrs pool (`assembler.py:197-207
@@ -1188,9 +1190,20 @@ fn dispatch_op(
                 "new_array_clear expects [length, arraydescr]"
             );
             let dst = expect_result_reg(result, Kind::Ref, "new_array_clear needs result");
-            let length = expect_int_reg_or_pool(state, &args[0]);
             let descr_idx = expect_array_bh_descr(state, &args[1], "new_array_clear");
-            state.builder.new_array_clear(dst, length, descr_idx);
+            // `assembler.py:99-107 emit_const(allow_short=True)` —
+            // `new_array_clear` is in `USE_C_FORM` (`assembler.py:312`),
+            // so a small ConstInt length is encoded inline as the `c`
+            // argcode (`new_array_clear/cd>r`).
+            match &args[0] {
+                Operand::ConstInt(v) if (-128..=127).contains(v) => {
+                    state.builder.new_array_clear_c(dst, *v as i8, descr_idx);
+                }
+                other => {
+                    let length = expect_int_reg_or_pool(state, other);
+                    state.builder.new_array_clear(dst, length, descr_idx);
+                }
+            }
         }
         "setarrayitem_gc_r" => {
             assert_eq!(
@@ -1199,12 +1212,23 @@ fn dispatch_op(
                 "setarrayitem_gc_r expects [array, index, value, arraydescr]"
             );
             let array = expect_reg(&args[0], Kind::Ref);
-            let index = expect_int_reg_or_pool(state, &args[1]);
             let value = expect_ref_reg_or_pool(state, &args[2]);
             let descr_idx = expect_array_bh_descr(state, &args[3], "setarrayitem_gc_r");
-            state
-                .builder
-                .setarrayitem_gc_r(array, index, value, descr_idx);
+            // `setarrayitem_gc_r` is also in `USE_C_FORM`: a small
+            // ConstInt index takes the `c` form (`setarrayitem_gc_r/rcrd`).
+            match &args[1] {
+                Operand::ConstInt(v) if (-128..=127).contains(v) => {
+                    state
+                        .builder
+                        .setarrayitem_gc_r_c(array, *v as i8, value, descr_idx);
+                }
+                other => {
+                    let index = expect_int_reg_or_pool(state, other);
+                    state
+                        .builder
+                        .setarrayitem_gc_r(array, index, value, descr_idx);
+                }
+            }
         }
         "hint_force_virtualizable" => {
             assert_eq!(args.len(), 1, "hint_force_virtualizable expects [vable]");

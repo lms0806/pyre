@@ -1081,6 +1081,21 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "new_array_clear dst");
     }
 
+    /// `c`-argcode form of [`Self::new_array_clear`] —
+    /// `assembler.py:99-107 emit_const(allow_short=True)` writes a
+    /// small ConstInt length (-128..127) inline as one signed byte
+    /// (`new_array_clear` is in `USE_C_FORM`, `assembler.py:312`).
+    ///
+    /// Encoding: `[BC_NEW_ARRAY_CLEAR_C][length i8][descr_idx lo u8]
+    ///             [descr_idx hi u8][dst u8]`.
+    pub fn new_array_clear_c(&mut self, dst: u16, length: i8, descr_idx: u16) {
+        self.touch_ref_reg(dst);
+        self.write_insn("new_array_clear/cd>r");
+        self.push_u8(length as u8);
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "new_array_clear dst");
+    }
+
     /// Store a Ref element into a GC-managed array.
     ///
     /// blackhole.py `bhimpl_setarrayitem_gc_r @arguments("cpu","r","i",
@@ -1104,6 +1119,29 @@ impl JitCodeBuilder {
         self.write_insn("setarrayitem_gc_r/rird");
         self.push_reg_u8(array_reg, "setarrayitem_gc_r array");
         self.push_reg_u8(index_reg, "setarrayitem_gc_r index");
+        self.push_reg_u8(value_reg, "setarrayitem_gc_r value");
+        self.push_u16(descr_idx);
+    }
+
+    /// `c`-argcode form of [`Self::setarrayitem_gc_r`] —
+    /// `assembler.py:99-107 emit_const(allow_short=True)` writes a
+    /// small ConstInt index (-128..127) inline as one signed byte
+    /// (`setarrayitem_gc_r` is in `USE_C_FORM`, `assembler.py:312`).
+    ///
+    /// Encoding: `[BC_SETARRAYITEM_GC_R_C][array_reg u8][index i8]
+    ///             [value_reg u8][descr_idx lo u8][descr_idx hi u8]`.
+    pub fn setarrayitem_gc_r_c(
+        &mut self,
+        array_reg: u16,
+        index: i8,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_ref_reg_or_pool_slot(value_reg);
+        self.write_insn("setarrayitem_gc_r/rcrd");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_r array");
+        self.push_u8(index as u8);
         self.push_reg_u8(value_reg, "setarrayitem_gc_r value");
         self.push_u16(descr_idx);
     }

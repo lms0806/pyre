@@ -1436,6 +1436,15 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
+                // Array indices are typed Signed, so the index register is
+                // always the int bank.  `bhimpl_getarrayitem_gc_*` only
+                // dispatches the `i`-index argcode; a ref/float index is a
+                // kind-flow bug upstream of the codewriter — fail here rather
+                // than emit an unconsumable ref-index (`rrd`/`ird`) shape.
+                assert_eq!(
+                    kc, 'i',
+                    "getarrayitem_gc array index must be int-kind, got {kc:?}",
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 // descr.py:359-362 + ARRAY_INSIDE._hints.get('nolength',
@@ -1481,6 +1490,15 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
+                // Array indices are typed Signed, so the index register is
+                // always the int bank.  `bhimpl_setarrayitem_gc_*` only
+                // dispatches the `i`-index argcode; a ref/float index is a
+                // kind-flow bug upstream of the codewriter — fail here rather
+                // than emit an unconsumable ref-index (`rrrd`) shape.
+                assert_eq!(
+                    kc, 'i',
+                    "setarrayitem_gc array index must be int-kind, got {kc:?}",
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);

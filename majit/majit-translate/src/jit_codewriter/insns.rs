@@ -314,12 +314,10 @@ pub const BC_SETFIELD_GC_I: u8 = 172;
 pub const BC_SETFIELD_GC_R: u8 = 173;
 
 // `getarrayitem_gc_*` / `setarrayitem_gc_*` — RPython
-// `blackhole.py:1330-1422`.  `bhimpl_getarrayitem_gc_{i,r,f}` only
-// defines the `rid` (ref + int_idx + descr) argcode shape.  Pyre also
-// emits a `rrd` (ref + ref_idx + descr) shape from
-// `OpKind::ArrayRead { index_ty: Ref }` (`blackhole.rs:6938`); that
-// shape has no upstream counterpart and lives in
-// `pyre_extension_insns()` — not here.
+// `blackhole.py:1330-1422`.  `bhimpl_getarrayitem_gc_{i,r,f}` defines
+// the `rid` (ref + int_idx + descr) argcode shape; array indices are
+// always int-classified, so the index operand always lands in the `i`
+// register bank.
 pub const BC_GETARRAYITEM_GC_R_RID: u8 = 174;
 pub const BC_SETARRAYITEM_GC_I: u8 = 176;
 pub const BC_SETARRAYITEM_GC_R: u8 = 177;
@@ -410,6 +408,15 @@ pub const BC_INT_BETWEEN: u8 = 213;
 // `pyframe.py:408-419` fixed-size items-array allocation).
 pub const BC_NEW_ARRAY_CLEAR: u8 = 214;
 
+// `c`-argcode forms (`assembler.py:99-107 emit_const(allow_short=
+// True)`): `new_array_clear` and `setarrayitem_gc_r` are both in
+// `USE_C_FORM` (`assembler.py:312`), so a small ConstInt operand
+// (-128..127) is written inline as one signed byte instead of a
+// constant-pool `i` slot, giving keys `new_array_clear/cd>r` and
+// `setarrayitem_gc_r/rcrd`.
+pub const BC_SETARRAYITEM_GC_R_C: u8 = 215;
+pub const BC_NEW_ARRAY_CLEAR_C: u8 = 216;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -423,15 +430,6 @@ pub const BC_ABORT_RESULT_R: u8 = 195;
 // pointer must be reified into the bytecode stream (backend-epic
 // adaptation, see `blackhole.rs:8462-8474`).
 pub const BC_VTABLE_METHOD_PTR: u8 = 196;
-
-// pyre-only `getarrayitem_gc_r/rrd>r` — Ref-indexed array read.  RPython
-// `blackhole.py:1333` only defines the `rid` (int-indexed) shape;
-// pyre's `OpKind::ArrayRead { index_ty: Ref, .. }` lowering
-// (`blackhole.rs:6938`) emits this `rrd` shape so the assembler can
-// encode the typed-Ref index without an int-coerce.  Quarantined into
-// `pyre_extension_insns()` until a porting pass lifts the ref-index
-// case to upstream's `cpu.bh_call_*`-resolved dispatch shape.
-pub const BC_GETARRAYITEM_GC_R_RRD: u8 = 175;
 
 // `record_quasiimmut_field/rdd` — RPython `blackhole.py:1538-1545`
 // `bhimpl_record_quasiimmut_field`.  Records that a quasi-immutable
@@ -829,9 +827,10 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("getfield_gc_f_pure/rd>f", BC_GETFIELD_GC_F_PURE);
 
     // GC heap array element load/store — `blackhole.py:1330-1422`.
-    // `bhimpl_getarrayitem_gc_{i,r,f}` only register the canonical
-    // `rid` (ref + int_idx + descr) shape.  Pyre's pyre-only `rrd` (ref
-    // + ref_idx + descr) shape lives in `pyre_extension_insns()`.
+    // `bhimpl_getarrayitem_gc_{i,r,f}` register only the canonical `rid`
+    // (ref + int_idx + descr) shape; array indices are always int-classified,
+    // and the assembler enforces the int-index argcode at emit time
+    // (`assembler.rs` `OpKind::ArrayRead`/`ArrayWrite`).
     // Setters are 4-byte payloads `ri{i,r,f}d` per
     // `bhimpl_setarrayitem_gc_{i,r,f}(cpu, array, index, newvalue,
     // arraydescr)` (`blackhole.py:1351-1359`): array (Ref), index (Int),
@@ -843,6 +842,10 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     // GC array allocation — `blackhole.py:1311-1313
     // bhimpl_new_array_clear @arguments("cpu","i","d",returns="r")`.
     m.insert("new_array_clear/id>r", BC_NEW_ARRAY_CLEAR);
+    // `c`-argcode forms (USE_C_FORM, `assembler.py:163/312`): small
+    // ConstInt index/length written inline as one signed byte.
+    m.insert("setarrayitem_gc_r/rcrd", BC_SETARRAYITEM_GC_R_C);
+    m.insert("new_array_clear/cd>r", BC_NEW_ARRAY_CLEAR_C);
     m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_gc_f/rid>f", BC_GETARRAYITEM_GC_F);
     // RPython `blackhole.py:1339-1341` aliases
@@ -1128,14 +1131,5 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     // pyre's Rust port hits this only on `dyn Trait` calls, where the
     // backend epic must look up the vtable slot itself.
     m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
-    // pyre-only `getarrayitem_gc_r/rrd>r` — Ref-indexed GC array read.
-    // RPython `blackhole.py:1333 bhimpl_getarrayitem_gc_r` only
-    // registers the canonical `rid` (int-indexed) shape.  Pyre's
-    // `OpKind::ArrayRead { index_ty: Ref, .. }` lowering
-    // (`blackhole.rs:6938`) emits this `rrd` shape so the assembler can
-    // encode the typed-Ref index without an int-coerce; converging
-    // requires lifting the ref-index case to upstream's
-    // `cpu.bh_call_*`-resolved dispatch shape.
-    m.insert("getarrayitem_gc_r/rrd>r", BC_GETARRAYITEM_GC_R_RRD);
     m
 }

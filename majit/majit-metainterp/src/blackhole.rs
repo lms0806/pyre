@@ -3517,11 +3517,11 @@ mod tests {
         fn wire_bhimpl_handlers_wires_tagged_int_base_access_aliases() {
             // Canonical RPython opnames (`_i`/`_r`/`_f`) emitted by pyre's
             // build-time assembler — including the pyre tagged-int base
-            // variant (`/id>X`, `/iXd`, `/iid>X`, `/ird>X`) that carries
-            // the base pointer in an int register. Emit side:
-            // majit-translate assembler.rs FieldRead/FieldWrite/ArrayRead
-            // /VableFieldRead/VableFieldWrite derive the opname kind
-            // suffix from the value/result register kind.
+            // variant (`/id>X`, `/iXd`, `/iid>X`) that carries the base
+            // pointer in an int register. Emit side: majit-translate
+            // assembler.rs FieldRead/FieldWrite/ArrayRead/VableFieldRead/
+            // VableFieldWrite derive the opname kind suffix from the
+            // value/result register kind.
             let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
                 majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
@@ -3529,17 +3529,16 @@ mod tests {
             insns.insert("setfield_gc_i/iid".to_string(), 2u8);
             insns.insert("setfield_gc_r/ird".to_string(), 3u8);
             insns.insert("getarrayitem_gc_i/iid>i".to_string(), 4u8);
-            insns.insert("getarrayitem_gc_i/ird>i".to_string(), 5u8);
-            insns.insert("getfield_vable_i/id>i".to_string(), 6u8);
-            insns.insert("setfield_vable_i/iid".to_string(), 7u8);
-            insns.insert("setfield_vable_r/ird".to_string(), 8u8);
+            insns.insert("getfield_vable_i/id>i".to_string(), 5u8);
+            insns.insert("setfield_vable_i/iid".to_string(), 6u8);
+            insns.insert("setfield_vable_r/ird".to_string(), 7u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
             super::wire_bhimpl_handlers(&mut builder);
 
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
-            for slot in 0usize..=8 {
+            for slot in 0usize..=7 {
                 assert_ne!(
                     builder.dispatch_table[slot] as *const () as usize, placeholder,
                     "slot {slot} must be wired",
@@ -5396,18 +5395,6 @@ fn handler_getarrayitem_gc_i_intbase(
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
-fn handler_getarrayitem_gc_i_intbase_refindex(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[position] as usize];
-    let index = bh.registers_r[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
-    Ok(pos + 1)
-}
 fn handler_getarrayitem_gc_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -5415,24 +5402,6 @@ fn handler_getarrayitem_gc_r(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, descr).0 as i64;
-    Ok(pos + 1)
-}
-
-// pyre-only `getarrayitem_gc_r/rrd>r`: index lands in a Ref register
-// (tagged-int-in-ref deviation — same root as `/rr>i` arithmetic
-// aliases). `registers_r`/`registers_i` both `Vec<i64>` so the raw
-// bits read back as the intended integer index. Disappears once
-// rtyper classifies integer array indices as `Signed`.
-fn handler_getarrayitem_gc_r_refindex(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_r[code[position] as usize];
-    let index = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, descr).0 as i64;
@@ -5469,17 +5438,17 @@ fn handler_setarrayitem_gc_r(
     Ok(pos)
 }
 
-// pyre-only `setarrayitem_gc_r/rrrd`: index lands in a Ref register
-// (same rtyper coverage gap as `getarrayitem_gc_r/rrd>r`). Identical
-// body to `handler_setarrayitem_gc_r` except index is read from
-// `registers_r` instead of `registers_i`.
-fn handler_setarrayitem_gc_r_refindex(
+// `setarrayitem_gc_r/rcrd` — `c`-argcode index (`assembler.py:99-107
+// emit_const(allow_short=True)`, USE_C_FORM `assembler.py:312`): the
+// index is one inline signed byte (`blackhole.py:127-129` decodes
+// `'c'` as a signed char), not a `registers_i`/pool slot.
+fn handler_setarrayitem_gc_r_c(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
-    let index = bh.registers_r[code[position + 1] as usize];
+    let index = code[position + 1] as i8 as i64;
     let value = bh.registers_r[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
     let cpu = bh.cpu.expect("cpu not set");
@@ -5580,6 +5549,20 @@ fn handler_new_array_clear(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
+    Ok(pos + 1)
+}
+
+// `new_array_clear/cd>r` — `c`-argcode length (see
+// `handler_setarrayitem_gc_r_c`): one inline signed byte.
+fn handler_new_array_clear_c(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let length = code[position] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
@@ -6796,25 +6779,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365). Same tagged-int
-    // base rationale as above for the `/iid>i` and `/ird>i` variants.
+    // base rationale as above for the `/iid>i` variant.
     builder.wire_handler("getarrayitem_gc_i/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
-    // pyre-only `/rrd>r`: index register is Ref-classified (rtyper gap).
-    builder.wire_handler(
-        "getarrayitem_gc_r/rrd>r",
-        handler_getarrayitem_gc_r_refindex,
-    );
     builder.wire_handler("getarrayitem_gc_i/iid>i", handler_getarrayitem_gc_i_intbase);
-    builder.wire_handler(
-        "getarrayitem_gc_i/ird>i",
-        handler_getarrayitem_gc_i_intbase_refindex,
-    );
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
-    // pyre-only `/rrrd`: index register is Ref-classified (rtyper gap).
-    builder.wire_handler("setarrayitem_gc_r/rrrd", handler_setarrayitem_gc_r_refindex);
+    builder.wire_handler("setarrayitem_gc_r/rcrd", handler_setarrayitem_gc_r_c);
 
     // Raw field operations (blackhole.py:1464-1502)
     builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
@@ -6832,6 +6805,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("new_with_vtable/d>r", handler_new_with_vtable);
     builder.wire_handler("new_array/id>r", handler_new_array);
     builder.wire_handler("new_array_clear/id>r", handler_new_array_clear);
+    builder.wire_handler("new_array_clear/cd>r", handler_new_array_clear_c);
 
     // String operations (blackhole.py:1200-1283)
     builder.wire_handler("strlen/r>i", handler_strlen);

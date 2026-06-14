@@ -41,7 +41,8 @@ enum Nullness {
 /// Handles:
 /// - Constant folding for pure integer/boolean ops
 /// - Algebraic simplifications (identity, absorbing elements)
-/// - Strength reduction (e.g., `x + x` -> `x << 1`)
+/// - Strength reduction for power-of-two `IntFloorDiv` / `IntMod`
+///   (every other integer fold lives in OptIntBounds / OptPure)
 /// - Guard simplification when argument is known constant
 /// - Boolean operation rewrites (inverse/reflex)
 /// - Conditional call elimination when condition/value is constant

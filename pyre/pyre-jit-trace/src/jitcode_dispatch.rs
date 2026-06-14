@@ -36,7 +36,7 @@
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow kind-flow) stays unsupported. |
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
-//! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
+//! | `setarrayitem_gc_r/rird`, `setarrayitem_gc_r/rcrd` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. The `rcrd` `c`-argcode form (USE_C_FORM `assembler.py:99-107/312`) decodes the index as one inline signed byte → ConstInt; same recording body otherwise. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
@@ -2425,7 +2425,9 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
 ///   return resop
 ///
 /// `opcode` is one of `GetarrayitemGc{I,R,F}`; `dst_bank` selects the
-/// result bank (`'i'`/`'r'`/`'f'`) the walker writes back into.
+/// result bank (`'i'`/`'r'`/`'f'`) the walker writes back into.  The
+/// index operand is always int-classified, so it is decoded from the
+/// `i` register bank.
 fn getarrayitem_gc_via_heapcache(
     code: &[u8],
     op: &DecodedOp,
@@ -2433,29 +2435,8 @@ fn getarrayitem_gc_via_heapcache(
     opcode: OpCode,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    getarrayitem_gc_via_heapcache_with_index_bank(code, op, ctx, opcode, dst_bank, 'i')
-}
-
-/// Underlying handler for `getarrayitem_gc_<i|r|f>` shapes.
-/// `index_bank` selects whether the index operand is decoded from the
-/// `i` register bank (canonical RPython shape `rid>X`) or the `r`
-/// register bank (pyre-only `rrd>r` — see `pyre_extension_insns()`
-/// + `blackhole.rs::handler_getarrayitem_gc_r_refindex`, an artifact of
-/// the rtyper not yet classifying integer array indices as `Signed`).
-fn getarrayitem_gc_via_heapcache_with_index_bank(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
-    opcode: OpCode,
-    dst_bank: char,
-    index_bank: char,
-) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
-    let index = match index_bank {
-        'i' => read_int_reg(code, op, 1, ctx)?,
-        'r' => read_ref_reg(code, op, 1, ctx)?,
-        _ => unreachable!("index_bank must be 'i' or 'r'"),
-    };
+    let index = read_int_reg(code, op, 1, ctx)?;
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
 
@@ -10846,31 +10827,16 @@ fn handle(
         "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
         "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
         // Heapcache-aware array reads/writes (canonical `rid>X` /
-        // `ri{i,r,f}d` shapes).  The pyre-only Ref-index shape
-        // `getarrayitem_gc_r/rrd>r` lives in `pyre_extension_insns()`
-        // and is NOT canonical; non-canonical setarrayitem shapes
-        // (`rrid`/`rrrd`/`rrfd`, Ref index) stay unsupported (kind-flow
-        // kind-flow territory).
+        // `ri{i,r,f}d` shapes).  Array indices are always int-classified,
+        // so the index operand is always decoded from the `i` register
+        // bank; non-canonical Ref-index shapes (`rrd>r`/`rrrd`/`rrfd`)
+        // never arise.
         "getarrayitem_gc_i/rid>i" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcI, 'i')
         }
         "getarrayitem_gc_r/rid>r" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcR, 'r')
         }
-        // pyre-only `rrd>r` variant: index lands in Ref bank (tagged-
-        // int-in-ref deviation, same root as the `/rr>i` arithmetic
-        // aliases — disappears once rtyper classifies integer array
-        // indices as `Signed`).  Sibling
-        // `blackhole.rs::handler_getarrayitem_gc_r_refindex` covers the
-        // dispatch table; this is the walker counterpart.
-        "getarrayitem_gc_r/rrd>r" => getarrayitem_gc_via_heapcache_with_index_bank(
-            code,
-            op,
-            ctx,
-            OpCode::GetarrayitemGcR,
-            'r',
-            'r',
-        ),
         "getarrayitem_gc_f/rid>f" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcF, 'f')
         }
@@ -10894,6 +10860,26 @@ fn handle(
         }
         "setarrayitem_gc_i/riid" => setarrayitem_gc_via_heapcache(code, op, ctx, 'i'),
         "setarrayitem_gc_r/rird" => setarrayitem_gc_via_heapcache(code, op, ctx, 'r'),
+        // `c`-argcode form (`assembler.py:99-107 emit_const(allow_short
+        // =True)`, USE_C_FORM `assembler.py:312`): the index is one
+        // inline signed byte → ConstInt.  Same body as
+        // [`setarrayitem_gc_via_heapcache`] with the index read from
+        // the bytecode instead of an i-bank register.
+        "setarrayitem_gc_r/rcrd" => {
+            let array = read_ref_reg(code, op, 0, ctx)?;
+            let index = OpRef::ConstInt(code[op.pc + 2] as i8 as i64);
+            let value = read_ref_reg(code, op, 2, ctx)?;
+            let descr = read_descr(code, op, 3, ctx)?;
+            let descr_index = descr.index();
+            ctx.trace_ctx.record_op_with_descr(
+                OpCode::SetarrayitemGc,
+                &[array, index, value],
+                descr,
+            );
+            ctx.trace_ctx
+                .heapcache_setarrayitem(array, index, descr_index, value);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
         // RPython `pyjitpl.py:746-755 opimpl_new_array_clear` —
         // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
@@ -10901,19 +10887,25 @@ fn handle(
         // `heapcache.new_array(resbox, lengthbox)`.  Operand layout
         // per `bhimpl_new_array_clear @arguments("cpu","i","d",
         // returns="r")`: 1B i-reg(length) + 2B descr + 1B r-reg(dst).
-        "new_array_clear/id>r" => {
-            let length = read_int_reg(code, op, 0, ctx)?;
+        // The `cd>r` arm is the `c`-argcode form (inline signed-byte
+        // length, USE_C_FORM): identical byte layout, length decoded
+        // as ConstInt.
+        "new_array_clear/id>r" | "new_array_clear/cd>r" => {
+            let length = if op.key == "new_array_clear/cd>r" {
+                OpRef::ConstInt(code[op.pc + 1] as i8 as i64)
+            } else {
+                read_int_reg(code, op, 0, ctx)?
+            };
             let descr = read_descr(code, op, 1, ctx)?;
             let resbox =
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::NewArrayClear, &[length], descr);
-            // heapcache.py `new_array(box, lengthbox)` — `clear=true`
-            // marks every slot as known-NULL until written
-            // (`trace_opcode.rs` newtuple items-block recording uses
-            // the same seed).
+            // heapcache.py:508-516 `new_array(box, lengthbox)` adds
+            // the virtual/unescaped flags only when `lengthbox` is a
+            // Const ("only constant-length arrays are virtuals").
             ctx.trace_ctx
                 .heap_cache_mut()
-                .new_array(resbox, length, true);
+                .new_array(resbox, length, length.is_constant());
             let dst = code[op.pc + 4] as usize;
             // A freshly recorded allocation has no runtime concrete —
             // same Null posture as other recorded producers.
@@ -19214,84 +19206,6 @@ mod tests {
             dst_post, cached,
             "cache hit must write cached OpRef into registers_r[dst]",
         );
-    }
-
-    /// pyre-only `getarrayitem_gc_r/rrd>r` mirrors the canonical
-    /// `rid>r` shape — same heapcache lookup / `GetarrayitemGcR`
-    /// emission — but reads the index from the Ref register bank
-    /// (tagged-int-in-ref deviation; see
-    /// `blackhole.rs::handler_getarrayitem_gc_r_refindex`).  Should
-    /// behave identically to the canonical variant on a cache miss.
-    #[test]
-    fn getarrayitem_gc_r_refindex_cache_miss_records_op_and_writes_dst() {
-        let byte = *insns_opname_to_byte()
-            .get("getarrayitem_gc_r/rrd>r")
-            .expect("`getarrayitem_gc_r/rrd>r` must be in insns table");
-        // Operand layout `rrd>r`: 1B r-reg(2) + 1B r-reg(3) +
-        // 2B descr(LE 1) + 1B r-dst(5).
-        let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
-        let mut tc = fresh_trace_ctx();
-        let mut regs_r = distinct_const_refs(&mut tc, 8);
-        let mut regs_i = distinct_const_ints(&mut tc, 4);
-        let array = regs_r[2];
-        let index = regs_r[3];
-        let dst_pre = regs_r[5];
-        let descr = field_descr_with_index(1);
-        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
-        let frame_done = done_descr_ref_for_tests();
-        let ops_before = tc.num_ops();
-        let mut wc = WalkContext {
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut [],
-            concrete_registers_r: &mut [],
-            concrete_registers_i: &mut [],
-            descr_refs: &descr_pool,
-            raw_descrs: RawDescrPool::Global,
-            is_authoritative_executor: false,
-            is_full_body_walk: false,
-            trace_ctx: &mut tc,
-            done_with_this_frame_descr_ref: frame_done,
-            done_with_this_frame_descr_int: make_fail_descr(101),
-            done_with_this_frame_descr_float: make_fail_descr(102),
-            done_with_this_frame_descr_void: make_fail_descr(103),
-            exit_frame_with_exception_descr_ref: make_fail_descr(2),
-            is_top_level: true,
-            sub_jitcode_lookup: &no_sub_jitcodes,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: 0,
-            outer_jitcode_index: 0,
-            outer_active_boxes: Vec::new(),
-            store_subscr_fn_addr: None,
-            pending_guard_snapshot_error: None,
-        };
-        let (outcome, next_pc) =
-            step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
-        assert_eq!(outcome, DispatchOutcome::Continue);
-        assert_eq!(
-            next_pc, 6,
-            "getarrayitem_gc_r/rrd>r operand layout = 5 bytes",
-        );
-        let dst_post = wc.registers_r[5];
-        assert_ne!(dst_post, dst_pre);
-        drop(wc);
-        assert_eq!(tc.num_ops(), ops_before + 1);
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![array, index],
-            "GetarrayitemGcR args must be [array, index] read from r-bank",
-        );
-        assert!(std::sync::Arc::ptr_eq(
-            last.getdescr().as_ref().expect("must carry array descr"),
-            &descr,
-        ));
-        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
