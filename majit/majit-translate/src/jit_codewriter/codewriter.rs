@@ -591,6 +591,31 @@ impl CodeWriter {
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
+        // Void-widening (exceptiontransform parity).  A scoped
+        // `Result<(), PyError>` callee declares `FUNC.RESULT = void`
+        // (`return_type = "()"`, stamped in `front::mir`), but its CFG
+        // still returns the unit `()` as a `Ref`-typed value because
+        // every aggregate lowers to `Ref`.  Collapse the returnblock to a
+        // genuine void return now — after the whole-program annotation
+        // fixpoint, the same ordering `rpython/translator/exceptiontransform.py`
+        // uses by running after rtyping — so flatten emits a void return
+        // and `graph_result_kind` agrees with the declared `v`.  The
+        // `declared==v && cfg==r` gate is exactly the unit-shell case; a
+        // genuinely void CFG (`cfg==v`) needs no rewrite.
+        if callcontrol.declared_return_kind(path) == Some('v')
+            && graph_result_kind(&rewritten.graph) == 'r'
+        {
+            crate::front::result_exc::widen_unit_return_to_void(&mut rewritten.graph);
+            // Sweep the unit producers the widen just orphaned.  Clearing
+            // the returnblock args/inputargs leaves the `()` ctor (or a
+            // tail-forwarded `Ref` call result) unread; without a dead-op
+            // pass it would survive into flatten as a value the void
+            // return no longer consumes.  `rpython/translator/simplify.py`
+            // `remove_dead_links_and_setattrs` runs after exceptiontransform
+            // for the same reason — `prune_dead_phis` keeps raising/impure
+            // producers and only drops the genuinely pure dead unit shells.
+            crate::model::prune_dead_phis(&mut rewritten.graph);
+        }
         let mut regallocs = crate::jit_codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(&rewritten.graph),

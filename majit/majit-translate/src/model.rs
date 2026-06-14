@@ -2095,6 +2095,215 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
     }
 }
 
+/// RPython `remove_assertion_errors(graph)` (simplify.py:321-346) over
+/// the front model graph.
+///
+/// ```python
+/// def remove_assertion_errors(graph):
+///     """Remove branches that go directly to raising an AssertionError,
+///     assuming that AssertionError shouldn't occur at run-time.  Note that
+///     this is how implicit exceptions are removed (see _implicit_ in
+///     flowcontext.py).
+///     """
+///     for block in list(graph.iterblocks()):
+///         for i in range(len(block.exits)-1, -1, -1):
+///             exit = block.exits[i]
+///             if not (exit.target is graph.exceptblock and
+///                     exit.args[0] == Constant(AssertionError)):
+///                 continue
+///             if len(block.exits) < 2:
+///                 break
+///             if block.canraise:
+///                 if exit.exitcase is None:
+///                     break
+///                 if len(block.exits) == 2:
+///                     block.exitswitch = None
+///                     exit.exitcase = None
+///             lst = list(block.exits)
+///             del lst[i]
+///             block.recloseblock(*lst)
+/// ```
+///
+/// One extension beyond the upstream body: when the removal leaves a
+/// single exit on a *non-canraise value switch*, the survivor is
+/// promoted to an unconditional link (`block.exitswitch = None;
+/// exits[0].exitcase = None` — `backendopt/removeassert.py:84-89
+/// kill_assertion_link`).  Upstream flow graphs only carry Bool or
+/// last-exception exitswitches into this pass, and `flatten.py
+/// insert_exits` tolerates a leftover single Bool case (`assert
+/// link.exitcase in (None, False, True)`); Rust enum-match lowering
+/// produces Int discriminant switches whose leftover `Int` case that
+/// assert rejects, so the `kill_assertion_link` normalisation applies
+/// here.  For the canraise two-exit case the survivor (`exits[0]`)
+/// already has `exitcase = None`, so the one code path covers both.
+///
+/// Returns the number of removed exits so the caller can gate the
+/// follow-up dead-condition sweep (`removeassert.py:35-37` — "now melt
+/// away the (hopefully) dead operation that compute the condition").
+pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::HOST_ENV;
+    let assert_err_class = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock = graph.exceptblock;
+    let mut removed = 0usize;
+    // upstream: `for block in list(graph.iterblocks())`.
+    for block_idx in 0..graph.blocks.len() {
+        let mut i = graph.blocks[block_idx].exits.len();
+        while i > 0 {
+            i -= 1;
+            let block = &graph.blocks[block_idx];
+            let Some(exit) = block.exits.get(i) else {
+                break;
+            };
+            // upstream: `if not (exit.target is graph.exceptblock and
+            // exit.args[0] == Constant(AssertionError)): continue`.
+            let targets_except = exit.target == exceptblock;
+            let args_is_assert_err = matches!(
+                exit.args.first(),
+                Some(LinkArg::Const(c))
+                    if matches!(
+                        &c.value,
+                        ConstValue::HostObject(h) if *h == assert_err_class
+                    )
+            );
+            if !(targets_except && args_is_assert_err) {
+                continue;
+            }
+            // upstream: `if len(block.exits) < 2: break`.
+            if block.exits.len() < 2 {
+                break;
+            }
+            // upstream: `if block.canraise: if exit.exitcase is None:
+            // break`.
+            if block.canraise() && exit.exitcase.is_none() {
+                break;
+            }
+            let exits_len = block.exits.len();
+            let block = &mut graph.blocks[block_idx];
+            // upstream: `lst = list(block.exits); del lst[i];
+            // block.recloseblock(*lst)`.
+            block.exits.remove(i);
+            if exits_len == 2 {
+                // Promote the survivor to an unconditional link —
+                // upstream's canraise arm (`simplify.py:333-335`) plus
+                // the `kill_assertion_link` normalisation for value
+                // switches (`removeassert.py:84-89`, see above).  Clear
+                // the low-level case too so no branch metadata lingers on
+                // a now-unconditional edge, matching `fold_constant_exitswitch`.
+                block.exitswitch = None;
+                block.exits[0].exitcase = None;
+                block.exits[0].llexitcase = None;
+            }
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Fold a constant exitswitch to its taken link — the model-layer
+/// slice of `constant_fold_graph`'s link folding
+/// (`rpython/translator/backendopt/constfold.py`): when a block's
+/// `exitswitch` Variable is bound in the same block by a constant
+/// (`ConstBool` / `ConstInt`, optionally through the `bool` UnaryOp
+/// wrap [`FunctionGraph::set_branch`] appends), keep only the
+/// matching exit and promote it to an unconditional link.  The dead
+/// condition ops melt away in the caller's [`prune_dead_phis`]
+/// sweep; the disconnected arm is emptied by
+/// [`clear_unreachable_blocks`].  Returns the number of folded
+/// switches.
+pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
+    let mut folded = 0usize;
+    for block_idx in 0..graph.blocks.len() {
+        let block = &graph.blocks[block_idx];
+        let Some(ExitSwitch::Value(sw)) = block.exitswitch.clone() else {
+            continue;
+        };
+        let def_of = |v: &crate::flowspace::model::Variable| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(v))
+                .map(|op| &op.kind)
+        };
+        let mut kind = def_of(&sw);
+        if let Some(OpKind::UnaryOp { op, operand, .. }) = kind
+            && op == "bool"
+        {
+            kind = def_of(operand);
+        }
+        // The matched exitcase spellings: an `If` branch carries
+        // `ExitCase::Bool` (`set_branch`), a MIR `SwitchInt` carries
+        // `ExitCase::Const(Int)` plus the `"default"` catch-all arm
+        // (`front::mir` terminator lowering).
+        let (bool_case, int_case) = match kind {
+            Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
+            Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then(|| *n != 0), Some(*n)),
+            _ => continue,
+        };
+        let matches_case = |link: &Link| match &link.exitcase {
+            Some(ExitCase::Bool(b)) => Some(*b) == bool_case,
+            Some(ExitCase::Const(ConstValue::Int(n))) => Some(*n) == int_case,
+            _ => false,
+        };
+        let is_default = |link: &Link| {
+            matches!(
+                &link.exitcase,
+                Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
+            )
+        };
+        let chosen = block
+            .exits
+            .iter()
+            .position(matches_case)
+            .or_else(|| block.exits.iter().position(is_default));
+        let Some(chosen) = chosen else {
+            continue;
+        };
+        let block = &mut graph.blocks[block_idx];
+        let mut taken = block.exits.swap_remove(chosen);
+        taken.exitcase = None;
+        taken.llexitcase = None;
+        block.exits = vec![taken];
+        block.exitswitch = None;
+        folded += 1;
+    }
+    folded
+}
+
+/// Empty every block unreachable from `graph.startblock` in place —
+/// operations, exits, inputargs cleared, the `Vec` slot kept because
+/// `BlockId` doubles as the index.  Needed after
+/// [`fold_constant_exitswitch`] disconnects an arm: the registry
+/// lift (`translate_op`) and [`prune_dead_phis`] both walk blocks by
+/// index, and `prune_dead_phis` pins no-predecessor blocks as extra
+/// entry points, so a disconnected arm would otherwise keep its dead
+/// ops alive.
+pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
+    let mut reachable = vec![false; graph.blocks.len()];
+    let mut worklist = vec![graph.startblock];
+    while let Some(b) = worklist.pop() {
+        if std::mem::replace(&mut reachable[b.0], true) {
+            continue;
+        }
+        for link in &graph.blocks[b.0].exits {
+            worklist.push(link.target);
+        }
+    }
+    // The return / except sinks stay even when no live link reaches
+    // them — graph plumbing addresses them unconditionally.
+    reachable[graph.returnblock.0] = true;
+    reachable[graph.exceptblock.0] = true;
+    for (idx, block) in graph.blocks.iter_mut().enumerate() {
+        if !reachable[idx] {
+            block.operations.clear();
+            block.exits.clear();
+            block.inputargs.clear();
+            block.exitswitch = None;
+        }
+    }
+}
+
 /// Remove dead operations and dead inputargs from `graph` per
 /// backward dataflow over operation operands + exitswitches +
 /// `Link.args`-as-dependencies.  Line-by-line port of
@@ -4244,6 +4453,37 @@ impl FunctionGraph {
         let etype_var = self.alloc_value_var();
         let evalue_var = self.alloc_value_var();
         self.set_goto(block, exceptblock, vec![etype_var, evalue_var]);
+    }
+
+    /// Terminate `block` with the implicit-exception raise shape of
+    /// RPython `RaiseImplicit.nomoreblocks`
+    /// (`flowspace/flowcontext.py:1271-1284`):
+    ///
+    /// ```python
+    /// msg = "implicit %s shouldn't occur" % exc_cls.__name__
+    /// w_type = Constant(AssertionError)
+    /// w_value = Constant(AssertionError(msg))
+    /// link = Link([w_type, w_value], ctx.graph.exceptblock)
+    /// ctx.recorder.crnt_block.closeblock(link)
+    /// ```
+    ///
+    /// Both link args are Constants with `args[0]` carrying the
+    /// `AssertionError` class itself — the shape
+    /// [`remove_assertion_errors`] matches to prune the branch under
+    /// the "AssertionError shouldn't occur at run-time" assumption
+    /// (`simplify.py:321-346`).
+    pub fn set_raise_implicit(&mut self, block: BlockId, exc_name: &str) {
+        use crate::flowspace::model::{Constant, HOST_ENV, HostObject};
+        let assert_err = HOST_ENV
+            .lookup_builtin("AssertionError")
+            .expect("HOST_ENV missing AssertionError");
+        let msg = format!("implicit {exc_name} shouldn't occur");
+        let w_type = LinkArg::Const(Constant::new(ConstValue::HostObject(assert_err.clone())));
+        let w_value = LinkArg::Const(Constant::new(ConstValue::HostObject(
+            HostObject::new_instance(assert_err, vec![ConstValue::UniStr(msg)]),
+        )));
+        let link = Link::new_mixed(vec![w_type, w_value], self.exceptblock, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
     }
 
     /// Terminate `block` with a Link to `exceptblock` carrying the

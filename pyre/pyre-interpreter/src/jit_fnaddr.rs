@@ -511,11 +511,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //
     // PyFrame::nlocals — invoked by `eval.rs:840 pop_value` and is the
     // funcptr the walker reaches when dispatching `PopTop`'s nested
-    // `pop_value` sub-jitcode.
+    // `pop_value` sub-jitcode.  Same dual-shape binding as
+    // `PyFrame::pop` below: the bare `self.nlocals()` spelling inside
+    // the MIR-lowered `pop_value` graph resolves through
+    // `impl_method_owner` to the 2-segment `["PyFrame", "nlocals"]`,
+    // while the module-qualified form is the 3-segment
+    // `["pyframe", "PyFrame", "nlocals"]` — register both.
     let pyframe_nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::nlocals",
+        "pyre_interpreter::PyFrame::nlocals",
         pyframe_nlocals as *const (),
     );
 
@@ -566,6 +572,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::shared_opcode::stack_underflow_error",
         "pyre_interpreter::stack_underflow_error",
         stack_underflow as *const (),
+    );
+
+    // `get_current_exception` / `set_current_exception` — the named TLS
+    // accessors `PyFrame::push_exc_info` / `pop_except` (`eval.rs`) call
+    // for the per-thread `CURRENT_EXCEPTION` slot.  Both carry
+    // `#[dont_look_inside]` (the `LocalKey::with` closure inside has no
+    // extractable graph), so the codewriter classifies the calls
+    // `Residual` and needs these bindings to bake real funcptrs instead
+    // of `symbolic_fnaddr_for_path` hashes.  These are the
+    // interpreter-side twins of the trace-side
+    // `get_current_exception_fn` / `set_current_exception_fn` cpu
+    // helpers — same TLS slot, same flat read/write semantics.
+    let get_current_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::get_current_exception",
+        "pyre_interpreter::get_current_exception",
+        get_current_exc as *const (),
+    );
+    let set_current_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::set_current_exception",
+        "pyre_interpreter::set_current_exception",
+        set_current_exc as *const (),
     );
 
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
@@ -648,6 +679,32 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::pyopcode::code_varnames_len",
         "pyre_interpreter::code_varnames_len",
         code_varnames_len as *const (),
+    );
+
+    // Paired-local index decode helpers for the LoadFastLoadFast /
+    // StoreFastLoadFast / StoreFastStoreFast /
+    // LoadFastBorrowLoadFastBorrow arms — same `push_alias_pair`
+    // rationale as `load_fast_var_num_to_index` above.
+    let var_nums_to_first_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::var_nums_to_first_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::var_nums_to_first_index",
+        "pyre_interpreter::var_nums_to_first_index",
+        var_nums_to_first_index as *const (),
+    );
+
+    let var_nums_to_second_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::var_nums_to_second_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::var_nums_to_second_index",
+        "pyre_interpreter::var_nums_to_second_index",
+        var_nums_to_second_index as *const (),
     );
 
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
@@ -1185,6 +1242,65 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::bh_store_subscr_fn"],
             store_subscr_fn
+        );
+    }
+
+    /// These path spellings are what keep the `pop_value` / paired-local
+    /// / exception-TLS residual calls off the `symbolic_fnaddr_for_path`
+    /// fallback (which SEGVs at trace time); a typo in either the
+    /// module-qualified or root alias would silently regress to a
+    /// symbolic hash, so pin both spellings against the live fnaddr.
+    #[test]
+    fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
+        let nlocals = nlocals as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyframe::PyFrame::nlocals"],
+            nlocals
+        );
+        assert_eq!(bindings["pyre_interpreter::PyFrame::nlocals"], nlocals);
+
+        let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
+        let get_exc = get_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::eval::get_current_exception"],
+            get_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::get_current_exception"], get_exc);
+
+        let set_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
+        let set_exc = set_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::eval::set_current_exception"],
+            set_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::set_current_exception"], set_exc);
+
+        let first: fn(
+            crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+            crate::bytecode::OpArg,
+        ) -> usize = crate::pyopcode::var_nums_to_first_index;
+        let first = first as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyopcode::var_nums_to_first_index"],
+            first
+        );
+        assert_eq!(bindings["pyre_interpreter::var_nums_to_first_index"], first);
+
+        let second: fn(
+            crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+            crate::bytecode::OpArg,
+        ) -> usize = crate::pyopcode::var_nums_to_second_index;
+        let second = second as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyopcode::var_nums_to_second_index"],
+            second
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::var_nums_to_second_index"],
+            second
         );
     }
 

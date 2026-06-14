@@ -730,6 +730,77 @@ pub fn lower_fun_decl_with_static_addrs(
         ))
     })?;
     let name = fd.item_meta.name_path();
+    // The Result-of-PyError exception-link lowering's callee rule
+    // applies when this body is a scoped callee (see
+    // `front::result_exc`); the caller rule applies to the diamond
+    // sites the body lowering captured.  Both run before
+    // `simplify_lowered_graph` so the freed shell ops feed the same
+    // dead-op sweep the Abort → RaiseImplicit fold uses.
+    let result_exc_callee = crate::front::result_exc::in_result_exc_scope(&name)
+        && crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    // A `Result<(), PyError>` scoped callee returns void after the
+    // exception-link lowering; widen its returnblock so the call
+    // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
+    let result_exc_ok_is_unit = result_exc_callee
+        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
+    let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+            // The exception-link transforms run on a simplified graph,
+            // as exceptiontransform.py does (graphs reach it after
+            // `simplify_graph`, simplify.py:1075): the discriminant
+            // switch's `default → Abort` else-unreachable arm must be
+            // pruned by `remove_assertion_errors` before the diamond
+            // matcher sees the switch, leaving the plain 0/1 pair.
+            // Untouched graphs skip this and keep their single
+            // end-of-lowering simplify, byte-identical.
+            simplify_lowered_graph(&mut lo.graph);
+        }
+        let mut tail_forwarded_returns = 0usize;
+        if !lo.result_exc_call_results.is_empty() {
+            let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
+                &mut lo.graph,
+                &lo.result_exc_call_results,
+                result_exc_callee,
+            )
+            .map_err(LowerError::Unsupported)?;
+            tail_forwarded_returns = outcome.tail_forwards;
+        }
+        if result_exc_callee {
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                tail_forwarded_returns,
+            )
+            .map_err(LowerError::Unsupported)?;
+            if result_exc_ok_is_unit {
+                // Stamp `FUNC.RESULT = void`.  The exception-link lowering
+                // already returns the unit `()` (the callee no longer
+                // builds a `Result` shell), but `front::mir` types every
+                // aggregate — including `()` — as `Ref`, so the CFG return
+                // kind is still `r`.  The codewriter reconciles this by
+                // collapsing the returnblock to a genuine void return
+                // post-annotation (the `declared==v && cfg==r` gate),
+                // mirroring `exceptiontransform.py` running after rtyping;
+                // doing the structural collapse here, before the
+                // whole-program annotation fixpoint, destabilises it.
+                lo.graph.return_type = Some("()".to_string());
+            }
+        }
+        // The `?`-diamond rewrite (`rewire_result_exc_call_sites`) detaches
+        // the pre-rewrite branch / discriminant / break blocks: the call
+        // block now exits straight to the continue arm and `exceptblock`,
+        // so those blocks lose their only predecessor.  RPython graph
+        // consumers only iterate blocks reachable from `startblock`
+        // (`flowspace/model.py:66 iterblocks`), so drop the now-unreachable
+        // blocks here — before `prune_dead_phis`, which would otherwise
+        // treat a no-predecessor block as an extra root
+        // (`transform_dead_op_vars`'s start set), and before the
+        // `jit_codewriter` consumers that scan `graph.blocks` directly.
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+            crate::model::clear_unreachable_blocks(&mut lo.graph);
+        }
+        simplify_lowered_graph(&mut lo.graph);
+        Ok(())
+    };
     // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
     // path that threads locals as block inputargs / phis).  Default
     // (flag unset) keeps the monotonic lowering so the gate stays green
@@ -741,7 +812,21 @@ pub fn lower_fun_decl_with_static_addrs(
         let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
         if lo.mir_model_is_acyclic() {
             match lo.lower_framestate() {
-                Ok(()) => return Ok(lo.graph),
+                Ok(()) => {
+                    // Run the shared post-lowering stage uniformly, same
+                    // as the linear / RPO paths below.  `finish` folds
+                    // constant exitswitches, drops `Abort` arms and runs
+                    // `simplify_lowered_graph`; gating it on result-exc
+                    // activity would let the framestate path keep dead
+                    // arms the other strategies prune, diverging the
+                    // graph for the same body.  The result-exc-specific
+                    // `clear_unreachable_blocks` stays gated inside
+                    // `finish`, and the exception-link ABI (raise-through
+                    // vs Result return) the transforms install runs here
+                    // too — uniform across lowering strategies.
+                    finish(&mut lo)?;
+                    return Ok(lo.graph);
+                }
                 Err(e) => {
                     if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
                         return Err(e);
@@ -752,7 +837,10 @@ pub fn lower_fun_decl_with_static_addrs(
     }
     let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
-        Ok(()) => Ok(lo.graph),
+        Ok(()) => {
+            finish(&mut lo)?;
+            Ok(lo.graph)
+        }
         // A forward-referenced definition — typically a `TermKind::Call`
         // dest at a higher MIR index than the block that reads it — reads
         // as an uninitialised local under MIR-index order.  Re-lower the
@@ -765,9 +853,49 @@ pub fn lower_fun_decl_with_static_addrs(
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
             let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
+            finish(&mut lo)?;
             Ok(lo.graph)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Per-graph simplification after lowering — the model-layer slice of
+/// RPython `simplify_graph(graph)` (`simplify.py:1075-1081`), which
+/// upstream runs on every freshly built flow graph.  Only the passes
+/// the Abort → `RaiseImplicit` fold needs are wired:
+///
+/// - `eliminate_empty_blocks` (simplify.py:52-69) collapses the empty
+///   raise block between a discriminant switch's `else
+///   unreachable!()` exit and `exceptblock`, exposing the
+///   `[Constant(AssertionError), …]` link to the next pass.
+/// - `remove_assertion_errors` (simplify.py:321-346) prunes the
+///   shouldn't-occur branch and promotes the surviving exit to an
+///   unconditional link.
+/// - `prune_dead_phis` (`transform_dead_op_vars`, simplify.py:422-524)
+///   melts the now-dead condition ops — the `__discriminant`
+///   FieldRead feeding the dropped exitswitch
+///   (`removeassert.py:35-37` "now melt away the (hopefully) dead
+///   operation that compute the condition").  Upstream leaves this to
+///   the later backendopt sweep (`backendopt/all.py`); the model
+///   layer has no later sweep, so it runs here, gated on an actual
+///   removal to keep untouched graphs byte-identical.
+fn simplify_lowered_graph(graph: &mut FunctionGraph) {
+    crate::model::eliminate_empty_blocks(graph);
+    let mut dirty = crate::model::remove_assertion_errors(graph) > 0;
+    // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
+    // config const folded by `const_eval_global`) collapse to the
+    // taken link and the dead arm is emptied — the registry lift
+    // (`translate_op`) walks blocks by index, so a disconnected arm
+    // reading an unliftable static (`SMALL_INTS`) would otherwise
+    // still fail the whole graph.  `constant_fold_graph` link
+    // folding (backendopt/constfold.py).
+    if crate::model::fold_constant_exitswitch(graph) > 0 {
+        crate::model::clear_unreachable_blocks(graph);
+        dirty = true;
+    }
+    if dirty {
+        crate::model::prune_dead_phis(graph);
     }
 }
 
@@ -883,6 +1011,13 @@ struct Lowering<'a> {
     /// so the paired `Result::expect` on such a local also aliases it
     /// — see [`Lowering::is_infallible_widening_try_from`].
     infallible_result_locals: std::collections::HashSet<usize>,
+    /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
+    /// callees whose declared result is `Result<T, PyError>`.  Each
+    /// heads a `Try::branch` diamond that
+    /// [`crate::front::result_exc::rewire_result_exc_call_sites`]
+    /// rewires into `ExitSwitch::LastException` exits after the body
+    /// lowering completes.
+    result_exc_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1010,6 +1145,7 @@ impl<'a> Lowering<'a> {
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
             infallible_result_locals: std::collections::HashSet::new(),
+            result_exc_call_results: Vec::new(),
         })
     }
 
@@ -1751,40 +1887,55 @@ impl<'a> Lowering<'a> {
                     // fits.  Emit a synthetic 2-arg Call so the write
                     // remains visible to the downstream side-effect
                     // tracking.
+                    //
+                    // The write produces no value (`result` below is `None`),
+                    // so the declared result kind must be Void: jtransform's
+                    // `resolve_call_result` reads `result_ty` when the op has
+                    // no result Variable, and a non-void kind there assembles
+                    // a `residual_call_r_<kind>` key with no `>` result tail
+                    // — a malformed opname nothing wires (`getkind(Void)`
+                    // keeps result-less calls on the `residual_call_*_v`
+                    // row).
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__deref_write".to_string()],
                         },
                         args: vec![base, value],
-                        result_ty: ValueType::Int,
+                        result_ty: ValueType::Void,
                     }
                 }
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
-                    // Adt-container writes resolve the declared field
-                    // name / owner / type, mirroring the typed
-                    // `FieldRead` arm in `resolve_place` — an
-                    // asymmetric synthetic label (`Adt_<idx>`) would
-                    // make the rtyper's `getfieldrepr` miss the attr
-                    // the paired read registered under its real name.
-                    if let Some((owner_root, field_name, _field_ty)) =
-                        self.resolve_adt_field(field_payload)
-                    {
-                        OpKind::FieldWrite {
-                            base,
-                            field: FieldDescriptor::new(field_name, Some(owner_root)),
-                            value,
-                            ty: tyref_to_value_type(dest_ty, self.llbc),
-                        }
-                    } else {
-                        let label = field_label_from_payload(field_payload);
-                        OpKind::FieldWrite {
-                            base,
-                            field: FieldDescriptor::new(label, None),
-                            value,
-                            ty: ValueType::Int,
-                        }
+                    // Resolve the field through its TypeDecl exactly
+                    // like the read side (`resolve_place` Field arm):
+                    // the descriptor must carry the same
+                    // (`field_name`, `owner_root`) shape or no
+                    // downstream owner-keyed consumer can match it —
+                    // jtransform's vable matcher rejects a `None`
+                    // owner against an owner-rooted config, so e.g.
+                    // `PyFrame.valuestackdepth` writes stayed plain
+                    // `setfield` while the paired reads rewrote to
+                    // `getfield_vable`.  The Adt case derives the
+                    // written value's kind from `dest_ty` (a Ref field
+                    // must not be stamped `Int`); the bare-label
+                    // fallback keeps non-Adt containers lowering as
+                    // before.
+                    let (field, ty) = match self.resolve_adt_field(field_payload) {
+                        Some((owner_root, field_name, _field_ty)) => (
+                            FieldDescriptor::new(field_name, Some(owner_root)),
+                            tyref_to_value_type(dest_ty, self.llbc),
+                        ),
+                        None => (
+                            FieldDescriptor::new(field_label_from_payload(field_payload), None),
+                            ValueType::Int,
+                        ),
+                    };
+                    OpKind::FieldWrite {
+                        base,
+                        field,
+                        value,
+                        ty,
                     }
                 } else if let Some(index_payload) = v.as_object().and_then(|m| m.get("Index")) {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
@@ -2341,18 +2492,24 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, _field_ty)) =
+                    && let Some((owner_root, field_name, field_ty)) =
                         self.resolve_adt_field(field_payload)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
-                    // The projected place's own `ty` is the field type
-                    // AFTER generic substitution; the TypeDecl's field ty
-                    // (`_field_ty`) is the declaration-side generic param
-                    // for generic ADTs (`Result<i64, E>`'s Ok payload
-                    // declares `T`), which `tyref_to_value_type` can only
-                    // degrade to `Ref(None)` — mistyping scalar payloads.
-                    let ty = tyref_to_value_type(&place_ty, self.llbc);
+                    // The field's DECLARED ty is the polymorphic decl's
+                    // (monomorphize=false): for a generic container
+                    // (`ControlFlow<B, C>`, `Result<T, E>`) it is a bare
+                    // type variable, which projects to the `Ref`
+                    // fallback even when the instantiated payload is an
+                    // `i64`.  The place's post-projection type carries
+                    // the substituted use-site type, so prefer it; keep
+                    // the decl ty for the rare place shapes whose
+                    // post-projection type the reader cannot resolve.
+                    let ty = match tyref_to_value_type(&place_ty, self.llbc) {
+                        ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
+                        resolved => resolved,
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -2522,6 +2679,7 @@ impl<'a> Lowering<'a> {
                 let segments = self.global_segments(mir_bb, id)?;
                 let op = self
                     .static_addr_op(&segments)
+                    .or_else(|| self.const_eval_global(id))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
@@ -2637,18 +2795,21 @@ impl<'a> Lowering<'a> {
         kind: &serde_json::Value,
     ) -> Option<(Vec<String>, String, Vec<String>)> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
-        // The first element is a Charon type body
-        // `{"id": {"Adt": <def_id>} | "Tuple" | {"Builtin": …}, "generics": …}`.
-        // The ADT `def_id` is nested at `[0]["id"]["Adt"]`; a `"Tuple"`
-        // / builtin atom `id` has no user-defined class and falls
-        // through to `None` (the Tuple/Array placeholder).
-        let type_id = adt
-            .first()?
-            .as_object()?
-            .get("id")?
-            .as_object()?
-            .get("Adt")?
-            .as_u64()?;
+        // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
+        // full `TypeDeclRef` object `{"generics": …, "id": {"Adt":
+        // <type_id>} | "Tuple" | {"Builtin": …}}` (the object shape is
+        // what Charon emits for generic-instantiated types such as
+        // `Result<T, E>`).  The bare-u64 read alone made every generic
+        // aggregate fall through to the `"Adt"` ctor-name fallback,
+        // collapsing all such constructors onto one identity (variant +
+        // owner lost).  A `"Tuple"` / builtin atom `id` has no
+        // user-defined class and falls through to `None` (the
+        // Tuple/Array placeholder).
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
@@ -2823,6 +2984,73 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// Evaluate a global's initializer to its literal when the body is
+    /// the trivial `_0 = <literal>; return` shape.  The read then
+    /// lowers to the same `Const*` op an inline literal produces —
+    /// flow graphs carry module-level constants as `Constant(value)`,
+    /// so config bools like `WITHPREBUILTINT` constant-fold their
+    /// guarded branches instead of minting a synthetic 0-arg call no
+    /// registry can resolve.  Non-trivial initializers (multi-block,
+    /// calls, aggregates) return `None` and keep the Call fallback.
+    fn const_eval_global(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        // Only an immutable, non-thread-local global folds to its init
+        // literal.  A `static mut` is written at runtime and a
+        // thread-local holds a per-thread value, so a post-init read of
+        // either must reach the live accessor, not the initialiser.  (A
+        // by-value read carries no address identity, so an immutable
+        // `static`'s literal is safe to inline here even when its address
+        // is taken elsewhere.)  `global_kind` does not distinguish
+        // `static mut` from `static`, so the mutability comes from the
+        // `static mut` keyword in Charon's recorded `source_text`.
+        if g.rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("ThreadLocal")
+        {
+            return None;
+        }
+        let is_static_mut = g
+            .rest
+            .get("item_meta")
+            .and_then(|m| m.get("source_text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.contains("static mut"));
+        if is_static_mut {
+            return None;
+        }
+        let init_id = g.rest.get("init")?.as_u64()?;
+        let fd = self.llbc.fn_by_id(init_id)?;
+        let u = fd.unstructured()?;
+        let [block] = u.body.as_slice() else {
+            return None;
+        };
+        if !matches!(block.term(), Ok(TermKind::Return)) {
+            return None;
+        }
+        let mut assigned: Option<serde_json::Value> = None;
+        for stmt in &block.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))))
+                    if matches!(place.kind, PlaceKind::Local(0)) && assigned.is_none() =>
+                {
+                    assigned = Some(value);
+                }
+                _ => return None,
+            }
+        }
+        match decode_constant(self.llbc, &assigned?).ok()? {
+            DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
+            DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+            // Strings / fn pointers keep the existing Call shapes the
+            // operand-constant lowering uses; folding them here would
+            // diverge from the `Rvalue::Use(Const)` treatment.
+            DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Terminators
     // -----------------------------------------------------------------------
@@ -2850,6 +3078,25 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
+            TermKind::Abort(_) => {
+                // A Rust panic-abort (`unreachable!()`, `panic!`,
+                // failed `unwrap`).  Python-level exceptions never
+                // reach here — they ride the `Result<_, PyError>`
+                // Switch/Return edges as ordinary control flow — so
+                // an Abort marks a "shouldn't occur at run-time"
+                // path, exactly the implicit-exception raise of
+                // `RaiseImplicit.nomoreblocks`
+                // (`flowcontext.py:1271-1284`).  Closing the block
+                // with `[Constant(AssertionError),
+                // Constant(AssertionError(msg))]` lets
+                // `remove_assertion_errors` (simplify.py:321-346)
+                // prune the branch — e.g. the `else unreachable!()`
+                // arm of a per-variant `let Instruction::X {..} =`
+                // re-match folds away together with its discriminant
+                // switch.
+                self.graph.set_raise_implicit(bb_id, "AssertionError");
+                Ok(())
+            }
             TermKind::UnwindResume => {
                 // Unwind-table cleanup resume.  Its only inbound edges
                 // are `on_unwind` edges, all of which this lowering
@@ -2860,28 +3107,6 @@ impl<'a> Lowering<'a> {
                 // ride the `Result<_, PyError>` Switch/Return edges as
                 // ordinary control flow.
                 self.graph.set_raise(bb_id, "mir-unwind");
-                Ok(())
-            }
-            TermKind::Abort(_) => {
-                // A panic site reached by ordinary control flow
-                // (explicit `panic!` / `unreachable!` / a diverging
-                // match arm), not unwind cleanup.  The RPython
-                // analogue of a host-level invariant failure is an
-                // `assert` raise, so lower the canonical
-                // `exc_from_raise` op sequence
-                // (`op.simple_call(const(AssertionError))` +
-                // `op.type(evalue)`) and close the block with the
-                // `(etype, evalue)` exception Link.  Message operands
-                // are not threaded through: the MIR panic payload is a
-                // host-formatting call chain with no Python-level
-                // meaning, matching the bare-`panic!()` shape of
-                // `lower_exc_from_raise`.
-                crate::front::raise::lower_exc_from_raise(
-                    &mut self.graph,
-                    bb_id,
-                    "AssertionError",
-                    vec![],
-                );
                 Ok(())
             }
             TermKind::Goto { target } => {
@@ -3168,6 +3393,15 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // Capture scoped `Result<T, PyError>` call results for the
+        // `?`-diamond rewiring pass (`front::result_exc`) that runs
+        // after the body lowering completes.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::result_exc::call_target_in_scope(target)
+            && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
+        {
+            self.result_exc_call_results.push(result_var.clone());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
             kind: op_kind,
@@ -4210,7 +4444,9 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .and_then(serde_json::Value::as_u64)?;
     let trait_impls = llbc.trait_impls_raw();
     let ti = trait_impls.get(trait_impl_id as usize)?;
-    // `impl_trait` is a TraitDeclRef; its trait-decl id field is `id`.
+    // `impl_trait` is a TraitDeclRef `{"id": <trait_decl_id>,
+    // "generics": {...}}` — same shape `resolve_impl_owner_adt_def_id`
+    // reads `generics.types[0]` from.
     let trait_id = ti
         .as_object()?
         .get("impl_trait")?
@@ -5098,7 +5334,11 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 /// Recursive worker for [`tyref_to_ast_string`] operating on a raw
 /// Charon type-expression `Value` (a TyRef body or a nested
 /// generic-argument type).  `depth` guards against pathological cycles.
-fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> String {
+pub(crate) fn charon_type_value_to_ast_string(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+) -> String {
     if depth > 24 {
         return "??deep".to_string();
     }
