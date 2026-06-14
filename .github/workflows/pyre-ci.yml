@@ -8,9 +8,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
-      - "scripts/install-charon.sh"
-      - "scripts/extract-llbc.sh"
-      - "scripts/charon-msvc-env.sh"
+      - "scripts/install-charon.py"
+      - "scripts/extract-llbc.py"
       - ".github/workflows/pyre-ci.yml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
@@ -19,9 +18,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
-      - "scripts/install-charon.sh"
-      - "scripts/extract-llbc.sh"
-      - "scripts/charon-msvc-env.sh"
+      - "scripts/install-charon.py"
+      - "scripts/extract-llbc.py"
       - ".github/workflows/pyre-ci.yml"
   workflow_dispatch:
 
@@ -38,14 +36,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       with:
         components: rustfmt
     - name: Run cargo fmt --check
       run: cargo fmt --all -- --check
 
-  cargo-test:
-    name: cargo test (${{ matrix.os }}, ${{ matrix.backend }})
+  prepare-charon-llbc:
+    name: prepare Charon/LLBC (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
       # Redirect the shared charon/ullbc build dir INTO the workspace so
@@ -53,20 +53,21 @@ jobs:
       # both scripts default to ../.pyre-build (shared across worktrees).
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       # Single source of truth for the pinned charon tag. MUST mirror
-      # CHARON_VERSION_DEFAULT in scripts/install-charon.sh: it drives both
-      # the cache keys below AND install-charon.sh's .installed-version
+      # CHARON_VERSION_DEFAULT in scripts/install-charon.py: it drives both
+      # the cache keys below AND install-charon.py's .installed-version
       # stamp, so a pin bump here misses the cache and re-installs.
       CHARON_VERSION: nightly-2026.05.29
     strategy:
       fail-fast: false
       matrix:
-        # On windows-latest install-charon.sh builds Charon from source
-        # (no Windows release asset is published); see scripts/install-charon.sh.
+        # On windows-latest install-charon.py builds Charon from source
+        # (no Windows release asset is published); see scripts/install-charon.py.
         os: [ubuntu-24.04, macos-latest, windows-latest]
-        backend: [dynasm, cranelift]
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
@@ -84,11 +85,17 @@ jobs:
         restore-keys: |
           charon-bin-${{ runner.os }}-${{ runner.arch }}-
     - name: Install Charon
-      # install-charon.sh self-skips on a restored stamp; the guard also
+      # install-charon.py self-skips on a restored stamp; the guard also
       # avoids the network round-trip / from-source rebuild on an exact hit.
       if: steps.charon-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: scripts/install-charon.sh
+      run: scripts/install-charon.py
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
     - name: Cache LLBC
       id: llbc-cache
       uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
@@ -96,39 +103,113 @@ jobs:
         # One atomic entry so the three ullbc files restore together — a
         # partial restore would degrade auto-discovery to the 2-crate path.
         path: build/llbc
-        # Per-OS/arch (cfg(target_os)/cfg(target_arch) bodies differ) + the
-        # charon pin + a hash of every ullbc input: Cargo.lock (resolved dep
-        # versions are monomorphized into the ullbc), every member manifest,
-        # the full pyre/ and majit/ source trees (majit-translate IS
-        # monomorphized into pyre-jit.ullbc), and the extraction scripts.
-        # No restore-keys: a prefix-match restore would reuse a stale ullbc
-        # and silently miscompile jit_trace_gen.rs — a miss must re-extract.
-        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'pyre/**', 'majit/**', 'scripts/install-charon.sh', 'scripts/extract-llbc.sh', 'scripts/charon-msvc-env.sh') }}
+        # Per-OS/arch because cfg(target_os)/cfg(target_arch) bodies differ.
+        # The fingerprint is computed by scripts/extract-llbc.py from the
+        # Charon target crates and their local path-dependency source closure,
+        # not broad pyre/** or majit/** globs.
+        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
     - name: Extract LLBC
-      # extract-llbc.sh never self-skips, so gate it on the ullbc cache hit.
+      # extract-llbc.py also self-skips by fingerprint; this gate avoids even
+      # checking per-crate stamps when the CI cache restored the whole set.
       if: steps.llbc-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: scripts/extract-llbc.sh pyre-object pyre-interpreter pyre-jit
-    - name: Run cargo test for ${{ matrix.backend }}
-      run: cargo test --all --no-default-features --features ${{ matrix.backend }}
+      run: scripts/extract-llbc.py pyre-object pyre-interpreter pyre-jit
 
-  pyre-check:
-    name: pyre/check.py (${{ matrix.os }})
+  cargo-test:
+    name: cargo test (${{ matrix.os }}, ${{ matrix.backend }})
     runs-on: ${{ matrix.os }}
+    needs: prepare-charon-llbc
+    if: ${{ always() }}
     env:
-      # See cargo-test job: redirect the shared build dir into the workspace
-      # for actions/cache, and pin CHARON_VERSION as the single source of truth.
+      # See prepare-charon-llbc: keep the restored Charon install in the
+      # workspace so scripts/builds find the same platform-specific path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
     strategy:
       fail-fast: false
       matrix:
-        # On windows-latest install-charon.sh builds Charon from source
-        # (no Windows release asset is published); see scripts/install-charon.sh.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        backend: [dynasm, cranelift]
+
+    steps:
+    - name: Check prepare-charon-llbc result
+      if: ${{ needs.prepare-charon-llbc.result != 'success' }}
+      shell: bash
+      run: |
+        echo "prepare-charon-llbc did not succeed: ${{ needs.prepare-charon-llbc.result }}" >&2
+        exit 1
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
+    - name: Restore Charon binary
+      id: restore-charon
+      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: |
+          .pyre-build/charon
+          .pyre-build/charon-src
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
+    - name: Restore LLBC
+      id: restore-llbc
+      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: build/llbc
+        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+    - name: Check prepared cache hits
+      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' || steps.restore-llbc.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        echo "cache miss from prepare-charon-llbc" >&2
+        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
+        echo "LLBC cache hit: ${{ steps.restore-llbc.outputs.cache-hit }}" >&2
+        exit 1
+    - name: Verify prepared Charon/LLBC
+      shell: bash
+      run: |
+        test -d .pyre-build/charon
+        test -s build/llbc/pyre-object.ullbc
+        test -s build/llbc/pyre-interpreter.ullbc
+        test -s build/llbc/pyre-jit.ullbc
+    - name: Run cargo test for ${{ matrix.backend }}
+      env:
+        BACKEND: ${{ matrix.backend }}
+      run: cargo test --all --no-default-features --features "$BACKEND"
+
+  pyre-check:
+    name: pyre/check.py (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: prepare-charon-llbc
+    if: ${{ always() }}
+    env:
+      # See prepare-charon-llbc: restore the shared build dir into the
+      # workspace and use the same Charon pin/cache key.
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    strategy:
+      fail-fast: false
+      matrix:
         os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
+    - name: Check prepare-charon-llbc result
+      if: ${{ needs.prepare-charon-llbc.result != 'success' }}
+      shell: bash
+      run: |
+        echo "prepare-charon-llbc did not succeed: ${{ needs.prepare-charon-llbc.result }}" >&2
+        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - name: Set up CPython
       id: cpython
@@ -143,30 +224,41 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Cache Charon binary
-      id: charon-cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
+    - name: Restore Charon binary
+      id: restore-charon
+      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
       with:
         path: |
           .pyre-build/charon
           .pyre-build/charon-src
         key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-        restore-keys: |
-          charon-bin-${{ runner.os }}-${{ runner.arch }}-
-    - name: Install Charon
-      if: steps.charon-cache.outputs.cache-hit != 'true'
-      shell: bash
-      run: scripts/install-charon.sh
-    - name: Cache LLBC
-      id: llbc-cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Restore LLBC
+      id: restore-llbc
+      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
       with:
         path: build/llbc
-        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'pyre/**', 'majit/**', 'scripts/install-charon.sh', 'scripts/extract-llbc.sh', 'scripts/charon-msvc-env.sh') }}
-    - name: Extract LLBC
-      if: steps.llbc-cache.outputs.cache-hit != 'true'
+        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+    - name: Check prepared cache hits
+      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' || steps.restore-llbc.outputs.cache-hit != 'true' }}
       shell: bash
-      run: scripts/extract-llbc.sh pyre-object pyre-interpreter pyre-jit
+      run: |
+        echo "cache miss from prepare-charon-llbc" >&2
+        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
+        echo "LLBC cache hit: ${{ steps.restore-llbc.outputs.cache-hit }}" >&2
+        exit 1
+    - name: Verify prepared Charon/LLBC
+      shell: bash
+      run: |
+        test -d .pyre-build/charon
+        test -s build/llbc/pyre-object.ullbc
+        test -s build/llbc/pyre-interpreter.ullbc
+        test -s build/llbc/pyre-jit.ullbc
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
