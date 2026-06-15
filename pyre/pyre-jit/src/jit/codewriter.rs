@@ -3353,6 +3353,7 @@ struct FnPtrIndices {
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
     load_deref_value_fn: HelperHandle,
+    unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
@@ -3703,6 +3704,13 @@ fn register_helper_fn_pointers(
         cpu.load_fast_check_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_unary_negative_fn` computes `-value`; a user `__neg__` may run
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_negative_fn = bind(
+        assembler,
+        cpu.unary_negative_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3747,6 +3755,7 @@ fn register_helper_fn_pointers(
         load_super_attr_fn,
         super_attr_unwrap_fn,
         load_deref_value_fn,
+        unary_negative_fn,
         unary_invert_fn,
         unary_not_fn,
         load_fast_check_fn,
@@ -4726,6 +4735,11 @@ impl CodeWriter {
                     idx: load_deref_value_fn_idx,
                     flavor: _load_deref_value_fn_flavor,
                 },
+            unary_negative_fn:
+                HelperHandle {
+                    idx: unary_negative_fn_idx,
+                    flavor: _unary_negative_fn_flavor,
+                },
             unary_invert_fn:
                 HelperHandle {
                     idx: unary_invert_fn_idx,
@@ -4816,6 +4830,7 @@ impl CodeWriter {
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
+                unary_negative_fn_idx,
                 unary_invert_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
@@ -7121,61 +7136,28 @@ impl CodeWriter {
                         // the following PopJumpIfFalse guards on it.
                         Instruction::ToBool => {}
 
-                        // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
+                        // UNARY_NEGATIVE: pops `value`, pushes `-value` (net 0).
+                        // `unary_negative(value)` HLOp →
+                        // `residual_call_r_r(unary_negative_fn, ListR[value])`
+                        // computes `-value` through
+                        // `opcode_ops::unary_negative_value`; a user `__neg__`
+                        // may run Python → MayForce.
                         Instruction::UnaryNegative => {
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let operand_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let operand_value_for_dual = operand_value.clone();
-                            let negated = emit_frontend_neg(
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                operand_value,
+                                "unary_negative",
+                                vec![val_value.into()],
+                                Kind::Ref,
                                 py_pc as i64,
                             );
-                            let subtract_tag =
-                                binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
-                                    .expect("subtract must have a jit binary-op tag");
-                            let scratch_zero = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // Walker-orthodoxy: graph dual-writes for
-                            // the UnaryNegative `box_int_fn(0)` + `binary_op_fn(
-                            // zero, operand, subtract_tag)` pair fire
-                            // unconditionally (no `is_portal` gating).  Both
-                            // residual_calls operate on values that are
-                            // available regardless of portal status —
-                            // `operand_value_for_dual` is the cloned popped
-                            // FlowValue (always present), and the `0:Int`
-                            // constant has no source dependency.  Mirrors
-                            // upstream `jtransform.py rewrite_op_int_neg`
-                            // (`0 - x`) which records both ops on the graph
-                            // for EVERY function, not just the portal.
-                            let zero_graph_var = residual_call!(
-                                box_int_fn_idx,
-                                CallFlavor::Plain,
-                                majit_ir::PyreHelperKind::BoxInt,
-                                vec![super::flow::Constant::signed(0).into()],
-                                vec![],
-                                vec![],
-                                vec![Kind::Int],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                            pin!(zero_graph_var, scratch_zero);
-                            pin!(Some(negated), stack_base + current_depth);
-                            if let Some(zero_var) = &zero_graph_var {
-                                let binary_result = residual_call!(
-                                    binary_op_fn_idx,
-                                    CallFlavor::MayForce,
-                                    majit_ir::PyreHelperKind::BinaryOp,
-                                    vec![super::flow::Constant::signed(subtract_tag as i64).into()],
-                                    vec![zero_var.clone().into(), operand_value_for_dual.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
-                                pin!(binary_result, stack_base + current_depth);
-                            }
-                            push_and_bump!(negated.into(), py_pc);
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // JumpBackwardNoInterrupt reuses `backward_jump_target`:

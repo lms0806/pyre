@@ -2642,7 +2642,11 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     /// mapdict.py:1157-1166 `getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if pyre_object::is_str(w_key) {
-            return self.getitem_str(w_dict, pyre_object::w_str_get_value(w_key));
+            // A mapdict node is keyed by a UTF-8 identifier, so a lone
+            // surrogate can never name a node — it is simply absent, with no
+            // strategy switch (matching `getitem_str` missing).
+            return pyre_object::w_str_get_value_opt(w_key)
+                .and_then(|key| self.getitem_str(w_dict, key));
         }
         if pyre_object::_never_equal_to_string(w_key) {
             return None;
@@ -2659,11 +2663,15 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     /// mapdict.py:1177-1183 `setitem`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if pyre_object::is_str(w_key) {
-            self.setitem_str(w_dict, pyre_object::w_str_get_value(w_key), w_value);
-        } else {
-            self.switch_to_object_strategy(w_dict);
-            pyre_object::w_dict_store(w_dict, w_key, w_value);
+            if let Some(key) = pyre_object::w_str_get_value_opt(w_key) {
+                self.setitem_str(w_dict, key, w_value);
+                return;
+            }
         }
+        // Non-string or lone-surrogate key: it cannot be a mapdict node,
+        // so degrade to the object strategy before storing.
+        self.switch_to_object_strategy(w_dict);
+        pyre_object::w_dict_store(w_dict, w_key, w_value);
     }
 
     /// mapdict.py:1172-1175 `setitem_str` — `flag = w_obj.setdictvalue(...);
@@ -2676,10 +2684,12 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     /// removed) where PyPy raises KeyError on a miss; the caller raises.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if pyre_object::is_str(w_key) {
-            return instance_node_deldictvalue(
-                mapdict_strategy_unerase(w_dict),
-                pyre_object::w_str_get_value(w_key),
-            );
+            // A lone surrogate can never name a mapdict node → nothing to
+            // delete (no strategy switch, matching a `getitem` miss).
+            let Some(key) = pyre_object::w_str_get_value_opt(w_key) else {
+                return false;
+            };
+            return instance_node_deldictvalue(mapdict_strategy_unerase(w_dict), key);
         }
         if pyre_object::_never_equal_to_string(w_key) {
             return false;

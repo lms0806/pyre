@@ -193,7 +193,14 @@ pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(err) => panic!("binary op failed in JIT: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: publish into the backend
+            // exception cells so the trailing GuardNoException deopts and
+            // re-raises through the blackhole.  Return null — the guard fires
+            // before the result is used.
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -201,7 +208,12 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match compare_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(err) => panic!("compare op failed in JIT: {err}"),
+        Err(err) => {
+            // Publish + null so the trailing GuardNoException deopts and
+            // re-raises (llmodel.py:194-199 _store_exception).
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -209,7 +221,12 @@ pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64
 pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
     match unary_negative_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => panic!("unary negative failed in JIT: {err}"),
+        Err(err) => {
+            // Publish + null so the trailing GuardNoException deopts and
+            // re-raises (llmodel.py:194-199 _store_exception).
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 
@@ -217,7 +234,12 @@ pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
 pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
     match unary_invert_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => panic!("unary invert failed in JIT: {err}"),
+        Err(err) => {
+            // Publish + null so the trailing GuardNoException deopts and
+            // re-raises (llmodel.py:194-199 _store_exception).
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
     }
 }
 

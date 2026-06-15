@@ -88,6 +88,9 @@ pub struct Cpu {
     /// dereference residual (cell contents, raising the named unbound-variable
     /// `NameError` resolved via `code` + `deref_idx`).
     pub load_deref_value_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
+    /// (a user `__neg__` may run Python → fallible).
+    pub unary_negative_fn: extern "C" fn(i64) -> i64,
     /// `bh_unary_invert_fn(value)` — UNARY_INVERT `~value` residual
     /// (a user `__invert__` may run Python → fallible).
     pub unary_invert_fn: extern "C" fn(i64) -> i64,
@@ -242,6 +245,7 @@ impl Cpu {
             load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
             super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
             load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
+            unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,
             load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,

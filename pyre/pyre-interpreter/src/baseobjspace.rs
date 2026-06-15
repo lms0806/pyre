@@ -2510,9 +2510,25 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             }
             return Err(attr_error_wtf8(obj, name));
         }
-        // Instance: the instance `__dict__` first (a surrogate can never
-        // be a data descriptor), then the class attribute via the type
-        // MRO.
+        // Instance / general object: the full descriptor protocol keyed
+        // through the WTF-8 MRO view, mirroring object_getattribute.  A
+        // surrogate name can legitimately reach a descriptor via
+        // `setattr(cls, '\udc80', descr)`, so a data descriptor's
+        // `__get__` takes priority over the instance dict, and a non-data
+        // descriptor binds after it (descroperation.py:88-112).
+        let w_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
+        let w_descr = if w_type.is_null() {
+            None
+        } else {
+            lookup_in_type_wtf8(w_type, name)
+        };
+        if let Some(descr) = w_descr {
+            if is_data_descr(descr) {
+                if let Some(result) = get(descr, obj, w_type)? {
+                    return Ok(result);
+                }
+            }
+        }
         let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
@@ -2521,10 +2537,18 @@ pub(crate) unsafe fn object_getattribute_surrogate(
                 }
             }
         }
-        if let Some(w_type) = crate::typedef::r#type(obj) {
-            if let Some(v) = lookup_in_type_wtf8(w_type, name) {
-                return Ok(v);
+        if let Some(descr) = w_descr {
+            if let Some(result) = get(descr, obj, w_type)? {
+                return Ok(result);
             }
+            if crate::is_function(descr)
+                && !crate::is_builtin_code(
+                    crate::function_get_code(descr) as pyre_object::PyObjectRef
+                )
+            {
+                return Ok(pyre_object::w_method_new(descr, obj, w_type));
+            }
+            return Ok(descr);
         }
         Err(attr_error_wtf8(obj, name))
     }
@@ -5178,6 +5202,14 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // PyPy: typeobject.py type.__setattr__ → w_type.dict_w[name] = w_value
     unsafe {
         if is_type(obj) {
+            // typeobject.py:416 — only heap types may have their dict mutated.
+            if !pyre_object::w_type_is_heaptype(obj) {
+                return Err(PyError::type_error(format!(
+                    "cannot set '{}' attribute of immutable type '{}'",
+                    name,
+                    w_type_get_name(obj)
+                )));
+            }
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store(&mut *dict_ptr, name, value);
@@ -5642,6 +5674,13 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // same as the surrogate sibling `object_delattr_surrogate`.
     unsafe {
         if is_type(obj) {
+            // typeobject.py:437 — only heap types may have attributes deleted.
+            if !pyre_object::w_type_is_heaptype(obj) {
+                return Err(PyError::type_error(format!(
+                    "cannot delete attributes on immutable type object '{}'",
+                    w_type_get_name(obj)
+                )));
+            }
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 if crate::dict_storage_delete(&mut *dict_ptr, name) {

@@ -1306,6 +1306,7 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         in_a_call: bool,
         after_residual_call: bool,
+        top_frame_marker_call_pc: Option<usize>,
     ) -> Vec<OpRef> {
         // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
         let live_pc = if in_a_call || after_residual_call {
@@ -1353,19 +1354,33 @@ impl MIFrame {
         // `pyjitpl.py:194-198`: a single `pc` drives both the result-box
         // clear and the liveness decode.  Resolve the resume jitcode pc once
         // here so the lazy-load preamble fills exactly the registers the
-        // snapshot below reads.  Marker-aware for an `in_a_call` parent whose
-        // CALL sits in a try-block: `after_residual_call_resume_pc_for` routes
-        // to the post-call `-live-`/catch.  Splitting the two — preamble at
-        // the fallthrough `-live-`, snapshot at the post-call `-live-` —
-        // would leave a post-call-only live register NONE in the resume data.
+        // snapshot below reads, routed through the SAME `-live-` the snapshot
+        // pc resolves to (`marker_aware_resume_pc` /
+        // `marker_aware_parent_resume_pc`).  A try-block residual call resumes
+        // at its OWN post-call `-live-`/catch via
+        // `after_residual_call_resume_pc_for`:
+        //   * in_a_call parent → the parent's stored CALL pc
+        //     (`residual_call_pc`).
+        //   * after_residual_call top frame → the CALL pc the caller folded
+        //     into the snapshot pc (`Some(orgpc)` for the marker-routed
+        //     GUARD_NOT_FORCED / GUARD_NO_EXCEPTION guards; `None` for the
+        //     GUARD_EXCEPTION path, which carries the exception via the
+        //     `jf_guard_exc` channel and resumes at a plain fallthrough pc).
+        // No marker entry falls back to the fallthrough `-live-`.  Splitting
+        // the two — preamble/boxes at the fallthrough `-live-`, snapshot at
+        // the post-call `-live-` — would make the decoder consume a different
+        // box count than the encoder wrote.
         let resume_jit_pc: Option<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
             if jc.payload.metadata.pc_map.is_empty() {
                 None
             } else {
-                match self
-                    .residual_call_pc
-                    .filter(|_| in_a_call)
+                let marker_call_pc = if in_a_call {
+                    self.residual_call_pc
+                } else {
+                    top_frame_marker_call_pc
+                };
+                match marker_call_pc
                     .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
                     .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
                 {
@@ -3754,7 +3769,7 @@ impl MIFrame {
     /// order.
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
-        let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
+        let active_boxes = self.get_list_of_active_boxes(ctx, false, false, None);
         // [frame, ec] portal-reds contract. Recover ec before snapshotting
         // sym fields so guard fail_args never carry OpRef::NONE in the ec
         // slot (adapter/bridge-from-guard paths).
@@ -3853,7 +3868,7 @@ impl MIFrame {
             self.flush_to_frame_for_guard(ctx);
             // pyjitpl.py:177: active boxes = registers only (no header).
             let callee_active_boxes =
-                self.get_list_of_active_boxes(ctx, false, after_residual_call);
+                self.get_list_of_active_boxes(ctx, false, after_residual_call, Some(self.orgpc));
             // RPython Box.type parity: snapshot types match the full
             // (un-filtered) active_boxes — constants are part of the
             // snapshot via TAGCONST.
@@ -3929,7 +3944,8 @@ impl MIFrame {
         after_residual_call: bool,
     ) {
         self.flush_to_frame_for_guard(ctx);
-        let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
+        let active_boxes =
+            self.get_list_of_active_boxes(ctx, false, after_residual_call, Some(self.orgpc));
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
         let fail_arg_types = snapshot_full_types.clone();
 
@@ -4574,7 +4590,7 @@ impl MIFrame {
         // the blackhole's marker-routed resume position (`build_framestack_
         // snapshot` folds the same marker into this parent's snapshot pc).
         parent_frame.residual_call_pc = parent.call_pc;
-        let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false);
+        let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false, None);
         let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
         let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
         (full_types, jitcode_index, active_boxes)
@@ -5082,7 +5098,7 @@ impl MIFrame {
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
-        let callee_active_boxes = self.get_list_of_active_boxes(ctx, false, false);
+        let callee_active_boxes = self.get_list_of_active_boxes(ctx, false, false, None);
         let callee_snapshot_types_full =
             self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
 
@@ -8538,7 +8554,11 @@ impl MIFrame {
                 this.clear_pre_opcode_state();
 
                 this.flush_to_frame_for_guard(ctx);
-                let active_boxes = this.get_list_of_active_boxes(ctx, false, after_residual_call);
+                // GUARD_EXCEPTION resumes via the `jf_guard_exc` channel at a
+                // plain fallthrough pc (no bit-14 marker), so read the boxes at
+                // the fallthrough `-live-` to match the snapshot pc below.
+                let active_boxes =
+                    this.get_list_of_active_boxes(ctx, false, after_residual_call, None);
                 let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
 
                 // capture_resumedata parity: full framestack snapshot.
@@ -10955,7 +10975,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
         assert_eq!(active, vec![int_box, ref_box, float_box]);
 
         unsafe {
@@ -11031,7 +11051,7 @@ mod tests {
             pre_opcode_semantic_depth: Some(3),
         };
 
-        let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
         assert_eq!(active, vec![stack0]);
 
         unsafe {

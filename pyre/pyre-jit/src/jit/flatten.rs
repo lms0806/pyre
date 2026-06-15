@@ -3324,6 +3324,13 @@ pub struct LoweringContext {
     /// (`Plain` — reads heap, raises on an unbound free variable, runs no
     /// user code).
     pub load_deref_value_fn_idx: u16,
+    /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
+    /// `unary_negative(value)` HLOp lowered to `residual_call_r_r(ConstInt(
+    /// fn_idx), ListR([value]), Descr) → reg` via
+    /// [`lower_unary_negative_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
+    /// shape); `bh_unary_negative_fn` computes `-value` (a user `__neg__`
+    /// may force virtualizables → `MayForce`).
+    pub unary_negative_fn_idx: u16,
     /// `unary_invert_fn` descrs-pool index.  UNARY_INVERT records the
     /// `unary_invert(value)` HLOp lowered to `residual_call_r_r(ConstInt(
     /// fn_idx), ListR([value]), Descr) → reg` via
@@ -4840,6 +4847,9 @@ where
     if let Some(insn) = lower_load_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_unary_negative_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_unary_invert_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5167,6 +5177,41 @@ where
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![cell, code])),
             descr_operand,
         ],
+        dst_reg,
+    ))
+}
+
+/// Lower the UNARY_NEGATIVE pyre HLOp `unary_negative(value)` → `result: Ref`
+/// to `residual_call_r_r(ConstInt(unary_negative_fn_idx), ListR([value]),
+/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
+/// `bh_unary_negative_fn` computes `-value`; a user `__neg__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`unary_negative` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_unary_negative_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "unary_negative" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.unary_negative_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
         dst_reg,
     ))
 }
@@ -6982,6 +7027,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7135,6 +7181,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7275,6 +7322,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7378,6 +7426,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7525,6 +7574,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7717,6 +7767,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -7958,6 +8009,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8065,6 +8117,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8116,6 +8169,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8244,6 +8298,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8330,6 +8385,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8387,6 +8443,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8436,6 +8493,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8492,6 +8550,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8575,6 +8634,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8621,6 +8681,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8681,6 +8742,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8757,6 +8819,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8818,6 +8881,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8894,6 +8958,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8946,6 +9011,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -8998,6 +9064,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -9055,6 +9122,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -9126,6 +9194,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -10520,6 +10589,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -10813,6 +10883,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
@@ -10932,6 +11003,7 @@ mod tests {
             unary_invert_fn_idx: 109,
             unary_not_fn_idx: 110,
             load_fast_check_fn_idx: 111,
+            unary_negative_fn_idx: 112,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
