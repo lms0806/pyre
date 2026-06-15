@@ -22,6 +22,11 @@ pub struct W_PropertyObject {
     /// `__doc__` exposed through `GetSetProperty(get_doc, set_doc)`
     /// (descriptor.py:316-318).  NULL plays None.
     pub w_doc: PyObjectRef,
+    /// `descriptor.py:183 self.w_name = None` — set by `__set_name__`
+    /// (descriptor.py:274-276) when the property is assigned as a class
+    /// attribute.  Surfaced through `__name__` and woven into the
+    /// `_properror` accessor messages.  NULL plays unset.
+    pub w_name: PyObjectRef,
     /// `descriptor.py:182 self.getter_doc = False` — True when the doc
     /// was copied from `fget.__doc__` (descriptor.py:196-204); `_copy`
     /// uses it to drop the inherited doc when the getter is replaced.
@@ -46,6 +51,7 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         fset,
         fdel,
         w_doc: PY_NULL,
+        w_name: PY_NULL,
         getter_doc: false,
     })
 }
@@ -74,6 +80,9 @@ pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_PropertyObject;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = false;
+    // Record the old→young edge: `w_doc` is a traced slot and the
+    // property may already have been promoted out of the nursery.
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
@@ -82,6 +91,20 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_PropertyObject;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = true;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// `self.w_name` — NULL plays unset.
+pub unsafe fn w_property_get_name(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_PropertyObject)).w_name
+}
+
+/// `descriptor.py:274-276 W_Property.set_name` — record the name the
+/// property was assigned under.
+pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
+    let prop = obj as *mut W_PropertyObject;
+    (*prop).w_name = w_name;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]

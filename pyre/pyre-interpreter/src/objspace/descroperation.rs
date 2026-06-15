@@ -587,29 +587,18 @@ pub(crate) unsafe fn int_value(obj: PyObjectRef) -> i64 {
 
 // ── Bitwise operations ───────────────────────────────────────────────
 
+// W_IntObject.descr_and/or/xor — always int; the bool result is produced
+// by W_BoolObject's own descr_and/or/xor, not by the int path.
 unsafe fn int_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) & int_value(b);
-    // bool & bool → bool
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) & int_value(b)))
 }
 
 unsafe fn int_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) | int_value(b);
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) | int_value(b)))
 }
 
 unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) ^ int_value(b);
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) ^ int_value(b)))
 }
 
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1513,6 +1502,232 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+// ── Numeric type-slot builtins ────────────────────────────────────────
+//
+// The `int`/`float` numeric special methods (`int.__add__`,
+// `float.__and__`, …) resolve to these concrete computations, not to the
+// operator dispatch above.  The operator (`add`, `and_`, …) drives the
+// forward+reflected protocol and, when an operand is a numeric subclass
+// that overrides the special method, re-dispatches through that operand's
+// type slot.  Wiring the slot back to the operator would re-enter it and
+// recurse without bound; wiring the slot to the concrete computation
+// terminates after computing the result or returning NotImplemented for
+// the reflected method to handle.  The `is_int_or_long`/`is_float` macro
+// guards in typedef.rs pre-filter the operand kinds, so the trailing
+// NotImplemented is reached only defensively.
+
+pub(crate) fn add_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_add(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_add(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_add(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn sub_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_sub(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_sub(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_sub(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn mul_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_mul(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_mul(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_mul(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        let a_num = is_int(a) || is_float(a) || is_long(a);
+        let b_num = is_int(b) || is_float(b) || is_long(b);
+        if a_num && b_num {
+            if is_float(a) || is_float(b) {
+                return float_truediv(a, b);
+            }
+            if !is_long(b) && as_float(b) == 0.0 {
+                return Err(PyError::zero_division("division by zero"));
+            }
+            if is_long(a) || is_long(b) {
+                let r = bigint_truediv(as_bigint(a), as_bigint(b))?;
+                return Ok(w_float_new(r));
+            }
+            return Ok(w_float_new(as_float(a) / as_float(b)));
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn floordiv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_floordiv(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_floordiv(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_floordiv(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn mod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_mod(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_mod(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_mod(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_pow(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_pow(a, b);
+        }
+        if is_float_pair(a, b) {
+            return float_pow_impl(as_float(a), as_float(b));
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        let lhs_num = is_int(a) || is_long(a) || is_float(a);
+        let rhs_num = is_int(b) || is_long(b) || is_float(b);
+        if lhs_num && rhs_num {
+            let q = floordiv(a, b)?;
+            let r = mod_(a, b)?;
+            return Ok(w_tuple_new(vec![q, r]));
+        }
+    }
+    Ok(w_not_implemented())
+}
+
+pub(crate) fn lshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_lshift(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_lshift(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn rshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return int_rshift(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_rshift(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn and_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        // int.__and__ — bool operands are treated as ints; the bool-typed
+        // result is produced by bool.__and__ (init_bool_type), not here.
+        if is_int(a) && is_int(b) {
+            return int_bitand(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitand(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn or_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_bitor(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitor(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
+pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if is_int(a) && is_int(b) {
+            return int_bitxor(a, b);
+        }
+        if is_int_or_long(a) && is_int_or_long(b) {
+            return long_bitxor(a, b);
+        }
+        Ok(w_not_implemented())
+    }
+}
+
 // ── descroperation helpers — pypy/objspace/descroperation.py ──────────
 //
 // These helpers implement the standard "forward + reverse with
@@ -2049,8 +2264,13 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 ///
 /// PyPy equivalent: _unionable() in _pypy_generic_alias.py
 #[inline]
-fn unionable(obj: PyObjectRef) -> bool {
-    unsafe { is_none(obj) || is_type(obj) || pyre_object::is_union(obj) }
+pub(crate) fn unionable(obj: PyObjectRef) -> bool {
+    unsafe {
+        is_none(obj)
+            || is_type(obj)
+            || pyre_object::is_union(obj)
+            || pyre_object::is_generic_alias(obj)
+    }
 }
 
 /// Bitwise OR dispatch (`|` operator).
@@ -2127,9 +2347,10 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return result;
         }
         // type | type — PEP 604 union types (Python 3.10+)
-        // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union
+        // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
+        // which collapses identical operands (`int | int` is `int`).
         if unionable(a) && unionable(b) {
-            return Ok(pyre_object::w_union_new(a, b));
+            return crate::genericalias::create_union(a, b);
         }
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;
