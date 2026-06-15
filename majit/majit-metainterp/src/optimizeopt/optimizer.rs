@@ -465,7 +465,7 @@ impl Optimizer {
                     // the authoritative shape; no extra type marker is
                     // needed at the import side.
                     let _ = (field_descrs, known_class, field_idx);
-                    imported_fields.push((*field_idx, field_ref));
+                    imported_fields.push((*field_idx, BoxRef::from_opref(field_ref)));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
@@ -485,7 +485,9 @@ impl Optimizer {
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
-                    .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
+                    .map(|item_info| {
+                        BoxRef::from_opref(Self::import_virtual_state_value(item_info, ctx))
+                    })
                     .collect();
                 ctx.set_ptr_info(
                     box_,
@@ -508,7 +510,7 @@ impl Optimizer {
                 let mut imported_fields = Vec::new();
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
-                    imported_fields.push((*field_idx, field_ref));
+                    imported_fields.push((*field_idx, BoxRef::from_opref(field_ref)));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
@@ -536,7 +538,9 @@ impl Optimizer {
                             .map(|(field_idx, field_info)| {
                                 (
                                     *field_idx,
-                                    Self::import_virtual_state_value(field_info, ctx),
+                                    BoxRef::from_opref(Self::import_virtual_state_value(
+                                        field_info, ctx,
+                                    )),
                                 )
                             })
                             .collect()
@@ -823,7 +827,11 @@ impl Optimizer {
                                     descr: entry.size_descr,
                                     known_class: *known_class,
                                     ob_type_descr: None,
-                                    fields: entry.fields,
+                                    fields: entry
+                                        .fields
+                                        .iter()
+                                        .map(|(i, r)| (*i, BoxRef::from_opref(*r)))
+                                        .collect(),
                                     last_guard_pos: -1,
                                     avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                                 },
@@ -838,7 +846,11 @@ impl Optimizer {
                             crate::optimizeopt::info::PtrInfo::VirtualStruct(
                                 crate::optimizeopt::info::VirtualStructInfo {
                                     descr: entry.size_descr,
-                                    fields: entry.fields,
+                                    fields: entry
+                                        .fields
+                                        .iter()
+                                        .map(|(i, r)| (*i, BoxRef::from_opref(*r)))
+                                        .collect(),
                                     last_guard_pos: -1,
                                     avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                                 },
@@ -910,7 +922,7 @@ impl Optimizer {
                 // raw pointers (info.py:865 RawBufferPtrInfo +
                 // getrawptrinfo()).
                 let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
-                let imported_fields: Vec<(u32, OpRef)> = fields
+                let imported_fields: Vec<(u32, BoxRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
                         let field_ref = Self::import_virtual_state_from_label_args_recurse(
@@ -926,7 +938,7 @@ impl Optimizer {
                         // (`Value::Ref(class_gcref)`) from `make_constant`. The
                         // Ref-typed const forwarding is the authoritative shape.
                         let _ = (field_descrs, known_class, field_idx);
-                        (*field_idx, field_ref)
+                        (*field_idx, BoxRef::from_opref(field_ref))
                     })
                     .collect();
                 let opref_box = ctx.get_box_replacement_box(opref);
@@ -955,13 +967,13 @@ impl Optimizer {
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
-                        Self::import_virtual_state_from_label_args_recurse(
+                        BoxRef::from_opref(Self::import_virtual_state_from_label_args_recurse(
                             item_info,
                             imported_label_args,
                             label_slot,
                             ctx,
                             walk_visited,
-                        )
+                        ))
                     })
                     .collect();
                 let opref_box = ctx.get_box_replacement_box(opref);
@@ -994,13 +1006,13 @@ impl Optimizer {
                     .map(|(field_idx, field_info)| {
                         (
                             *field_idx,
-                            Self::import_virtual_state_from_label_args_recurse(
+                            BoxRef::from_opref(Self::import_virtual_state_from_label_args_recurse(
                                 field_info,
                                 imported_label_args,
                                 label_slot,
                                 ctx,
                                 walk_visited,
-                            ),
+                            )),
                         )
                     })
                     .collect();
@@ -1037,12 +1049,14 @@ impl Optimizer {
                             .map(|(field_idx, field_info)| {
                                 (
                                     *field_idx,
-                                    Self::import_virtual_state_from_label_args_recurse(
-                                        field_info,
-                                        imported_label_args,
-                                        label_slot,
-                                        ctx,
-                                        walk_visited,
+                                    BoxRef::from_opref(
+                                        Self::import_virtual_state_from_label_args_recurse(
+                                            field_info,
+                                            imported_label_args,
+                                            label_slot,
+                                            ctx,
+                                            walk_visited,
+                                        ),
                                     ),
                                 )
                             })
@@ -2292,7 +2306,7 @@ impl Optimizer {
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let source = typed_inputargs[i];
-                    let target = nia[i];
+                    let target = nia[i].to_opref();
                     // Constants don't participate in forwarding.
                     if ctx.get_box_replacement_box(target).and_then(|cb| cb.const_value()).is_some() {
                         return source;
@@ -2705,7 +2719,7 @@ impl Optimizer {
                         let fresh_info = match info {
                             crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                 for field in &mut vinfo.fields {
-                                    let orig_field = field.1;
+                                    let orig_field = field.1.to_opref();
                                     // RPython Box type parity: the alias
                                     // inherits `box.type` from the original
                                     // field. RPython Box always carries
@@ -2725,7 +2739,7 @@ impl Optimizer {
                                     let (ff, b_ff) = ctx.reserve_virtual_box(tp);
                                     let b_orig = ctx.get_box_replacement(orig_field);
                                     ctx.make_equal_to(&b_ff, &b_orig);
-                                    field.1 = ff;
+                                    field.1 = BoxRef::from_opref(ff);
                                 }
                                 crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
                             }
@@ -3242,14 +3256,19 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
+                let remap_boxref = |arg: &mut crate::r#box::BoxRef| {
+                    let mut opref = arg.to_opref();
+                    remap_opref(&mut opref);
+                    *arg = crate::r#box::BoxRef::from_opref(opref);
+                };
                 for arg in &mut state.next_iteration_args {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &mut state.end_args {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &mut state.renamed_inputargs {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &state.short_inputargs {
                     // Renamed-box positions track op compaction through the
@@ -6202,7 +6221,7 @@ mod tests {
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, OpRef::int_op(11))],
+                fields: vec![(1, BoxRef::from_opref(OpRef::int_op(11)))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -6262,7 +6281,7 @@ mod tests {
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, OpRef::int_op(11))],
+                fields: vec![(0, BoxRef::from_opref(OpRef::int_op(11)))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -6345,8 +6364,20 @@ mod tests {
         let sp = ctx
             .build_imported_short_preamble()
             .expect("forcing imported short guard arg should build short preamble");
-        assert_eq!(sp.used_boxes, vec![OpRef::int_op(14)]);
-        assert_eq!(sp.jump_args, vec![OpRef::int_op(14)]);
+        assert_eq!(
+            sp.used_boxes
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::int_op(14)]
+        );
+        assert_eq!(
+            sp.jump_args
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::int_op(14)]
+        );
     }
 
     #[test]

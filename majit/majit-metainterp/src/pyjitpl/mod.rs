@@ -1485,12 +1485,10 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
-        for frame in self.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(opref) = slot.as_mut() {
-                    if let Some(gcref) = opref.as_const_ptr_mut() {
-                        visitor(gcref);
-                    }
+        for frame in self.framestack.frames.iter() {
+            for slot in frame.ref_regs.iter() {
+                if let Some(b) = slot.as_ref() {
+                    b.walk_const_ptr_refs(&mut visitor);
                 }
             }
         }
@@ -1512,14 +1510,12 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
-        // constants into `initial_inputarg_consts`. Inline
-        // `ConstPtr(GcRef)` entries here live outside the op-graph
-        // and must be forwarded by the same GC walker — history.py:314
+        // constants into `initial_inputarg_consts`. Each is a
+        // `BoxKind::Const` box; a Ref entry's inline gcref is forwarded
+        // through the canonical `BoxRef::walk_const_ptr_refs` — history.py:314
         // `ConstPtr.value` is a gcref attribute of the Box.
-        for opref in trace_ctx.initial_inputarg_consts.iter_mut() {
-            if let Some(slot) = opref.as_const_ptr_mut() {
-                visitor(slot);
-            }
+        for b in trace_ctx.initial_inputarg_consts.iter() {
+            b.walk_const_ptr_refs(&mut visitor);
         }
         // heapcache.py:50-104 — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
@@ -1550,9 +1546,12 @@ impl<M: Clone> MetaInterp<M> {
             // compilation is paused for GC, mirroring RPython's in-place field
             // update of `ConstPtr.value`.
             let opref = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
-            if let Some(gcref) = opref.as_const_ptr_mut() {
-                visitor(gcref);
-            }
+            // Forward the snapshot slot's inline const gcref through the
+            // canonical BoxRef-Const walk, writing the updated ref back in
+            // place (mirroring an in-place ConstPtr.value field update).
+            let b = BoxRef::from_opref(*opref);
+            b.walk_const_ptr_refs(&mut visitor);
+            *opref = b.to_opref();
         }
     }
 
@@ -2761,10 +2760,10 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|value| {
                     let opref = ctx.recorder.record_input_arg(value.get_type());
                     // history.py:227/268/314 — Const{Int,Float,Ptr}.value
-                    // is inline on the Box itself; mint inline-Const
-                    // directly rather than allocating a pool index.
-                    ctx.initial_inputarg_consts
-                        .push(OpRef::const_inline_from_value(value));
+                    // is inline on the Box itself; snapshot the value into a
+                    // `BoxKind::Const` box (GC-walked once via
+                    // `BoxRef::walk_const_ptr_refs`).
+                    ctx.initial_inputarg_consts.push(BoxRef::new_const(*value));
                     opref
                 })
                 .collect()
@@ -3317,11 +3316,10 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
                 ctx.callinfocollection = self.callinfocollection.clone();
                 // history.py:227/268/314 — Const{Int,Float,Ptr}.value
-                // is inline on the Box; mint inline-Const directly.
-                ctx.initial_inputarg_consts = live_values
-                    .iter()
-                    .map(OpRef::const_inline_from_value)
-                    .collect();
+                // is inline on the Box; snapshot each value into a
+                // `BoxKind::Const` box (GC-walked via walk_const_ptr_refs).
+                ctx.initial_inputarg_consts =
+                    live_values.iter().map(|v| BoxRef::new_const(*v)).collect();
                 if let Some(ref descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor.clone());
                 }
@@ -3531,11 +3529,9 @@ impl<M: Clone> MetaInterp<M> {
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
         // history.py:227/268/314 — Const{Int,Float,Ptr}.value is inline
-        // on the Box; mint inline-Const directly.
-        ctx.initial_inputarg_consts = live_values
-            .iter()
-            .map(OpRef::const_inline_from_value)
-            .collect();
+        // on the Box; snapshot each value into a `BoxKind::Const` box
+        // (GC-walked via walk_const_ptr_refs).
+        ctx.initial_inputarg_consts = live_values.iter().map(|v| BoxRef::new_const(*v)).collect();
         if let Some(ref descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor.clone());
         }
@@ -4453,13 +4449,15 @@ impl<M: Clone> MetaInterp<M> {
         ctx: &TraceCtx,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
     ) -> *const u8 {
-        // history.py:314 ConstPtr.value lives inline on the OpRef
-        // (Slice 7 inline-Const cutover).
+        // history.py:314 ConstPtr.value lives inline on the box —
+        // `orig_inpargs[idx].getref_base()` parity read.
         driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
-            .and_then(|idx| ctx.initial_inputarg_consts.get(idx).copied())
-            .and_then(|const_ref| const_ref.as_const_ptr())
-            .map(|gcref| gcref.0 as *const u8)
+            .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
+            .and_then(|const_box| match const_box.const_value() {
+                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
+                _ => None,
+            })
             .unwrap_or(std::ptr::null())
     }
 
@@ -4741,7 +4739,16 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.header_pc,
                 );
             }
-            trace.cut_trace_from_with_consts(start, original_boxes, &ctx.initial_inputarg_consts)
+            // cut_trace_from_with_consts remaps escaped original inputargs to
+            // their trace-entry Const via a transient build-time map keyed by
+            // `OpRef.raw()` — derive the inline-Const OpRef view here (not a
+            // persistent GC store, so no stale-pointer hazard).
+            let inputarg_consts: Vec<OpRef> = ctx
+                .initial_inputarg_consts
+                .iter()
+                .map(|b| b.to_opref())
+                .collect();
+            trace.cut_trace_from_with_consts(start, original_boxes, &inputarg_consts)
         } else {
             trace
         };
@@ -5040,7 +5047,8 @@ impl<M: Clone> MetaInterp<M> {
                 Some(args) => args
                     .iter()
                     .enumerate()
-                    .map(|(i, &opref)| {
+                    .map(|(i, arg)| {
+                        let opref = arg.to_opref();
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
@@ -5949,7 +5957,13 @@ impl<M: Clone> MetaInterp<M> {
                         header_pc,
                     );
                 }
-                trace.cut_trace_from_with_consts(start, original_boxes, &initial_inputarg_consts)
+                // Inline-Const OpRef view for the transient cut_trace remap
+                // (keyed by `OpRef.raw()`; not a persistent GC store).
+                let inputarg_consts: Vec<OpRef> = initial_inputarg_consts
+                    .iter()
+                    .map(|b| b.to_opref())
+                    .collect();
+                trace.cut_trace_from_with_consts(start, original_boxes, &inputarg_consts)
             } else {
                 trace
             };
@@ -9027,10 +9041,11 @@ impl<M: Clone> MetaInterp<M> {
                 let renamed_inputargs: Vec<InputArg> = es
                     .renamed_inputargs
                     .iter()
-                    .map(|&opref| {
+                    .map(|arg| {
                         // RPython retrace passes the original typed Box list
                         // directly; each renamed inputarg OpRef carries its
                         // `.type` intrinsically (history.py:220).
+                        let opref = arg.to_opref();
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
@@ -9619,7 +9634,8 @@ impl<M: Clone> MetaInterp<M> {
                 let renamed_inputargs: Vec<InputArg> = es
                     .renamed_inputargs
                     .iter()
-                    .map(|&opref| {
+                    .map(|arg| {
+                        let opref = arg.to_opref();
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
@@ -15257,7 +15273,10 @@ mod metainterp_static_data_tests {
         assert_eq!(f.int_values[0], Some(100));
         assert_eq!(f.int_regs[1], Some(OpRef::int_op(11)));
         assert_eq!(f.int_values[1], Some(101));
-        assert_eq!(f.ref_regs[0], Some(OpRef::ref_op(20)));
+        assert_eq!(
+            f.ref_regs[0].as_ref().map(|b| b.to_opref()),
+            Some(OpRef::ref_op(20))
+        );
         assert_eq!(f.ref_values[0], Some(200));
         assert_eq!(f.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(f.float_values[0], Some(300));

@@ -1029,7 +1029,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fields
                             .iter()
                             .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect(),
@@ -1044,7 +1044,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fields
                             .iter()
                             .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect(),
@@ -1055,7 +1055,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .items
                     .iter()
-                    .map(|vref| self.ctx.get_replacement_opref(*vref))
+                    .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
                     .collect(),
             }),
             PtrInfo::VirtualArrayStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -1068,7 +1068,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fielddescrs.iter().enumerate().map(|(fi, _)| {
                             ef.iter()
                                 .find(|(field_idx, _)| *field_idx == fi as u32)
-                                .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                                .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                                 .unwrap_or(OpRef::NONE)
                         })
                     })
@@ -1107,7 +1107,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 Some(majit_ir::VirtualFieldsInfo {
                     descr: None,
                     known_class: None,
-                    field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent)],
+                    field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent.to_opref())],
                 })
             }
             // vstring.py:207-208 VStringPlainInfo._visitor_walk_recursive:
@@ -1134,20 +1134,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         ._chars
                         .iter()
                         .map(|slot| {
-                            slot.map(|r| self.ctx.get_replacement_opref(r))
+                            slot.as_ref()
+                                .map(|r| self.ctx.get_replacement_opref(r.to_opref()))
                                 .unwrap_or(OpRef::NONE)
                         })
                         .collect(),
                     // vstring.py:255-257: [self.s, self.start, self.lgtop].
                     VStringVariant::Slice(s) => vec![
-                        self.ctx.get_replacement_opref(s.s),
-                        self.ctx.get_replacement_opref(s.start),
-                        self.ctx.get_replacement_opref(s.lgtop),
+                        self.ctx.get_replacement_opref(s.s.to_opref()),
+                        self.ctx.get_replacement_opref(s.start.to_opref()),
+                        self.ctx.get_replacement_opref(s.lgtop.to_opref()),
                     ],
                     // vstring.py:319-324: [self.vleft, self.vright].
                     VStringVariant::Concat(c) => vec![
-                        self.ctx.get_replacement_opref(c.vleft),
-                        self.ctx.get_replacement_opref(c.vright),
+                        self.ctx.get_replacement_opref(c.vleft.to_opref()),
+                        self.ctx.get_replacement_opref(c.vright.to_opref()),
                     ],
                     // Non-virtual `VStringVariant::Ptr` would not reach
                     // here because of the `is_virtual()` guard above.
@@ -2291,7 +2292,7 @@ impl OptContext {
                 use crate::optimizeopt::info::VStringVariant;
                 if let PtrInfo::Str(sinfo) = info {
                     if let VStringVariant::Concat(c) = sinfo.variant {
-                        return Some((c.vleft, c.vright));
+                        return Some((c.vleft.to_opref(), c.vright.to_opref()));
                     }
                 }
                 None
@@ -2357,7 +2358,7 @@ impl OptContext {
         }
         self.with_ptr_info_mut(&resolved, |info| {
             if let PtrInfo::Str(si) = info {
-                si.lgtop = Some(lgtop);
+                si.lgtop = Some(crate::r#box::BoxRef::from_opref(lgtop));
             }
         });
     }
@@ -3571,15 +3572,17 @@ impl OptContext {
             }
             if let Some(infos) = exported_infos {
                 let items: Vec<OpRef> = match &*preamble_info_handle.borrow() {
-                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
-                    PtrInfo::VirtualArray(a) => a.items.iter().copied().collect(),
-                    PtrInfo::VirtualStruct(s) => s.fields.iter().map(|(_, r)| *r).collect(),
+                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
+                    PtrInfo::VirtualArray(a) => a.items.iter().map(|b| b.to_opref()).collect(),
+                    PtrInfo::VirtualStruct(s) => {
+                        s.fields.iter().map(|(_, r)| r.to_opref()).collect()
+                    }
                     PtrInfo::VirtualArrayStruct(a) => a
                         .element_fields
                         .iter()
-                        .flat_map(|row| row.iter().map(|(_, r)| *r))
+                        .flat_map(|row| row.iter().map(|(_, r)| r.to_opref()))
                         .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values().to_vec(),
+                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values(),
                     _ => Vec::new(),
                 };
                 self.setinfo_from_preamble_list(&items, infos);
@@ -5279,7 +5282,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5298,7 +5301,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5333,8 +5336,11 @@ impl OptContext {
             PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
                 let descr = v.descr.clone();
                 let len = v.items.len() as i64;
-                let items: Vec<FieldEntry> =
-                    v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
+                let items: Vec<FieldEntry> = v
+                    .items
+                    .iter()
+                    .map(|r| FieldEntry::Value(r.clone()))
+                    .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
@@ -9427,7 +9433,7 @@ mod constant_ptr_info_tests {
             &slice_box,
             PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
                 offset: 8,
-                parent,
+                parent: crate::r#box::BoxRef::from_opref(parent),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
