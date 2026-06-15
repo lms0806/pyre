@@ -38,8 +38,9 @@ use crate::{GcRef, OpRef, Type, Value};
 /// op/inputarg/const objects.
 pub struct Box {
     /// `resoperation.py:260 type` (`'i'` / `'r'` / `'f'` / `'v'`).
-    /// Absorbs the frontend semantic portion that majit currently spreads
-    /// across `value_types` / `inputarg_types` / `constant_types`.
+    /// Carries the per-value type that majit otherwise reads from each
+    /// value's own tag (`Op::result_type`, `InputArg.tp`, `Const::get_type`)
+    /// rather than from a side table.
     pub type_: Type,
 
     /// Rust enum mirror of RPython's subclass hierarchy.

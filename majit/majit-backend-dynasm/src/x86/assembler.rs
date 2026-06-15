@@ -670,8 +670,8 @@ pub struct Assembler386<'a> {
     /// Mirrors `OpTypeIndex::op_pos`.
     op_pos: Vec<u32>,
     /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
-    /// variant carries its own type (`Const::get_type`), subsuming the
-    /// legacy `constant_types` side table.
+    /// variant carries its own type (`Const::get_type`), so no separate
+    /// constant-type map is needed.
     constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
     /// Next available frame slot index.
     next_slot: usize,
@@ -2597,19 +2597,14 @@ impl<'a> Assembler386<'a> {
             eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
 
-        // RegAlloc keeps the raw `i64` value map and the `Type` map as
-        // separate views; project them from the typed pool at this boundary.
+        // RegAlloc keeps the raw `i64` value map; project it from the
+        // typed pool at this boundary (each Const carries its own type).
         let ra_constants: majit_ir::VecAssoc<u32, i64> = self
             .constants
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
-        let ra_constant_types: majit_ir::VecAssoc<u32, Type> = self
-            .constants
-            .iter()
-            .map(|(&k, c)| (k, c.get_type()))
-            .collect();
-        let mut ra = RegAlloc::new(ra_constants, ra_constant_types, inputargs, ops);
+        let mut ra = RegAlloc::new(ra_constants, inputargs, ops);
         let is_bridge = self.bridge_input_locs.is_some();
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(arglocs);
@@ -7407,8 +7402,7 @@ impl<'a> Assembler386<'a> {
             return false;
         }
         // history.py:227/268/314 — inline-Const variants carry value
-        // inline; the variant tag IS the box type, subsuming the
-        // legacy constant_types side table.
+        // inline; the variant tag IS the box type.
         if let Some(val) = value.inline_const_bits() {
             if !matches!(value, OpRef::ConstPtr(_)) {
                 return false;

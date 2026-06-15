@@ -164,11 +164,6 @@ pub struct GcRewriterImpl {
     /// JitFrame info for call_assembler rewriting.
     /// rewrite.py:665 — handle_call_assembler needs frame layout info.
     pub jitframe_info: Option<JitFrameDescrs>,
-    /// Type annotations for constant OpRefs. RPython's ConstPtr/ConstInt
-    /// boxes carry `.type` intrinsically; here we pass constant types
-    /// from the optimizer so the rewriter can check `v.type == 'r'` on
-    /// constant values (rewrite.py:930).
-    pub constant_types: VecAssoc<u32, Type>,
     /// rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
     /// by target token number. Provided by the backend.
     pub call_assembler_callee_locs:
@@ -382,12 +377,6 @@ struct RewriteState {
     /// Constant pool (from optimizer) — maps OpRef key → typed `Const`
     /// value. Each box variant carries its own type (`Const::get_type`).
     constants: VecAssoc<u32, Const>,
-    /// rewrite.py:930 parity — structural equivalent of Box.type.
-    /// Maps OpRef.0 → Type for all known values (both op results and
-    /// constants). In RPython each Box carries its own `.type` attribute;
-    /// here we mirror that with an explicit lookup table because OpRef
-    /// is a plain u32 without embedded type information.
-    result_types: VecAssoc<u32, Type>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -488,7 +477,6 @@ impl RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
             constants: VecAssoc::new(),
-            result_types: VecAssoc::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -561,12 +549,9 @@ impl RewriteState {
 
     /// Emit an op. Void ops do not consume a result id.
     ///
-    /// For non-Void results this also registers `op.result_type()` in
-    /// `result_types`.  RPython Boxes carry `.type` intrinsically
-    /// (rewrite.py:930 `v.type`); the Rust port uses `result_types` as
-    /// the structural equivalent, so any newly emitted result op must
-    /// populate the table, not only the input-trace ops copied in by
-    /// `run_with_constants` (line 2137-2142).
+    /// The result OpRef carries its own type via the variant tag
+    /// (`int_op`/`float_op`/`ref_op`) — rewrite.py:930 `v.type` parity —
+    /// so no separate type table is maintained.
     fn emit(&mut self, op: Op) -> BoxRef {
         let rt = op.result_type();
         let pos = if rt == Type::Void {
@@ -579,7 +564,6 @@ impl RewriteState {
                 Type::Void => unreachable!("Void filtered above"),
             };
             self.next_pos += 1;
-            self.result_types.insert(pos.raw(), rt);
             pos
         };
         op.pos.set(pos);
@@ -595,12 +579,8 @@ impl RewriteState {
     /// Emit a result-producing op, preserving the provided position when the
     /// source trace already assigned one.
     ///
-    /// Registers `op.result_type()` in `result_types` for both the
-    /// fresh-position and preserved-position cases — see `emit()` doc.
-    /// For a preserved position the table already holds an entry from
-    /// the input-trace scan, but re-registering is either a no-op
-    /// (matching type) or an explicit overwrite when the caller built
-    /// a rewritten op with a different type at the same position.
+    /// The result OpRef carries its own type via the variant tag, so no
+    /// separate type table is maintained — see `emit()` doc.
     fn emit_result(&mut self, op: Op, preferred_pos: OpRef) -> BoxRef {
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
@@ -610,7 +590,6 @@ impl RewriteState {
         } else {
             preferred_pos
         };
-        self.result_types.insert(pos.raw(), rt);
         op.pos.set(pos);
         let rc = std::rc::Rc::new(op);
         self.out.push(rc.clone());
@@ -2792,8 +2771,8 @@ impl GcRewriter for GcRewriterImpl {
 
         // Result positions are consumed only by result-producing ops; a
         // Void-result op never occupies a position slot. Skip Void ops here
-        // for the same reason the `result_types` build loop below guards on
-        // `rt != Type::Void` — otherwise a Void op carrying the `VoidOp(
+        // for the same reason `emit` assigns no position id when
+        // `rt == Type::Void` — otherwise a Void op carrying the `VoidOp(
         // u32::MAX)` sentinel (op_typed(NONE.raw(), Void)) would saturate
         // the max and overflow the first `next_pos += 1` in `emit`.
         let next_pos = ops
@@ -2803,19 +2782,6 @@ impl GcRewriter for GcRewriterImpl {
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
-        // Build result_types map from input ops — structural equivalent
-        // of RPython's Box.type attribute (rewrite.py:930 `v.type`).
-        for op in &ops {
-            let rt = op.result_type();
-            if rt != Type::Void && !op.pos.get().is_none() {
-                st.result_types.insert(op.pos.get().raw(), rt);
-            }
-        }
-        // Merge constant types — RPython's ConstPtr/ConstInt carry type
-        // intrinsically; here we inject them into the same map.
-        for (&k, &tp) in &self.constant_types {
-            st.result_types.entry(k).or_insert_with(|| tp);
-        }
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this
             // op on a previous iteration, use the stashed replacement.
@@ -3151,7 +3117,6 @@ mod tests {
                 jit_wb_cards_set_singlebyte: 0,
             },
             jitframe_info: None,
-            constant_types: VecAssoc::new(),
             call_assembler_callee_locs: None,
             // llmodel.py:39 default keeps existing pre-scale-everything behavior
             // in tests written against it; per-backend overrides have dedicated
@@ -4569,7 +4534,6 @@ mod tests {
                 jit_wb_cards_set_singlebyte: 0x40,
             },
             jitframe_info: None,
-            constant_types: VecAssoc::new(),
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
             supports_load_effective_address: true,

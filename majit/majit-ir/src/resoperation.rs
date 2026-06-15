@@ -1278,7 +1278,8 @@ pub struct Op {
     /// storage); the bound-shed + skip-bound-in-remap follow-up mirrors
     /// the `args` sequence.
     pub fail_args: std::cell::RefCell<Option<SmallVec<[Operand; 3]>>>,
-    /// Types of fail_args, set by the optimizer from constant_types.
+    /// Types of fail_args, set by the optimizer (`set_fail_arg_types`)
+    /// from each fail-arg operand's type.
     /// When present, the backend uses these instead of inferring types.
     /// `RefCell` so the optimizer can stamp types onto a shared `Op`
     /// reached through `Rc<Op>`: RPython

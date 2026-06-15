@@ -7671,11 +7671,7 @@ impl CraneliftBackend {
     // `compile_tmp_callback` and other backend-agnostic consumers can
     // reach them through `&mut dyn Backend`.
 
-    fn gc_rewriter(
-        &self,
-        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
-    ) -> Option<GcRewriterImpl> {
-        let ct = constant_types.clone();
+    fn gc_rewriter(&self) -> Option<GcRewriterImpl> {
         with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
             nursery_top_addr: gc.nursery_top_addr(),
@@ -7698,7 +7694,6 @@ impl CraneliftBackend {
             jitframe_info: JITFRAME_LAYOUT
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
-            constant_types: ct,
             // llmodel.py:39 default. Cranelift lowers GcStoreIndexed via
             // ir::MemFlags and explicit offset arithmetic rather than an
             // ISA scaled addressing mode, so we keep the rewriter in the
@@ -7796,25 +7791,7 @@ impl CraneliftBackend {
     ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        // rewrite.py:930 `v.type` — RPython Box carries its type on the
-        // object itself, so InputArg / ResOperation / Const all return
-        // the same `.type` attribute.  Pyre's flat `OpRef` stores types
-        // in side maps keyed by the raw u32; each `Const` carries its
-        // own `get_type()` (disjoint key spaces via
-        // `OpRef::CONST_BIT = 1 << 31`).  Each InputArg's raw OpRef
-        // value lives at `InputArg.index`: top-level loops occupy
-        // `[0, num_inputs)`, while Phase E.2b bridges occupy
-        // `[bridge_inputarg_base..)`. Key the merged map by the actual
-        // `ia.index` so the rewriter's `v.type` lookup matches the OpRef
-        // values that ops reference, regardless of namespace.
-        let mut constant_types_with_inputargs: majit_ir::VecAssoc<u32, majit_ir::Type> =
-            constants.iter().map(|(&k, c)| (k, c.get_type())).collect();
-        for ia in inputargs.iter() {
-            constant_types_with_inputargs
-                .entry(ia.index)
-                .or_insert_with(|| ia.tp);
-        }
-        if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
+        if let Some(rewriter) = self.gc_rewriter() {
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
             let (result, new_constants) =
@@ -11452,7 +11429,7 @@ impl CraneliftBackend {
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
-                    let rw = self.gc_rewriter(&majit_ir::VecAssoc::new());
+                    let rw = self.gc_rewriter();
                     let wb_byteofs = rw
                         .as_ref()
                         .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)

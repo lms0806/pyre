@@ -1707,6 +1707,16 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // subject's partially-annotated blocks are evicted on drop and never
     // poison a later subject's session-global `specialize_more_blocks`.
     _subject_block_scope.commit();
+
+    // Inert opname-reachability gauge over the rtyped flowspace graph this
+    // subject specialized cleanly — the dual-gate Match path the gauge's
+    // placement note targets.  Gated on `PYRE_JTRANSFORM_SHADOW` so the
+    // default build neither borrows nor walks the graph; the gauge never
+    // mutates it.
+    if crate::jit_codewriter::jtransform_shadow::is_enabled() {
+        crate::jit_codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
+    }
+
     Ok((value_to_var, constant_concretetypes))
 }
 

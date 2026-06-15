@@ -973,12 +973,8 @@ impl DynasmBackend {
     // reach them through `&mut dyn Backend`.
 
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
-    fn gc_rewriter(
-        &self,
-        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
-    ) -> Option<majit_gc::rewrite::GcRewriterImpl> {
+    fn gc_rewriter(&self) -> Option<majit_gc::rewrite::GcRewriterImpl> {
         with_dynasm_active_gc(|gc| {
-            let ct = constant_types.clone();
             majit_gc::rewrite::GcRewriterImpl {
                 nursery_free_addr: gc.nursery_free_addr(),
                 nursery_top_addr: gc.nursery_top_addr(),
@@ -997,7 +993,6 @@ impl DynasmBackend {
                     descr
                 },
                 jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
-                constant_types: ct,
                 // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
                 // ptr2int(compiled_loop_token.frame_info), both sourced from the
                 // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
@@ -1088,31 +1083,7 @@ impl DynasmBackend {
             .collect();
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
         inject_builtin_string_descrs(&mut normalized);
-        // rewrite.py:930 `v.type` — RPython Box carries its type on the
-        // object itself, so InputArg / ResOperation / Const all return
-        // the same `.type` attribute. Pyre's flat `OpRef` stores types
-        // in side maps keyed by the raw u32; each `Const` carries its
-        // own `get_type()` (disjoint key spaces via
-        // `OpRef::CONST_BIT = 1 << 31`), projected here for the rewriter.
-        //
-        // Each InputArg's raw OpRef value lives at `InputArg.index`:
-        // top-level loops occupy `[0, num_inputs)`, while Phase E.2b
-        // bridges occupy `[bridge_inputarg_base..)`. Key the merged
-        // map by `ia.index` (NOT a dense `enumerate` index) so the
-        // rewriter's `v.type` lookup matches the OpRef values that
-        // ops reference, regardless of namespace — RPython relies on
-        // Box identity here, pyre's line-by-line analog is `arg.0 ==
-        // inputargs[i].index`. Mirrors the Cranelift backend's
-        // `constant_types_with_inputargs` build at compiler.rs:7042.
-        let mut constant_types: majit_ir::VecAssoc<u32, Type> = self
-            .constants
-            .iter()
-            .map(|(&k, c)| (k, c.get_type()))
-            .collect();
-        for ia in inputargs.iter() {
-            constant_types.entry(ia.index).or_insert_with(|| ia.tp);
-        }
-        if let Some(rewriter) = self.gc_rewriter(&constant_types) {
+        if let Some(rewriter) = self.gc_rewriter() {
             use majit_gc::GcRewriter;
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).

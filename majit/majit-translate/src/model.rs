@@ -2132,13 +2132,32 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
                 Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
             )
         };
-        let chosen = block
+        // `replace_exitswitch_by_constant` (simplify.py:36-48) collects
+        // *every* arm whose exitcase equals the constant and asserts exactly
+        // one survivor (`assert len(newexits) == 1`), falling back to the
+        // `"default"` catch-all only when none match: a constant matching
+        // two arms is a malformed switch that checkgraph's exitcase
+        // uniqueness invariant (`flowspace/model.py:686`) forbids.
+        let matching: Vec<usize> = block
             .exits
             .iter()
-            .position(matches_case)
-            .or_else(|| block.exits.iter().position(is_default));
-        let Some(chosen) = chosen else {
-            continue;
+            .enumerate()
+            .filter(|(_, link)| matches_case(link))
+            .map(|(idx, _)| idx)
+            .collect();
+        let chosen = match matching.as_slice() {
+            [only] => *only,
+            [] => {
+                let Some(default_idx) = block.exits.iter().position(is_default) else {
+                    continue;
+                };
+                default_idx
+            }
+            _ => panic!(
+                "const-fold: constant switch matched {} arms (duplicate exitcase) in graph {:?}",
+                matching.len(),
+                graph.name
+            ),
         };
         let block = &mut graph.blocks[block_idx];
         let mut taken = block.exits.swap_remove(chosen);

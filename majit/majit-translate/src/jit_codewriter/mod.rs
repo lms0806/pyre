@@ -14,6 +14,10 @@ pub mod format;
 pub mod insns;
 pub mod jitcode;
 pub mod jtransform;
+// No upstream sibling: an inert, env-gated diagnostic that gauges how much
+// of the rtyped flowspace graph an opname-dispatching jtransform would
+// already accept. Never on the production path; see the module docs.
+pub mod jtransform_shadow;
 pub mod liveness;
 pub mod policy;
 pub mod regalloc;
