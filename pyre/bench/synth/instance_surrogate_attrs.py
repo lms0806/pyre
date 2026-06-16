@@ -2,7 +2,9 @@ N = 100000
 
 METH = '\udc81'   # lone surrogate naming a method on the class
 PROP = '\udc82'   # lone surrogate naming a property (data descriptor)
-ATTR = '\udc83'   # lone surrogate naming a per-instance attribute
+A1 = '\udc83'            # lone surrogate naming a per-instance attribute
+A2 = '\udc84\udc85'      # multi-surrogate per-instance attribute name
+A3 = 'ascii_attr'        # plain name stored alongside the surrogate nodes
 
 
 def _meth(self):
@@ -29,14 +31,21 @@ def main():
         acc = acc + getattr(p, PROP)
         i = i + 1
 
-    # Post-loop tail running in the already-compiled `main` frame: a
-    # per-instance surrogate attribute set degrades the mapdict to the
-    # object strategy, then get / __dict__ membership / del round-trip.
-    setattr(p, ATTR, 5)
-    acc = acc + getattr(p, ATTR)
-    acc = acc + (1 if ATTR in p.__dict__ else 0)
-    delattr(p, ATTR)
-    acc = acc + (0 if hasattr(p, ATTR) else 1)
+    # Post-loop tail running in the already-compiled `main` frame:
+    # per-instance surrogate-named attributes are stored as mapdict nodes
+    # (keyed by their full WTF-8 name), interleaved with a plain-named one,
+    # then read back, summed through __dict__, deleted and re-added.
+    setattr(p, A1, 5)
+    setattr(p, A2, 7)
+    setattr(p, A3, 11)
+    acc = acc + getattr(p, A1) + getattr(p, A2) + getattr(p, A3)
+    acc = acc + sum(p.__dict__.values())
+    acc = acc + (1 if A1 in p.__dict__ else 0)
+    acc = acc + (1 if A2 in p.__dict__ else 0)
+    delattr(p, A1)
+    acc = acc + (0 if hasattr(p, A1) else 1)
+    setattr(p, A1, 13)
+    acc = acc + getattr(p, A1)
     print(acc)
 
 

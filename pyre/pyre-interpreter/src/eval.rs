@@ -2152,8 +2152,11 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // every non-data descriptor — never bind self for it.  (Data
             // descriptors that win over the instance dict — property /
             // member — resolve to PY_NULL either way.)
-            let shadowed =
-                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, name).is_some();
+            let shadowed = crate::objspace::std::mapdict::instance_node_getdictvalue(
+                obj,
+                rustpython_wtf8::Wtf8::new(name),
+            )
+            .is_some();
             let w_type = pyre_object::w_instance_get_type(obj);
             // callmethod.py:33 `w_type.has_object_getattribute()`: a non-default
             // `__getattribute__` produced `attr` through the override rather

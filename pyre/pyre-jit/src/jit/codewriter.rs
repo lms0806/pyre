@@ -7137,9 +7137,11 @@ impl CodeWriter {
                         Instruction::ToBool => {}
 
                         // UNARY_NEGATIVE: pops `value`, pushes `-value` (net 0).
-                        // `unary_negative(value)` HLOp →
-                        // `residual_call_r_r(unary_negative_fn, ListR[value])`
-                        // computes `-value` through
+                        // The graph records the flowspace `neg(value)` op
+                        // (`emit_frontend_neg`, operation.py:466); the SSARepr
+                        // lowering `lower_unary_negative_hlop_to_insn` turns it
+                        // into `residual_call_r_r(unary_negative_fn, ListR[value])`
+                        // computing `-value` through
                         // `opcode_ops::unary_negative_value`; a user `__neg__`
                         // may run Python → MayForce.
                         Instruction::UnaryNegative => {
@@ -7148,12 +7150,10 @@ impl CodeWriter {
                             if let super::flow::FlowValue::Variable(v) = &val_value {
                                 pin!(Some(*v), val_reg);
                             }
-                            let result_value = emit_graph_op_with_result(
+                            let result_value = emit_frontend_neg(
                                 &mut graph,
                                 &current_block.block(),
-                                "unary_negative",
-                                vec![val_value.into()],
-                                Kind::Ref,
+                                val_value,
                                 py_pc as i64,
                             );
                             pin!(Some(result_value), stack_base + current_depth);
@@ -8920,9 +8920,11 @@ impl CodeWriter {
                         }
 
                         // UNARY_INVERT: pops `value`, pushes `~value` (net 0).
-                        // `unary_invert(value)` HLOp →
-                        // `residual_call_r_r(unary_invert_fn, ListR[value])`
-                        // computes `~value` through
+                        // The graph records the object-space `invert(value)` op
+                        // (pyopcode.py:653 `unaryoperation("invert")`); the
+                        // SSARepr lowering `lower_unary_invert_hlop_to_insn`
+                        // turns it into `residual_call_r_r(unary_invert_fn,
+                        // ListR[value])` computing `~value` through
                         // `opcode_ops::unary_invert_value`; a user `__invert__`
                         // may run Python → MayForce.
                         Instruction::UnaryInvert => {
@@ -8934,7 +8936,7 @@ impl CodeWriter {
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "unary_invert",
+                                "invert",
                                 vec![val_value.into()],
                                 Kind::Ref,
                                 py_pc as i64,
@@ -8944,9 +8946,13 @@ impl CodeWriter {
                         }
 
                         // UNARY_NOT: pops `value`, pushes `not value` as a bool
-                        // (net 0).  `unary_not(value)` HLOp →
+                        // (net 0).  The graph records the object-space
+                        // `not_(value)` op (pyopcode.py:651
+                        // `unaryoperation("not_")` → `space.not_` =
+                        // `newbool(not is_true(value))`); the SSARepr lowering
+                        // `lower_unary_not_hlop_to_insn` turns it into
                         // `residual_call_r_r(unary_not_fn, ListR[value])`
-                        // returns `not truth(value)` through
+                        // returning `not truth(value)` through
                         // `opcode_ops::truth_value`; a user `__bool__` /
                         // `__len__` may run Python → MayForce.
                         Instruction::UnaryNot => {
@@ -8958,7 +8964,7 @@ impl CodeWriter {
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "unary_not",
+                                "not_",
                                 vec![val_value.into()],
                                 Kind::Ref,
                                 py_pc as i64,

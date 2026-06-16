@@ -3325,22 +3325,22 @@ pub struct LoweringContext {
     /// user code).
     pub load_deref_value_fn_idx: u16,
     /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
-    /// `unary_negative(value)` HLOp lowered to `residual_call_r_r(ConstInt(
-    /// fn_idx), ListR([value]), Descr) → reg` via
+    /// flowspace `neg(value)` op (operation.py:466) lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
     /// [`lower_unary_negative_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
     /// shape); `bh_unary_negative_fn` computes `-value` (a user `__neg__`
     /// may force virtualizables → `MayForce`).
     pub unary_negative_fn_idx: u16,
     /// `unary_invert_fn` descrs-pool index.  UNARY_INVERT records the
-    /// `unary_invert(value)` HLOp lowered to `residual_call_r_r(ConstInt(
-    /// fn_idx), ListR([value]), Descr) → reg` via
+    /// object-space `invert(value)` op (pyopcode.py:653) lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
     /// [`lower_unary_invert_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
     /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
     /// may force virtualizables → `MayForce`).
     pub unary_invert_fn_idx: u16,
-    /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the
-    /// `unary_not(value)` HLOp lowered to `residual_call_r_r(ConstInt(
-    /// fn_idx), ListR([value]), Descr) → reg` via
+    /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
+    /// `not_(value)` op (pyopcode.py:651) lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
     /// [`lower_unary_not_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE shape);
     /// `bh_unary_not_fn` returns `not value` as a bool (a user `__bool__` /
     /// `__len__` may force virtualizables → `MayForce`).
@@ -5181,14 +5181,14 @@ where
     ))
 }
 
-/// Lower the UNARY_NEGATIVE pyre HLOp `unary_negative(value)` → `result: Ref`
-/// to `residual_call_r_r(ConstInt(unary_negative_fn_idx), ListR([value]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_negative_fn` computes `-value`; a user `__neg__` may force
-/// virtualizables → `MayForce`.
+/// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
+/// (operation.py:466) to `residual_call_r_r(ConstInt(unary_negative_fn_idx),
+/// ListR([value]), Descr) → reg`, the single-Ref
+/// [`lower_format_simple_hlop_to_insn`] shape. `bh_unary_negative_fn`
+/// computes `-value`; a user `__neg__` may force virtualizables → `MayForce`.
 ///
-/// Returns `None` for non-`unary_negative` opnames so the caller can fall
-/// through to other lowering arms.
+/// Returns `None` for non-`neg` opnames so the caller can fall through to
+/// other lowering arms.
 pub fn lower_unary_negative_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -5199,7 +5199,7 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "unary_negative" || op.args.len() != 1 {
+    if op.opname != "neg" || op.args.len() != 1 {
         return None;
     }
     let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
@@ -5216,13 +5216,14 @@ where
     ))
 }
 
-/// Lower the UNARY_INVERT pyre HLOp `unary_invert(value)` → `result: Ref`
-/// to `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
+/// Lower the UNARY_INVERT object-space op `invert(value)` → `result: Ref`
+/// (pyopcode.py:653 `unaryoperation("invert")`) to
+/// `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
 /// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
 /// `bh_unary_invert_fn` computes `~value`; a user `__invert__` may force
 /// virtualizables → `MayForce`.
 ///
-/// Returns `None` for non-`unary_invert` opnames so the caller can fall
+/// Returns `None` for non-`invert` opnames so the caller can fall
 /// through to other lowering arms.
 pub fn lower_unary_invert_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -5234,7 +5235,7 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "unary_invert" || op.args.len() != 1 {
+    if op.opname != "invert" || op.args.len() != 1 {
         return None;
     }
     let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
@@ -5251,13 +5252,14 @@ where
     ))
 }
 
-/// Lower the UNARY_NOT pyre HLOp `unary_not(value)` → `result: Ref` to
+/// Lower the UNARY_NOT object-space op `not_(value)` → `result: Ref`
+/// (pyopcode.py:651 `unaryoperation("not_")`) to
 /// `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]), Descr) →
 /// reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
 /// `bh_unary_not_fn` returns `not value` as a bool; a user `__bool__` /
 /// `__len__` may force virtualizables → `MayForce`.
 ///
-/// Returns `None` for non-`unary_not` opnames so the caller can fall through
+/// Returns `None` for non-`not_` opnames so the caller can fall through
 /// to other lowering arms.
 pub fn lower_unary_not_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -5269,7 +5271,7 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "unary_not" || op.args.len() != 1 {
+    if op.opname != "not_" || op.args.len() != 1 {
         return None;
     }
     let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
@@ -11726,7 +11728,7 @@ mod tests {
 
     #[test]
     fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
-        // `unary_invert(value)` →
+        // `invert(value)` →
         // `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
         // Descr) → reg` (MayForce — a user `__invert__` may run Python).
         // Same single-Ref shape as FORMAT_SIMPLE.
@@ -11734,7 +11736,7 @@ mod tests {
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
         let op = super::super::flow::SpaceOperation::new(
-            "unary_invert",
+            "invert",
             vec![value_var.into()],
             Some(result_var.into()),
             0,
@@ -11795,7 +11797,7 @@ mod tests {
 
     #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
-        // `unary_not(value)` →
+        // `not_(value)` →
         // `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]),
         // Descr) → reg` (MayForce — a user `__bool__` / `__len__` may run
         // Python).  Same single-Ref shape as FORMAT_SIMPLE.
@@ -11803,7 +11805,7 @@ mod tests {
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
         let op = super::super::flow::SpaceOperation::new(
-            "unary_not",
+            "not_",
             vec![value_var.into()],
             Some(result_var.into()),
             0,

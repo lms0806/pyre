@@ -12,6 +12,7 @@
 use crate::PyError;
 use pyre_object::PyObjectRef;
 
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
@@ -119,7 +120,7 @@ pub struct Terminator {
     /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`. PyPy lazily inits it
     /// to `{}`; the eager empty map here is equivalent.
-    pub cache_attrs: RefCell<HashMap<(String, u16), *const CachedAttributeHolder>>,
+    pub cache_attrs: RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
     /// mapdict.py:53 `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
     pub terminator: MapRef,
@@ -158,7 +159,7 @@ pub struct UnboxedExtra {
 /// mapdict.py:420 `PlainAttribute(AbstractAttribute)` — one stored attribute.
 pub struct PlainAttribute {
     /// mapdict.py:425 `name` (utf8-encoded).
-    pub name: String,
+    pub name: Wtf8Buf,
     /// mapdict.py:426 `attrkind`.
     pub attrkind: u16,
     /// mapdict.py:427 `storageindex` (= `back.storage_needed()`).
@@ -173,7 +174,7 @@ pub struct PlainAttribute {
     pub order: usize,
     /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`.
-    pub cache_attrs: RefCell<HashMap<(String, u16), *const CachedAttributeHolder>>,
+    pub cache_attrs: RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
     /// mapdict.py:53 `AbstractAttribute.terminator` (= `back.terminator`).
     pub terminator: MapRef,
     /// `Some` for an `UnboxedPlainAttribute` (mapdict.py:532); `None` for a
@@ -334,7 +335,11 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
 /// # Safety
 /// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
-pub unsafe fn instance_node_setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+pub unsafe fn instance_node_setdictvalue(
+    obj: PyObjectRef,
+    name: &Wtf8,
+    value: PyObjectRef,
+) -> bool {
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
@@ -358,7 +363,7 @@ pub unsafe fn instance_node_setdictvalue(obj: PyObjectRef, name: &str, value: Py
 /// # Safety
 /// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
-pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
@@ -382,7 +387,7 @@ pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &str) -> Option
 /// # Safety
 /// `obj` must be a live `W_InstanceObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
-pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &str) -> bool {
+pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool {
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
@@ -411,7 +416,7 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
-    node_read(map, inst, "dict", SPECIAL)
+    node_read(map, inst, Wtf8::new("dict"), SPECIAL)
 }
 
 /// Write the instance `__dict__` wrapper into the "dict" SPECIAL slot
@@ -430,7 +435,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
-    node_write(map, inst, "dict", SPECIAL, w_dict)
+    node_write(map, inst, Wtf8::new("dict"), SPECIAL, w_dict)
 }
 
 // ── methods needed for slots (mapdict.py:764-780 MapdictSlotsSupport) ──
@@ -455,10 +460,10 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    let w_res = unsafe { node_read(map, inst, "slot", attrkind) };
+    let w_res = unsafe { node_read(map, inst, Wtf8::new("slot"), attrkind) };
     // read → _direct_read (mapdict.py:592-598) lazily migrates an unboxed
     // attribute to boxed storage, as in `instance_node_getdictvalue`.
-    unsafe { maybe_migrate_to_boxed(map, inst, "slot", attrkind) };
+    unsafe { maybe_migrate_to_boxed(map, inst, Wtf8::new("slot"), attrkind) };
     w_res
 }
 
@@ -482,7 +487,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    let flag = node_write(map, inst, "slot", attrkind, w_value);
+    let flag = node_write(map, inst, Wtf8::new("slot"), attrkind, w_value);
     debug_assert!(flag, "node_write returned false for a slot attribute");
 }
 
@@ -508,7 +513,7 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     let inst = &mut *(obj as *mut pyre_object::W_InstanceObject);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    match node_delete(map, &*inst, "slot", attrkind) {
+    match node_delete(map, &*inst, Wtf8::new("slot"), attrkind) {
         None => false,
         Some(new_obj) => {
             inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
@@ -522,7 +527,7 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
 /// # Safety
 /// `back` must point to a live (immortal) map node.
 pub unsafe fn new_plain_attribute(
-    name: String,
+    name: Wtf8Buf,
     attrkind: u16,
     back: MapRef,
     order: usize,
@@ -553,7 +558,7 @@ pub unsafe fn new_plain_attribute(
 /// # Safety
 /// `back` must point to a live (immortal) map node.
 pub unsafe fn new_unboxed_plain_attribute(
-    name: String,
+    name: Wtf8Buf,
     attrkind: u16,
     back: MapRef,
     order: usize,
@@ -659,7 +664,7 @@ impl MapNode {
     }
 
     /// mapdict.py:47 `AbstractAttribute.cache_attrs`.
-    pub fn cache_attrs(&self) -> &RefCell<HashMap<(String, u16), *const CachedAttributeHolder>> {
+    pub fn cache_attrs(&self) -> &RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
         match self {
             MapNode::Terminator(t) => &t.cache_attrs,
             MapNode::Plain(p) => &p.cache_attrs,
@@ -689,9 +694,9 @@ pub unsafe fn node_search(node: MapRef, attrtype: u16) -> Option<MapRef> {
 ///
 /// # Safety
 /// `node` and its `back` chain must point to live map nodes.
-pub unsafe fn find_map_attr_chain(mut node: MapRef, name: &str, attrkind: u16) -> Option<MapRef> {
+pub unsafe fn find_map_attr_chain(mut node: MapRef, name: &Wtf8, attrkind: u16) -> Option<MapRef> {
     while let MapNode::Plain(p) = unsafe { &*node } {
-        if attrkind == p.attrkind && name == p.name {
+        if attrkind == p.attrkind && name == &*p.name {
             return Some(node);
         }
         node = p.back;
@@ -703,7 +708,7 @@ pub unsafe fn find_map_attr_chain(mut node: MapRef, name: &str, attrkind: u16) -
 /// behind `find_map_attr`. A null `MapRef` slot means "empty"/"not found".
 pub struct MapAttrCache {
     attrs: Vec<MapRef>,
-    names: Vec<Option<String>>,
+    names: Vec<Option<Wtf8Buf>>,
     indexes: Vec<u16>,
     cached_attrs: Vec<MapRef>,
 }
@@ -746,7 +751,7 @@ thread_local! {
 /// distribution — `find_map_attr` always rechecks name+attrkind, so a
 /// collision never changes the result. Stands in for
 /// `objectmodel.compute_hash(name)` (mapdict.py:91).
-fn compute_name_hash(name: &str) -> i64 {
+fn compute_name_hash(name: &Wtf8) -> i64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.as_bytes() {
         h ^= *b as u64;
@@ -763,7 +768,7 @@ fn compute_name_hash(name: &str) -> i64 {
 ///
 /// # Safety
 /// `self_node` and its `back` chain must point to live map nodes.
-pub unsafe fn find_map_attr(self_node: MapRef, name: &str, attrkind: u16) -> Option<MapRef> {
+pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Option<MapRef> {
     const SHIFT2: u32 = u64::BITS - METHODCACHESIZEEXP;
     const SHIFT1: u32 = SHIFT2 - 5;
     // current_object_addr_as_int(self) (mapdict.py:88) — the map node address.
@@ -796,7 +801,7 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &str, attrkind: u16) -> Opt
         if crate::baseobjspace::side_effects_ok() {
             let mut cache = cache.borrow_mut();
             cache.attrs[attr_hash] = self_node;
-            cache.names[attr_hash] = Some(name.to_string());
+            cache.names[attr_hash] = Some(name.to_owned());
             cache.indexes[attr_hash] = attrkind;
             cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
         }
@@ -1110,7 +1115,7 @@ unsafe fn load_attr_slowpath(
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
                 // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
-                if let Some(attr) = unsafe { find_map_attr(map, attrname, attrkind) } {
+                if let Some(attr) = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     // mapdict.py:1531-1532 `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
@@ -1250,7 +1255,7 @@ unsafe fn store_attr_slowpath(
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
                 // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
-                match unsafe { find_map_attr(map, attrname, attrkind) } {
+                match unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     Some(attr) => {
                         // mapdict.py:1630-1631 — fill only when there is no custom
                         // `__getattribute__` to upset the cache invariant.
@@ -1291,7 +1296,9 @@ unsafe fn store_attr_slowpath(
                             let inst =
                                 unsafe { &mut *(w_obj as *mut pyre_object::W_InstanceObject) };
                             // mapdict.py:1639 `map.terminator._write_terminator(...)`.
-                            unsafe { write_terminator(term, inst, name, attrkind, w_value) };
+                            unsafe {
+                                write_terminator(term, inst, Wtf8::new(name), attrkind, w_value)
+                            };
                             // mapdict.py:1640 `mapnew = w_obj._get_mapdict_map()`.
                             let mapnew = inst._get_mapdict_map();
                             // mapdict.py:1642-1648 — fill only when no attribute
@@ -1629,7 +1636,7 @@ unsafe fn convert_to_boxed<O: MapdictObject>(obj: &mut O) -> MapRef {
 /// `obj` must implement the mapdict storage protocol.
 unsafe fn convert_to_boxed_and_write<O: MapdictObject>(
     obj: &mut O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     w_value: PyObjectRef,
 ) {
@@ -1729,7 +1736,7 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
 unsafe fn terminator_read<O: MapdictObject>(
     term: MapRef,
     obj: &O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
 ) -> Option<PyObjectRef> {
     let t = unsafe { (*term).as_terminator() };
@@ -1739,7 +1746,7 @@ unsafe fn terminator_read<O: MapdictObject>(
             // from the materialised instance dict (`space.finditem_str(
             // obj.getdict(space), name)`).
             let w_dict = obj.getdict();
-            unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }
+            unsafe { pyre_object::w_dict_getitem_wtf8(w_dict, name) }
         }
         // Terminator / DictTerminator / NoDictTerminator read nothing.
         _ => None,
@@ -1753,7 +1760,7 @@ unsafe fn terminator_read<O: MapdictObject>(
 pub unsafe fn node_read<O: MapdictObject>(
     self_node: MapRef,
     obj: &O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
 ) -> Option<PyObjectRef> {
     match unsafe { find_map_attr(self_node, name, attrkind) } {
@@ -1780,7 +1787,7 @@ pub unsafe fn node_read<O: MapdictObject>(
 unsafe fn maybe_migrate_to_boxed<O: MapdictObject>(
     self_node: MapRef,
     obj: &mut O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
 ) {
     let attr = match unsafe { find_map_attr(self_node, name, attrkind) } {
@@ -1889,12 +1896,12 @@ unsafe fn node_set_terminator<O: MapdictObject>(
 unsafe fn node_delete<O: MapdictObject>(
     self_node: MapRef,
     obj: &O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
 ) -> Option<Object> {
     if unsafe { (*self_node).is_plain() } {
         let p = unsafe { (*self_node).as_plain() };
-        if attrkind == p.attrkind && p.name.as_str() == name {
+        if attrkind == p.attrkind && &*p.name == name {
             // mapdict.py:462-466 — attribute found; drop it by rebuilding from
             // `back` (which excludes this node).
             if p.ever_mutated.get() {
@@ -1924,7 +1931,7 @@ unsafe fn node_delete<O: MapdictObject>(
             // carrier on this terminator (`Terminator.copy(self, obj)`).
             TerminatorKind::Devolved if attrkind == DICT => {
                 let w_dict = obj.getdict();
-                let w_key = pyre_object::w_str_new(name);
+                let w_key = pyre_object::w_str_from_wtf8(name.to_owned());
                 unsafe { pyre_object::w_dict_delitem(w_dict, w_key) };
                 Some(unsafe { node_copy(self_node, obj) })
             }
@@ -1990,7 +1997,7 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
             // self._prim_direct_read(obj)`). `plain_direct_read` performs that
             // prim read, boxing the slot when the attribute is unboxed.
             let w_value = unsafe { plain_direct_read(self_node, obj) };
-            let w_attr = pyre_object::w_str_new(&p.name);
+            let w_attr = pyre_object::w_str_from_wtf8(p.name.clone());
             unsafe { pyre_object::w_dict_store(w_dict, w_attr, w_value) };
         } else {
             // mapdict.py:499/508 — keep the non-DICT attribute on the carrier.
@@ -2051,7 +2058,7 @@ pub struct CachedAttributeHolder {
 /// # Safety
 /// `back` must point to a live map node.
 unsafe fn new_cached_attribute_holder(
-    name: String,
+    name: Wtf8Buf,
     attrkind: u16,
     back: MapRef,
     unbox_type: Option<UnboxType>,
@@ -2100,16 +2107,16 @@ unsafe fn holder_pick_attr(
 /// `self_node` must point to a live map node.
 unsafe fn get_new_attr(
     self_node: MapRef,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     unbox_type: Option<UnboxType>,
 ) -> *const CachedAttributeHolder {
-    let key = (name.to_string(), attrkind);
+    let key = (name.to_owned(), attrkind);
     if let Some(&holder) = unsafe { (*self_node).cache_attrs() }.borrow().get(&key) {
         return holder;
     }
     let holder =
-        unsafe { new_cached_attribute_holder(name.to_string(), attrkind, self_node, unbox_type) };
+        unsafe { new_cached_attribute_holder(name.to_owned(), attrkind, self_node, unbox_type) };
     unsafe { (*self_node).cache_attrs() }
         .borrow_mut()
         .insert(key, holder);
@@ -2122,14 +2129,14 @@ unsafe fn get_new_attr(
 /// `self_node` and its chain must point to live map nodes.
 unsafe fn find_branch_to_move_into(
     self_node: MapRef,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     unbox_type: Option<UnboxType>,
 ) -> (usize, *const CachedAttributeHolder) {
     let mut current_order = usize::MAX; // sys.maxint
     let mut number_to_readd = 0usize;
     let mut current = self_node;
-    let key = (name.to_string(), attrkind);
+    let key = (name.to_owned(), attrkind);
     loop {
         let holder = unsafe { (*current).cache_attrs() }
             .borrow()
@@ -2278,9 +2285,8 @@ unsafe fn reorder_and_add<O: MapdictObject>(
                 };
                 self_node = obj._get_mapdict_map();
                 let unbox_type = unsafe { pick_unbox_type(self_node, w_value) };
-                let (n, holder) = unsafe {
-                    find_branch_to_move_into(self_node, name.as_str(), attrkind, unbox_type)
-                };
+                let (n, holder) =
+                    unsafe { find_branch_to_move_into(self_node, &name, attrkind, unbox_type) };
                 number_to_readd = n;
                 attr = unsafe { holder_pick_attr(holder, unbox_type) };
             }
@@ -2295,7 +2301,7 @@ unsafe fn reorder_and_add<O: MapdictObject>(
 pub unsafe fn add_attr<O: MapdictObject>(
     self_node: MapRef,
     obj: &mut O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     w_value: PyObjectRef,
 ) {
@@ -2319,7 +2325,7 @@ pub unsafe fn add_attr<O: MapdictObject>(
 unsafe fn write_terminator<O: MapdictObject>(
     term: MapRef,
     obj: &mut O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     w_value: PyObjectRef,
 ) -> bool {
@@ -2332,7 +2338,7 @@ unsafe fn write_terminator<O: MapdictObject>(
             // into the materialised instance dict (`space.setitem_str(
             // obj.getdict(space), name, w_value)`).
             let w_dict = obj.getdict();
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, name, w_value) };
+            unsafe { pyre_object::w_dict_setitem_wtf8(w_dict, name, w_value) };
             return true;
         }
         _ => {}
@@ -2373,7 +2379,7 @@ unsafe fn write_terminator<O: MapdictObject>(
 pub unsafe fn node_write<O: MapdictObject>(
     self_node: MapRef,
     obj: &mut O,
-    name: &str,
+    name: &Wtf8,
     attrkind: u16,
     w_value: PyObjectRef,
 ) -> bool {
@@ -2491,7 +2497,7 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     while i < nodes.len() {
         let node = nodes[i];
         let name = &(*node).as_plain().name;
-        keys.push(pyre_object::w_str_new(name));
+        keys.push(pyre_object::w_str_from_wtf8(name.clone()));
         i += 1;
     }
     keys
@@ -2546,7 +2552,7 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     while i < nodes.len() {
         let node = nodes[i];
         let name = &(*node).as_plain().name;
-        let w_key = pyre_object::w_str_new(name);
+        let w_key = pyre_object::w_str_from_wtf8(name.clone());
         let w_value = plain_direct_read(node, inst);
         out.push((w_key, w_value));
         i += 1;
@@ -2642,11 +2648,13 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     /// mapdict.py:1157-1166 `getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if pyre_object::is_str(w_key) {
-            // A mapdict node is keyed by a UTF-8 identifier, so a lone
-            // surrogate can never name a node — it is simply absent, with no
-            // strategy switch (matching `getitem_str` missing).
-            return pyre_object::w_str_get_value_opt(w_key)
-                .and_then(|key| self.getitem_str(w_dict, key));
+            // mapdict.py:1161 `space.text_w(w_key)` — a str key (including a
+            // lone surrogate) is looked up by its full WTF-8 name, so a
+            // surrogate-named attribute is a mapdict node like any other.
+            return instance_node_getdictvalue(
+                mapdict_strategy_unerase(w_dict),
+                pyre_object::w_str_get_wtf8(w_key),
+            );
         }
         if pyre_object::_never_equal_to_string(w_key) {
             return None;
@@ -2656,20 +2664,27 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py:1168-1170 `getitem_str` — `w_obj.getdictvalue(space, key)`.
+    /// The trait key is a UTF-8 `&str`; a UTF-8 string is valid WTF-8, so the
+    /// node lookup uses its `Wtf8` view directly.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), key)
+        instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key))
     }
 
     /// mapdict.py:1177-1183 `setitem`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if pyre_object::is_str(w_key) {
-            if let Some(key) = pyre_object::w_str_get_value_opt(w_key) {
-                self.setitem_str(w_dict, key, w_value);
-                return;
-            }
+            // mapdict.py:1180 — store under the full WTF-8 name so a
+            // surrogate-named attribute becomes a mapdict node rather than
+            // forcing a strategy switch.
+            instance_node_setdictvalue(
+                mapdict_strategy_unerase(w_dict),
+                pyre_object::w_str_get_wtf8(w_key),
+                w_value,
+            );
+            return;
         }
-        // Non-string or lone-surrogate key: it cannot be a mapdict node,
-        // so degrade to the object strategy before storing.
+        // Non-string key: it cannot be a mapdict node, so degrade to the
+        // object strategy before storing.
         self.switch_to_object_strategy(w_dict);
         pyre_object::w_dict_store(w_dict, w_key, w_value);
     }
@@ -2677,19 +2692,19 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
     /// mapdict.py:1172-1175 `setitem_str` — `flag = w_obj.setdictvalue(...);
     /// assert flag`. `instance_node_setdictvalue` debug_asserts the flag itself.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), key, w_value);
+        instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key), w_value);
     }
 
     /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
     /// removed) where PyPy raises KeyError on a miss; the caller raises.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if pyre_object::is_str(w_key) {
-            // A lone surrogate can never name a mapdict node → nothing to
-            // delete (no strategy switch, matching a `getitem` miss).
-            let Some(key) = pyre_object::w_str_get_value_opt(w_key) else {
-                return false;
-            };
-            return instance_node_deldictvalue(mapdict_strategy_unerase(w_dict), key);
+            // mapdict.py:1203 — delete by the full WTF-8 name (a surrogate
+            // name addresses a real node, no strategy switch).
+            return instance_node_deldictvalue(
+                mapdict_strategy_unerase(w_dict),
+                pyre_object::w_str_get_wtf8(w_key),
+            );
         }
         if pyre_object::_never_equal_to_string(w_key) {
             return false;
@@ -3073,12 +3088,22 @@ pub fn delweakref(self_ref: PyObjectRef) {
 mod tests {
     use super::*;
 
+    // Node names are WTF-8; the test fixtures spell them with plain UTF-8
+    // string literals. `wn` borrows a `&Wtf8` view for the lookup/read/write
+    // helpers, `wb` produces an owned `Wtf8Buf` for `new_plain_attribute`.
+    fn wn(s: &str) -> &Wtf8 {
+        Wtf8::new(s)
+    }
+    fn wb(s: &str) -> Wtf8Buf {
+        Wtf8::new(s).to_owned()
+    }
+
     // A map chain is `terminator <- "a"(DICT) <- "b"(DICT)`. The w_cls is a
     // null placeholder: the node layer never dereferences it.
     unsafe fn build_chain() -> (MapRef, MapRef, MapRef) {
         let term = new_dict_terminator(std::ptr::null_mut());
-        let a = unsafe { new_plain_attribute("a".to_string(), DICT, term, 0) };
-        let b = unsafe { new_plain_attribute("b".to_string(), DICT, a, 1) };
+        let a = unsafe { new_plain_attribute(wb("a"), DICT, term, 0) };
+        let b = unsafe { new_plain_attribute(wb("b"), DICT, a, 1) };
         (term, a, b)
     }
 
@@ -3125,7 +3150,7 @@ mod tests {
             crate::typedef::init_typeobjects();
             let w_cls = crate::typedef::make_builtin_type("MapdictCacheEntryT", |_| {});
             let term = new_dict_terminator(w_cls);
-            let attr = new_plain_attribute("x".to_string(), DICT, term, 0);
+            let attr = new_plain_attribute(wb("x"), DICT, term, 0);
             let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_cls);
 
             let entry = MapdictCacheEntry {
@@ -3138,7 +3163,7 @@ mod tests {
             // matching map + version -> valid for a load
             assert!(entry.is_valid_for_map(attr, false));
             // a different map fails identity (mapdict.py:1440 `mymap is map`)
-            let other = new_plain_attribute("y".to_string(), DICT, term, 1);
+            let other = new_plain_attribute(wb("y"), DICT, term, 1);
             assert!(!entry.is_valid_for_map(other, false));
             // store gate: valid_for_store == false rejects stores (mapdict.py:1432)
             assert!(!entry.is_valid_for_map(attr, true));
@@ -3161,11 +3186,11 @@ mod tests {
     fn find_map_attr_chain_walks_back_pointers() {
         unsafe {
             let (_term, a, b) = build_chain();
-            assert_eq!(find_map_attr_chain(b, "a", DICT), Some(a));
-            assert_eq!(find_map_attr_chain(b, "b", DICT), Some(b));
-            assert_eq!(find_map_attr_chain(b, "c", DICT), None);
+            assert_eq!(find_map_attr_chain(b, wn("a"), DICT), Some(a));
+            assert_eq!(find_map_attr_chain(b, wn("b"), DICT), Some(b));
+            assert_eq!(find_map_attr_chain(b, wn("c"), DICT), None);
             // attrkind namespaces are distinct: "a" exists only under DICT.
-            assert_eq!(find_map_attr_chain(b, "a", SPECIAL), None);
+            assert_eq!(find_map_attr_chain(b, wn("a"), SPECIAL), None);
         }
     }
 
@@ -3175,11 +3200,11 @@ mod tests {
             MAP_ATTR_CACHE.with(|c| c.borrow_mut().clear());
             let (_term, a, b) = build_chain();
             // first call populates the cache, second hits it
-            assert_eq!(find_map_attr(b, "a", DICT), Some(a));
-            assert_eq!(find_map_attr(b, "a", DICT), Some(a));
-            assert_eq!(find_map_attr(b, "b", DICT), Some(b));
-            assert_eq!(find_map_attr(b, "missing", DICT), None);
-            assert_eq!(find_map_attr(b, "missing", DICT), None);
+            assert_eq!(find_map_attr(b, wn("a"), DICT), Some(a));
+            assert_eq!(find_map_attr(b, wn("a"), DICT), Some(a));
+            assert_eq!(find_map_attr(b, wn("b"), DICT), Some(b));
+            assert_eq!(find_map_attr(b, wn("missing"), DICT), None);
+            assert_eq!(find_map_attr(b, wn("missing"), DICT), None);
         }
     }
 
@@ -3222,11 +3247,11 @@ mod tests {
                 map: b,
                 storage: vec![sentinel(0xa), sentinel(0xb)],
             };
-            assert_eq!(node_read(b, &obj, "a", DICT), Some(sentinel(0xa)));
-            assert_eq!(node_read(b, &obj, "b", DICT), Some(sentinel(0xb)));
+            assert_eq!(node_read(b, &obj, wn("a"), DICT), Some(sentinel(0xa)));
+            assert_eq!(node_read(b, &obj, wn("b"), DICT), Some(sentinel(0xb)));
             // absent attribute falls through to the (Dict) terminator → None
-            assert_eq!(node_read(b, &obj, "missing", DICT), None);
-            assert_eq!(node_read(b, &obj, "a", SPECIAL), None);
+            assert_eq!(node_read(b, &obj, wn("missing"), DICT), None);
+            assert_eq!(node_read(b, &obj, wn("a"), SPECIAL), None);
             assert_eq!(obj._mapdict_storage_length(), 2);
         }
     }
@@ -3236,8 +3261,8 @@ mod tests {
         unsafe {
             // chain "a","b" (DICT, boxed) under terminator t1
             let t1 = boxed_dict_terminator();
-            let a = new_plain_attribute("a".to_string(), DICT, t1, 0);
-            let b = new_plain_attribute("b".to_string(), DICT, a, 1);
+            let a = new_plain_attribute(wb("a"), DICT, t1, 0);
+            let b = new_plain_attribute(wb("b"), DICT, a, 1);
             let obj = MockObj {
                 map: b,
                 storage: vec![sentinel(0xa), sentinel(0xb)],
@@ -3248,11 +3273,11 @@ mod tests {
             // new chain is rooted at t2 with the same attrs/order/values
             assert_eq!((*new_obj.map).terminator(), t2);
             assert_eq!(
-                node_read(new_obj.map, &new_obj, "a", DICT),
+                node_read(new_obj.map, &new_obj, wn("a"), DICT),
                 Some(sentinel(0xa))
             );
             assert_eq!(
-                node_read(new_obj.map, &new_obj, "b", DICT),
+                node_read(new_obj.map, &new_obj, wn("b"), DICT),
                 Some(sentinel(0xb))
             );
             assert_eq!(new_obj.storage.len(), 2);
@@ -3286,8 +3311,8 @@ mod tests {
                 storage: vec![sentinel(0xa), sentinel(0xb)],
             };
             plain_direct_write(a, &mut obj, sentinel(0x111));
-            assert_eq!(node_read(b, &obj, "a", DICT), Some(sentinel(0x111)));
-            assert_eq!(node_read(b, &obj, "b", DICT), Some(sentinel(0xb)));
+            assert_eq!(node_read(b, &obj, wn("a"), DICT), Some(sentinel(0x111)));
+            assert_eq!(node_read(b, &obj, wn("b"), DICT), Some(sentinel(0xb)));
         }
     }
 
@@ -3303,23 +3328,23 @@ mod tests {
             // write two fresh attributes; each takes the common
             // (number_to_readd == 0) append path
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, &mut obj, "x", DICT, sentinel(0x1)));
+            assert!(node_write(m, &mut obj, wn("x"), DICT, sentinel(0x1)));
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, &mut obj, "y", DICT, sentinel(0x2)));
+            assert!(node_write(m, &mut obj, wn("y"), DICT, sentinel(0x2)));
 
             assert_eq!(obj.storage.len(), 2);
             assert_eq!(unsafe { (*obj.map).num_attributes() }, 2);
             let m = obj._get_mapdict_map();
-            assert_eq!(node_read(m, &obj, "x", DICT), Some(sentinel(0x1)));
-            assert_eq!(node_read(m, &obj, "y", DICT), Some(sentinel(0x2)));
-            assert_eq!(node_read(m, &obj, "z", DICT), None);
+            assert_eq!(node_read(m, &obj, wn("x"), DICT), Some(sentinel(0x1)));
+            assert_eq!(node_read(m, &obj, wn("y"), DICT), Some(sentinel(0x2)));
+            assert_eq!(node_read(m, &obj, wn("z"), DICT), None);
 
             // overwrite an existing attribute → direct write, no growth
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, &mut obj, "x", DICT, sentinel(0x9)));
+            assert!(node_write(m, &mut obj, wn("x"), DICT, sentinel(0x9)));
             assert_eq!(obj.storage.len(), 2);
             let m = obj._get_mapdict_map();
-            assert_eq!(node_read(m, &obj, "x", DICT), Some(sentinel(0x9)));
+            assert_eq!(node_read(m, &obj, wn("x"), DICT), Some(sentinel(0x9)));
         }
     }
 
@@ -3337,23 +3362,23 @@ mod tests {
             obj._set_mapdict_map(term);
 
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, obj, "x", DICT, sentinel(0x1)));
+            assert!(node_write(m, obj, wn("x"), DICT, sentinel(0x1)));
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, obj, "y", DICT, sentinel(0x2)));
+            assert!(node_write(m, obj, wn("y"), DICT, sentinel(0x2)));
 
             assert_eq!(obj._mapdict_storage_length(), 2);
             assert_eq!((*obj._get_mapdict_map()).num_attributes(), 2);
             let m = obj._get_mapdict_map();
-            assert_eq!(node_read(m, obj, "x", DICT), Some(sentinel(0x1)));
-            assert_eq!(node_read(m, obj, "y", DICT), Some(sentinel(0x2)));
-            assert_eq!(node_read(m, obj, "z", DICT), None);
+            assert_eq!(node_read(m, obj, wn("x"), DICT), Some(sentinel(0x1)));
+            assert_eq!(node_read(m, obj, wn("y"), DICT), Some(sentinel(0x2)));
+            assert_eq!(node_read(m, obj, wn("z"), DICT), None);
 
             // overwrite an existing attribute → direct write, no growth
             let m = obj._get_mapdict_map();
-            assert!(node_write(m, obj, "x", DICT, sentinel(0x9)));
+            assert!(node_write(m, obj, wn("x"), DICT, sentinel(0x9)));
             assert_eq!(obj._mapdict_storage_length(), 2);
             let m = obj._get_mapdict_map();
-            assert_eq!(node_read(m, obj, "x", DICT), Some(sentinel(0x9)));
+            assert_eq!(node_read(m, obj, wn("x"), DICT), Some(sentinel(0x9)));
         }
     }
 
@@ -3368,24 +3393,76 @@ mod tests {
             let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
             obj._set_mapdict_map(term);
 
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x11)));
-            assert!(instance_node_setdictvalue(obj_ref, "y", sentinel(0x22)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
             assert_eq!(
-                instance_node_getdictvalue(obj_ref, "x"),
+                instance_node_getdictvalue(obj_ref, wn("x")),
                 Some(sentinel(0x11))
             );
             assert_eq!(
-                instance_node_getdictvalue(obj_ref, "y"),
+                instance_node_getdictvalue(obj_ref, wn("y")),
                 Some(sentinel(0x22))
             );
-            assert_eq!(instance_node_getdictvalue(obj_ref, "z"), None);
+            assert_eq!(instance_node_getdictvalue(obj_ref, wn("z")), None);
 
             // overwrite an existing attribute
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x99)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x99)));
             assert_eq!(
-                instance_node_getdictvalue(obj_ref, "x"),
+                instance_node_getdictvalue(obj_ref, wn("x")),
                 Some(sentinel(0x99))
             );
+        }
+    }
+
+    #[test]
+    fn instance_node_surrogate_name_stays_a_mapdict_node() {
+        unsafe {
+            // A lone-surrogate attribute name addresses a real mapdict node,
+            // keyed by its full WTF-8 name, rather than degrading the instance
+            // dict to the object strategy. mapdict.py:1157-1211 routes any str
+            // key — surrogate-bearing included — through getdictvalue.
+            let term = boxed_dict_terminator();
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
+            obj._set_mapdict_map(term);
+
+            // A '\udc81' lone surrogate, interleaved with a plain-named attr.
+            let mut sur = Wtf8Buf::new();
+            sur.push(rustpython_wtf8::CodePoint::from_u32(0xDC81).unwrap());
+
+            assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
+            assert!(instance_node_setdictvalue(
+                obj_ref,
+                wn("ascii"),
+                sentinel(0x66)
+            ));
+
+            // Both round-trip; the surrogate attribute is a node, so the dict
+            // length and the materialised key set include it.
+            assert_eq!(
+                instance_node_getdictvalue(obj_ref, &sur),
+                Some(sentinel(0x55))
+            );
+            assert_eq!(
+                instance_node_getdictvalue(obj_ref, wn("ascii")),
+                Some(sentinel(0x66))
+            );
+            assert_eq!(instance_node_dict_length(obj_ref), 2);
+
+            // Key materialisation rebuilds the surrogate name through
+            // w_str_from_wtf8 without panicking on the lone surrogate.
+            let keys = instance_node_dict_keys(obj_ref);
+            assert_eq!(keys.len(), 2);
+            assert_eq!(pyre_object::w_str_get_wtf8(keys[0]), &*sur);
+
+            // Deleting the surrogate node leaves the plain attribute intact.
+            assert!(instance_node_deldictvalue(obj_ref, &sur));
+            assert_eq!(instance_node_getdictvalue(obj_ref, &sur), None);
+            assert_eq!(
+                instance_node_getdictvalue(obj_ref, wn("ascii")),
+                Some(sentinel(0x66))
+            );
+            assert_eq!(instance_node_dict_length(obj_ref), 1);
         }
     }
 
@@ -3399,25 +3476,25 @@ mod tests {
             };
             for (name, v) in [("a", 0xa), ("b", 0xb), ("c", 0xc)] {
                 let m = obj._get_mapdict_map();
-                assert!(node_write(m, &mut obj, name, DICT, sentinel(v)));
+                assert!(node_write(m, &mut obj, wn(name), DICT, sentinel(v)));
             }
             assert_eq!(obj._mapdict_storage_length(), 3);
 
             // delete the middle attribute and transplant the rebuilt carrier
             // (mapdict.py:852-857 deldictvalue).
             let m = obj._get_mapdict_map();
-            let new_obj = node_delete(m, &obj, "b", DICT).expect("b present");
+            let new_obj = node_delete(m, &obj, wn("b"), DICT).expect("b present");
             obj._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 
             assert_eq!(obj._mapdict_storage_length(), 2);
             let m = obj._get_mapdict_map();
-            assert_eq!(node_read(m, &obj, "a", DICT), Some(sentinel(0xa)));
-            assert_eq!(node_read(m, &obj, "b", DICT), None);
-            assert_eq!(node_read(m, &obj, "c", DICT), Some(sentinel(0xc)));
+            assert_eq!(node_read(m, &obj, wn("a"), DICT), Some(sentinel(0xa)));
+            assert_eq!(node_read(m, &obj, wn("b"), DICT), None);
+            assert_eq!(node_read(m, &obj, wn("c"), DICT), Some(sentinel(0xc)));
 
             // deleting an absent attribute returns None
             let m = obj._get_mapdict_map();
-            assert!(node_delete(m, &obj, "zzz", DICT).is_none());
+            assert!(node_delete(m, &obj, wn("zzz"), DICT).is_none());
         }
     }
 
@@ -3429,16 +3506,16 @@ mod tests {
             let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
             obj._set_mapdict_map(term);
 
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x1)));
-            assert!(instance_node_setdictvalue(obj_ref, "y", sentinel(0x2)));
-            assert!(instance_node_deldictvalue(obj_ref, "x"));
-            assert_eq!(instance_node_getdictvalue(obj_ref, "x"), None);
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x1)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x2)));
+            assert!(instance_node_deldictvalue(obj_ref, wn("x")));
+            assert_eq!(instance_node_getdictvalue(obj_ref, wn("x")), None);
             assert_eq!(
-                instance_node_getdictvalue(obj_ref, "y"),
+                instance_node_getdictvalue(obj_ref, wn("y")),
                 Some(sentinel(0x2))
             );
             // deleting again reports the attribute is gone
-            assert_eq!(instance_node_deldictvalue(obj_ref, "x"), false);
+            assert_eq!(instance_node_deldictvalue(obj_ref, wn("x")), false);
         }
     }
 
@@ -3454,8 +3531,8 @@ mod tests {
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
             let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
             obj._set_mapdict_map(term);
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x11)));
-            assert!(instance_node_setdictvalue(obj_ref, "y", sentinel(0x22)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
             let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
 
@@ -3516,8 +3593,8 @@ mod tests {
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
             let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
             obj._set_mapdict_map(term);
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x11)));
-            assert!(instance_node_setdictvalue(obj_ref, "y", sentinel(0x22)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
             let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
@@ -3558,7 +3635,7 @@ mod tests {
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
             let obj = &mut *(obj_ref as *mut pyre_object::W_InstanceObject);
             obj._set_mapdict_map(term);
-            assert!(instance_node_setdictvalue(obj_ref, "a", sentinel(0x55)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("a"), sentinel(0x55)));
 
             let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
 
@@ -3596,8 +3673,8 @@ mod tests {
 
             let v1 = sentinel(0xA1);
             let v2 = sentinel(0xB2);
-            assert!(instance_node_setdictvalue(obj_ref, "x", v1));
-            assert!(instance_node_setdictvalue(obj_ref, "y", v2));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), v1));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), v2));
 
             let addr = obj_ref as usize;
             // Never entered INSTANCE_DICT (no getdict call), proving storage
@@ -3641,7 +3718,7 @@ mod tests {
 
             // a DICT attribute is visible in the view; the SPECIAL "dict" slot
             // (storing the wrapper) is excluded from the view.
-            assert!(instance_node_setdictvalue(obj_ref, "x", sentinel(0x1)));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x1)));
             assert_eq!(MAP_DICT_STRATEGY.length(w1), 1);
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, "x"), Some(sentinel(0x1)));
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, "dict"), None);
@@ -3663,8 +3740,8 @@ mod tests {
             let w_dict = _obj_getdict(obj_ref);
             let v1 = sentinel(0xC1);
             let v2 = sentinel(0xC2);
-            assert!(instance_node_setdictvalue(obj_ref, "x", v1));
-            assert!(instance_node_setdictvalue(obj_ref, "y", v2));
+            assert!(instance_node_setdictvalue(obj_ref, wn("x"), v1));
+            assert!(instance_node_setdictvalue(obj_ref, wn("y"), v2));
 
             let mut seen: Vec<PyObjectRef> = Vec::new();
             instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
@@ -3696,7 +3773,7 @@ mod tests {
                 let name = format!("k{i}");
                 assert!(instance_node_setdictvalue(
                     obj_ref,
-                    &name,
+                    wn(&name),
                     sentinel(0x2000 + i)
                 ));
             }
@@ -3743,7 +3820,7 @@ mod tests {
                 let name = format!("k{i}");
                 assert!(instance_node_setdictvalue(
                     obj_ref,
-                    &name,
+                    wn(&name),
                     sentinel(0x1000 + i)
                 ));
             }
@@ -3795,9 +3872,9 @@ mod tests {
                 storage: vec![],
             };
             let m = o1._get_mapdict_map();
-            node_write(m, &mut o1, "p", DICT, sentinel(1));
+            node_write(m, &mut o1, wn("p"), DICT, sentinel(1));
             let m = o2._get_mapdict_map();
-            node_write(m, &mut o2, "p", DICT, sentinel(2));
+            node_write(m, &mut o2, wn("p"), DICT, sentinel(2));
             assert_eq!(o1.map, o2.map);
         }
     }
@@ -3812,9 +3889,9 @@ mod tests {
                 storage: vec![],
             };
             let m = o1._get_mapdict_map();
-            node_write(m, &mut o1, "a", DICT, sentinel(0xa1));
+            node_write(m, &mut o1, wn("a"), DICT, sentinel(0xa1));
             let m = o1._get_mapdict_map();
-            node_write(m, &mut o1, "b", DICT, sentinel(0xb1));
+            node_write(m, &mut o1, wn("b"), DICT, sentinel(0xb1));
 
             // o2 inserts b first, then a — adding "a" must trigger
             // _reorder_and_add (a lower-order ancestor already has "a") and
@@ -3824,14 +3901,14 @@ mod tests {
                 storage: vec![],
             };
             let m = o2._get_mapdict_map();
-            node_write(m, &mut o2, "b", DICT, sentinel(0xb2));
+            node_write(m, &mut o2, wn("b"), DICT, sentinel(0xb2));
             let m = o2._get_mapdict_map();
-            node_write(m, &mut o2, "a", DICT, sentinel(0xa2));
+            node_write(m, &mut o2, wn("a"), DICT, sentinel(0xa2));
 
             // values preserved through the reorder
             let m = o2._get_mapdict_map();
-            assert_eq!(node_read(m, &o2, "a", DICT), Some(sentinel(0xa2)));
-            assert_eq!(node_read(m, &o2, "b", DICT), Some(sentinel(0xb2)));
+            assert_eq!(node_read(m, &o2, wn("a"), DICT), Some(sentinel(0xa2)));
+            assert_eq!(node_read(m, &o2, wn("b"), DICT), Some(sentinel(0xb2)));
             assert_eq!(o2.storage.len(), 2);
             // reordered to the canonical (insertion-ordered) map shared with o1
             assert_eq!(o2.map, o1.map);
@@ -3854,7 +3931,7 @@ mod tests {
             assert!(node_write(
                 m,
                 &mut obj,
-                "x",
+                wn("x"),
                 DICT,
                 pyre_object::w_int_new(42)
             ));
@@ -3866,7 +3943,7 @@ mod tests {
             assert_eq!(obj.storage.len(), 1);
             // reading boxes the longlong back into an int of the same value
             let m = obj._get_mapdict_map();
-            let r = node_read(m, &obj, "x", DICT).unwrap();
+            let r = node_read(m, &obj, wn("x"), DICT).unwrap();
             assert!(pyre_object::is_int(r));
             assert_eq!(pyre_object::w_int_get_value(r), 42);
         }
@@ -3881,9 +3958,9 @@ mod tests {
                 storage: vec![],
             };
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "x", DICT, pyre_object::w_int_new(10));
+            node_write(m, &mut obj, wn("x"), DICT, pyre_object::w_int_new(10));
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "y", DICT, pyre_object::w_int_new(20));
+            node_write(m, &mut obj, wn("y"), DICT, pyre_object::w_int_new(20));
             // both pack into a single shared longlong list (storageindex 0,
             // listindex 0 and 1) — storage does not grow for the second one
             assert_eq!(obj.storage.len(), 1);
@@ -3892,11 +3969,11 @@ mod tests {
             assert_eq!(p.unboxed.as_ref().unwrap().listindex, 1);
             let m = obj._get_mapdict_map();
             assert_eq!(
-                pyre_object::w_int_get_value(node_read(m, &obj, "x", DICT).unwrap()),
+                pyre_object::w_int_get_value(node_read(m, &obj, wn("x"), DICT).unwrap()),
                 10
             );
             assert_eq!(
-                pyre_object::w_int_get_value(node_read(m, &obj, "y", DICT).unwrap()),
+                pyre_object::w_int_get_value(node_read(m, &obj, wn("y"), DICT).unwrap()),
                 20
             );
         }
@@ -3911,14 +3988,14 @@ mod tests {
                 storage: vec![],
             };
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "i", DICT, pyre_object::w_int_new(7));
+            node_write(m, &mut obj, wn("i"), DICT, pyre_object::w_int_new(7));
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "f", DICT, pyre_object::w_float_new(2.5));
+            node_write(m, &mut obj, wn("f"), DICT, pyre_object::w_float_new(2.5));
             // int and float pack into one longlong list (the float as its bits)
             assert_eq!(obj.storage.len(), 1);
             let m = obj._get_mapdict_map();
-            let ri = node_read(m, &obj, "i", DICT).unwrap();
-            let rf = node_read(m, &obj, "f", DICT).unwrap();
+            let ri = node_read(m, &obj, wn("i"), DICT).unwrap();
+            let rf = node_read(m, &obj, wn("f"), DICT).unwrap();
             // each is re-boxed to its own type
             assert!(pyre_object::is_int(ri));
             assert_eq!(pyre_object::w_int_get_value(ri), 7);
@@ -3936,17 +4013,17 @@ mod tests {
                 storage: vec![],
             };
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "x", DICT, pyre_object::w_int_new(1));
+            node_write(m, &mut obj, wn("x"), DICT, pyre_object::w_int_new(1));
             let map_after_first = obj.map;
             // a same-typed overwrite updates the longlong in place: no map
             // transition, no storage growth
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "x", DICT, pyre_object::w_int_new(2));
+            node_write(m, &mut obj, wn("x"), DICT, pyre_object::w_int_new(2));
             assert_eq!(obj.map, map_after_first);
             assert_eq!(obj.storage.len(), 1);
             let m = obj._get_mapdict_map();
             assert_eq!(
-                pyre_object::w_int_get_value(node_read(m, &obj, "x", DICT).unwrap()),
+                pyre_object::w_int_get_value(node_read(m, &obj, wn("x"), DICT).unwrap()),
                 2
             );
         }
@@ -3962,9 +4039,9 @@ mod tests {
             };
             let v = -3.141_592_653_589_793_f64;
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "f", DICT, pyre_object::w_float_new(v));
+            node_write(m, &mut obj, wn("f"), DICT, pyre_object::w_float_new(v));
             let m = obj._get_mapdict_map();
-            let r = node_read(m, &obj, "f", DICT).unwrap();
+            let r = node_read(m, &obj, wn("f"), DICT).unwrap();
             assert!(pyre_object::is_float(r));
             assert_eq!(pyre_object::w_float_get_value(r), v);
         }
@@ -3980,18 +4057,18 @@ mod tests {
                 storage: vec![],
             };
             let m = obj._get_mapdict_map();
-            node_write(m, &mut obj, "x", DICT, pyre_object::w_int_new(10));
+            node_write(m, &mut obj, wn("x"), DICT, pyre_object::w_int_new(10));
             assert!((*obj.map).as_plain().unboxed.is_some());
             // the class becomes type-unstable: freeze unboxing for its terminator.
             (*term).as_terminator().allow_unboxing.set(false);
             // mapdict.py:592-598 — a read now lazily migrates obj to boxed storage.
             let m = obj._get_mapdict_map();
-            maybe_migrate_to_boxed(m, &mut obj, "x", DICT);
+            maybe_migrate_to_boxed(m, &mut obj, wn("x"), DICT);
             // the rebuilt map's attribute is boxed; the value is preserved.
             assert!((*obj.map).as_plain().unboxed.is_none());
             let m = obj._get_mapdict_map();
             assert_eq!(
-                pyre_object::w_int_get_value(node_read(m, &obj, "x", DICT).unwrap()),
+                pyre_object::w_int_get_value(node_read(m, &obj, wn("x"), DICT).unwrap()),
                 10
             );
         }

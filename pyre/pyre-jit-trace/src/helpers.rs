@@ -209,7 +209,7 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
 /// recorded as a normal residual call — NOT pure: the instance dict mutates,
 /// so the result is guarded `null` per iteration rather than folded.  `w_name`
 /// is the interned immortal name pointer; the body reads it back via
-/// `w_str_get_value`, mirroring [`jit_lookup_where_with_method_cache`].  Null
+/// `w_str_get_wtf8`, mirroring [`jit_lookup_where_with_method_cache`].  Null
 /// on a null receiver / name or a non-instance receiver (the fast path
 /// already pinned the receiver type with `guard_class`).
 pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
@@ -218,7 +218,7 @@ pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
     if w_obj.is_null() || w_name.is_null() || !unsafe { is_instance(w_obj) } {
         return PY_NULL as i64;
     }
-    let name = unsafe { w_str_get_value(w_name) };
+    let name = unsafe { w_str_get_wtf8(w_name) };
     let w_value = unsafe {
         pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue(w_obj, name)
     };

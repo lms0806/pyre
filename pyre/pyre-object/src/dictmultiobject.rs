@@ -2458,6 +2458,40 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     entries.shift_remove(&object_key_for(w_key)).is_some()
 }
 
+/// WTF-8 keyed sibling of `w_dict_getitem_str` — routes through the
+/// generic object-key lookup so a lone-surrogate key resolves on the
+/// `ObjectDictStrategy` entries map.  `w_str_get_value` (used by the
+/// Unicode strategy's str fast path) panics on a lone surrogate, so the
+/// str-keyed wrapper cannot be used for such names.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_getitem_wtf8(
+    obj: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+) -> Option<PyObjectRef> {
+    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+    w_dict_lookup(obj, w_key)
+}
+
+/// WTF-8 keyed sibling of `w_dict_setitem_str`.  A key that is valid
+/// UTF-8 takes the str fast path (so an ASCII/Unicode dict keeps its
+/// strategy); only a lone-surrogate key forces the object strategy via
+/// `w_dict_setitem_wtf8_no_proxy`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_setitem_wtf8(
+    obj: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+    value: PyObjectRef,
+) {
+    match key.as_str() {
+        Ok(s) => w_dict_setitem_str(obj, s, value),
+        Err(_) => w_dict_setitem_wtf8_no_proxy(obj, key, value),
+    }
+}
+
 /// WTF-8 keyed sibling of `w_dict_setitem_str_no_proxy` — lets a
 /// lone-surrogate namespace key reach the back-mirror `W_DictObject`.
 /// The dict is forced onto `ObjectDictStrategy` (ObjectKey-keyed via

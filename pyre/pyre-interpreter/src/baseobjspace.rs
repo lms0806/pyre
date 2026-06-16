@@ -2503,6 +2503,13 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
         match object_getattribute_surrogate(obj, w_name, name) {
             Ok(v) => Ok(v),
             Err(e) => {
+                // descroperation.py:234-244 `_handle_getattribute`: only an
+                // AttributeError from `__getattribute__` (here a descriptor
+                // `__get__` or the dict miss) triggers the `__getattr__`
+                // fallback; any other exception propagates unchanged.
+                if e.kind != crate::PyErrorKind::AttributeError {
+                    return Err(e);
+                }
                 if is_instance(obj) {
                     let w_type = w_instance_get_type(obj);
                     if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
@@ -2540,11 +2547,19 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             return Err(attr_error_wtf8(obj, name));
         }
         if is_type(obj) {
-            // `typeobject.py lookup_where` over the type's own MRO. A
-            // surrogate cannot name a metatype descriptor, so the
-            // class-attribute search is the whole protocol.
-            if let Some(v) = lookup_in_type_wtf8(obj, name) {
-                return Ok(v);
+            // typeobject.py W_TypeObject.descr_getattribute: a surrogate
+            // cannot name a metatype descriptor (those are identifiers), so
+            // the metatype data/non-data descriptor branches are unreachable
+            // and the type's own MRO is the whole protocol.  The found value
+            // is bound via `space.get(w_value, space.w_None, self)` =
+            // `__get__(None, type)`, the same as the identifier path, so a
+            // surrogate-named classmethod / property / custom descriptor is
+            // resolved rather than returned raw.
+            if let Some(w_value) = lookup_in_type_wtf8(obj, name) {
+                if let Some(result) = get(w_value, w_none(), obj)? {
+                    return Ok(result);
+                }
+                return Ok(w_value);
             }
             return Err(attr_error_wtf8(obj, name));
         }
@@ -2659,6 +2674,14 @@ pub(crate) unsafe fn object_setattr_surrogate(
         // and `mutated` falls back to the conservative whole-cache reset
         // (correct: a surrogate can never name `__eq__`/`__hash__`).
         if is_type(obj) {
+            // typeobject.py:416 — only heap types may have their dict mutated.
+            if !pyre_object::w_type_is_heaptype(obj) {
+                return Err(PyError::type_error(format!(
+                    "cannot set {} attribute of immutable type '{}'",
+                    crate::display::format_wtf8_repr(name),
+                    w_type_get_name(obj)
+                )));
+            }
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store_wtf8(&mut *dict_ptr, name, value);
@@ -2735,6 +2758,13 @@ pub(crate) unsafe fn object_delattr_surrogate(
             return Err(attr_error_wtf8(obj, name));
         }
         if is_type(obj) {
+            // typeobject.py:437 — only heap types may have attributes deleted.
+            if !pyre_object::w_type_is_heaptype(obj) {
+                return Err(PyError::type_error(format!(
+                    "cannot delete attributes on immutable type object '{}'",
+                    w_type_get_name(obj)
+                )));
+            }
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() && crate::dict_storage_delete_wtf8(&mut *dict_ptr, name) {
                 // A lone surrogate has no `&str` form, so `mutated` falls
@@ -2983,7 +3013,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
             // split of the class name with `"builtins"` fallback).
 
             if let Some(value) = lookup_in_type_where(obj, name) {
-                if let Some(result) = get(value, PY_NULL, obj)? {
+                // typeobject.py W_TypeObject.descr_getattribute:
+                // `space.get(w_value, space.w_None, self)` — bind via
+                // `__get__(None, type)` (functions stay unbound, classmethod
+                // binds the class, a custom descriptor sees `obj is None`).
+                // The receiver must be the `None` singleton, not a null
+                // pointer, or a Python `__get__(self, obj, objtype=None)`
+                // loses its `obj` argument.
+                if let Some(result) = get(value, w_none(), obj)? {
                     return Ok(result);
                 }
                 return Ok(value);
@@ -4493,7 +4530,7 @@ pub unsafe fn load_method_fast_path(
     }
     // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`: a
     // shadowing instance attribute means the method is not bound.
-    if crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, name).is_some() {
+    if crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name)).is_some() {
         return None;
     }
     Some((w_type, version_tag, w_descr))
@@ -4934,7 +4971,10 @@ unsafe fn get(
 
     // property: PyPy W_Property.get → call fget(obj)
     if is_property(descr) {
-        if obj.is_null() {
+        // W_Property.get: `if space.is_w(w_obj, space.w_None): return self`
+        // — a `None` receiver (class-level access via `__get__(None, type)`)
+        // returns the property itself, the same as a null receiver.
+        if obj.is_null() || is_none(obj) {
             return Ok(Some(descr));
         }
         let fget = w_property_get_fget(descr);
