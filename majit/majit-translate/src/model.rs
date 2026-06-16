@@ -3264,12 +3264,13 @@ impl FunctionGraph {
         }
     }
 
-    /// Walk the graph structure and collect every distinct
+    /// Walk the startblock-reachable block closure (`iterblocks()`
+    /// parity, `rpython/flowspace/model.py:66`) and collect every distinct
     /// [`crate::flowspace::model::Variable`] it references: block
     /// `inputargs`, operation operands
     /// ([`crate::inline::op_variable_refs`]) and results, link `args` /
     /// exception extravars, and the `exitswitch` condition.  Distinct by
-    /// identity, in first-appearance order.
+    /// identity, in first-appearance DFS order.
     ///
     /// The canonical value enumeration for passes that walk the graph's
     /// values (regalloc coloring, `Variable.annotation` reset /
@@ -3288,7 +3289,23 @@ impl FunctionGraph {
                 out.push(v);
             }
         };
-        for block in &self.blocks {
+        // `iterblocks()` parity (`rpython/flowspace/model.py:66`): walk only
+        // the startblock-reachable closure over `Block.exits`, id-keyed
+        // because block ids need not be index-aligned
+        // (`flowspace_adapter::reachable_block_ids`).  Unreachable lowered
+        // blocks (orphan `on_unwind` cleanup, pruned `SwitchInt` arms) carry
+        // no annotated value — `remove_dead_blocks` drops them before rtyping.
+        let by_id: std::collections::HashMap<BlockId, &Block> =
+            self.blocks.iter().map(|b| (b.id, b)).collect();
+        let mut block_seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+        let mut stack = vec![self.startblock];
+        while let Some(bid) = stack.pop() {
+            if !block_seen.insert(bid) {
+                continue;
+            }
+            let Some(block) = by_id.get(&bid) else {
+                continue;
+            };
             for v in block.input_variables() {
                 push(v.clone(), &mut seen, &mut out);
             }
@@ -3316,6 +3333,7 @@ impl FunctionGraph {
             if let Some(ExitSwitch::Value(cond)) = &block.exitswitch {
                 push(cond.clone(), &mut seen, &mut out);
             }
+            stack.extend(block.exits.iter().rev().map(|e| e.target));
         }
         out
     }

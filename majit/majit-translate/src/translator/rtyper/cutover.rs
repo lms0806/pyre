@@ -614,14 +614,18 @@ fn project_value_to_var(
 /// outside the closure is legacy-only by construction; diffing it
 /// against the real path is a guaranteed false `real=Unknown`.
 fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    // Id-keyed lookup, not the dense `blocks[id.0]` projection — block ids
+    // need not be index-aligned (`flowspace_adapter::reachable_block_ids`).
+    let by_id: std::collections::HashMap<crate::model::BlockId, &crate::model::Block> =
+        graph.blocks.iter().map(|b| (b.id, b)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![graph.startblock];
     let mut vars = std::collections::HashSet::new();
     while let Some(bid) = stack.pop() {
-        if !seen.insert(bid.0) {
+        if !seen.insert(bid) {
             continue;
         }
-        let Some(block) = graph.blocks.get(bid.0) else {
+        let Some(block) = by_id.get(&bid) else {
             continue;
         };
         for ia in &block.inputargs {
