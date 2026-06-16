@@ -4051,7 +4051,7 @@ mod tests {
     ) -> crate::annotator::description::DescEntry {
         use crate::annotator::description::{DescEntry, FunctionDesc};
         use crate::flowspace::argument::Signature;
-        DescEntry::Function(Rc::new(std::cell::RefCell::new(FunctionDesc::new(
+        DescEntry::function(Rc::new(std::cell::RefCell::new(FunctionDesc::new(
             bk.clone(),
             None,
             name,

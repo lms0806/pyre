@@ -526,20 +526,25 @@ pub(crate) fn simplify_desc_set_default(
 /// returns the inner `Rc::as_ptr` identity.
 ///
 /// Callsite mapping (upstream → Rust):
-/// * `isinstance(desc, FunctionDesc)` → `matches!(entry,
-///   DescEntry::Function(_))`
+/// * `isinstance(desc, FunctionDesc)` → [`DescEntry::is_function`] /
+///   `matches!(entry, DescEntry::Func(_))` (the `Func` variant holds
+///   both a plain function and a memo desc)
 /// * `desc.pycall(...)` → per-variant dispatch via `match entry { ... }`
 /// * `bookkeeper.descs[pyobj] = result` →
 ///   `bookkeeper.descs.insert(pyobj, entry)`
 #[derive(Clone, Debug)]
 pub enum DescEntry {
-    /// upstream `FunctionDesc` — ported file description.py:190-393.
-    Function(Rc<RefCell<FunctionDesc>>),
-    /// upstream `MemoDesc(FunctionDesc)` — description.py:395-404. A
-    /// `@specialize.memo` function; `isinstance(desc, FunctionDesc)` is
-    /// true upstream, so every non-`pycall` dispatch delegates to the
-    /// wrapped FunctionDesc.
-    Memo(Rc<RefCell<MemoDesc>>),
+    /// upstream `FunctionDesc` (description.py:190-393) and its subclass
+    /// `MemoDesc` (description.py:395-404), unified into one variant.
+    ///
+    /// `isinstance(desc, FunctionDesc)` is true for both, so the two
+    /// must never diverge at a use site. Folding them behind the opaque
+    /// [`FuncDescEntry`] makes the wrapped `FunctionDesc` reachable only
+    /// via [`FuncDescEntry::func`] (memo-aware): a single `Func` match
+    /// arm covers both cases, so no consumer can branch on the plain
+    /// function and silently skip a memo one. `getKind` keeps them
+    /// distinct via [`FuncDescEntry::is_memo`] (model.py:560-566).
+    Func(FuncDescEntry),
     /// upstream `MethodDesc` — description.py:407-519.
     Method(Rc<RefCell<MethodDesc>>),
     /// upstream `FrozenDesc` — description.py:528-599.
@@ -553,15 +558,137 @@ pub enum DescEntry {
     Class(Rc<RefCell<super::classdesc::ClassDesc>>),
 }
 
+/// The `FunctionDesc`-or-`MemoDesc` payload of [`DescEntry::Func`].
+///
+/// `MemoDesc(FunctionDesc)` is a one-method-override subclass upstream
+/// (only `pycall` differs; description.py:395-404), and
+/// `isinstance(desc, FunctionDesc)` is true for it. Modelling the pair
+/// as one value with a private `inner` means the wrapped `FunctionDesc`
+/// is reachable only through [`func`](Self::func), which yields the
+/// memo's base for the memo case. A FunctionDesc-keyed path therefore
+/// cannot match the plain case and forget the memo case — the defect
+/// the rtyper repr / signature / call-family / lost-method paths
+/// previously carried.
+///
+/// Encoding rationale — why one opaque variant, not two, a trait object,
+/// or a memo flag on FunctionDesc. RPython tests the desc class two
+/// different ways and the encoding must satisfy both:
+///   * `getKind` keys on the exact `desc.__class__` (model.py:563) and
+///     raises "mixing several kinds of PBCs" on a heterogeneous set
+///     (model.py:564-565). MemoDesc must therefore stay a *distinct*
+///     kind: a memo flag on FunctionDesc would make a Function+Memo PBC
+///     pass the mix check it has to fail. `kind()` (→ `DescKind::Memo`)
+///     is that exact-class projection.
+///   * `rtyper_makerepr` dispatches on `issubclass(kind, FunctionDesc)`
+///     (rpbc.py:38), true for MemoDesc. `func()` / `as_function()` are
+///     that subtype view — both cases resolve to a FunctionDesc.
+///
+/// `consider_call_site` / `simplify_desc_set` are @staticmethods invoked
+/// on the kind class, not the instance (model.py:574,578); the enum
+/// `match` is that class-keyed dispatch. A `dyn Desc` trait object would
+/// model instance-virtual dispatch (the wrong axis here), would still
+/// need a kind discriminant to implement getKind, and would forfeit the
+/// exhaustiveness the closed Desc set gets from an enum. Hence: keep the
+/// enum, fold the two function kinds into one `Func` whose sole
+/// FunctionDesc accessor `func()` is memo-aware, and carry the
+/// exact-class split in `is_memo()` / `kind()`.
+#[derive(Clone, Debug)]
+pub struct FuncDescEntry {
+    inner: FuncDescInner,
+}
+
+#[derive(Clone, Debug)]
+enum FuncDescInner {
+    /// a `FunctionDesc` whose specializer is not `memo`.
+    Plain(Rc<RefCell<FunctionDesc>>),
+    /// a `MemoDesc` (description.py:395) wrapping its base `FunctionDesc`.
+    Memo(Rc<RefCell<MemoDesc>>),
+}
+
+impl FuncDescEntry {
+    /// Wrap a plain `FunctionDesc`.
+    pub fn plain(rc: Rc<RefCell<FunctionDesc>>) -> Self {
+        FuncDescEntry {
+            inner: FuncDescInner::Plain(rc),
+        }
+    }
+
+    /// Wrap a `MemoDesc`.
+    pub fn memo(rc: Rc<RefCell<MemoDesc>>) -> Self {
+        FuncDescEntry {
+            inner: FuncDescInner::Memo(rc),
+        }
+    }
+
+    /// The underlying `FunctionDesc` — the `isinstance(desc,
+    /// FunctionDesc)` view. For a `MemoDesc` this is its wrapped base
+    /// (description.py:395 `MemoDesc(FunctionDesc)`).
+    pub fn func(&self) -> Rc<RefCell<FunctionDesc>> {
+        match &self.inner {
+            FuncDescInner::Plain(rc) => rc.clone(),
+            FuncDescInner::Memo(rc) => rc.borrow().base.clone(),
+        }
+    }
+
+    /// `isinstance(desc, MemoDesc)` — true only for the memo subclass.
+    pub fn is_memo(&self) -> bool {
+        matches!(self.inner, FuncDescInner::Memo(_))
+    }
+
+    /// The `MemoDesc` when this is one, for memo-specific dispatch
+    /// (`MemoDesc.pycall`).
+    pub fn as_memo(&self) -> Option<Rc<RefCell<MemoDesc>>> {
+        match &self.inner {
+            FuncDescInner::Memo(rc) => Some(rc.clone()),
+            FuncDescInner::Plain(_) => None,
+        }
+    }
+
+    /// `type(desc)` projection. A memo desc is a distinct kind upstream
+    /// (`getKind` keys on `desc.__class__`).
+    pub fn kind(&self) -> super::model::DescKind {
+        if self.is_memo() {
+            super::model::DescKind::Memo
+        } else {
+            super::model::DescKind::Function
+        }
+    }
+
+    /// `id(desc)` — the identity of the actual desc object (the
+    /// `MemoDesc` itself for a memo, not its base).
+    pub fn desc_key(&self) -> DescKey {
+        match &self.inner {
+            FuncDescInner::Plain(rc) => DescKey::from_rc(rc),
+            FuncDescInner::Memo(rc) => DescKey::from_rc(rc),
+        }
+    }
+
+    /// `desc.pyobj` — the wrapped host function object.
+    pub fn pyobj(&self) -> Option<HostObject> {
+        match &self.inner {
+            FuncDescInner::Plain(rc) => rc.borrow().base.pyobj.clone(),
+            FuncDescInner::Memo(rc) => rc.borrow().base.borrow().base.pyobj.clone(),
+        }
+    }
+}
+
 impl DescEntry {
+    /// Wrap a plain `FunctionDesc` as a [`DescEntry::Func`].
+    pub fn function(rc: Rc<RefCell<FunctionDesc>>) -> Self {
+        DescEntry::Func(FuncDescEntry::plain(rc))
+    }
+
+    /// Wrap a `MemoDesc` as a [`DescEntry::Func`].
+    pub fn memo(rc: Rc<RefCell<MemoDesc>>) -> Self {
+        DescEntry::Func(FuncDescEntry::memo(rc))
+    }
+
     /// RPython `id(desc)` — pointer-identity handle. Used as the dict
     /// key by `CallFamily.descs`, `FrozenAttrFamily.descs`, and
     /// `ClassAttrFamily.descs`.
     pub fn desc_key(&self) -> DescKey {
         match self {
-            DescEntry::Function(rc) => DescKey::from_rc(rc),
-            // `id(desc)` is the MemoDesc object's identity upstream.
-            DescEntry::Memo(rc) => DescKey::from_rc(rc),
+            DescEntry::Func(fe) => fe.desc_key(),
             DescEntry::Method(rc) => DescKey::from_rc(rc),
             DescEntry::Frozen(rc) => DescKey::from_rc(rc),
             DescEntry::MethodOfFrozen(rc) => DescKey::from_rc(rc),
@@ -575,8 +702,7 @@ impl DescEntry {
     /// None`).
     pub fn pyobj(&self) -> Option<HostObject> {
         match self {
-            DescEntry::Function(rc) => rc.borrow().base.pyobj.clone(),
-            DescEntry::Memo(rc) => rc.borrow().base.borrow().base.pyobj.clone(),
+            DescEntry::Func(fe) => fe.pyobj(),
             DescEntry::Method(_) => None,
             DescEntry::Frozen(rc) => rc.borrow().base.pyobj.clone(),
             DescEntry::MethodOfFrozen(_) => None,
@@ -589,14 +715,13 @@ impl DescEntry {
     /// [`super::model::SomePBC::getKind`] (model.py:560-566).
     pub fn kind(&self) -> super::model::DescKind {
         match self {
-            DescEntry::Function(_) => super::model::DescKind::Function,
             // upstream `getKind` keys on `desc.__class__`: a MemoDesc is
             // a distinct kind (mixing with FunctionDesc → "mixing several
             // kinds of PBCs"). `consider_call_site` / `simplify_desc_set`
             // are inherited from FunctionDesc, so a homogeneous memo PBC
             // routes through the Function path (see `SomePBC::simplify` /
             // `consider_call_site`).
-            DescEntry::Memo(_) => super::model::DescKind::Memo,
+            DescEntry::Func(fe) => fe.kind(),
             DescEntry::Method(_) => super::model::DescKind::Method,
             DescEntry::Class(_) => super::model::DescKind::Class,
             DescEntry::Frozen(_) => super::model::DescKind::Frozen,
@@ -616,14 +741,12 @@ impl DescEntry {
         name: &str,
     ) -> DescEntry {
         match self {
-            DescEntry::Function(fd) => {
-                DescEntry::Method(FunctionDesc::bind_under(fd, classdef, name))
-            }
-            // MemoDesc inherits `FunctionDesc.bind_under`; bind the wrapped
-            // FunctionDesc (the resulting MethodDesc carries the base
-            // funcdesc — a memo bound method is not a path pyre exercises).
-            DescEntry::Memo(md) => {
-                DescEntry::Method(FunctionDesc::bind_under(&md.borrow().base, classdef, name))
+            // MemoDesc inherits `FunctionDesc.bind_under`; `func()` binds
+            // the wrapped FunctionDesc (the resulting MethodDesc carries
+            // the base funcdesc — a memo bound method is not a path pyre
+            // exercises).
+            DescEntry::Func(fe) => {
+                DescEntry::Method(FunctionDesc::bind_under(&fe.func(), classdef, name))
             }
             DescEntry::Method(md) => DescEntry::Method(md.borrow().bind_under(classdef, name)),
             // upstream: `Desc.bind_under` default = `return self`.
@@ -648,14 +771,13 @@ impl DescEntry {
         match self {
             DescEntry::Frozen(rc) => rc.borrow().s_read_attribute(name),
             DescEntry::Class(rc) => super::classdesc::ClassDesc::s_read_attribute(rc, name),
-            DescEntry::Function(_)
-            | DescEntry::Memo(_)
-            | DescEntry::Method(_)
-            | DescEntry::MethodOfFrozen(_) => Err(AnnotatorError::new(format!(
-                "AttributeError: {:?} has no s_read_attribute (pbc_getattr of {:?})",
-                self.kind(),
-                name
-            ))),
+            DescEntry::Func(_) | DescEntry::Method(_) | DescEntry::MethodOfFrozen(_) => {
+                Err(AnnotatorError::new(format!(
+                    "AttributeError: {:?} has no s_read_attribute (pbc_getattr of {:?})",
+                    self.kind(),
+                    name
+                )))
+            }
         }
     }
 
@@ -669,9 +791,9 @@ impl DescEntry {
         args_s: Vec<super::model::SomeValue>,
     ) -> Result<(Rc<PyGraph>, Vec<Option<super::model::SomeValue>>), AnnotatorError> {
         match self {
-            DescEntry::Function(rc) => rc.borrow().get_call_parameters(args_s),
-            // MemoDesc inherits `get_call_parameters` from FunctionDesc.
-            DescEntry::Memo(rc) => rc.borrow().base.borrow().get_call_parameters(args_s),
+            // MemoDesc inherits `get_call_parameters` from FunctionDesc;
+            // `func()` is the base FunctionDesc for the memo case.
+            DescEntry::Func(fe) => fe.func().borrow().get_call_parameters(args_s),
             DescEntry::Method(_)
             | DescEntry::Frozen(_)
             | DescEntry::MethodOfFrozen(_)
@@ -706,8 +828,9 @@ impl DescEntry {
     /// Shorthand predicates matching upstream `isinstance(desc, ...)`
     /// dispatch at bookkeeper callsites.
     pub fn is_function(&self) -> bool {
-        // upstream `isinstance(desc, FunctionDesc)` is true for MemoDesc.
-        matches!(self, DescEntry::Function(_) | DescEntry::Memo(_))
+        // upstream `isinstance(desc, FunctionDesc)` is true for MemoDesc;
+        // the unified `Func` variant carries both.
+        matches!(self, DescEntry::Func(_))
     }
     pub fn is_method(&self) -> bool {
         matches!(self, DescEntry::Method(_))
@@ -722,14 +845,22 @@ impl DescEntry {
         matches!(self, DescEntry::Class(_))
     }
 
-    /// Variant-specific getter. Returns `None` when `self` is a
-    /// different variant — the caller is expected to branch via
-    /// `is_function()` first.
+    /// The `isinstance(desc, FunctionDesc)` view: the underlying
+    /// `FunctionDesc` for either a plain function or a memo (its base).
+    /// Returns `None` for the non-function variants.
     pub fn as_function(&self) -> Option<Rc<RefCell<FunctionDesc>>> {
         match self {
-            DescEntry::Function(rc) => Some(rc.clone()),
-            // MemoDesc is-a FunctionDesc: yield the wrapped base.
-            DescEntry::Memo(rc) => Some(rc.borrow().base.clone()),
+            DescEntry::Func(fe) => Some(fe.func()),
+            _ => None,
+        }
+    }
+
+    /// The [`FuncDescEntry`] when this is a function/memo desc, for
+    /// memo-aware dispatch (e.g. `is_memo()` / `as_memo()` /
+    /// `MemoDesc.pycall`).
+    pub fn as_func_entry(&self) -> Option<&FuncDescEntry> {
+        match self {
+            DescEntry::Func(fe) => Some(fe),
             _ => None,
         }
     }
@@ -766,8 +897,7 @@ impl DescEntry {
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         match self {
-            DescEntry::Function(rc) => rc.borrow().get_graph(args, op_key),
-            DescEntry::Memo(rc) => rc.borrow().base.borrow().get_graph(args, op_key),
+            DescEntry::Func(fe) => fe.func().borrow().get_graph(args, op_key),
             DescEntry::Method(rc) => rc.borrow().get_graph(args, op_key),
             DescEntry::MethodOfFrozen(rc) => rc.borrow().get_graph(args, op_key),
             DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
@@ -781,8 +911,19 @@ impl DescEntry {
     /// `build_calltable_row` (description.py:66-67).
     pub fn rowkey(&self) -> Result<DescKey, AnnotatorError> {
         match self {
-            DescEntry::Function(rc) => Ok(FunctionDesc::rowkey(rc)),
-            DescEntry::Memo(rc) => Ok(FunctionDesc::rowkey(&rc.borrow().base)),
+            // Upstream `FunctionDesc.rowkey()` returns `self`
+            // (description.py:365), and a MemoDesc *is* a FunctionDesc, so
+            // there rowkey(memo) == id(memo) == the membership key
+            // (`desc_key`). Here a MemoDesc carries no Desc identity of its
+            // own — only its wrapped base — so for a memo this rowkey is
+            // the base's identity while `desc_key` (PBC membership) is the
+            // wrapper's; the two coincide upstream but split here. The
+            // split is unobservable: a memo call is replaced with a value
+            // or a dispatch graph at annotation time and never enters a
+            // calltable, so this arm is not reached for a memo. Matching
+            // upstream (rowkey == the wrapper) would require MemoDesc to
+            // embed its own Desc identity.
+            DescEntry::Func(fe) => Ok(FunctionDesc::rowkey(&fe.func())),
             DescEntry::Method(rc) => Ok(rc.borrow().rowkey()),
             DescEntry::MethodOfFrozen(rc) => Ok(rc.borrow().rowkey()),
             DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
@@ -993,8 +1134,7 @@ impl FunctionDesc {
 
     fn nameof_desc(desc: &DescEntry) -> String {
         match desc {
-            DescEntry::Function(rc) => rc.borrow().name.clone(),
-            DescEntry::Memo(rc) => rc.borrow().base.borrow().name.clone(),
+            DescEntry::Func(fe) => fe.func().borrow().name.clone(),
             DescEntry::Method(rc) => rc.borrow().name.clone(),
             DescEntry::MethodOfFrozen(rc) => rc.borrow().funcdesc.borrow().name.clone(),
             DescEntry::Class(rc) => rc.borrow().name.clone(),
@@ -2198,7 +2338,7 @@ impl FunctionDesc {
         }
         let family = descs[0].borrow().base.getcallfamily()?;
         let shape = args.rawshape();
-        let desc_entries: Vec<DescEntry> = descs.iter().cloned().map(DescEntry::Function).collect();
+        let desc_entries: Vec<DescEntry> = descs.iter().cloned().map(DescEntry::function).collect();
         let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
         let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
@@ -3463,15 +3603,15 @@ mod tests {
 
         let entry = bk.getdesc(&host).expect("getdesc");
         assert!(
-            matches!(entry, DescEntry::Memo(_)),
-            "memo function must route to DescEntry::Memo, got {:?}",
+            matches!(&entry, DescEntry::Func(fe) if fe.is_memo()),
+            "memo function must route to a memo Func entry, got {:?}",
             entry.kind()
         );
         // isinstance(desc, FunctionDesc) is true for MemoDesc.
         assert!(entry.is_function());
         assert!(entry.as_function().is_some());
 
-        let DescEntry::Memo(md) = &entry else {
+        let Some(md) = entry.as_func_entry().and_then(|fe| fe.as_memo()) else {
             unreachable!()
         };
         // unknown bool arg -> all_values = [False, True] -> union(20, 10).
@@ -3489,6 +3629,46 @@ mod tests {
             !s.is_constant(),
             "two distinct results must not be constant"
         );
+    }
+
+    /// A plain function and a memo desc are the one [`DescEntry::Func`]
+    /// variant: `isinstance(desc, FunctionDesc)` holds for both, so the
+    /// underlying FunctionDesc is reachable through `as_function()` /
+    /// `FuncDescEntry::func()` for either, while `kind()` keeps them
+    /// distinct (`getKind` keys on `desc.__class__`). There is no
+    /// `DescEntry::Function`-only variant a FunctionDesc-keyed path could
+    /// match while silently skipping the memo case.
+    #[test]
+    fn func_desc_entry_unifies_plain_and_memo() {
+        let (_ann, bk) = ann_bk();
+        let func = compiled_graph_func("def f(x):\n    return 0\n", Vec::new());
+        let sig = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func);
+        let fd = std::rc::Rc::new(std::cell::RefCell::new(FunctionDesc::new(
+            bk,
+            Some(host),
+            "f",
+            sig,
+            None,
+            None,
+        )));
+
+        let plain = DescEntry::function(fd.clone());
+        assert!(plain.is_function());
+        assert_eq!(plain.kind(), super::super::model::DescKind::Function);
+        assert!(!plain.as_func_entry().unwrap().is_memo());
+        assert!(std::rc::Rc::ptr_eq(&plain.as_function().unwrap(), &fd));
+
+        let memo = DescEntry::memo(std::rc::Rc::new(std::cell::RefCell::new(MemoDesc::new(
+            fd.clone(),
+        ))));
+        // isinstance(desc, FunctionDesc) is true for the memo subclass.
+        assert!(memo.is_function());
+        assert_eq!(memo.kind(), super::super::model::DescKind::Memo);
+        assert!(memo.as_func_entry().unwrap().is_memo());
+        assert!(memo.as_func_entry().unwrap().as_memo().is_some());
+        // as_function() yields the memo's wrapped base FunctionDesc.
+        assert!(std::rc::Rc::ptr_eq(&memo.as_function().unwrap(), &fd));
     }
 
     /// Build a PyGraph with a given signature/defaults for the
@@ -3921,7 +4101,7 @@ mod tests {
                 parms: vec!["0".to_string()],
             }),
         );
-        let pbc = SomePBC::new(vec![DescEntry::Function(callee)], false);
+        let pbc = SomePBC::new(vec![DescEntry::function(callee)], false);
         let mut inputcells = vec![Some(SomeValue::PBC(pbc))];
 
         let graph = fd
@@ -4572,7 +4752,7 @@ mod tests {
         let family = fd.borrow().base.getcallfamily().unwrap();
         let (shape, index) = family
             .borrow()
-            .find_row(&bk, &[DescEntry::Function(fd)], &args, None)
+            .find_row(&bk, &[DescEntry::function(fd)], &args, None)
             .unwrap();
 
         assert_eq!(shape, args.rawshape());

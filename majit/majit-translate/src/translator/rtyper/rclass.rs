@@ -634,7 +634,7 @@ impl ClassRepr {
                         "ClassRepr.prepare_method expected MethodDesc entries after lookup_filter",
                     )
                 })?;
-                Ok(DescEntry::Function(method.borrow().funcdesc.clone()))
+                Ok(DescEntry::function(method.borrow().funcdesc.clone()))
             })
             .collect::<Result<_, TyperError>>()?;
         // rclass.py:236 — `return annmodel.SomePBC(funcdescs)`. The

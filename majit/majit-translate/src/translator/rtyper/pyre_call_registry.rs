@@ -600,7 +600,7 @@ impl PyreCallRegistry {
     /// 3. constructs `FunctionDesc::new(bookkeeper, Some(host),
     ///    name, signature, None, None)` with pyre's authoritative
     ///    parameter signature,
-    /// 4. inserts `DescEntry::Function(fd)` into `bookkeeper.descs`
+    /// 4. inserts `DescEntry::function(fd)` into `bookkeeper.descs`
     ///    keyed by `host_object`'s Arc identity so any later
     ///    `bookkeeper.getdesc(host_object)` short-circuits at the
     ///    cache lookup at upstream `bookkeeper.py:362-364`
@@ -663,7 +663,7 @@ impl PyreCallRegistry {
         // getdesc(host_object) lookup short-circuits at the cache.
         self.bookkeeper.descs.borrow_mut().insert(
             host_object.clone(),
-            DescEntry::Function(function_desc.clone()),
+            DescEntry::function(function_desc.clone()),
         );
         let entry = Rc::new(PyreFunctionEntry {
             host_object,
@@ -852,20 +852,20 @@ mod tests {
         let entry =
             registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
         // Direct cache lookup — Bookkeeper.descs[host_object] must
-        // be DescEntry::Function(entry.function_desc).
+        // be DescEntry::function(entry.function_desc).
         let descs = bk.descs.borrow();
         let cached = descs
             .get(&entry.host_object)
             .expect("registry must pre-insert the entry under host_object's Arc identity");
-        match cached {
-            DescEntry::Function(fd) => {
+        match cached.as_function() {
+            Some(fd) => {
                 assert!(
-                    Rc::ptr_eq(fd, &entry.function_desc),
+                    Rc::ptr_eq(&fd, &entry.function_desc),
                     "bookkeeper.descs entry must point at the same FunctionDesc Rc the \
                      registry returned, so getdesc identity-cache parity holds"
                 );
             }
-            other => panic!("expected DescEntry::Function, got {other:?}"),
+            None => panic!("expected a function desc, got {cached:?}"),
         }
     }
 

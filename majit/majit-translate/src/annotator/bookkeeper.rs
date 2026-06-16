@@ -1256,11 +1256,11 @@ impl Bookkeeper {
         // upstream: `if specializer is memo: return MemoDesc(...) else:
         // return FunctionDesc(...)`.
         if fd.borrow().is_memo() {
-            Ok(DescEntry::Memo(Rc::new(RefCell::new(
+            Ok(DescEntry::memo(Rc::new(RefCell::new(
                 super::description::MemoDesc::new(fd),
             ))))
         } else {
-            Ok(DescEntry::Function(fd))
+            Ok(DescEntry::function(fd))
         }
     }
 
@@ -2259,15 +2259,26 @@ impl Bookkeeper {
         let mut results: Vec<SomeValue> = Vec::with_capacity(pbc.descriptions.len());
         for entry in pbc.descriptions.values() {
             let r = match entry {
-                super::description::DescEntry::Function(fd) => {
-                    fd.borrow()
-                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
-                }
-                // upstream `MemoDesc.pycall` projects the union-of-results
-                // annotation (or the dispatch graph's return var).
-                super::description::DescEntry::Memo(md) => {
-                    md.borrow()
-                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
+                // upstream `desc.pycall` virtual dispatch: a memo desc
+                // runs `MemoDesc.pycall` (union-of-results annotation, or
+                // the dispatch graph's return var); a plain function runs
+                // `FunctionDesc.pycall`.
+                super::description::DescEntry::Func(fe) => {
+                    if let Some(md) = fe.as_memo() {
+                        md.borrow().pycall(
+                            whence.clone(),
+                            args,
+                            &s_previous_result,
+                            op_key.clone(),
+                        )?
+                    } else {
+                        fe.func().borrow().pycall(
+                            whence.clone(),
+                            args,
+                            &s_previous_result,
+                            op_key.clone(),
+                        )?
+                    }
                 }
                 super::description::DescEntry::Method(md) => {
                     md.borrow()

@@ -3586,7 +3586,7 @@ mod tests {
         use super::super::super::flowspace::argument::Signature;
         use super::super::description::{DescEntry, FunctionDesc};
         use std::cell::RefCell;
-        DescEntry::Function(Rc::new(RefCell::new(FunctionDesc::new(
+        DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
             bk.clone(),
             None,
             name,
@@ -3613,7 +3613,7 @@ mod tests {
             None,
             None,
         )));
-        DescEntry::Memo(Rc::new(RefCell::new(MemoDesc::new(fd))))
+        DescEntry::memo(Rc::new(RefCell::new(MemoDesc::new(fd))))
     }
 
     /// Build a stub [`DescEntry::Class`] for SomePBC lattice tests.

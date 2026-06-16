@@ -3014,7 +3014,7 @@ mod tests {
     }
 
     fn fake_function_entry(bk: &Rc<super::super::bookkeeper::Bookkeeper>, name: &str) -> DescEntry {
-        DescEntry::Function(Rc::new(RefCell::new(FunctionDesc::new(
+        DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
             bk.clone(),
             None,
             name,

@@ -42,19 +42,17 @@ fn render_classdef_key_repr(
 fn render_desc_repr(desc: &crate::annotator::description::DescEntry) -> String {
     use crate::annotator::description::DescEntry;
     match desc {
-        DescEntry::Function(fd) => {
+        DescEntry::Func(fe) => {
+            let label = if fe.is_memo() {
+                "MemoDesc"
+            } else {
+                "FunctionDesc"
+            };
+            let fd = fe.func();
             let fd = fd.borrow();
             match &fd.base.pyobj {
-                Some(pyobj) => format!("<FunctionDesc for {:?}>", pyobj),
-                None => "<FunctionDesc>".into(),
-            }
-        }
-        DescEntry::Memo(md) => {
-            let base = md.borrow();
-            let fd = base.base.borrow();
-            match &fd.base.pyobj {
-                Some(pyobj) => format!("<MemoDesc for {:?}>", pyobj),
-                None => "<MemoDesc>".into(),
+                Some(pyobj) => format!("<{label} for {:?}>", pyobj),
+                None => format!("<{label}>"),
             }
         }
         DescEntry::Frozen(fd) => {
@@ -84,7 +82,7 @@ fn render_desc_repr(desc: &crate::annotator::description::DescEntry) -> String {
         }
         DescEntry::MethodOfFrozen(mfd) => {
             let mfd = mfd.borrow();
-            let funcdesc = crate::annotator::description::DescEntry::Function(mfd.funcdesc.clone());
+            let funcdesc = crate::annotator::description::DescEntry::function(mfd.funcdesc.clone());
             let frozendesc =
                 crate::annotator::description::DescEntry::Frozen(mfd.frozendesc.clone());
             format!(

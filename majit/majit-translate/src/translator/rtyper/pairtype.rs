@@ -1726,7 +1726,7 @@ mod tests {
         use std::rc::Rc;
 
         fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
-            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+            DescEntry::function(Rc::new(StdRefCell::new(FunctionDesc::new(
                 bk.clone(),
                 None,
                 name,
@@ -1787,7 +1787,7 @@ mod tests {
         use std::rc::Rc;
 
         fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
-            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+            DescEntry::function(Rc::new(StdRefCell::new(FunctionDesc::new(
                 bk.clone(),
                 None,
                 name,
@@ -1801,14 +1801,8 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
 
-        let fd_f = match f_entry(&ann.bookkeeper, "f") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
-        let fd_g = match f_entry(&ann.bookkeeper, "g") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
+        let fd_f = f_entry(&ann.bookkeeper, "f").as_function().unwrap();
+        let fd_g = f_entry(&ann.bookkeeper, "g").as_function().unwrap();
         for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
             desc.borrow().cache.borrow_mut().insert(
                 GraphCacheKey::None,
@@ -1829,14 +1823,14 @@ mod tests {
         .unwrap();
 
         let s_from = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g.clone())],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g.clone())],
             false,
         );
         let r_from: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_from).unwrap());
         let r_to: Arc<dyn Repr> = Arc::new(
             FunctionRepr::new(
                 &rtyper,
-                SomePBC::new(vec![DescEntry::Function(fd_g)], false),
+                SomePBC::new(vec![DescEntry::function(fd_g)], false),
             )
             .unwrap(),
         );
@@ -1873,7 +1867,7 @@ mod tests {
         use std::rc::Rc;
 
         fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
-            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+            DescEntry::function(Rc::new(StdRefCell::new(FunctionDesc::new(
                 bk.clone(),
                 None,
                 name,
@@ -1886,14 +1880,8 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
 
-        let fd_f = match f_entry(&ann.bookkeeper, "f") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
-        let fd_g = match f_entry(&ann.bookkeeper, "g") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
+        let fd_f = f_entry(&ann.bookkeeper, "f").as_function().unwrap();
+        let fd_g = f_entry(&ann.bookkeeper, "g").as_function().unwrap();
         for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
             desc.borrow().cache.borrow_mut().insert(
                 GraphCacheKey::None,
@@ -1914,7 +1902,7 @@ mod tests {
         .unwrap();
 
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());

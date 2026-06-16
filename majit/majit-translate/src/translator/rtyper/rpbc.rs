@@ -649,7 +649,7 @@ pub(crate) mod tests {
             None,
         )));
         // `1 < len(descs)` is `1 < 1` → false → early return.
-        let s_pbc_one = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc_one = SomePBC::new(vec![DescEntry::function(fd)], false);
         assert!(!small_cand(&rtyper, &s_pbc_one).unwrap());
     }
 
@@ -674,7 +674,7 @@ pub(crate) mod tests {
             None,
         )));
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_a), DescEntry::Function(fd_b)],
+            vec![DescEntry::function(fd_a), DescEntry::function(fd_b)],
             false,
         );
         // Default withsmallfuncsets=0 → `2 < 0` is false → early return false.
@@ -733,7 +733,7 @@ pub(crate) mod tests {
         );
         FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
             .unwrap();
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd.clone())], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd.clone())], false);
         let callfamily = fd.borrow().base.getcallfamily().unwrap();
 
         let selected = select_call_family_row(&bk, &callfamily, &s_pbc, &args, None).unwrap();
@@ -5249,7 +5249,7 @@ impl MethodOfFrozenPBCRepr {
 
         // upstream: `s_function = SomePBC([self.funcdesc])`.
         let s_function = SomeValue::PBC(SomePBC::new(
-            vec![DescEntry::Function(self.funcdesc.clone())],
+            vec![DescEntry::function(self.funcdesc.clone())],
             false,
         ));
         // upstream: `hop2 = hop.copy()`.
@@ -5378,7 +5378,7 @@ impl Repr for MethodOfFrozenPBCRepr {
         // (rpbc.py:183-184) — `return self.s_pbc`. For
         // MethodOfFrozenPBCRepr the equivalent is the funcdesc-derived
         // SomePBC: a single-FunctionDesc PBC (no can_be_None).
-        let s_callable = SomePBC::new(vec![DescEntry::Function(self.funcdesc.clone())], false);
+        let s_callable = SomePBC::new(vec![DescEntry::function(self.funcdesc.clone())], false);
         let r_func = rtyper.getrepr(&crate::annotator::model::SomeValue::PBC(s_callable))?;
         // upstream: `return r_func, 1` — the `1` is the arg-position
         // offset (skip the bound `self`).
@@ -6587,7 +6587,7 @@ impl MethodsPBCRepr {
                      a MethodDesc",
                 )
             })?;
-            funcdesc_entries.push(DescEntry::Function(md.borrow().funcdesc.clone()));
+            funcdesc_entries.push(DescEntry::function(md.borrow().funcdesc.clone()));
         }
 
         // upstream: `s_func = SomePBC(funcdescs, subset_of=r_func.s_pbc)`.
@@ -6993,7 +6993,7 @@ mod pbc_repr_tests {
     }
 
     fn function_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
-        DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+        DescEntry::function(Rc::new(StdRefCell::new(FunctionDesc::new(
             bk.clone(),
             None,
             name,
@@ -7113,7 +7113,7 @@ mod pbc_repr_tests {
         );
 
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
@@ -7208,8 +7208,8 @@ mod pbc_repr_tests {
 
         let s_pbc = SomePBC::new(
             vec![
-                DescEntry::Function(fd_f.clone()),
-                DescEntry::Function(fd_g.clone()),
+                DescEntry::function(fd_f.clone()),
+                DescEntry::function(fd_g.clone()),
             ],
             false,
         );
@@ -7298,7 +7298,7 @@ mod pbc_repr_tests {
         // the populated specfunc.
         use crate::flowspace::model::ConstValue;
         let (r, fd_f, _fd_g, _rtyper) = build_multi_row_functions_pbc_repr();
-        let desc_f = DescEntry::Function(fd_f);
+        let desc_f = DescEntry::function(fd_f);
 
         let c1 = r.convert_desc(&desc_f).unwrap();
         assert_eq!(
@@ -7475,7 +7475,7 @@ mod pbc_repr_tests {
         // Single-MethodOfFrozenDesc PBC routes r_im_self through
         // SingleFrozenPBCRepr (Void-typed).
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
@@ -7510,7 +7510,7 @@ mod pbc_repr_tests {
         // bound-frozendesc's repr (single-frozen → Void None sentinel).
         use crate::flowspace::model::ConstValue;
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
@@ -7531,7 +7531,7 @@ mod pbc_repr_tests {
         // ported `convert_const` rejects non-`HostObject` ConstValues
         // before invoking `getdesc`.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
@@ -7552,10 +7552,10 @@ mod pbc_repr_tests {
         // repr around `f`, then call convert_desc with a MethodOf-
         // FrozenDesc whose funcdesc is `g`.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd_f) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd_f) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
-        let DescEntry::Function(fd_g) = function_entry(&ann.bookkeeper, "g") else {
+        let Some(fd_g) = function_entry(&ann.bookkeeper, "g").as_function() else {
             unreachable!()
         };
         let mof_f = method_of_frozen_entry(&ann.bookkeeper, &fd_f, "frozen0");
@@ -7575,7 +7575,7 @@ mod pbc_repr_tests {
         //                  getRepr = MethodOfFrozenPBCRepr`.
         use crate::annotator::model::SomeValue;
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
@@ -7631,7 +7631,7 @@ mod pbc_repr_tests {
         // methodname matches, classdef is the owner, and lowleveltype
         // tracks `r_im_self.lowleveltype`.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let cdef = classdef_for(&ann, "C");
@@ -7656,10 +7656,10 @@ mod pbc_repr_tests {
         // raise "cannot find a unique name under which the methods can
         // be found". Pyre surfaces it as a structured TyperError.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd_a) = function_entry(&ann.bookkeeper, "fa") else {
+        let Some(fd_a) = function_entry(&ann.bookkeeper, "fa").as_function() else {
             unreachable!()
         };
-        let DescEntry::Function(fd_b) = function_entry(&ann.bookkeeper, "fb") else {
+        let Some(fd_b) = function_entry(&ann.bookkeeper, "fb").as_function() else {
             unreachable!()
         };
         let cdef = classdef_for(&ann, "C");
@@ -7683,7 +7683,7 @@ mod pbc_repr_tests {
         // The MethodsPBCRepr's lowleveltype tracks `r_im_self.lowleveltype`,
         // so the produced LLPtr's concretetype matches the target Ptr.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let cdef = classdef_for(&ann, "PbcConvertConstC");
@@ -7716,7 +7716,7 @@ mod pbc_repr_tests {
         // rpbc.py:1162 — `if getattr(method, 'im_func', None) is None:
         //                   raise TyperError("not a bound method: %r" % method)`.
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let cdef = classdef_for(&ann, "PbcConvertConstReject");
@@ -7743,7 +7743,7 @@ mod pbc_repr_tests {
         //                  getRepr = MethodsPBCRepr`.
         use crate::annotator::model::SomeValue;
         let (ann, rtyper) = make_rtyper();
-        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
             unreachable!()
         };
         let cdef = classdef_for(&ann, "D");
@@ -8806,7 +8806,7 @@ mod pbc_repr_tests {
         let (ann, rtyper) = make_rtyper();
         let (fd, shape, pygraph) = single_funcdesc_with_callfamily(&ann, "f");
 
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
         let llop = empty_lloplist(&rtyper);
 
@@ -8824,7 +8824,7 @@ mod pbc_repr_tests {
         let (ann, rtyper) = make_rtyper();
         let (fd, shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
 
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
         let llop = empty_lloplist(&rtyper);
 
@@ -8842,7 +8842,7 @@ mod pbc_repr_tests {
         let (ann, rtyper) = make_rtyper();
         let (fd, _shape, pygraph) = single_funcdesc_with_callfamily(&ann, "f");
 
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
 
         let result = r.get_unique_llfn().unwrap();
@@ -8863,7 +8863,7 @@ mod pbc_repr_tests {
         // Touch `getcallfamily()` so FunctionReprBase picks up an empty
         // family rather than `None` — otherwise the test would surface
         // the "callfamily not available" guard instead.
-        if let DescEntry::Function(rc) = &f {
+        if let Some(rc) = f.as_function() {
             rc.borrow().base.getcallfamily().unwrap();
         } else {
             unreachable!();
@@ -8904,7 +8904,7 @@ mod pbc_repr_tests {
             .borrow_mut()
             .insert(GraphCacheKey::None, pygraph.clone());
 
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r = FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap();
 
         let result = r
@@ -8937,7 +8937,7 @@ mod pbc_repr_tests {
 
         let (ann, rtyper) = make_rtyper();
         let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r: std::sync::Arc<FunctionRepr> =
             std::sync::Arc::new(FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap());
         let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
@@ -9016,7 +9016,7 @@ mod pbc_repr_tests {
 
         let (ann, rtyper) = make_rtyper();
         let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r: std::sync::Arc<FunctionsPBCRepr> =
             std::sync::Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc.clone()).unwrap());
         let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
@@ -9177,8 +9177,8 @@ mod pbc_repr_tests {
         )
         .unwrap();
 
-        let f_entry = DescEntry::Function(fd_f.clone());
-        let s_pbc = SomePBC::new(vec![f_entry.clone(), DescEntry::Function(fd_g)], false);
+        let f_entry = DescEntry::function(fd_f.clone());
+        let s_pbc = SomePBC::new(vec![f_entry.clone(), DescEntry::function(fd_g)], false);
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
 
         let c1 = r.convert_desc(&f_entry).unwrap();
@@ -9237,7 +9237,7 @@ mod pbc_repr_tests {
         .unwrap();
 
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
@@ -9297,7 +9297,7 @@ mod pbc_repr_tests {
         )
         .unwrap();
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
@@ -9361,7 +9361,7 @@ mod pbc_repr_tests {
             None,
         )
         .unwrap();
-        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd_rc)], false);
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd_rc)], false);
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
 
         let host_value = ConstValue::HostObject(host_f);
@@ -9428,7 +9428,7 @@ mod pbc_repr_tests {
         )
         .unwrap();
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
@@ -9508,7 +9508,7 @@ mod pbc_repr_tests {
         )
         .unwrap();
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r: std::sync::Arc<dyn Repr> =
@@ -9591,7 +9591,7 @@ mod pbc_repr_tests {
         .unwrap();
 
         let s_pbc = SomePBC::new(
-            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
@@ -9628,7 +9628,7 @@ mod pbc_repr_tests {
         // returns an empty Vec (its `calltables.get(shape)` miss path).
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
-        if let DescEntry::Function(rc) = &f {
+        if let Some(rc) = f.as_function() {
             rc.borrow().base.getcallfamily().unwrap();
         }
         let s_pbc = SomePBC::new(vec![f], false);
