@@ -2589,15 +2589,16 @@ impl RPythonAnnotator {
         } else {
             // upstream: knowntypedata-driven constraints per exit.
             let exitswitch = block.borrow().exitswitch.clone();
+            // `getattr(block.exitswitch.annotation, "knowntypedata", {})`
+            // (annrpython.py:566) — read generically off the exitswitch
+            // binding; SomeBool and an integer-discriminant SomeInteger
+            // both carry it, every other annotation defaults to `{}`.
             let knowntypedata: KnownTypeData = match exitswitch {
                 Some(Hlvalue::Variable(ref v)) => v
                     .annotation
                     .borrow()
                     .as_ref()
-                    .and_then(|rc| match rc.as_ref() {
-                        SomeValue::Bool(b) => b.knowntypedata.clone(),
-                        _ => None,
-                    })
+                    .and_then(|rc| rc.knowntypedata().cloned())
                     .unwrap_or_default(),
                 _ => HashMap::new(),
             };

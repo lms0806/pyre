@@ -452,6 +452,15 @@ pub struct SomeInteger {
     pub nonneg: bool,
     /// RPython `self.unsigned` — `knowntype is r_uint`.
     pub unsigned: bool,
+    /// Branch-refinement facts for an integer-valued exitswitch, keyed
+    /// by the case constant ([`ExitCaseKey::Int`]). Upstream defines
+    /// `set_knowntypedata` only on `SomeBool` (model.py:236), since
+    /// `SomeBool(SomeInteger)` and its only multi-way narrowing comes
+    /// from boolean `is`/`isinstance`/comparison ops. The exitswitch
+    /// consumer reads it generically — `getattr(annotation,
+    /// "knowntypedata", {})` (annrpython.py:566) — so an integer
+    /// discriminant `SwitchInt` carries its per-case constraints here.
+    pub knowntypedata: Option<KnownTypeData>,
 }
 
 impl SomeInteger {
@@ -468,6 +477,7 @@ impl SomeInteger {
             // upstream: `self.nonneg = unsigned or nonneg`.
             nonneg: unsigned || nonneg,
             unsigned,
+            knowntypedata: None,
         }
     }
 
@@ -494,6 +504,21 @@ impl SomeInteger {
             base: SomeObjectBase::new(knowntype, true),
             nonneg: unsigned || nonneg,
             unsigned,
+            knowntypedata: None,
+        }
+    }
+
+    /// RPython `SomeBool.set_knowntypedata` (model.py:236-242), reused
+    /// for an integer discriminant. Same set-once assertion and
+    /// falsy-inner-dict pruning as [`SomeBool::set_knowntypedata`].
+    pub fn set_knowntypedata(&mut self, mut data: KnownTypeData) {
+        assert!(
+            self.knowntypedata.is_none(),
+            "assert not hasattr(self, 'knowntypedata')"
+        );
+        data.retain(|_case, inner| !inner.is_empty());
+        if !data.is_empty() {
+            self.knowntypedata = Some(data);
         }
     }
 }
@@ -2000,6 +2025,21 @@ impl SomeValueTag {
 }
 
 impl SomeValue {
+    /// RPython `getattr(annotation, "knowntypedata", {})`
+    /// (annrpython.py:566) — the exitswitch consumer reads branch
+    /// constraints generically, without type-checking the annotation.
+    /// `SomeBool` always carries it after a comparison; an integer
+    /// discriminant `SomeInteger` carries per-case constraints once a
+    /// `SwitchInt` exitswitch is annotated. Every other annotation
+    /// returns the `{}` default (`None`).
+    pub fn knowntypedata(&self) -> Option<&KnownTypeData> {
+        match self {
+            SomeValue::Bool(b) => b.knowntypedata.as_ref(),
+            SomeValue::Integer(i) => i.knowntypedata.as_ref(),
+            _ => None,
+        }
+    }
+
     /// RPython `type(self)` in dispatch keys — returns a [`SomeValueTag`]
     /// that identifies the variant without carrying any payload.
     pub fn tag(&self) -> SomeValueTag {
@@ -4857,6 +4897,64 @@ mod tests {
             b.knowntypedata.is_none(),
             "empty inner dict should be pruned"
         );
+    }
+
+    #[test]
+    fn someinteger_carries_knowntypedata_keyed_by_int_case() {
+        // An integer discriminant SwitchInt attaches per-case
+        // constraints keyed by ExitCaseKey::Int(k), the same set-once /
+        // empty-pruning contract as SomeBool.
+        let x = Rc::new(Variable::named("x"));
+        let mut ktd: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut ktd,
+            ExitCaseKey::Int(2),
+            &[Rc::clone(&x)],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let mut i = SomeInteger::default();
+        i.set_knowntypedata(ktd);
+        let data = i.knowntypedata.as_ref().expect("ktd must be populated");
+        assert!(data.contains_key(&ExitCaseKey::Int(2)));
+        assert!(!data.contains_key(&ExitCaseKey::Int(0)));
+    }
+
+    #[test]
+    fn knowntypedata_accessor_reads_generically() {
+        // `getattr(annotation, "knowntypedata", {})` (annrpython.py:566)
+        // reads off SomeBool and SomeInteger; any other annotation
+        // returns the `{}` default (None).
+        let x = Rc::new(Variable::named("x"));
+
+        let mut b_ktd: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut b_ktd,
+            ExitCaseKey::Bool(true),
+            &[Rc::clone(&x)],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let mut b = SomeBool::new();
+        b.set_knowntypedata(b_ktd);
+        assert!(SomeValue::Bool(b).knowntypedata().is_some());
+
+        let mut i_ktd: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut i_ktd,
+            ExitCaseKey::Int(1),
+            &[Rc::clone(&x)],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let mut i = SomeInteger::default();
+        i.set_knowntypedata(i_ktd);
+        assert!(SomeValue::Integer(i).knowntypedata().is_some());
+
+        // A plain integer and a non-carrier annotation read as None.
+        assert!(
+            SomeValue::Integer(SomeInteger::default())
+                .knowntypedata()
+                .is_none()
+        );
+        assert!(SomeValue::Type(SomeType::new()).knowntypedata().is_none());
     }
 
     #[test]
