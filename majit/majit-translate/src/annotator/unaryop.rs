@@ -30,7 +30,7 @@ use super::super::flowspace::operation::{
 };
 use super::annrpython::RPythonAnnotator;
 use super::model::{
-    AnnotatorError, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger, SomeIterator,
+    AnnotatorError, ExitCaseKey, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger, SomeIterator,
     SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue, SomeValueTag,
     add_knowntypedata, s_bool, s_impossible_value, s_none,
 };
@@ -313,7 +313,12 @@ fn init_someobject_defaults(
                     Hlvalue::Constant(_) => Vec::new(),
                 };
                 let mut knowntypedata = std::collections::HashMap::new();
-                add_knowntypedata(&mut knowntypedata, true, &vars, s_nonnone_obj);
+                add_knowntypedata(
+                    &mut knowntypedata,
+                    ExitCaseKey::Bool(true),
+                    &vars,
+                    s_nonnone_obj,
+                );
                 r.set_knowntypedata(knowntypedata);
                 SomeValue::Bool(r)
             }),
@@ -1738,7 +1743,12 @@ fn init_somestring_overrides(
                     let s_nonnul = s_string
                         .nonnulify()
                         .expect("contains(String): nonnulify must succeed");
-                    add_knowntypedata(&mut knowntypedata, false, &vars, s_nonnul);
+                    add_knowntypedata(
+                        &mut knowntypedata,
+                        ExitCaseKey::Bool(false),
+                        &vars,
+                        s_nonnul,
+                    );
                     r.set_knowntypedata(knowntypedata);
                     return SomeValue::Bool(r);
                 }
@@ -1839,7 +1849,12 @@ fn init_someunicodestring_overrides(
                     let s_nonnul = s_string
                         .nonnulify()
                         .expect("contains(UnicodeString): nonnulify must succeed");
-                    add_knowntypedata(&mut knowntypedata, false, &vars, s_nonnul);
+                    add_knowntypedata(
+                        &mut knowntypedata,
+                        ExitCaseKey::Bool(false),
+                        &vars,
+                        s_nonnul,
+                    );
                     r.set_knowntypedata(knowntypedata);
                     return SomeValue::Bool(r);
                 }
@@ -4759,7 +4774,7 @@ mod tests {
         };
         let ktd = b.knowntypedata.expect("knowntypedata must be populated");
         let narrowed = ktd
-            .get(&true)
+            .get(&ExitCaseKey::Bool(true))
             .and_then(|inner| inner.get(&Rc::new(v)))
             .expect("truth branch must refine the object");
         match narrowed {
@@ -5324,7 +5339,7 @@ mod tests {
         };
         let ktd = b.knowntypedata.expect("knowntypedata must be populated");
         let narrowed = ktd
-            .get(&false)
+            .get(&ExitCaseKey::Bool(false))
             .and_then(|inner| inner.get(&Rc::new(v_string)))
             .expect("false branch must refine the string");
         match narrowed {
@@ -5358,7 +5373,7 @@ mod tests {
         };
         let ktd = b.knowntypedata.expect("knowntypedata must be populated");
         let narrowed = ktd
-            .get(&false)
+            .get(&ExitCaseKey::Bool(false))
             .and_then(|inner| inner.get(&Rc::new(v_string)))
             .expect("false branch must refine the unicode string");
         match narrowed {

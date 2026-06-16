@@ -326,7 +326,12 @@ fn bind_is(
                 .unwrap_or_else(|| s_src.clone());
             let vars: Vec<Rc<super::super::flowspace::model::Variable>> =
                 t.is_type_of.iter().map(Rc::clone).collect();
-            super::model::add_knowntypedata(knowntypedata, true, &vars, refined);
+            super::model::add_knowntypedata(
+                knowntypedata,
+                super::model::ExitCaseKey::Bool(true),
+                &vars,
+                refined,
+            );
         }
     }
 
@@ -336,7 +341,12 @@ fn bind_is(
         Hlvalue::Constant(_) => None,
     };
     if let Some(var) = tgt_var.as_ref() {
-        super::model::add_knowntypedata(knowntypedata, true, &[Rc::clone(var)], s_src.clone());
+        super::model::add_knowntypedata(
+            knowntypedata,
+            super::model::ExitCaseKey::Bool(true),
+            &[Rc::clone(var)],
+            s_src.clone(),
+        );
 
         // binaryop.py:51-55 — False branch `nonnoneify`.
         let s_nonnone = if s_src.is_constant()
@@ -347,7 +357,12 @@ fn bind_is(
         } else {
             s_tgt.clone()
         };
-        super::model::add_knowntypedata(knowntypedata, false, &[Rc::clone(var)], s_nonnone);
+        super::model::add_knowntypedata(
+            knowntypedata,
+            super::model::ExitCaseKey::Bool(false),
+            &[Rc::clone(var)],
+            s_nonnone,
+        );
     }
 }
 
@@ -1059,7 +1074,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
                 let case = matches!(cmp_op, OpKind::Lt | OpKind::Le | OpKind::Eq);
                 super::model::add_knowntypedata(
                     &mut knowntypedata,
-                    case,
+                    super::model::ExitCaseKey::Bool(case),
                     &[Rc::new(v.clone())],
                     SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt2))),
                 );
@@ -1073,7 +1088,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
                 let case = matches!(cmp_op, OpKind::Gt | OpKind::Ge | OpKind::Eq);
                 super::model::add_knowntypedata(
                     &mut knowntypedata,
-                    case,
+                    super::model::ExitCaseKey::Bool(case),
                     &[Rc::new(v.clone())],
                     SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt1))),
                 );

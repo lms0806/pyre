@@ -2456,8 +2456,8 @@ impl RPythonAnnotator {
     fn flowin(&self, graph: &GraphRef, block: &BlockRef) -> Result<(), FlowinError> {
         use super::super::flowspace::model::LinkRef;
         use super::model::{
-            KnownTypeData, SomeException, SomeInstance, SomeObjectTrait, difference, intersection,
-            s_impossible_value,
+            ExitCaseKey, KnownTypeData, SomeException, SomeInstance, SomeObjectTrait, difference,
+            intersection, s_impossible_value,
         };
 
         // Phase 1 — op loop.
@@ -2617,7 +2617,7 @@ impl RPythonAnnotator {
                     _ => None,
                 };
                 let constraints = truth
-                    .and_then(|t| knowntypedata.get(&t).cloned())
+                    .and_then(|t| knowntypedata.get(&ExitCaseKey::Bool(t)).cloned())
                     .unwrap_or_default();
                 self.follow_link(graph, link, &constraints);
             }

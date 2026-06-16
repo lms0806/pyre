@@ -523,12 +523,25 @@ impl SomeObjectTrait for SomeInteger {
 ///
 /// Upstream `SomeBool.__init__` takes no args — the class attributes
 /// fix `knowntype = bool`, `nonneg = True`, `unsigned = False`.
+/// Key for [`KnownTypeData`] — the branch's `exitcase` value, the
+/// typed Rust projection of RPython's generic exitcase key
+/// (`knowntypedata.get(link.exitcase, {})`, annrpython.py:571). A bool
+/// exitswitch keys by the branch truth value; an integer exitswitch —
+/// e.g. an enum discriminant `SwitchInt` — keys by the case constant.
+/// RPython keys directly by the Python exitcase object (`True`/`False`/
+/// an int); the sum type makes the two cases explicit and hashable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExitCaseKey {
+    Bool(bool),
+    Int(i64),
+}
+
 /// RPython `knowntypedata` carrier type — `defaultdict(dict)` keyed by
-/// branch truth value (`True` / `False`), inner dict keyed by
+/// the branch `exitcase` value ([`ExitCaseKey`]), inner dict keyed by
 /// [`Variable`] identity. Populated by [`add_knowntypedata`] and
 /// merged by [`merge_knowntypedata`].
 pub type KnownTypeData =
-    std::collections::HashMap<bool, std::collections::HashMap<Rc<Variable>, SomeValue>>;
+    std::collections::HashMap<ExitCaseKey, std::collections::HashMap<Rc<Variable>, SomeValue>>;
 
 /// `knowntypedata` (set_knowntypedata in model.py:236-242) stores the
 /// branch-refinement facts for a bool-valued variable: a map from the
@@ -3438,15 +3451,17 @@ pub fn read_can_only_throw(
 
 /// RPython `add_knowntypedata(ktd, truth, vars, s_obj)` (model.py:789-791).
 ///
-/// Populates a boolean-keyed table tracking "if this bool is `truth`,
-/// these variables have annotation `s_obj`".
+/// Populates an exitcase-keyed table tracking "if this branch takes the
+/// `case` exit, these variables have annotation `s_obj`". RPython keys
+/// by the `link.exitcase` value, which for a bool exitswitch is
+/// `True`/`False` and for an integer exitswitch is the case constant.
 pub fn add_knowntypedata(
     ktd: &mut KnownTypeData,
-    truth: bool,
+    case: ExitCaseKey,
     vars: &[Rc<Variable>],
     s_obj: SomeValue,
 ) {
-    let entry = ktd.entry(truth).or_default();
+    let entry = ktd.entry(case).or_default();
     for v in vars {
         entry.insert(Rc::clone(v), s_obj.clone());
     }
@@ -3459,14 +3474,14 @@ pub fn add_knowntypedata(
 /// the two refinements.
 pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownTypeData {
     let mut r: KnownTypeData = std::collections::HashMap::new();
-    for (truth, constraints) in ktd1 {
-        let Some(other) = ktd2.get(truth) else {
+    for (case, constraints) in ktd1 {
+        let Some(other) = ktd2.get(case) else {
             continue;
         };
         for (v, s1) in constraints {
             let Some(s2) = other.get(v) else { continue };
             if let Ok(u) = unionof([s1, s2]) {
-                r.entry(*truth).or_default().insert(Rc::clone(v), u);
+                r.entry(*case).or_default().insert(Rc::clone(v), u);
             }
         }
     }
@@ -4758,13 +4773,13 @@ mod tests {
         let y = Rc::new(Variable::named("y"));
         add_knowntypedata(
             &mut ktd,
-            true,
+            ExitCaseKey::Bool(true),
             &[Rc::clone(&x), Rc::clone(&y)],
             SomeValue::Integer(SomeInteger::default()),
         );
-        assert_eq!(ktd[&true].len(), 2);
-        assert!(ktd[&true].contains_key(&x));
-        assert!(!ktd.contains_key(&false));
+        assert_eq!(ktd[&ExitCaseKey::Bool(true)].len(), 2);
+        assert!(ktd[&ExitCaseKey::Bool(true)].contains_key(&x));
+        assert!(!ktd.contains_key(&ExitCaseKey::Bool(false)));
     }
 
     #[test]
@@ -4774,22 +4789,22 @@ mod tests {
         let mut k1: KnownTypeData = std::collections::HashMap::new();
         add_knowntypedata(
             &mut k1,
-            true,
+            ExitCaseKey::Bool(true),
             &[Rc::clone(&x), Rc::clone(&y)],
             SomeValue::Integer(SomeInteger::default()),
         );
         let mut k2: KnownTypeData = std::collections::HashMap::new();
         add_knowntypedata(
             &mut k2,
-            true,
+            ExitCaseKey::Bool(true),
             &[Rc::clone(&x)],
             SomeValue::Integer(SomeInteger::default()),
         );
         let merged = merge_knowntypedata(&k1, &k2);
         // Only x survives (present in both); y dropped.
-        assert_eq!(merged[&true].len(), 1);
-        assert!(merged[&true].contains_key(&x));
-        assert!(!merged[&true].contains_key(&y));
+        assert_eq!(merged[&ExitCaseKey::Bool(true)].len(), 1);
+        assert!(merged[&ExitCaseKey::Bool(true)].contains_key(&x));
+        assert!(!merged[&ExitCaseKey::Bool(true)].contains_key(&y));
     }
 
     #[test]
@@ -4802,7 +4817,7 @@ mod tests {
         let mut ktd: KnownTypeData = std::collections::HashMap::new();
         add_knowntypedata(
             &mut ktd,
-            true,
+            ExitCaseKey::Bool(true),
             &[Rc::clone(&x)],
             SomeValue::Integer(SomeInteger::new(true, false)),
         );
@@ -4835,7 +4850,7 @@ mod tests {
     #[test]
     fn somebool_set_knowntypedata_rejects_empty_inner() {
         let mut ktd: KnownTypeData = std::collections::HashMap::new();
-        ktd.insert(true, std::collections::HashMap::new()); // empty inner
+        ktd.insert(ExitCaseKey::Bool(true), std::collections::HashMap::new()); // empty inner
         let mut b = SomeBool::new();
         b.set_knowntypedata(ktd);
         assert!(
