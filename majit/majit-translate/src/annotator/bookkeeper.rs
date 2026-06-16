@@ -1546,7 +1546,22 @@ impl Bookkeeper {
             // `ClassDef` on every call — the identity cache is the memo, no
             // name-keyed side table needed.
             let host = self.intern_class_by_qualname(&n);
-            self.getuniqueclassdef(&host)?;
+            // Materialise the classdef lineage base-most first:
+            // `getdesc` and `ClassDef::new` each recurse into their
+            // base (classdesc.py:559 / :672) and both memoise, so
+            // pre-seeding every base keeps the native recursion depth
+            // at one frame even when the embedded-header chain is
+            // registry-deep (same worklist discipline as `graph`).
+            let mut lineage: Vec<HostObject> = vec![host];
+            while let Some(base) = lineage
+                .last()
+                .and_then(|h| h.class_bases().and_then(|b| b.first().cloned()))
+            {
+                lineage.push(base);
+            }
+            for h in lineage.iter().rev() {
+                self.getuniqueclassdef(h)?;
+            }
             let referenced: Vec<String> = {
                 let guard = self.pyre_struct_fields.borrow();
                 if let Some(reg) = guard.as_ref() {
@@ -1748,20 +1763,92 @@ impl Bookkeeper {
     /// lookups of one type-root — the pyre analog of resolving a type
     /// name to one class object before `getuniqueclassdef(cls)`.
     ///
-    /// A bare leaf is first resolved to its canonical `module::Leaf`
-    /// spelling through `canonical_struct_name`, so the bare and
-    /// qualified spellings of one struct intern to one `HostObject` —
-    /// name strings are a resolution input, never the identity itself
-    /// (`getuniqueclassdef(cls)` keys by class object, bookkeeper.py:339).
-    /// A duplicate leaf whose origin was tombstoned by
-    /// `harden_duplicate_leaf_metadata` passes through unresolved; its
-    /// classdef stays attrs-empty because the field registry withdrew
-    /// the bare alias, so no struct's fields can be misattributed.
-    /// Dotted qualnames (transparent-ctor classes) pass through
-    /// `canonical_struct_name` unchanged, so qualname callers intern
-    /// by their full spelling.
+    /// Embedded-header subclassing: a struct whose FIRST field embeds
+    /// another registered type root BY VALUE (`W_IntObject { ob_header:
+    /// PyObject, intval: i64 }`, `LoopBlock { base: FrameBlock }`) is
+    /// the Rust spelling of upstream's class hierarchy
+    /// (`W_IntObject(W_Root)`, `LoopBlock(FrameBlock)`) — base the
+    /// minted class on the header root's class, the same shared-Arc
+    /// shape [`Self::intern_class_by_qualname_with_bases`] uses for
+    /// enum variants, so `ClassDef::commonbase` unions siblings to the
+    /// header root and `cast_pointer`-style refinement connects the
+    /// `InstanceRepr`s.  The base is interned under its BARE LEAF —
+    /// the spelling `tyref_class_root` seeds params with — so the
+    /// subclass points at the same class Arc the rest of the session
+    /// uses.
+    ///
+    /// Each chain node's cache key is resolved through
+    /// `canonical_struct_name`, so the bare and qualified spellings of
+    /// one struct intern to one `HostObject` — name strings are a
+    /// resolution input, never the identity itself
+    /// (`getuniqueclassdef(cls)` keys by class object,
+    /// bookkeeper.py:339).  Dotted qualnames pass through unchanged; a
+    /// bare leaf whose origin was tombstoned by
+    /// `harden_duplicate_leaf_metadata` stays unresolved and keeps an
+    /// attrs-empty classdef because the field registry withdrew the
+    /// bare alias.
+    ///
+    /// The header chain is collected iteratively with a revisit guard:
+    /// registry field-type strings strip references
+    /// (`tyref_to_ast_string` renders `&T` as `T`), so a reference
+    /// cycle (`A.next: &B`, `B.prev: &A`) is indistinguishable from
+    /// by-value embedding here — a revisited leaf ends the chain (a
+    /// reference loop is linkage, not a header hierarchy), and a
+    /// pathological registry chain must not exhaust the native stack
+    /// (same O(reachable)-heap discipline as
+    /// [`Self::getuniqueclassdef_for_struct_root`]'s worklist).
     pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
-        self.intern_class_by_qualname_with_bases(name, Vec::new())
+        // Collect `name`'s embedded-header chain, outermost first,
+        // stopping at an already-interned class (its Arc becomes the
+        // deepest base) or at a chain end (scalar / unregistered /
+        // revisited first field).  The class-cache key is the canonical
+        // `module::Leaf` (`canonical_struct_name`); the field-registry
+        // lookup uses the raw spelling (the registry carries both
+        // qualified and bare keys).
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut base_host: Option<HostObject> = None;
+        let mut cur = name.to_string();
+        loop {
+            let key = majit_ir::descr::canonical_struct_name(&cur);
+            if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
+                if chain.is_empty() {
+                    return existing.clone();
+                }
+                base_host = Some(existing.clone());
+                break;
+            }
+            seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
+            chain.push(cur.clone());
+            let next = self.pyre_struct_fields.borrow().as_ref().and_then(|reg| {
+                let (first_name, first_ty) = reg.fields.get(&cur)?.first()?;
+                // Only header-conventional first fields mark subclassing
+                // (`ob_header: PyObject` / `base: FrameBlock`).  A
+                // by-value first field of another registered type is
+                // otherwise plain composition (`PyError { kind:
+                // PyErrorKind, … }`), not a class hierarchy.
+                if first_name != "ob_header" && first_name != "base" {
+                    return None;
+                }
+                let leaf = first_ty.rsplit("::").next().unwrap_or(first_ty);
+                (reg.fields.contains_key(leaf) && !seen.contains(leaf)).then(|| leaf.to_string())
+            });
+            match next {
+                Some(n) => cur = n,
+                None => break,
+            }
+        }
+        // Mint base-most first so each class links its base's Arc.
+        for node in chain.iter().rev() {
+            let key = majit_ir::descr::canonical_struct_name(node);
+            let bases = base_host.iter().cloned().collect();
+            let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
+            self.pyre_struct_root_classes
+                .borrow_mut()
+                .insert(key, host.clone());
+            base_host = Some(host);
+        }
+        base_host.expect("chain holds at least `name` itself")
     }
 
     /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
@@ -1784,6 +1871,36 @@ impl Bookkeeper {
             .borrow_mut()
             .insert(key, host.clone());
         host
+    }
+
+    /// True when `name` is a type-root key in the snapshot
+    /// struct-field registry ([`Self::pyre_struct_fields`]).  Enums and
+    /// structs both register under their qualified path AND bare leaf
+    /// (`front/mir.rs` `TypeDeclKind::Enum` / `Struct` arms), so a
+    /// ctor's `owner_path` last segment answers true exactly when the
+    /// owner is itself an ADT (an enum-variant ctor) rather than a
+    /// module (a struct ctor).
+    pub fn is_pyre_struct_root(&self, name: &str) -> bool {
+        self.pyre_struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.fields.contains_key(name))
+    }
+
+    /// True when type-root `root`'s registry rows include a field named
+    /// `name`.  The cutover's class-dict method population consults this
+    /// so a method member never shadows a same-named instance field — a
+    /// function source for a field attribute would union-conflict in
+    /// `generalize_attr`.
+    pub fn pyre_struct_root_has_field(&self, root: &str, name: &str) -> bool {
+        self.pyre_struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| {
+                reg.fields
+                    .get(root)
+                    .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
+            })
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type
@@ -1811,7 +1928,13 @@ impl Bookkeeper {
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
             "bool" => return super::model::s_bool(),
-            "String" | "str" => return super::model::s_str0(),
+            // Rust strings are UTF-8 text; literals lower through
+            // `__str_const` into `UniStr` constants (UnicodeString
+            // annotation, `UnicodeRepr::convert_const`), so the field
+            // projection must be the unicode string type or attr-cell
+            // unions degrade to the byte `StringRepr` ("not a str:
+            // UniStr(..)" at convert_const).
+            "String" | "str" => return super::model::s_unicode0(),
             "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
             "()" => return super::model::s_none(),
             _ => {}

@@ -905,6 +905,50 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
+        // `rtyper.py:815 convertvar` TyperError — no pairtype
+        // convert_from_to edge between the two reprs.  The live hitter
+        // is generic-enum payload conflation: the front registers ONE
+        // flat class per enum (`Result.Ok`) with first-writer-wins
+        // field rows, so two monomorphic instantiations (`Result<Tuple,
+        // _>` vs `Result<Option<_>, _>`) share one `__pos_0` attr and
+        // the second write needs an unrelated-classdef conversion
+        // (`Option.None` → `Tuple`) that
+        // `pair_instance_instance_convert_from_to` correctly answers
+        // NotImplemented for (rclass.py:1054-1055).  Skip until
+        // per-instantiation variant classes (generic payload
+        // monomorphization) land.
+        || msg.contains("don't know how to convert from")
+        // Unported `rtyper_makerepr` arms (`rmodel.rs:2895-2965`
+        // SomeList / SomeDict / SomeIterator / SomeByteArray /
+        // SomeObject) surface bare `MissingRTypeOperation` messages of
+        // the form "<Some*>.rtyper_makerepr — port rpython/rtyper/…"
+        // WITHOUT the trait helper's "unimplemented operation:" prefix
+        // (`rmodel.rs:817-822`), so the substring above does not
+        // absorb them.  Container reprs (rlist.py ListRepr, rdict.py
+        // DictRepr, rrange.py iterator reprs, …) are not ported yet;
+        // the legacy walker handles such graphs until each repr lands.
+        || msg.contains("rtyper_makerepr — port rpython/rtyper/")
+        // `ClassRepr` / `InstanceRepr` accessors that require a
+        // completed `_setup_repr` (`rbase` populated, rclass.py:273-274)
+        // reached through a path that never ran `Repr::setup()` on the
+        // repr.  Upstream's `rtyper.getrepr` always queues `setup()`
+        // before handing the repr out; pyre's host-struct-seeded
+        // receivers (`*mut PyObject` params with a registry classdef)
+        // can reach class-field reads through reprs minted outside
+        // that queue.  Setup-ordering port gap — fall back to the
+        // legacy walker until the getrepr/setup chain covers these
+        // roots.
+        || msg.contains("rbase missing — call setup() first")
+        // `BrokenReprTyperError` (`rmodel.py:42-44`, ported at
+        // `rmodel.rs:449-456`): a Repr whose `setup()` failed earlier
+        // is re-requested and refuses to half-initialize.  In the
+        // per-graph census a Skipped subject can leave a shared
+        // session `ClassRepr` in the BROKEN state; the next graph
+        // touching the same repr then surfaces this message.  It is a
+        // secondary echo of the root failure (itself Skip-classified
+        // above), not an independent cause — absorb it so one broken
+        // repr does not fatal every later graph in the session.
+        || msg.contains("cannot setup already failed Repr")
         // `AnnotatorError: immutablevalue(HostObject` is not
         // Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
         // None).  The adapter emits `HostObject::new_class(name, [])`
@@ -1116,14 +1160,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // (the `ExtRegistryEntry.compute_result_annotation` shape) so
         // callers annotate the declared unit/bool result and the
         // codewriter emits the residual call via the fn's registered
-        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-unit/bool returns
+        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-scalar returns
         // fall through to the normal lift — no current marker needs
-        // them, and the stub builder's scalar coverage is unaudited
-        // for that case.
+        // them, and the stub builder's coverage is unaudited for that
+        // case.
         if graph.hints.iter().any(|h| h == "dont_look_inside") {
             let return_lltype = match graph.return_type.as_deref() {
                 None | Some("()") => Some(LowLevelType::Void),
                 Some("bool") => Some(LowLevelType::Bool),
+                Some("i64") => Some(LowLevelType::Signed),
                 _ => None,
             };
             if let Some(return_lltype) = return_lltype
@@ -1150,6 +1195,46 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                         .insert(entry.host_object.clone(), message);
                 }
             }
+        }
+    }
+    // Pass 3 — make impl methods visible in their owner's class dict.
+    // RPython's ClassDesc reads methods straight off the class object
+    // (`classdesc.py:808-817 find_source_for` → `cls.__dict__[name]`):
+    // a Python class object already carries its functions as members
+    // when annotation starts.  Pyre's struct-root class objects are
+    // minted with no members (`Bookkeeper::intern_class_by_qualname`),
+    // so a receiver method call — `CallTarget::Method` lowers to
+    // `getattr(recv, name)` + `simple_call`
+    // (`flowspace_adapter.rs:1357`) — found no attribute source and
+    // blocked.  Registering each `[owner, method]` registry entry's
+    // user-function HostObject as a class member completes the
+    // analogue: `find_source_for` imports it into the classdict as a
+    // Constant, and `s_get_value` binds it under the classdef
+    // (`bind_callables_under` → MethodDesc) whose `cachedgraph` hits
+    // the pass-2 prefill.  Owner names are gated on the struct-field
+    // registry (module and trait leaves are never type roots), and a
+    // same-named instance field wins — a function source for a field
+    // attribute would union-conflict in `generalize_attr`.
+    let bk = registry.bookkeeper();
+    for (key, _graph, entry) in &pending {
+        // `CallPath::for_impl_method` splits the module-qualified owner
+        // ("pyframe::PyFrame" → [pyframe, PyFrame, method]), so the
+        // owner is the second-to-last segment.  Free-function paths
+        // ([module, foo]) put a module there, and modules are never
+        // type roots — the struct-field-registry gate filters them.
+        let segs = key.segments();
+        let [.., owner, method] = segs else {
+            continue;
+        };
+        if !bk.is_pyre_struct_root(owner) || bk.pyre_struct_root_has_field(owner, method) {
+            continue;
+        }
+        let class_host = bk.intern_class_by_qualname(owner);
+        if class_host.class_get(method).is_none() {
+            class_host.class_set(
+                method.clone(),
+                crate::flowspace::model::ConstValue::HostObject(entry.host_object.clone()),
+            );
         }
     }
     Ok(())

@@ -2597,17 +2597,16 @@ fn build_class_inner(
     }
 
     // When `__prepare__` returned a custom mapping (a dict subclass such as
-    // enum._EnumDict), the class body must execute against it directly so its
-    // `__setitem__`/`__getitem__` fire mid-body — e.g. `WHITE = RED | GREEN`
-    // reads the values `_EnumDict.__setitem__` resolved on assignment, not the
-    // stale `auto()` sentinels.  Route the frame's name binding through it via
-    // setdictscope_object; an absent or plain-dict namespace keeps the
-    // DictStorage fast path.  Restricted to a dict-subclass instance with a
-    // resolvable backing so the post-execution mirror below can recover its
-    // entries — an exotic non-dict mapping keeps the legacy path unchanged.
-    let mapping_namespace = w_namespace.filter(|&w| unsafe {
-        pyre_object::is_instance(w) && !crate::type_methods::resolve_dict_backing(w).is_null()
-    });
+    // enum._EnumDict, or any non-dict mapping), the class body must execute
+    // against it directly so its `__setitem__`/`__getitem__` fire mid-body —
+    // e.g. `WHITE = RED | GREEN` reads the values `_EnumDict.__setitem__`
+    // resolved on assignment, not the stale `auto()` sentinels.  Upstream
+    // `compiling.py:207-209` runs `frame.setdictscope(w_namespace)`
+    // unconditionally; route the frame's name binding through the mapping
+    // via setdictscope_object.  An absent or plain-dict namespace keeps the
+    // DictStorage fast path (plain-dict stores have no observable side
+    // effects, and the metaclass replay below restores its final contents).
+    let mapping_namespace = w_namespace.filter(|&w| unsafe { !pyre_object::is_dict(w) });
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
@@ -2630,12 +2629,13 @@ fn build_class_inner(
     // into class_ns for the downstream type construction (classcell capture,
     // create_all_slots, __set_name__), which read class_ns.
     if let Some(w_ns) = mapping_namespace {
+        let class_ns = unsafe { &mut *class_ns_ptr };
+        // Rebuild from the final contents so names `del`eted from the
+        // mapping during body execution don't survive in class_ns.
+        class_ns.clear();
         let backing = crate::type_methods::resolve_dict_backing(w_ns);
         if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
-            let class_ns = unsafe { &mut *class_ns_ptr };
-            // Rebuild from the final backing so names `del`eted from the
-            // mapping during body execution don't survive in class_ns.
-            class_ns.clear();
+            // Dict subclass: read final entries off the backing dict.
             for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
                     crate::dict_storage_store(
@@ -2645,8 +2645,48 @@ fn build_class_inner(
                     );
                 }
             }
-            unsafe { (*class_ns_ptr).fix_ptr() };
+        } else if w_metaclass.is_some() {
+            // A custom metaclass receives the raw mapping unchanged (passed
+            // below) and owns its enumeration — `type.__new__` runs
+            // `PyMapping_Keys` itself.  The mapping must therefore not be
+            // walked here; only `__classcell__` is consumed locally, for the
+            // post-metaclass cell validation below, so lift just that one key
+            // via `space.getitem` rather than calling the mapping's `keys()`.
+            let w_cellkey = pyre_object::w_str_new("__classcell__");
+            match crate::baseobjspace::getitem(w_ns, w_cellkey) {
+                Ok(value) if !value.is_null() => {
+                    crate::dict_storage_store(class_ns, "__classcell__", value);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Arbitrary non-dict mapping with the default metaclass: this path
+            // builds the type directly from `class_ns`, so materialize the
+            // whole namespace via the mapping protocol's `keys()` (the
+            // `PyMapping_Keys` path `type.__new__` takes for a non-dict
+            // namespace) and read each value back via `space.getitem` so
+            // `__getitem__` overrides apply.  `keys()` rather than `iter()`
+            // keeps a mapping without `__iter__` working.
+            let keys_method = crate::baseobjspace::getattr_str(w_ns, "keys")?;
+            let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+            let keys = crate::builtins::collect_iterable(keys_obj)?;
+            for key in keys {
+                if !unsafe { pyre_object::is_str(key) } {
+                    continue;
+                }
+                let value = crate::baseobjspace::getitem(w_ns, key)?;
+                if !value.is_null() {
+                    crate::dict_storage_store(
+                        class_ns,
+                        unsafe { pyre_object::w_str_get_value(key) },
+                        value,
+                    );
+                }
+            }
         }
+        unsafe { (*class_ns_ptr).fix_ptr() };
     }
 
     // compiling.py:211-212 — when __mro_entries__ rewrote the bases, expose

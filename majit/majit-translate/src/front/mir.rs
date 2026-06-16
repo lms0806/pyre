@@ -258,7 +258,21 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     // it classifies the residual failure as a tracked degradation (the
     // function becomes a residual call) rather than a build-failing
     // regression.
-    msg.contains("uninitialised local")
+    if msg.contains("uninitialised local") {
+        return true;
+    }
+    // A scoped (`execute_*` family) Result-of-PyError wrapper whose body
+    // is a pure tail-forward of an *unscoped* Result-of-PyError callee
+    // (`let step = executor.method()?; Ok(step)` where `method` is not in
+    // `RESULT_EXC_LOWERING_SCOPE`).  The forward collapses to a direct
+    // returnblock link with no `Ok`/`Err` shell, so the callee rule finds
+    // nothing to rewrite and the caller rule never saw a scoped call —
+    // `result_exc::lower_result_exc_returns` reports "no rewritable
+    // returns".  The exception-link lowering cannot model this shape, so
+    // the wrapper degrades to a residual call (the trivial forward runs
+    // unchanged at the interpreter level); the inner method still JITs
+    // through its own scoped callees.
+    msg.contains("no rewritable returns")
 }
 
 pub fn build_semantic_program_from_llbc(
@@ -938,6 +952,20 @@ impl std::error::Error for LowerError {}
 // Lowering state
 // ---------------------------------------------------------------------------
 
+/// The `(base, index)` operands of a devirtualized workspace index call,
+/// recorded for the paired `*p = v` write.  Each operand keeps the
+/// resolving-block Variable plus its source MIR local (`None` for a
+/// constant operand) so the write site can re-resolve through
+/// `local_var` after the operand is rebound across the call's block
+/// split.  See [`Lowering::index_elem_alias`].
+#[derive(Clone)]
+struct IndexElemAlias {
+    base_local: Option<usize>,
+    base_var: Variable,
+    index_local: Option<usize>,
+    index_var: Variable,
+}
+
 struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
@@ -1003,14 +1031,29 @@ struct Lowering<'a> {
     /// getarrayitem instead and the paired `*p = v` write
     /// ([`Lowering::emit_projection_write`] `Deref` arm) consults
     /// this map to emit `ArrayWrite` rather than the opaque
-    /// `__deref_write` marker.
-    index_elem_alias: std::collections::HashMap<usize, (Variable, Variable)>,
-    /// MIR locals bound by a devirtualized infallible widening
-    /// `usize::try_from(u8|u16|u32)` call.  The value is the source
-    /// integer itself (the conversion cannot fail on 64-bit targets),
-    /// so the paired `Result::expect` on such a local also aliases it
-    /// — see [`Lowering::is_infallible_widening_try_from`].
-    infallible_result_locals: std::collections::HashSet<usize>,
+    /// `__deref_write` marker.  The base/index are kept as both the
+    /// resolving-block Variable and their source MIR local: the write
+    /// usually lands in a later block (the index call terminates its
+    /// own block), where the operands have been rebound to fresh
+    /// inputarg Variables, so the consumer re-resolves through
+    /// `local_var` by local and only falls back to the recorded
+    /// Variable for a base/index without a backing local (a constant).
+    index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
+    /// MIR locals whose enum discriminant is a translation-time
+    /// constant: single-assignment locals bound by an always-`Ok`
+    /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
+    /// `Rvalue::Discriminant` on such a local emits `ConstInt(tag)`
+    /// instead of the synthetic FieldRead, which lets the
+    /// `lower_switch` Constant fold drop the statically dead
+    /// `Err`/panic arm even though MIR calls terminate their block
+    /// (the switch always sits in a successor block).  Only locals
+    /// outside [`Lowering::multi_assigned_locals`] enter this map, so
+    /// a re-bound local can never carry a stale tag.
+    const_discriminant_locals: std::collections::HashMap<usize, i64>,
+    /// MIR locals assigned more than once anywhere in the body
+    /// (statement assigns + call destinations).  Guard set for
+    /// [`Lowering::const_discriminant_locals`].
+    multi_assigned_locals: std::collections::HashSet<usize>,
     /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
     /// callees whose declared result is `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -1105,7 +1148,8 @@ impl<'a> Lowering<'a> {
         for _ in 1..body.body.len() {
             block_id.push(graph.create_block());
         }
-        let block_live_in = compute_mir_liveness(body);
+        let index_write_extra_live = compute_index_write_extra_live(body, llbc);
+        let block_live_in = compute_mir_liveness(body, &index_write_extra_live);
         let mut block_entry_local_var = vec![vec![None; n_locals]; body.body.len()];
         let block_entry_positional_aggregate_locals =
             vec![std::collections::HashMap::new(); body.body.len()];
@@ -1144,7 +1188,8 @@ impl<'a> Lowering<'a> {
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
-            infallible_result_locals: std::collections::HashSet::new(),
+            const_discriminant_locals: std::collections::HashMap::new(),
+            multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
         })
     }
@@ -1843,6 +1888,18 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Re-resolve a recorded [`IndexElemAlias`] operand to the Variable
+    /// live in the current block: prefer the current `local_var` binding
+    /// of its source MIR local (rebound to a fresh inputarg if the
+    /// operand was threaded across the index call's block split), and
+    /// fall back to the Variable captured at the index call for a
+    /// constant operand with no backing local.
+    fn realias_operand(&self, local: Option<usize>, recorded: Variable) -> Variable {
+        local
+            .and_then(|l| self.local_var.get(l).cloned().flatten())
+            .unwrap_or(recorded)
+    }
+
     /// Emit the side-effectful write op for an `Assign` whose dest is
     /// a `Projection(inner, elem)`. `value` is the freshly computed
     /// rvalue.  `dest_ty` is the projected place's own `TyRef` — the
@@ -1866,14 +1923,21 @@ impl<'a> Lowering<'a> {
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
             ProjectionElem::Atom(s) if s == "Deref" => {
-                if let Some((arr, idx)) = inner_local
+                if let Some(alias) = inner_local
                     .and_then(|i| self.index_elem_alias.get(&i))
                     .cloned()
                 {
                     // `*p = val` where `p` was bound by a
                     // devirtualized workspace `index_mut` call is the
                     // write half of `arr[i] = val` — emit the array
-                    // write directly (setarrayitem).
+                    // write directly (setarrayitem).  The index call
+                    // terminates its own block, so the base/index
+                    // operands are typically rebound to fresh inputarg
+                    // Variables here; re-resolve them through
+                    // `local_var` by their source local and fall back
+                    // to the recorded Variable for a constant operand.
+                    let arr = self.realias_operand(alias.base_local, alias.base_var);
+                    let idx = self.realias_operand(alias.index_local, alias.index_var);
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
@@ -2066,9 +2130,50 @@ impl<'a> Lowering<'a> {
                 // encodes the conversion.  Genuine `Neg` / `Not` arithmetic
                 // keeps a real scalar `OpKind::UnaryOp`.
                 if unary_op_is_cast(&op_json) {
+                    // Signedness-aware source classification — `operand_value_kind`
+                    // (`tyref_to_value_type`) collapses `uN` and `iN` both to
+                    // `Int`, hiding a `usize as i64` flip; `tyref_to_attr_value_type`
+                    // keeps the signed/unsigned split.
+                    let src_attr = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            Some(tyref_to_attr_value_type(&p.ty, self.llbc))
+                        }
+                        Operand::Const(_) => None,
+                    };
                     let src_kind = self.operand_value_kind(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
+                    // — aliasing keeps the source `r_uint` annotation on the
+                    // signed destination, tripping the SomeInteger signedness
+                    // `UnionError` (`binaryop.py:178-202`) when the length
+                    // meets a signed index.  Route the unsigned→signed flip
+                    // through `rarithmetic.intmask` (the RPython spelling of
+                    // this re-type): `rtype_intmask` coerces to `lltype.Signed`
+                    // — identity on the i64 carrier — so the value is unchanged
+                    // and the result re-types Signed.  Resolves via the Layer-3
+                    // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
+                    // .module_get(intmask)` path (`flowspace_adapter.rs`).
+                    if matches!(src_attr, Some(ValueType::Unsigned))
+                        && matches!(tyref_to_attr_value_type(dest_ty, self.llbc), ValueType::Int)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: ["rpython", "rlib", "rarithmetic", "intmask"]
+                                        .into_iter()
+                                        .map(str::to_string)
+                                        .collect(),
+                                },
+                                args: vec![arg],
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
                     return Ok(
                         match src_kind
                             .as_ref()
@@ -2089,22 +2194,36 @@ impl<'a> Lowering<'a> {
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
-                            // ptr→ptr cast onto a monomorphic-ADT
-                            // pointee, which is the upstream instance
-                            // downcast `cast_pointer(PTRTYPE, p)`;
-                            // surface it for the annotator (jtransform
-                            // re-aliases, see
-                            // [`cast_pointer_marker_op`]).
+                            // ptr→ptr cast to a registered struct root,
+                            // which narrows to `SomeInstance(root)` so a
+                            // field read on the pointee resolves (#298;
+                            // see the `Rvalue::Cast` arm for the full
+                            // rationale).  The SOURCE must already be a Ref
+                            // for this to be a genuine `cast_pointer`
+                            // (ptr→ptr); an int→ptr or unknown-source cast
+                            // is `cast_int_to_ptr` territory and aliases
+                            // instead of narrowing to an instance.
                             None => {
-                                if matches!(dst_kind, ValueType::Ref(_))
-                                    && matches!(src_kind, Some(ValueType::Ref(_)))
-                                    && let Some(root) =
-                                        cast_ptr_target_class_root(dest_ty, self.llbc)
+                                if matches!(src_kind, Some(ValueType::Ref(_)))
+                                    && let ValueType::Ref(_) = dst_kind
+                                    && let Some(root) = tyref_class_root(dest_ty, self.llbc)
                                 {
                                     let res = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
                                     );
-                                    (Some(cast_pointer_marker_op(root, arg)), res)
+                                    (
+                                        Some(OpKind::Call {
+                                            target: CallTarget::FunctionPath {
+                                                segments: vec![
+                                                    "__pyre_cast_instance".to_string(),
+                                                    root.clone(),
+                                                ],
+                                            },
+                                            args: vec![arg],
+                                            result_ty: ValueType::Ref(Some(root)),
+                                        }),
+                                        res,
+                                    )
                                 } else {
                                     (None, arg)
                                 }
@@ -2194,21 +2313,42 @@ impl<'a> Lowering<'a> {
             // so reuse the alias path: the cast result Variable is the
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
-            // Exception: a `RawPtr` cast onto a monomorphic-ADT
-            // pointee (`obj as *const W_Foo`) is the upstream instance
-            // downcast `cast_pointer(PTRTYPE, p)` — surface it as the
-            // `__cast_pointer/<Root>` marker so the annotator types
-            // the result; jtransform re-aliases it (see
-            // [`cast_pointer_marker_op`]).
             Rvalue::Cast(kind, operand, ty) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
+                // #298: a same-bank ptr→ptr cast to a registered struct
+                // root (`obj as *const W_CodeObject`) keeps the i64
+                // pointer carrier in place, so it would alias like above
+                // — but the result is then read like an instance of that
+                // struct (`(*p).code_ptr`), and aliasing leaves the
+                // pointer classdef-less so the field read blocks at the
+                // annotator getattr arm.  `tyref_class_root` returns
+                // `Some` only for a named-ADT pointee (None for
+                // primitives / builtin containers / generics / multi-impl
+                // type-vars), so emit a `__pyre_cast_instance` narrow
+                // whose annotator types the result `SomeInstance(root)`
+                // and whose typer folds to a `cast_pointer`.  Gate on the
+                // raw-pointer cast kind: `lltype.cast_pointer`
+                // (`lltype.py:964-975`) is pointer-to-pointer only, and
+                // int-to-pointer is the separate `cast_int_to_ptr`
+                // analyzer, so an `addr_usize as *const Struct` reinterpret
+                // must NOT be narrowed to an instance downcast.
                 if cast_kind_is_raw_ptr(&kind)
-                    && let Some(root) = cast_ptr_target_class_root(&ty, self.llbc)
+                    && let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
+                    && let Some(root) = tyref_class_root(&ty, self.llbc)
                 {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    return Ok((Some(cast_pointer_marker_op(root, v)), res));
+                    return Ok((
+                        Some(OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                            },
+                            args: vec![v],
+                            result_ty: ValueType::Ref(Some(root)),
+                        }),
+                        res,
+                    ));
                 }
                 Ok((None, v))
             }
@@ -2638,7 +2778,12 @@ impl<'a> Lowering<'a> {
                                 base,
                                 field: FieldDescriptor::new(
                                     format!("__pos_{idx}"),
-                                    Some("Adt".to_string()),
+                                    // Same spelling the construction-side
+                                    // FieldWrite chain records for builtin
+                                    // tuple aggregates (`aggregate_ctor_name`
+                                    // id atom), so read and write attrs key
+                                    // under one owner.
+                                    Some("Tuple".to_string()),
                                 ),
                                 ty,
                                 pure: false,
@@ -2677,6 +2822,42 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 let segments = self.global_segments(mir_bb, id)?;
+                // A `PyType` singleton static (`&SLICE_TYPE`): narrow the
+                // raw address through `__pyre_cast_instance["PyType"]` so
+                // the read types `SomeInstance("PyType")`, matching the
+                // `(*obj).ob_type` field-read.  The bare `ConstInt` address
+                // would pair `IntegerRepr` against that field's
+                // `InstanceRepr` and block `rtype_is_` on the
+                // `ob_type == &TYPE` pointer-identity chain — the same
+                // narrow `obj as *const RegisteredStruct` already uses
+                // (#298).
+                if let Some(addr) = self.pytype_static_addr(&segments) {
+                    let bb_id = self.block_id[mir_bb];
+                    let raw = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(raw.clone()),
+                        kind: OpKind::ConstRefAddr(addr),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "__pyre_cast_instance".to_string(),
+                                    "PyType".to_string(),
+                                ],
+                            },
+                            args: vec![raw],
+                            result_ty: ValueType::Ref(Some("PyType".to_string())),
+                        },
+                    });
+                    return Ok(res);
+                }
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.const_eval_global(id))
@@ -2971,17 +3152,33 @@ impl<'a> Lowering<'a> {
     fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
         let full = segments.join("::");
         let stripped = strip_crate_prefix(&full);
-        for (key, addr) in self.static_addrs.pytypes {
-            if static_key_matches(&full, &stripped, key) {
-                return Some(OpKind::ConstInt(*addr));
-            }
-        }
         for (key, addr) in self.static_addrs.refs {
             if static_key_matches(&full, &stripped, key) {
                 return Some(OpKind::ConstRefAddr(*addr));
             }
         }
         None
+    }
+
+    /// Address of a `pytypes`-bucket host static — a `PyType` singleton
+    /// (`&SLICE_TYPE`, `&INT_TYPE`, …).  The `Global` reader lowers these
+    /// to a `__pyre_cast_instance["PyType"]` narrow of the raw address
+    /// (a typed instance pointer) rather than the bare `ConstInt` the
+    /// `refs` siblings avoid: a `PyType` static is the same kind of value
+    /// as the `(*obj).ob_type` field-read it is compared against, so it
+    /// must type `SomeInstance("PyType")` for `rtype_is_` (pointer
+    /// identity) to lower the `ob_type == &TYPE` chain
+    /// (`is_slice` / `is_cell` / `is_range`).  `jit_static_pytype_addrs`
+    /// puts only `PyType` statics in this bucket, so the root is always
+    /// `"PyType"`.
+    fn pytype_static_addr(&self, segments: &[String]) -> Option<i64> {
+        let full = segments.join("::");
+        let stripped = strip_crate_prefix(&full);
+        self.static_addrs
+            .pytypes
+            .iter()
+            .find(|(key, _)| static_key_matches(&full, &stripped, key))
+            .map(|(_, addr)| *addr)
     }
 
     /// Evaluate a global's initializer to its literal when the body is
@@ -3203,17 +3400,29 @@ impl<'a> Lowering<'a> {
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
-        // The first operand's MIR local (if it is one) feeds the
-        // paired `try_from`/`expect` devirtualization below, which
-        // keys on `infallible_result_locals`.
-        let first_arg_local = call.args.first().and_then(|op| match op {
-            Operand::Move(p) | Operand::Copy(p) => match &p.kind {
-                PlaceKind::Local(i) => Some(*i as usize),
-                _ => None,
-            },
+        let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
+        // MIR local index behind each plain-local argument, kept
+        // alongside the resolved Variables so call intercepts can
+        // consult per-local lowering state
+        // (`const_discriminant_locals`).
+        let arg_locals: Vec<Option<usize>> = call
+            .args
+            .iter()
+            .map(|op| match op {
+                Operand::Copy(p) | Operand::Move(p) => match p.kind {
+                    PlaceKind::Local(i) => Some(i as usize),
+                    _ => None,
+                },
+                Operand::Const(_) => None,
+            })
+            .collect();
+        // First argument's MIR-declared type, captured before the
+        // operands are consumed — `reflexive_into_alias` compares it
+        // against the destination type.
+        let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
-        let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -3271,35 +3480,142 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.index_elem_alias
-                        .insert(dest_local, (args[0].clone(), args[1].clone()));
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                        },
+                    );
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `usize::try_from(x).expect(…)` where `x` is u8/u16/
-                // u32 — a widening conversion that cannot fail on the
-                // 64-bit targets pyre supports, routed through the
-                // Opaque `ptr_try_from_impls` core impls.  `try_from`
-                // aliases its argument and records the destination
-                // local; the paired `expect` on that local unwraps by
-                // aliasing the same value.  A fallible source width
-                // never matches, so genuine error paths keep their
-                // ordinary call lowering.
-                if args.len() == 1 && self.is_infallible_widening_try_from(&reg) {
-                    self.infallible_result_locals.insert(dest_local);
-                    self.local_var[dest_local] = Some(args[0].clone());
+                // `<[T]>::swap(s, a, b)` over a `&mut [T]` whose base is
+                // the same `FixedObjectArray` shape the workspace index
+                // path reads.  Lower to the getarrayitem/setarrayitem
+                // decomposition: read both elements, then write each
+                // back to the other's index.  The base operand feeds the
+                // synthetic `ArrayWrite`s the MIR never spells, but every
+                // arg here is live in the call block (no cross-block
+                // rebind like the deferred `index_mut` write), so no
+                // extra liveness threading is needed.  The call returns
+                // `()`; its dead destination binds to a fresh Void var.
+                if args.len() == 3 && self.is_slice_swap_call(&reg) {
+                    let base = args[0].clone();
+                    let idx_a = args[1].clone();
+                    let idx_b = args[2].clone();
+                    let elem_a = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let elem_b = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(elem_a.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: idx_a.clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(elem_b.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: idx_b.clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base: base.clone(),
+                            index: idx_a,
+                            value: elem_b,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base,
+                            index: idx_b,
+                            value: elem_a,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                if args.len() == 2
-                    && first_arg_local.is_some_and(|l| self.infallible_result_locals.contains(&l))
-                    && self.is_result_expect(&reg)
-                {
+                // `*const T::cast_mut()` / `*mut T::cast_const()` /
+                // `<ptr>::cast()` — address-preserving pointer
+                // reinterprets the JIT models as identity (the
+                // receiver-method twin of the `CastKind::RawPtr` Rvalue
+                // → `same_as`).  Alias the destination to the receiver so
+                // the method name never reaches the rtyper as a
+                // `ptr.getattr`.
+                if args.len() == 1 && self.is_ptr_identity_cast(&reg) {
+                    // When the cast target names a registered struct root
+                    // (`ptr.cast::<W_SRE_Pattern>()` then a field read),
+                    // narrow the result to `SomeInstance(root)` exactly
+                    // like the `Rvalue::Cast` arm: a bare alias leaves the
+                    // pointer classdef-less and the downstream `getattr`
+                    // blocks at the annotator.  The receiver is already a
+                    // raw pointer (`is_ptr_identity_cast`), so this is a
+                    // genuine `cast_pointer` (ptr→ptr).
+                    if let ValueType::Ref(_) = tyref_to_value_type(&call.dest.ty, self.llbc)
+                        && let Some(root) = tyref_class_root(&call.dest.ty, self.llbc)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        "__pyre_cast_instance".to_string(),
+                                        root.clone(),
+                                    ],
+                                },
+                                args: vec![args[0].clone()],
+                                result_ty: ValueType::Ref(Some(root)),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(res);
+                    } else {
+                        self.local_var[dest_local] = Some(args[0].clone());
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<Atomic*>::load(&self, ordering)` — a relaxed read of a
+                // layout-transparent atomic.  `&self` already aliases the
+                // inner field read, so alias the destination to it (the
+                // `ordering` arg is discarded); the `load` name never
+                // reaches the rtyper as a `ptr.getattr`.
+                if args.len() == 2 && self.is_atomic_load(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -3323,27 +3639,78 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
-                // `CallTarget::Method` requires a receiver in `args[0]`
-                // (the flowspace adapter lowers it to `getattr(recv,
-                // method_leaf) → simple_call(bound_method, …)`).
-                // Charon's `impl_method_owner` matches both inherent
-                // methods (which carry `&self`) *and* associated
-                // functions (e.g. `RootScope::new()` — no `self` arg).
-                // Only the former actually has a receiver in `args[0]`;
-                // routing a 0-arg associated function through `Method`
-                // panics at `flowspace_adapter.rs:1045` ("Call::Method
-                // has empty args").  Fall back to the `FunctionPath`
-                // segments when there is no receiver to thread.
-                let target = match method_hint {
-                    Some((owner_root, leaf)) if !args.is_empty() => {
-                        CallTarget::method(leaf, Some(owner_root))
-                    }
-                    _ => CallTarget::FunctionPath { segments },
-                };
-                OpKind::Call {
+                if self.try_lower_checked_neg(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
                     target,
-                    args,
-                    result_ty: result_ty.clone(),
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_usize_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                let alias =
+                    if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
+                        // Identity unwrap: the receiver variable was bound
+                        // directly to the `Ok` payload, so the result is
+                        // that variable — bind and close the block with no
+                        // op emitted.
+                        Some(payload)
+                    } else {
+                        self.reflexive_into_alias(
+                            &segments,
+                            &args,
+                            first_arg_ty.as_ref(),
+                            &call.dest.ty,
+                        )
+                        .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                        .or_else(|| {
+                            self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
+                        })
+                        .or_else(|| self.oparg_value_alias(&segments, &args))
+                    };
+                if let Some(value) = alias {
+                    self.local_var[dest_local] = Some(value);
+                    let bb_id = self.block_id[mir_bb];
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                {
+                    // `CallTarget::Method` requires a receiver in `args[0]`
+                    // (the flowspace adapter lowers it to `getattr(recv,
+                    // method_leaf) → simple_call(bound_method, …)`).
+                    // Charon's `impl_method_owner` matches both inherent
+                    // methods (which carry `&self`) *and* associated
+                    // functions (e.g. `RootScope::new()` — no `self` arg).
+                    // Only the former actually has a receiver in `args[0]`;
+                    // routing a 0-arg associated function through `Method`
+                    // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                    // has empty args").  Fall back to the `FunctionPath`
+                    // segments when there is no receiver to thread.
+                    let target = match method_hint {
+                        Some((owner_root, leaf)) if !args.is_empty() => {
+                            CallTarget::method(leaf, Some(owner_root))
+                        }
+                        _ => CallTarget::FunctionPath { segments },
+                    };
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty: result_ty.clone(),
+                    }
                 }
             }
             (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
@@ -3427,7 +3794,9 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a Charon `CallKind` to a flattened path segment list the
     /// codewriter consumes as `CallTarget::FunctionPath`, plus an
-    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods.
+    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
+    /// plus the `[Owner, leaf]` registration spelling when the callee is
+    /// an inherent-impl *associated function* (no receiver).
     ///
     /// The method hint is `Some` when the FunDecl's raw name segments
     /// encode an `Impl` block immediately before the leaf `Ident` —
@@ -3437,6 +3806,14 @@ impl<'a> Lowering<'a> {
     /// `CallTarget::FunctionPath` so the annotator can prepend a
     /// classdef-bound `SomeInstance` for `self`; see the comment at
     /// the use site in [`Self::lower_call`].
+    ///
+    /// The associated-function spelling is computed only when the
+    /// method hint is `None` (a receiver-shaped callee never consumes
+    /// it), and only the `CallTarget::FunctionPath` construction in
+    /// `lower_call` applies it — the raw `name_path()` segments stay
+    /// untouched for the std special-case matchers (`checked_neg` /
+    /// `try_from` / `into` / `expect`) that key on the
+    /// `[.., "<Impl>", leaf]` shape.
     fn call_target_segments(
         &self,
         mir_bb: usize,
@@ -3578,6 +3955,15 @@ impl<'a> Lowering<'a> {
         };
         let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
             Some(adt_def_id) => {
+                // The hint is only valid when the fn actually receives
+                // the impl owner as `self` (`Owner` / `&Owner` /
+                // `*mut Owner` first input).  Associated functions —
+                // `PyError::type_error(msg)` — have no receiver;
+                // routing them as `Method` makes the adapter getattr
+                // the method name off `args[0]` (the message string).
+                if !self.first_input_is_adt(fd, adt_def_id) {
+                    return None;
+                }
                 let td = self.llbc.type_by_id(adt_def_id)?;
                 let owner = td
                     .item_meta
@@ -3650,50 +4036,84 @@ impl<'a> Lowering<'a> {
     /// getarrayitem/setarrayitem on the receiver and is devirtualized
     /// to `ArrayRead`/`ArrayWrite` by the caller.
     fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or("");
-        (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+        is_workspace_index_regular(reg, self.llbc)
     }
 
-    /// `usize::try_from` (`ptr_try_from_impls`, Opaque core code)
-    /// applied to a u8/u16/u32 source — always `Ok` when the target
-    /// is pointer-width on 64-bit, so the call aliases its argument
-    /// (see the paired `expect` handling in [`Self::lower_call`]).
-    fn is_infallible_widening_try_from(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if fd.item_meta.name_path() != "core::convert::num::ptr_try_from_impls::<Impl>::try_from" {
-            return false;
-        }
-        fd.signature.inputs.first().is_some_and(|t| {
-            tyref_node(t, self.llbc)
-                .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                .and_then(|n| n.get("Literal"))
-                .and_then(|l| l.get("UInt"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|w| matches!(w, "U8" | "U16" | "U32"))
-        })
-    }
-
-    /// `Result::expect` (Opaque core code) — only devirtualized when
-    /// the receiver local was bound by an infallible `try_from` above.
-    fn is_result_expect(&self, reg: &RegularCall) -> bool {
+    /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
+    /// in-place element exchange through a `&mut [T]`.  The slice base
+    /// is the same `FixedObjectArray` shape `is_workspace_index_call`
+    /// reads, so the callsite lowers to the getarrayitem/setarrayitem
+    /// decomposition rather than residualizing the Opaque core body.
+    fn is_slice_swap_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::result::<Impl>::expect")
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+    }
+
+    /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
+    /// / `<ptr>::cast` — address-preserving const↔mut flips and pointee
+    /// retypes.  The same i64 machine repr as the receiver, so the JIT
+    /// models them as identity, the receiver-method twin of the
+    /// `CastKind::RawPtr` Rvalue (`same_as`, [`cast_label_from_payload`]).
+    /// Gating on a `RawPtr` self excludes unrelated inherent `cast`
+    /// methods on non-pointer owners.
+    fn is_ptr_identity_cast(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let leaf = fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if !matches!(leaf.as_str(), "cast" | "cast_mut" | "cast_const") {
+            return false;
+        }
+        fd.signature.inputs.first().is_some_and(|t| {
+            tyref_node(t, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|o| o.contains_key("RawPtr"))
+        })
+    }
+
+    /// `<core::sync::atomic::Atomic*>::load(&self, ordering)` — a relaxed
+    /// read of a std atomic.  The atomic types are layout-transparent
+    /// over their inner scalar/pointer (asserted for the `PyType`
+    /// `subclassrange_*` / `instantiate` vtable fields), so the JIT
+    /// models the load as that inner value: [`tyref_atomic_inner_value_type`]
+    /// types the `Atomic*` field as its inner [`ValueType`], the `&self`
+    /// `Ref` rvalue aliases to that field read, and this aliases the load
+    /// destination to the receiver.  Gating on an atomic receiver
+    /// excludes unrelated inherent `load` methods, and the method name
+    /// never reaches the rtyper as a `ptr.getattr`.
+    fn is_atomic_load(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let name = fd.item_meta.name_path();
+        if name.rsplit("::").next() != Some("load") {
+            return false;
+        }
+        fd.signature.inputs.first().is_some_and(|t| {
+            adt_path_of_tyref(t, self.llbc).is_some_and(|p| {
+                p.contains("::sync::atomic::")
+                    && p.rsplit("::")
+                        .next()
+                        .is_some_and(|leaf| leaf.starts_with("Atomic"))
+            })
+        })
     }
 
     /// Devirtualize a callsite of the blanket
@@ -3814,6 +4234,61 @@ impl<'a> Lowering<'a> {
         is_into && tyref_is_string_adt(dest_ty, self.llbc)
     }
 
+    /// Whether the FunDecl's first signature input is the given ADT,
+    /// possibly behind reference / raw-pointer layers (`self: Owner`,
+    /// `&Owner`, `&mut Owner`, `*const/mut Owner`).  Distinguishes a
+    /// real method from an associated function of the same impl block.
+    fn first_input_is_adt(&self, fd: &FunDecl, adt_def_id: u64) -> bool {
+        let Some(first) = fd.signature.inputs.first() else {
+            return false;
+        };
+        let Some(mut v) = self.tyref_body(first) else {
+            return false;
+        };
+        loop {
+            let Some(obj) = v.as_object() else {
+                return false;
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                match self.llbc.dedup_body(id) {
+                    Some(b) => {
+                        v = b;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            // `{"Ref": [region, ty, kind]}` / `{"RawPtr": [ty, kind]}`.
+            if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+                match arr.get(1) {
+                    Some(inner) => {
+                        v = inner;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+                match arr.first() {
+                    Some(inner) => {
+                        v = inner;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            return inline_adt_def_id(v) == Some(adt_def_id);
+        }
+    }
+
     /// Decode the receiver type's ADT `def_id` from an `Impl` NameSeg
     /// payload.  Two shapes:
     ///
@@ -3873,6 +4348,543 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// Alias `Arg::<T>::get(self, arg: OpArg) -> T`
+    /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs:1286)
+    /// to its `OpArg` argument.  `Arg<T>` is the zero-sized oparg marker
+    /// ([`tyref_is_bytecode_arg_marker`]) and `OpArg` is the transparent
+    /// `struct OpArg(u32)` newtype, both modeled as a plain integer (the
+    /// raw operand) — see [`tyref_is_oparg`].
+    /// The body is `T::try_from(u32::from(arg)).unwrap()`, and every
+    /// `OpArgType` (`VarNum` / `VarNums` / `u32`) is a transparent newtype
+    /// over `u32`, so the result's bits equal `u32::from(arg)` — the
+    /// argument's own integer value.  Returning `arg` (`args[1]`) directly
+    /// is the identity the marker `self` is dropped around.
+    ///
+    /// Without this the `.get` method call lowers to `getattr(Integer,
+    /// "get")` on the integer `self` marker — an attribute the annotator
+    /// cannot type (the dominant `Cannot find attribute "get" on Integer`
+    /// wall behind `complete_pending_blocks` for the opcode-dispatch
+    /// handler family, which all read their operand via `<field>.get(op_arg)`).
+    ///
+    /// Identified by the second input being the `oparg::OpArg` type: no
+    /// other `.get` (slice / `Vec` / map) takes an `OpArg`, and the
+    /// concrete `OpArg` resolves robustly where the generic `self: Arg<T>`
+    /// marker would not.  Returns `None` for any other `.get` so those
+    /// keep the `Call` form.
+    fn oparg_arg_get_alias(
+        &self,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        if segments.last().map(String::as_str) != Some("get") {
+            return None;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        // The `OpArg` argument (`inputs[1]` — `args[1]`, after the
+        // `self` receiver) is the operand value.
+        let oparg_ty = fd.signature.inputs.get(1)?;
+        // `OpArg` is `Opaque` in the LLBC (external crate), so resolve it
+        // by qualified name rather than structural shape.
+        if !adt_path_of_tyref(oparg_ty, self.llbc).is_some_and(|p| p.ends_with("oparg::OpArg")) {
+            return None;
+        }
+        // A fieldless-enum result (`Arg::<SpecialMethod>::get`) must keep
+        // its `Ref` enum shape.  Aliasing to the bare integer operand
+        // would make the downstream `match`'s `Rvalue::Discriminant` read
+        // a `__discriminant` field off an integer base — a
+        // `getfield_gc_i_pure/id>i` opname no blackhole handler covers.
+        // The generic `fd.signature.output` is the type parameter `T`, so
+        // key off the call's concrete destination type instead.  Only the
+        // int-newtype results (`VarNum` / `u32`, whose bits *are* the
+        // operand) alias; the enum keeps the canonical `…/rd>i` read.
+        if self.tyref_is_fieldless_enum(dest_ty) {
+            return None;
+        }
+        args.get(1).cloned()
+    }
+
+    /// Alias the transparent `OpArgType` conversions to their single
+    /// argument.  Each oparg newtype is `#[repr(transparent)]` over
+    /// `u32` and the fieldless oparg enums carry their operand as the
+    /// discriminant, so — once the operand is modeled as an integer
+    /// ([`tyref_is_oparg`], [`oparg_arg_get_alias`]) — every conversion
+    /// below is the identity on that integer:
+    ///   * the inherent `as_u32` / `as_usize` extractors and the
+    ///     `from_u32` constructor (`newtype_oparg!`), and
+    ///   * the `From` conversions (`u32::from(oparg)` for a newtype, the
+    ///     `__discriminant` read for a fieldless enum).
+    /// Gated on the defining impl living in `bytecode::oparg` so the
+    /// generic `from` / `as_u32` / `as_usize` names cannot match
+    /// unrelated types.
+    fn oparg_value_alias(&self, segments: &[String], args: &[Variable]) -> Option<Variable> {
+        let [arg] = args else {
+            return None;
+        };
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "rustpython_compiler_core"
+            || module.as_str() != "oparg"
+            || impl_seg.as_str() != "<Impl>"
+            || !matches!(leaf.as_str(), "as_u32" | "as_usize" | "from_u32" | "from")
+        {
+            return None;
+        }
+        Some(arg.clone())
+    }
+
+    /// The ADT `def_id` behind a signature [`TyRef`], whether inline
+    /// or routed through the dedup table.  `None` for non-ADT shapes.
+    fn tyref_adt_def_id(&self, ty: &TyRef) -> Option<u64> {
+        match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+            TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
+        }
+    }
+
+    /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
+    /// one variant and every variant carrying zero payload fields.  Such
+    /// an enum is represented by-value as its discriminant integer, so
+    /// `Rvalue::Discriminant` on it is the identity on that value (see the
+    /// `Discriminant` lowering).  Payload-carrying enums return `false`
+    /// and keep the `__discriminant` field read against their aggregate
+    /// `Ref` base.
+    fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        match &td.kind {
+            TypeDeclKind::Enum(variants) => {
+                !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
+            }
+            _ => false,
+        }
+    }
+
+    /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
+    /// core fn bodies are Opaque in the LLBC, so the `Call` form is
+    /// permanently unliftable) to a decomposed ovfcheck shape.
+    /// Upstream `translator/simplify.py:70-108 transform_ovfcheck`
+    /// rewrites `ovfcheck(-x)` into the op's `_ovf` variant
+    /// (`flowspace/operation.py:195-200 ovfchecked`, registered by
+    /// `operation.py:466 add_operator('neg', ..., ovf=True)`), whose
+    /// OverflowError edge the caller branches on.  Rust spells that
+    /// ovfcheck as `checked_neg()` + a `Some`/`None` match, so the
+    /// equivalent decomposition writes the destination `Option<i64>`
+    /// as a synthetic aggregate (the same transparent-ctor +
+    /// `FieldWrite` chain `Rvalue::Aggregate` emits):
+    /// `__discriminant = ne(v, i64::MIN)` — negation overflows only
+    /// at `i64::MIN`, and `Option`'s `None`/`Some` tags are 0/1 — and
+    /// payload `__pos_0 = neg(v)` (wrapping; the `None` arm never
+    /// reads it).  The downstream discriminant switch and payload
+    /// downcast then lower through the ordinary enum FieldRead paths.
+    /// Returns `Ok(false)` when the call is not `checked_neg` (or the
+    /// destination's `Option` decl cannot be resolved) so the generic
+    /// `Call` lowering proceeds.
+    fn try_lower_checked_neg(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "checked_neg"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        // Resolve the destination `Option` decl so the FieldWrite owner
+        // matches what `resolve_aggregate_adt` would record for a real
+        // `Some(..)` construction site of the same type.
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        // Same owner-path / ctor-leaf split `resolve_aggregate_adt`
+        // performs, so the ctor target and FieldWrite owner carry the
+        // spellings the rest of the aggregate machinery expects.
+        let owner = td.item_meta.name_path();
+        let arg = arg.clone();
+        let bb_id = self.block_id[mir_bb];
+
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        let payload = push_op(
+            &mut self.graph,
+            OpKind::UnaryOp {
+                op: "neg".to_string(),
+                operand: arg.clone(),
+                result_ty: ValueType::Int,
+            },
+        );
+        let min = push_op(&mut self.graph, OpKind::ConstInt(i64::MIN));
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: arg,
+                rhs: min,
+                result_ty: ValueType::Int,
+            },
+        );
+        self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, payload, dest_local, target)?;
+        Ok(true)
+    }
+
+    /// Lower the infallible `usize::try_from(<u8|u16|u32>)`
+    /// (`core::convert::num::ptr_try_from_impls::<Impl>::try_from`,
+    /// Opaque in the LLBC like every core fn) to its decomposed
+    /// always-`Ok` shape: `__discriminant = 0` (`Result`'s `Ok` tag)
+    /// and `__pos_0 = arg` (the widening is an identity on the i64
+    /// carrier).  Upstream `rarithmetic.py:140-145 widen` performs
+    /// the same smaller-than-word unsigned → Signed widening as a
+    /// no-op; pyre spells it `usize::try_from(x).expect(..)`
+    /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
+    /// `Err` arm is statically dead on the 64-bit-only targets pyre
+    /// supports.  Impls with word-sized-or-wider inputs — the
+    /// genuinely fallible directions of the same impl group — keep
+    /// the `Call` form.
+    fn try_lower_usize_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "ptr_try_from_impls"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "try_from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_uint_atom(src),
+            Some("U8" | "U16" | "U32")
+        ) {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = td.item_meta.name_path();
+        let arg = arg.clone();
+        if self.multi_assigned_locals.contains(&dest_local) {
+            // A re-bindable local may later carry a runtime `Result`,
+            // so the constant tag can't be recorded and consumers
+            // can't be folded — materialize the aggregate so field
+            // reads on the local stay type-consistent.
+            let bb_id = self.block_id[mir_bb];
+            let disc = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(disc.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, arg, dest_local, target)?;
+            return Ok(true);
+        }
+        // Identity widening: bind the destination local directly to
+        // the operand — no `Result` object is materialized at all,
+        // exactly as upstream `widen` leaves no op in the graph.
+        // The discriminant switch always sits in a successor block
+        // (a MIR call terminates its own block), so record the
+        // constant tag per-local: `Rvalue::Discriminant` folds to
+        // `ConstInt(0)` and `expect`/`unwrap` aliases the payload
+        // (`expect_on_const_ok`) without touching the variable.
+        self.const_discriminant_locals.insert(dest_local, 0);
+        self.local_var[dest_local] = Some(arg);
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Resolve `Result::expect` / `Result::unwrap` on a receiver local
+    /// recorded always-`Ok` (`const_discriminant_locals`, tag 0) to
+    /// the receiver variable itself.  Such locals are bound directly
+    /// to the `Ok` payload by [`Lowering::try_lower_usize_try_from`]
+    /// (no `Result` object is materialized), so the unwrap is an
+    /// alias, not an op.  The match these methods perform lives
+    /// inside the Opaque core body, so without the intercept the call
+    /// keeps its panic-message `&str` argument and the graph walls on
+    /// the `__str_const` lowering even though the `Err` arm is
+    /// statically dead.  Upstream has no such call: `ovfcheck`-free
+    /// widening is a plain identity (`rarithmetic.py:140-145 widen`),
+    /// so the operand *is* the whole operation.  Returns `None` for
+    /// any other callee or a receiver without the always-`Ok` record,
+    /// keeping the generic `Call` form.
+    fn expect_on_const_ok(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+    ) -> Option<Variable> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "result"
+            || impl_seg.as_str() != "<Impl>"
+            || !matches!(leaf.as_str(), "expect" | "unwrap")
+        {
+            return None;
+        }
+        let recv = args.first()?;
+        let recv_local = (*arg_locals.first()?)?;
+        if *self.const_discriminant_locals.get(&recv_local)? != 0 {
+            return None;
+        }
+        Some(recv.clone())
+    }
+
+    /// Resolve the reflexive blanket `Into::into`
+    /// (`core::convert::<Impl>::into` where the argument's declared
+    /// type equals the destination's) to its operand.  `impl<T>
+    /// From<T> for T` makes `x.into()` an identity, but the blanket
+    /// fn's body is Opaque in the LLBC so the `Call` form is
+    /// permanently unliftable.  Upstream has no counterpart: an
+    /// identity conversion never appears as an op in RPython graphs.
+    /// Non-reflexive `into` calls (source ≠ destination type) keep
+    /// the generic `Call` form.
+    fn reflexive_into_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "convert"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "into"
+        {
+            return None;
+        }
+        let [arg] = args else {
+            return None;
+        };
+        let src = self.tyref_body(first_arg_ty?)?;
+        let dst = self.tyref_body(dest_ty)?;
+        (src == dst).then(|| arg.clone())
+    }
+
+    /// Resolve the trait-spelled `Into::into` (`["Into", "into"]` — a
+    /// generic-parameter receiver, so Charon cannot select the impl at
+    /// the call site) to its operand when the destination type is
+    /// `alloc::string::String`.  `impl Into<String>` message parameters
+    /// (the `PyError` constructor family) reach `msg.into()` inside the
+    /// generic body; the annotation model maps `String` and `str` to
+    /// the same string value (`project_pyre_field_type` — `s_unicode0`),
+    /// matching upstream's single string type (`rstr.py`), so the
+    /// conversion is an identity at the annotation level.  Other
+    /// destination types keep the generic `Call` form.
+    fn trait_into_string_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [trait_seg, leaf] = segments else {
+            return None;
+        };
+        if trait_seg.as_str() != "Into" || leaf.as_str() != "into" {
+            return None;
+        }
+        let [arg] = args else {
+            return None;
+        };
+        let dest_path = self.tyref_adt_name_path(dest_ty)?;
+        (dest_path == "alloc::string::String").then(|| arg.clone())
+    }
+
+    /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
+    /// resolves to, following `Deduplicated` / `HashConsedValue`
+    /// wrapper layers.  `None` for non-ADT shapes.
+    fn tyref_adt_name_path(&self, ty: &TyRef) -> Option<String> {
+        let mut v = self.tyref_body(ty)?;
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            break;
+        }
+        let def_id = inline_adt_def_id(v)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        Some(td.item_meta.name_path())
+    }
+
+    /// The resolved JSON body of a [`TyRef`], following the dedup
+    /// table.  Two `TyRef`s denote the same type iff their bodies are
+    /// structurally equal (the dedup table only dedupes identical
+    /// bodies, so mixed inline/dedup spellings still compare equal).
+    fn tyref_body<'t>(&self, ty: &'t TyRef) -> Option<&'t serde_json::Value>
+    where
+        'a: 't,
+    {
+        match ty {
+            TyRef::Inline { value: (_, v) } => Some(v),
+            TyRef::Other(v) => Some(v),
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id),
+        }
+    }
+
+    /// The `UInt` width atom (`"U8"` / `"U32"` / `"Usize"` …) of a
+    /// scalar-typed [`TyRef`], `None` for any non-`UInt` shape.
+    fn tyref_literal_uint_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        let value = match ty {
+            TyRef::Inline { value: (_, v) } => v,
+            TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        value
+            .as_object()?
+            .get("Literal")?
+            .as_object()?
+            .get("UInt")?
+            .as_str()
+    }
+
+    /// Shared tail for the decomposed checked-arithmetic /
+    /// infallible-conversion call lowerings: write `disc` and
+    /// `payload` into the destination `Option`/`Result` local as a
+    /// synthetic aggregate — the same transparent-ctor + `FieldWrite`
+    /// chain [`Rvalue::Aggregate`] emits — then bind the destination
+    /// local and close the block toward the call's success target.
+    ///
+    /// Unlike `resolve_aggregate_adt`'s enum arm, which constructs
+    /// the VARIANT identity (`Option::Some`), this constructs the
+    /// enum TYPE root (`Option`) and writes `__discriminant`
+    /// explicitly.  That is deliberate: `disc` may be a runtime value
+    /// (`checked_neg`'s `ne(v, MIN)`), so no single variant identity
+    /// is correct, and the enum root is exactly the flat class every
+    /// downstream enum attr read keys (`Rvalue::Discriminant` reads
+    /// `__discriminant` with no owner, payload projections key the
+    /// enum leaf — `resolve_adt_field` — and `extract_struct_fields`
+    /// registers `__discriminant` + the payload-field union on the
+    /// root).  Constructing a variant identity here instead breaks
+    /// the real-path annotation of multi-assigned destination locals
+    /// (`<other> ∪ int` UnionError in `mergeinputargs`).
+    fn emit_tagged_pair_aggregate(
+        &mut self,
+        mir_bb: usize,
+        owner: &str,
+        disc: Variable,
+        payload: Variable,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
+        let ctor_name = owner_path.pop().unwrap_or_default();
+        let ctor_target = if owner_path.is_empty() {
+            CallTarget::synthetic_transparent_ctor(ctor_name.clone())
+        } else {
+            CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: ctor_target,
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
+            },
+        });
+        // Both decomposed fields carry integers: the `__discriminant`
+        // tag is an `i64` (matching the `Rvalue::Discriminant`
+        // `FieldRead` and the `i64` field registration) and the
+        // `__pos_0` payload is the negated / widened integer the
+        // `checked_neg` / `usize::try_from` callers materialize.  A
+        // `Ref` field type here would disagree with that registration.
+        for (name, value) in [("__discriminant", disc), ("__pos_0", payload)] {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: res.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: name.to_string(),
+                        owner_root: Some(owner.to_string()),
+                    },
+                    value,
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
     fn lower_switch(
         &mut self,
         mir_bb: usize,
@@ -3883,6 +4895,36 @@ impl<'a> Lowering<'a> {
         let discr_var = self.resolve_operand(mir_bb, discr)?;
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
+                // Constant-bool discriminant: take the known arm
+                // unconditionally.  `flowcontext.py:364-367
+                // FlowContext.guessbool` returns a Constant condition's
+                // value directly instead of forking the recorder, so a
+                // translation-time `const` gate like
+                // `if WITHPREBUILTINT { ... }` leaves no branch in the
+                // upstream graph.  The discriminant here is a fresh var
+                // whose defining op sits in this same block when the
+                // read folded to a constant (`static_addr_op` /
+                // `global_literal_init_op` chain); the untaken target
+                // stays in `block_id` but drops out via the adapter's
+                // reachability prune.
+                let const_cond = self
+                    .graph
+                    .block(bb_id)
+                    .operations
+                    .iter()
+                    .rev()
+                    .find(|op| op.result.as_ref() == Some(&discr_var))
+                    .and_then(|op| match op.kind {
+                        OpKind::ConstBool(b) => Some(b),
+                        _ => None,
+                    });
+                if let Some(cond) = const_cond {
+                    let taken = if cond { then_bb } else { else_bb };
+                    let args = self.edge_args(mir_bb, taken as usize)?;
+                    self.graph
+                        .set_goto(bb_id, self.block_id[taken as usize], args);
+                    return Ok(());
+                }
                 // Route through `set_branch` so the cond gets the
                 // upstream `bool` UnaryOp wrap before becoming the
                 // exitswitch (flowcontext.py:756
@@ -4055,7 +5097,141 @@ fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet
     set
 }
 
-fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
+/// MIR locals assigned more than once anywhere in `body` — statement
+/// assigns plus call destinations.  See
+/// [`Lowering::multi_assigned_locals`].
+fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashSet<usize> {
+    let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut bump = |place: &Place| {
+        if let PlaceKind::Local(i) = place.kind {
+            *counts.entry(i as usize).or_insert(0) += 1;
+        }
+    };
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() {
+                bump(&place);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            bump(&call.dest);
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether a statically-resolved [`RegularCall`] is a workspace
+/// `Index::index` / `IndexMut::index_mut` impl (the `FixedObjectArray`
+/// family) — those bottom out at raw-slice construction and are lowered
+/// as RPython's getarrayitem rather than a residual call.  Shared by the
+/// call-lowering intercept and the liveness pre-pass.
+fn is_workspace_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    let path = fd.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or("");
+    (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+}
+
+/// The MIR local behind a plain-local [`Operand`], or `None` for a
+/// constant or a projected place.
+fn operand_local(op: Option<&Operand>) -> Option<usize> {
+    match op? {
+        Operand::Copy(p) | Operand::Move(p) => match p.kind {
+            PlaceKind::Local(i) => Some(i as usize),
+            _ => None,
+        },
+        Operand::Const(_) => None,
+    }
+}
+
+/// The base MIR local of a `*p = v` deref write (`Projection(Local(p),
+/// Deref)`), or `None` for any other place shape — the same destination
+/// shape [`Lowering::emit_projection_write`] re-expresses as an
+/// `ArrayWrite` when `p` was bound by a workspace index call.
+fn deref_write_base_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let ProjectionElem::Atom(s) = elem else {
+        return None;
+    };
+    if s != "Deref" {
+        return None;
+    }
+    match inner.kind {
+        PlaceKind::Local(i) => Some(i as usize),
+        _ => None,
+    }
+}
+
+/// Per-block extra-live MIR locals for the deferred array-write base /
+/// index of a workspace `index` / `index_mut` call.
+///
+/// `arr[i] = v` lowers to `_p = index_mut(_s, _i)` (recorded as an
+/// `index_elem_alias`, [`Lowering::lower_call`]) followed — across the
+/// call's own block split — by `*_p = v`, which
+/// [`Lowering::emit_projection_write`] re-expresses as `ArrayWrite {
+/// base: _s, index: _i, .. }`.  That `ArrayWrite` is a synthetic use of
+/// `_s` / `_i` the MIR never spells, so plain liveness drops them before
+/// the write block and the base reaches the rtyper as an undefined
+/// operand.  Return, per block, the base/index locals of every such
+/// `_p` deref-written in it, for [`compute_mir_liveness`] to mark live;
+/// the backward fixpoint then threads them from their definition (which
+/// dominates the `_p` use).
+fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<usize>> {
+    let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
+        std::collections::HashMap::new();
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !is_workspace_index_regular(reg, llbc) {
+            continue;
+        }
+        let PlaceKind::Local(p) = call.dest.kind else {
+            continue;
+        };
+        index_call.insert(
+            p as usize,
+            (
+                operand_local(call.args.first()),
+                operand_local(call.args.get(1)),
+            ),
+        );
+    }
+    let mut extra = vec![Vec::new(); body.body.len()];
+    if index_call.is_empty() {
+        return extra;
+    }
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if let Some(p) = deref_write_base_local(&place)
+                && let Some((base, idx)) = index_call.get(&p)
+            {
+                extra[bb_idx].extend(base.iter().copied());
+                extra[bb_idx].extend(idx.iter().copied());
+            }
+        }
+    }
+    extra
+}
+
+fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<Vec<bool>> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut uses = vec![vec![false; n_locals]; n_blocks];
@@ -4113,6 +5289,20 @@ fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
             }
             TermKind::Drop { target, .. } => push_successor(&mut succs[bb_idx], target, n_blocks),
             TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
+        }
+    }
+
+    // Synthetic deferred-array-write uses: the base/index of a
+    // workspace index call feed an `ArrayWrite` the MIR never spells
+    // (see `compute_index_write_extra_live`).  Mark them live-used in
+    // the block that holds the `*p = v` write — unless that block also
+    // defines them — so the backward fixpoint threads them in from
+    // their definition, which dominates the `_p` use.
+    for (bb_idx, locals) in extra_live.iter().enumerate().take(n_blocks) {
+        for &local_idx in locals {
+            if local_idx < n_locals && !defs[bb_idx][local_idx] {
+                uses[bb_idx][local_idx] = true;
+            }
         }
     }
 
@@ -4703,6 +5893,32 @@ fn aggregate_ctor_name(kind: &serde_json::Value) -> String {
         return s.to_string();
     }
     if let Some(obj) = kind.as_object() {
+        // `{"Adt": [{"id": "Tuple" | {"Builtin": "Array"}}, ...]}` — an
+        // aggregate whose type id is a builtin container atom rather
+        // than a resolvable ADT def_id.  Name the placeholder after the
+        // id atom so every tuple/array site shares one spelling; the
+        // wrapper key "Adt" would mint a fresh same-named class per
+        // site (the adapter's bare-leaf arm does not intern), and two
+        // `()` values meeting at a join then fail to union ("RPython
+        // cannot unify instances with no common base class").
+        if let Some(id) = obj
+            .get("Adt")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(serde_json::Value::as_object)
+            .and_then(|m| m.get("id"))
+        {
+            if let Some(atom) = id.as_str() {
+                return atom.to_string();
+            }
+            if let Some(builtin) = id
+                .as_object()
+                .and_then(|m| m.get("Builtin"))
+                .and_then(serde_json::Value::as_str)
+            {
+                return builtin.to_string();
+            }
+        }
         if let Some(k) = obj.keys().next() {
             return k.clone();
         }
@@ -4868,6 +6084,23 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // Non-`Literal` (ADT / pointer / tuple) shapes only.  Atomic wrappers
+    // type as their inner value; integer widths collapse to `Int` here,
+    // matching the literal-int handling above.  Checked after the cheap
+    // `Literal` fast-path so primitive operands never pay the lookup.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return match inner {
+            ValueType::Unsigned => ValueType::Int,
+            other => other,
+        };
+    }
+    // `OpArg` is the transparent `struct OpArg(u32)` raw-operand wrapper;
+    // its external decl is `Opaque`, so it would otherwise fall to
+    // `Ref(None)` and shell to a classdef-less instance.  Model it as the
+    // bare integer operand it carries (`tyref_is_oparg`).
+    if tyref_is_oparg(ty, llbc) {
+        return ValueType::Int;
+    }
     ValueType::Ref(None)
 }
 
@@ -4919,6 +6152,14 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Float;
             }
         }
+    }
+    // Non-`Literal` (ADT / pointer / tuple) shapes only.  Atomic wrappers
+    // type as their inner value; unlike [`tyref_to_value_type`] the
+    // signed/unsigned split is kept here (`AtomicUsize` → `Unsigned`) so
+    // the per-field someshell matches the inner scalar.  Checked after
+    // the cheap `Literal` fast-path so primitive fields never pay it.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return inner;
     }
     ValueType::Ref(None)
 }
@@ -4978,6 +6219,47 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
+/// The inner [`ValueType`] of a `core::sync::atomic` atomic type
+/// (`AtomicI64` → `Int`, `AtomicUsize` → `Unsigned`, `AtomicBool` →
+/// `Bool`, `AtomicPtr<T>` → `Ref(None)`), or `None` when `ty` is not a
+/// std atomic.  The atomic wrappers are layout-transparent over their
+/// inner scalar/pointer (asserted at pyobject.rs for the `PyType` vtable
+/// `subclassrange_*` / `instantiate` fields), and the upstream typeptr
+/// ranges are plain int fields, so a field of one types as that inner
+/// value and its `load`/`store` fold to it (`is_atomic_load`).
+fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let id = adt_node_def_id(node)?;
+    let name = &llbc.type_by_id(id)?.item_meta.name;
+    // Cheap leaf check first — no path-string allocation (unlike
+    // `name_path` / `adt_path_of_tyref`).  This runs on the hot
+    // `tyref_to_value_type` fallback path, so it must stay
+    // allocation-free: bail before the module scan unless the type's
+    // last segment is an `Atomic*` ident.
+    let leaf = match name.last()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        NameSeg::Other(_) => return None,
+    };
+    if !leaf.starts_with("Atomic") {
+        return None;
+    }
+    // Confirm std's `core::sync::atomic` module so a user type
+    // coincidentally named `Atomic*` does not match.
+    let in_atomic_mod = name
+        .iter()
+        .any(|s| matches!(s, NameSeg::Ident { ident: (id, _) } if id == "atomic"));
+    if !in_atomic_mod {
+        return None;
+    }
+    match leaf {
+        "AtomicPtr" => Some(ValueType::Ref(None)),
+        "AtomicBool" => Some(ValueType::Bool),
+        l if l.starts_with("AtomicI") => Some(ValueType::Int),
+        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+        _ => None,
+    }
+}
+
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
 /// the zero-sized oparg marker (`pub struct Arg<T: OpArgType>
 /// (PhantomData<T>)`, instruction.rs:1262).  The external decl is
@@ -4989,6 +6271,34 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
+}
+
+/// Whether a `TyRef` resolves (behind reference wrappers) to the
+/// `rustpython_compiler_core::bytecode::oparg::OpArg` newtype.  `OpArg`
+/// is the transparent `struct OpArg(u32)` raw-operand wrapper; its
+/// external decl is `Opaque` in the LLBC, so a payload row spelled
+/// through it would project to an attr the annotator cannot type.  The
+/// value is only ever the raw u32 operand (constructed from a `u32`,
+/// consumed by `Arg::get` / `u32::from`), so the lifted model carries it
+/// as a plain integer wherever it appears — matching upstream, where the
+/// bytecode operand is a bare int with no wrapper type.
+fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    // Cheap leaf check before the full path-string comparison: bail
+    // unless the type's last segment is the `OpArg` ident.
+    let leaf_is_oparg = matches!(
+        td.item_meta.name.last(),
+        Some(NameSeg::Ident { ident: (s, _) }) if s == "OpArg"
+    );
+    leaf_is_oparg && td.item_meta.name_path().ends_with("oparg::OpArg")
 }
 
 /// The ADT def_id of an (already wrapper-stripped) type node, or
@@ -5117,6 +6427,88 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
         .as_u64()
 }
 
+/// True when fn-level type variable `var_index` carries an
+/// `Into<String>` trait clause.  The clause's trait generics spell
+/// `[<subject>, <target>]`; the subject must be our variable and the
+/// target must resolve to the `alloc::string::String` ADT, with the
+/// trait decl's leaf name `Into` (a `From<String>` bound has the same
+/// generics shape but means the *opposite* conversion).
+fn typevar_bounded_by_into_string(
+    var_index: u64,
+    fn_generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    let Some(clauses) = fn_generics
+        .as_object()
+        .and_then(|g| g.get("trait_clauses"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    fn strip<'a>(llbc: &'a Llbc, mut v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            return Some(v);
+        }
+    }
+    for clause in clauses {
+        let Some(sb) = clause
+            .as_object()
+            .and_then(|c| c.get("trait_"))
+            .and_then(|t| t.as_object())
+            .and_then(|t| t.get("skip_binder"))
+            .and_then(|s| s.as_object())
+        else {
+            continue;
+        };
+        let is_into = sb
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| llbc.trait_by_id(id))
+            .map(|td| td.item_meta.name_path())
+            .is_some_and(|n| n.rsplit("::").next() == Some("Into"));
+        if !is_into {
+            continue;
+        }
+        let Some(types) = sb
+            .get("generics")
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+        else {
+            continue;
+        };
+        let subject_is_var = types
+            .first()
+            .and_then(|s| strip(llbc, s))
+            .and_then(typevar_bound_index)
+            == Some(var_index);
+        if !subject_is_var {
+            continue;
+        }
+        let target_is_string = types
+            .get(1)
+            .and_then(|t| resolve_tyexpr_to_adt_def_id_free(llbc, t))
+            .and_then(|id| llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String");
+        if target_is_string {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve a generic parameter type (`&T` where `T: Trait`, including a
 /// trait default body's `&Self`) to the bound trait's qualified
 /// `name_path()`.
@@ -5149,6 +6541,16 @@ fn tyref_generic_trait_bound_root(
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let param_index = typevar_bound_index(strip_ty_wrappers(node, llbc)?)?;
+    // `T: Into<String>` — the conventional message-parameter bound
+    // (`PyError::type_error(msg: impl Into<String>)`).  Such a variable
+    // is a string at the annotation level (the model maps `String` and
+    // `str` to one string type), so it resolves to the `"String"` root
+    // and the input-cell derivation seeds `s_unicode0` instead of a
+    // classdef-less instance shell whose field writes would poison
+    // classdef attr cells.
+    if typevar_bounded_by_into_string(param_index, generics, llbc) {
+        return Some("String".to_string());
+    }
     for clause in generics.get("trait_clauses")?.as_array()? {
         let Some(pred) = clause.get("trait_").and_then(|t| t.get("skip_binder")) else {
             continue;

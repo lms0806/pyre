@@ -1230,6 +1230,78 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `__pyre_cast_instance` — front-end pointer-downcast
+                    // narrow (#298).  `front::mir` emits a synthetic
+                    // `Call(["__pyre_cast_instance", <root>], [operand])`
+                    // for `obj as *const RegisteredStruct`, stashing the
+                    // target struct root in `segments[1]` because the
+                    // `Vec<Variable>` arg carrier cannot hold a `Constant`
+                    // (same carrier limitation as the Branch-3c
+                    // `simple_call(<exc class>)` reconstruction below).
+                    // Reconstruct it here as `simple_call(callable,
+                    // operand, Constant(root))`: the analyzer reads the
+                    // trailing `ByteStr` root to type the result
+                    // `SomeInstance(root)`, and the typer lowers the call
+                    // to a `cast_pointer`.  The callable resolves through
+                    // the `__pyre_cast_instance` HOST_ENV singleton so its
+                    // Arc identity matches the `BUILTIN_TYPER` key.
+                    if segments.len() == 2 && segments[0] == "__pyre_cast_instance" {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "__pyre_cast_instance requires exactly one operand, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let callable_host = HOST_ENV
+                            .lookup_builtin("__pyre_cast_instance")
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "__pyre_cast_instance missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let callable =
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        call_args.push(callable);
+                        call_args.extend(arg_hls);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                            &segments[1],
+                        ))));
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
+                    // `<[T]>::len(slice)` — the slice-receiver `.len()`
+                    // method call.  Rust lowers `slice.len()` to a MIR
+                    // call to `core::slice::<impl [T]>::len`, not to the
+                    // `Rvalue::Len` that `front/mir.rs` lowers to a
+                    // `__len` synthetic.  There is no source body for the
+                    // intrinsic to register, so route it to the rtyper's
+                    // `len` operation (`rtyper.rs:2016 "len" arm` →
+                    // `Repr.rtype_len`), the same dispatch upstream
+                    // `op.len(v)` reaches via `unaryop.py:867-870`.  The
+                    // receiver annotates as `SomeList` (slices map to
+                    // `SomeList` in `bookkeeper`), so `rtype_len` lands on
+                    // the list repr's `ll_length` lowering.
+                    if segments.len() == 4
+                        && segments[0] == "core"
+                        && segments[1] == "slice"
+                        && segments[2] == "<Impl>"
+                        && segments[3] == "len"
+                    {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "core::slice::<Impl>::len requires exactly one receiver arg, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "core::slice::<Impl>::len requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -1410,22 +1482,23 @@ pub fn translate_op(
                     // interned: a bare variant name like `Ok` is ambiguous
                     // across enums, so interning it would conflate distinct
                     // classes onto one `ClassDesc`.  Exception: the fixed
-                    // aggregate-kind placeholder tags (`Adt` for tuples /
-                    // unresolved ADTs, `Array`, `Closure` — see
-                    // `front::mir::aggregate_ctor_name`) are not variant
-                    // names, and the construction-side FieldWrite chain
-                    // shares the same tag as `owner_root` with the
-                    // field-projection side (which resolves it through
-                    // `getuniqueclassdef_for_struct_root` →
-                    // `intern_class_by_qualname`).  Minting a fresh Arc
-                    // per site here splits the placeholder into one
-                    // `ClassDef` per occurrence, so the value's classdef
-                    // can never match the field repr's interned classdef
-                    // (rtyper convert_from_to has no common base → typer
-                    // error).
+                    // aggregate-kind placeholder tags named by id atom
+                    // (`Tuple` for tuples / unresolved ADTs, `Array`,
+                    // `Closure` — see `front::mir::aggregate_ctor_name`) are
+                    // not variant names; they name ONE universal placeholder
+                    // each (no enum ambiguity), and the construction-side
+                    // FieldWrite chain shares the same tag as `owner_root`
+                    // with the field-projection side (which resolves it
+                    // through `getuniqueclassdef_for_struct_root` →
+                    // `intern_class_by_qualname`).  Minting a fresh Arc per
+                    // site here splits the placeholder into one `ClassDef`
+                    // per occurrence, so the value's classdef can never match
+                    // the field repr's interned classdef (rtyper
+                    // convert_from_to has no common base → typer error), and
+                    // two `()` values meeting at a join can never union.
                     let host = if owner_path.is_empty() {
-                        if matches!(name.as_str(), "Adt" | "Array" | "Closure") {
-                            call_registry.bookkeeper().intern_class_by_qualname(name)
+                        if matches!(name.as_str(), "Tuple" | "Array" | "Closure") {
+                            call_registry.bookkeeper().intern_class_by_qualname(&name)
                         } else {
                             HostObject::new_class(name.clone(), Vec::new())
                         }
@@ -2060,6 +2133,20 @@ pub(crate) fn derive_subject_inputcells(
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py:283-305 FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
+                // String-typed params are string values, not class
+                // instances: `String` and `str` both map to the single
+                // unicode string type (`project_pyre_field_type` —
+                // `s_unicode0`; string literals lower to `UniStr`
+                // constants).  The foreign
+                // `alloc::string::String` TypeDecl also registers
+                // struct-field rows, so the registry path below would
+                // otherwise seed a `SomeInstance(String)` shell whose
+                // field writes poison classdef attr cells with
+                // instance-annotated strings.
+                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
+                    cells.push(crate::annotator::model::s_unicode0());
+                    continue;
+                }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
                     // A generic param (`&T` where `T: Trait`, incl. a
                     // trait default body's `&Self`) carries the bound

@@ -490,6 +490,42 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::has_hash_w_hook",
+        "pyre_object::has_hash_w_hook",
+        pyre_object::dict_eq_hook::has_hash_w_hook as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::hash_w_hooked",
+        "pyre_object::hash_w_hooked",
+        pyre_object::dict_eq_hook::hash_w_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::has_compares_by_identity_hook",
+        "pyre_object::has_compares_by_identity_hook",
+        pyre_object::dict_eq_hook::has_compares_by_identity_hook as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::compares_by_identity_hooked",
+        "pyre_object::compares_by_identity_hooked",
+        pyre_object::dict_eq_hook::compares_by_identity_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::signal_hash_error",
+        "pyre_object::signal_hash_error",
+        pyre_object::dict_eq_hook::signal_hash_error as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::take_hash_error",
+        "pyre_object::take_hash_error",
+        pyre_object::dict_eq_hook::take_hash_error as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
         crate::stack_check::stack_almost_full as *const (),
@@ -1047,13 +1083,11 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
         ),
         pytype_addr!("weakref::GC_WEAKREF_TYPE", weakref::GC_WEAKREF_TYPE),
-        // CELL_TYPE / SLICE_TYPE / RANGE_TYPE / RANGE_ITER_TYPE /
-        // SEQ_ITER_TYPE are deliberately absent: folding them lets
-        // previously-Skipped object-space graphs lift, and
-        // ArithmeticOpcodeHandler::compare_value then hits a fatal
-        // "UnionError in mergeinputargs: <other> ∪ <other>" (CELL_TYPE
-        // alone reproduces it).  Add them back once that union is
-        // resolved.
+        pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
+        pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
+        pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),
+        pytype_addr!("rangeobject::RANGE_ITER_TYPE", rangeobject::RANGE_ITER_TYPE),
+        pytype_addr!("rangeobject::SEQ_ITER_TYPE", rangeobject::SEQ_ITER_TYPE),
         pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
         pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
         pytype_addr!(
