@@ -5964,7 +5964,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // this helper switches to
     // `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`.
     //
-    // The snapshot is therefore single Python frame at the outer
+    // The snapshot is therefore a single Python frame at the outer
     // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
     // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
     // carries the `PyFrame` state at the Python opcode boundary

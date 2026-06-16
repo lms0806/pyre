@@ -3545,7 +3545,7 @@ mod dict_method_tests {
 
     use crate::test_hooks::install_hash_hook;
 
-    fn assert_type_error(result: Result<PyObjectRef, crate::PyError>) {
+    fn assert_type_error<T: std::fmt::Debug>(result: Result<T, crate::PyError>) {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
     }

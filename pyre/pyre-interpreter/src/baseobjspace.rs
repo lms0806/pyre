@@ -1339,7 +1339,13 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 
 /// Set item by index: `obj[index] = value`.
 
-pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+// `STORE_SUBSCR` discards the result (`pypy/interpreter/pyopcode.py:702`
+// calls `space.setitem` as a bare statement), so the traced residual
+// call is a void `CALL_N` (`rpython/jit/codewriter/jtransform.py
+// handle_residual_call` keys `result_kind` off the discarded result's
+// Void concretetype). The unit return models that: the prior `PyResult`
+// (always `Ok(w_none())`) surfaced a ref result every caller discards.
+pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     let obj = unwrap_cell(obj);
     let index = unwrap_cell(index);
     let value = unwrap_cell(value);
@@ -1355,19 +1361,19 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
             ));
         }
         if is_list(obj) {
-            return setitem_list(obj, index, value);
+            return setitem_list(obj, index, value).map(|_| ());
         }
         if is_dict(obj) {
             return match pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) {
-                Ok(()) => Ok(w_none()),
+                Ok(()) => Ok(()),
                 Err(_) => Err(take_pending_hash_error()),
             };
         }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return setitem_bytearray(obj, index, value);
+            return setitem_bytearray(obj, index, value).map(|_| ());
         }
         if is_instance(obj) {
-            return setitem_instance(obj, index, value);
+            return setitem_instance(obj, index, value).map(|_| ());
         }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",

@@ -1198,7 +1198,8 @@ pub fn proxy_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 pub fn proxy_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    crate::baseobjspace::setitem(w_obj0, args[1], args[2])
+    crate::baseobjspace::setitem(w_obj0, args[1], args[2])?;
+    Ok(pyre_object::w_none())
 }
 
 pub fn proxy_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

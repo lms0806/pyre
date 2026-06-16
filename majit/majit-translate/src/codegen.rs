@@ -1518,10 +1518,13 @@ pub fn generated_compare_value_direct(
 /// Trace a unary int operation: unbox → op → (no re-box, returns raw int).
 ///
 /// RPython jitcode parity: guard_class + getfield_gc_i + INT_NEG/INT_INVERT.
-/// For IntNeg, also emits guard_false(value == INT_MIN) to prevent overflow.
+/// For IntNeg, declines the fast path at concrete INT_MIN (descr_neg's long
+/// branch) and otherwise emits guard_false(value == INT_MIN) so a later
+/// INT_MIN input deopts to the long path.
 ///
-/// Returns None if the operand is not an int → caller should fall back
-/// to residual trace_unary_negative/invert_value.
+/// Returns None if the operand is not an int, or is the INT_MIN neg special
+/// case → caller should fall back to residual
+/// trace_unary_negative/invert_value.
 #[inline]
 pub fn generated_unary_int_value(
     frame: &mut crate::state::MIFrame,
@@ -1544,8 +1547,15 @@ pub fn generated_unary_int_value(
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
         crate::state::trace_unbox_int_with_resume(frame, value, int_type_addr)
     };
-    // intobject.py int_neg: guard against INT_MIN (overflow to long).
+    // intobject.py:628 descr_neg: `if a == MININT: return <long>`.  At
+    // concrete MININT the interpreter negates through the long branch, so
+    // decline the int fast path and let the residual long-neg be traced —
+    // an int_neg here would diverge from that long result and trip the
+    // guard_false below on its own recording value.
     if matches!(opcode, OpCode::IntNeg) {
+        if unsafe { pyre_object::w_int_get_value(concrete_value) } == i64::MIN {
+            return None;
+        }
         let min_val = ctx.const_int(i64::MIN);
         let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
         if let Some(majit_ir::Value::Int(n)) = ctx.box_value(payload) {

@@ -260,21 +260,19 @@ pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
+pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
     match crate::setitem(
         obj as PyObjectRef,
         index as PyObjectRef,
         value as PyObjectRef,
     ) {
-        Ok(_) => 0,
+        Ok(()) => {}
         Err(err) => {
             // llmodel.py:194-199 _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after STORE_SUBSCR (instruction_may_raise) deopts and re-raises
-            // through the blackhole resume instead of crashing.  Return garbage
-            // — the guard fires before the result is used.
+            // through the blackhole resume instead of crashing.
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
         }
     }
 }
@@ -351,14 +349,13 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// already depends on pyre-interpreter for the normal recording-time
 /// helpers (`jit_setitem`, `jit_getitem`, ...).
 ///
-/// Returns 1 on success, 0 on raise (exception object stashed in
-/// `BH_LAST_EXC_VALUE`); the polarity matches the executor's
-/// raise-vs-success ABI for void residual_calls and parallels
-/// `bh_execute_store_subscr` above.  `jit_setitem` upstream of this
-/// (called by `setarrayitem_gc` arms) panics on raise because the
-/// strategy guard upstream proves the raise cannot happen; this
-/// helper covers the residual-call leg where the raise is
-/// observable.
+/// `BH_LAST_EXC_VALUE`); the 1/0 polarity parallels
+/// `bh_execute_store_subscr` above and matches the executor's
+/// raise-vs-success ABI for void residual_calls.  The trait-side void
+/// `jit_setitem` instead publishes the raise into the backend
+/// pos_exception cells (the recorded GuardNoException re-raises through
+/// the blackhole resume) — `bh_store_subscr_fn` is the residual-call
+/// leg, which signals the raise to the dispatcher via the 0 return.
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
@@ -425,10 +422,7 @@ mod tests {
         unsafe {
             assert_eq!(w_int_get_value(item), 4);
         }
-        assert_eq!(
-            jit_setitem(list as i64, w_int_new(0) as i64, w_int_new(9) as i64),
-            0
-        );
+        jit_setitem(list as i64, w_int_new(0) as i64, w_int_new(9) as i64);
         let updated = jit_getitem(list as i64, w_int_new(0) as i64) as PyObjectRef;
         unsafe {
             assert_eq!(w_int_get_value(updated), 9);

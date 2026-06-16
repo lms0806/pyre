@@ -432,8 +432,14 @@ impl pyre_interpreter::ArithmeticOpcodeHandler for crate::state::MIFrame {
         let concrete_val = value.concrete.to_pyobj();
         let mut result_concrete = crate::state::ConcreteValue::Null;
         if !concrete_val.is_null() && unsafe { pyre_object::is_int(concrete_val) } {
-            let v = unsafe { pyre_object::w_int_get_value(concrete_val) };
-            result_concrete = crate::state::ConcreteValue::Int(v.wrapping_neg());
+            // Compute the concrete via interpreter dispatch (baseobjspace::neg),
+            // mirroring `concrete_binary_value` / `concrete_compare_value`:
+            // `checked_neg` promotes `i64::MIN` to a `W_Long` bigint instead of
+            // wrapping, matching the executed value.  For ordinary ints this
+            // yields the same `Int(-v)`.
+            if let Ok(r) = pyre_interpreter::opcode_ops::unary_negative_value(concrete_val) {
+                result_concrete = crate::state::ConcreteValue::from_pyobj(r);
+            }
         }
         let opref = self.unary_int_value(value.opref, majit_ir::OpCode::IntNeg, concrete_val)?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))

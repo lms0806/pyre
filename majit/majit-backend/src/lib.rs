@@ -2154,18 +2154,20 @@ pub trait Backend: Send {
             .wrapping_add((index as usize).wrapping_mul(itemsize));
         // SAFETY: `array_ptr` is a GC-managed array pointer threaded through
         // from the trace recorder; `index` is bounded by the outer
-        // interpreter's array-length precondition.  Mirrors `llmodel.py:592
-        // read_int_at_mem` raw pointer read with size + sign discrimination
-        // from the array descriptor.
+        // interpreter's array-length precondition.  `read_unaligned` mirrors
+        // `llmodel.py:592 read_int_at_mem` — a raw load that does not assume
+        // natural alignment (byte/short item arrays need not be 8-aligned) —
+        // with size + sign discrimination from the array descriptor, matching
+        // the dynasm backend's read_int_at_mem.
         unsafe {
             match (itemsize, is_signed) {
-                (1, true) => *(item_addr as *const i8) as i64,
-                (1, false) => *(item_addr as *const u8) as i64,
-                (2, true) => *(item_addr as *const i16) as i64,
-                (2, false) => *(item_addr as *const u16) as i64,
-                (4, true) => *(item_addr as *const i32) as i64,
-                (4, false) => *(item_addr as *const u32) as i64,
-                (8, _) => *(item_addr as *const i64),
+                (1, true) => (item_addr as *const i8).read_unaligned() as i64,
+                (1, false) => (item_addr as *const u8).read_unaligned() as i64,
+                (2, true) => (item_addr as *const i16).read_unaligned() as i64,
+                (2, false) => (item_addr as *const u16).read_unaligned() as i64,
+                (4, true) => (item_addr as *const i32).read_unaligned() as i64,
+                (4, false) => (item_addr as *const u32).read_unaligned() as i64,
+                (8, _) => (item_addr as *const i64).read_unaligned(),
                 other => panic!(
                     "bh_getarrayitem_gc_i: unsupported (itemsize, signed) = {:?}",
                     other,
@@ -2183,13 +2185,40 @@ pub trait Backend: Send {
         GcRef::NULL
     }
     /// model.py:211 bh_getarrayitem_gc_f(array, index, arraydescr)
+    ///
+    /// `llmodel.py:601-604`:
+    ///   ofs = unpack_arraydescr(arraydescr)
+    ///   fsize = rffi.sizeof(longlong.FLOATSTORAGE)
+    ///   read_float_at_mem(array, itemindex * fsize + ofs)
+    /// The float load uses the FIXED `FLOATSTORAGE` width, not the
+    /// descriptor's `itemsize`; `base_size` supplies `ofs`.  Shared by
+    /// pyre's raw-memory backends (cranelift, dynasm, wasm); backends
+    /// routing array reads through their own runtime override this.
     fn bh_getarrayitem_gc_f(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        use majit_translate::jitcode::BhDescr;
+        let base_size = match arraydescr {
+            BhDescr::Array { base_size, .. } => *base_size,
+            other => panic!(
+                "bh_getarrayitem_gc_f: expected BhDescr::Array, got {:?}",
+                other,
+            ),
+        };
+        // rffi.sizeof(longlong.FLOATSTORAGE)
+        const FSIZE: usize = 8;
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(FSIZE));
+        // SAFETY: `array_ptr` is a float-array pointer threaded through from
+        // the trace recorder; `index` is bounded by the outer interpreter's
+        // array-length precondition.  `read_unaligned` mirrors `llmodel.py:490
+        // read_float_at_mem` — a raw `FLOATSTORAGE` load that does not assume
+        // natural alignment — matching the dynasm backend's read_float_at_mem.
+        unsafe { (item_addr as *const f64).read_unaligned() }
     }
     /// model.py:247 bh_setarrayitem_gc_i(array, index, newvalue, arraydescr)
     fn bh_setarrayitem_gc_i(
@@ -2221,22 +2250,31 @@ pub trait Backend: Send {
 
     // ── model.py: raw array operations ──
     /// model.py:212 bh_getarrayitem_raw_i(array, index, arraydescr)
+    ///
+    /// `llmodel.py:592 read_int_at_mem(array, ofs + index * size, size,
+    /// sign)` — identical typed-int memory load as the GC variant for the
+    /// blackhole reader, so route through [`bh_getarrayitem_gc_i`].
     fn bh_getarrayitem_raw_i(
         &self,
-        _array: i64,
-        _index: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        self.bh_getarrayitem_gc_i(array, index, arraydescr)
     }
     /// model.py:214 bh_getarrayitem_raw_f(array, index, arraydescr)
+    ///
+    /// `llmodel.py:625 bh_getarrayitem_raw_f = bh_getarrayitem_gc_f` — the
+    /// raw float read is the identical typed memory access as the GC
+    /// variant for the blackhole reader, so route through
+    /// [`bh_getarrayitem_gc_f`].
     fn bh_getarrayitem_raw_f(
         &self,
-        _array: i64,
-        _index: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        self.bh_getarrayitem_gc_f(array, index, arraydescr)
     }
     /// model.py:250 bh_setarrayitem_raw_i(array, index, newvalue, arraydescr)
     fn bh_setarrayitem_raw_i(

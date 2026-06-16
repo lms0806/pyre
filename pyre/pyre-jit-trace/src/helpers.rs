@@ -538,7 +538,15 @@ pub trait TraceHelperAccess {
 
     fn trace_store_subscr(&mut self, obj: OpRef, key: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
-            let _ = emit_trace_call_int_typed(
+            // STORE_SUBSCR discards the result → void `CALL_N`
+            // (`jtransform.py handle_residual_call` keys `result_kind` off
+            // `op.result.concretetype`, which is Void when the opimpl drops
+            // the value). `setitem` returns `Result<(), PyError>`, so the
+            // residual helper `jit_setitem` is a void shim; its raise is
+            // surfaced by the `guard_no_exception` recorded below, mirroring
+            // the rtyper presenting only the success type as `FUNC.RESULT`
+            // (`call.py:222`) with out-of-band `OperationError` propagation.
+            emit_trace_call_void_typed(
                 ctx,
                 jit_setitem as *const (),
                 &[obj, key, value],
