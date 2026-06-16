@@ -176,7 +176,7 @@ impl StrPtrInfoExt for StrPtrInfo {
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
         if let Some(lgtop) = self.lgtop.as_ref() {
-            return ctx.get_box_replacement_box(lgtop.to_opref()).and_then(|b| {
+            return ctx.resolve_box_box_opt(lgtop).and_then(|b| {
                 ctx.get_constant_int_box(&b).or_else(|| {
                     ctx.peek_intbound_box(&b)
                         .filter(|ib| ib.is_constant())
@@ -193,13 +193,13 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
             // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop
             VStringVariant::Slice(info) => {
-                let b = ctx.get_box_replacement_box(info.lgtop.to_opref())?;
+                let b = ctx.resolve_box_box_opt(&info.lgtop)?;
                 ctx.get_constant_int_or_bound_box(&b)
             }
             // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.get_box_replacement_box(info.vleft.to_opref());
-                let vright_box = ctx.get_box_replacement_box(info.vright.to_opref());
+                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
+                let vright_box = ctx.resolve_box_box_opt(&info.vright);
                 let left = vleft_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let right = vright_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let len1 = left.get_known_str_length(ctx, mode)?;
@@ -227,12 +227,12 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Plain(info) => {
                 let mut chars = Vec::with_capacity(info._chars.len());
                 for ch in &info._chars {
-                    let ch_opref = ch.as_ref().map(|b| b.to_opref())?;
+                    let ch_box = ch.as_ref()?;
                     // vstring.py:179: `c.is_constant()` for Plain strings
                     // accepts only an actual ConstInt, not a synthesized
                     // ConstInt from a constant IntBound.
                     chars.push(
-                        ctx.get_box_replacement_box(ch_opref)
+                        ctx.resolve_box_box_opt(ch_box)
                             .and_then(|cb| cb.const_int())?,
                     );
                 }
@@ -240,12 +240,12 @@ impl StrPtrInfoExt for StrPtrInfo {
             }
             VStringVariant::Slice(info) => {
                 // vstring.py:236-248: use getintbound().is_constant()
-                let s_box = ctx.get_box_replacement_box(info.s.to_opref());
+                let s_box = ctx.resolve_box_box_opt(&info.s);
                 let source = s_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let source_chars = source.get_constant_string_spec(ctx, mode)?;
-                let start_box = ctx.get_box_replacement_box(info.start.to_opref())?;
+                let start_box = ctx.resolve_box_box_opt(&info.start)?;
                 let start = usize::try_from(ctx.get_constant_int_or_bound_box(&start_box)?).ok()?;
-                let lgtop_box = ctx.get_box_replacement_box(info.lgtop.to_opref())?;
+                let lgtop_box = ctx.resolve_box_box_opt(&info.lgtop)?;
                 let length =
                     usize::try_from(ctx.get_constant_int_or_bound_box(&lgtop_box)?).ok()?;
                 let stop = start.checked_add(length)?;
@@ -255,8 +255,8 @@ impl StrPtrInfoExt for StrPtrInfo {
                 Some(source_chars[start..stop].to_vec())
             }
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.get_box_replacement_box(info.vleft.to_opref());
-                let vright_box = ctx.get_box_replacement_box(info.vright.to_opref());
+                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
+                let vright_box = ctx.resolve_box_box_opt(&info.vright);
                 let left = vleft_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let right = vright_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let mut chars = left.get_constant_string_spec(ctx, mode)?;
@@ -280,20 +280,20 @@ impl StrPtrInfoExt for StrPtrInfo {
             VStringVariant::Slice(info) => {
                 // vstring.py:491: index = _int_add(sinfo.start, index)
                 // Accept intbound-constant starts, not just literal constants.
-                let start_box = ctx.get_box_replacement_box(info.start.to_opref())?;
+                let start_box = ctx.resolve_box_box_opt(&info.start)?;
                 let start = ctx.get_constant_int_or_bound_box(&start_box)?;
-                let s_box = ctx.get_box_replacement_box(info.s.to_opref());
+                let s_box = ctx.resolve_box_box_opt(&info.s);
                 let source = s_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 source.strgetitem(index as i64 + start, ctx)
             }
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.get_box_replacement_box(info.vleft.to_opref());
+                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
                 let left = vleft_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 let left_len = usize::try_from(left.get_known_str_length(ctx, self.mode)?).ok()?;
                 if index < left_len {
                     left.strgetitem(index as i64, ctx)
                 } else {
-                    let vright_box = ctx.get_box_replacement_box(info.vright.to_opref());
+                    let vright_box = ctx.resolve_box_box_opt(&info.vright);
                     let right = vright_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                     right.strgetitem((index - left_len) as i64, ctx)
                 }
@@ -794,14 +794,13 @@ impl PtrInfoExt for PtrInfo {
             return false;
         }
         for (_, val) in fields {
-            let val = val.to_opref();
-            if !ctx
-                .get_box_replacement_box(val)
+            let resolved_box = ctx.resolve_box_box_opt(val);
+            if resolved_box
+                .as_ref()
                 .and_then(|cb| cb.const_value())
-                .is_some()
+                .is_none()
             {
                 // Check if it's a virtual that is also immutable+constant
-                let resolved_box = ctx.get_box_replacement_box(val);
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
                         continue;
@@ -882,9 +881,8 @@ fn force_box_impl(
                     // Write constant field values directly to the allocated memory.
                     for (field_idx, val_ref) in fields.iter() {
                         let field_idx = *field_idx;
-                        let val_ref = val_ref.to_opref();
                         if let Some(value) = ctx
-                            .get_box_replacement_box(val_ref)
+                            .resolve_box_box_opt(val_ref)
                             .and_then(|cb| cb.const_value())
                         {
                             if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
@@ -1277,7 +1275,7 @@ fn force_box_impl(
             let lengthbox = match &variant {
                 VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
                 VStringVariant::Slice(info) => ctx
-                    .get_box_replacement_box(info.lgtop.to_opref())
+                    .resolve_box_box_opt(&info.lgtop)
                     .map(|b| b.to_opref())
                     .unwrap_or(info.lgtop.to_opref()),
                 VStringVariant::Concat(info) => {

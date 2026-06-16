@@ -54,8 +54,8 @@ use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 #[inline]
-fn make_nonnull_opref(ctx: &mut OptContext, opref: OpRef) {
-    if let Some(box_ref) = ctx.get_box_replacement_box(opref) {
+fn make_nonnull_box(ctx: &mut OptContext, arg: &BoxRef) {
+    if let Some(box_ref) = ctx.resolve_box_box_opt(arg) {
         ctx.make_nonnull(&box_ref);
     }
 }
@@ -1604,7 +1604,7 @@ impl OptHeap {
             return;
         }
         for arg in op.getarglist().iter() {
-            if let Some(arg_box) = ctx.get_box_replacement_box(arg.to_opref()) {
+            if let Some(arg_box) = ctx.resolve_box_box_opt(&arg) {
                 self.escape_box(&arg_box);
             }
         }
@@ -2105,7 +2105,7 @@ impl OptHeap {
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
                 // the result so it survives calls (unlike normal mutable fields).
                 self.quasi_immut_cache.insert(qi_key, op.pos.get());
-                make_nonnull_opref(ctx, op.arg(0).to_opref());
+                make_nonnull_box(ctx, &op.arg(0));
                 let obj_box = ctx
                     .get_box_replacement_box(obj)
                     .unwrap_or_else(|| BoxRef::from_opref(obj));
@@ -2121,7 +2121,7 @@ impl OptHeap {
         //     structinfo.setfield(descr, op.getarg(0), op, ...)
         // heap.py optimize_GETFIELD_GC_I default path also marks the base:
         //     self.make_nonnull(op.getarg(0))
-        make_nonnull_opref(ctx, op.arg(0).to_opref());
+        make_nonnull_box(ctx, &op.arg(0));
         let obj_box = ctx
             .get_box_replacement_box(obj)
             .unwrap_or_else(|| BoxRef::from_opref(obj));
@@ -2733,7 +2733,7 @@ impl OptHeap {
             // when it falls through to record the new value (matching
             // pyre's `arrayinfo_setitem` below), `make_nonnull` still
             // fires.
-            make_nonnull_opref(ctx, op.arg(0).to_opref());
+            make_nonnull_box(ctx, &op.arg(0));
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
@@ -2766,7 +2766,7 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0)) (optimizer.py:440-451).
-        make_nonnull_opref(ctx, op.arg(0).to_opref());
+        make_nonnull_box(ctx, &op.arg(0));
         OptimizationResult::Emit(op.clone())
     }
 

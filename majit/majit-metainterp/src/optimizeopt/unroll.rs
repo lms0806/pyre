@@ -1308,7 +1308,7 @@ impl UnrollOptimizer {
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for inputarg in &initial_sp.inputargs {
                 let info = final_ctx
-                    .get_box_replacement_box(inputarg.to_opref())
+                    .resolve_box_box_opt(inputarg)
                     .as_ref()
                     .and_then(|b| final_ctx.peek_ptr_info(b));
                 infos.push(info);

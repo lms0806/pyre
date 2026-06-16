@@ -4385,6 +4385,7 @@ impl OptContext {
     /// InputArg identity is unified (the InputArg analog of the ResOp
     /// emit-rebind keystone in `materialize_box_at` / `set_forwarded_op`).
     pub fn resolve_box_box(&self, arg: &crate::r#box::BoxRef) -> crate::r#box::BoxRef {
+        self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             #[cfg(debug_assertions)]
@@ -4412,6 +4413,7 @@ impl OptContext {
     /// A bound InputArg stays on the `OpRef` path for the same canonical-
     /// identity reason documented on [`OptContext::resolve_box_box`].
     pub fn resolve_box_box_opt(&self, arg: &crate::r#box::BoxRef) -> Option<crate::r#box::BoxRef> {
+        self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             #[cfg(debug_assertions)]
@@ -4430,6 +4432,67 @@ impl OptContext {
             Some(resolved)
         } else {
             self.get_box_replacement_box(arg.to_opref())
+        }
+    }
+
+    /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
+    /// canonical producer (the `find_producer_op` / OpRef-store resolution)
+    /// has received a forwarding — const-fold (`make_constant_box` /
+    /// `seed_constant`) or CSE (`make_equal_to`) — that did NOT route through
+    /// `emit`'s `live_synthetics` catch-up (mod.rs:2673), the recorder input
+    /// op the operands carry at that position stays a DISTINCT, still-
+    /// unforwarded `Op`. A box-native walk from such an operand then freezes
+    /// on the unforwarded input op while the OpRef path resolves the canonical
+    /// (the witnessed `resolve_box_box` divergence). Link `input_op ->
+    /// canonical` here, the non-emitted analogue of `emit`'s synth->op_rc link,
+    /// so both paths agree.
+    ///
+    /// Cycle-safe: only an UNFORWARDED bound ResOp whose store canonical is a
+    /// genuinely distinct `Op` is linked. Const and InputArg operands resolve
+    /// canonically already and are skipped.
+    ///
+    /// The cycle guard keys on the bound `Op` identity, NOT the position: a
+    /// position routinely carries TWO distinct `Op` objects — the recorder
+    /// input op the operands bind to, and the emitted/canonical op
+    /// `find_producer_op` returns (the host on which `heap`/`virtualize` set the
+    /// position's PtrInfo via `set_forwarded_info`). Both share the same
+    /// `to_opref()` (position), so a position-equality guard would skip exactly
+    /// this same-position duplication, leaving the operand's box-native walk
+    /// stranded on the info-less input op while the OpRef store path reaches the
+    /// info-bearing canonical. Linking those two distinct ops is the whole point
+    /// of the heal. But `get_box_replacement_box` can also re-mint a DIFFERENT
+    /// `BoxRef` wrapping the SAME bound `Op` as `arg` (a store wrapper vs the
+    /// memoized operand box); `same_box` (an `Rc::ptr_eq` on the boxes) misses
+    /// that, so an explicit `Rc::ptr_eq` on the bound ops is needed — without it
+    /// `set_forwarded_op` self-cycles (`arg.op -> arg.op`). The canonical is a
+    /// `get_box_replacement_box` terminal (`Forwarded::None`/`Info`, never a
+    /// `Box`), so once a genuinely distinct op is linked no chain cycle forms.
+    fn heal_arg_to_canonical(&self, arg: &crate::r#box::BoxRef) {
+        if arg.bound_op().is_none() {
+            return;
+        }
+        if !matches!(arg.get_forwarded(), crate::r#box::Forwarded::None) {
+            return;
+        }
+        let Some(canon) = self.get_box_replacement_box(arg.to_opref()) else {
+            return;
+        };
+        if arg.same_box(&canon) {
+            return;
+        }
+        // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
+        // `BoxRef` — linking would be a one-node self-cycle.
+        if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op()) {
+            if std::rc::Rc::ptr_eq(&ao, &co) {
+                return;
+            }
+        }
+        if let Some(value) = canon.const_value() {
+            arg.set_forwarded_const(majit_ir::Const::from_value(value));
+        } else if let Some(canon_op) = canon.bound_op() {
+            arg.set_forwarded_op(&canon_op);
+        } else if let Some(canon_ia) = canon.bound_inputarg() {
+            arg.set_forwarded_inputarg(&canon_ia);
         }
     }
 
@@ -7720,7 +7783,12 @@ impl OptContext {
         // BoxRef-routing read. Owned PtrInfo from `peek_ptr_info` is
         // consumed by `matches!` so no borrow is held when the mutable
         // re-borrow of the BoxRef slot runs below for the early return.
-        let arg0_box = self.get_box_replacement_box(op.arg(0).to_opref());
+        // optimizer.py:467 opinfo = arg0.get_forwarded(): resolve op.arg(0)
+        // box-native to the position's canonical (the info-host
+        // `find_producer_op` returns). The Phase-1 heal links the operand's
+        // input op to that canonical even at a shared position, so the
+        // box-native terminal now carries the PtrInfo `heap`/`virtualize` set.
+        let arg0_box = self.resolve_box_box_opt(&op.arg(0));
         if matches!(
             arg0_box.as_ref().and_then(|b| self.peek_ptr_info(b)),
             Some(

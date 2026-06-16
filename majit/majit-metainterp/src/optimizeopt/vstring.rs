@@ -558,7 +558,7 @@ impl OptString {
     ) -> OptimizationResult {
         let len_ref = op.arg(0).to_opref();
         if let Some(len) = ctx
-            .get_box_replacement_box(len_ref)
+            .resolve_box_box_opt(&op.arg(0))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
@@ -602,12 +602,11 @@ impl OptString {
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.resolve_box_box(&op.arg(0));
-        let idx_ref = op.arg(1).to_opref();
         let char_ref = op.arg(2).to_opref();
         let char_resolved = ctx.get_replacement_opref(char_ref);
 
         if let Some(idx) = ctx
-            .get_box_replacement_box(idx_ref)
+            .resolve_box_box_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let i = idx as usize;
@@ -638,10 +637,9 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let str_ref = ctx.resolve_box_box(&op.arg(0));
-        let idx_ref = op.arg(1).to_opref();
 
         if let Some(idx) = ctx
-            .get_box_replacement_box(idx_ref)
+            .resolve_box_box_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if let Some(ch_ref) = self.strgetitem(str_ref.to_opref(), idx, mode, ctx) {
