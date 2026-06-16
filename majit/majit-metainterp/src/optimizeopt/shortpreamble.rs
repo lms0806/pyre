@@ -1712,13 +1712,17 @@ impl ProducedShortOp {
             invented_name: self.invented_name,
             preamble_op: replay_rc,
         };
+        let obj_box = ctx.get_box_replacement_box(obj_resolved);
         if obj_resolved.is_constant()
-            || ctx
-                .get_box_replacement_box(obj_resolved)
-                .and_then(|b| ctx.get_constant_box(&b))
+            || obj_box
+                .as_ref()
+                .and_then(|b| ctx.get_constant_box(b))
                 .is_some()
         {
-            if let Some(info) = ctx.get_const_info_array_mut(obj_resolved, descr.clone()) {
+            if let Some(info) = obj_box
+                .as_ref()
+                .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+            {
                 info.set_preamble_item(index as usize, pop.clone());
             }
         } else {

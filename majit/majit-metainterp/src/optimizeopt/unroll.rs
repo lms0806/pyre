@@ -6394,6 +6394,10 @@ mod tests {
         let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
         exported_bounds.insert(OpRef::int_op(21), IntBound::bounded(10, 20));
+        // Bind the export-input position at its source (a forced end-arg is a
+        // bound box in production); virtualstate.py:711-720 create_state
+        // receives real AbstractValues.
+        ctx.materialize_box_at(OpRef::int_op(21));
 
         let exported = export_state(
             &[OpRef::int_op(21)],
@@ -6437,6 +6441,12 @@ mod tests {
     fn test_export_state_uses_forced_end_args_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
+        // Forced end-of-preamble args are bound boxes in production
+        // (force_box_for_end_of_preamble); bind the fixture's export-input
+        // position at its source so every value reaching export_single_value
+        // has a canonical box (virtualstate.py:711-720 create_state receives
+        // real AbstractValues, never bare positions).
+        ctx.materialize_box_at(OpRef::int_op(21));
         ctx.preamble_end_args = Some(vec![OpRef::int_op(21)]);
 
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
@@ -6483,6 +6493,12 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             });
+        // Bind export-input positions at their source: the GETFIELD receiver
+        // and result are bound boxes in production (label arg / ProducedShortOp.res
+        // = materialize_box_at, shortpreamble.rs:436). virtualstate.py:711-720
+        // create_state receives real AbstractValues, never bare positions.
+        ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.materialize_box_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6544,6 +6560,11 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             });
+        // Bind export-input positions at their source (label arg /
+        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // virtualstate.py:711-720 create_state receives real AbstractValues.
+        ctx.materialize_box_at(OpRef::int_op(12));
+        ctx.materialize_box_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(11)],
@@ -6603,6 +6624,12 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             });
+
+        // Bind export-input positions at their source (label arg /
+        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // virtualstate.py:711-720 create_state receives real AbstractValues.
+        ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.materialize_box_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6910,6 +6937,12 @@ mod tests {
                 invented_name: true,
                 same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
             });
+        // Bind export-input positions at their source (IntAdd operands /
+        // same-as alias are bound boxes in production); virtualstate.py:711-720
+        // create_state receives real AbstractValues, never bare positions.
+        ctx.materialize_box_at(OpRef::int_op(12));
+        ctx.materialize_box_at(OpRef::int_op(13));
+        ctx.materialize_box_at(OpRef::int_op(14));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(13), OpRef::int_op(14)],

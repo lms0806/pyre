@@ -1352,7 +1352,7 @@ impl Optimizer {
     pub fn export_all_cached_fields(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&[OpRef]>,
+        available_boxes: Option<&[BoxRef]>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1365,7 +1365,7 @@ impl Optimizer {
     pub fn export_all_cached_arrayitems(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&[OpRef]>,
+        available_boxes: Option<&[BoxRef]>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {

@@ -7343,21 +7343,11 @@ impl OptContext {
         &mut self,
         opref: OpRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
-        // Use materialize_box_at (non-walking, &mut self) so the original
-        // BoxRef is materialized — getptrinfo's internal chain
-        // walk then advances from the original BoxRef whose position
-        // is preserved, allowing the opref_type fallback to read the
-        // seed_constant Ref override.
-        let opref_box = self.get_box_replacement_box(opref);
-        let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
-        };
-        if gcref.is_null() {
-            return None;
-        }
-        self.const_infos.get_mut(&gcref.0)
+        // Resolve the position to its canonical box, then delegate to the
+        // box-native form. `get_box_replacement_box` returns `None` for an
+        // unresolved position (the old `and_then`/`_ => return None` arm).
+        let op = self.get_box_replacement_box(opref)?;
+        self.get_const_info_mut_if_exists_box(&op)
     }
 
     /// info.py:715-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
@@ -7373,15 +7363,44 @@ impl OptContext {
         opref: OpRef,
         parent_descr: Option<DescrRef>,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        // Resolve the position to its canonical box, then delegate to the
+        // box-native form.
+        let op = self.get_box_replacement_box(opref)?;
+        self.get_const_info_mut_box(&op, parent_descr)
+    }
+
+    /// Box-native form of `get_const_info_mut_if_exists`: the caller already
+    /// holds the (canonical) struct box, so `getptrinfo` chain-walks it
+    /// directly (info.py:886 `op = get_box_replacement(op)`). Returns `None`
+    /// when the box is not a constant pointer, the constant is null, or no
+    /// `const_infos` entry exists yet.
+    pub fn get_const_info_mut_if_exists_box(
+        &mut self,
+        op: &crate::r#box::BoxRef,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        use crate::optimizeopt::info::PtrInfo;
+        let gcref = match self.getptrinfo(op) {
+            Some(PtrInfo::Constant(g)) => g,
+            _ => return None,
+        };
+        if gcref.is_null() {
+            return None;
+        }
+        self.const_infos.get_mut(&gcref.0)
+    }
+
+    /// Box-native form of `get_const_info_mut` (info.py:715-726
+    /// `ConstPtrInfo._get_info`): the caller holds the (canonical) struct
+    /// box. Creates a `StructPtrInfo(parent_descr)` on miss; raises
+    /// `InvalidLoop` on a null constant base (info.py:720-721).
+    pub fn get_const_info_mut_box(
+        &mut self,
+        op: &crate::r#box::BoxRef,
+        parent_descr: Option<DescrRef>,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        // Use materialize_box_at (non-walking, &mut self) so the original
-        // BoxRef is materialized — getptrinfo's internal chain
-        // walk then advances from the original BoxRef whose position
-        // is preserved, allowing the opref_type fallback to read the
-        // seed_constant Ref override.
-        let opref_box = self.get_box_replacement_box(opref);
-        let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
+        let gcref = match self.getptrinfo(op) {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
         };
@@ -7430,16 +7449,25 @@ impl OptContext {
         opref: OpRef,
         descr: DescrRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        // Resolve the position to its canonical box, then delegate to the
+        // box-native form.
+        let op = self.get_box_replacement_box(opref)?;
+        self.get_const_info_array_mut_box(&op, descr)
+    }
+
+    /// Box-native form of `get_const_info_array_mut` (info.py:728-735
+    /// `ConstPtrInfo._get_array_info`): the caller holds the (canonical)
+    /// array box, so `getptrinfo` chain-walks it directly. Creates an
+    /// `ArrayPtrInfo(descr)` with a `nonnegative` lenbound on miss; raises
+    /// `InvalidLoop` on a null constant base (info.py:730-731).
+    pub fn get_const_info_array_mut_box(
+        &mut self,
+        op: &crate::r#box::BoxRef,
+        descr: DescrRef,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
-        // info.py:729: ref = self._const.getref_base() — same dispatch as
-        // _get_info; route through getptrinfo for the op.type contract.
-        // Use materialize_box_at (non-walking, &mut self) so the original
-        // BoxRef is materialized — getptrinfo's internal chain
-        // walk then advances from the original BoxRef whose position
-        // is preserved, allowing the opref_type fallback to read the
-        // seed_constant Ref override.
-        let opref_box = self.get_box_replacement_box(opref);
-        let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
+        // info.py:729: ref = self._const.getref_base()
+        let gcref = match self.getptrinfo(op) {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
         };
@@ -7509,15 +7537,10 @@ impl OptContext {
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let arg0 = self.resolve_box_box(&op.arg(0)).to_opref();
-        if arg0.is_constant()
-            || self
-                .get_box_replacement_box(arg0)
-                .and_then(|cb| cb.const_value())
-                .is_some()
-        {
+        let arg0 = self.resolve_box_box(&op.arg(0));
+        if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr() {
-                if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
+                if let Some(info) = self.get_const_info_array_mut_box(&arg0, descr) {
                     info.setitem(index, value);
                 }
             }
@@ -8031,7 +8054,7 @@ pub trait Optimization {
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&[OpRef]>,
+        _available_boxes: Option<&[crate::r#box::BoxRef]>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -8049,7 +8072,7 @@ pub trait Optimization {
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&[OpRef]>,
+        _available_boxes: Option<&[crate::r#box::BoxRef]>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }

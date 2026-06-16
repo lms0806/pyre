@@ -490,11 +490,29 @@ impl OptString {
 
     /// vstring.py:486-517 OptString.strgetitem + vstring.py:393-403 _strgetitem
     ///
+    /// `mode` is threaded from the caller (mode_string / mode_unicode) rather
+    /// than recovered from the receiver's PtrInfo, so make_nonnull_str installs
+    /// the correct string flavour even on a not-yet-typed receiver.
+    ///
     /// Tries virtual dispatch (Plain/Slice/Concat), then ConstPtr constant
     /// resolution. Returns None only when the char can't be determined.
-    fn strgetitem(&self, opref: OpRef, index: i64, ctx: &mut OptContext) -> Option<OpRef> {
+    fn strgetitem(
+        &self,
+        opref: OpRef,
+        index: i64,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> Option<OpRef> {
         let resolved_box = ctx.get_box_replacement_box(opref);
-        // Virtual dispatch: PtrInfo::Str → VStringInfo.strgetitem
+        // vstring.py:487: self.make_nonnull_str(s, mode) — ensure the receiver
+        // carries a (nonnull) string PtrInfo before it is read. A no-op when the
+        // box is constant or already a virtual string; otherwise it installs the
+        // non-virtual StrPtrInfo{Ptr} so nonnull-ness reaches later passes.
+        if let Some(b) = &resolved_box {
+            ctx.make_nonnull_str(b, mode);
+        }
+        // vstring.py:488: sinfo = getptrinfo(s). Virtual dispatch:
+        // PtrInfo::Str → VStringInfo.strgetitem (Plain/Slice/Concat); Ptr → None.
         let from_virtual = resolved_box
             .as_ref()
             .and_then(|b| ctx.getptrinfo(b))
@@ -503,7 +521,6 @@ impl OptString {
             return from_virtual;
         }
         // vstring.py:393-403 _strgetitem: isinstance(strbox, ConstPtr)
-        let mode = self.get_mode(opref, ctx);
         match resolved_box.as_ref().and_then(|b| ctx.getconst(b)) {
             Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
                 let r = majit_ir::GcRef(raw as usize);
@@ -617,6 +634,7 @@ impl OptString {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let str_ref = ctx.resolve_box_box(&op.arg(0));
@@ -626,7 +644,7 @@ impl OptString {
             .get_box_replacement_box(idx_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            if let Some(ch_ref) = self.strgetitem(str_ref.to_opref(), idx, ctx) {
+            if let Some(ch_ref) = self.strgetitem(str_ref.to_opref(), idx, mode, ctx) {
                 let b_old = BoxRef::from_bound_op(op_rc);
                 let b_new = ctx.get_box_replacement(ch_ref);
                 ctx.make_equal_to(&b_old, &b_new);
@@ -721,17 +739,18 @@ impl OptString {
                 };
                 let mut dst_chars = Vec::with_capacity(length as usize);
                 for index in 0..length {
-                    let char_ref =
-                        if let Some(ch_ref) = self.strgetitem(src_ref, src_start + index, ctx) {
-                            ctx.get_replacement_opref(ch_ref)
-                        } else {
-                            // vstring.py:580-581 → _strgetitem → emit_extra
-                            let index_ref = ctx.make_constant_int(src_start + index);
-                            let pass_idx = ctx.current_pass_idx;
-                            let arg_src = ctx.materialize_box_at(src_ref);
-                            let arg_index = ctx.materialize_box_at(index_ref);
-                            ctx.emit_extra(pass_idx, Op::new(getitem_opcode, &[arg_src, arg_index]))
-                        };
+                    let char_ref = if let Some(ch_ref) =
+                        self.strgetitem(src_ref, src_start + index, mode, ctx)
+                    {
+                        ctx.get_replacement_opref(ch_ref)
+                    } else {
+                        // vstring.py:580-581 → _strgetitem → emit_extra
+                        let index_ref = ctx.make_constant_int(src_start + index);
+                        let pass_idx = ctx.current_pass_idx;
+                        let arg_src = ctx.materialize_box_at(src_ref);
+                        let arg_index = ctx.materialize_box_at(index_ref);
+                        ctx.emit_extra(pass_idx, Op::new(getitem_opcode, &[arg_src, arg_index]))
+                    };
                     if dst_virtual {
                         dst_chars.push(Some(char_ref));
                     } else {
@@ -1092,8 +1111,8 @@ impl OptString {
                 let l1_const = l1box.and_then(|r| ctx.isinstance_const_int(r));
                 if l1_const == Some(1) {
                     // vstring.py:761-768: both length 1 → compare chars
-                    let c1 = self.strgetitem(arg1.to_opref(), 0, ctx);
-                    let c2 = self.strgetitem(arg2.to_opref(), 0, ctx);
+                    let c1 = self.strgetitem(arg1.to_opref(), 0, mode, ctx);
+                    let c2 = self.strgetitem(arg2.to_opref(), 0, mode, ctx);
                     if let (Some(ch1), Some(ch2)) = (c1, c2) {
                         let arg_ch1 = ctx.materialize_box_at(ch1);
                         let arg_ch2 = ctx.materialize_box_at(ch2);
@@ -1107,7 +1126,7 @@ impl OptString {
                     let source = info.s.to_opref();
                     let start = info.start.to_opref();
                     let length = info.lgtop.to_opref();
-                    if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, ctx) {
+                    if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, mode, ctx) {
                         return self.generate_modified_call(
                             OopSpecIndex::StreqSliceChar,
                             &[source, start, length, vchar],
@@ -1161,7 +1180,7 @@ impl OptString {
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
-                if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, ctx) {
+                if let Some(vchar) = self.strgetitem(arg2.to_opref(), 0, mode, ctx) {
                     // vstring.py:800-804
                     let oopspec = if self.is_known_nonnull(arg1, ctx) {
                         OopSpecIndex::StreqNonnullChar
@@ -1283,8 +1302,8 @@ impl OptString {
         if l1c == Some(1) && l2c == Some(1) {
             // vstring.py:830-836: extract chars and INT_SUB
             if let (Some(char1), Some(char2)) = (
-                self.strgetitem(op.arg(1).to_opref(), 0, ctx),
-                self.strgetitem(op.arg(2).to_opref(), 0, ctx),
+                self.strgetitem(op.arg(1).to_opref(), 0, mode, ctx),
+                self.strgetitem(op.arg(2).to_opref(), 0, mode, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
                 let b_old = BoxRef::from_bound_op(op_rc);
@@ -1392,14 +1411,14 @@ impl Optimization for OptString {
             OpCode::Newstr => self._optimize_newstr(op, op_rc, mode_string, ctx),
             OpCode::Newunicode => self._optimize_newstr(op, op_rc, mode_unicode, ctx),
             OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, ctx),
+            OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, mode_string, ctx),
             OpCode::Strlen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copystrcontent => self.optimize_copystrcontent(op, mode_string, ctx),
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, ctx),
+            OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, mode_unicode, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, mode_unicode, ctx),
 
@@ -1824,11 +1843,11 @@ mod tests {
         );
 
         // Get char at index 0 of the slice -> should be source[1] = int_op(201)
-        let ch = pass.strgetitem(slice_ref, 0, &mut ctx);
+        let ch = pass.strgetitem(slice_ref, 0, mode_string, &mut ctx);
         assert_eq!(ch, Some(OpRef::int_op(201)));
 
         // Get char at index 1 of the slice -> should be source[2] = int_op(202)
-        let ch = pass.strgetitem(slice_ref, 1, &mut ctx);
+        let ch = pass.strgetitem(slice_ref, 1, mode_string, &mut ctx);
         assert_eq!(ch, Some(OpRef::int_op(202)));
     }
 
@@ -1863,11 +1882,11 @@ mod tests {
         set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
 
         assert_eq!(
-            pass.strgetitem(slice_ref, 0, &mut ctx),
+            pass.strgetitem(slice_ref, 0, mode_string, &mut ctx),
             Some(OpRef::int_op(201))
         );
         assert_eq!(
-            pass.strgetitem(slice_ref, 1, &mut ctx),
+            pass.strgetitem(slice_ref, 1, mode_string, &mut ctx),
             Some(OpRef::int_op(202))
         );
     }
@@ -2223,22 +2242,22 @@ mod tests {
 
         // Index 0 -> left[0] = 200
         assert_eq!(
-            pass.strgetitem(concat, 0, &mut ctx),
+            pass.strgetitem(concat, 0, mode_string, &mut ctx),
             Some(OpRef::int_op(200))
         );
         // Index 1 -> left[1] = 201
         assert_eq!(
-            pass.strgetitem(concat, 1, &mut ctx),
+            pass.strgetitem(concat, 1, mode_string, &mut ctx),
             Some(OpRef::int_op(201))
         );
         // Index 2 -> right[0] = 202
         assert_eq!(
-            pass.strgetitem(concat, 2, &mut ctx),
+            pass.strgetitem(concat, 2, mode_string, &mut ctx),
             Some(OpRef::int_op(202))
         );
         // Index 3 -> right[1] = 203
         assert_eq!(
-            pass.strgetitem(concat, 3, &mut ctx),
+            pass.strgetitem(concat, 3, mode_string, &mut ctx),
             Some(OpRef::int_op(203))
         );
     }

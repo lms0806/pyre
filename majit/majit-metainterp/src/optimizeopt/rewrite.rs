@@ -50,8 +50,15 @@ enum Nullness {
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
 pub struct OptRewrite {
-    /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
-    /// Used by find_rewritable_bool to check if inverse/reflex was computed.
+    /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, populated by
+    /// optimize_comparison. Upstream has no bool_result_cache; find_rewritable_bool
+    /// / try_boolinvers (rewrite.py:54-93) build a synthetic ResOperation and look
+    /// it up via get_pure_result against the shared _pure_operations table.
+    /// Convergence: retire this cache and route the bool lookups through the pure
+    /// optimizer's get_pure_result / pure_from_args2 (both already present at
+    /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
+    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to BoxRef
+    /// would entrench a structure upstream does not have.
     bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).

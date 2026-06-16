@@ -28,8 +28,6 @@ use majit_ir::vec_set::VecSet;
 use majit_ir::descr::descr_identity;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
-use crate::r#box::BoxRef;
-
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
 #[derive(Clone, Debug)]
@@ -2473,30 +2471,26 @@ pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    // Keyed by the resolved OpRef `get_box_replacement(opref).to_opref()` —
-    // the stable identity projection of the resolved box. virtualstate.py:712-716
-    // keys `self.info` (a plain identity dict) by `get_box_replacement(box)` and
-    // relies on "same resolved box → same key" for finished / in_progress dedup.
+    // Keyed by `BoxRef` identity (`Rc::ptr_eq`, const by value) — the resolved
+    // box `get_box_replacement(opref)`. virtualstate.py:712-716 keys `self.info`
+    // (a plain identity dict) by `get_box_replacement(box)` and relies on "same
+    // resolved box → same key" for finished / in_progress dedup. A bound
+    // producer resolves to its one canonical `Rc` (memoized `from_bound_op`),
+    // and value-equal constants merge via `BoxRef`'s `same_constant` (matching
+    // RPython's shared-instance dedup; the benign over-merge is on not-virtual
+    // const nodes that emit no fail-arg box).
     //
-    // The OpRef projection reproduces that invariant for every case: a bound
-    // producer resolves to its canonical position OpRef (bind-at-alloc #194), and
-    // a value-equal constant resolves to inline-Const's one canonical OpRef
-    // (value-merge — matching RPython's shared-instance dedup; distinct
-    // value-equal `ConstInt` objects are merged because inline-Const gives a
-    // constant one canonical handle, a benign over-merge since a constant
-    // resolves to a not-virtual node that emits no fail-arg box). Crucially it is
-    // also stable for an UNRESOLVED position: `get_box_replacement` mints a fresh
-    // `BoxRef::from_opref` per call when no canonical host is bound (export_state
-    // / unroll.rs do not enforce bind-at-alloc), so a BoxRef identity key would
-    // give two visits of the same OpRef *different* keys and split the cache;
-    // `from_opref(o).to_opref() == o` keeps them merged.
-    //
-    // CONVERGENCE: re-key to `BoxRef` identity (`Rc::ptr_eq`) once bind-at-alloc
-    // covers every export entry (export_state + unroll) so the resolved box has
-    // one canonical `Rc` per position. `VecAssoc`/`VecSet` are Vec-backed and
-    // compare by `Eq` only (never hash), so no GC pointer is hashed here.
-    pub finished: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Rc<VirtualStateInfoNode>>,
-    pub in_progress: majit_ir::vec_set::VecSet<OpRef>,
+    // bind-at-alloc invariant: every position reaching export resolves to a
+    // bound box (debug-asserted in `export_single_value`). Production forced
+    // end-args and `ProducedShortOp.res` (shortpreamble.rs:436
+    // `materialize_box_at`) are bound at creation; an unbound position would
+    // mint a fresh `BoxRef::from_opref` per visit and split the cache, so the
+    // assert traps that as a bind-at-alloc gap rather than silently
+    // mis-deduping. `VecAssoc`/`VecSet` are Vec-backed and compare by `Eq` only
+    // (never hash), so no GC pointer is hashed here.
+    pub finished:
+        crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, Rc<VirtualStateInfoNode>>,
+    pub in_progress: majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
 }
 
 impl ExportCache {
@@ -2541,13 +2535,21 @@ fn export_single_value(
     // virtualstate.py:713-716 `box = get_box_replacement(box)` then keyed
     // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
     // lookup so two field references forwarding to the same target collapse
-    // onto the same VirtualStateInfo. Key the DAG cache by the resolved OpRef
-    // projection (stable per resolved box, including unresolved positions; see
-    // ExportCache) — `to_opref()` is computed once and reused as both the cache
-    // key and the inner-export position.
-    let opref = ctx.get_box_replacement(opref).to_opref();
+    // onto the same VirtualStateInfo. Key the DAG cache by the resolved box's
+    // identity (`Rc::ptr_eq`, const by value) — the bound producer's one
+    // canonical `Rc`.
+    let box_ = ctx.get_box_replacement(opref);
+    // bind-at-alloc invariant (see ExportCache): every position reaching
+    // export resolves to a bound box, so `box_` is a stable canonical `Rc`
+    // rather than a fresh `from_opref` placeholder that would split the cache.
+    debug_assert!(
+        ctx.get_box_replacement_box(opref).is_some(),
+        "export_single_value: unbound position {opref:?} reached export — \
+         bind-at-alloc invariant violated (every value reaching create_state \
+         must be a bound box; virtualstate.py:711-720)"
+    );
     // virtualstate.py:714-716: cache hit returns the cached state directly.
-    if let Some(cached) = cache.finished.get(&opref) {
+    if let Some(cached) = cache.finished.get(&box_) {
         return Rc::clone(cached);
     }
     // Cycle: this opref is currently being exported on the parent stack.
@@ -2561,7 +2563,7 @@ fn export_single_value(
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
     // (RPython parity gap documented above) is therefore latent — no
     // benchmark constructs the necessary self-referential structures.
-    if cache.in_progress.contains(&opref) {
+    if cache.in_progress.contains(&box_) {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
         // form through ptr fields, so the only reachable cycles are on
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
@@ -2569,12 +2571,12 @@ fn export_single_value(
         // with LEVEL_UNKNOWN.
         return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
-    cache.in_progress.insert(opref);
+    cache.in_progress.insert(box_.clone());
 
-    let info = export_single_value_inner(opref, ctx, cache);
+    let info = export_single_value_inner(box_.to_opref(), ctx, cache);
     let rc = VirtualStateInfoNode::new_rc(info);
-    cache.in_progress.remove(&opref);
-    cache.finished.insert(opref, Rc::clone(&rc));
+    cache.in_progress.remove(&box_);
+    cache.finished.insert(box_, Rc::clone(&rc));
     rc
 }
 
@@ -2743,6 +2745,7 @@ fn export_single_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::r#box::BoxRef;
     use crate::optimizeopt::info::VirtualStructInfo;
     use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
