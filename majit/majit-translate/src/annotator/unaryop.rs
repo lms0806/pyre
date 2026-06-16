@@ -3767,11 +3767,32 @@ fn init_someinstance_overrides(
                         )
                     });
                 // unaryop.py:841 — `return self.classdef.s_getattr(attr, self.flags)`.
-                super::classdesc::ClassDef::s_getattr(classdef, &attr, &inst.flags).unwrap_or_else(
-                    |err| {
+                let s_attr = super::classdesc::ClassDef::s_getattr(classdef, &attr, &inst.flags)
+                    .unwrap_or_else(|err| {
                         panic!("AnnotatorError: SomeInstance.s_getattr({attr:?}) failed: {err:?}")
-                    },
-                )
+                    });
+                // `__discriminant` (the synthetic enum-tag pseudo-attribute;
+                // see the classdef-less arm above) carries discriminant→variant
+                // narrowing knowntypedata keyed by the receiver variable, so a
+                // `match disc { k => ... }` switch refines this base-classed
+                // receiver to SomeInstance(variant_k) per arm via follow_link's
+                // improve.  No RPython analogue (RPython has no Rust enums).
+                if attr == "__discriminant" {
+                    if let (SomeValue::Integer(si), Hlvalue::Variable(recv)) =
+                        (&s_attr, &hl.args[0])
+                    {
+                        let enum_root = classdef.borrow().name.clone();
+                        if let Some(ktd) = ann.bookkeeper.enum_variant_narrowing_knowntypedata(
+                            &enum_root,
+                            &Rc::new(recv.clone()),
+                        ) {
+                            let mut si = si.clone();
+                            si.set_knowntypedata(ktd);
+                            return SomeValue::Integer(si);
+                        }
+                    }
+                }
+                s_attr
             }),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },

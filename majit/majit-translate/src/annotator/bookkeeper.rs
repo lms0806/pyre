@@ -305,6 +305,15 @@ pub struct Bookkeeper {
     /// build the bookkeeper directly, in which case
     /// `getuniqueclassdef_for_struct_root` leaves `attrs` empty.
     pub pyre_struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
+    /// TODO: no upstream equivalent (RPython has no Rust enums).  Enum
+    /// type-root name (dual-keyed: qualified path and bare leaf) →
+    /// `discriminant value → variant name` table.  Consulted by
+    /// [`Self::enum_variant_narrowing_knowntypedata`] to build the
+    /// discriminant→variant narrowing `knowntypedata` the `__discriminant`
+    /// getattr attaches.  `None` for unit-test fixtures that build the
+    /// bookkeeper directly.
+    pub pyre_enum_variant_by_discriminant:
+        RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
     /// TODO: no upstream equivalent.  Interning table mapping a struct
     /// type-root name to its canonical host class `HostObject`.  Because
     /// `HostObject` equality is `Arc` pointer identity (`model.rs:233`),
@@ -513,6 +522,7 @@ impl Bookkeeper {
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             pyre_struct_fields: RefCell::new(None),
+            pyre_enum_variant_by_discriminant: RefCell::new(None),
             pyre_struct_root_classes: RefCell::new(HashMap::new()),
             pyre_trait_unique_impls: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
@@ -533,6 +543,17 @@ impl Bookkeeper {
     /// overwrites the previous registry.
     pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.pyre_struct_fields.borrow_mut() = Some(registry);
+    }
+
+    /// TODO: no upstream equivalent.  Wire the enum
+    /// `discriminant → variant` tables consumed by
+    /// [`Self::enum_variant_narrowing_knowntypedata`].  Idempotent: a
+    /// second call overwrites the previous map.
+    pub fn set_pyre_enum_variant_by_discriminant(
+        &self,
+        map: Rc<HashMap<String, HashMap<i64, String>>>,
+    ) {
+        *self.pyre_enum_variant_by_discriminant.borrow_mut() = Some(map);
     }
 
     /// TODO: no upstream equivalent.  Wire the trait →
@@ -1616,6 +1637,49 @@ impl Bookkeeper {
         let variant_path = format!("{canon_root}::{variant_name}");
         let variant_host = self.intern_class_by_qualname_with_bases(&variant_path, vec![base_host]);
         self.getuniqueclassdef(&variant_host)
+    }
+
+    /// Build the discriminant→variant narrowing `knowntypedata` for a
+    /// Rust enum's `__discriminant` read.  Each entry is keyed by the
+    /// integer tag value and narrows the `receiver` variable to the
+    /// variant subclass ([`Self::getuniqueclassdef_for_enum_variant`]),
+    /// so a `match disc { k => ... }` switch refines `SomeInstance(base)`
+    /// to `SomeInstance(variant_k)` in arm `k` through `follow_link`'s
+    /// `improve` (binaryop.py:685).  `enum_root` is the receiver class
+    /// name; the variant table is dual-keyed by qualified path and bare
+    /// leaf, so either spelling resolves.  Returns `None` when the class
+    /// is not a registered enum root (the read then stays a plain
+    /// `SomeInteger`).
+    pub fn enum_variant_narrowing_knowntypedata(
+        self: &Rc<Self>,
+        enum_root: &str,
+        receiver: &Rc<crate::flowspace::model::Variable>,
+    ) -> Option<super::model::KnownTypeData> {
+        let by_discr = {
+            let guard = self.pyre_enum_variant_by_discriminant.borrow();
+            let map = guard.as_ref()?;
+            map.get(enum_root)
+                .or_else(|| enum_root.rsplit("::").next().and_then(|leaf| map.get(leaf)))
+                .cloned()?
+        };
+        let mut ktd = super::model::KnownTypeData::new();
+        for (discr, variant_name) in &by_discr {
+            let variant_cd = self
+                .getuniqueclassdef_for_enum_variant(enum_root, variant_name)
+                .ok()?;
+            let s_variant = SomeValue::Instance(super::model::SomeInstance::new(
+                Some(variant_cd),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+            super::model::add_knowntypedata(
+                &mut ktd,
+                super::model::ExitCaseKey::Int(*discr),
+                std::slice::from_ref(receiver),
+                s_variant,
+            );
+        }
+        Some(ktd)
     }
 
     /// Project one struct's registry rows into its `ClassDef.attrs`
@@ -3417,6 +3481,80 @@ mod tests {
             ),
             other => panic!("expected SomeInstance(variant), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enum_variant_narrowing_knowntypedata_keys_int_cases_to_variant_subclasses() {
+        use crate::annotator::model::{ExitCaseKey, SomeInstance, SomeValue};
+        use crate::flowspace::model::Variable;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Color".to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("rgb".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // discriminant 0 -> Rgb, 1 -> Named.
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "Rgb".to_string());
+        by_discr.insert(1, "Named".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("Color".to_string(), by_discr);
+        bk.set_pyre_enum_variant_by_discriminant(Rc::new(map));
+
+        let base = bk
+            .getuniqueclassdef_for_struct_root("Color")
+            .expect("base registers");
+        let receiver = Rc::new(Variable::new());
+        let ktd = bk
+            .enum_variant_narrowing_knowntypedata("Color", &receiver)
+            .expect("enum root has a variant table");
+
+        // One knowntypedata case per variant, keyed by the integer tag.
+        assert_eq!(ktd.len(), 2, "one knowntypedata case per variant");
+        for (discr, variant_name) in [(0, "Rgb"), (1, "Named")] {
+            let constraints = ktd
+                .get(&ExitCaseKey::Int(discr))
+                .unwrap_or_else(|| panic!("missing Int({discr}) case"));
+            let s_refined = constraints
+                .get(&receiver)
+                .expect("receiver variable is the narrowing key");
+            let variant = bk
+                .getuniqueclassdef_for_enum_variant("Color", variant_name)
+                .expect("variant registers");
+            // The refinement narrows SomeInstance(base) to the variant —
+            // exactly what follow_link's improve does in arm `discr`.
+            let s_base = SomeValue::Instance(SomeInstance::new(
+                Some(base.clone()),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+            let narrowed = crate::annotator::binaryop::improve(&s_base, s_refined);
+            match narrowed {
+                SomeValue::Instance(si) => assert!(
+                    si.classdef
+                        .as_ref()
+                        .is_some_and(|c| Rc::ptr_eq(c, &variant)),
+                    "Int({discr}) narrows the receiver to {variant_name}"
+                ),
+                other => panic!("expected SomeInstance({variant_name}), got {other:?}"),
+            }
+        }
+
+        // A class with no registered variant table yields no narrowing.
+        let other_recv = Rc::new(Variable::new());
+        assert!(
+            bk.enum_variant_narrowing_knowntypedata("NotAnEnum", &other_recv)
+                .is_none(),
+            "non-enum class yields no knowntypedata"
+        );
     }
 
     #[test]

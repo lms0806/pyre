@@ -768,6 +768,14 @@ pub struct CallControl {
     /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
     struct_fields: crate::front::StructFieldRegistry,
 
+    /// TODO: no upstream equivalent (RPython has no Rust enums).  Maps an
+    /// enum type-root name (dual-keyed: qualified path and bare leaf) to
+    /// its `discriminant value → variant name` table.  Threaded into the
+    /// dual-gate bookkeeper so the `__discriminant` getattr can attach
+    /// discriminant→variant narrowing `knowntypedata` (see
+    /// `Bookkeeper::enum_variant_narrowing_knowntypedata`).
+    enum_variant_by_discriminant: HashMap<String, HashMap<i64, String>>,
+
     /// Trait leaf → owner root of its only concrete impl in the
     /// analyzed LLBC world (traits with two or more impl owners are
     /// absent).  Computed in `lib.rs` from `concrete_trait_methods` and
@@ -1142,6 +1150,7 @@ impl CallControl {
             descr_indices: DescrIndexRegistry::default(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
+            enum_variant_by_discriminant: HashMap::new(),
             trait_unique_impls: HashMap::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
@@ -1212,6 +1221,18 @@ impl CallControl {
     /// project a struct's fields onto its classdef.
     pub fn struct_fields(&self) -> &crate::front::StructFieldRegistry {
         &self.struct_fields
+    }
+
+    /// Register the enum `discriminant → variant` tables (see the
+    /// `enum_variant_by_discriminant` field doc).
+    pub fn set_enum_variant_by_discriminant(&mut self, map: HashMap<String, HashMap<i64, String>>) {
+        self.enum_variant_by_discriminant = map;
+    }
+
+    /// Enum type-root → `discriminant → variant` table, threaded into the
+    /// dual-gate bookkeeper alongside [`Self::struct_fields`].
+    pub fn enum_variant_by_discriminant(&self) -> &HashMap<String, HashMap<i64, String>> {
+        &self.enum_variant_by_discriminant
     }
 
     /// Register the trait → unique-concrete-impl-owner map (see the

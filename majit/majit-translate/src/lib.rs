@@ -769,6 +769,9 @@ fn analyze_pipeline_from_module_paths(
     call_control.set_known_struct_names(program.known_struct_names.clone());
     // RPython: struct field types for op.args[0].concretetype resolution.
     call_control.set_struct_fields(program.struct_fields.clone());
+    // Enum `discriminant → variant` tables for the `__discriminant`
+    // getattr's discriminant→variant narrowing knowntypedata.
+    call_control.set_enum_variant_by_discriminant(program.enum_variant_by_discriminant.clone());
     // RPython: symbolic.get_field_token / get_size — resolve struct layouts
     // through the LayoutProvider. If no provider is given, use the heuristic
     // (type-string-based approximation of #[repr(C)] layout).

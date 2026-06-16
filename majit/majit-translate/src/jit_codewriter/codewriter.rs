@@ -146,6 +146,11 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_pyre_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        // Enum `discriminant → variant` tables for the `__discriminant`
+        // getattr's narrowing knowntypedata producer.
+        registry.set_pyre_enum_variant_by_discriminant(std::rc::Rc::new(
+            callcontrol.enum_variant_by_discriminant().clone(),
+        ));
         // Trait → unique-impl owner map for the generic-receiver seed
         // path (`derive_subject_inputcells` resolves a bound-trait
         // `class_root` through it before the struct-root lookup).

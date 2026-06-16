@@ -228,6 +228,18 @@ impl PyreCallRegistry {
         self.bookkeeper.set_pyre_trait_unique_impls(map);
     }
 
+    /// Thread the enum `discriminant → variant` tables into the shared
+    /// bookkeeper so the `__discriminant` getattr can attach
+    /// discriminant→variant narrowing `knowntypedata`.  Called once from
+    /// `dual_gate_registry` with
+    /// `CallControl::enum_variant_by_discriminant().clone()`.
+    pub fn set_pyre_enum_variant_by_discriminant(
+        &self,
+        map: Rc<HashMap<String, HashMap<i64, String>>>,
+    ) {
+        self.bookkeeper.set_pyre_enum_variant_by_discriminant(map);
+    }
+
     /// Seed each struct-root class `HostObject`'s dict with its
     /// registered impl-method function hosts.
     ///
