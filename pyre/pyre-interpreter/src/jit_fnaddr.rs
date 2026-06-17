@@ -1132,6 +1132,35 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "itertoolsmodule::PAIRWISE_TYPE",
             itertoolsmodule::PAIRWISE_TYPE
         ),
+        pytype_addr!("sreobject::SRE_SCANNER_TYPE", sreobject::SRE_SCANNER_TYPE),
+        pytype_addr!(
+            "rangeobject::LONG_RANGE_ITER_TYPE",
+            rangeobject::LONG_RANGE_ITER_TYPE
+        ),
+        // `pyre_interpreter`-local `PyType` singletons.  The `pytype_addr!`
+        // macro emits `&pyre_object::$path` and cannot reach these
+        // crate-local statics, so capture their addresses directly.  The
+        // keys match the front-end `["pyre_interpreter", module, NAME]`
+        // global-read segments via the `static_key_matches` `::`-suffix
+        // rule, so the `module::NAME` form suffices.  All four are
+        // compile-time `static … : PyType = new_pytype(…)` so the captured
+        // address is the stable runtime identity.
+        (
+            "function::FUNCTION_TYPE",
+            &crate::function::FUNCTION_TYPE as *const _ as i64,
+        ),
+        (
+            "function::BUILTIN_FUNCTION_TYPE",
+            &crate::function::BUILTIN_FUNCTION_TYPE as *const _ as i64,
+        ),
+        (
+            "gateway::BUILTIN_CODE_TYPE",
+            &crate::gateway::BUILTIN_CODE_TYPE as *const _ as i64,
+        ),
+        (
+            "pytraceback::PYTRACEBACK_TYPE",
+            &crate::pytraceback::PYTRACEBACK_TYPE as *const _ as i64,
+        ),
     ]
 }
 

@@ -1527,23 +1527,28 @@ pub fn translate_op(
                         // the field-read side uses
                         // (`getuniqueclassdef_for_struct_root`), so
                         // ctor base and attr reads share one
-                        // `HostObject` Arc.  Scoped to unit-only enums
-                        // (flat class rows = `__discriminant` alone):
-                        // a payload-bearing enum's flat class projects
-                        // the union of variant payload rows as classdef
-                        // attrs, and the subclass instance repr would
-                        // have to materialize all of them — walling on
-                        // reprs not yet ported (e.g. `Vec` payload rows
-                        // need rlist.py ListRepr).  Those enums keep
-                        // base-less variant classes until the missing
-                        // reprs land.
+                        // `HostObject` Arc.  Applies to every enum root
+                        // (flat class leads with `__discriminant`),
+                        // payload-bearing included: the variant subclass
+                        // inherits the base's projected payload rows
+                        // exactly as the discriminant-narrowing path
+                        // already mints them (`getuniqueclassdef_for_enum_variant`
+                        // bases variants ungated), so this adds no repr
+                        // obligation beyond what narrowing already
+                        // creates.  A payload row whose repr is not yet
+                        // ported (e.g. `Vec` → rlist.py ListRepr) walls
+                        // later in `convert_from_to`, which the dual gate
+                        // degrades to a graceful legacy Skip — strictly
+                        // better than the base-less variant's
+                        // `mergeinputargs` "no common base class" panic
+                        // (sibling `Option::Some` ∪ `Option::None`).
                         let enum_base = owner_path.last().and_then(|owner_tail| {
                             let registry = bk.pyre_struct_fields.borrow();
-                            let is_unit_enum = registry
+                            let is_enum_root = registry
                                 .as_ref()
-                                .is_some_and(|reg| reg.is_unit_only_enum(owner_tail));
+                                .is_some_and(|reg| reg.is_enum_root(owner_tail));
                             drop(registry);
-                            is_unit_enum.then(|| bk.intern_class_by_qualname(owner_tail))
+                            is_enum_root.then(|| bk.intern_class_by_qualname(owner_tail))
                         });
                         match enum_base {
                             Some(base) => {

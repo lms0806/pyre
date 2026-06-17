@@ -7289,11 +7289,21 @@ fn infer_fail_arg_types(
             fail_arg_types.push(Type::Ref);
             continue;
         }
-        // resoperation.py Box.type parity: default to Ref (GCREF).
-        // RPython's Box carries an immutable .type attribute; unknown
-        // boxes are RefOp-based (the most common case in pyre).
-        fail_arg_types
-            .push(lookup_type_at(type_index, overrides, opref, op_index).unwrap_or(Type::Ref));
+        // assembler.py:46 compute_gcmap reads `box.type` directly; a real
+        // live fail_arg always carries it (constant, inputarg, or op
+        // result — all typed). A type-less non-None fail_arg would be a
+        // Box-identity violation, so surface it in debug. Release keeps the
+        // conservative Ref default (gcmap over-inclusion is GC-safe; Int
+        // would drop a real root).
+        let tp = lookup_type_at(type_index, overrides, opref, op_index).unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "cranelift fail_arg {opref:?} (op {op_index}) has no box.type \
+                 — real live boxes carry it intrinsically"
+            );
+            Type::Ref
+        });
+        fail_arg_types.push(tp);
     }
     Ok(fail_arg_types)
 }

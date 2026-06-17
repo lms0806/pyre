@@ -780,6 +780,36 @@ fn const_bits_or_panic(v: OpRef, constants: &majit_ir::VecAssoc<u32, i64>, where
     })
 }
 
+/// `box.type` for a regalloc operand, given its `OpTypeIndex` lookup result.
+///
+/// RPython reads `v.type` directly during register allocation; every real
+/// Box pins its type at construction (history.py:220 ConstInt / :261
+/// ConstFloat / :307 ConstPtr), so `OpTypeIndex::opref_type` returns it.
+/// The only type-less operand is a regalloc-scratch `TempVar`, which
+/// RPython's `_check_type` (regalloc.py:405-407) exempts from the type
+/// check via `isinstance(v, TempVar)`. Pyre allocates every `TempVar` as
+/// GP-integer scratch (`fresh_temp_var`, all call sites mirror `TempInt()`),
+/// so a type-less operand resolves to `Type::Int`.
+///
+/// Any *other* type-less opref is a real Box that lost its type tag — a
+/// Box-identity violation. `_check_type` is debug-only (`not
+/// we_are_translated()`), so this mirrors it with a `debug_assert!`: the
+/// release build keeps RPython's untyped flow, the debug build surfaces the
+/// violation at the boundary instead of silently picking `Int`.
+fn box_type_or_temp(known: Option<Type>, v: OpRef) -> Type {
+    match known {
+        Some(tp) => tp,
+        None => {
+            debug_assert!(
+                matches!(v, OpRef::TempVar(_)),
+                "regalloc operand {v:?} has no box.type and is not a TempVar \
+                 (real Boxes carry box.type intrinsically)"
+            );
+            Type::Int
+        }
+    }
+}
+
 impl RegisterManager {
     /// regalloc.py:368
     pub fn new(
@@ -1452,17 +1482,15 @@ impl RegisterManager {
         let items: Vec<(OpRef, RegLoc)> = self.reg_bindings_items();
         for (v, reg) in items {
             let max_age = longevity.get(v).unwrap().last_usage;
-            // TODO: the `unwrap_or(Type::Int)` mirrors
-            // the cranelift caller seeding gap documented at
-            // `majit-ir/src/op_type_index.rs:144-164`. RPython box.type
-            // is intrinsic on the Box object (history.py:220) and never
-            // requires a fallback.
+            // regalloc.py:774 reads `v.type` directly; box.type is
+            // intrinsic on every real Box (history.py:220). A type-less
+            // binding is only a regalloc-scratch TempVar (`_check_type`
+            // exemption, regalloc.py:405), resolved to Type::Int by
+            // `box_type_or_temp`.
             let v_type = if self.position >= 0 {
-                type_index
-                    .opref_type_at(v, self.position as usize)
-                    .unwrap_or(Type::Int)
+                box_type_or_temp(type_index.opref_type_at(v, self.position as usize), v)
             } else {
-                type_index.opref_type(v).unwrap_or(Type::Int)
+                box_type_or_temp(type_index.opref_type(v), v)
             };
             if !force_store.contains(&v) && max_age <= self.position {
                 // variable dies
@@ -2025,15 +2053,14 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py:305 possibly_free_vars_for_op(op) — RPython reads
-    /// `arg.type` per box; pyre routes through `self.opref_type`. The
-    /// `unwrap_or(Type::Int)` is a TODO; see `tp()`
-    /// docstring + `majit-ir/src/op_type_index.rs:144-164` for the
-    /// shared cranelift caller seeding gap rationale.
+    /// `arg.type` per box; pyre routes through `self.tp`, which resolves a
+    /// real Box's intrinsic type and falls back to `Type::Int` only for a
+    /// `TempVar` (the `_check_type` exemption, regalloc.py:405).
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
         for arg in op.getarglist().iter() {
             if !arg.is_constant() && !arg.is_none() {
                 let arg = arg.to_opref();
-                let tp = self.opref_type(arg).unwrap_or(Type::Int);
+                let tp = self.tp(arg);
                 self.possibly_free_var(arg, tp);
             }
         }
@@ -2357,14 +2384,13 @@ impl<'a> RegAlloc<'a> {
     // ── Type resolution ──
 
     /// RPython reads `box.type` directly (history.py:220 ConstInt /
-    /// :261 ConstFloat / :307 ConstPtr pin `type` at construction);
-    /// pyre delegates to `OpTypeIndex`. The `unwrap_or(Type::Int)`
-    /// fallback is a TODO mirroring
-    /// `majit-ir/src/op_type_index.rs:144-164` — the same cranelift
-    /// caller seeding gap blocks fail-loud here. Convergence path
-    /// closes both layers together.
+    /// :261 ConstFloat / :307 ConstPtr pin `type` at construction); pyre
+    /// delegates to `OpTypeIndex`. A type-less result is only ever a
+    /// regalloc-scratch `TempVar` (GP-integer), which [`box_type_or_temp`]
+    /// resolves to `Type::Int` while debug-asserting the `_check_type`
+    /// (regalloc.py:405) TempVar exemption.
     pub(crate) fn tp(&self, v: OpRef) -> Type {
-        self.opref_type(v).unwrap_or(Type::Int)
+        box_type_or_temp(self.opref_type(v), v)
     }
 
     /// Extract the integer value of a constant OpRef (like RPython's getint()).

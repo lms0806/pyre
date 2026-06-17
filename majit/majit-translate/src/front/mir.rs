@@ -7257,11 +7257,14 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
 /// method has a classdef-less analyzer reachable through the `getattr` →
 /// bound-method path, so [`Lowering::impl_method_owner`] may route them as
 /// `CallTarget::Method` even though Charon leaves the `Self` type unresolved
-/// (non-ADT, no entry in the type table).  `mut_ptr::is_null` resolves to
-/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`).  Pairs absent
-/// here keep the `FunctionPath` form rather than surface a new panicking
+/// (non-ADT, no entry in the type table).  `*_ptr::is_null` resolves to
+/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`), lowered to
+/// `ptr_iszero`; `const_ptr` and `mut_ptr` share the analyzer since the
+/// receiver mutability does not affect the null test.  Pairs absent here
+/// keep the `FunctionPath` form rather than surface a new panicking
 /// `SomeInstance.getattr`.
-const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] = &[("mut_ptr", "is_null")];
+const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
+    &[("mut_ptr", "is_null"), ("const_ptr", "is_null")];
 
 /// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
 /// raw `NameSeg` vec ends in two consecutive `Ident` segments — the

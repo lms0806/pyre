@@ -1764,7 +1764,11 @@ impl GcRewriterImpl {
         let val_is_ref = if field_is_ptr {
             match st.result_type_of(&val) {
                 Some(tp) => tp == Type::Ref,
-                None => true, // field is ptr → assume value is Ref
+                // `result_type_of` is None only for the OpRef::None /
+                // virtual-object marker (history.py Box.type has no analog
+                // for it). Stored into a pointer field it is a GCREF slot,
+                // so it needs a barrier — assume Ref.
+                None => true,
             }
         } else {
             false
@@ -1844,6 +1848,9 @@ impl GcRewriterImpl {
             let v = st.resolve(op.arg(2));
             let val_is_ref = match st.result_type_of(&v) {
                 Some(tp) => tp == Type::Ref,
+                // None only for the OpRef::None / virtual marker (no type
+                // tag); route the barrier decision through the array
+                // descriptor — a pointer array is a GCREF slot.
                 None => op
                     .getdescr()
                     .and_then(|d| d.as_array_descr().map(|ad| ad.is_array_of_pointers()))

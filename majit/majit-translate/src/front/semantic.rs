@@ -143,6 +143,17 @@ impl StructFieldRegistry {
             .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
     }
 
+    /// True when `owner` is registered as an enum flat class — its first
+    /// row is the synthetic `__discriminant` tag.  Unlike
+    /// [`Self::is_unit_only_enum`] this also holds for payload-bearing
+    /// enums (whose later rows carry the union of variant fields), so it
+    /// gates the variant-ctor base linkage that every enum needs for
+    /// sibling variants to share a `commonbase`.
+    pub fn is_enum_root(&self, owner: &str) -> bool {
+        self.lookup_fields(owner)
+            .is_some_and(|rows| matches!(rows.first(), Some((name, _)) if name == "__discriminant"))
+    }
+
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         if let Some(fields) = self.fields.get(owner) {
             return Some(fields.as_slice());
