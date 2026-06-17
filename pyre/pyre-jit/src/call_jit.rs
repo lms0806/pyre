@@ -3605,6 +3605,25 @@ pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
     0
 }
 
+/// LIST_EXTEND residual (`list_extend` HLOp → `residual_call_r_v`).
+/// Runs `list.extend(iterable)` through the shared
+/// `opcode_ops::list_extend_value` (the same code the interpreter's
+/// `list_extend` runs); `list` is peeked and mutated in place.  A
+/// non-iterable operand or a user iterator running Python can raise
+/// (`MayForce`).  Void result, so always returns 0; on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException`, matching `bh_delete_subscr_fn`.
+pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::list_extend_value(
+        list as pyre_object::PyObjectRef,
+        iterable as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never
@@ -3838,28 +3857,16 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     }
 
     // op_code 10 = CHECK_EXC_MATCH isinstance check (from codewriter CheckExcMatch).
-    // lhs = exception value, rhs = exception type to match.
+    // lhs = exception value, rhs = exception type (or tuple of types) to match.
+    // Mirror the interpreter's `check_exc_match_against` =
+    // `exception_match(type(exc), match_class)` (eval.rs:851) so the match
+    // walks the exception class MRO and accepts a tuple of classes.  The
+    // earlier bespoke `ExcKind`-vs-type-name model only handled str / builtin
+    // function match specs and fell through to an unconditional `true` for a
+    // proper exception type object, which made every `except SomeError:`
+    // appear to match — wrong for any clause beyond the first.
     if op_code == 10 {
-        let matched = unsafe {
-            if !pyre_object::is_exception(lhs) {
-                true
-            } else {
-                let kind = pyre_object::w_exception_get_kind(lhs);
-                if pyre_object::is_str(rhs) {
-                    let type_name = pyre_object::w_str_get_value(rhs);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else if pyre_interpreter::is_function(rhs)
-                    && pyre_interpreter::is_builtin_code(
-                        pyre_interpreter::function_get_code(rhs) as pyre_object::PyObjectRef
-                    )
-                {
-                    let type_name = pyre_interpreter::function_get_name(rhs);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else {
-                    true
-                }
-            }
-        };
+        let matched = pyre_interpreter::eval::check_exc_match_against(lhs, rhs);
         return pyre_object::w_bool_from(matched) as i64;
     }
 

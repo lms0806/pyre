@@ -6222,11 +6222,24 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
 #[inline]
 fn check_residual_call_exception_after(
     bh: &mut BlackholeInterpreter,
+    next_pos: usize,
 ) -> Result<Option<usize>, DispatchError> {
     let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
     if exc_val == 0 {
         return Ok(None);
     }
+    // `dispatch_step` stores the handler's return value into `self.position`
+    // only *after* the handler returns, so right now `self.position` still
+    // points at this residual call's first operand byte.  Advance it to
+    // `next_pos` — the post-call position the handler is about to return,
+    // where the codewriter emitted the can-raise opcode's `-live-` /
+    // `catch_exception` adjacency (`codewriter.rs:9161-9188`).  Without this,
+    // `handle_exception_in_frame`'s forward case inspects an operand byte
+    // (never a `catch_exception`) and the backward scan stops at the
+    // *pre*-call `-live-`, so a residual call executed directly during the
+    // walk escapes its enclosing `try` even though the catch sits right
+    // after it.
+    bh.position = next_pos;
     if bh.handle_exception_in_frame(exc_val) {
         return Ok(Some(bh.position));
     }
@@ -6251,7 +6264,7 @@ fn handler_residual_call_irf_i(
     // blackhole.py:1244-1246 → bhimpl_residual_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_i[dst] = result;
@@ -6272,7 +6285,7 @@ fn handler_residual_call_irf_r(
     // blackhole.py:1247-1249 → bhimpl_residual_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_r[dst] = result.0 as i64;
@@ -6293,7 +6306,7 @@ fn handler_residual_call_irf_f(
     // blackhole.py:1250-1252 → bhimpl_residual_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_f[dst] = result.to_bits() as i64;
@@ -6314,7 +6327,7 @@ fn handler_residual_call_irf_v(
     // which forwards to cpu.bh_call_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_irf_v(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
         return Ok(handler_pc);
     }
     Ok(p)
@@ -6334,7 +6347,7 @@ fn handler_residual_call_ir_i(
     // blackhole.py:1234-1236 → bhimpl_residual_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_i[dst] = result;
@@ -6354,7 +6367,7 @@ fn handler_residual_call_ir_r(
     // blackhole.py:1237-1239 → bhimpl_residual_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_r[dst] = result.0 as i64;
@@ -6373,7 +6386,7 @@ fn handler_residual_call_ir_v(
     // blackhole.py:1240-1242 → bhimpl_residual_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
         return Ok(handler_pc);
     }
     Ok(p)
@@ -6392,7 +6405,7 @@ fn handler_residual_call_r_i(
     // blackhole.py:1225-1226 → bhimpl_residual_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_i[dst] = result;
@@ -6411,7 +6424,7 @@ fn handler_residual_call_r_r(
     // blackhole.py:1227-1229 → bhimpl_residual_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
         return Ok(handler_pc);
     }
     bh.registers_r[dst] = result.0 as i64;
@@ -6429,7 +6442,7 @@ fn handler_residual_call_r_v(
     // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh)? {
+    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
         return Ok(handler_pc);
     }
     Ok(p)
@@ -6992,6 +7005,35 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "arraylen_vable/rdd>i".to_string(),
         majit_translate::insns::BC_ARRAYLEN_VABLE,
+    );
+    // GC array-build family — `BuildTuple` / `BuildList` / `BuildMap` /
+    // `BuildSet` / `BuildString` lower to `new_array_clear` (alloc) +
+    // unrolled `setarrayitem_gc_r` (fill) + a `new*_from_array` residual
+    // (already covered by the residual_call family above).  A
+    // guard-failure resume into a jitcode whose forward path contains a
+    // literal/return tuple (or list/map/set/str) walks the alloc + fill
+    // ops, so the strict builder must wire them or `dispatch_step`
+    // panics on the unwired byte.  Both the const-operand variants
+    // (`cd>r` length, `rcrd` index — what the codewriter emits, since
+    // the length and index are compile-time constants) and the
+    // register-operand variants (`id>r`, `rird`) are registered so the
+    // builder stays correct if the flattener ever colors them into
+    // registers.  Handlers wired in `wire_bhimpl_handlers`.
+    insns.insert(
+        "new_array_clear/cd>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+    );
+    insns.insert(
+        "new_array_clear/id>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+    );
+    insns.insert(
+        "setarrayitem_gc_r/rcrd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+    );
+    insns.insert(
+        "setarrayitem_gc_r/rird".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R,
     );
     insns.insert(
         "hint_force_virtualizable/r".to_string(),

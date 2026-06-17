@@ -1372,14 +1372,22 @@ fn reserve_local_ref_colors_in_place(
 /// re-separated, so the resume reverse map stays non-injective.
 ///
 /// This simulates the same in-order union-find merge the regalloc applies
-/// and skips any pair whose union would place two different frame-local
-/// slots — or a frame-local slot and a stack slot — in one group.  A
-/// skipped pair's endpoints get a `*_copy` at flatten time instead of
-/// sharing a register — correct, since they hold distinct frame slots.
-/// Two stack slots MAY still coalesce (their colors are allowed to alias),
-/// matching [`collect_distinct_slot_interference_pairs`], so within-slot
-/// pairs and stack↔stack pairs are kept.  Splice-only (production passes
-/// the unfiltered pairs and is byte-identical).
+/// and skips any pair whose union would place two different frame slots —
+/// two distinct frame-local slots, two distinct stack slots, or a
+/// frame-local and a stack slot — in one group.  A skipped pair's
+/// endpoints get a `*_copy` at flatten time instead of sharing a register —
+/// correct, since they hold distinct frame slots.  Two distinct stack slots
+/// must not coalesce either: a guard compare's two operands occupy adjacent
+/// stack slots and are simultaneously live, so merging them aliases one
+/// register across both operands and the pre-merge voids the SSA-liveness
+/// edge that would otherwise keep them apart (the assumption in
+/// [`collect_distinct_slot_interference_pairs`] that simultaneously-live
+/// stack slots interfere through normal liveness only holds once the
+/// pre-merge no longer collapses them).  Distinct stack slots that are
+/// disjoint-live stay free to share a color — the chordal coloring aliases
+/// them when no interference edge forces them apart, so this only forbids
+/// the union-find MERGE, not color reuse.  Only WITHIN-slot pairs survive.
+/// Splice-only (production passes the unfiltered pairs and is byte-identical).
 fn filter_cross_slot_coalesce_pairs(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
     walker_slot_for_variable: &[Option<u16>],
@@ -1412,15 +1420,29 @@ fn filter_cross_slot_coalesce_pairs(
     };
     let local_of =
         |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) < nlocals) };
-    let is_stack =
-        |id: VariableId| -> bool { slot_of(id).is_some_and(|s| (s as usize) >= nlocals) };
+    let stack_of =
+        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) >= nlocals) };
+    // Claim at most one slot of a given kind for the merged group, treating
+    // a second distinct slot of that kind as a conflict.  Returns the
+    // claimed slot (if any) or signals a conflict.
+    let claim_slot = |candidates: [Option<u16>; 4]| -> Result<Option<u16>, ()> {
+        let mut claimed: Option<u16> = None;
+        for s in candidates.into_iter().flatten() {
+            match claimed {
+                None => claimed = Some(s),
+                Some(c) if c == s => {}
+                Some(_) => return Err(()),
+            }
+        }
+        Ok(claimed)
+    };
     let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
     // Frame-local slot claimed by each union-find root (absent = the group
     // touches no frame-local slot).
     let mut group_local: HashMap<VariableId, u16> = HashMap::new();
-    // Roots whose group already touches at least one stack slot.
-    let mut group_has_stack: std::collections::HashSet<VariableId> =
-        std::collections::HashSet::new();
+    // Stack slot claimed by each union-find root (absent = the group touches
+    // no stack slot).
+    let mut group_stack: HashMap<VariableId, u16> = HashMap::new();
     let mut kept = Vec::with_capacity(pairs.len());
     for &(a, b) in pairs {
         parent.entry(a).or_insert(a);
@@ -1434,45 +1456,39 @@ fn filter_cross_slot_coalesce_pairs(
         // The single frame-local slot the merged group may claim, or a
         // conflict if the two groups + raw endpoints name 2+ distinct
         // frame-local slots.
-        let mut claimed: Option<u16> = None;
-        let mut conflict = false;
-        for s in [
+        let Ok(claimed_local) = claim_slot([
             group_local.get(&ra).copied(),
             group_local.get(&rb).copied(),
             local_of(a),
             local_of(b),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            match claimed {
-                None => claimed = Some(s),
-                Some(c) if c == s => {}
-                Some(_) => {
-                    conflict = true;
-                    break;
-                }
-            }
-        }
-        if conflict {
+        ]) else {
             continue;
-        }
-        let merged_has_stack = group_has_stack.contains(&ra)
-            || group_has_stack.contains(&rb)
-            || is_stack(a)
-            || is_stack(b);
+        };
+        // Likewise the single stack slot the merged group may claim: two
+        // distinct stack slots hold simultaneously-live values (e.g. the
+        // two operands of a guard compare), so merging them would alias one
+        // register across both and the pre-merge would void the SSA-liveness
+        // edge that keeps them apart.  Reject the cross-slot stack merge.
+        let Ok(claimed_stack) = claim_slot([
+            group_stack.get(&ra).copied(),
+            group_stack.get(&rb).copied(),
+            stack_of(a),
+            stack_of(b),
+        ]) else {
+            continue;
+        };
         // A frame-local slot must not share a register group with any stack
-        // slot (① local↔stack collision), so reject a merge that would put
-        // a claimed local and a stack slot together.
-        if claimed.is_some() && merged_has_stack {
+        // slot (local↔stack collision), so reject a merge that would put a
+        // claimed local and a claimed stack slot together.
+        if claimed_local.is_some() && claimed_stack.is_some() {
             continue;
         }
         parent.insert(rb, ra);
-        if let Some(s) = claimed {
+        if let Some(s) = claimed_local {
             group_local.insert(ra, s);
         }
-        if merged_has_stack {
-            group_has_stack.insert(ra);
+        if let Some(s) = claimed_stack {
+            group_stack.insert(ra, s);
         }
         kept.push((a, b));
     }
@@ -2613,6 +2629,25 @@ fn emit_frontend_delete_attr(
     );
 }
 
+/// LIST_EXTEND — records the 2-arg `list_extend(list, iterable)` HLOp
+/// (void result) that `flatten.rs::lower_list_extend_hlop_to_insn`
+/// threads into the `bh_list_extend_fn(list, iterable)` residual.  The
+/// list is peeked (not popped) — the residual mutates it in place.
+fn emit_frontend_list_extend(
+    block: &super::flow::BlockRef,
+    list: super::flow::FlowValue,
+    iterable: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "list_extend",
+        vec![list.into(), iterable.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3357,6 +3392,7 @@ struct FnPtrIndices {
     unary_invert_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
+    list_extend_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3711,6 +3747,14 @@ fn register_helper_fn_pointers(
         cpu.unary_negative_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_list_extend_fn` extends a list in place from an arbitrary
+    // iterable; iterating it runs user `__iter__`/`__next__` → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let list_extend_fn = bind(
+        assembler,
+        cpu.list_extend_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3759,6 +3803,7 @@ fn register_helper_fn_pointers(
         unary_invert_fn,
         unary_not_fn,
         load_fast_check_fn,
+        list_extend_fn,
     }
 }
 
@@ -4755,6 +4800,11 @@ impl CodeWriter {
                     idx: load_fast_check_fn_idx,
                     flavor: _load_fast_check_fn_flavor,
                 },
+            list_extend_fn:
+                HelperHandle {
+                    idx: list_extend_fn_idx,
+                    flavor: _list_extend_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4834,6 +4884,7 @@ impl CodeWriter {
                 unary_invert_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
+                list_extend_fn_idx,
             });
         }
 
@@ -7573,7 +7624,6 @@ impl CodeWriter {
                                 .last()
                                 .cloned()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
-                            let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // CheckExcMatch
                             // compare_fn factor refactor.  `compare_fn` is
                             // the same helper used by COMPARE_OP — the
@@ -7603,10 +7653,28 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(cmp_result, scratch_match);
-                            let result_value = fresh_ref_value(&mut graph);
+                            // Push the compare result itself, not a fresh
+                            // disconnected ref.  A fresh `result_value` has no
+                            // producing op, so its register colour is never
+                            // written during the body walk; PopJumpIfFalse then
+                            // feeds that unwritten register to `truth_fn`, which
+                            // reads NULL and mis-branches once the regalloc
+                            // colours the fresh ref differently from the compare
+                            // result (reproducible on a nested except resume).
+                            // Mirror CompareOp (codewriter.rs:6744): pin the
+                            // result to the stack slot it is pushed to so
+                            // PopJumpIfFalse's pop re-pins the same value to the
+                            // same slot and `truth_fn` reads the compare's own
+                            // register.
+                            let result_value: super::flow::FlowValue = match cmp_result {
+                                Some(v) => v.into(),
+                                None => fresh_ref_value(&mut graph).into(),
+                            };
+                            if let super::flow::FlowValue::Variable(v) = &result_value {
+                                pin!(Some(*v), stack_base + current_depth);
+                            }
                             current_state.stack.push(result_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_match, result_value, py_pc);
+                            emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
 
                         Instruction::PopExcept => {
@@ -8065,15 +8133,68 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // Swap: swap TOS with TOS[i]. No net stack effect.
-                        // pyopcode.py SWAP / eval.rs:1029-1034.
                         Instruction::Swap { i } => {
+                            // SWAP(n): exchange TOS with the value n
+                            // slots below it.  Stack values flow by symbolic
+                            // `FlowValue` identity — every consumer reads the
+                            // FlowValue, not the positional register (see
+                            // `emit_ref_return!` / `emit_pushvalue_ref!`'s
+                            // `let _ = $src`), and regalloc colors by Variable,
+                            // not by stack position — so the symbolic swap below
+                            // carries the value exchange for the compiled trace.
+                            // The two affected stack slots also mirror to the
+                            // virtualizable array at `stack_base_absolute + depth`
+                            // (jtransform.py:1898 `do_fixed_list_setitem`, vable
+                            // branch); a guard-failure resume walk reconstructs
+                            // the live frame from those slots, so emit the crossed
+                            // `setarrayitem_vable_r` writes that keep the mirror
+                            // consistent.  Previously this arm emitted
+                            // `abort_permanent`, which made any resume walk that
+                            // reached a SWAP (e.g. the `return`-from-`except`
+                            // cleanup `SWAP 2; POP_EXCEPT; RETURN_VALUE`) fail.
                             let depth = i.get(op_arg) as usize;
                             let stack_len = current_state.stack.len();
                             if depth > 0 && depth <= stack_len {
-                                current_state.stack.swap(stack_len - 1, stack_len - depth);
+                                let tos_idx = stack_len - 1;
+                                let other_idx = stack_len - depth;
+                                current_state.stack.swap(tos_idx, other_idx);
+                                if is_portal && tos_idx != other_idx {
+                                    let tos_value = current_state.stack[tos_idx].clone();
+                                    let other_value = current_state.stack[other_idx].clone();
+                                    let tos_slot: super::flow::FlowValue =
+                                        super::flow::Constant::signed(
+                                            (stack_base_absolute + tos_idx) as i64,
+                                        )
+                                        .into();
+                                    let other_slot: super::flow::FlowValue =
+                                        super::flow::Constant::signed(
+                                            (stack_base_absolute + other_idx) as i64,
+                                        )
+                                        .into();
+                                    record_graph_op(
+                                        &current_block.block(),
+                                        "setarrayitem_vable_r",
+                                        vable_setarrayitem_ref_graph_args(
+                                            frame_var.into(),
+                                            tos_slot.into(),
+                                            tos_value.into(),
+                                        ),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                    record_graph_op(
+                                        &current_block.block(),
+                                        "setarrayitem_vable_r",
+                                        vable_setarrayitem_ref_graph_args(
+                                            frame_var.into(),
+                                            other_slot.into(),
+                                            other_value.into(),
+                                        ),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                }
                             }
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
@@ -8476,10 +8597,32 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ListExtend(i): peek list, pop iterable. Net: -1.
-                        Instruction::ListExtend { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // ListExtend(i): PEEK(i) list (mutated in place, stays
+                        // on the stack), POP iterable (TOS). Net: -1.
+                        // `list.extend(iterable)` via the `list_extend` residual.
+                        Instruction::ListExtend { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // PEEK(oparg): after popping the iterable, PEEK(1) is
+                            // the new TOS, so the list sits at `len - oparg`.
+                            // Clone its FlowValue without popping — the residual
+                            // mutates it in place and it stays live for STORE_FAST.
+                            let list_value = {
+                                let len = current_state.stack.len();
+                                if oparg >= 1 && oparg <= len {
+                                    current_state.stack[len - oparg].clone()
+                                } else {
+                                    fresh_ref_value(&mut graph)
+                                }
+                            };
+                            emit_frontend_list_extend(
+                                &current_block.block(),
+                                list_value,
+                                iterable_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
@@ -10692,20 +10835,22 @@ mod tests {
         assert!(pairs.is_empty());
     }
 
-    /// The coalesce filter drops a pair that would merge a frame
-    /// local with a stack slot (keeping the local↔stack interference edge
-    /// effective), but keeps a pair that merges two stack slots.
+    /// The coalesce filter drops any pair that would merge two distinct
+    /// frame slots — local↔stack AND stack↔stack — but keeps a within-slot
+    /// pair (two Variables pinned to the same stack slot).
     #[test]
-    fn filter_cross_slot_coalesce_pairs_rejects_local_stack_keeps_stack_stack() {
-        // V0 → local slot 0; V1 → stack slot 3; V2 → stack slot 4.
-        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16)];
-        // local↔stack pair (V0,V1) must be dropped; stack↔stack (V1,V2) kept.
+    fn filter_cross_slot_coalesce_pairs_rejects_all_cross_slot_merges() {
+        // V0 → local slot 0; V1,V3 → stack slot 3; V2 → stack slot 4.
+        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16), Some(3u16)];
+        // local↔stack (V0,V1) dropped; cross-slot stack↔stack (V1,V2)
+        // dropped; within-slot stack (V1,V3) kept.
         let pairs = vec![
             (VariableId(0), VariableId(1)),
             (VariableId(1), VariableId(2)),
+            (VariableId(1), VariableId(3)),
         ];
         let kept = filter_cross_slot_coalesce_pairs(&pairs, &walker_slot_for_variable, 1);
-        assert_eq!(kept, vec![(VariableId(1), VariableId(2))]);
+        assert_eq!(kept, vec![(VariableId(1), VariableId(3))]);
     }
 
     /// A single qualifying frame-local slot yields no interference pairs.

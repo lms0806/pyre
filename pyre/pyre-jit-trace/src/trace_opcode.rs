@@ -8033,7 +8033,109 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
     ) -> Result<Option<pyre_interpreter::StepResult<FrontendOp>>, PyError> {
+        // LOAD_CONST walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `LoadConst` residualises
+        // `opcode_load_const(frame, &ConstantData)` — the `&ConstantData`
+        // operand is oparg-derived (resolved from `consti` against the
+        // code's constant pool), but the per-opcode arm entry
+        // (`dispatch_via_miframe_at_opcode_entry`) seeds only `r0 = frame`,
+        // leaving that operand register unbound — the walk aborts with
+        // `ResidualCallArgUnbound { arg_index: 2 }`.  (A const-specialising
+        // JIT wants the constant BAKED into the IR, not threaded as a
+        // runtime arg, so seeding the register is also the wrong shape.)
+        //
+        // Resolve the constant here and delegate to the existing
+        // `OpcodeStepExecutor::load_const` (the same method
+        // `execute_load_const` calls on the trait leg), which emits the
+        // type-specialised IR (`ConstRef` / `int_constant` / `str_constant`
+        // / …) and pushes via `push_value` — keeping `sym.valuestackdepth`
+        // / vable shadow / concrete mirror coherent.  Same delegation
+        // pattern as the StoreSubscr / PushNull hooks below; bypasses
+        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        if let Instruction::LoadConst { consti } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let const_idx = consti.get(op_arg);
+            OpcodeStepExecutor::load_const(self, &code.constants[const_idx])?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // LOAD_SMALL_INT walker activation — the const-push sibling of
+        // LoadConst (the small int lives in the oparg itself, not the
+        // constant pool).  Delegate to `OpcodeStepExecutor::load_small_int`
+        // (the same method `execute_load_small_int` calls), which emits an
+        // int ConstRef and pushes via `push_value` (advancing vsd).
+        if let Instruction::LoadSmallInt { i } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::load_small_int(self, i64::from(i.get(op_arg)))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // LOAD_FAST / LOAD_FAST_BORROW walker activation via trait-path
+        // delegation.  Same oparg-payload shape as LoadConst: the auto-gen
+        // arm reads the `var_num` local index from a register the r0-only
+        // arm entry leaves unbound.  Resolve the local index + name
+        // (mirroring `execute_load_fast`, which serves both opcodes) and
+        // delegate to the existing `OpcodeStepExecutor::load_fast_checked`,
+        // whose vable read + `push_value` emits the specialised IR and
+        // advances vsd.  LoadFastBorrow shares the handler — the
+        // borrow-vs-own distinction is a runtime refcount concern the
+        // symbolic IR does not model.
+        if let Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } =
+            instruction
+        {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = pyre_interpreter::load_fast_var_num_to_index(*var_num, op_arg);
+            let name = if idx < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx].as_ref()
+            } else {
+                "<cell>"
+            };
+            OpcodeStepExecutor::load_fast_checked(self, idx, name)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // STORE_FAST walker activation via trait-path delegation.
+        //
+        // Same oparg-payload shape as LoadFast (the var_num local index is
+        // read from an arm register the r0-only entry leaves unbound).
+        // Delegate to `OpcodeStepExecutor::store_fast`, which pops the TOS
+        // (via `pop_value`, advancing vsd) and emits the `setarrayitem_
+        // vable_r` local write — a VABLE array write (the JIT-modeled,
+        // resume-safe kind), distinct from a globals-dict write.  The
+        // updated local rides the vable shadow to the live PyFrame through
+        // `synchronize_virtualizable`.  No `code` needed (store_fast takes
+        // only the index); bypasses `apply_walker_stack_effect` because
+        // `pop_value` handles vsd.
+        if let Instruction::StoreFast { var_num } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::store_fast(self, var_num.get(op_arg).as_usize())?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // BINARY_OP walker activation via trait-path delegation.
+        //
+        // Same oparg-payload shape (the operator tag is read from an arm
+        // register the r0-only entry leaves unbound).  Delegate to
+        // `OpcodeStepExecutor::binary_op`, which pops the two operands (via
+        // `pop_value`, advancing vsd), emits the type-specialised
+        // arithmetic IR (`int_add_ovf` &c. behind class guards), and pushes
+        // the result.  Unlike the load/store hooks above this is MAY-RAISE
+        // (TypeError on mismatched operands): `binary_op` returns
+        // `Err(PyError)`, which propagates through
+        // `dispatch_via_walker_for_opcode` to `trace_code_step` exactly as
+        // an `execute_opcode_step` error would on the trait leg, so the
+        // recorder's exception handling is identical on either dispatch
+        // leg.  Bypasses `apply_walker_stack_effect` because `pop_value` /
+        // `push_value` handle vsd.
+        if let Instruction::BinaryOp { op } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::binary_op(self, op.get(op_arg))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -8148,6 +8250,7 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
         // PyPy `_opimpl_*` direct-record entry point — opcodes that bypass
         // the auto-gen arm-jitcode walk and emit IR / produce concrete
@@ -8156,7 +8259,9 @@ impl MIFrame {
         //
         // Returns `Some(step_result)` when the opcode was handled here.
         // The arm-jitcode walker below runs only when this returns `None`.
-        if let Some(step_result) = self.try_walker_direct_opcode_dispatch(instruction, op_arg)? {
+        if let Some(step_result) =
+            self.try_walker_direct_opcode_dispatch(instruction, op_arg, code)?
+        {
             return Ok(step_result);
         }
 
@@ -8444,8 +8549,18 @@ impl MIFrame {
                     && !in_inline_frame
                     && !foldable_list_load_attr
                 {
-                    self.dispatch_via_walker_for_opcode(&instruction, op_arg)
+                    self.dispatch_via_walker_for_opcode(&instruction, op_arg, code)
                 } else {
+                    if flip_probe_enabled() {
+                        let reason = if !production_walker_handles(&instruction) {
+                            "not-in-allowlist"
+                        } else if in_inline_frame {
+                            "in-inline-frame"
+                        } else {
+                            "foldable-list-load-attr"
+                        };
+                        flip_probe_record(&instruction, reason);
+                    }
                     let shadow_outcome =
                         crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
                     let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
@@ -8975,6 +9090,14 @@ impl MIFrame {
                 // walker, which captures a single-frame snapshot under
                 // `MAJIT_SHADOW_WALKER=1` and would diverge from the
                 // trait dispatcher's multi-frame view in inline frames.
+                if flip_probe_enabled() {
+                    let reason = if self.parent_frames.is_empty() {
+                        "toplevel-inline-step"
+                    } else {
+                        "inline-frame"
+                    };
+                    flip_probe_record(&instruction, reason);
+                }
                 let shadow_outcome = if self.parent_frames.is_empty() {
                     crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg)
                 } else {
@@ -9207,6 +9330,37 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     matches!(
         instruction,
         Instruction::Nop
+            // LoadConst handled by the dispatch_via_walker_for_opcode entry
+            // hook: resolves the constant from `consti` + the code pool and
+            // delegates to `OpcodeStepExecutor::load_const`, whose
+            // `push_value` advances vsd.  The auto-gen arm residualises
+            // `opcode_load_const(frame, &ConstantData)` with the
+            // oparg-derived `&ConstantData` operand left unbound by the
+            // r0-only arm entry (ResidualCallArgUnbound).
+            | Instruction::LoadConst { .. }
+            // LoadSmallInt handled by the entry hook (const-push sibling of
+            // LoadConst; small int in the oparg → load_small_int → int
+            // ConstRef + push_value).
+            | Instruction::LoadSmallInt { .. }
+            // LoadFast / LoadFastBorrow handled by the
+            // dispatch_via_walker_for_opcode entry hook: resolves the
+            // var_num local index + name and delegates to
+            // OpcodeStepExecutor::load_fast_checked (push_value advances
+            // vsd).  The auto-gen arm reads the var_num oparg payload from
+            // a register the r0-only arm entry leaves unbound.
+            | Instruction::LoadFast { .. }
+            | Instruction::LoadFastBorrow { .. }
+            // StoreFast handled by the dispatch_via_walker_for_opcode entry
+            // hook: delegates to OpcodeStepExecutor::store_fast (pop_value
+            // advances vsd, setarrayitem_vable_r writes the local).
+            // Distinct from StoreFastStoreFast, which stays trait-routed
+            // (#405 arm-entry var_nums seeding).
+            | Instruction::StoreFast { .. }
+            // BinaryOp handled by the dispatch_via_walker_for_opcode entry
+            // hook: delegates to OpcodeStepExecutor::binary_op (pop_value
+            // ×2 + specialised arithmetic IR + push_value).  May-raise; the
+            // Err propagates to trace_code_step like the trait leg.
+            | Instruction::BinaryOp { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
@@ -9353,6 +9507,41 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // following CALL.
             | Instruction::PushNull
     )
+}
+
+/// Phase-5 flip-completion probe: is `PYRE_FLIP_PROBE` set?  Read once.
+/// When set, the trait-dispatch fallback callers record each unique
+/// (opcode, reason) that still bypasses the walker, so the residual flip
+/// surface is measurable against the production workload.  Inert (a
+/// single cached bool load) when unset.
+fn flip_probe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FLIP_PROBE").is_some())
+}
+
+/// Record one trait-dispatch fallback hit, deduplicated per
+/// (opcode-variant, reason) so each distinct residual case prints once
+/// instead of once-per-opcode-execution.  `reason` distinguishes
+/// not-in-allowlist vs the context gates (inline-frame / foldable
+/// list-method LOAD_ATTR).
+fn flip_probe_record(instruction: &Instruction, reason: &str) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    let dbg = format!("{instruction:?}");
+    let name = dbg
+        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or(&dbg);
+    let key = format!("{name}|{reason}");
+    SEEN.with(|seen| {
+        if seen.borrow_mut().insert(key) {
+            eprintln!("[flip-probe] trait-fallback opcode={name} reason={reason}");
+        }
+    });
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
