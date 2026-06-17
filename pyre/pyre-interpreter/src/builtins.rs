@@ -1765,19 +1765,21 @@ fn type_descr_new_with_metaclass(
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
 
-        // __set_name__ protocol — type_new_set_names
-        // typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
-        if !w_ns_backing.is_null() {
-            let entries = unsafe { pyre_object::w_dict_items(w_ns_backing) };
-            for (k, v) in entries {
-                if unsafe { is_str(k) } {
-                    if let Ok(set_name) = crate::baseobjspace::getattr_str(v, "__set_name__") {
-                        // getattr returns a bound method, so self is already bound.
-                        // Call: bound_set_name(owner, name); propagate a raise.
-                        call_and_check(set_name, &[w_type, k])?;
-                    }
-                }
-            }
+        // _set_names (typeobject.py:1006) — call `__set_name__(owner, name)`
+        // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),
+        // i.e. the filtered namespace with `__classcell__`/`__classdictcell__`
+        // already removed, not the original backing.  Collect the entries
+        // first so the storage borrow is released before the call, which may
+        // re-enter the type's dict.
+        let set_name_entries: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+            (*ns_ptr)
+                .entries_wtf8()
+                .map(|(k, v)| (k.to_owned(), *v))
+                .collect()
+        };
+        for (key, v) in set_name_entries {
+            let k = pyre_object::w_str_from_wtf8(key);
+            unsafe { crate::baseobjspace::set_name(w_type, k, v) }?;
         }
 
         // type_new_init_subclass — fire __init_subclass__ with the
@@ -4109,6 +4111,50 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(dict)
 }
 
+/// util.py:62 `_classdir` — union `getattr(klass, '__dict__')`'s keys with,
+/// recursively, `_classdir(base)` for each base in `getattr(klass,
+/// '__bases__')`.  Both attributes are read through the attribute protocol so
+/// a metaclass that customizes `__dict__`/`__bases__` access participates.
+unsafe fn classdir_into(
+    w_cls: PyObjectRef,
+    names: &mut Vec<Wtf8Buf>,
+) -> Result<(), crate::PyError> {
+    unsafe { classdir_recurse(w_cls, names) }
+}
+
+unsafe fn classdir_recurse(
+    w_cls: PyObjectRef,
+    names: &mut Vec<Wtf8Buf>,
+) -> Result<(), crate::PyError> {
+    // getattr(klass, '__dict__', None): names.update(ns).  This is deliberately
+    // iterable-driven, not dict-only: app-level PyPy accepts any iterable here.
+    match crate::baseobjspace::getattr_str(w_cls, "__dict__") {
+        Ok(w_ns) if !w_ns.is_null() && !unsafe { pyre_object::is_none(w_ns) } => {
+            for k in collect_iterable(w_ns)? {
+                if unsafe { pyre_object::is_str(k) } {
+                    names.push(unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned());
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
+        Err(e) => return Err(e),
+    }
+
+    // getattr(klass, '__bases__', None): for base in bases.
+    match crate::baseobjspace::getattr_str(w_cls, "__bases__") {
+        Ok(bases) if !bases.is_null() && !unsafe { pyre_object::is_none(bases) } => {
+            for base in collect_iterable(bases)? {
+                unsafe { classdir_recurse(base, names) }?;
+            }
+        }
+        Ok(_) => {}
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// `dir([obj])` — PyPy: pypy/module/__builtin__/interp_classobj.py descr_dir
 ///
 /// Without argument: names in the current local scope (not supported).
@@ -4154,6 +4200,15 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             //     `space.iter(w_dict)` would do the same).
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
+                // module.py:163 descr_module__dir__ — a `__dir__` stored in the
+                // module's own dict drives dir() (called with no arguments);
+                // otherwise the dict keys are listed.
+                if let Some(mod_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")? {
+                    if !mod_dir.is_null() {
+                        let result = crate::call::call_function_impl_result(mod_dir, &[])?;
+                        return builtin_sorted(&[result]);
+                    }
+                }
                 if pyre_object::is_dict(w_dict) {
                     for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries_wtf8(w_dict) {
                         names.push(name);
@@ -4169,17 +4224,17 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         } else if pyre_object::is_type(obj) {
-            let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(obj);
-            if !ns_ptr.is_null() {
-                let ns = &*(ns_ptr as *const DictStorage);
-                for (name, _) in ns.entries_wtf8() {
-                    names.push(name.to_owned());
-                }
-            }
+            // util.py:62 `_classdir` (`type.__dir__`, typeobject.py:1234) —
+            // the class's `__dict__` keys unioned with `_classdir` of each
+            // base, recursively.
+            classdir_into(obj, &mut names)?;
         } else if pyre_object::is_instance(obj) {
-            // typeobject.py:1247 type_dir collects names from the instance
-            // dict and the type's MRO. The instance dict for hasdict objects
-            // is the live W_DictObject returned by w_obj.getdict(space).
+            // util.py:80 `_objectdir` (`object.__dir__`) — the instance
+            // `__dict__` keys plus `_classdir(type(obj))`.  The instance dict
+            // for hasdict objects is the live W_DictObject returned by
+            // `w_obj.getdict(space)`; `__slots__` Member descriptor names live
+            // in the class namespaces walked by `classdir_into`, so every slot
+            // is listed regardless of whether it currently holds a value.
             let w_dict = crate::baseobjspace::getdict(obj);
             if !w_dict.is_null() {
                 for (k, _) in pyre_object::w_dict_items(w_dict) {
@@ -4188,44 +4243,19 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     }
                 }
             }
-            // Plus the type's own namespace — `_classdir` walks the MRO
-            // and unions each class's `__dict__` keys, which is where
-            // `__slots__` Member descriptor names live, so every slot is
-            // listed regardless of whether it currently holds a value.
-            // The instance mapdict above is the sole instance attribute
-            // store; no ATTR_TABLE walk is needed.
             let w_type = pyre_object::w_instance_get_type(obj);
             if !w_type.is_null() && pyre_object::is_type(w_type) {
-                let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
-                if !ns_ptr.is_null() {
-                    let ns = &*(ns_ptr as *const DictStorage);
-                    for (name, _) in ns.entries_wtf8() {
-                        names.push(name.to_owned());
-                    }
-                }
-            }
-        } else if pyre_object::is_dict(obj) {
-            for (k, _) in pyre_object::w_dict_items(obj) {
-                if pyre_object::is_str(k) {
-                    names.push(pyre_object::w_str_get_wtf8(k).to_owned());
-                }
+                classdir_into(w_type, &mut names)?;
             }
         } else {
-            // Fallback: walk the object's type namespace so user-
-            // visible attributes on builtin W_Root types (PyTraceback,
-            // dict view, etc.) surface in dir().  Mirrors PyPy's
-            // `typeobject.py:1247 type_dir` MRO walk.  Excluded for
-            // module/instance/type/dict above because those have
-            // richer paths that combine instance+class entries.
+            // Fallback `_objectdir` (util.py:80) for builtin W_Root types
+            // (PyTraceback, dict, dict view, etc.) that have no instance dict:
+            // `_classdir` of their type.  Excluded for module/instance/type
+            // above because those have richer paths that combine instance and
+            // class entries.
             if let Some(w_type) = crate::typedef::r#type(obj) {
                 if pyre_object::is_type(w_type) {
-                    let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
-                    if !ns_ptr.is_null() {
-                        let ns = &*(ns_ptr as *const DictStorage);
-                        for (name, _) in ns.entries_wtf8() {
-                            names.push(name.to_owned());
-                        }
-                    }
+                    classdir_into(w_type, &mut names)?;
                 }
             }
         }

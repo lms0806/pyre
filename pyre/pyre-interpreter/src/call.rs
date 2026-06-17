@@ -410,6 +410,22 @@ fn format_missing_err(fname: &str, missing: &[&str], positional: bool) -> String
     )
 }
 
+/// `argument.py:620-626` ArgErrUnknownKwds.getmsg parity.
+fn format_unknown_kwds_err(fname: &str, unmatched: &[Wtf8Buf]) -> String {
+    if unmatched.len() == 1 {
+        format!(
+            "{}() got an unexpected keyword argument '{}'",
+            fname, unmatched[0]
+        )
+    } else {
+        format!(
+            "{}() got {} unexpected keyword arguments",
+            fname,
+            unmatched.len()
+        )
+    }
+}
+
 fn call_user_function_with_eval(
     frame: &PyFrame,
     callable: PyObjectRef,
@@ -990,24 +1006,7 @@ pub(crate) fn resolve_kwargs(
     // `argument.py:270-271` ArgErrUnknownKwds — unmatched kwargs and no
     // **kwarg to absorb them.
     if !unmatched_kw_names.is_empty() {
-        let msg = if unmatched_kw_names.len() == 1 {
-            format!(
-                "{}() got an unexpected keyword argument '{}'",
-                fname, unmatched_kw_names[0]
-            )
-        } else {
-            let joined = unmatched_kw_names
-                .iter()
-                .map(|s| format!("'{}'", s))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}() got {} unexpected keyword arguments: {}",
-                fname,
-                unmatched_kw_names.len(),
-                joined
-            )
-        };
+        let msg = format_unknown_kwds_err(&fname, &unmatched_kw_names);
         return Err(crate::PyError::type_error(msg));
     }
 
@@ -1187,24 +1186,7 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     if !unmatched_kw_names.is_empty() {
-        let msg = if unmatched_kw_names.len() == 1 {
-            format!(
-                "{}() got an unexpected keyword argument '{}'",
-                fname, unmatched_kw_names[0]
-            )
-        } else {
-            let joined = unmatched_kw_names
-                .iter()
-                .map(|s| format!("'{}'", s))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}() got {} unexpected keyword arguments: {}",
-                fname,
-                unmatched_kw_names.len(),
-                joined
-            )
-        };
+        let msg = format_unknown_kwds_err(fname, &unmatched_kw_names);
         return Err(crate::PyError::type_error(msg));
     }
 
@@ -1460,24 +1442,7 @@ pub fn call_with_kwargs(
 
             // `argument.py:270-271` ArgErrUnknownKwds.
             if !unmatched_kw_names.is_empty() {
-                let msg = if unmatched_kw_names.len() == 1 {
-                    format!(
-                        "{}() got an unexpected keyword argument '{}'",
-                        fname, unmatched_kw_names[0]
-                    )
-                } else {
-                    let joined = unmatched_kw_names
-                        .iter()
-                        .map(|s| format!("'{}'", s))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "{}() got {} unexpected keyword arguments: {}",
-                        fname,
-                        unmatched_kw_names.len(),
-                        joined
-                    )
-                };
+                let msg = format_unknown_kwds_err(&fname, &unmatched_kw_names);
                 return Err(crate::PyError::type_error(msg));
             }
 
@@ -2919,12 +2884,8 @@ fn build_class_inner(
                 ns.entries().map(|(k, &v)| (k.to_string(), v)).collect();
             for (attr_name, value) in entries {
                 if !value.is_null() {
-                    if let Ok(set_name) = crate::baseobjspace::getattr_str(value, "__set_name__") {
-                        crate::builtins::call_and_check(
-                            set_name,
-                            &[w, pyre_object::w_str_new(&attr_name)],
-                        )?;
-                    }
+                    let w_name = pyre_object::w_str_new(&attr_name);
+                    unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
                 }
             }
         }
