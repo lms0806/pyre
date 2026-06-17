@@ -2948,16 +2948,30 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // keeps only flags that agree on both sides.
         (SomeValue::Instance(a), SomeValue::Instance(b)) => {
             let can_be_none = a.can_be_none || b.can_be_none;
+            // binaryop.py:666-672 unions two SomeInstances through
+            // `commonbase(classdef1, classdef2)`.  The `classdef is
+            // None` case is a special case that yields `basedef = None`;
+            // when BOTH sides carry a classdef and `commonbase` returns
+            // None, RPython raises `UnionError` — it does NOT widen two
+            // unrelated classdefs to the classdef-less top.  The
+            // dual-gate catches that UnionError and Skips the graph
+            // (legacy fallback), which is the parity-correct outcome.
             let merged_classdef = match (&a.classdef, &b.classdef) {
-                (None, _) | (_, None) => Some(None),
-                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb).map(Some),
-            };
-            let Some(merged_classdef) = merged_classdef else {
-                return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
-                    msg: "RPython cannot unify instances with no common base class".into(),
-                });
+                (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
+                    Some(base) => Some(base),
+                    None => {
+                        return Err(UnionError {
+                            lhs: s1.clone(),
+                            rhs: s2.clone(),
+                            msg: "RPython cannot unify instances with no \
+                                  common base class"
+                                .to_string(),
+                        });
+                    }
+                },
+                // special case only: a classdef-less top instance on
+                // either side unions to the classdef-less top.
+                _ => None,
             };
             let mut flags = a.flags.clone();
             flags.retain(|key, value| b.flags.get(key) == Some(value));
@@ -4564,21 +4578,6 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_classdef_instances_errors() {
-        let a = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new_standalone("pkg.A", None)),
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        let b = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new_standalone("pkg.B", None)),
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        assert!(union(&a, &b).is_err());
-    }
-
-    #[test]
     fn union_instance_uses_common_base_classdef() {
         let base = ClassDef::new_standalone("pkg.Base", None);
         let sub = ClassDef::new_standalone("pkg.Sub", Some(&base));
@@ -4616,6 +4615,25 @@ mod tests {
             panic!("expected SomeInstance");
         };
         assert!(inst.classdef.is_none());
+    }
+
+    #[test]
+    fn union_instances_with_no_common_base_raises() {
+        // Two standalone classes carry classdefs and share no base.
+        // binaryop.py:666-672 raises UnionError when both sides have a
+        // classdef and `commonbase` returns None — it does NOT widen
+        // unrelated classdefs to the classdef-less top.
+        let a = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pkg.A", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let b = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pkg.B", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert!(union(&a, &b).is_err());
     }
 
     #[test]

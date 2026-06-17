@@ -659,6 +659,21 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
         kind if is_str_const_define(kind) => false,
+        // The `hint_promote` / `hint_promote_or_string` markers lower to
+        // a non-raising `same_as(arg)` (`rtyper.py:478-481` internal
+        // renaming) in `translate_op` — they emit no raising op.  Matched
+        // before the general `Call` arm, same as the elisions above.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            ..
+        } if segments.len() == 1
+            && matches!(
+                segments[0].as_str(),
+                "hint_promote" | "hint_promote_or_string"
+            ) =>
+        {
+            false
+        }
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -1142,6 +1157,25 @@ pub fn translate_op(
                         let arg = iter.next().ok_or_else(|| {
                             TyperError::message(
                                 "hint_promote_or_string requires at least one arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
+                    }
+                    // `hint_promote` is the `front::mir` marker for
+                    // `jit::promote(x)` = `hint(x, promote=True)`
+                    // (`rlib/jit.py:101`).  As with `hint_promote_or_string`
+                    // above, the marker has no registry entry; lower it to
+                    // `same_as(arg)` (`rtyper.py:478-481` internal renaming)
+                    // so the dual-gate real path types the result as the
+                    // arg's repr instead of skipping.  The residual
+                    // `OpKind::Call` survives untouched into `jtransform`,
+                    // where `rewrite_op_hint` emits the
+                    // `<kind>_guard_value` family (`jtransform.py:608-614`).
+                    if segments.len() == 1 && segments[0] == "hint_promote" {
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "hint_promote requires at least one arg".to_string(),
                             )
                         })?;
                         return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);

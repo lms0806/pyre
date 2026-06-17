@@ -2957,6 +2957,7 @@ impl<'a> Lowering<'a> {
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.const_eval_global(id))
+                    .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
@@ -3543,9 +3544,37 @@ impl<'a> Lowering<'a> {
                 // it takes the same alias path.
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
-                        || self.trait_clause_into_string_identity(&reg, &call.dest.ty))
+                        || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
+                        || self.is_noop_ptr_cast(&reg)
+                        || self.is_reflexive_into_iter(&reg))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<Box<T>>::deref` / `<Rc<T>>::deref` / `<Arc<T>>::deref`
+                // / the workspace `FrameBox::deref` (+ their `deref_mut`)
+                // whose `&T` is a registered struct.  The handle is one
+                // pointer word, so `*p` is a typed pointer reinterpret:
+                // emit the `cast_pointer(T, p)` downcast marker
+                // (`cast_pointer_marker_op`) the flowspace adapter rebuilds
+                // into `simple_call(lltype.cast_pointer, T, p)`, yielding
+                // `SomeInstance(T)` regardless of the receiver's
+                // classdef-less annotation.  Slice / `str` derefs resolve
+                // no struct root and keep their ordinary lowering.
+                if args.len() == 1
+                    && let Some(root) = self.deref_cast_root(&reg, &call.dest.ty)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: cast_pointer_marker_op(root, args[0].clone()),
+                    });
+                    self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3718,6 +3747,27 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::is_nan(x)` is `x != x` (`rfloat.isnan`) — emit the
+                // reflexive `ne` BinOp instead of an unresolved call.
+                if args.len() == 1 && self.is_f64_is_nan(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[0].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -3785,22 +3835,38 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
-                    // `CallTarget::Method` requires a receiver in `args[0]`
-                    // (the flowspace adapter lowers it to `getattr(recv,
-                    // method_leaf) → simple_call(bound_method, …)`).
-                    // Charon's `impl_method_owner` matches both inherent
-                    // methods (which carry `&self`) *and* associated
-                    // functions (e.g. `RootScope::new()` — no `self` arg).
-                    // Only the former actually has a receiver in `args[0]`;
-                    // routing a 0-arg associated function through `Method`
-                    // panics at `flowspace_adapter.rs:1045` ("Call::Method
-                    // has empty args").  Fall back to the `FunctionPath`
-                    // segments when there is no receiver to thread.
-                    let target = match method_hint {
-                        Some((owner_root, leaf)) if !args.is_empty() => {
-                            CallTarget::method(leaf, Some(owner_root))
+                    // `jit::promote(x)` rewrites to the synthesised
+                    // `hint_promote` marker so the residual `OpKind::Call`
+                    // reaches `jtransform::rewrite_op_hint`, which emits
+                    // `[-live-, <kind>_guard_value(x)]`
+                    // (`jit_codewriter/jtransform.py:608-614`).  The rtyper
+                    // lowers the marker to `same_as` for the dual-gate type
+                    // projection (`flowspace_adapter`), and jtransform aliases
+                    // the result back to `x`.  Same single-segment marker
+                    // shape as the `elidable_promote` wrapper's
+                    // `hint_promote_or_string`.
+                    let target = if args.len() == 1 && self.is_jit_promote(&reg) {
+                        CallTarget::FunctionPath {
+                            segments: vec!["hint_promote".to_string()],
                         }
-                        _ => CallTarget::FunctionPath { segments },
+                    } else {
+                        // `CallTarget::Method` requires a receiver in `args[0]`
+                        // (the flowspace adapter lowers it to `getattr(recv,
+                        // method_leaf) → simple_call(bound_method, …)`).
+                        // Charon's `impl_method_owner` matches both inherent
+                        // methods (which carry `&self`) *and* associated
+                        // functions (e.g. `RootScope::new()` — no `self` arg).
+                        // Only the former actually has a receiver in `args[0]`;
+                        // routing a 0-arg associated function through `Method`
+                        // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                        // has empty args").  Fall back to the `FunctionPath`
+                        // segments when there is no receiver to thread.
+                        match method_hint {
+                            Some((owner_root, leaf)) if !args.is_empty() => {
+                                CallTarget::method(leaf, Some(owner_root))
+                            }
+                            _ => CallTarget::FunctionPath { segments },
+                        }
                     };
                     OpKind::Call {
                         target,
@@ -4236,6 +4302,120 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
+    /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
+    /// change only const/mut, never the pointee type.  The JIT does not
+    /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
+    /// same-Variable alias, mir.rs:50), so a `p.cast_mut()` callsite binds
+    /// its destination straight to the pointer argument instead of
+    /// emitting a call to core's raw-pointer method (which has no graph
+    /// lowering and is not a registered callee).
+    ///
+    /// The pointee-changing `<ptr>::cast::<U>()` is NOT matched here: it
+    /// routes to [`is_ptr_identity_cast`], which narrows a
+    /// `cast::<RegisteredStruct>()` to `SomeInstance(root)` (the same
+    /// `cast_pointer` shape as `obj as *const W_Foo`) instead of leaving
+    /// the destination classdef-less and blocking the downstream getattr.
+    fn is_noop_ptr_cast(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::ptr::const_ptr::<Impl>::cast_mut" | "core::ptr::mut_ptr::<Impl>::cast_const"
+            )
+        })
+    }
+
+    /// A thin-pointer `Deref::deref` / `DerefMut::deref_mut` whose
+    /// dereferenced `&T` is a registered struct, resolved to the pointee
+    /// struct root.  Valid only when the handle's single pointer word *is*
+    /// the pointee address, so `*p` is a zero-offset reinterpret: `Box<T>`
+    /// (no header — `Unique<T>` points straight at `T`), the workspace
+    /// `FrameBox` (`{ptr: *mut PyFrame}`), and single-field transparent
+    /// wrappers (`{UnsafeCell<T>}`).  For these the caller lowers the
+    /// deref to the `cast_pointer(T, p)` downcast marker
+    /// (`cast_pointer_marker_op`), which yields `SomeInstance(T)`
+    /// (lltype.py:964-974) independent of the receiver's (classdef-less)
+    /// annotation — the same shape pyre emits for `obj as *const W_Foo`.
+    ///
+    /// `Rc<T>` / `Arc<T>` are the exception: their word points at a
+    /// refcount header, so the pointee sits at a non-zero offset and
+    /// `cast_pointer` would reinterpret the header.  They are subtracted
+    /// by owner-type leaf; an unresolved owner keeps the ordinary
+    /// thin-pointer treatment, since the dereferenced `&T` must still
+    /// resolve a registered struct root below.
+    ///
+    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf or
+    /// the dereferenced type is not a named ADT (slice / `str` derefs
+    /// resolve no struct root — their `&[T]` / `&str` value model is the
+    /// receiver's, narrowed by the list / string reprs, not a pointer
+    /// downcast).
+    fn deref_cast_root(&self, reg: &RegularCall, dest_ty: &TyRef) -> Option<String> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        let np = fd.item_meta.name_path();
+        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return None;
+        }
+        if let Some(leaf) = deref_impl_owner_leaf(self.llbc, fd) {
+            if matches!(leaf.as_str(), "Rc" | "Arc") {
+                return None;
+            }
+        }
+        tyref_class_root(dest_ty, self.llbc)
+    }
+
+    /// The blanket `impl<I: Iterator> IntoIterator for I`
+    /// (`core::iter::traits::collect`) — its `into_iter(self) -> I`
+    /// returns the receiver unchanged, so a `for` desugar's `into_iter`
+    /// callsite aliases its argument instead of calling core's identity
+    /// body (an unregistered callee).  Container impls
+    /// (`Vec`/array/`Range`) live under other module paths, so the exact
+    /// path match selects only the reflexive blanket.
+    fn is_reflexive_into_iter(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
+        })
+    }
+
+    /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the
+    /// callsite would skip as an unregistered `FunctionPath`.  `is_nan`
+    /// is `value != value` (`rfloat.isnan`), so the caller lowers it to
+    /// a reflexive `ne` `BinOp`; the float operand makes the rtyper pick
+    /// `float_ne`, which (unlike `int_ne`) carries no `n(x, x) => 0`
+    /// reflexive fold, preserving the NaN-only truth value.
+    fn is_f64_is_nan(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
+    }
+
+    /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
+    /// (`rlib/jit.py:101`).  The wrapper carries the `promote` flag by its
+    /// name (its body is a bare `hint(x)`, shared with `promote_string` /
+    /// `promote_unicode`), so the callsite is recognised by the wrapper
+    /// path, not the body.  Matched on the exact `promote` leaf so the
+    /// `promote_string` / `promote_unicode` siblings — which `jtransform`
+    /// cannot lower without an `rstr.STR`/`UNICODE` layout — keep their
+    /// ordinary (skipping) call lowering.
+    fn is_jit_promote(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "majit_metainterp::jit::promote")
+    }
+
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -5606,6 +5786,33 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
         return None;
     }
     Some((owner_qualified, leaf))
+}
+
+/// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
+/// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
+/// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
+/// registry-keyed `impl_method_owner_for_fundecl` (which resolves only
+/// self-receiver methods it can key into `PyreCallRegistry`).  Used to
+/// subtract the `cast_pointer` thin-pointer rewrite for the
+/// header-offset handles whose word is not the pointee address.
+/// Returns `None` when the owner cannot be resolved, in which case the
+/// caller keeps the ordinary thin-pointer treatment.
+fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let path = td.item_meta.name_path();
+    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
 }
 
 /// Collect, from the lowered MIR,
@@ -7429,6 +7636,30 @@ fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
         || stripped
             .strip_suffix(key)
             .is_some_and(|prefix| prefix.ends_with("::"))
+}
+
+/// Supply the value of a primitive `f64` associated constant whose
+/// initializer Charon records as an `Opaque` body — `core` defines
+/// `f64::INFINITY` as `1.0_f64 / 0.0_f64`, so no in-LLBC init survives
+/// for [`Lowering::const_eval_global`] to evaluate.  The value is a
+/// fixed IEEE-754 bit pattern the host (rustc) already computed, so
+/// emit it as the same by-value `ConstFloat` an inline float literal
+/// lowers to (mirroring `rfloat.INFINITY` reaching the flow graph as a
+/// float `Constant`).  Matches on the `f64::<Impl>::<NAME>` tail so a
+/// `core`- or `std`-rooted path resolves identically.
+fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
+    let tail: Vec<&str> = segments
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    let bits = match tail.as_slice() {
+        ["f64", "<Impl>", "INFINITY"] => f64::INFINITY.to_bits(),
+        _ => return None,
+    };
+    Some(OpKind::ConstFloat(bits))
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {

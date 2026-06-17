@@ -2483,6 +2483,39 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
+        // Jitcode-side fold of `we_are_jitted()` -> `true`: inside the
+        // tracer / blackhole interpreter `we_are_jitted()` is always
+        // true (rlib/jit.py:355) — the dual of `constfold::
+        // replace_we_are_jitted` folding the genc side to `false`.
+        //
+        // RPython folds this at the truth test: the rtyper lowers the
+        // call to the `_we_are_jitted` symbolic constant
+        // (`inputconst(Signed, _we_are_jitted)`) and
+        // `rewrite_op_int_is_true` folds `int_is_true(_we_are_jitted)`
+        // -> `Constant(True)` (jtransform.py:1633-1639).  That structure
+        // does not reproduce on pyre's model graph: the rtyper's SpecTag
+        // (`rbuiltin::rtype_we_are_jitted`) lives on the ephemeral
+        // flowspace graph (discarded after publishing types), the model
+        // `OpKind` has no SpecTag-carrying const variant, and pyre's
+        // `we_are_jitted() -> bool` feeds `exitswitch` directly with no
+        // `int_is_true` op to fold.  So the call itself — keyed by the
+        // `majit_metainterp::jit::we_are_jitted` `FunctionPath` (mir.rs
+        // splits the LLBC name_path) — is the only fold point in the
+        // model graph; folding it to `ConstBool(true)` yields the same
+        // green `exitswitch` condition RPython's folded `int_is_true`
+        // produces, and avoids a residual call + guard on the runtime
+        // JIT-mode flag in the hot method-cache path.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.len() == 3
+            && segments[0] == "majit_metainterp"
+            && segments[1] == "jit"
+            && segments[2] == "we_are_jitted"
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstBool(true),
+            }]);
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);
@@ -6627,6 +6660,44 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `we_are_jitted()` folds to `ConstBool(true)` in jitcode
+    /// (`rewrite_op_int_is_true` fold of `_we_are_jitted`,
+    /// jtransform.py:1636-1639) — the jitcode runs during tracing and
+    /// blackholing where the JIT-mode flag is true (rlib/jit.py:355).
+    #[test]
+    fn we_are_jitted_folds_to_const_true() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("we_are_jitted_fold");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["majit_metainterp", "jit", "we_are_jitted"]);
+        let result_ty = ValueType::Bool;
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "we_are_jitted_fold",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(ops[0].result, Some(result_var));
+                assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
+            }
+            _ => panic!("expected Replace with ConstBool(true)"),
         }
     }
 

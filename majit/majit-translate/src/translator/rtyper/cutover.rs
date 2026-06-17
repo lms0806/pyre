@@ -723,6 +723,7 @@ fn compare_real_against_legacy(
 /// | `compute_at_fixpoint failed`               | PBC dispatch / call-family coverage (per-call).                              |
 /// | `post-rtyper jtransform variant`           | Per-variant emit-site retracing (rpbc / rclass / front-end).  Includes `OpKind::Abort` (pyre-only marker; retire every `Expr::ForLoop` / `stop_unsupported` / `continue_with_unknown` emit-site at the front-end). |
 /// | `adapter cross-block body Input`           | Final emit-site retirement.                                                  |
+/// | `noneify() not supported`                  | Front-end typed null-pointer lowering (`Option<*T>` / null → `SomePtr`, not `SomeNone`); the raise itself is parity-correct. |
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
@@ -995,6 +996,26 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // body-`Input` emission is replaced by a Link.args / inputargs
         // threading pass that mirrors RPython.
         || msg.contains("adapter cross-block body Input")
+        // `SomeValue::noneify()` reached a `SomePtr` operand — a block
+        // merge unioned a `_ptr` with `NoneType`.  The raise itself is
+        // parity-correct: RPython's default `noneify` raises `UnionError`
+        // (model.py:121-122) and `SomePtr` defines no override, while
+        // `pair(SomePtr, SomeObject).union` raises too
+        // (llannotation.py:119-120) — so this Skip catches a *correct*
+        // raise, it does not paper over a wrong annotation rule.  The
+        // only divergence is upstream of the merge: RPython spells a null
+        // pointer as `lltype.nullptr(T)`, which annotates as a
+        // (null-valued) `SomePtr`, so `pair(SomePtr, SomePtr).union`
+        // (llannotation.py:94-98) keeps it in the pointer lattice and
+        // `noneify` is never reached.  Pyre's `front::mir` still lowers
+        // some Rust null/`Option<*T>` shapes to a `SomeNone` rather than
+        // a typed null `SomePtr` (the same null-pointer-typing gap
+        // tracked by the `LLAddress(Null)` exceptblock work), so the
+        // merge surfaces `_ptr ∪ NoneType`.  CONVERGENCE: lower a typed
+        // null pointer at the `front::mir` producer; removing this Skip
+        // without that fix only hard-breaks on the parity-correct raise.
+        // Until then the legacy walker keeps handling the graphs.
+        || msg.contains("noneify() not supported")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
     // `simple_call(<host_callable>, v)` — reaching
@@ -1878,6 +1899,19 @@ mod tests {
         assert!(
             is_known_unported(msg),
             "registry population must skip/fallback on the current indirect-call cutover gap"
+        );
+    }
+
+    #[test]
+    fn known_unported_classifies_noneify_on_ptr_merge() {
+        // A `_ptr ∪ NoneType` block merge reaches `SomeValue::noneify()`
+        // on a `SomePtr` operand — a parity-correct raise (default
+        // `noneify` raises, `SomePtr` has no override) the dual gate
+        // defers to legacy until `front::mir` lowers a typed null pointer.
+        let msg = "RPython noneify() not supported for this annotation";
+        assert!(
+            is_known_unported(msg),
+            "noneify-on-ptr merge must skip/fallback on the typed-null-pointer-lowering gap"
         );
     }
 
