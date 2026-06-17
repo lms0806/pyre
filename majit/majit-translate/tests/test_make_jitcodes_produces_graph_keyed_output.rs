@@ -99,24 +99,79 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
             reg.in_order.len()
         );
 
-        // Invariant 4: registry contains per-opcode-arm dispatch JitCodes,
+        // Invariant 4: registry contains every per-opcode-arm dispatch JitCode,
         // produced by `build_canonical_opcode_dispatch` (lib.rs:965-1027)
         // from the decomposed `execute_opcode_step` match arms. The portal
         // selector itself is not separately registered; each arm becomes
         // one `__opcode_dispatch__::<selector>#<arm_id>` JitCode mirroring
         // RPython's per-opcode handler graphs at `call.py:145-148
         // grab_initial_jitcodes`.
-        let has_arm = reg.by_path.keys().any(|k| {
-            k.segments
-                .first()
-                .map(|s| s == "__opcode_dispatch__")
-                .unwrap_or(false)
-        });
+        let dispatch_keys: Vec<String> = reg
+            .by_path
+            .keys()
+            .filter_map(|k| {
+                if k.segments.first().map(|s| s.as_str()) == Some("__opcode_dispatch__") {
+                    k.segments.get(1).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            dispatch_keys.len(),
+            107,
+            "expected 107 per-opcode dispatch arms in `by_path`; got {}",
+            dispatch_keys.len()
+        );
+        let dispatch_selectors: HashSet<String> = dispatch_keys
+            .iter()
+            .map(|k| {
+                k.rsplit_once('#')
+                    .map(|(selector, _)| selector)
+                    .unwrap_or(k)
+            })
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            dispatch_selectors.len(),
+            dispatch_keys.len(),
+            "opcode dispatch selectors must be unique across arms"
+        );
+        assert_eq!(
+            dispatch_selectors
+                .iter()
+                .filter(|selector| selector.contains(" | "))
+                .count(),
+            4,
+            "expected four Or-pattern dispatch arms"
+        );
         assert!(
-            has_arm,
-            "per-opcode dispatch arms missing from `by_path` — \
-             `build_canonical_opcode_dispatch` (lib.rs:965-1027) did not seed any \
-             `__opcode_dispatch__::<selector>#<arm_id>` JitCode"
+            dispatch_selectors.contains("Instruction::PopTop"),
+            "PopTop arm present"
+        );
+        assert!(
+            dispatch_selectors.contains("Instruction::LoadConst"),
+            "LoadConst arm present"
+        );
+        assert!(
+            dispatch_selectors.contains("Instruction::ExitInitCheck"),
+            "ExitInitCheck present as its own arm"
+        );
+        assert!(dispatch_selectors.contains("_"), "wildcard key present");
+        let async_stub_cases = [
+            "Instruction::CleanupThrow",
+            "Instruction::EndAsyncFor",
+            "Instruction::GetAiter",
+            "Instruction::GetAnext",
+            "Instruction::GetAwaitable",
+        ];
+        assert!(
+            dispatch_selectors.iter().any(|selector| {
+                async_stub_cases
+                    .iter()
+                    .all(|case| selector.split(" | ").any(|part| part == *case))
+            }),
+            "async-stub Or group present: got {dispatch_selectors:?}"
         );
     });
 
