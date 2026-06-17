@@ -516,7 +516,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 return Err(crate::PyError::value_error("n must be at least one"));
             }
             let strict = match crate::builtins::kwarg_get(kwargs, "strict") {
-                Some(w) => crate::baseobjspace::is_true(w),
+                Some(w) => crate::baseobjspace::is_true(w)?,
                 None => false,
             };
             let n = n as usize;

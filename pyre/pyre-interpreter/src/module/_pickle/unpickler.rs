@@ -66,7 +66,7 @@ impl W_Unpickler {
         // pyre stores unicode natively, so they are accepted for signature
         // compatibility. `fix_imports` gates the proto-< 3 py2→py3 name remap.
         let _ = (encoding, errors);
-        self.fix_imports = crate::baseobjspace::is_true(fix_imports);
+        self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
         self.w_file_readline = crate::baseobjspace::getattr_str(file, "readline")?;
         self.w_stack = pyre_object::w_none();

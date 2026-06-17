@@ -668,10 +668,10 @@ pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
             return Ok(w_str_len(obj) != 0);
         }
         if pyre_object::is_bytes(obj) {
-            return pyre_object::w_bytes_len(obj) != 0;
+            return Ok(pyre_object::w_bytes_len(obj) != 0);
         }
         if pyre_object::is_bytearray(obj) {
-            return pyre_object::w_bytearray_len(obj) != 0;
+            return Ok(pyre_object::w_bytearray_len(obj) != 0);
         }
         if is_list(obj) {
             return Ok(w_list_len(obj) > 0);

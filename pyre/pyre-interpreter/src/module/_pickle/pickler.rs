@@ -195,7 +195,7 @@ impl W_Pickler {
         self.proto = proto;
         self.bin = proto >= 1;
         self.framing = proto >= 4;
-        self.fix_imports = crate::baseobjspace::is_true(fix_imports);
+        self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.buffer_callback = buffer_callback;
         self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
         Ok(())
@@ -394,7 +394,7 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         return Ok(());
     }
     if unsafe { pyre_object::is_bool(w_obj) } {
-        save_bool(ctx, buf, w_obj);
+        save_bool(ctx, buf, w_obj)?;
         return Ok(());
     }
     if unsafe { pyre_object::is_int_or_long(w_obj) } {
@@ -473,14 +473,15 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
     Err(pickling_error("__reduce__ must return string or tuple"))
 }
 
-fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
-    let truthy = crate::baseobjspace::is_true(w_obj);
+fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    let truthy = crate::baseobjspace::is_true(w_obj)?;
     if ctx.proto >= 2 {
         buf.push(if truthy { op::NEWTRUE } else { op::NEWFALSE });
     } else {
         // I00\n / I01\n
         buf.extend_from_slice(if truthy { b"I01\n" } else { b"I00\n" });
     }
+    Ok(())
 }
 
 fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
@@ -923,7 +924,7 @@ fn save_picklebuffer(
     let mut in_band = true;
     if !unsafe { pyre_object::is_none(ctx.buffer_callback) } {
         let w_ret = call_fn(ctx.buffer_callback, &[w_obj])?;
-        in_band = crate::baseobjspace::is_true(w_ret);
+        in_band = crate::baseobjspace::is_true(w_ret)?;
     }
     if in_band {
         // In-band buffers memoize the wrapper (`_save_bytes_data` /

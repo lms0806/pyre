@@ -108,7 +108,7 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
         let w_data = crate::module::_pickle::call_meth(obj, "tobytes", &[])?;
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_data) }.to_vec();
         let w_ro = crate::baseobjspace::getattr_str(obj, "readonly")?;
-        return Ok((data, crate::baseobjspace::is_true(w_ro)));
+        return Ok((data, crate::baseobjspace::is_true(w_ro)?));
     }
     Err(PyError::type_error(format!(
         "a bytes-like object is required, not '{}'",

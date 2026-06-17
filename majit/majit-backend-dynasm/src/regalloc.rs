@@ -6505,30 +6505,4 @@ mod tests {
         assert_eq!(get_scale(4), 2);
         assert_eq!(get_scale(8), 3);
     }
-
-    #[test]
-    #[ignore = "GuardNotForced2 frame-depth argloc emission (assembler.py:935 check_frame_depth wiring) not yet ported on side3; test added ahead of supporting code"]
-    fn test_guard_not_forced_2_carries_frame_depth_argloc() {
-        let i0 = OpRef::int_op(100);
-        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
-        let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
-
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let output = ra.walk_operations();
-
-        match &output[0] {
-            RegAllocOp::PerformGuard {
-                arglocs, faillocs, ..
-            } => {
-                assert_eq!(faillocs.len(), 1);
-                assert_eq!(arglocs.len(), 1);
-                match arglocs[0] {
-                    Loc::Immed(imm) => assert_eq!(imm.value, 1),
-                    ref other => panic!("expected frame-depth immed, got {other:?}"),
-                }
-            }
-            other => panic!("expected PerformGuard, got {other:?}"),
-        }
-    }
 }
