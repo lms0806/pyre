@@ -5,6 +5,8 @@
 
 pub mod __builtin__;
 #[allow(non_snake_case)]
+pub mod __pypy__;
+#[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;
@@ -27,6 +29,8 @@ pub mod _locale;
 pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _opcode;
+#[allow(non_snake_case)]
+pub mod _pickle;
 #[allow(non_snake_case)]
 pub mod _posixshmem;
 #[allow(non_snake_case)]

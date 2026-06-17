@@ -336,6 +336,18 @@ pub fn init_typeobjects() {
             &pyre_object::MAPPING_PROXY_TYPE as *const PyType as usize,
             new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
         );
+        // module — `pypy/interpreter/module.py Module.typedef`, bases=(object,).
+        // `W_ModuleObject` carries a custom Rust layout (name + w_dict), so
+        // instances are produced by `w_module_new` at import time, not by the
+        // generic `object.__new__`.  Registering the W_TypeObject gives
+        // `type(m)` a real type (was the bare name string), so `m.__class__`,
+        // `__flags__`, `isinstance(m, object)` and the inherited
+        // `object.__reduce_ex__` all resolve.  `get_instantiate(&MODULE_TYPE)`
+        // (read by `w_module_new`) is wired by the `set_instantiate` loop below.
+        reg.insert(
+            &pyre_object::MODULE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("module", init_module_type, object_type) as usize,
+        );
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  PyPy registers
         // each as a distinct TypeDef but they share the
@@ -619,9 +631,14 @@ pub fn init_typeobjects() {
             &pyre_object::superobject::SUPER_TYPE as *const PyType as usize,
             new_typeobject_with_base("super", |_| {}, object_type) as usize,
         );
+        let generator_type = new_typeobject_with_base("generator", |_| {}, object_type);
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — a generator is produced
+        // only by calling a generator function, never by `generator()`,
+        // so `tp_new` is NULL and pickling refuses it.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(generator_type) };
         reg.insert(
             &pyre_object::generatorobject::GENERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("generator", |_| {}, object_type) as usize,
+            generator_type as usize,
         );
         reg.insert(
             &pyre_object::rangeobject::RANGE_ITER_TYPE as *const PyType as usize,
@@ -641,6 +658,22 @@ pub fn init_typeobjects() {
             // class `range_iterator` (`functional.py`); the word-fit and bignum
             // iterators share that public name though they are distinct types.
             new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::enumerateobject::ENUMERATE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("enumerate", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_VALUEITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_valueiterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_ITEMITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_itemiterator", |_| {}, object_type) as usize,
         );
         reg.insert(
             &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
@@ -819,6 +852,27 @@ pub fn w_object() -> PyObjectRef {
         .unwrap_or(PY_NULL)
 }
 
+/// Stamp the builtin `__new__` carrier in `ns` with `__self__ =
+/// type_obj` (the type that defines `tp_new`), mirroring
+/// `typeobject.c add_tp_new_wrapper`.  `copyreg._reduce_ex` walks the
+/// MRO testing `base.__new__.__self__ is base`, so each builtin type
+/// that defines `__new__` must carry its own type as the wrapper's
+/// `__self__`.  Inherited `__new__` keeps the ancestor's stamp
+/// (`function_set_new_self` only writes when unset).
+///
+/// # Safety
+/// `ns_ptr` must be a valid, live `DictStorage`; `type_obj` a valid type.
+unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) {
+    if let Some(w_new) = (*ns_ptr).get("__new__").copied() {
+        if !w_new.is_null() && pyre_object::propertyobject::is_staticmethod(w_new) {
+            let inner = pyre_object::propertyobject::w_staticmethod_get_func(w_new);
+            if !inner.is_null() && crate::function::is_function(inner) {
+                crate::function::function_set_new_self(inner, type_obj);
+            }
+        }
+    }
+}
+
 /// Create the root `object` type. MRO = [object].
 fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
     let mut ns = Box::new(DictStorage::new());
@@ -847,6 +901,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
         pyre_object::w_type_set_weakrefable(type_obj, false);
     }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
     type_obj
 }
 
@@ -925,6 +980,70 @@ fn new_typeobject_with_base_and_layout(
         mro.push(base);
     }
     unsafe { w_type_set_mro(type_obj, mro) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
+    type_obj
+}
+
+/// Create a named builtin type inheriting from multiple `bases`.
+///
+/// The first entry is the primary base (drives layout/hasdict/weakref
+/// inheritance, like `w_bestbase` in typeobject.py:setup_builtin_type);
+/// the full tuple is recorded as `__bases__` and the MRO is the C3
+/// linearization (`compute_default_mro`).  Used for builtin exception
+/// classes with more than one base, e.g.
+/// `class UnsupportedOperation(OSError, ValueError)`.
+pub fn make_builtin_type_with_bases(
+    name: &str,
+    init: impl FnOnce(&mut DictStorage),
+    bases: &[PyObjectRef],
+) -> PyObjectRef {
+    let layout_pytype = &INSTANCE_TYPE as *const PyType;
+    let base = bases[0];
+    let mut ns = Box::new(DictStorage::new());
+    ns.fix_ptr();
+    init(&mut ns);
+    let ns_ptr = Box::into_raw(ns);
+    let bases_tuple = w_tuple_new(bases.to_vec());
+    let type_obj = w_type_new_builtin(name, bases_tuple, ns_ptr as *mut u8, layout_pytype);
+
+    unsafe {
+        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        let reuse = if !parent_layout.is_null() {
+            std::ptr::eq((*parent_layout).typedef, layout_pytype)
+        } else {
+            false
+        };
+        let has_dict = (*ns_ptr).get("__dict__").is_some();
+        let has_weakref = (*ns_ptr).get("__weakref__").is_some();
+        let layout = if reuse {
+            parent_layout
+        } else {
+            let has_new = (*ns_ptr).get("__new__").is_some();
+            pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+                typedef: layout_pytype,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: parent_layout,
+                acceptable_as_base_class: has_new,
+                typedef_hasdict: false,
+            })
+        };
+        pyre_object::w_type_set_layout(type_obj, layout);
+        // typedef.py:39-41: inherit hasdict/weakrefable from any base.
+        let mut hasdict = has_dict;
+        let mut weakrefable = has_weakref;
+        for &b in bases {
+            hasdict |= pyre_object::w_type_get_hasdict(b);
+            weakrefable |= pyre_object::w_type_get_weakrefable(b);
+        }
+        pyre_object::w_type_set_hasdict(type_obj, hasdict);
+        pyre_object::w_type_set_weakrefable(type_obj, weakrefable);
+    }
+
+    // MRO = C3 linearization over the recorded `__bases__`.
+    let mro = unsafe { crate::baseobjspace::compute_default_mro(type_obj) };
+    unsafe { w_type_set_mro(type_obj, mro) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
     type_obj
 }
 
@@ -1039,7 +1158,12 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 pub(crate) fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
-    let f = make_builtin_function("__new__", func);
+    // `BuiltinFunction`-typed so `type(int.__new__)` differs from a user
+    // `def`'s `function`, letting `copyreg._reduce_ex`'s
+    // `isinstance(new, type(int.__new__))` match only builtin `tp_new`
+    // wrappers (mirrors `builtin_function_or_method`).  `__self__` is
+    // stamped at type-finalisation via `stamp_new_descr_self`.
+    let f = crate::gateway::make_builtin_function_as_builtin("__new__", func);
     pyre_object::w_staticmethod_new(f)
 }
 
@@ -1052,6 +1176,62 @@ fn make_maketrans_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
     pyre_object::w_staticmethod_new(make_builtin_function("maketrans", func))
+}
+
+/// `moduleobject.c module_new` — allocate an anonymous `W_ModuleObject`
+/// (empty name, fresh dict).  The name is seeded by `__init__`, so
+/// `__new__` ignores its arguments.  A subclass instance is retagged
+/// with the actual class.
+fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_module = pyre_object::w_module_new("", std::ptr::null_mut());
+    if let Some(cls) = args.first().copied() {
+        if !cls.is_null() {
+            unsafe { (*w_module).w_class = cls };
+        }
+    }
+    Ok(w_module)
+}
+
+/// `moduleobject.c module_init` / `module.py:18-24 Module.__init__` —
+/// `module.__init__(self, name, doc=None)`.  Seeds the `name` field plus
+/// `__name__` / `__doc__` / `__package__` / `__loader__` / `__spec__`
+/// in the module dict.
+fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "module.__init__() missing required argument 'name' (pos 1)".to_string(),
+        ));
+    }
+    let self_ = positional[0];
+    let w_name = positional[1];
+    let w_doc = positional
+        .get(2)
+        .copied()
+        .unwrap_or_else(pyre_object::w_none);
+    let name = crate::baseobjspace::text_w(w_name)?;
+    unsafe { pyre_object::w_module_set_name(self_, name) };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_dict, "__name__", w_name);
+        pyre_object::w_dict_setitem_str(w_dict, "__doc__", w_doc);
+        pyre_object::w_dict_setitem_str(w_dict, "__package__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(w_dict, "__loader__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(w_dict, "__spec__", pyre_object::w_none());
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `module.py Module.typedef` — wire `__new__` / `__init__` so
+/// `type(m)(name)` builds a real module.  `module` defines its own
+/// `tp_new`, so `module.__new__ is not object.__new__`.
+fn init_module_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(module_descr_new));
+    dict_storage_store(
+        ns,
+        "__init__",
+        make_builtin_function("__init__", module_descr_init),
+    );
 }
 
 fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2200,6 +2380,22 @@ fn init_str_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // unicodeobject.py descr_getnewargs — `(W_UnicodeObject(self._utf8),)`:
+    // a fresh plain str from the contents, so a str subclass reduces to str.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_from_wtf8(s.to_owned()),
+                ]))
+            },
+            1,
+        ),
+    );
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
@@ -3752,6 +3948,21 @@ fn init_tuple_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // tupleobject.py descr_getnewargs — `((self-copy),)`
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(
+                    items,
+                )]))
+            },
+            1,
+        ),
+    );
 }
 
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
@@ -4750,6 +4961,18 @@ fn init_type_type(ns: &mut DictStorage) {
     );
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
 
+    // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
+    let flags_getter = make_builtin_function_with_arity(
+        "__flags__",
+        |args| {
+            Ok(pyre_object::w_int_new(unsafe {
+                pyre_object::w_type_get_flags(args[1])
+            }))
+        },
+        2,
+    );
+    dict_storage_store(ns, "__flags__", make_getset_descriptor(flags_getter));
+
     // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
     // form returns the MRO as a fresh list (the `__mro__` getset above
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
@@ -5366,8 +5589,21 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
     // W_TypeObject is still under construction, so `cls` cannot be
     // resolved here; `patch_builtin_function_descriptors` runs after the
     // type cache is populated and writes the missing reqcls.
-    let self_getter =
-        make_builtin_function_with_arity("__self__", |_args| Ok(pyre_object::w_none()), 2);
+    // A builtin `__new__` carrier reports its defining type as `__self__`
+    // (`typeobject.c add_tp_new_wrapper`), stamped via
+    // `stamp_new_descr_self`; every other builtin function keeps the
+    // `always_none` behaviour.
+    let self_getter = make_builtin_function_with_arity(
+        "__self__",
+        |args| {
+            let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if func.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(unsafe { crate::function::function_get_self_or_none(func) })
+        },
+        2,
+    );
     dict_storage_store(ns, "__self__", make_getset_descriptor(self_getter));
 
     dict_storage_store(
@@ -6820,6 +7056,21 @@ fn init_int_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // intobject.py descr_getnewargs — `(wrapint(self.intval),)`: a fresh
+    // plain int from the value, so an int subclass (e.g. bool) reduces to
+    // the base int.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let v = unsafe { pyre_object::w_int_get_value(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_int_new(v)]))
+            },
+            1,
+        ),
+    );
 }
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
@@ -7194,6 +7445,20 @@ fn init_float_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // floatobject.py descr_getnewargs — `(self.descr_float(),)`: a fresh
+    // plain float from the value.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_float_new(v)]))
+            },
+            1,
+        ),
+    );
 }
 
 #[derive(Copy, Clone)]
@@ -7538,11 +7803,36 @@ fn init_object_type(ns: &mut DictStorage) {
             2,
         ),
     );
-    // PyPy: objectobject.py descr___reduce_ex__
+    // objectobject.py descr__reduce__ / descr__reduce_ex__ / descr__getstate__
+    dict_storage_store(
+        ns,
+        "__reduce__",
+        make_builtin_function_with_arity(
+            "__reduce__",
+            |args| crate::reduce_protocol::descr_reduce(args[0]),
+            1,
+        ),
+    );
     dict_storage_store(
         ns,
         "__reduce_ex__",
-        make_builtin_function_with_arity("__reduce_ex__", |_| Ok(pyre_object::w_none()), 2),
+        make_builtin_function_with_arity(
+            "__reduce_ex__",
+            |args| {
+                let proto = unsafe { pyre_object::w_int_get_value(args[1]) };
+                crate::reduce_protocol::descr_reduce_ex(args[0], proto)
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getstate__",
+        make_builtin_function_with_arity(
+            "__getstate__",
+            |args| crate::reduce_protocol::object_getstate_default(args[0]),
+            1,
+        ),
     );
     // typeobject.py descr___init_subclass__ — the default accepts no
     // keywords; class-definition keywords reaching it via the builtin
@@ -7958,6 +8248,22 @@ fn init_bytes_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // bytesobject.py descr_getnewargs — a fresh plain bytes from the value,
+    // so a bytes subclass reduces to bytes.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let data = unsafe { pyre_object::w_bytes_data(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_bytes_from_bytes(data),
+                ]))
+            },
+            1,
+        ),
+    );
     // bytes methods are mostly shared with bytearray — add as needed.
 }
 
@@ -9988,6 +10294,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
             Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
         }
+        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data)?,
         _ => {
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?

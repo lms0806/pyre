@@ -186,6 +186,11 @@ pub fn install_builtin_modules() {
         crate::module::importlib::interp_importlib::register_abc
     );
 
+    // __pypy__ package + builders submodule — the PyPy-only surface
+    // pickle.py imports (identity_dict + builders.BytesBuilder).
+    pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
+    pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
+
     pyre_install_module!(_signal);
     pyre_install_module!(atexit);
     pyre_install_module!(pwd);
@@ -206,6 +211,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_multiprocessing);
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
+    pyre_install_module!(_pickle);
     pyre_install_module!(_struct);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
@@ -241,7 +247,6 @@ pub fn install_builtin_modules() {
         "_sha3",
         "_blake2",
         "_decimal",
-        "_pickle",
         "_datetime",
         "_json",
         "_csv",
@@ -308,6 +313,10 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let w_dict = pyre_object::w_module_dict_new();
     for (key, &value) in namespace.entries() {
         if !value.is_null() {
+            // MixedModule parity: interp-level builtin functions carry the
+            // module name as `__module__`, so `pickle` can save them by
+            // reference (`save_global`) without guessing via `whichmodule`.
+            unsafe { crate::function::builtin_function_set_module(value, name_obj) };
             unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
         }
     }
@@ -438,6 +447,19 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
         }
     }
     SYS_MODULES.with(|m| m.borrow().get(name).copied())
+}
+
+/// Look up a loaded module by name in `sys.modules` (Python-visible dict
+/// first, then the interpreter cache). Mirrors `check_sys_modules`.
+pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
+    check_sys_modules(name)
+}
+
+/// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
+/// installed. Used by callers that need to iterate every loaded module
+/// (e.g. pickle's `whichmodule` scan).
+pub fn sys_modules_dict() -> PyObjectRef {
+    SYS_MODULES_DICT.with(|d| d.get())
 }
 
 pub fn set_sys_module(name: &str, module: PyObjectRef) {

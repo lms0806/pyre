@@ -499,6 +499,37 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     1,
                 ),
             );
+            // memoryview.toreadonly — a fresh view over a bytes copy of the
+            // backing buffer, which the stub treats as read-only.
+            crate::dict_storage_store(
+                ns,
+                "toreadonly",
+                make_builtin_function_with_arity(
+                    "toreadonly",
+                    |args| {
+                        let mv = args.get(0).copied().unwrap_or(w_none());
+                        unsafe {
+                            let (data, itemsize, _) = memoryview_data(mv)?;
+                            let fmt = crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")?;
+                            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
+                            let inst = pyre_object::w_instance_new(cls);
+                            crate::baseobjspace::setattr_str(
+                                inst,
+                                "__pyre_buf__",
+                                pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                            )?;
+                            crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", fmt)?;
+                            crate::baseobjspace::setattr_str(
+                                inst,
+                                "__pyre_itemsize__",
+                                w_int_new(itemsize as i64),
+                            )?;
+                            Ok(inst)
+                        }
+                    },
+                    1,
+                ),
+            );
             // memoryview.itemsize attribute — read from the per-instance
             // __pyre_itemsize__ slot via property descriptor.
             crate::dict_storage_store(
@@ -596,7 +627,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("filter", || {
         make_module_builtin_function("filter", |args| {
             if args.len() < 2 {
-                return Ok(w_list_new(vec![]));
+                return Ok(pyre_object::w_seq_iter_new(w_list_new(vec![]), 0));
             }
             let func = args[0];
             let items = collect_iterable(args[1])?;
@@ -617,7 +648,11 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     out.push(item);
                 }
             }
-            Ok(w_list_new(out))
+            // `filter` is a lazy iterator in CPython; pyre eagerly applies
+            // the predicate but still hands back an iterator (matching
+            // `map`/`zip`) so `next(filter(...))` works.
+            let n = out.len();
+            Ok(pyre_object::w_seq_iter_new(w_list_new(out), n))
         })
     });
     namespace.get_or_insert_with("input", || {
@@ -992,8 +1027,14 @@ pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     let mut seed = DictStorage::new();
     install_default_builtins(&mut seed);
     let w_dict = pyre_object::w_module_dict_new();
+    // MixedModule parity: the interp-level builtins carry "builtins" as
+    // `__module__`, so `pickle.save_global` resolves them by reference
+    // without the `whichmodule` guess (every module namespace exposes the
+    // builtins, which makes that guess unstable).
+    let module_name = w_str_new("builtins");
     for (key, &value) in seed.entries() {
         if !value.is_null() {
+            unsafe { crate::function::builtin_function_set_module(value, module_name) };
             unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
         }
     }
@@ -2442,6 +2483,28 @@ fn make_exc_type_with_init(
     cls
 }
 
+/// Build a builtin exception class with more than one base, e.g.
+/// `class UnsupportedOperation(OSError, ValueError)`
+/// (`Modules/_io/_iomodule.c`).  The MRO is the C3 linearization over
+/// `bases`; the first base drives instance layout.  `with_traceback` /
+/// `add_note` are inherited through the MRO from `BaseException`, so
+/// only `__new__` is installed here.
+pub(crate) fn make_exc_type_multi(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    bases: &[PyObjectRef],
+) -> PyObjectRef {
+    let cls = crate::typedef::make_builtin_type_with_bases(
+        name,
+        move |ns| {
+            crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+        },
+        bases,
+    );
+    register_exc_class(name, cls);
+    cls
+}
+
 /// Thread-local registry from exception class name (as used by
 /// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
 /// namespace. Populated at init-builtins time via `make_exc_type`.
@@ -2841,6 +2904,11 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
+    }
+    // Values outside the machine-int range parse as arbitrary precision.
+    if let Some(big) = BigInt::parse_bytes(cleaned.as_bytes(), radix) {
+        let signed = if sign < 0 { -big } else { big };
+        return Ok(w_long_new(signed));
     }
     Err(crate::PyError::new(
         crate::PyErrorKind::ValueError,
