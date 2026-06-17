@@ -1377,6 +1377,12 @@ fn get_actual_typeid_via_active_runtime(gcref: GcRef) -> Option<u32> {
     with_cranelift_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
 }
 
+/// `majit_gc::CanMoveFn` installed by `set_gc_allocator`. Mirrors
+/// `rgc.can_move` (rpython/rlib/rgc.py:229).
+fn can_move_via_active_runtime(gcref: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
+}
+
 /// `majit_gc::SubclassRangeFn` installed by `set_gc_allocator`.
 /// Resolves the codegen-time `rclass.CLASSTYPE.subclassrange_{min,max}`
 /// lookup from x86/assembler.py:1971-1974 through the GC's
@@ -3987,6 +3993,21 @@ fn use_declared_var_or_panic(builder: &mut FunctionBuilder, opref: OpRef, what: 
     builder.use_var(var(opref.raw()))
 }
 
+/// `x86/regalloc.py:58-61` `convert_to_imm` ConstPtr guard: a non-null
+/// `ConstPtr` whose object can still move must never be baked as an
+/// immediate — `remove_constptr` (rewrite.py:1100) routes those through the
+/// gc_table. Null and non-moving (prebuilt / old-gen / no active GC)
+/// ConstPtrs are baked directly. `rgc.can_move` parity via
+/// `majit_gc::can_move`; the `we_are_translated()` clause is subsumed
+/// because `can_move` is false when no moving GC is active.
+fn guard_constptr_immediate(opref: OpRef) {
+    if let Some(g) = opref.as_const_ptr() {
+        if !g.is_null() && majit_gc::can_move(g) {
+            panic!("convert_to_imm: ConstPtr needs special care");
+        }
+    }
+}
+
 fn resolve_opref(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
@@ -4005,6 +4026,12 @@ fn resolve_opref(
          emitted this null OpRef must bind it (or rewrite the op) \
          instead of relying on a zero-load fallback"
     );
+    // x86/regalloc.py:58-61: a non-null movable `ConstPtr` must never be
+    // baked as an immediate. Op-args are additionally all-rewritten to
+    // `LoadFromGcTable` (rewrite.py:1100), so in a GC-rewritten trace this
+    // never fires for op-args; the guard is the shared `convert_to_imm`
+    // parity check (null / non-moving ConstPtrs are baked directly).
+    guard_constptr_immediate(opref);
     // RPython boxes/inputargs are distinct from Consts even when pyre's
     // compact OpRef numbering collides with an entry in the constant pool.
     // Once an OpRef has a declared variable, the variable is authoritative.
@@ -4852,6 +4879,8 @@ fn resolve_opref_or_imm(
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
     }
+    // x86/regalloc.py:58-61: refuse baking a movable non-null ConstPtr.
+    guard_constptr_immediate(opref);
     // Inline-Const fast path: history.py:227/268/314 — value lives on
     // the Box, not in a side pool.
     if let Some(c) = opref.inline_const_bits() {
@@ -4878,6 +4907,10 @@ fn resolve_failarg_opref(
     ref_root_base_ofs: i32,
     opref: OpRef,
 ) -> CValue {
+    // x86/regalloc.py:58-61: refuse baking a movable non-null ConstPtr —
+    // a fail-arg reference constant whose object can move must be reloaded
+    // through GC-forwarded resume data, not frozen as an immediate.
+    guard_constptr_immediate(opref);
     // Inline-Const fast path: history.py:227/268/314 — Const Box value
     // is inline. Stale-ref reload only applies to op-result variables
     // (regalloc-assigned slots), never to constants.
@@ -6333,6 +6366,16 @@ struct CompiledLoop {
     /// an immediate; holding the clone here keeps the `RwLock`
     /// allocation alive for the lifetime of the compiled code.
     cpu_attachments: CpuDescrHandle,
+    /// `assembler.py:822 gcreftracers.append(tracer)`: the per-loop
+    /// reference-constant `GcTable`, or `None` when the trace references
+    /// none. Its base address is baked into machine code by the
+    /// `LoadFromGcTable` genop, so the strong `Arc` must outlive the
+    /// compiled code. `do_compile` hands it back here; `compile_loop` /
+    /// `compile_bridge` push it onto the owning CLT's
+    /// `asmmemmgr_gcreftracers` (the authoritative keepalive, matching
+    /// `register_fail_descrs`), because a bridge's `CompiledLoop` is
+    /// consumed into `BridgeData` and would otherwise drop the table.
+    gc_table: Option<Arc<majit_gc::GcTable>>,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -7652,6 +7695,7 @@ impl CraneliftBackend {
             subclass_range: Some(subclass_range_via_active_runtime),
             typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
             typeid_is_object: Some(typeid_is_object_via_active_runtime),
+            can_move: Some(can_move_via_active_runtime),
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
@@ -7788,13 +7832,13 @@ impl CraneliftBackend {
         inputargs: &[InputArg],
         ops: &[Op],
         constants: &majit_ir::VecAssoc<u32, majit_ir::Const>,
-    ) -> Vec<Op> {
+    ) -> (Vec<Op>, Vec<GcRef>) {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
         if let Some(rewriter) = self.gc_rewriter() {
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
-            let (result, new_constants) =
+            let (result, new_constants, gcrefs) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // rewrite.py creates fresh ConstInt boxes for sizes, offsets
             // and helper addresses; `new_constants` is the full typed pool.
@@ -7803,9 +7847,9 @@ impl CraneliftBackend {
             for (k, c) in new_constants {
                 self.constants.entry(k).or_insert(c);
             }
-            result
+            (result, gcrefs)
         } else {
-            normalized
+            (normalized, Vec::new())
         }
     }
 
@@ -8007,8 +8051,17 @@ impl CraneliftBackend {
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
+        let (prepared_ops, gcrefs) =
+            self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
         let ops = prepared_ops.as_slice();
+        // assembler.py:793-824 parity: build the per-loop gc_table from
+        // the rewrite's reference-constant list. Its base address is baked
+        // by the `LoadFromGcTable` genop; the strong `Arc` is moved into
+        // the returned `CompiledLoop` so it outlives the baked immediate,
+        // and the gc_table walker forwards its slots across collections.
+        // Empty list ⇒ no table, base stays 0.
+        let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        let gc_table_base = gc_table.as_ref().map_or(0usize, |t| t.base_addr());
         // RPython parity: regalloc asserts that every Box used as an
         // argument or in fail_args is bound to a register or stack
         // location before code emission begins. The pyre/Cranelift
@@ -13314,11 +13367,25 @@ impl CraneliftBackend {
                 }
 
                 // ── Load from GC table ──
+                // `assembler.py:1545` `genop_load_from_gc_table`: load the
+                // reference constant at `gc_table_base + index*WORD`.
+                // arg(0) is the `ConstInt(index)` produced by the rewrite's
+                // `remove_constptr`; the table base is baked absolute
+                // because cranelift's `JITModule` exposes no
+                // code-buffer-start reservation seam (x86-32 `MOV_rj`
+                // model, `assembler.py:1551-1552`). The slot value is
+                // GC-forwarded in place by the gc_table root walker, so
+                // each load observes the relocated object. Cranelift folds
+                // `base + (const_index << 3)` to a single address.
                 OpCode::LoadFromGcTable => {
-                    // Load a constant pointer from the GC table.
-                    // arg(0) = index into the gc table
                     let index = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    builder.def_var(var(vi), index);
+                    let base = builder.ins().iconst(cl_types::I64, gc_table_base as i64);
+                    let byte_ofs = builder.ins().ishl_imm(index, 3);
+                    let slot_addr = builder.ins().iadd(base, byte_ofs);
+                    let value = builder
+                        .ins()
+                        .load(ptr_type, MemFlags::trusted(), slot_addr, 0);
+                    builder.def_var(var(vi), value);
                 }
 
                 // ── Load effective address ──
@@ -13617,7 +13684,27 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
             cpu_attachments: self.cpu_handle(),
+            gc_table,
         })
+    }
+
+    /// `assembler.py:822 gcreftracers.append(tracer)` parity for the
+    /// per-loop reference-constant `GcTable`.  The table's base address is
+    /// baked into machine code by the `LoadFromGcTable` genop, so the
+    /// strong `Arc` must outlive the compiled trace.
+    /// `clt.asmmemmgr_gcreftracers` is that lifetime root (`model.py:294`
+    /// / `llmodel.py:252-268 free_loop_and_bridges`), the same root used
+    /// by `register_fail_descrs`; when the CLT drops, the table frees and
+    /// its `Weak` in the gcreftracer registry is reaped lazily.
+    fn register_gc_table(
+        &self,
+        token: &majit_backend::JitCellToken,
+        table: Arc<majit_gc::GcTable>,
+    ) {
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
     }
 }
 
@@ -14655,6 +14742,9 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         self.registered_call_assembler_tokens.insert(token.number);
         self.register_fail_descrs(token, &compiled.fail_descrs);
+        if let Some(table) = compiled.gc_table.clone() {
+            self.register_gc_table(token, table);
+        }
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -14864,6 +14954,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // are scoped to the original loop's CLT, so the tracer batch
         // lands on `original_token`'s `asmmemmgr_gcreftracers`.
         self.register_fail_descrs(original_token, &compiled.fail_descrs);
+        // The bridge's `CompiledLoop` is consumed into `BridgeData` below,
+        // so its `gc_table` would drop with it; pin the table on the
+        // original loop's CLT (same scope as the bridge's fail descrs).
+        if let Some(table) = compiled.gc_table.clone() {
+            self.register_gc_table(original_token, table);
+        }
 
         // Attach the bridge to the original guard's fail descriptor so that
         // execute_token can dispatch to it on subsequent guard failures.
